@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { Boxes, KeyRound, Lock, Sparkles, Users } from "lucide-react";
+import { Boxes, FlaskConical, KeyRound, Lock, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -15,7 +15,8 @@ type Item = {
 };
 
 const RESOURCES: Item[] = [
-  { label: "Inference", href: "/serverless", icon: Boxes },
+  { label: "Serverless Inference", href: "/serverless", icon: Boxes },
+  { label: "Benchmark", href: "/benchmark", icon: FlaskConical },
   { label: "Autotrain", href: "#", icon: Sparkles, locked: true },
 ];
 const ACCOUNT: Item[] = [{ label: "API keys", href: "/api-keys", icon: KeyRound }];
@@ -26,8 +27,13 @@ export function ConsoleSidebar({ isAdmin = false }: { isAdmin?: boolean } = {}) 
   const { collapsed, mobileOpen, closeMobile } = useSidebarState();
 
   const isActive = (href: string) => {
-    if (href !== "/serverless") return pathname === href;
-    return pathname === "/serverless" || pathname.startsWith("/serverless/");
+    if (href === "/serverless") {
+      return pathname === "/serverless" || pathname.startsWith("/serverless/");
+    }
+    if (href === "/benchmark") {
+      return pathname === "/benchmark" || pathname.startsWith("/benchmark/");
+    }
+    return pathname === href;
   };
 
   const groups = (
@@ -113,7 +119,7 @@ export function ConsoleSidebar({ isAdmin = false }: { isAdmin?: boolean } = {}) 
           />
           {!collapsed && (
             <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-              Serverless
+              GPU Platform
             </span>
           )}
         </Link>

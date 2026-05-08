@@ -30,6 +30,7 @@ from .auth import (
     verify_password,
 )
 from .db import App, Request as ReqRow, User, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
+from . import bench as bench_module
 
 logger = logging.getLogger("gateway")
 
@@ -202,6 +203,16 @@ async def lifespan(app: FastAPI):
     app.state.provider = None
     app.state.autoscaler_task = None
     app.state.reconciler_task = None
+    if os.environ.get("BENCHMARK_S3_BUCKET", "").strip():
+        # Materialize SSH key from env (prod) before anything else uses it.
+        bench_module.bootstrap_ssh_key_from_env()
+        orphaned = await bench_module.cleanup_orphaned_running(app.state.redis)
+        if orphaned:
+            logger.warning(
+                "bench: marked %d previously-running benchmark(s) as failed (gateway restart). "
+                "Check RunPod for any pods left billing.", orphaned,
+            )
+        logger.info("bench enabled (bucket=%s)", os.environ.get("BENCHMARK_S3_BUCKET"))
     if os.environ.get("AUTOSCALER", "0") == "1":
         from .provider import build_provider
         from .autoscaler import autoscaler_loop
@@ -266,6 +277,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+app.include_router(bench_module.router)
 
 
 @app.middleware("http")

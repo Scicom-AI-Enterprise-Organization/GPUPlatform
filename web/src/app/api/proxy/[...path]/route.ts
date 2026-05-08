@@ -39,10 +39,23 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
 
   try {
     const res = await fetch(target, init);
+    const ct = res.headers.get("content-type") ?? "application/json";
+    // SSE / chunked: pipe the body through instead of buffering — buffering
+    // would break long-running streams (e.g. benchmark log tails).
+    if (ct.includes("text/event-stream") || ct.includes("application/x-ndjson")) {
+      return new NextResponse(res.body, {
+        status: res.status,
+        headers: {
+          "Content-Type": ct,
+          "Cache-Control": "no-cache",
+          "X-Accel-Buffering": "no",
+        },
+      });
+    }
     const body = await res.text();
     return new NextResponse(body, {
       status: res.status,
-      headers: { "Content-Type": res.headers.get("content-type") ?? "application/json" },
+      headers: { "Content-Type": ct },
     });
   } catch (e) {
     return NextResponse.json(

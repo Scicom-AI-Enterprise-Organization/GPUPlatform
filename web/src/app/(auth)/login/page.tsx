@@ -12,7 +12,7 @@ export default async function LoginPage({
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
         <p className="text-sm text-muted-foreground">
-          Welcome back to Serverless GPU.
+          Welcome back to GPU Platform.
         </p>
       </div>
       <LoginForm next={next ?? "/serverless"} />

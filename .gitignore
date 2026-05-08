@@ -24,3 +24,9 @@ venv/
 .DS_Store
 
 research/
+# Local Claude Code session state
+.claude/
+
+# Scratch planning docs (kept locally, not in git)
+plan.md
+plan_*.md

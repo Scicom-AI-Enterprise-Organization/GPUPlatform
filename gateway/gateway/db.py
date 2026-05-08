@@ -87,6 +87,9 @@ def get_database_url() -> str:
 
 async def init_db() -> None:
     global _engine, _sessionmaker
+    # Import side-effect: registers Benchmark / BenchmarkJob tables on Base
+    # before create_all runs.
+    from . import bench  # noqa: F401
     _engine = create_async_engine(get_database_url(), pool_pre_ping=True)
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     async with _engine.begin() as conn:

@@ -16,7 +16,7 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Serverless GPU",
+  title: "GPU Platform",
   description: "Deploy and monitor serverless vLLM endpoints",
 };
 

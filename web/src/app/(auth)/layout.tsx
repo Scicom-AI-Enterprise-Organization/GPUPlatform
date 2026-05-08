@@ -22,7 +22,7 @@ export default function AuthLayout({ children }: { children: React.ReactNode }) 
               className="h-9 w-auto select-none"
             />
             <span className="text-sm font-medium uppercase tracking-wide text-muted-foreground">
-              Serverless GPU
+              GPU Platform
             </span>
           </Link>
           <div className="max-w-md space-y-3">
@@ -53,7 +53,7 @@ export default function AuthLayout({ children }: { children: React.ReactNode }) 
               className="h-8 w-auto select-none"
             />
             <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-              Serverless GPU
+              GPU Platform
             </span>
           </Link>
           {children}

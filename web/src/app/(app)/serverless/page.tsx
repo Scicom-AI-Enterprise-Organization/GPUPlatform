@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Plus } from "lucide-react";
+import { Boxes, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
@@ -28,23 +28,18 @@ export default async function ServerlessPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <ConsoleTopbar crumbs={[{ label: "Inference" }]} username={username} />
+      <ConsoleTopbar crumbs={[{ label: "Serverless Inference" }]} username={username} />
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
-        <div className="mb-6 flex items-end justify-between">
+        <div className="mb-6 flex items-start gap-4 rounded-xl border border-border bg-gradient-to-br from-sky-500/10 via-background to-blue-500/5 p-6">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-sky-500 to-blue-500 text-white shadow-lg shadow-blue-500/30">
+            <Boxes className="h-6 w-6" />
+          </div>
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Inference</h1>
-            <p className="mt-1 text-sm text-muted-foreground">
+            <h1 className="text-2xl font-semibold tracking-tight">Serverless Inference</h1>
+            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
               Deploy and scale GPU-powered inference endpoints. Pay per second of compute.
             </p>
           </div>
-          {!noAccess && (
-            <Button asChild>
-              <Link href="/serverless/new">
-                <Plus className="h-4 w-4" />
-                New endpoint
-              </Link>
-            </Button>
-          )}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -57,11 +52,19 @@ export default async function ServerlessPage() {
 
         {!noAccess && (
           <section>
-            <div className="mb-3 flex items-baseline justify-between border-b border-border pb-2">
-              <h2 className="text-base font-medium">Endpoints</h2>
-              <span className="text-xs text-muted-foreground">
-                {apps.length} {apps.length === 1 ? "endpoint" : "endpoints"}
-              </span>
+            <div className="mb-3 flex items-center justify-between border-b border-border pb-2">
+              <div className="flex items-baseline gap-3">
+                <h2 className="text-base font-medium">Endpoints</h2>
+                <span className="text-xs text-muted-foreground">
+                  {apps.length} {apps.length === 1 ? "endpoint" : "endpoints"}
+                </span>
+              </div>
+              <Button asChild size="sm">
+                <Link href="/serverless/new">
+                  <Plus className="h-4 w-4" />
+                  New endpoint
+                </Link>
+              </Button>
             </div>
             <EndpointGrid apps={apps} />
           </section>

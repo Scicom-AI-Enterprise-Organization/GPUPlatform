@@ -4,7 +4,16 @@
 // In the browser: route through /api/proxy/* — the proxy does the cookie →
 // Bearer-token translation server-side, so the token never hits the bundle.
 
-import type { AppRecord, CreateAppRequest, CreateAppResponse } from "./types";
+import type {
+  AggregatePoint,
+  AppRecord,
+  BenchmarkFile,
+  BenchmarkRecord,
+  BenchmarkTemplate,
+  CreateAppRequest,
+  CreateAppResponse,
+  CreateBenchmarkRequest,
+} from "./types";
 
 export type GpuAvailability = {
   gpu: string;
@@ -107,6 +116,44 @@ export const gateway = {
     ),
   getAppStatus: (id: string) =>
     request<AppStatus>(`/apps/${encodeURIComponent(id)}/status`),
+
+  // ---- Benchmarks ----
+  listBenchmarks: () => request<BenchmarkRecord[]>("/benchmarks"),
+  getBenchmark: (id: string) =>
+    request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}`),
+  createBenchmark: (body: CreateBenchmarkRequest) =>
+    request<BenchmarkRecord>("/benchmarks", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteBenchmark: (id: string) =>
+    request<{ ok: boolean; id: string }>(
+      `/benchmarks/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+  listBenchmarkFiles: (id: string) =>
+    request<BenchmarkFile[]>(`/benchmarks/${encodeURIComponent(id)}/files`),
+  /** Browser EventSource URL for SSE log stream — proxied through Next so the
+   * session cookie is translated to a Bearer token server-side. */
+  benchmarkLogsStreamUrl: (id: string) =>
+    `/api/proxy/benchmarks/${encodeURIComponent(id)}/logs/stream`,
+
+  // ---- Cross-benchmark aggregate (one point per result.json across all benches) ----
+  aggregateBenchmarks: () => request<AggregatePoint[]>("/benchmarks/_aggregate"),
+
+  // ---- Benchmark templates ----
+  listBenchmarkTemplates: () =>
+    request<BenchmarkTemplate[]>("/benchmarks/templates"),
+  createBenchmarkTemplate: (name: string, config_yaml: string) =>
+    request<BenchmarkTemplate>("/benchmarks/templates", {
+      method: "POST",
+      body: JSON.stringify({ name, config_yaml }),
+    }),
+  deleteBenchmarkTemplate: (id: string) =>
+    request<{ ok: boolean; id: string }>(
+      `/benchmarks/templates/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
 };
 
 export type AppStatus = {

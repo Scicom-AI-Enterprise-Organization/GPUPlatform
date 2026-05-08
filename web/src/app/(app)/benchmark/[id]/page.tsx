@@ -2,25 +2,25 @@ import { notFound } from "next/navigation";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { gateway } from "@/lib/gateway";
 import { currentUsername } from "@/lib/current-user";
-import { EndpointDetail } from "./endpoint-detail";
+import { BenchmarkDetail } from "./benchmark-detail";
 
-export default async function EndpointPage({
+export default async function BenchmarkDetailPage({
   params,
 }: {
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
   const username = await currentUsername();
-  let app;
+  let bench;
   try {
-    app = await gateway.getApp(id);
+    bench = await gateway.getBenchmark(id);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.includes("404")) notFound();
     return (
       <div className="flex h-full flex-col">
         <ConsoleTopbar
-          crumbs={[{ label: "Serverless Inference", href: "/serverless" }, { label: id }]}
+          crumbs={[{ label: "Benchmark", href: "/benchmark" }, { label: id }]}
           username={username}
         />
         <div className="flex-1 px-6 py-8">
@@ -35,10 +35,10 @@ export default async function EndpointPage({
   return (
     <div className="flex h-full flex-col">
       <ConsoleTopbar
-        crumbs={[{ label: "Serverless Inference", href: "/serverless" }, { label: app.name }]}
+        crumbs={[{ label: "Benchmark", href: "/benchmark" }, { label: bench.name }]}
         username={username}
       />
-      <EndpointDetail app={app} />
+      <BenchmarkDetail bench={bench} />
     </div>
   );
 }

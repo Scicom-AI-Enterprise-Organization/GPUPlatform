@@ -23,7 +23,7 @@ export default async function Landing() {
             <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white shadow-[0_0_30px_-5px] shadow-fuchsia-500/60">
               <Rocket className="h-4 w-4" />
             </span>
-            <span>Serverless GPU</span>
+            <span>GPU Platform</span>
           </Link>
           <Button asChild size="sm">
             <Link href={signedIn ? "/serverless" : "/login"}>
