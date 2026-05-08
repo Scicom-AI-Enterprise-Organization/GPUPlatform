@@ -623,10 +623,10 @@ async def create_compute(
             },
         )
 
-    # Non-admins must be approved by an admin first. We persist the request
-    # row immediately (so the requester can see "pending" in their list) but
-    # don't call RunPod until an admin clicks Approve. Admins bypass entirely.
-    needs_approval = not user.is_admin
+    # Approval gate: admins and anyone on the seeded `full-access` policy
+    # role bypass entirely (treated as trusted). Everyone else lands in
+    # `pending_approval` until an admin clicks Approve.
+    needs_approval = not user.is_admin and user.policy_role_id != "full-access"
     pod_id = _gen_id()
     row = ComputePod(
         id=pod_id,
