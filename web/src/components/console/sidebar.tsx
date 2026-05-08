@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { Box, Boxes, CheckSquare, FlaskConical, KeyRound, Lock, ScrollText, Shield, Sparkles, Users } from "lucide-react";
+import { Box, Boxes, CheckSquare, FlaskConical, KeyRound, Lock, ScrollText, Server, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -26,8 +26,11 @@ const ACCOUNT: Item[] = [{ label: "API keys", href: "/api-keys", icon: KeyRound 
 const ADMIN: Item[] = [
   { label: "Organization", href: "/organization", icon: Users },
   { label: "Roles", href: "/admin/roles", icon: Shield },
-  { label: "Compute approvals", href: "/admin/compute-approvals", icon: CheckSquare },
   { label: "Audit log", href: "/admin/audit", icon: ScrollText },
+];
+const MANAGE: Item[] = [
+  { label: "Compute approvals", href: "/admin/compute-approvals", icon: CheckSquare },
+  { label: "Provisioned", href: "/admin/provisioned", icon: Server },
 ];
 
 type Sections = { inference: boolean; benchmark: boolean; compute: boolean };
@@ -84,17 +87,30 @@ export function ConsoleSidebar({
       </SidebarGroup>
 
       {isAdmin && (
-        <SidebarGroup label="Admin" collapsed={collapsed}>
-          {ADMIN.map((item) => (
-            <SidebarItem
-              key={item.label}
-              item={item}
-              active={isActive(item.href)}
-              collapsed={collapsed}
-              onNavigate={closeMobile}
-            />
-          ))}
-        </SidebarGroup>
+        <>
+          <SidebarGroup label="Manage" collapsed={collapsed}>
+            {MANAGE.map((item) => (
+              <SidebarItem
+                key={item.label}
+                item={item}
+                active={isActive(item.href)}
+                collapsed={collapsed}
+                onNavigate={closeMobile}
+              />
+            ))}
+          </SidebarGroup>
+          <SidebarGroup label="Admin" collapsed={collapsed}>
+            {ADMIN.map((item) => (
+              <SidebarItem
+                key={item.label}
+                item={item}
+                active={isActive(item.href)}
+                collapsed={collapsed}
+                onNavigate={closeMobile}
+              />
+            ))}
+          </SidebarGroup>
+        </>
       )}
     </>
   );
