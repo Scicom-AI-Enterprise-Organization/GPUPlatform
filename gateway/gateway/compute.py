@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from . import audit
-from .auth import require_section
+from .auth import require_admin, require_section
 from .db import Base, User, get_session, session_factory
 from .runpod_provider import _map_gpu
 
@@ -119,7 +119,8 @@ class ComputePod(Base):
     image: Mapped[str] = mapped_column(String(255))
     template_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     cloud_type: Mapped[str] = mapped_column(String(16), default="COMMUNITY")
-    status: Mapped[str] = mapped_column(String(16), default="creating", index=True)
+    # creating | running | failed | terminated | pending_approval | rejected
+    status: Mapped[str] = mapped_column(String(20), default="creating", index=True)
     runpod_pod_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     public_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     ssh_port: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -129,6 +130,9 @@ class ComputePod(Base):
     jupyter_password: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     cost_per_hr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     error_text: Mapped[Optional[str]] = mapped_column(String(4096), nullable=True)
+    # Set when an admin rejects an approval request. Distinct from error_text
+    # (which is for provisioning failures) so the UI can render the right copy.
+    reject_reason: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
@@ -440,6 +444,7 @@ class ComputeRecord(BaseModel):
     jupyter_password: Optional[str] = None
     cost_per_hr: Optional[float] = None
     error_text: Optional[str] = None
+    reject_reason: Optional[str] = None
     created_by: str
     created_at: str
     ready_at: Optional[str] = None
@@ -459,6 +464,10 @@ class TemplateRecord(BaseModel):
     name: str
     image: str
     description: str
+
+
+class RejectRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=1024)
 
 
 # ---------- HTTP API ---------------------------------------------------
@@ -496,6 +505,7 @@ def _to_record(p: ComputePod, owner_username: str) -> ComputeRecord:
         jupyter_password=p.jupyter_password,
         cost_per_hr=p.cost_per_hr,
         error_text=p.error_text,
+        reject_reason=p.reject_reason,
         created_by=owner_username,
         created_at=p.created_at.isoformat() if p.created_at else "",
         ready_at=p.ready_at.isoformat() if p.ready_at else None,
@@ -514,6 +524,81 @@ def _gen_id() -> str:
 @router.get("/templates", response_model=list[TemplateRecord])
 async def list_templates(_: User = Depends(require_section("compute"))):
     return [TemplateRecord(**t) for t in CURATED_TEMPLATES]
+
+
+# Admin-only approval queue. Routes live under /compute/approvals/* (rather
+# than /admin/compute-approvals) so the entire compute surface stays under
+# one router prefix and the admin UI doesn't have to think about two roots.
+
+
+@router.get("/approvals", response_model=list[ComputeRecord])
+async def list_approvals(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    rows = await session.execute(
+        select(ComputePod)
+        .where(ComputePod.status == "pending_approval")
+        .order_by(ComputePod.created_at.asc())
+    )
+    out: list[ComputeRecord] = []
+    for p in rows.scalars().all():
+        owner = await session.get(User, p.owner_id)
+        out.append(_to_record(p, owner.username if owner else ""))
+    return out
+
+
+@router.post("/{pod_id}/approve", response_model=ComputeRecord)
+async def approve_compute(
+    pod_id: str,
+    actor: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    p = await session.get(ComputePod, pod_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail={"error": "compute pod not found"})
+    if p.status != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": f"pod is in status '{p.status}', not pending_approval"},
+        )
+    p.status = "creating"
+    p.reject_reason = None
+    await session.commit()
+    asyncio.create_task(_safe_create(pod_id))
+    await audit.record(
+        actor, "compute.approve", "compute", pod_id, p.name,
+        details={"requester_id": p.owner_id},
+    )
+    owner = await session.get(User, p.owner_id)
+    return _to_record(p, owner.username if owner else "")
+
+
+@router.post("/{pod_id}/reject", response_model=ComputeRecord)
+async def reject_compute(
+    pod_id: str,
+    body: RejectRequest,
+    actor: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    p = await session.get(ComputePod, pod_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail={"error": "compute pod not found"})
+    if p.status != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": f"pod is in status '{p.status}', not pending_approval"},
+        )
+    p.status = "rejected"
+    p.reject_reason = (body.reason or "").strip() or None
+    p.terminated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await audit.record(
+        actor, "compute.reject", "compute", pod_id, p.name,
+        details={"requester_id": p.owner_id, "reason": p.reject_reason},
+    )
+    owner = await session.get(User, p.owner_id)
+    return _to_record(p, owner.username if owner else "")
 
 
 @router.post("", response_model=ComputeRecord)
@@ -538,6 +623,10 @@ async def create_compute(
             },
         )
 
+    # Non-admins must be approved by an admin first. We persist the request
+    # row immediately (so the requester can see "pending" in their list) but
+    # don't call RunPod until an admin clicks Approve. Admins bypass entirely.
+    needs_approval = not user.is_admin
     pod_id = _gen_id()
     row = ComputePod(
         id=pod_id,
@@ -549,16 +638,19 @@ async def create_compute(
         image=tpl["image"],
         template_id=tpl["id"],
         cloud_type=body.cloud_type,
-        status="creating",
+        status="pending_approval" if needs_approval else "creating",
         owner_id=user.id,
     )
     session.add(row)
     await session.commit()
 
-    asyncio.create_task(_safe_create(pod_id))
+    if not needs_approval:
+        asyncio.create_task(_safe_create(pod_id))
 
     await audit.record(
-        user, "compute.create", "compute", pod_id, body.name.strip(),
+        user,
+        "compute.request" if needs_approval else "compute.create",
+        "compute", pod_id, body.name.strip(),
         details={
             "gpu_type": body.gpu_type, "gpu_count": body.gpu_count,
             "template_id": tpl["id"], "cloud_type": body.cloud_type,
@@ -584,16 +676,17 @@ async def list_compute(
     user: User = Depends(require_section("compute")),
     session: AsyncSession = Depends(get_session),
 ):
-    if user.is_admin:
-        rows = await session.execute(
-            select(ComputePod).order_by(ComputePod.created_at.desc())
-        )
-    else:
-        rows = await session.execute(
-            select(ComputePod)
-            .where(ComputePod.owner_id == user.id)
-            .order_by(ComputePod.created_at.desc())
-        )
+    # Hide terminated pods — once a pod is gone there's no useful action left
+    # and the list gets noisy. Detail page (`/compute/{id}`) still resolves
+    # for terminated rows so links from audit / direct URLs keep working.
+    stmt = (
+        select(ComputePod)
+        .where(ComputePod.status != "terminated")
+        .order_by(ComputePod.created_at.desc())
+    )
+    if not user.is_admin:
+        stmt = stmt.where(ComputePod.owner_id == user.id)
+    rows = await session.execute(stmt)
     out: list[ComputeRecord] = []
     for p in rows.scalars().all():
         owner = await session.get(User, p.owner_id)

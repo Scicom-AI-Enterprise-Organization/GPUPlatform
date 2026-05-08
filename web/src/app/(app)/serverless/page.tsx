@@ -20,7 +20,7 @@ async function loadEndpoints(): Promise<{ apps: AppRecord[]; error: string | nul
 
 export default async function ServerlessPage() {
   const me = await getMe();
-  const noAccess = me?.role === "user";
+  const noAccess = !me?.sections?.inference;
   const [{ apps, error }, username] = await Promise.all([
     noAccess ? Promise.resolve({ apps: [], error: null }) : loadEndpoints(),
     currentUsername(),

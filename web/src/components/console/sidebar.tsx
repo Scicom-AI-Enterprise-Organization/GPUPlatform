@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { Box, Boxes, FlaskConical, KeyRound, Lock, ScrollText, Shield, Sparkles, Users } from "lucide-react";
+import { Box, Boxes, CheckSquare, FlaskConical, KeyRound, Lock, ScrollText, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -26,6 +26,7 @@ const ACCOUNT: Item[] = [{ label: "API keys", href: "/api-keys", icon: KeyRound 
 const ADMIN: Item[] = [
   { label: "Organization", href: "/organization", icon: Users },
   { label: "Roles", href: "/admin/roles", icon: Shield },
+  { label: "Compute approvals", href: "/admin/compute-approvals", icon: CheckSquare },
   { label: "Audit log", href: "/admin/audit", icon: ScrollText },
 ];
 
@@ -54,15 +55,12 @@ export function ConsoleSidebar({
     return pathname === href;
   };
 
-  const visibleResources = RESOURCES.filter((it) => {
-    if (!it.section) return true;
-    return sections[it.section];
-  });
-
+  // Show every resource so users see the full surface of the platform; the
+  // page itself renders a "no permission" alert if they can't actually use it.
   const groups = (
     <>
       <SidebarGroup label="Resources" collapsed={collapsed}>
-        {visibleResources.map((item) => (
+        {RESOURCES.map((item) => (
           <SidebarItem
             key={item.label}
             item={item}

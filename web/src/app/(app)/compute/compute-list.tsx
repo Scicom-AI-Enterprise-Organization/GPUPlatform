@@ -62,7 +62,11 @@ function StatusPill({ status }: { status: ComputeStatus }) {
       "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
     creating:
       "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+    pending_approval:
+      "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
     failed:
+      "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400",
+    rejected:
       "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400",
     terminated:
       "border-border bg-muted text-muted-foreground",
@@ -70,7 +74,9 @@ function StatusPill({ status }: { status: ComputeStatus }) {
   const label: Record<ComputeStatus, string> = {
     running: "running",
     creating: "creating",
+    pending_approval: "pending",
     failed: "failed",
+    rejected: "rejected",
     terminated: "terminated",
   };
   return (

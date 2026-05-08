@@ -215,6 +215,14 @@ async def init_db() -> None:
             UPDATE users SET policy_role_id = 'full-access'
             WHERE policy_role_id IS NULL AND role IN ('developer', 'admin')
         """))
+        # Compute approval workflow: widen status column from 16 → 20 to fit
+        # 'pending_approval', and add reject_reason for admin-supplied notes.
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ALTER COLUMN status TYPE VARCHAR(20)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS reject_reason VARCHAR(1024)"
+        ))
 
 
 async def seed_admin_user() -> None:

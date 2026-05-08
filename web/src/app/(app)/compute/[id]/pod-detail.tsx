@@ -26,11 +26,13 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const pollRef = useRef<number | null>(null);
 
-  // Poll while we're waiting for the pod to come up. Stop polling when it
-  // reaches a terminal state (running/failed/terminated) — there's nothing
-  // more to learn until the user clicks "Terminate".
+  // Poll while we're waiting for the pod to move out of an in-flight state.
+  // 'pending_approval' polls so the requester sees the status flip the moment
+  // an admin approves; 'creating' polls so SSH info appears as soon as RunPod
+  // is ready. Terminal states (running/failed/terminated/rejected) stop polling.
   useEffect(() => {
-    if (pod.status !== "creating") {
+    const inFlight = pod.status === "creating" || pod.status === "pending_approval";
+    if (!inFlight) {
       if (pollRef.current) {
         window.clearInterval(pollRef.current);
         pollRef.current = null;
@@ -110,14 +112,14 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
           </div>
           <p className="mt-1 font-mono text-xs text-muted-foreground">{pod.id}</p>
         </div>
-        {pod.status !== "terminated" && (
+        {pod.status !== "terminated" && pod.status !== "rejected" && (
           <Button variant="outline" onClick={() => setConfirmOpen(true)} disabled={terminating}>
             {terminating ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
               <Trash2 className="h-4 w-4" />
             )}
-            Terminate
+            {pod.status === "pending_approval" ? "Withdraw" : "Terminate"}
           </Button>
         )}
       </div>
@@ -125,10 +127,15 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
       <Dialog open={confirmOpen} onOpenChange={(o) => !terminating && setConfirmOpen(o)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Terminate {pod.name}?</DialogTitle>
+            <DialogTitle>
+              {pod.status === "pending_approval"
+                ? `Withdraw request for ${pod.name}?`
+                : `Terminate ${pod.name}?`}
+            </DialogTitle>
             <DialogDescription>
-              Stops billing immediately and deletes the pod from RunPod. Anything not
-              saved to a persistent volume is lost. This can&apos;t be undone.
+              {pod.status === "pending_approval"
+                ? "The approval request will be cancelled. You can submit a new one any time."
+                : "Stops billing immediately and deletes the pod from RunPod. Anything not saved to a persistent volume is lost. This can't be undone."}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -141,7 +148,13 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
             </Button>
             <Button variant="destructive" onClick={terminate} disabled={terminating}>
               {terminating && <Loader2 className="h-4 w-4 animate-spin" />}
-              {terminating ? "Terminating…" : "Terminate"}
+              {terminating
+                ? pod.status === "pending_approval"
+                  ? "Withdrawing…"
+                  : "Terminating…"
+                : pod.status === "pending_approval"
+                  ? "Withdraw"
+                  : "Terminate"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -162,6 +175,31 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
           <Field label="Image" value={pod.image} className="col-span-full font-mono text-xs" />
         </dl>
       </Card>
+
+      {/* Pending / rejected — explain what's happening before showing connect UI. */}
+      {pod.status === "pending_approval" && (
+        <Card title="Awaiting approval">
+          <p className="text-sm text-muted-foreground">
+            Your request has been submitted to an admin for approval. Once approved
+            the pod will start provisioning automatically — this page will refresh
+            on its own.
+          </p>
+        </Card>
+      )}
+
+      {pod.status === "rejected" && (
+        <Card title="Request rejected">
+          <p className="text-sm text-muted-foreground">
+            An admin rejected this request. You can submit a new one with different
+            specs from the Compute page.
+          </p>
+          {pod.reject_reason && (
+            <pre className="mt-3 whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs text-muted-foreground">
+              {pod.reject_reason}
+            </pre>
+          )}
+        </Card>
+      )}
 
       {/* Connect — only meaningful when running. Show a clear "wait" UI in
           other states rather than empty/dead controls. */}
@@ -318,9 +356,21 @@ function StatusPill({ status }: { status: ComputeStatus }) {
       "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
     creating:
       "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+    pending_approval:
+      "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
     failed:
       "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400",
+    rejected:
+      "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400",
     terminated: "border-border bg-muted text-muted-foreground",
+  };
+  const label: Record<ComputeStatus, string> = {
+    running: "running",
+    creating: "creating",
+    pending_approval: "pending",
+    failed: "failed",
+    rejected: "rejected",
+    terminated: "terminated",
   };
   return (
     <span
@@ -329,7 +379,7 @@ function StatusPill({ status }: { status: ComputeStatus }) {
         styles[status],
       )}
     >
-      {status}
+      {label[status]}
     </span>
   );
 }

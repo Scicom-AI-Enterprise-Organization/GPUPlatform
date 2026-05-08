@@ -20,7 +20,7 @@ async function loadCompute(): Promise<{ items: ComputePod[]; error: string | nul
 
 export default async function ComputePage() {
   const me = await getMe();
-  const noAccess = me?.role === "user";
+  const noAccess = !me?.sections?.compute;
   const [{ items, error }, username] = await Promise.all([
     noAccess ? Promise.resolve({ items: [], error: null }) : loadCompute(),
     currentUsername(),

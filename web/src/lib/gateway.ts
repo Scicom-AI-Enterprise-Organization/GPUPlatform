@@ -181,6 +181,16 @@ export const gateway = {
     request<ComputeSshInfo>(`/compute/${encodeURIComponent(id)}/ssh`),
   listComputeTemplates: () =>
     request<ComputeTemplate[]>("/compute/templates"),
+  listComputeApprovals: () => request<ComputePod[]>("/compute/approvals"),
+  approveCompute: (id: string) =>
+    request<ComputePod>(`/compute/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+    }),
+  rejectCompute: (id: string, reason?: string) =>
+    request<ComputePod>(`/compute/${encodeURIComponent(id)}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason ?? null }),
+    }),
 
   // ---- Admin: users, policy roles, audit ----
   adminListUsers: () => request<AdminUserRecord[]>("/admin/users"),

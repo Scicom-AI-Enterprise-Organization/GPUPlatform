@@ -64,7 +64,11 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         template_id: templateId,
         cloud_type: secureCloud ? "SECURE" : "COMMUNITY",
       });
-      toast.success("Pod creating — provisioning takes a few minutes");
+      toast.success(
+        pod.status === "pending_approval"
+          ? "Request submitted — an admin will review and approve."
+          : "Pod creating — provisioning takes a few minutes",
+      );
       router.push(`/compute/${pod.id}`);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));

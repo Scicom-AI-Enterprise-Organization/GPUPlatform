@@ -22,7 +22,7 @@ async function loadBenchmarks(): Promise<{ items: BenchmarkRecord[]; error: stri
 
 export default async function BenchmarkPage() {
   const me = await getMe();
-  const noAccess = me?.role === "user";
+  const noAccess = !me?.sections?.benchmark;
   const [{ items, error }, username] = await Promise.all([
     noAccess ? Promise.resolve({ items: [], error: null }) : loadBenchmarks(),
     currentUsername(),

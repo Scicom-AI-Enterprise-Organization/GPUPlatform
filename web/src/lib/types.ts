@@ -133,7 +133,13 @@ export type AggregatePoint = {
 
 // ---- Compute (raw RunPod pods with SSH + JupyterLab) ----
 
-export type ComputeStatus = "creating" | "running" | "failed" | "terminated";
+export type ComputeStatus =
+  | "pending_approval"
+  | "creating"
+  | "running"
+  | "failed"
+  | "terminated"
+  | "rejected";
 
 export type ComputePod = {
   id: string;
@@ -154,6 +160,7 @@ export type ComputePod = {
   jupyter_password: string | null;
   cost_per_hr: number | null;
   error_text: string | null;
+  reject_reason: string | null;
   created_by: string;
   created_at: string;
   ready_at: string | null;
