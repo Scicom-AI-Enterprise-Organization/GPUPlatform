@@ -10,9 +10,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # runpodctl — benchmaq shells out to it for `pod create / ssh info / delete`.
+# TARGETARCH is set by BuildKit per platform in multi-arch builds (amd64/arm64);
+# without it we'd bake the host arch into both image variants → "exec format
+# error" when the wrong-arch pod boots on an EKS node.
+ARG TARGETARCH
 RUN curl -fsSL -o /usr/local/bin/runpodctl \
-      https://github.com/runpod/runpodctl/releases/download/v2.1.9/runpodctl-linux-amd64 \
-    && chmod +x /usr/local/bin/runpodctl
+      "https://github.com/runpod/runpodctl/releases/download/v2.1.9/runpodctl-linux-${TARGETARCH}" \
+    && chmod +x /usr/local/bin/runpodctl \
+    && /usr/local/bin/runpodctl version || true
 
 RUN pip install --no-cache-dir uv
 COPY pyproject.toml ./
