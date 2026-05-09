@@ -116,16 +116,42 @@ export async function GET(req: NextRequest) {
   }
   const sess = (await upsertRes.json()) as { token: string; username: string };
 
-  const res = NextResponse.redirect(new URL(next, req.url));
+  const res = NextResponse.redirect(absoluteUrl(req, next));
   setAuthCookies(res.cookies, sess.token, sess.username);
   res.cookies.delete(STATE_COOKIE);
   return res;
 }
 
 function failRedirect(req: NextRequest, message: string) {
-  const url = new URL("/login", req.url);
+  const url = absoluteUrl(req, "/login");
   url.searchParams.set("sso_error", message);
   const res = NextResponse.redirect(url);
   res.cookies.delete(STATE_COOKIE);
   return res;
+}
+
+// Build a public-facing absolute URL for redirects. `req.url` ends up using
+// the container's internal bind (0.0.0.0:3000) once we're behind an ingress
+// that doesn't propagate Host into Next's URL parsing — so prefer:
+//
+//   1. The origin of the configured GITHUB_OAUTH_REDIRECT_URI (already the
+//      public URL, since GitHub round-tripped through it).
+//   2. The X-Forwarded-Host + X-Forwarded-Proto pair if set.
+//   3. Fall back to req.url (good enough for local dev).
+function absoluteUrl(req: NextRequest, path: string): URL {
+  const fromCallback = (() => {
+    if (!GH_REDIRECT_URI) return null;
+    try {
+      return new URL(GH_REDIRECT_URI).origin;
+    } catch {
+      return null;
+    }
+  })();
+  if (fromCallback) return new URL(path, fromCallback);
+
+  const xfHost = req.headers.get("x-forwarded-host");
+  const xfProto = req.headers.get("x-forwarded-proto") ?? "https";
+  if (xfHost) return new URL(path, `${xfProto}://${xfHost}`);
+
+  return new URL(path, req.url);
 }
