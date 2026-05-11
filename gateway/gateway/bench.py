@@ -128,6 +128,15 @@ def s3_put_file(key: str, path: str) -> None:
         _s3_client().put_object(Bucket=_bucket(), Key=key, Body=f.read())
 
 
+def s3_get_text(key: str) -> Optional[str]:
+    """Read an S3 object as utf-8 text. Returns None if the key is missing."""
+    try:
+        obj = _s3_client().get_object(Bucket=_bucket(), Key=key)
+        return obj["Body"].read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
 def s3_list(prefix: str) -> list[dict]:
     cli = _s3_client()
     out: list[dict] = []
@@ -213,9 +222,23 @@ def _resolve_config(raw_yaml: str) -> str:
 _LIVE: dict[str, asyncio.subprocess.Process] = {}
 
 
+def _full_log_path(bench_id: str) -> Path:
+    """On-disk file that captures *every* log line for a run, uncapped.
+    Uploaded to S3 as `{prefix}logs.txt` on completion so the UI can replay
+    the full log even after the redis list has been TTL'd or LRU-trimmed."""
+    return _work_dir(bench_id) / "_full.log"
+
+
 async def _push_log(redis, bench_id: str, line: str) -> None:
     if not line:
         return
+    # Append to the full on-disk log (best-effort). This is the canonical
+    # record — redis is just the live-tail cache.
+    try:
+        with _full_log_path(bench_id).open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
     key = f"bench:logs:{bench_id}"
     try:
         await redis.rpush(key, line)
@@ -315,8 +338,18 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     result_json: Optional[dict] = None
     error_excerpt: Optional[str] = None
 
+    # Upload the complete, uncapped log to S3 as logs.txt. The stream endpoint
+    # falls back to this for terminal benches so the UI can replay the full
+    # log forever, even after the redis list has been trimmed or TTL'd.
+    full_log = _full_log_path(bench_id)
+    if full_log.exists():
+        try:
+            s3_put_file(f"{prefix}logs.txt", str(full_log))
+        except Exception as e:
+            await _push_log(redis, bench_id, f"[gateway] s3 upload failed for logs.txt: {e}")
+
     for path in sorted(work.rglob("*")):
-        if not path.is_file() or path.name == "config.yaml":
+        if not path.is_file() or path.name in ("config.yaml", "_full.log"):
             continue
         rel = path.relative_to(work).as_posix()
         try:
@@ -334,11 +367,12 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 pass
 
     if rc != 0:
-        # Capture last 4KB of redis log for error_text so the UI list page
-        # has something to surface without opening Logs tab.
+        # Tail the full on-disk log for the error_text card on the list page.
         try:
-            tail = await redis.lrange(f"bench:logs:{bench_id}", -50, -1) or []
-            error_excerpt = "\n".join(tail)[-4000:]
+            if full_log.exists():
+                with full_log.open("r", encoding="utf-8", errors="replace") as f:
+                    tail_lines = f.readlines()[-50:]
+                error_excerpt = "".join(tail_lines)[-4000:]
         except Exception:
             error_excerpt = None
 
@@ -852,8 +886,22 @@ async def stream_logs(
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
 
     redis = request.app.state.redis
+    # If the bench is already terminal and we've uploaded logs.txt to S3,
+    # stream the full log from there — this is the canonical, uncapped copy.
+    # Redis may have been trimmed or TTL'd by now, so it would otherwise show
+    # a partial / empty log for older runs.
+    initial_status = b.status
+    s3_full_log: Optional[str] = None
+    if initial_status in ("done", "failed", "cancelled"):
+        s3_full_log = s3_get_text(f"{benchmark_s3_prefix(bench_id)}logs.txt")
 
     async def gen() -> AsyncIterator[bytes]:
+        if s3_full_log is not None:
+            for line in s3_full_log.splitlines():
+                yield f"data: {line}\n\n".encode("utf-8")
+            yield f"event: end\ndata: {initial_status}\n\n".encode("utf-8")
+            return
+
         key = f"bench:logs:{bench_id}"
         # Replay everything we already have, then poll for new lines until terminal.
         cursor = 0
