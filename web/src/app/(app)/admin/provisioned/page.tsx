@@ -13,11 +13,14 @@ async function load(token: string): Promise<{
   apps: AppRecord[];
 }> {
   const headers = { Authorization: `Bearer ${token}` };
+  // Admin "Provisioned" view must show everyone's resources, not just the
+  // current admin's. /compute and /apps both default to scope=mine; pass
+  // scope=all to get the full cross-user list (gateway enforces admin-only).
   const [c, a] = await Promise.allSettled([
-    fetch(`${GATEWAY}/compute`, { headers, cache: "no-store" }).then((r) =>
+    fetch(`${GATEWAY}/compute?scope=all`, { headers, cache: "no-store" }).then((r) =>
       r.ok ? (r.json() as Promise<ComputePod[]>) : [],
     ),
-    fetch(`${GATEWAY}/apps`, { headers, cache: "no-store" }).then((r) =>
+    fetch(`${GATEWAY}/apps?scope=all`, { headers, cache: "no-store" }).then((r) =>
       r.ok ? (r.json() as Promise<AppRecord[]>) : [],
     ),
   ]);
