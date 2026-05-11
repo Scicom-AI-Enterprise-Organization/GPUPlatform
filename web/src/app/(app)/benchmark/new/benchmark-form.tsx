@@ -281,7 +281,12 @@ export function BenchmarkForm() {
 
   const [form, setForm] = useState<FormState>(DEFAULTS);
   const [name, setName] = useState(DEFAULTS.benchName);
-  const availability = useGpuAvailability(form.gpu_type, form.gpu_count, mode === "form");
+  const availability = useGpuAvailability(
+    form.gpu_type,
+    form.gpu_count,
+    mode === "form",
+    form.secure_cloud ? "SECURE" : "COMMUNITY",
+  );
   const [yamlBuf, setYamlBuf] = useState<string>(renderYaml(DEFAULTS));
   const formYaml = useMemo(
     () => renderYaml({ ...form, benchName: name || "untitled" }),

@@ -673,18 +673,23 @@ async def _safe_create(pod_id: str) -> None:
 
 @router.get("", response_model=list[ComputeRecord])
 async def list_compute(
+    scope: str = "mine",
     user: User = Depends(require_section("compute")),
     session: AsyncSession = Depends(get_session),
 ):
     # Hide terminated pods — once a pod is gone there's no useful action left
     # and the list gets noisy. Detail page (`/compute/{id}`) still resolves
     # for terminated rows so links from audit / direct URLs keep working.
+    #
+    # Admins default to their own pods; pass ?scope=all to see everyone's.
+    # Non-admins are always scoped to own regardless of the param.
+    show_all = user.is_admin and scope == "all"
     stmt = (
         select(ComputePod)
         .where(ComputePod.status != "terminated")
         .order_by(ComputePod.created_at.desc())
     )
-    if not user.is_admin:
+    if not show_all:
         stmt = stmt.where(ComputePod.owner_id == user.id)
     rows = await session.execute(stmt)
     out: list[ComputeRecord] = []

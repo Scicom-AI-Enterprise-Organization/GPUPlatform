@@ -74,7 +74,7 @@ function pickY(p: AggregatePoint, metric: MetricKey, useP99: boolean): number | 
 
 type SeriesKey = string;
 
-export function BenchmarkExplorer() {
+export function BenchmarkExplorer({ scope = "mine" }: { scope?: "mine" | "all" }) {
   const [points, setPoints] = useState<AggregatePoint[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -89,7 +89,7 @@ export function BenchmarkExplorer() {
     setLoading(true);
     setError(null);
     try {
-      const data = await gateway.aggregateBenchmarks();
+      const data = await gateway.aggregateBenchmarks(scope);
       setPoints(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -99,7 +99,8 @@ export function BenchmarkExplorer() {
   }
   useEffect(() => {
     refresh();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope]);
 
   const allModels = useMemo(() => uniqueOf(points ?? [], (p) => p.model ?? "—"), [points]);
   const allGpus = useMemo(() => uniqueOf(points ?? [], (p) => p.gpu_type ?? "—"), [points]);

@@ -45,7 +45,12 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const [secureCloud, setSecureCloud] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  const availability = useGpuAvailability(gpuType, gpuCount, true);
+  const availability = useGpuAvailability(
+    gpuType,
+    gpuCount,
+    true,
+    secureCloud ? "SECURE" : "COMMUNITY",
+  );
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();

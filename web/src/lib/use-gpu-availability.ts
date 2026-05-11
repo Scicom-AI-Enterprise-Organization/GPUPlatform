@@ -13,6 +13,7 @@ export function useGpuAvailability(
   gpu: string,
   count: number,
   enabled = true,
+  cloudType?: "COMMUNITY" | "SECURE",
 ): State {
   const [state, setState] = useState<State>({ status: "idle" });
   const reqId = useRef(0);
@@ -26,8 +27,10 @@ export function useGpuAvailability(
     setState({ status: "loading" });
     const t = setTimeout(async () => {
       try {
+        const params = new URLSearchParams({ gpu, count: String(count) });
+        if (cloudType) params.set("cloud_type", cloudType);
         const res = await fetch(
-          `/api/proxy/v1/availability?gpu=${encodeURIComponent(gpu)}&count=${count}`,
+          `/api/proxy/v1/availability?${params.toString()}`,
           { cache: "no-store" },
         );
         if (id !== reqId.current) return;
@@ -51,7 +54,7 @@ export function useGpuAvailability(
       }
     }, 300);
     return () => clearTimeout(t);
-  }, [gpu, count, enabled]);
+  }, [gpu, count, enabled, cloudType]);
 
   return state;
 }

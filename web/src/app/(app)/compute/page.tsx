@@ -3,26 +3,37 @@ import { Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
+import { ScopeToggle } from "@/components/scope-toggle";
 import { gateway } from "@/lib/gateway";
 import type { ComputePod } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { ComputeList } from "./compute-list";
 
-async function loadCompute(): Promise<{ items: ComputePod[]; error: string | null }> {
+async function loadCompute(
+  scope: "mine" | "all",
+): Promise<{ items: ComputePod[]; error: string | null }> {
   try {
-    const items = await gateway.listCompute();
+    const items = await gateway.listCompute(scope);
     return { items, error: null };
   } catch (e) {
     return { items: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-export default async function ComputePage() {
+export default async function ComputePage({
+  searchParams,
+}: {
+  searchParams: Promise<{ scope?: string }>;
+}) {
   const me = await getMe();
   const noAccess = !me?.sections?.compute;
+  const sp = await searchParams;
+  const scope: "mine" | "all" =
+    me?.is_admin && sp.scope === "all" ? "all" : "mine";
+
   const [{ items, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ items: [], error: null }) : loadCompute(),
+    noAccess ? Promise.resolve({ items: [], error: null }) : loadCompute(scope),
     currentUsername(),
   ]);
 
@@ -34,13 +45,16 @@ export default async function ComputePage() {
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         {/* Plain header — no gradient, no coloured icon tile. Colour is reserved
             for state. */}
-        <div className="mb-6">
-          <h1 className="text-2xl font-semibold tracking-tight">Compute</h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-            Provision a raw GPU pod with SSH and JupyterLab. Pods bill per-second
-            until you terminate them — pick a template, click create, you get back
-            an SSH command and a JupyterLab URL.
-          </p>
+        <div className="mb-6 flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">Compute</h1>
+            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Provision a raw GPU pod with SSH and JupyterLab. Pods bill per-second
+              until you terminate them — pick a template, click create, you get back
+              an SSH command and a JupyterLab URL.
+            </p>
+          </div>
+          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -58,6 +72,7 @@ export default async function ComputePage() {
                 <h2 className="text-base font-medium">Pods</h2>
                 <span className="text-xs text-muted-foreground">
                   {items.length} total · {active} active
+                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <Button asChild size="sm">

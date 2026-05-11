@@ -609,10 +609,14 @@ async def _safe_run(redis, bench_id: str, raw_yaml: str) -> None:
 
 @router.get("", response_model=list[BenchmarkRecord])
 async def list_benchmarks(
+    scope: str = "mine",
     user: User = Depends(require_section("benchmark")),
     session: AsyncSession = Depends(get_session),
 ):
-    if user.is_admin:
+    # Admins default to their own runs; pass ?scope=all to see everyone's.
+    # Non-admins are always scoped to own regardless of the param.
+    show_all = user.is_admin and scope == "all"
+    if show_all:
         rows = await session.execute(select(Benchmark).order_by(Benchmark.created_at.desc()))
     else:
         rows = await session.execute(
@@ -703,16 +707,18 @@ def _parse_config(yaml_text: str) -> dict:
 
 @router.get("/_aggregate", response_model=list[AggregatePoint])
 async def aggregate(
+    scope: str = "mine",
     user: User = Depends(require_section("benchmark")),
     session: AsyncSession = Depends(get_session),
 ):
-    cache_key = "admin" if user.is_admin else f"u{user.id}"
+    show_all = user.is_admin and scope == "all"
+    cache_key = "admin-all" if show_all else f"u{user.id}"
     now = time.time()
     cached = _AGG_CACHE.get(cache_key)
     if cached and cached[0] > now:
         return cached[1]
 
-    if user.is_admin:
+    if show_all:
         rows = await session.execute(
             select(Benchmark).where(Benchmark.status.in_(["done", "running", "failed"]))
         )

@@ -4,7 +4,7 @@ import { useState } from "react";
 import { BarChart3, ChevronDown, ChevronRight } from "lucide-react";
 import { BenchmarkExplorer } from "./explorer";
 
-export function ExplorerCollapsible() {
+export function ExplorerCollapsible({ scope = "mine" }: { scope?: "mine" | "all" }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="mb-8">
@@ -41,7 +41,7 @@ export function ExplorerCollapsible() {
       {/* Lazy: only mounts (and fetches /benchmarks/_aggregate) when expanded. */}
       {open && (
         <div className="mt-3">
-          <BenchmarkExplorer />
+          <BenchmarkExplorer scope={scope} />
         </div>
       )}
     </div>

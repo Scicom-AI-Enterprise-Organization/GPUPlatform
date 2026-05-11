@@ -810,17 +810,24 @@ async def get_gpu_availability(
     request: Request,
     gpu: str,
     count: int = 1,
+    cloud_type: Optional[str] = None,
     # Cross-section: both Inference and Benchmark forms call this, so we gate
     # on the broader developer role instead of a specific section.
     user: User = Depends(require_developer),
 ):
     """Live check whether `count` of `gpu` can be provisioned right now on
     the active provider. UI uses this to render a green/red/yellow badge
-    next to the GPU picker. Provider-side caches keep upstream RPS bounded."""
+    next to the GPU picker. Provider-side caches keep upstream RPS bounded.
+
+    `cloud_type` is optional and provider-specific (RunPod: COMMUNITY/SECURE).
+    When omitted the provider's configured default is used.
+    """
     if count < 1 or count > 8:
         raise HTTPException(status_code=400, detail="count must be 1..8")
     if not gpu or len(gpu) > 64:
         raise HTTPException(status_code=400, detail="gpu name required (≤64 chars)")
+    if cloud_type is not None and cloud_type.upper() not in ("COMMUNITY", "SECURE"):
+        raise HTTPException(status_code=400, detail="cloud_type must be COMMUNITY or SECURE")
     provider = getattr(request.app.state, "provider", None)
     if provider is None:
         return {
@@ -829,7 +836,7 @@ async def get_gpu_availability(
             "checked_at": time.time(), "provider": "fake",
         }
     try:
-        result = await provider.check_availability(gpu, count)
+        result = await provider.check_availability(gpu, count, cloud_type=cloud_type)
     except Exception:
         logger.exception("availability check failed for %s x%d", gpu, count)
         return {
@@ -964,13 +971,17 @@ async def create_app(
 
 @app.get("/apps", response_model=list[AppRecord])
 async def list_apps(
+    scope: str = "mine",
     user: User = Depends(require_section("inference")),
     session: AsyncSession = Depends(get_session),
 ):
+    # Admins default to their own apps; pass ?scope=all to see everyone's.
+    # Non-admins are always scoped to own regardless of the param.
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
+    show_all = user.is_admin and scope == "all"
     stmt = select(App).options(selectinload(App.owner))
-    if not user.is_admin:
+    if not show_all:
         stmt = stmt.where(App.owner_id == user.id)
     result = await session.execute(stmt)
     apps = result.scalars().all()

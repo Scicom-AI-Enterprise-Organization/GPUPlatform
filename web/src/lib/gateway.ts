@@ -92,7 +92,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const gateway = {
   baseUrl: PUBLIC_BASE,
-  listApps: () => request<AppRecord[]>("/apps"),
+  listApps: (scope: "mine" | "all" = "mine") =>
+    request<AppRecord[]>(`/apps?scope=${scope}`),
   getApp: (id: string) => request<AppRecord>(`/apps/${encodeURIComponent(id)}`),
   createApp: (body: CreateAppRequest) =>
     request<CreateAppResponse>("/apps", {
@@ -118,15 +119,17 @@ export const gateway = {
     request<GatewayRequestRecord[]>(
       `/apps/${encodeURIComponent(id)}/requests?limit=${limit}`,
     ),
-  checkAvailability: (gpu: string, count = 1) =>
-    request<GpuAvailability>(
-      `/v1/availability?gpu=${encodeURIComponent(gpu)}&count=${count}`,
-    ),
+  checkAvailability: (gpu: string, count = 1, cloudType?: "COMMUNITY" | "SECURE") => {
+    const params = new URLSearchParams({ gpu, count: String(count) });
+    if (cloudType) params.set("cloud_type", cloudType);
+    return request<GpuAvailability>(`/v1/availability?${params.toString()}`);
+  },
   getAppStatus: (id: string) =>
     request<AppStatus>(`/apps/${encodeURIComponent(id)}/status`),
 
   // ---- Benchmarks ----
-  listBenchmarks: () => request<BenchmarkRecord[]>("/benchmarks"),
+  listBenchmarks: (scope: "mine" | "all" = "mine") =>
+    request<BenchmarkRecord[]>(`/benchmarks?scope=${scope}`),
   getBenchmark: (id: string) =>
     request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}`),
   createBenchmark: (body: CreateBenchmarkRequest) =>
@@ -147,7 +150,8 @@ export const gateway = {
     `/api/proxy/benchmarks/${encodeURIComponent(id)}/logs/stream`,
 
   // ---- Cross-benchmark aggregate (one point per result.json across all benches) ----
-  aggregateBenchmarks: () => request<AggregatePoint[]>("/benchmarks/_aggregate"),
+  aggregateBenchmarks: (scope: "mine" | "all" = "mine") =>
+    request<AggregatePoint[]>(`/benchmarks/_aggregate?scope=${scope}`),
 
   // ---- Benchmark templates ----
   listBenchmarkTemplates: () =>
@@ -164,7 +168,8 @@ export const gateway = {
     ),
 
   // ---- Compute ----
-  listCompute: () => request<ComputePod[]>("/compute"),
+  listCompute: (scope: "mine" | "all" = "mine") =>
+    request<ComputePod[]>(`/compute?scope=${scope}`),
   getCompute: (id: string) =>
     request<ComputePod>(`/compute/${encodeURIComponent(id)}`),
   createCompute: (body: CreateComputeRequest) =>

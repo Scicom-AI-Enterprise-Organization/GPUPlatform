@@ -284,15 +284,24 @@ class RunPodProvider(Provider):
                 return pod["id"]
         return None
 
-    async def check_availability(self, gpu: str, count: int) -> GpuAvailability:
+    async def check_availability(
+        self,
+        gpu: str,
+        count: int,
+        cloud_type: Optional[str] = None,
+    ) -> GpuAvailability:
         """Query RunPod's GraphQL gpuTypes endpoint for live stock + price.
 
         RunPod's REST API (/v1/*) doesn't expose GPU listings — only GraphQL at
         api.runpod.io/graphql does. We POST a single query that returns
         stockStatus, availableGpuCounts, and lowestPrice for the requested
         (gpu, count, cloudType). Cached 30s with single-flight lock.
+
+        `cloud_type` overrides the provider-level default per request, so the
+        UI's COMMUNITY/SECURE toggle reflects in the badge.
         """
-        key = (gpu, count)
+        effective_cloud = (cloud_type or self.cloud_type).upper()
+        key = (gpu, count, effective_cloud)
         now = time.time()
         cached = self._avail_cache.get(key)
         if cached is not None and cached[1] > now:
@@ -305,7 +314,7 @@ class RunPodProvider(Provider):
                 return cached[0]
 
             rp_gpu = _map_gpu(gpu)
-            secure = self.cloud_type.upper() == "SECURE"
+            secure = effective_cloud == "SECURE"
             query = """
             query GpuTypes($id: String, $count: Int!, $secure: Boolean!) {
               gpuTypes(input: { id: $id }) {
@@ -390,9 +399,9 @@ class RunPodProvider(Provider):
 
             if stock in (None, "None") or (counts and count not in counts):
                 reason = (
-                    f"No host with ≥{count}× {gpu} on RunPod {self.cloud_type}"
+                    f"No host with ≥{count}× {gpu} on RunPod {effective_cloud}"
                     if counts
-                    else f"No {gpu} in stock on RunPod {self.cloud_type}"
+                    else f"No {gpu} in stock on RunPod {effective_cloud}"
                 )
                 result = GpuAvailability(
                     gpu=gpu, count=count, available=False, reason=reason,

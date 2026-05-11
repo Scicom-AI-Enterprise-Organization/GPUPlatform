@@ -266,7 +266,12 @@ class PrimeIntellectProvider(Provider):
             offset += 100
         return None
 
-    async def check_availability(self, gpu: str, count: int) -> GpuAvailability:
+    async def check_availability(
+        self,
+        gpu: str,
+        count: int,
+        cloud_type: Optional[str] = None,  # ignored — PI has no community/secure split
+    ) -> GpuAvailability:
         """Hit PI's /availability endpoint and parse the cheapest matching row.
 
         Cached for 30s per (gpu, count) to bound upstream RPS. Single-flighted

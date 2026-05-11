@@ -3,26 +3,37 @@ import { Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
+import { ScopeToggle } from "@/components/scope-toggle";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { EndpointGrid } from "./endpoint-grid";
 
-async function loadEndpoints(): Promise<{ apps: AppRecord[]; error: string | null }> {
+async function loadEndpoints(
+  scope: "mine" | "all",
+): Promise<{ apps: AppRecord[]; error: string | null }> {
   try {
-    const apps = await gateway.listApps();
+    const apps = await gateway.listApps(scope);
     return { apps, error: null };
   } catch (e) {
     return { apps: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-export default async function ServerlessPage() {
+export default async function ServerlessPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ scope?: string }>;
+}) {
   const me = await getMe();
   const noAccess = !me?.sections?.inference;
+  const sp = await searchParams;
+  const scope: "mine" | "all" =
+    me?.is_admin && sp.scope === "all" ? "all" : "mine";
+
   const [{ apps, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ apps: [], error: null }) : loadEndpoints(),
+    noAccess ? Promise.resolve({ apps: [], error: null }) : loadEndpoints(scope),
     currentUsername(),
   ]);
 
@@ -30,11 +41,14 @@ export default async function ServerlessPage() {
     <div className="flex h-full flex-col">
       <ConsoleTopbar crumbs={[{ label: "Serverless Inference" }]} username={username} />
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
-        <div className="mb-6">
-          <h1 className="text-2xl font-semibold tracking-tight">Serverless Inference</h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-            Deploy and scale GPU-powered inference endpoints. Pay per second of compute.
-          </p>
+        <div className="mb-6 flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">Serverless Inference</h1>
+            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Deploy and scale GPU-powered inference endpoints. Pay per second of compute.
+            </p>
+          </div>
+          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -52,6 +66,7 @@ export default async function ServerlessPage() {
                 <h2 className="text-base font-medium">Endpoints</h2>
                 <span className="text-xs text-muted-foreground">
                   {apps.length} {apps.length === 1 ? "endpoint" : "endpoints"}
+                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <Button asChild size="sm">

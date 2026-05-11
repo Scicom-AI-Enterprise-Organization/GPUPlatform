@@ -73,10 +73,15 @@ class Provider(ABC):
         cheaply (e.g. by pod name prefix) should override."""
         return await self.list_machines()
 
-    async def check_availability(self, gpu: str, count: int) -> GpuAvailability:
+    async def check_availability(
+        self,
+        gpu: str,
+        count: int,
+        cloud_type: Optional[str] = None,
+    ) -> GpuAvailability:
         """Best-effort live check of whether `count` of `gpu` can be
-        provisioned right now. Default assumes available (FakeProvider has
-        no real upstream to query)."""
+        provisioned right now. `cloud_type` is provider-specific (e.g.
+        RunPod COMMUNITY/SECURE); None = provider default."""
         return GpuAvailability(gpu=gpu, count=count, available=True)
 
     async def shutdown(self) -> None:

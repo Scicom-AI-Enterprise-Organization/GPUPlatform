@@ -10,21 +10,32 @@ import { getMe } from "@/lib/me";
 import { BenchmarkList } from "./benchmark-list";
 import { BenchmarkDashboard } from "./dashboard";
 import { ExplorerCollapsible } from "./explorer-collapsible";
+import { ScopeToggle } from "@/components/scope-toggle";
 
-async function loadBenchmarks(): Promise<{ items: BenchmarkRecord[]; error: string | null }> {
+async function loadBenchmarks(
+  scope: "mine" | "all",
+): Promise<{ items: BenchmarkRecord[]; error: string | null }> {
   try {
-    const items = await gateway.listBenchmarks();
+    const items = await gateway.listBenchmarks(scope);
     return { items, error: null };
   } catch (e) {
     return { items: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-export default async function BenchmarkPage() {
+export default async function BenchmarkPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ scope?: string }>;
+}) {
   const me = await getMe();
   const noAccess = !me?.sections?.benchmark;
+  const sp = await searchParams;
+  const scope: "mine" | "all" =
+    me?.is_admin && sp.scope === "all" ? "all" : "mine";
+
   const [{ items, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ items: [], error: null }) : loadBenchmarks(),
+    noAccess ? Promise.resolve({ items: [], error: null }) : loadBenchmarks(scope),
     currentUsername(),
   ]);
 
@@ -32,12 +43,15 @@ export default async function BenchmarkPage() {
     <div className="flex h-full flex-col">
       <ConsoleTopbar crumbs={[{ label: "Benchmark" }]} username={username} />
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
-        <div className="mb-6">
-          <h1 className="text-2xl font-semibold tracking-tight">Benchmark</h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-            Run <span className="font-mono text-xs">llm-benchmaq</span> sweeps on real GPUs.
-            Results land in S3; metrics and files surface in the detail view.
-          </p>
+        <div className="mb-6 flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">Benchmark</h1>
+            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Run <span className="font-mono text-xs">llm-benchmaq</span> sweeps on real GPUs.
+              Results land in S3; metrics and files surface in the detail view.
+            </p>
+          </div>
+          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -49,7 +63,7 @@ export default async function BenchmarkPage() {
         )}
 
         {!noAccess && items.length > 0 && <BenchmarkDashboard items={items} />}
-        {!noAccess && items.length > 0 && <ExplorerCollapsible />}
+        {!noAccess && items.length > 0 && <ExplorerCollapsible scope={scope} />}
 
         {!noAccess && (
           <section>
@@ -58,6 +72,7 @@ export default async function BenchmarkPage() {
                 <h2 className="text-base font-medium">Benchmarks</h2>
                 <span className="text-xs text-muted-foreground">
                   {items.length} {items.length === 1 ? "run" : "runs"}
+                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <Button asChild size="sm">
