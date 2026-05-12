@@ -85,19 +85,51 @@ def install() -> None:
 
     RemoteExecutor._run_command = _patched_run_command  # type: ignore[assignment]
 
-    # Surface install errors. pyremote's _install_dependencies calls
-    # `_run_command(cmd, stream=self.install_verbose)` and then raises
-    # `RemoteImportError(f"...: {stderr}")` on failure. But uv (and pip with
-    # modern terminals) writes its actual error to STDOUT, not stderr — so
-    # the error message comes back empty. Forcing install_verbose=True
-    # makes _run_command stream both streams live to our subprocess stdout
-    # (which the gateway captures into bench logs), so the real error is
-    # visible whether the install succeeds or fails.
-    _orig_install_deps = RemoteExecutor._install_dependencies
+    # Replace _install_dependencies wholesale so we get full visibility into
+    # the install output regardless of pyremote's stream behaviour. The
+    # original captures stdout+stderr into separate vars but only puts
+    # `stderr` into the RemoteImportError — uv writes its real error to
+    # stdout, so the error message comes back empty. Here we capture both,
+    # echo both to the subprocess stdout/stderr (so the gateway can stream
+    # them into bench logs), and put both into the exception on failure.
+    import sys as _sys
+    import hashlib as _hashlib
 
     def _patched_install_deps(self):
-        self.install_verbose = True
-        return _orig_install_deps(self)
+        if not self.dependencies:
+            return
+        deps_key = ",".join(sorted(self.dependencies)) + str(self.venv) + str(self.uv)
+        deps_hash = _hashlib.md5(deps_key.encode()).hexdigest()[:8]
+        if deps_hash in self._deps_installed:
+            return
+        deps_str = " ".join(f'"{dep}"' for dep in self.dependencies)
+        if self.uv:
+            cmd = (
+                "source $HOME/.local/bin/env 2>/dev/null || true\n"
+                f"source {self.uv.activate_path}\n"
+                f"uv pip install {deps_str}"
+            )
+        elif self.venv:
+            cmd = f"{self.venv.pip_path} install {deps_str}"
+        else:
+            cmd = f"{self._python_path} -m pip install {deps_str}"
+
+        print(f"[shim] installing {self.dependencies}", flush=True)
+        exit_status, stdout_data, stderr_data = self._run_command(cmd, timeout=300, stream=False)
+        if stdout_data:
+            print(stdout_data, flush=True)
+        if stderr_data:
+            print(stderr_data, file=_sys.stderr, flush=True)
+        print(f"[shim] install rc={exit_status}", flush=True)
+
+        if exit_status != 0:
+            from pyremote import RemoteImportError  # type: ignore
+            tail = ((stderr_data or "") + "\n" + (stdout_data or "")).strip()
+            tail = tail[-1500:] if tail else "(no output from uv)"
+            raise RemoteImportError(
+                f"Failed to install dependencies {self.dependencies} (rc={exit_status}):\n{tail}"
+            )
+        self._deps_installed.add(deps_hash)
 
     RemoteExecutor._install_dependencies = _patched_install_deps  # type: ignore[assignment]
     _INSTALLED = True
