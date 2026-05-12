@@ -612,7 +612,7 @@ export function BenchmarkForm({
   }
 
   return (
-    <form onSubmit={onSubmit} className="mx-auto max-w-2xl space-y-6">
+    <form onSubmit={onSubmit} className="space-y-6">
       {/* Header — plain, no gradient. */}
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Create benchmark</h1>

@@ -85,7 +85,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   }
 
   return (
-    <form onSubmit={onSubmit} className="mx-auto max-w-2xl space-y-6">
+    <form onSubmit={onSubmit} className="space-y-6">
       {/* Section: identity */}
       <Section title="Pod" description="A short name to remember this pod by.">
         <div className="space-y-1.5">
