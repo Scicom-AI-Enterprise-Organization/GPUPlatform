@@ -22,7 +22,7 @@ dependencies = [
     "pyyaml>=6.0",
     # llm-benchmaq is the CLI we shell out to for benchmark runs. Public repo;
     # pulls in paramiko/scp/etc.
-    "benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@7fae15d",
+    "benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@53a41eb",
 ]
 
 [project.scripts]
