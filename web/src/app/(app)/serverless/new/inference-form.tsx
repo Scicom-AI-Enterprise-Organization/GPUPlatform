@@ -143,6 +143,7 @@ export function InferenceForm() {
     | { gpu: string; gpu_count: number; reason: string }
     | null
   >(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const gpuMemInvalid = (() => {
     const s = vllm.gpu_memory_utilization.trim();
@@ -169,25 +170,26 @@ export function InferenceForm() {
     !alwaysOn && (!Number.isFinite(parsedIdle) || parsedIdle < 1 || parsedIdle > 86400);
 
   function submit() {
+    setSubmitError(null);
     if (!name.trim() || !model.trim()) {
-      toast.error("Endpoint name and model name are required.");
+      setSubmitError("Endpoint name and model name are required.");
       return;
     }
     if (idleInvalid) {
-      toast.error(
+      setSubmitError(
         "Enter a positive idle timeout in seconds, or tick 'No idle timeout'.",
       );
       return;
     }
     if (advancedInvalid) {
-      toast.error("Fix the invalid values in Advanced options.");
+      setSubmitError("Fix the invalid values in Advanced options.");
       return;
     }
     if (explicitlyUnavailable) {
       const reason =
         (availability.status === "ok" && availability.data.reason) ||
         `${gpu}×${gpuCount} isn't available on the active provider right now.`;
-      toast.error(reason);
+      setSubmitError(reason);
       return;
     }
     const vllmArgs = buildVllmArgs(vllm);
@@ -208,11 +210,11 @@ export function InferenceForm() {
         if (res.unavailable) {
           setUnavailableModal(res.unavailable);
         } else {
-          toast.error(res.error);
+          setSubmitError(res.error);
         }
         return;
       }
-      toast.success(`Endpoint ${res.app_id} created`);
+      toast.success(`Endpoint ${res.app_id} created`, { duration: 4000 });
       router.push(`/serverless/${encodeURIComponent(res.app_id)}`);
     });
   }
@@ -501,7 +503,10 @@ export function InferenceForm() {
         </div>
       </div>
 
-      <div className="mt-5 flex items-center justify-end gap-2">
+      <div className="mt-5 flex items-center justify-end gap-3">
+        {submitError && (
+          <p className="mr-auto text-sm text-destructive">{submitError}</p>
+        )}
         <Button variant="ghost" onClick={() => router.push("/serverless")} disabled={pending}>
           Cancel
         </Button>

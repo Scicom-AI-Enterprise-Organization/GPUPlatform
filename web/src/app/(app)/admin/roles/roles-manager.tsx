@@ -103,9 +103,9 @@ function RoleCard({
           sections: nextSections,
         });
         onChange(updated);
-        toast.success(`${role.name} updated`);
+        toast.success(`${role.name} updated`, { duration: 3000 });
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : String(e));
+        toast.error(e instanceof Error ? e.message : String(e)), { duration: 5000 };
       }
     });
   };
@@ -118,7 +118,7 @@ function RoleCard({
         const updated = await gateway.adminUpdatePolicyRole(role.id, { name: trimmed });
         onChange(updated);
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : String(e));
+        toast.error(e instanceof Error ? e.message : String(e)), { duration: 5000 };
       }
     });
   };
@@ -129,9 +129,9 @@ function RoleCard({
       try {
         await gateway.adminDeletePolicyRole(role.id);
         onDelete(role.id);
-        toast.success(`Deleted ${role.name}`);
+        toast.success(`Deleted ${role.name}`, { duration: 3000 });
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : String(e));
+        toast.error(e instanceof Error ? e.message : String(e)), { duration: 5000 };
       }
     });
   };
@@ -270,11 +270,11 @@ function CreateRoleDialog({
     try {
       const r = await gateway.adminCreatePolicyRole(effectiveId, name.trim(), sections);
       onCreated(r);
-      toast.success(`Created ${r.name}`);
+      toast.success(`Created ${r.name}`, { duration: 3000 });
       reset();
       onOpenChange(false);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(e instanceof Error ? e.message : String(e)), { duration: 5000 };
     } finally {
       setPending(false);
     }

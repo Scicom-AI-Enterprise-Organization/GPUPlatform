@@ -3,7 +3,6 @@
 import { useEffect, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Copy, Trash2 } from "lucide-react";
-import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -45,6 +44,7 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
   const [tab, setTab] = useState<(typeof TABS)[number]["value"]>("logs");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [pending, startTransition] = useTransition();
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Auto-refresh while not terminal so KPIs (status, exit_code, etc.) stay live.
   useEffect(() => {
@@ -62,13 +62,13 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
   }, [bench.id, bench.status]);
 
   function handleDelete() {
+    setDeleteError(null);
     startTransition(async () => {
       try {
         await gateway.deleteBenchmark(bench.id);
-        toast.success(`Deleted ${bench.id}`);
         router.push("/benchmark");
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : String(e));
+        setDeleteError(e instanceof Error ? e.message : String(e));
       }
     });
   }
@@ -157,7 +157,13 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
         </Tabs>
       </div>
 
-      <Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+      <Dialog
+        open={confirmDelete}
+        onOpenChange={(o) => {
+          setConfirmDelete(o);
+          if (!o) setDeleteError(null);
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Delete benchmark?</DialogTitle>
@@ -168,6 +174,9 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
+            {deleteError && (
+              <p className="mr-auto text-sm text-destructive">{deleteError}</p>
+            )}
             <Button variant="outline" onClick={() => setConfirmDelete(false)}>
               Cancel
             </Button>

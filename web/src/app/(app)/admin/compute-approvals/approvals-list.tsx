@@ -3,7 +3,6 @@
 import { useState, useTransition } from "react";
 import { Check, Cpu, Inbox, Loader2, User, X } from "lucide-react";
 import { avatarFor } from "@/lib/avatar";
-import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -24,16 +23,18 @@ export function ApprovalsList({ initial }: { initial: ComputePod[] }) {
   const [reason, setReason] = useState("");
   const [pending, startTransition] = useTransition();
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<{ id: string; msg: string } | null>(null);
+  const [rejectError, setRejectError] = useState<string | null>(null);
 
   function approve(pod: ComputePod) {
     setBusyId(pod.id);
+    setRowError(null);
     startTransition(async () => {
       try {
         await gateway.approveCompute(pod.id);
         setItems((cur) => cur.filter((p) => p.id !== pod.id));
-        toast.success(`Approved ${pod.name} — provisioning now`);
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : String(e));
+        setRowError({ id: pod.id, msg: e instanceof Error ? e.message : String(e) });
       } finally {
         setBusyId(null);
       }
@@ -44,15 +45,15 @@ export function ApprovalsList({ initial }: { initial: ComputePod[] }) {
     if (!rejecting) return;
     const target = rejecting;
     setBusyId(target.id);
+    setRejectError(null);
     startTransition(async () => {
       try {
         await gateway.rejectCompute(target.id, reason.trim() || undefined);
         setItems((cur) => cur.filter((p) => p.id !== target.id));
-        toast.success(`Rejected ${target.name}`);
         setRejecting(null);
         setReason("");
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : String(e));
+        setRejectError(e instanceof Error ? e.message : String(e));
       } finally {
         setBusyId(null);
       }
@@ -143,7 +144,12 @@ export function ApprovalsList({ initial }: { initial: ComputePod[] }) {
                 </span>
               </div>
 
-              <div className="mt-3 flex items-center justify-end border-t border-border/60 pt-2 text-xs text-muted-foreground">
+              <div className="mt-3 flex items-center justify-between gap-3 border-t border-border/60 pt-2 text-xs text-muted-foreground">
+                {rowError?.id === p.id ? (
+                  <span className="text-destructive">{rowError.msg}</span>
+                ) : (
+                  <span />
+                )}
                 <span title={new Date(p.created_at).toISOString()}>
                   {new Date(p.created_at).toLocaleString()}
                 </span>
@@ -182,11 +188,15 @@ export function ApprovalsList({ initial }: { initial: ComputePod[] }) {
             />
           </div>
           <DialogFooter>
+            {rejectError && (
+              <p className="mr-auto text-sm text-destructive">{rejectError}</p>
+            )}
             <Button
               variant="outline"
               onClick={() => {
                 setRejecting(null);
                 setReason("");
+                setRejectError(null);
               }}
               disabled={pending}
             >

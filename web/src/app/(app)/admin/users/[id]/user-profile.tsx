@@ -53,10 +53,10 @@ export function UserProfile({
         body: JSON.stringify({ role: next }),
       });
       if (!r.ok) {
-        toast.error(`Failed: ${await r.text()}`);
+        toast.error(`Failed: ${await r.text()}`, { duration: 5000 });
         return;
       }
-      toast.success(`${user.username} → ${next}`);
+      toast.success(`${user.username} → ${next}`, { duration: 3000 });
       router.refresh();
     });
   }
@@ -71,10 +71,10 @@ export function UserProfile({
         body: JSON.stringify({ policy_role_id: value }),
       });
       if (!r.ok) {
-        toast.error(`Failed: ${await r.text()}`);
+        toast.error(`Failed: ${await r.text()}`, { duration: 5000 });
         return;
       }
-      toast.success(value ? `${user.username} → ${value}` : `${user.username} detached from role`);
+      toast.success(value ? `${user.username} → ${value}` : `${user.username} detached from role`, { duration: 3000 });
       router.refresh();
     });
   }
@@ -84,10 +84,10 @@ export function UserProfile({
     startTransition(async () => {
       const r = await fetch(`/api/proxy/admin/users/${user.id}`, { method: "DELETE" });
       if (!r.ok) {
-        toast.error(`Failed: ${await r.text()}`);
+        toast.error(`Failed: ${await r.text()}`, { duration: 5000 });
         return;
       }
-      toast.success(`Deleted ${user.username}`);
+      toast.success(`Deleted ${user.username}`, { duration: 3000 });
       router.replace("/organization");
     });
   }
@@ -281,10 +281,10 @@ function Field({
     try {
       await navigator.clipboard.writeText(value);
       setCopied(true);
-      toast.success(`${label} copied`);
+      toast.success(`${label} copied`, { duration: 3000 });
       window.setTimeout(() => setCopied(false), 1200);
     } catch {
-      toast.error("Couldn't access clipboard");
+      toast.error("Couldn't access clipboard", { duration: 5000 });
     }
   }
   return (

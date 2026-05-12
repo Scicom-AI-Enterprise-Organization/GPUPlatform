@@ -146,7 +146,7 @@ function RequestsTabInner({ appId }: { appId: string }) {
 
   async function send() {
     if (!prompt.trim()) {
-      toast.error("Prompt is required.");
+      toast.error("Prompt is required.", { duration: 5000 });
       return;
     }
     setSending(true);
@@ -166,9 +166,9 @@ function RequestsTabInner({ appId }: { appId: string }) {
         app_id: appId,
       };
       upsert(stored);
-      toast.success(`Queued ${stored.id}`);
+      toast.success(`Queued ${stored.id}`, { duration: 3000 });
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(e instanceof Error ? e.message : String(e)), { duration: 5000 };
     } finally {
       setSending(false);
     }
@@ -272,7 +272,7 @@ function RequestsTabInner({ appId }: { appId: string }) {
                     size="icon-xs"
                     onClick={() => {
                       navigator.clipboard.writeText(curlCmd);
-                      toast.success("cURL copied");
+                      toast.success("cURL copied", { duration: 3000 });
                     }}
                     aria-label="Copy cURL"
                   >
@@ -283,7 +283,7 @@ function RequestsTabInner({ appId }: { appId: string }) {
                     size="icon-xs"
                     onClick={() => {
                       navigator.clipboard.writeText(resultUrl);
-                      toast.success("URL copied");
+                      toast.success("URL copied", { duration: 3000 });
                     }}
                     aria-label="Copy URL"
                   >
@@ -345,7 +345,7 @@ function RequestRow({ req, onRemove }: { req: StoredRequest; onRemove: () => voi
           <button
             onClick={() => {
               navigator.clipboard.writeText(req.id);
-              toast.success("ID copied");
+              toast.success("ID copied", { duration: 3000 });
             }}
             className="text-left hover:text-primary"
             title="Copy request_id"

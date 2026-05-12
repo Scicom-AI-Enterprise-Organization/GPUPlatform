@@ -50,7 +50,7 @@ export function ApiKeyPanel() {
 
   function copy(text: string, label: string) {
     navigator.clipboard.writeText(text);
-    toast.success(`${label} copied`);
+    toast.success(`${label} copied`, { duration: 3000 });
   }
 
   async function rotate() {
@@ -65,7 +65,7 @@ export function ApiKeyPanel() {
       await fetch("/api/auth/logout", { method: "POST" });
       window.location.href = "/login?next=/api-keys";
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
     } finally {
       setRotating(false);
     }
@@ -228,7 +228,7 @@ function Snippet({ label, code }: { label: string; code: string }) {
           className="absolute right-2 top-2"
           onClick={() => {
             navigator.clipboard.writeText(code);
-            toast.success("Snippet copied");
+            toast.success("Snippet copied", { duration: 3000 });
           }}
         >
           <Copy className="h-3 w-3" />

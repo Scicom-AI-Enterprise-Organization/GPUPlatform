@@ -35,16 +35,17 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
   const [tab, setTab] = useState<(typeof TABS)[number]["value"]>("overview");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [pending, startTransition] = useTransition();
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const avatar = avatarFor(app.name);
 
   function handleDelete() {
+    setDeleteError(null);
     startTransition(async () => {
       const res = await deleteEndpoint(app.app_id);
       if (!res.ok) {
-        toast.error(res.error);
+        setDeleteError(res.error);
         return;
       }
-      toast.success(`Deleted ${app.app_id}`);
       router.push("/serverless");
     });
   }
@@ -104,7 +105,13 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
         </Tabs>
       </div>
 
-      <Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+      <Dialog
+        open={confirmDelete}
+        onOpenChange={(o) => {
+          setConfirmDelete(o);
+          if (!o) setDeleteError(null);
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Delete {app.name}?</DialogTitle>
@@ -113,6 +120,9 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
+            {deleteError && (
+              <p className="mr-auto text-sm text-destructive">{deleteError}</p>
+            )}
             <Button variant="ghost" onClick={() => setConfirmDelete(false)} disabled={pending}>
               Cancel
             </Button>

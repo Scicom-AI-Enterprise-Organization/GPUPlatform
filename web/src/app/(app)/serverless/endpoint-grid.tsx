@@ -14,7 +14,6 @@ import {
   User,
   X,
 } from "lucide-react";
-import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -47,6 +46,7 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -75,22 +75,21 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
   const onDeleteSelected = async () => {
     if (selected.size === 0) return;
     setDeleting(true);
+    setDeleteError(null);
     const ids = Array.from(selected);
     const results = await Promise.allSettled(ids.map((id) => deleteEndpoint(id)));
     const failures = results.filter(
       (r) => r.status === "rejected" || (r.status === "fulfilled" && !r.value.ok),
     ).length;
     setDeleting(false);
-    setConfirmOpen(false);
     if (failures === 0) {
-      toast.success(`Deleted ${ids.length} endpoint${ids.length === 1 ? "" : "s"}`, {
-        duration: 4000,
-      });
+      setConfirmOpen(false);
+      exitSelect();
+      router.refresh();
     } else {
-      toast.error(`${failures} of ${ids.length} failed to delete`, { duration: 5000 });
+      setDeleteError(`${failures} of ${ids.length} failed to delete`);
+      router.refresh();
     }
-    exitSelect();
-    router.refresh();
   };
 
   if (apps.length === 0) {
@@ -217,7 +216,15 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
 
       <SingleDeleteDialog target={single} onClose={() => setSingle(null)} />
 
-      <Dialog open={confirmOpen} onOpenChange={(o) => !deleting && setConfirmOpen(o)}>
+      <Dialog
+        open={confirmOpen}
+        onOpenChange={(o) => {
+          if (!deleting) {
+            setConfirmOpen(o);
+            if (!o) setDeleteError(null);
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
@@ -229,6 +236,9 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
+            {deleteError && (
+              <p className="mr-auto text-sm text-destructive">{deleteError}</p>
+            )}
             <Button variant="outline" onClick={() => setConfirmOpen(false)} disabled={deleting}>
               Cancel
             </Button>
@@ -394,23 +404,32 @@ function SingleDeleteDialog({
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
+  const [err, setErr] = useState<string | null>(null);
 
   function handleDelete() {
     if (!target) return;
+    setErr(null);
     startTransition(async () => {
       const res = await deleteEndpoint(target.app_id);
       if (!res.ok) {
-        toast.error(res.error);
+        setErr(res.error);
         return;
       }
-      toast.success(`Deleted ${target.app_id}`);
       onClose();
       router.refresh();
     });
   }
 
   return (
-    <Dialog open={!!target} onOpenChange={(open) => !open && onClose()}>
+    <Dialog
+      open={!!target}
+      onOpenChange={(open) => {
+        if (!open) {
+          setErr(null);
+          onClose();
+        }
+      }}
+    >
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Delete {target?.name}?</DialogTitle>
@@ -419,6 +438,7 @@ function SingleDeleteDialog({
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
+          {err && <p className="mr-auto text-sm text-destructive">{err}</p>}
           <Button variant="ghost" onClick={onClose} disabled={pending}>
             Cancel
           </Button>

@@ -4,7 +4,6 @@ import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import yaml from "js-yaml";
 import { CheckSquare, Inbox, Search, Trash2, X } from "lucide-react";
-import { toast } from "sonner";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkRecord } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -59,6 +58,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -77,18 +77,19 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const onDeleteSelected = async () => {
     if (selected.size === 0) return;
     setDeleting(true);
+    setDeleteError(null);
     const ids = Array.from(selected);
     const results = await Promise.allSettled(ids.map((id) => gateway.deleteBenchmark(id)));
     const failures = results.filter((r) => r.status === "rejected").length;
     setDeleting(false);
-    setConfirmOpen(false);
     if (failures === 0) {
-      toast.success(`Deleted ${ids.length} benchmark${ids.length === 1 ? "" : "s"}`, { duration: 4000 });
+      setConfirmOpen(false);
+      exitSelect();
+      router.refresh();
     } else {
-      toast.error(`${failures} of ${ids.length} failed to delete`, { duration: 5000 });
+      setDeleteError(`${failures} of ${ids.length} failed to delete`);
+      router.refresh();
     }
-    exitSelect();
-    router.refresh();
   };
 
   const haystacks = useMemo(
@@ -241,7 +242,15 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
         </div>
       )}
 
-      <Dialog open={confirmOpen} onOpenChange={(o) => !deleting && setConfirmOpen(o)}>
+      <Dialog
+        open={confirmOpen}
+        onOpenChange={(o) => {
+          if (!deleting) {
+            setConfirmOpen(o);
+            if (!o) setDeleteError(null);
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
@@ -254,6 +263,9 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
+            {deleteError && (
+              <p className="mr-auto text-sm text-destructive">{deleteError}</p>
+            )}
             <Button variant="outline" onClick={() => setConfirmOpen(false)} disabled={deleting}>
               Cancel
             </Button>

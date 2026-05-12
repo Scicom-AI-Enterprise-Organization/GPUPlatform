@@ -400,7 +400,7 @@ function RawYamlBlock({ yaml: src }: { yaml: string }) {
   function copy() {
     navigator.clipboard.writeText(src).then(() => {
       setCopied(true);
-      toast.success("YAML copied");
+      toast.success("YAML copied", { duration: 3000 });
       setTimeout(() => setCopied(false), 1500);
     });
   }

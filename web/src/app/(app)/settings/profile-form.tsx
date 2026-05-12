@@ -55,7 +55,7 @@ export function ProfileForm({
         setErr(msg ?? `Failed (${r.status})`);
         return;
       }
-      toast.success("Password changed — sign in again to continue");
+      toast.success("Password changed — sign in again to continue", { duration: 4000 });
       setTimeout(() => {
         window.location.href = "/login";
       }, 800);

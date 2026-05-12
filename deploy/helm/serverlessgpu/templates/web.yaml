@@ -24,6 +24,7 @@ metadata:
     {{- include "serverlessgpu.web.selectorLabels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.web.replicaCount }}
+  revisionHistoryLimit: 2
   selector:
     matchLabels:
       {{- include "serverlessgpu.web.selectorLabels" . | nindent 6 }}

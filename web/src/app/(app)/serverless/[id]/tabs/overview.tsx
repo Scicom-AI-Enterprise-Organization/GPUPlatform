@@ -220,7 +220,7 @@ function CopyButton({ text }: { text: string }) {
       size="icon-sm"
       onClick={() => {
         navigator.clipboard.writeText(text);
-        toast.success("Copied");
+        toast.success("Copied", { duration: 3000 });
       }}
     >
       <Copy className="h-3.5 w-3.5" />
@@ -361,11 +361,11 @@ function ScaleStrategyCard({ app }: { app: AppRecord }) {
 
   function save() {
     if (maxInvalid) {
-      toast.error("Max workers must be an integer between 1 and 20.");
+      toast.error("Max workers must be an integer between 1 and 20.", { duration: 5000 });
       return;
     }
     if (idleInvalid) {
-      toast.error("Idle timeout must be an integer 0–86400 seconds (0 = always-on).");
+      toast.error("Idle timeout must be an integer 0–86400 seconds (0 = always-on, { duration: 5000 }).");
       return;
     }
     startTransition(async () => {
@@ -374,10 +374,10 @@ function ScaleStrategyCard({ app }: { app: AppRecord }) {
         idle_timeout_s: parsedIdle,
       });
       if (!res.ok) {
-        toast.error(res.error);
+        toast.error(res.error, { duration: 5000 });
         return;
       }
-      toast.success("Scale strategy updated");
+      toast.success("Scale strategy updated", { duration: 3000 });
       setEditing(false);
       router.refresh();
     });
@@ -486,16 +486,16 @@ function EngineArgsCard({ app }: { app: AppRecord }) {
 
   function save() {
     if (tooLong) {
-      toast.error("Engine args too long (max 2048 chars).");
+      toast.error("Engine args too long (max 2048 chars, { duration: 5000 }).");
       return;
     }
     startTransition(async () => {
       const res = await updateAutoscaler(app.app_id, { vllm_args: value.trim() });
       if (!res.ok) {
-        toast.error(res.error);
+        toast.error(res.error, { duration: 5000 });
         return;
       }
-      toast.success("Engine args saved. Click Restart to apply now.");
+      toast.success("Engine args saved. Click Restart to apply now.", { duration: 3000 });
       setEditing(false);
       router.refresh();
     });
@@ -505,13 +505,13 @@ function EngineArgsCard({ app }: { app: AppRecord }) {
     startRestart(async () => {
       const res = await restartEndpoint(app.app_id);
       if (!res.ok) {
-        toast.error(res.error);
+        toast.error(res.error, { duration: 5000 });
         return;
       }
       if (res.drained === 0) {
-        toast.success("No live workers to restart — next cold start will use the latest config.");
+        toast.success("No live workers to restart — next cold start will use the latest config.", { duration: 3000 });
       } else {
-        toast.success(`Draining ${res.drained} worker${res.drained === 1 ? "" : "s"} — autoscaler will respawn.`);
+        toast.success(`Draining ${res.drained} worker${res.drained === 1 ? "" : "s"} — autoscaler will respawn.`, { duration: 3000 });
       }
       setConfirmRestart(false);
       router.refresh();

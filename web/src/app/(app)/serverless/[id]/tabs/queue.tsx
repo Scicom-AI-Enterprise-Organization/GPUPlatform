@@ -218,7 +218,7 @@ function Row({ item, position }: { item: Item; position?: number }) {
             className="font-mono text-xs hover:text-primary"
             onClick={() => {
               navigator.clipboard.writeText(item.request_id);
-              toast.success("Request ID copied");
+              toast.success("Request ID copied", { duration: 3000 });
             }}
             title="Copy request_id"
           >
@@ -281,7 +281,7 @@ function Row({ item, position }: { item: Item; position?: number }) {
                 className="ml-auto"
                 onClick={() => {
                   navigator.clipboard.writeText(JSON.stringify(item, null, 2));
-                  toast.success("Job JSON copied");
+                  toast.success("Job JSON copied", { duration: 3000 });
                 }}
               >
                 <Copy className="h-3 w-3" />

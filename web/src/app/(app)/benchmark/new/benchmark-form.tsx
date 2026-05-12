@@ -557,7 +557,7 @@ export function BenchmarkForm({
     if (!t) return;
     setYamlBuf(t.config_yaml);
     setMode("yaml");
-    toast.success(`Loaded template: ${t.name}`);
+    toast.success(`Loaded template: ${t.name}`, { duration: 3000 });
   }
 
   async function deleteTemplate(id: string) {
@@ -565,15 +565,15 @@ export function BenchmarkForm({
       await gateway.deleteBenchmarkTemplate(id);
       setTemplates((prev) => prev.filter((t) => t.id !== id));
       if (selectedTemplateId === id) setSelectedTemplateId("");
-      toast.success("Template deleted");
+      toast.success("Template deleted", { duration: 3000 });
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(e instanceof Error ? e.message : String(e)), { duration: 5000 };
     }
   }
 
   async function handleSaveTemplate() {
     if (!saveName.trim()) {
-      toast.error("Template needs a name");
+      toast.error("Template needs a name", { duration: 5000 });
       return;
     }
     const yamlToSave = mode === "form" ? formYaml : yamlBuf;
@@ -582,9 +582,9 @@ export function BenchmarkForm({
       setTemplates((prev) => [t, ...prev]);
       setSaveOpen(false);
       setSaveName("");
-      toast.success(`Saved template: ${t.name}`);
+      toast.success(`Saved template: ${t.name}`, { duration: 3000 });
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(e instanceof Error ? e.message : String(e)), { duration: 5000 };
     }
   }
 
@@ -725,7 +725,7 @@ export function BenchmarkForm({
             // mode aren't lost when flipping back.
             const parsed = parseYamlToForm(yamlBuf, form);
             if (parsed.parseError) {
-              toast.error(`Can't parse YAML: ${parsed.parseError}`);
+              toast.error(`Can't parse YAML: ${parsed.parseError}`, { duration: 5000 });
               return;
             }
             setForm(parsed.state);

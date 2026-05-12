@@ -26,6 +26,7 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
   const [pod, setPod] = useState<ComputePod>(initial);
   const [terminating, setTerminating] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [terminateError, setTerminateError] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
 
   // Poll while we're waiting for the pod to move out of an in-flight state.
@@ -61,9 +62,9 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
   async function copy(value: string, what: string) {
     try {
       await navigator.clipboard.writeText(value);
-      toast.success(`${what} copied`);
+      toast.success(`${what} copied`, { duration: 3000 });
     } catch {
-      toast.error("Couldn't access clipboard");
+      toast.error("Couldn't access clipboard", { duration: 4000 });
     }
   }
 
@@ -79,22 +80,21 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      toast.success("SSH key downloaded — chmod 600 before use");
+      toast.success("SSH key downloaded — chmod 600 before use", { duration: 4000 });
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
     }
   }
 
   async function terminate() {
     setTerminating(true);
+    setTerminateError(null);
     try {
       await gateway.deleteCompute(pod.id);
-      toast.success("Pod terminated");
       router.push("/compute");
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      setTerminateError(e instanceof Error ? e.message : String(e));
       setTerminating(false);
-      setConfirmOpen(false);
     }
   }
 
@@ -131,7 +131,15 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
         )}
       </div>
 
-      <Dialog open={confirmOpen} onOpenChange={(o) => !terminating && setConfirmOpen(o)}>
+      <Dialog
+        open={confirmOpen}
+        onOpenChange={(o) => {
+          if (!terminating) {
+            setConfirmOpen(o);
+            if (!o) setTerminateError(null);
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
@@ -146,6 +154,9 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
+            {terminateError && (
+              <p className="mr-auto text-sm text-destructive">{terminateError}</p>
+            )}
             <Button
               variant="outline"
               onClick={() => setConfirmOpen(false)}

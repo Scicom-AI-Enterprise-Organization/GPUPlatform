@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Box, Boxes, Cpu, Inbox, Loader2, RefreshCw, Trash2, User } from "lucide-react";
 import { avatarFor } from "@/lib/avatar";
-import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -65,6 +64,8 @@ export function ProvisionedList({
   const [confirm, setConfirm] = useState<Row | null>(null);
   const [pending, startTransition] = useTransition();
   const [refreshing, setRefreshing] = useState(false);
+  const [terminateError, setTerminateError] = useState<string | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
 
   const rows: Row[] = useMemo(() => {
     const computeRows: Row[] = computes
@@ -102,6 +103,7 @@ export function ProvisionedList({
 
   async function refresh() {
     setRefreshing(true);
+    setRefreshError(null);
     try {
       const [c, a] = await Promise.all([
         gateway.listCompute(),
@@ -110,7 +112,7 @@ export function ProvisionedList({
       setComputes(c);
       setApps(a);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      setRefreshError(e instanceof Error ? e.message : String(e));
     } finally {
       setRefreshing(false);
     }
@@ -119,6 +121,7 @@ export function ProvisionedList({
   function terminate() {
     if (!confirm) return;
     const target = confirm;
+    setTerminateError(null);
     startTransition(async () => {
       try {
         if (target.kind === "compute") {
@@ -128,29 +131,33 @@ export function ProvisionedList({
           await gateway.deleteApp(target.id);
           setApps((cur) => cur.filter((a) => a.app_id !== target.id));
         }
-        toast.success(`Terminated ${target.name}`);
         setConfirm(null);
         router.refresh();
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : String(e));
+        setTerminateError(e instanceof Error ? e.message : String(e));
       }
     });
   }
 
   return (
     <>
-      <div className="mb-3 flex items-center justify-between">
+      <div className="mb-3 flex items-center justify-between gap-3">
         <span className="text-xs text-muted-foreground">
           {rows.length} live · {computes.filter((c) => LIVE_COMPUTE_STATES.has(c.status)).length} compute · {apps.length} inference
         </span>
-        <Button variant="outline" size="sm" onClick={refresh} disabled={refreshing}>
-          {refreshing ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <RefreshCw className="h-4 w-4" />
+        <div className="flex items-center gap-3">
+          {refreshError && (
+            <span className="text-xs text-destructive">{refreshError}</span>
           )}
-          Refresh
-        </Button>
+          <Button variant="outline" size="sm" onClick={refresh} disabled={refreshing}>
+            {refreshing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="h-4 w-4" />
+            )}
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {rows.length === 0 ? (
@@ -188,6 +195,9 @@ export function ProvisionedList({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
+            {terminateError && (
+              <p className="mr-auto text-sm text-destructive">{terminateError}</p>
+            )}
             <Button
               variant="outline"
               onClick={() => setConfirm(null)}
