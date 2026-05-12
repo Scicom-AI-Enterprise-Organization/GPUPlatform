@@ -2,11 +2,13 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 import {
   CheckSquare,
   Cpu,
   Inbox,
+  LayoutGrid,
+  List,
   Loader2,
   MoreHorizontal,
   Search,
@@ -47,6 +49,15 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
   const [deleting, setDeleting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [view, setView] = useState<"rows" | "grid">("rows");
+  useEffect(() => {
+    const v = window.localStorage.getItem("sgpu_serverless_view");
+    if (v === "rows" || v === "grid") setView(v);
+  }, []);
+  const setViewPersist = (v: "rows" | "grid") => {
+    setView(v);
+    window.localStorage.setItem("sgpu_serverless_view", v);
+  };
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -126,6 +137,34 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
             </button>
           )}
         </div>
+        <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
+          <button
+            type="button"
+            onClick={() => setViewPersist("rows")}
+            className={cn(
+              "inline-flex items-center justify-center px-2.5 text-sm",
+              view === "rows" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50",
+            )}
+            title="List view"
+            aria-label="List view"
+            aria-pressed={view === "rows"}
+          >
+            <List className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewPersist("grid")}
+            className={cn(
+              "inline-flex items-center justify-center border-l border-input px-2.5 text-sm",
+              view === "grid" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50",
+            )}
+            title="Grid view"
+            aria-label="Grid view"
+            aria-pressed={view === "grid"}
+          >
+            <LayoutGrid className="h-4 w-4" />
+          </button>
+        </div>
         {selectMode ? (
           <button
             type="button"
@@ -200,7 +239,14 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
           <p className="text-sm text-muted-foreground">No endpoints match your search.</p>
         </div>
       ) : (
-        <div className="flex flex-col gap-3">
+        <div
+          className={cn(
+            "gap-3",
+            view === "rows"
+              ? "flex flex-col"
+              : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
+          )}
+        >
           {filtered.map((app) => (
             <EndpointCard
               key={app.app_id}

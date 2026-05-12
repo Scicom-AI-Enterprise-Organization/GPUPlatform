@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import yaml from "js-yaml";
-import { CheckSquare, Inbox, Search, Trash2, X } from "lucide-react";
+import { CheckSquare, Inbox, LayoutGrid, List, Search, Trash2, X } from "lucide-react";
+import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkRecord } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -59,6 +60,15 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const [deleting, setDeleting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [view, setView] = useState<"rows" | "grid">("rows");
+  useEffect(() => {
+    const v = window.localStorage.getItem("sgpu_bench_view");
+    if (v === "rows" || v === "grid") setView(v);
+  }, []);
+  const setViewPersist = (v: "rows" | "grid") => {
+    setView(v);
+    window.localStorage.setItem("sgpu_bench_view", v);
+  };
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -146,6 +156,34 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
             </option>
           ))}
         </select>
+        <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
+          <button
+            type="button"
+            onClick={() => setViewPersist("rows")}
+            className={cn(
+              "inline-flex items-center justify-center px-2.5 text-sm",
+              view === "rows" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50",
+            )}
+            title="List view"
+            aria-label="List view"
+            aria-pressed={view === "rows"}
+          >
+            <List className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewPersist("grid")}
+            className={cn(
+              "inline-flex items-center justify-center border-l border-input px-2.5 text-sm",
+              view === "grid" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50",
+            )}
+            title="Grid view"
+            aria-label="Grid view"
+            aria-pressed={view === "grid"}
+          >
+            <LayoutGrid className="h-4 w-4" />
+          </button>
+        </div>
         {selectMode ? (
           <button
             type="button"
@@ -229,7 +267,14 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
           <p className="text-sm text-muted-foreground">No benchmarks match your filters.</p>
         </div>
       ) : (
-        <div className="flex flex-col gap-3">
+        <div
+          className={cn(
+            "gap-3",
+            view === "rows"
+              ? "flex flex-col"
+              : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
+          )}
+        >
           {filtered.map((b) => (
             <BenchmarkRow
               key={b.id}

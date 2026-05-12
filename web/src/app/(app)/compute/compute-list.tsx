@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
-import { CheckSquare, Cpu, Inbox, Search, Trash2, User, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { CheckSquare, Cpu, Inbox, LayoutGrid, List, Search, Trash2, User, X } from "lucide-react";
 import type { ComputePod, ComputeStatus } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
@@ -54,6 +54,15 @@ export function ComputeList({ items }: { items: ComputePod[] }) {
   const [deleting, setDeleting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [view, setView] = useState<"rows" | "grid">("rows");
+  useEffect(() => {
+    const v = window.localStorage.getItem("sgpu_compute_view");
+    if (v === "rows" || v === "grid") setView(v);
+  }, []);
+  const setViewPersist = (v: "rows" | "grid") => {
+    setView(v);
+    window.localStorage.setItem("sgpu_compute_view", v);
+  };
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -135,6 +144,34 @@ export function ComputeList({ items }: { items: ComputePod[] }) {
             </option>
           ))}
         </select>
+        <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
+          <button
+            type="button"
+            onClick={() => setViewPersist("rows")}
+            className={cn(
+              "inline-flex items-center justify-center px-2.5 text-sm",
+              view === "rows" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50",
+            )}
+            title="List view"
+            aria-label="List view"
+            aria-pressed={view === "rows"}
+          >
+            <List className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewPersist("grid")}
+            className={cn(
+              "inline-flex items-center justify-center border-l border-input px-2.5 text-sm",
+              view === "grid" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50",
+            )}
+            title="Grid view"
+            aria-label="Grid view"
+            aria-pressed={view === "grid"}
+          >
+            <LayoutGrid className="h-4 w-4" />
+          </button>
+        </div>
         {selectMode ? (
           <button
             type="button"
@@ -218,7 +255,14 @@ export function ComputeList({ items }: { items: ComputePod[] }) {
           <p className="text-sm text-muted-foreground">No pods match your filters.</p>
         </div>
       ) : (
-        <ul className="flex flex-col gap-3">
+        <ul
+          className={cn(
+            "gap-3",
+            view === "rows"
+              ? "flex flex-col"
+              : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
+          )}
+        >
           {filtered.map((p) => (
             <PodRow
               key={p.id}
