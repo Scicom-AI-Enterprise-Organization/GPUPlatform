@@ -21,8 +21,8 @@ dependencies = [
     "boto3>=1.34",
     "pyyaml>=6.0",
     # llm-benchmaq is the CLI we shell out to for benchmark runs. Public repo;
-    # pulls in paramiko/scp/etc. Pinned to main since the project is pre-1.0.
-    "benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git",
+    # pulls in paramiko/scp/etc.
+    "benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@069fcf6",
 ]
 
 [project.scripts]
