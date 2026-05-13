@@ -238,20 +238,36 @@ def _resolve_config(
             rem["key_filename"] = _ssh_key_path()
     else:
         # Bare-metal VM: drop runpod block (irrelevant + would confuse benchmaq)
-        # and rewrite remote to point at the VM. Preserve any uv/dependencies
-        # the user (or form-mode renderYaml) already set.
+        # and rewrite remote to use benchmaq's `backend: ssh` runner — a
+        # paramiko-based path with proper live-streaming, idempotent
+        # uv+benchmaq install on the VM, and zero dependency on pyremote.
+        # benchmaq[vllm] pulls vLLM transitively via the extra; we pin the
+        # vllm version explicitly when the user picked one in the form.
         cfg.pop("runpod", None)
         rem = cfg.setdefault("remote", {})
+        rem["backend"] = "ssh"
         rem["host"] = vm_target["host"]
         rem["port"] = int(vm_target.get("port") or 22)
         rem["username"] = vm_target.get("user", "root")
         rem["key_filename"] = vm_target["key_filename"]
-        # benchmaq needs *something* to install — if the form didn't render a
-        # block, fall back to a vLLM-only setup.
-        if not rem.get("uv"):
-            rem["uv"] = {"path": "~/.benchmark-venv", "python_version": "3.11"}
-        if not rem.get("dependencies"):
-            rem["dependencies"] = ["vllm", "pyyaml", "requests", "huggingface_hub[hf_transfer]"]
+        uv = rem.setdefault("uv", {})
+        uv.setdefault("path", "~/.bench-venv")
+        uv.setdefault("python_version", "3.11")
+        uv.setdefault(
+            "benchmaq_ref",
+            "git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@75d1353",
+        )
+        # If the form rendered a vLLM pin under remote.dependencies (legacy
+        # path), surface it as uv.vllm_version so the new ssh backend picks
+        # it up. Otherwise leave unset = latest.
+        if "vllm_version" not in uv:
+            for dep in (rem.get("dependencies") or []):
+                if isinstance(dep, str) and dep.startswith("vllm==") and len(dep) > 6:
+                    uv["vllm_version"] = dep.split("==", 1)[1].strip()
+                    break
+        # The new backend installs benchmaq[vllm] + vllm itself; the legacy
+        # `dependencies` field is unused here.
+        rem.pop("dependencies", None)
 
         # `/workspace/...` is RunPod's per-pod mount and doesn't exist on
         # bare-metal VMs (where the SSH user is typically `ubuntu` and only

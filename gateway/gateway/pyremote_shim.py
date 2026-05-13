@@ -104,22 +104,30 @@ def install() -> None:
             return
         deps_str = " ".join(f'"{dep}"' for dep in self.dependencies)
         if self.uv:
+            # `uv -v` forces verbose output (resolve + per-wheel download
+            # progress). Without it uv suppresses progress when stdout isn't
+            # a TTY, which is exactly the case under SSH/subprocess capture.
             cmd = (
                 "source $HOME/.local/bin/env 2>/dev/null || true\n"
                 f"source {self.uv.activate_path}\n"
-                f"uv pip install {deps_str}"
+                f"uv -v pip install {deps_str}"
             )
         elif self.venv:
-            cmd = f"{self.venv.pip_path} install {deps_str}"
+            cmd = f"{self.venv.pip_path} install -v {deps_str}"
         else:
-            cmd = f"{self._python_path} -m pip install {deps_str}"
+            cmd = f"{self._python_path} -m pip install -v {deps_str}"
 
         print(f"[shim] installing {self.dependencies}", flush=True)
-        # stream=True makes pyremote's _run_command print lines live as they
-        # arrive on stdout/stderr — uv's download progress + resolver output
-        # show up in the bench log in real time. The returned stdout_data /
-        # stderr_data are the joined captured lines (for the error message).
+        # stream=True makes pyremote's _run_command print lines live; the
+        # final dump below is a safety net in case the live stream path
+        # doesn't bubble up under some SSH/proxy edge case.
         exit_status, stdout_data, stderr_data = self._run_command(cmd, timeout=600, stream=True)
+        if stdout_data:
+            print("[shim] --- uv stdout (captured) ---", flush=True)
+            print(stdout_data, flush=True)
+        if stderr_data:
+            print("[shim] --- uv stderr (captured) ---", file=_sys.stderr, flush=True)
+            print(stderr_data, file=_sys.stderr, flush=True)
         print(f"[shim] install rc={exit_status}", flush=True)
 
         if exit_status != 0:
