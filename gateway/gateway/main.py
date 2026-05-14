@@ -73,6 +73,10 @@ class CreateAppRequest(BaseModel):
     # Per-worker disk sizing. None = provider default.
     container_disk_gb: Optional[int] = None
     volume_gb: Optional[int] = None
+    # Per-app cloud-account selection (kind=runpod / pi provider row).
+    # NULL = use gateway-wide env keys. The autoscaler singleton still uses
+    # env today — per-app routing through resolve_cloud_creds is a follow-up.
+    provider_id: Optional[str] = None
 
 
 class CreateAppResponse(BaseModel):
@@ -95,6 +99,7 @@ class AppRecord(BaseModel):
     cloud_type: Optional[str] = None
     container_disk_gb: Optional[int] = None
     volume_gb: Optional[int] = None
+    provider_id: Optional[str] = None
     created_at: str
     owner: str
 
@@ -257,6 +262,7 @@ def _to_app_record(app: App) -> AppRecord:
         cloud_type=getattr(app, "cloud_type", None),
         container_disk_gb=getattr(app, "container_disk_gb", None),
         volume_gb=getattr(app, "volume_gb", None),
+        provider_id=getattr(app, "provider_id", None),
         created_at=app.created_at.isoformat() if app.created_at else "",
         owner=app.owner.username if app.owner else "",
     )
@@ -889,6 +895,20 @@ async def create_app(
         raise HTTPException(status_code=400, detail="container_disk_gb must be 1..2000")
     if req.volume_gb is not None and (req.volume_gb < 0 or req.volume_gb > 4000):
         raise HTTPException(status_code=400, detail="volume_gb must be 0..4000")
+    # Validate provider_id if the user picked one. Today the autoscaler
+    # still builds a global provider from env, so per-app routing is a
+    # no-op at run-time — but persist it so the UI stays consistent and
+    # the follow-up wiring can pick it up without re-asking the user.
+    if req.provider_id:
+        from .db import Provider
+        prov = await session.get(Provider, req.provider_id)
+        if prov is None:
+            raise HTTPException(status_code=400, detail="unknown provider_id")
+        if prov.kind not in ("runpod", "pi"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"provider {req.provider_id} is kind={prov.kind}, serverless requires runpod or pi",
+            )
     record = App(
         app_id=req.name,
         owner_id=user.id,
@@ -905,6 +925,7 @@ async def create_app(
         cloud_type=cloud_type_norm,
         container_disk_gb=req.container_disk_gb,
         volume_gb=req.volume_gb,
+        provider_id=req.provider_id,
         created_at=datetime.now(timezone.utc),
     )
     session.add(record)

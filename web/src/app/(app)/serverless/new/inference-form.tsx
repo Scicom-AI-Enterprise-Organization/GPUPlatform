@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { AlertTriangle, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -28,6 +28,8 @@ import { cn } from "@/lib/utils";
 import { deployEndpoint } from "../actions";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
+import { gateway } from "@/lib/gateway";
+import type { ProviderRecord } from "@/lib/types";
 
 // vLLM is what the live RunPod template runs. SGLang is a placeholder for a
 // future template — keep it disabled so the option is visible but inert.
@@ -141,7 +143,13 @@ export function InferenceForm() {
   const [idleInput, setIdleInput] = useState("0");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [enableMetrics, setEnableMetrics] = useState(true);
+  const [providerId, setProviderId] = useState<string>("");
+  const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [vllm, setVllm] = useState({ ...DEFAULT_VLLM_ARGS });
+
+  useEffect(() => {
+    gateway.listProviders().then(setProviders).catch(() => {});
+  }, []);
   const [unavailableModal, setUnavailableModal] = useState<
     | { gpu: string; gpu_count: number; reason: string }
     | null
@@ -226,6 +234,7 @@ export function InferenceForm() {
         cloud_type: cloudType,
         container_disk_gb: parsedDisk,
         volume_gb: parsedVolume,
+        provider_id: providerId || null,
       });
       if (!res.ok) {
         if (res.unavailable) {
@@ -290,6 +299,39 @@ export function InferenceForm() {
                   </SelectContent>
                 </Select>
               </div>
+            </Field>
+
+            <Field
+              label="RunPod account (API key)"
+              hint="Which RunPod provider to bill against. Stored on the endpoint row. Note: the autoscaler currently still uses the gateway-default key at runtime — per-app routing is the next refactor."
+            >
+              <Select
+                value={providerId || "__default__"}
+                onValueChange={(v) => setProviderId(v === "__default__" ? "" : v)}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__default__">Gateway default</SelectItem>
+                  {providers
+                    .filter((p) => p.kind === "runpod")
+                    .map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.name}
+                        {p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+              {providers.filter((p) => p.kind === "runpod").length === 0 && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  None registered.{" "}
+                  <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">
+                    Add a RunPod account →
+                  </a>
+                </p>
+              )}
             </Field>
 
             <Field

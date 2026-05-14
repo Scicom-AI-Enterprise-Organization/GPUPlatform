@@ -1,16 +1,22 @@
 """HTTP routes for user-registered cloud providers.
 
-For phase 1 only VM (bare-metal SSH) is implemented. Adding RunPod/PI later
-means another `_validate_*_config` branch and a `kind` value the test path
-recognises.
+Three kinds today:
+- `vm`   — bare-metal SSH, user uploads a PEM.
+- `runpod` / `pi` — cloud accounts, user pastes an API key. Gateway validates
+  it with a cheap GET and auto-generates an ed25519 keypair so spawned pods
+  can be SSH'd later without a manual upload step.
 """
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -27,7 +33,8 @@ logger = logging.getLogger("gateway.providers")
 router = APIRouter(prefix="/v1/providers", tags=["providers"])
 
 VM_DEFAULT_PORT = 22
-SUPPORTED_KINDS = ("vm",)
+SUPPORTED_KINDS = ("vm", "runpod", "pi")
+API_KEY_KINDS = ("runpod", "pi")
 
 
 class VmConfig(BaseModel):
@@ -39,27 +46,33 @@ class VmConfig(BaseModel):
     private_key: Optional[str] = None
 
 
+class ApiKeyConfig(BaseModel):
+    api_key: Optional[str] = None
+
+
 class CreateProviderRequest(BaseModel):
     name: str
-    kind: str  # "vm" only for now
+    kind: str  # "vm" | "runpod" | "pi"
     vm: Optional[VmConfig] = None
+    api: Optional[ApiKeyConfig] = None
 
 
 class TestProviderRequest(BaseModel):
     """Test against an arbitrary config without persisting it. The frontend
-    calls this from the new-provider form so users can verify SSH before they
-    commit to saving the row.
+    calls this from the new-provider form so users can verify SSH (vm) or
+    the API key (runpod/pi) before they commit to saving the row.
 
     Alternately, callers may pass `provider_id` to test an already-saved
-    provider — useful for the list page's per-row "Re-test" button later.
+    provider — useful for the list page's per-row "Re-test" button.
     """
     kind: str
     vm: Optional[VmConfig] = None
+    api: Optional[ApiKeyConfig] = None
     provider_id: Optional[str] = None
 
 
 class ProviderRecord(BaseModel):
-    """Public shape. Never includes the private key body."""
+    """Public shape. Never includes the private key body or the raw API key."""
     id: str
     name: str
     kind: str
@@ -71,6 +84,11 @@ class ProviderRecord(BaseModel):
     user: Optional[str] = None
     gpus: Optional[list[str]] = None
     gpu_count: Optional[int] = None
+    # API-key-kind summary; absent for vm.
+    api_key_last4: Optional[str] = None
+    ssh_pub: Optional[str] = None
+    validated_at: Optional[str] = None
+    account_email: Optional[str] = None
 
 
 class TestProviderResponse(BaseModel):
@@ -97,6 +115,12 @@ class AvailabilityResponse(BaseModel):
 
 def _to_record(p: Provider, owner_username: str) -> ProviderRecord:
     cfg = p.config or {}
+    api_key_last4: Optional[str] = None
+    if p.kind in API_KEY_KINDS and cfg.get("api_key_enc"):
+        try:
+            api_key_last4 = crypto.decrypt(cfg["api_key_enc"])[-4:]
+        except Exception:
+            api_key_last4 = None
     return ProviderRecord(
         id=p.id,
         name=p.name,
@@ -108,6 +132,10 @@ def _to_record(p: Provider, owner_username: str) -> ProviderRecord:
         user=cfg.get("user"),
         gpus=cfg.get("gpus"),
         gpu_count=cfg.get("gpu_count"),
+        api_key_last4=api_key_last4,
+        ssh_pub=cfg.get("ssh_pub"),
+        validated_at=cfg.get("validated_at"),
+        account_email=cfg.get("account_email"),
     )
 
 
@@ -121,6 +149,69 @@ def _validate_vm(vm: Optional[VmConfig]) -> VmConfig:
     if not vm.user.strip():
         raise HTTPException(status_code=400, detail="vm.user is required")
     return vm
+
+
+def _gen_ssh_keypair(label: str) -> tuple[str, str]:
+    """Return (public_openssh, private_openssh_pem). Used so api-key providers
+    have an SSH key available for spawned pods without forcing the user to
+    upload one."""
+    sk = Ed25519PrivateKey.generate()
+    priv = sk.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    pub_raw = sk.public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH,
+        format=serialization.PublicFormat.OpenSSH,
+    ).decode()
+    return f"{pub_raw} {label}", priv
+
+
+async def _runpod_validate(api_key: str) -> tuple[bool, str, dict]:
+    """Cheap GET that succeeds on any valid RunPod key. Lists 1 pod —
+    always authorised regardless of whether the account has any pods."""
+    base = os.environ.get("RUNPOD_API_BASE", "https://rest.runpod.io/v1").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as cli:
+            r = await cli.get(
+                f"{base}/pods",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except httpx.HTTPError as e:
+        return False, f"network error: {e}", {}
+    if r.status_code == 200:
+        return True, "ok", {}
+    if r.status_code in (401, 403):
+        return False, "unauthorized", {}
+    return False, f"HTTP {r.status_code}: {r.text[:200]}", {}
+
+
+async def _pi_validate(api_key: str) -> tuple[bool, str, dict]:
+    """Cheap GET against Prime Intellect — list pods with limit=1."""
+    base = os.environ.get("PI_API_BASE", "https://api.primeintellect.ai").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as cli:
+            r = await cli.get(
+                f"{base}/api/v1/pods/",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"limit": 1, "offset": 0},
+            )
+    except httpx.HTTPError as e:
+        return False, f"network error: {e}", {}
+    if r.status_code == 200:
+        return True, "ok", {}
+    if r.status_code in (401, 403):
+        return False, "unauthorized", {}
+    return False, f"HTTP {r.status_code}: {r.text[:200]}", {}
+
+
+async def _validate_api_key(kind: str, api_key: str) -> tuple[bool, str, dict]:
+    if kind == "runpod":
+        return await _runpod_validate(api_key)
+    if kind == "pi":
+        return await _pi_validate(api_key)
+    raise HTTPException(status_code=400, detail=f"kind {kind} not an api-key kind")
 
 
 @router.get("", response_model=list[ProviderRecord])
@@ -159,6 +250,7 @@ async def create_provider(
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="name is required")
 
+    pid = f"prov-{secrets.token_hex(4)}"
     config: dict
     if req.kind == "vm":
         vm = _validate_vm(req.vm)
@@ -170,10 +262,25 @@ async def create_provider(
             "user": vm.user.strip(),
             "private_key_enc": crypto.encrypt(vm.private_key),
         }
+    elif req.kind in API_KEY_KINDS:
+        api = req.api or ApiKeyConfig()
+        if not api.api_key or not api.api_key.strip():
+            raise HTTPException(status_code=400, detail="api.api_key is required")
+        key = api.api_key.strip()
+        ok, msg, account = await _validate_api_key(req.kind, key)
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"{req.kind} key invalid: {msg}")
+        ssh_pub, ssh_priv = _gen_ssh_keypair(label=f"gateway@{pid}")
+        config = {
+            "api_key_enc": crypto.encrypt(key),
+            "ssh_pub": ssh_pub,
+            "ssh_priv_enc": crypto.encrypt(ssh_priv),
+            "validated_at": datetime.now(timezone.utc).isoformat(),
+            "account_email": account.get("email") if isinstance(account, dict) else None,
+        }
     else:  # pragma: no cover — guarded above
         raise HTTPException(status_code=400, detail=f"kind {req.kind} not implemented")
 
-    pid = f"prov-{secrets.token_hex(4)}"
     row = Provider(
         id=pid,
         owner_id=user.id,
@@ -223,6 +330,36 @@ async def test_provider(
     if req.kind not in SUPPORTED_KINDS:
         raise HTTPException(status_code=400, detail=f"unsupported kind: {req.kind}")
 
+    # ---- API-key kinds: cheap HTTP probe, no SSH ----
+    if req.kind in API_KEY_KINDS:
+        if req.provider_id:
+            row = await session.get(Provider, req.provider_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="provider not found")
+            if row.kind != req.kind:
+                raise HTTPException(status_code=400, detail="kind mismatch")
+            enc = (row.config or {}).get("api_key_enc")
+            if not enc:
+                raise HTTPException(status_code=500, detail="provider missing stored key")
+            api_key = crypto.decrypt(enc)
+        else:
+            api = req.api or ApiKeyConfig()
+            if not api.api_key or not api.api_key.strip():
+                raise HTTPException(status_code=400, detail="api.api_key required for test")
+            api_key = api.api_key.strip()
+        ok, msg, _ = await _validate_api_key(req.kind, api_key)
+        if req.provider_id and ok:
+            row = await session.get(Provider, req.provider_id)
+            if row is not None:
+                cfg = dict(row.config or {})
+                cfg["validated_at"] = datetime.now(timezone.utc).isoformat()
+                row.config = cfg
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(row, "config")
+                await session.commit()
+        return TestProviderResponse(ok=ok, message=msg, gpus=[], gpu_count=0)
+
+    # ---- VM: SSH probe (existing path) ----
     # Resolve config: either inline (new-provider form) or from a saved row.
     if req.provider_id:
         row = await session.get(Provider, req.provider_id)
@@ -283,8 +420,16 @@ async def provider_availability(
     row = await session.get(Provider, provider_id)
     if row is None:
         raise HTTPException(status_code=404, detail="provider not found")
+    if row.kind in API_KEY_KINDS:
+        enc = (row.config or {}).get("api_key_enc")
+        if not enc:
+            raise HTTPException(status_code=500, detail="provider missing stored key")
+        ok, msg, _ = await _validate_api_key(row.kind, crypto.decrypt(enc))
+        return AvailabilityResponse(
+            ok=ok, message=msg, gpus=[], checked_at=datetime.now(timezone.utc).timestamp(),
+        )
     if row.kind != "vm":
-        raise HTTPException(status_code=400, detail="availability check only supported for kind=vm")
+        raise HTTPException(status_code=400, detail="availability check not supported for kind={}".format(row.kind))
     cfg = row.config or {}
     enc = cfg.get("private_key_enc")
     if not enc:

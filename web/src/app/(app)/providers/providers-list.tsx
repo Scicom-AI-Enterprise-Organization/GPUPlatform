@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { Cloud, Cpu, MoreHorizontal, Server, Trash2, User } from "lucide-react";
+import { Cloud, Copy, Cpu, KeyRound, MoreHorizontal, Server, Trash2, User } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -29,6 +29,16 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, string>>({});
+  const [showPub, setShowPub] = useState<Record<string, boolean>>({});
+
+  const onCopyPub = async (id: string, pub: string) => {
+    try {
+      await navigator.clipboard.writeText(pub);
+      setTestResult((prev) => ({ ...prev, [id]: "OK · public key copied" }));
+    } catch {
+      // ignore
+    }
+  };
 
   const onDelete = async () => {
     if (!target) return;
@@ -82,8 +92,12 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
                   <div className="flex items-center gap-2">
                     <span className="truncate font-medium text-foreground">{p.name}</span>
                     <span className="inline-flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                      {p.kind === "vm" ? <Server className="h-3 w-3" /> : <Cloud className="h-3 w-3" />}
-                      {p.kind}
+                      {p.kind === "vm" ? (
+                        <Server className="h-3 w-3" />
+                      ) : (
+                        <Cloud className="h-3 w-3" />
+                      )}
+                      {p.kind === "pi" ? "prime intellect" : p.kind}
                     </span>
                   </div>
                   <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -132,7 +146,7 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
                   {p.user}@{p.host}:{p.port}
                 </span>
               )}
-              {p.gpu_count != null && p.gpu_count > 0 && (
+              {p.kind === "vm" && p.gpu_count != null && p.gpu_count > 0 && (
                 <span className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 text-xs">
                   <Cpu className="h-3 w-3 text-muted-foreground" />
                   <span className="font-mono">
@@ -141,12 +155,51 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
                   </span>
                 </span>
               )}
-              {(p.gpu_count == null || p.gpu_count === 0) && (
+              {p.kind === "vm" && (p.gpu_count == null || p.gpu_count === 0) && (
                 <span className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground">
                   not yet probed
                 </span>
               )}
+              {(p.kind === "runpod" || p.kind === "pi") && p.api_key_last4 && (
+                <span className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 font-mono text-xs">
+                  <KeyRound className="h-3 w-3 text-muted-foreground" />
+                  ****{p.api_key_last4}
+                </span>
+              )}
+              {p.account_email && (
+                <span className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground">
+                  {p.account_email}
+                </span>
+              )}
             </div>
+
+            {(p.kind === "runpod" || p.kind === "pi") && p.ssh_pub && (
+              <div className="mt-2 text-xs">
+                <button
+                  type="button"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() =>
+                    setShowPub((prev) => ({ ...prev, [p.id]: !prev[p.id] }))
+                  }
+                >
+                  {showPub[p.id] ? "Hide" : "Show"} SSH pubkey
+                </button>
+                {showPub[p.id] && (
+                  <div className="mt-1 flex items-start gap-2 rounded-md bg-muted/50 p-2 font-mono text-[11px]">
+                    <span className="flex-1 break-all">{p.ssh_pub}</span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => onCopyPub(p.id, p.ssh_pub!)}
+                      aria-label="Copy public key"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {testResult[p.id] && (
               <div

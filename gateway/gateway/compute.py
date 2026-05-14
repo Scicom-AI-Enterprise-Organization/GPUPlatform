@@ -139,6 +139,8 @@ class ComputePod(Base):
     )
     ready_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     terminated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Per-pod cloud-account selection. NULL = platform default (env var).
+    provider_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
 
 
 # ---------- RunPod REST helpers ----------------------------------------
@@ -148,7 +150,26 @@ def _api_base() -> str:
     return os.environ.get("RUNPOD_API_BASE", "https://rest.runpod.io/v1").rstrip("/")
 
 
+async def _resolve_api_key(provider_id: Optional[str]) -> str:
+    """Look up the right RunPod key for a given compute pod row.
+
+    Falls back to the gateway env var when no provider_id is set so the
+    legacy single-tenant path keeps working without a provider registered."""
+    if provider_id:
+        from .provider_resolve import resolve_cloud_creds
+        from .db import session_factory
+        async with session_factory()() as s:
+            creds = await resolve_cloud_creds(s, provider_id, "runpod")
+        return creds.api_key
+    k = os.environ.get("RUNPOD_API_KEY", "").strip()
+    if not k:
+        raise RuntimeError("RUNPOD_API_KEY not set — Compute requires a RunPod provider or env key")
+    return k
+
+
 def _api_key() -> str:
+    """Synchronous env-only lookup. Retained for the few startup-time call
+    sites that don't yet have a provider_id context."""
     k = os.environ.get("RUNPOD_API_KEY", "").strip()
     if not k:
         raise RuntimeError("RUNPOD_API_KEY not set — Compute requires a real RunPod account")
@@ -159,11 +180,17 @@ def _name_prefix() -> str:
     return os.environ.get("COMPUTE_NAME_PREFIX", "sgpu-compute")
 
 
-def _client() -> httpx.AsyncClient:
+def _client(api_key: Optional[str] = None) -> httpx.AsyncClient:
+    """Build an httpx client for the RunPod REST API.
+
+    Pass `api_key` to use a provider-specific key; otherwise falls back to
+    the gateway env var. Async callers that know the compute pod's
+    provider_id should resolve via _resolve_api_key() first and pass it in.
+    """
     return httpx.AsyncClient(
         base_url=_api_base(),
         headers={
-            "Authorization": f"Bearer {_api_key()}",
+            "Authorization": f"Bearer {api_key or _api_key()}",
             "Content-Type": "application/json",
         },
         timeout=30.0,
@@ -237,6 +264,25 @@ async def _create_pod(pod_id: str) -> None:
         row = await s.get(ComputePod, pod_id)
         if row is None:
             return
+    # Resolve RunPod creds up front so we use the same account through the
+    # whole provision + poll cycle even if the user later edits providers.
+    try:
+        api_key = await _resolve_api_key(row.provider_id)
+    except Exception as e:
+        await _mark_failed(pod_id, f"runpod creds resolve failed: {e}"[:4000])
+        return
+    # When the pod was launched via a kind=runpod provider, fetch its
+    # generated public key so we can inject it into the pod's
+    # authorized_keys via env.PUBLIC_KEY. SSH-info later returns the
+    # matching private half.
+    ssh_pub: Optional[str] = None
+    if row.provider_id:
+        from . import crypto
+        from .db import Provider
+        async with session_factory()() as s:
+            prov = await s.get(Provider, row.provider_id)
+            if prov is not None:
+                ssh_pub = (prov.config or {}).get("ssh_pub")
 
     # JupyterLab password is generated up front so we can persist it on the
     # row before the pod actually exists — that way if the create succeeds
@@ -262,10 +308,16 @@ async def _create_pod(pod_id: str) -> None:
         "ports": ["22/tcp", "8888/http"],
         # JUPYTER_PASSWORD is the contract runpod/pytorch start.sh uses to
         # decide whether to launch JupyterLab. Setting it = always-on.
-        "env": {"JUPYTER_PASSWORD": jupyter_password},
+        # PUBLIC_KEY (when present) is what runpod/pytorch start.sh appends
+        # to ~/.ssh/authorized_keys so the user can SSH in with the key we
+        # generated for this provider row.
+        "env": {
+            "JUPYTER_PASSWORD": jupyter_password,
+            **({"PUBLIC_KEY": ssh_pub} if ssh_pub else {}),
+        },
     }
 
-    async with _client() as cli:
+    async with _client(api_key=api_key) as cli:
         try:
             r = await cli.post("/pods", json=body)
         except Exception as e:
@@ -372,8 +424,13 @@ async def _mark_failed(pod_id: str, error: str) -> None:
     logger.warning("compute %s: failed — %s", pod_id, error)
 
 
-async def _delete_runpod(runpod_id: str) -> None:
-    async with _client() as cli:
+async def _delete_runpod(runpod_id: str, provider_id: Optional[str] = None) -> None:
+    try:
+        api_key = await _resolve_api_key(provider_id)
+    except Exception as e:
+        logger.warning("compute: delete %s — cred resolve failed: %s", runpod_id, e)
+        return
+    async with _client(api_key=api_key) as cli:
         try:
             r = await cli.delete(f"/pods/{runpod_id}")
             if r.status_code >= 400 and r.status_code != 404:
@@ -422,6 +479,9 @@ class CreateComputeRequest(BaseModel):
     volume_gb: int = Field(default=0, ge=0, le=2000)
     template_id: str = Field(default="pytorch-2.4-cuda12.4")
     cloud_type: str = Field(default="COMMUNITY", pattern=r"^(COMMUNITY|SECURE)$")
+    # NULL = use the gateway-wide RUNPOD_API_KEY env var. When set, must
+    # refer to a kind=runpod Provider row.
+    provider_id: Optional[str] = None
 
 
 class ComputeRecord(BaseModel):
@@ -445,6 +505,7 @@ class ComputeRecord(BaseModel):
     cost_per_hr: Optional[float] = None
     error_text: Optional[str] = None
     reject_reason: Optional[str] = None
+    provider_id: Optional[str] = None
     created_by: str
     created_at: str
     ready_at: Optional[str] = None
@@ -506,6 +567,7 @@ def _to_record(p: ComputePod, owner_username: str) -> ComputeRecord:
         cost_per_hr=p.cost_per_hr,
         error_text=p.error_text,
         reject_reason=p.reject_reason,
+        provider_id=p.provider_id,
         created_by=owner_username,
         created_at=p.created_at.isoformat() if p.created_at else "",
         ready_at=p.ready_at.isoformat() if p.ready_at else None,
@@ -607,10 +669,22 @@ async def create_compute(
     user: User = Depends(require_section("compute")),
     session: AsyncSession = Depends(get_session),
 ):
-    if not os.environ.get("RUNPOD_API_KEY", "").strip():
+    # Either body.provider_id resolves to a runpod-kind row, or the gateway
+    # env var is set — accept either.
+    if body.provider_id:
+        from .db import Provider
+        prov = await session.get(Provider, body.provider_id)
+        if prov is None:
+            raise HTTPException(status_code=400, detail={"error": "unknown provider_id"})
+        if prov.kind != "runpod":
+            raise HTTPException(
+                status_code=400,
+                detail={"error": f"provider {body.provider_id} is kind={prov.kind}, compute requires runpod"},
+            )
+    elif not os.environ.get("RUNPOD_API_KEY", "").strip():
         raise HTTPException(
             status_code=503,
-            detail={"error": "RUNPOD_API_KEY not configured on gateway"},
+            detail={"error": "no RunPod credentials — register a provider or set RUNPOD_API_KEY"},
         )
 
     tpl = _resolve_template(body.template_id)
@@ -640,6 +714,7 @@ async def create_compute(
         cloud_type=body.cloud_type,
         status="pending_approval" if needs_approval else "creating",
         owner_id=user.id,
+        provider_id=body.provider_id,
     )
     session.add(row)
     await session.commit()
@@ -730,15 +805,35 @@ async def get_ssh_info(
             status_code=409,
             detail={"error": "pod is not ready for SSH yet", "status": p.status},
         )
-    key_path = _ssh_key_path()
-    try:
-        private_key = Path(key_path).read_text()
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": f"SSH key not found at {key_path} on gateway"},
-        )
-    cmd = f"ssh -i ~/.ssh/sgpu-runpod -p {p.ssh_port} {p.ssh_user}@{p.public_ip}"
+    # When the pod was spawned via a kind=runpod provider, serve THAT
+    # provider's generated private key — it's the one whose public half we
+    # injected into the pod's authorized_keys at create time. Falls back to
+    # the gateway's default file-based key for legacy / env-spawned pods.
+    private_key: Optional[str] = None
+    if p.provider_id:
+        from . import crypto
+        from .db import Provider
+        prov = await session.get(Provider, p.provider_id)
+        if prov is not None:
+            enc = (prov.config or {}).get("ssh_priv_enc")
+            if enc:
+                try:
+                    private_key = crypto.decrypt(enc)
+                except Exception:
+                    private_key = None
+    if private_key is None:
+        key_path = _ssh_key_path()
+        try:
+            private_key = Path(key_path).read_text()
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": f"SSH key not found at {key_path} on gateway"},
+            )
+    # Suggest a filename that hints at the source so users with multiple
+    # providers don't overwrite a stash that points at someone else's pods.
+    key_hint = f"sgpu-{p.provider_id}" if p.provider_id else "sgpu-runpod"
+    cmd = f"ssh -i ~/.ssh/{key_hint} -p {p.ssh_port} {p.ssh_user}@{p.public_ip}"
     return SshInfoResponse(
         ssh_command=cmd,
         ssh_user=p.ssh_user,
@@ -761,6 +856,7 @@ async def delete_compute(
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
 
     runpod_id = p.runpod_pod_id
+    pod_provider_id = p.provider_id
     pod_name = p.name
     # Snapshot billing inputs BEFORE we overwrite terminated_at — the audit
     # helper measures cost as (terminated_at or now - ready_at) × rate, and
@@ -773,7 +869,7 @@ async def delete_compute(
 
     if runpod_id:
         # Fire-and-forget — gateway shouldn't block on RunPod's API.
-        asyncio.create_task(_delete_runpod(runpod_id))
+        asyncio.create_task(_delete_runpod(runpod_id, provider_id=pod_provider_id))
 
     details: dict[str, Any] = {}
     if runpod_id:

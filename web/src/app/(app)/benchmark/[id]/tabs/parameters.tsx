@@ -131,7 +131,7 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
         </p>
       </div>
 
-      {bench.provider_id ? (
+      {bench.provider_id && provider?.kind === "vm" ? (
         <ParamsCard
           icon={<Server className="h-4 w-4" />}
           title="Pod (bare metal)"
@@ -180,9 +180,32 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
         <ParamsCard
           icon={<Server className="h-4 w-4" />}
           title="Pod"
-          description="What benchmaq spawned on RunPod."
+          description={
+            bench.provider_id
+              ? `What benchmaq spawned on RunPod (account: ${provider?.name ?? bench.provider_id}).`
+              : "What benchmaq spawned on RunPod."
+          }
+          action={
+            bench.provider_id && provider?.kind === "runpod" ? (
+              <Badge variant="secondary" className="font-mono text-[10px]">
+                RunPod
+              </Badge>
+            ) : undefined
+          }
         >
           <KvGrid>
+            {bench.provider_id && (
+              <Kv
+                label="Account (API key)"
+                value={
+                  provider
+                    ? `${provider.name}${provider.api_key_last4 ? ` · ****${provider.api_key_last4}` : ""}`
+                    : bench.provider_id
+                }
+                mono
+                wide
+              />
+            )}
             <Kv label="GPU type" value={pod.gpu_type} mono />
             <Kv label="GPU count" value={pod.gpu_count} />
             <Kv

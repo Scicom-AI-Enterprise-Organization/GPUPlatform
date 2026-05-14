@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -17,7 +17,7 @@ import {
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
-import type { ComputeTemplate } from "@/lib/types";
+import type { ComputeTemplate, ProviderRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // Same option list as the benchmark form so users see one consistent picker.
@@ -43,8 +43,14 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
     templates[0]?.id ?? "pytorch-2.4-cuda12.4",
   );
   const [secureCloud, setSecureCloud] = useState(false);
+  const [providerId, setProviderId] = useState<string>("");
+  const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+
+  useEffect(() => {
+    gateway.listProviders().then(setProviders).catch(() => {});
+  }, []);
 
   const availability = useGpuAvailability(
     gpuType,
@@ -70,6 +76,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         volume_gb: volumeGb,
         template_id: templateId,
         cloud_type: secureCloud ? "SECURE" : "COMMUNITY",
+        provider_id: providerId || null,
       });
       toast.success(
         pod.status === "pending_approval"
@@ -98,6 +105,40 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
             maxLength={128}
             required
           />
+        </div>
+      </Section>
+
+      {/* Section: RunPod account */}
+      <Section
+        title="RunPod account"
+        description="Which RunPod API key to bill against. Default = gateway env key."
+      >
+        <div className="space-y-1.5">
+          <Label>API key</Label>
+          <Select
+            value={providerId || "__default__"}
+            onValueChange={(v) => setProviderId(v === "__default__" ? "" : v)}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__default__">Gateway default</SelectItem>
+              {providers
+                .filter((p) => p.kind === "runpod")
+                .map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {p.name}
+                    {p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
+                  </SelectItem>
+                ))}
+            </SelectContent>
+          </Select>
+          {providers.filter((p) => p.kind === "runpod").length === 0 && (
+            <p className="text-xs text-muted-foreground">
+              None registered. <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add a RunPod account →</a>
+            </p>
+          )}
         </div>
       </Section>
 

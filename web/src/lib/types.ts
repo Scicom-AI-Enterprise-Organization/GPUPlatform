@@ -39,6 +39,7 @@ export type CreateAppRequest = {
   cloud_type?: "COMMUNITY" | "SECURE";
   container_disk_gb?: number;
   volume_gb?: number;
+  provider_id?: string | null;
 };
 
 export type CreateAppResponse = {
@@ -173,6 +174,7 @@ export type ComputePod = {
   cost_per_hr: number | null;
   error_text: string | null;
   reject_reason: string | null;
+  provider_id: string | null;
   created_by: string;
   created_at: string;
   ready_at: string | null;
@@ -187,6 +189,7 @@ export type CreateComputeRequest = {
   volume_gb?: number;
   template_id: string;
   cloud_type?: "COMMUNITY" | "SECURE";
+  provider_id?: string | null;
 };
 
 export type ComputeTemplate = {
@@ -206,7 +209,7 @@ export type ComputeSshInfo = {
 
 // ---- Cloud providers (user-registered VMs / RunPod / PI accounts) ----
 
-export type ProviderKind = "vm";
+export type ProviderKind = "vm" | "runpod" | "pi";
 
 export type ProviderRecord = {
   id: string;
@@ -219,6 +222,10 @@ export type ProviderRecord = {
   user?: string | null;
   gpus?: string[] | null;
   gpu_count?: number | null;
+  api_key_last4?: string | null;
+  ssh_pub?: string | null;
+  validated_at?: string | null;
+  account_email?: string | null;
 };
 
 export type VmConfigInput = {
@@ -228,15 +235,21 @@ export type VmConfigInput = {
   private_key?: string;
 };
 
+export type ApiKeyConfigInput = {
+  api_key?: string;
+};
+
 export type CreateProviderRequest = {
   name: string;
   kind: ProviderKind;
   vm?: VmConfigInput;
+  api?: ApiKeyConfigInput;
 };
 
 export type TestProviderRequest = {
   kind: ProviderKind;
   vm?: VmConfigInput;
+  api?: ApiKeyConfigInput;
   provider_id?: string;
 };
 

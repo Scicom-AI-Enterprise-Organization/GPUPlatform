@@ -523,18 +523,20 @@ _POD_CREATED_RE = re.compile(r"Pod created:\s*(\S+)")
 _COST_CAPTURED: set[str] = set()
 
 
-async def _fetch_runpod_cost(pod_id: str) -> Optional[float]:
+async def _fetch_runpod_cost(pod_id: str, provider_id: Optional[str] = None) -> Optional[float]:
     """Return RunPod's costPerHr for a pod by id, or None if anything goes
     sideways (no API key, pod not found, transient network error). Best-effort
     — never raises."""
-    api_key = os.environ.get("RUNPOD_API_KEY", "").strip()
-    if not api_key:
+    from .provider_resolve import try_resolve_cloud_creds
+    async with session_factory()() as s:
+        creds = await try_resolve_cloud_creds(s, provider_id, "runpod")
+    if creds is None:
         return None
     base = os.environ.get("RUNPOD_API_BASE", "https://rest.runpod.io/v1")
     try:
         async with httpx.AsyncClient(
             base_url=base,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"Authorization": f"Bearer {creds.api_key}"},
             timeout=15.0,
         ) as cli:
             r = await cli.get(f"/pods/{pod_id}")
@@ -547,15 +549,15 @@ async def _fetch_runpod_cost(pod_id: str) -> Optional[float]:
         return None
 
 
-async def _terminate_runpod_pod(pod_id: str) -> None:
+async def _terminate_runpod_pod(pod_id: str, provider_id: Optional[str] = None) -> None:
     """Delete a RunPod pod by id. Raises if the API call fails (caller logs)."""
-    api_key = os.environ.get("RUNPOD_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("RUNPOD_API_KEY not set")
+    from .provider_resolve import resolve_cloud_creds
+    async with session_factory()() as s:
+        creds = await resolve_cloud_creds(s, provider_id, "runpod")
     base = os.environ.get("RUNPOD_API_BASE", "https://rest.runpod.io/v1")
     async with httpx.AsyncClient(
         base_url=base,
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers={"Authorization": f"Bearer {creds.api_key}"},
         timeout=30.0,
     ) as cli:
         r = await cli.delete(f"/pods/{pod_id}")
@@ -563,11 +565,11 @@ async def _terminate_runpod_pod(pod_id: str) -> None:
             raise RuntimeError(f"RunPod terminate {pod_id}: {r.status_code} {r.text[:200]}")
 
 
-async def _capture_runpod_cost(bench_id: str, pod_id: str) -> None:
+async def _capture_runpod_cost(bench_id: str, pod_id: str, provider_id: Optional[str] = None) -> None:
     """Look up the hourly rate for the pod benchmaq just spawned and store it
     on the row. Logged but otherwise best-effort — a cost-tracking failure must
     never break the run."""
-    cost = await _fetch_runpod_cost(pod_id)
+    cost = await _fetch_runpod_cost(pod_id, provider_id=provider_id)
     try:
         async with session_factory()() as s:
             row = await s.get(Benchmark, bench_id)
@@ -582,7 +584,7 @@ async def _capture_runpod_cost(bench_id: str, pod_id: str) -> None:
     logger.info("bench %s: pod=%s cost=%s/hr", bench_id, pod_id, cost)
 
 
-async def _drain(stream: asyncio.StreamReader, prefix: str, redis, bench_id: str) -> None:
+async def _drain(stream: asyncio.StreamReader, prefix: str, redis, bench_id: str, provider_id: Optional[str] = None) -> None:
     """Read lines from a subprocess pipe and fan them out to redis + python log."""
     while True:
         line = await stream.readline()
@@ -596,7 +598,7 @@ async def _drain(stream: asyncio.StreamReader, prefix: str, redis, bench_id: str
             m = _POD_CREATED_RE.search(text)
             if m:
                 _COST_CAPTURED.add(bench_id)
-                asyncio.create_task(_capture_runpod_cost(bench_id, m.group(1)))
+                asyncio.create_task(_capture_runpod_cost(bench_id, m.group(1), provider_id=provider_id))
 
 
 async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
@@ -615,8 +617,29 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         cleanup_model = bool(getattr(b, "cleanup_model", True))
         await s.commit()
 
-    vm_target: Optional[dict] = None
+    # Disambiguate provider kind. A runpod-kind provider_id picks WHICH
+    # RunPod account to bill against (cred override only); a vm-kind id
+    # switches us onto the bare-metal SSH path.
+    provider_kind: Optional[str] = None
     if provider_id:
+        from .db import Provider
+        async with session_factory()() as s:
+            prov = await s.get(Provider, provider_id)
+            if prov is None:
+                await _push_log(redis, bench_id, f"[gateway] provider {provider_id} not found")
+                async with session_factory()() as s2:
+                    b2 = await s2.get(Benchmark, bench_id)
+                    if b2 is not None:
+                        b2.status = "failed"
+                        b2.error_text = f"provider {provider_id} not found"
+                        b2.ended_at = datetime.now(timezone.utc)
+                        await s2.commit()
+                return
+            provider_kind = prov.kind
+
+    vm_target: Optional[dict] = None
+    runpod_creds = None
+    if provider_kind == "vm":
         try:
             vm_target = await _materialise_vm_key(work, provider_id)
             await _push_log(redis, bench_id, f"[gateway] bare-metal target: {vm_target['user']}@{vm_target['host']}:{vm_target['port']}")
@@ -627,6 +650,22 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 if b2 is not None:
                     b2.status = "failed"
                     b2.error_text = f"VM target setup failed: {e}"[:4000]
+                    b2.ended_at = datetime.now(timezone.utc)
+                    await s.commit()
+            return
+    elif provider_kind == "runpod":
+        from .provider_resolve import resolve_cloud_creds
+        try:
+            async with session_factory()() as s:
+                runpod_creds = await resolve_cloud_creds(s, provider_id, "runpod")
+            await _push_log(redis, bench_id, f"[gateway] runpod provider {provider_id} (key ****{runpod_creds.api_key[-4:]})")
+        except Exception as e:
+            await _push_log(redis, bench_id, f"[gateway] could not resolve runpod provider: {e}")
+            async with session_factory()() as s:
+                b2 = await s.get(Benchmark, bench_id)
+                if b2 is not None:
+                    b2.status = "failed"
+                    b2.error_text = f"runpod provider resolve failed: {e}"[:4000]
                     b2.ended_at = datetime.now(timezone.utc)
                     await s.commit()
             return
@@ -642,7 +681,15 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         await _push_log(redis, bench_id, f"[gateway] starting benchmaq runpod bench (cwd={work})")
 
     env = dict(os.environ)
-    env["RUNPOD_API_KEY"] = os.environ.get("RUNPOD_API_KEY", "")
+    # Cred override: when the user picked a runpod-kind provider, the key
+    # stored in providers.config wins over the gateway-wide env. benchmaq
+    # picks RUNPOD_API_KEY straight from the subprocess env.
+    if runpod_creds is not None:
+        env["RUNPOD_API_KEY"] = runpod_creds.api_key
+        if runpod_creds.cloud_type:
+            env["RUNPOD_CLOUD_TYPE"] = runpod_creds.cloud_type
+    else:
+        env["RUNPOD_API_KEY"] = os.environ.get("RUNPOD_API_KEY", "")
     env["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
     # benchmaq writes results into the cwd by default unless config says otherwise.
 
@@ -689,8 +736,8 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
 
     try:
         await asyncio.gather(
-            _drain(proc.stdout, "", redis, bench_id),
-            _drain(proc.stderr, "[stderr] ", redis, bench_id),
+            _drain(proc.stdout, "", redis, bench_id, provider_id=provider_id),
+            _drain(proc.stderr, "[stderr] ", redis, bench_id, provider_id=provider_id),
         )
         rc = await proc.wait()
     except asyncio.CancelledError:
@@ -1388,6 +1435,16 @@ async def terminate_benchmark(
     runpod_pod_id = b.runpod_pod_id
     bench_name = b.name
 
+    # Figure out the provider kind so cleanup knows whether to SSH (vm) or
+    # only tear down a runpod pod (runpod). A None provider_id implies legacy
+    # env-based RunPod cred (no per-row override).
+    provider_kind: Optional[str] = None
+    if provider_id:
+        from .db import Provider
+        prov = await session.get(Provider, provider_id)
+        if prov is not None:
+            provider_kind = prov.kind
+
     await _push_log(redis, bench_id, "[gateway] terminate requested")
 
     # Cancel the runner task — its CancelledError handler kills the local
@@ -1414,7 +1471,7 @@ async def terminate_benchmark(
 
     async def _cleanup():
         # SSH-side cleanup for VM benches: kill any survivors + remove model.
-        if provider_id:
+        if provider_kind == "vm":
             work = _work_dir(bench_id)
             try:
                 vm_target = await _materialise_vm_key(work, provider_id)
@@ -1436,9 +1493,12 @@ async def terminate_benchmark(
                         await _push_log(redis, bench_id, f"[gateway] terminate: model cleanup failed: {e}")
 
         # RunPod pod teardown — only when benchmaq spawned a pod itself.
+        # Use the per-row provider_id (when it's a runpod-kind one) so we
+        # hit the same account benchmaq used to spawn the pod.
         if runpod_pod_id:
+            pid_for_teardown = provider_id if provider_kind == "runpod" else None
             try:
-                await _terminate_runpod_pod(runpod_pod_id)
+                await _terminate_runpod_pod(runpod_pod_id, provider_id=pid_for_teardown)
                 await _push_log(redis, bench_id, f"[gateway] terminate: runpod pod {runpod_pod_id} torn down")
             except Exception as e:
                 await _push_log(redis, bench_id, f"[gateway] terminate: runpod teardown failed: {e}")

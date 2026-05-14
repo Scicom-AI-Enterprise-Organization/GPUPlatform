@@ -29,22 +29,33 @@ export function ProviderForm() {
 
   const [kind, setKind] = useState<ProviderKind>("vm");
   const [name, setName] = useState("");
+
+  // VM-only fields
   const [host, setHost] = useState("");
   const [port, setPort] = useState("22");
   const [user, setUser] = useState("root");
   const [privateKey, setPrivateKey] = useState("");
 
+  // API-key kinds (runpod / pi)
+  const [apiKey, setApiKey] = useState("");
+
   const [test, setTest] = useState<TestState>({ status: "idle" });
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const validVm = () => {
+  const isApiKind = kind === "runpod" || kind === "pi";
+
+  const validate = (): string | null => {
     if (!name.trim()) return "Name is required.";
-    if (!host.trim()) return "Host is required.";
-    const p = Number(port);
-    if (!Number.isFinite(p) || p < 1 || p > 65535) return "Port must be 1..65535.";
-    if (!user.trim()) return "SSH user is required.";
-    if (!privateKey.trim()) return "Private key is required.";
+    if (kind === "vm") {
+      if (!host.trim()) return "Host is required.";
+      const p = Number(port);
+      if (!Number.isFinite(p) || p < 1 || p > 65535) return "Port must be 1..65535.";
+      if (!user.trim()) return "SSH user is required.";
+      if (!privateKey.trim()) return "Private key is required.";
+    } else {
+      if (!apiKey.trim()) return "API key is required.";
+    }
     return null;
   };
 
@@ -60,22 +71,29 @@ export function ProviderForm() {
 
   const onTest = async () => {
     setSubmitError(null);
-    const err = validVm();
+    const err = validate();
     if (err) {
       setTest({ status: "fail", message: err });
       return;
     }
     setTest({ status: "running" });
     try {
-      const r = await gateway.testProvider({
-        kind: "vm",
-        vm: {
-          host: host.trim(),
-          port: Number(port),
-          user: user.trim(),
-          private_key: privateKey,
-        },
-      });
+      const r = await gateway.testProvider(
+        kind === "vm"
+          ? {
+              kind: "vm",
+              vm: {
+                host: host.trim(),
+                port: Number(port),
+                user: user.trim(),
+                private_key: privateKey,
+              },
+            }
+          : {
+              kind,
+              api: { api_key: apiKey.trim() },
+            },
+      );
       if (r.ok) {
         setTest({ status: "ok", message: r.message, gpus: r.gpus, gpu_count: r.gpu_count });
       } else {
@@ -89,23 +107,31 @@ export function ProviderForm() {
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError(null);
-    const err = validVm();
+    const err = validate();
     if (err) {
       setSubmitError(err);
       return;
     }
     setSubmitting(true);
     try {
-      await gateway.createProvider({
-        name: name.trim(),
-        kind: "vm",
-        vm: {
-          host: host.trim(),
-          port: Number(port),
-          user: user.trim(),
-          private_key: privateKey,
-        },
-      });
+      await gateway.createProvider(
+        kind === "vm"
+          ? {
+              name: name.trim(),
+              kind: "vm",
+              vm: {
+                host: host.trim(),
+                port: Number(port),
+                user: user.trim(),
+                private_key: privateKey,
+              },
+            }
+          : {
+              name: name.trim(),
+              kind,
+              api: { api_key: apiKey.trim() },
+            },
+      );
       router.push("/providers");
       router.refresh();
     } catch (e) {
@@ -121,19 +147,28 @@ export function ProviderForm() {
         <div className="mb-4">
           <h2 className="text-base font-medium">Provider</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            VM is bare-metal SSH. RunPod and PI accounts coming later.
+            VM is bare-metal SSH. RunPod and Prime Intellect connect with an
+            API key from your account dashboard.
           </p>
         </div>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
             <Label htmlFor="provider-kind">Type</Label>
-            <Select value={kind} onValueChange={(v) => setKind(v as ProviderKind)}>
+            <Select
+              value={kind}
+              onValueChange={(v) => {
+                setKind(v as ProviderKind);
+                setTest({ status: "idle" });
+              }}
+            >
               <SelectTrigger id="provider-kind" className="mt-1.5">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="vm">VM (bare metal SSH)</SelectItem>
+                <SelectItem value="runpod">RunPod (API key)</SelectItem>
+                <SelectItem value="pi">Prime Intellect (API key)</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -143,7 +178,9 @@ export function ProviderForm() {
               id="provider-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. lab-rig-01"
+              placeholder={
+                kind === "vm" ? "e.g. lab-rig-01" : "e.g. my-runpod-account"
+              }
               className="mt-1.5"
             />
           </div>
@@ -220,6 +257,41 @@ export function ProviderForm() {
             />
             <p className="mt-1 text-xs text-muted-foreground">
               Make sure the matching public half is already in <span className="font-mono">~/.ssh/authorized_keys</span> on the VM — we never need or store the public key here.
+            </p>
+          </div>
+        </section>
+      )}
+
+      {isApiKind && (
+        <section className="rounded-lg border border-border bg-card p-5">
+          <div className="mb-4">
+            <h2 className="text-base font-medium">API key</h2>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {kind === "runpod"
+                ? "Paste a key from runpod.io → Settings → API Keys. Stored encrypted at rest with Fernet. Test validates it by listing 1 pod."
+                : "Paste a bearer token from app.primeintellect.ai. Stored encrypted at rest with Fernet. Test validates it by listing 1 pod."}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4">
+            <div>
+              <Label htmlFor="api-key">API key</Label>
+              <Input
+                id="api-key"
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder={kind === "runpod" ? "rpa_..." : "pi_..."}
+                className="mt-1.5 font-mono text-xs"
+                autoComplete="off"
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Community vs. Secure tier is picked per workload — this key
+              works on both. On save we generate an ed25519 SSH keypair for
+              this provider and inject the public half into spawned pods
+              automatically — no upload step. The private key never leaves
+              the gateway.
             </p>
           </div>
         </section>

@@ -112,6 +112,12 @@ class App(Base):
     # (RUNPOD_CONTAINER_DISK_GB / RUNPOD_VOLUME_GB).
     container_disk_gb: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     volume_gb: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Per-app cloud-account selection. NULL = use the global env-driven
+    # provider singleton built at gateway startup. Per-app routing through
+    # the autoscaler is still a follow-up — the column lands now so the
+    # API surface is stable and we can backfill the resolver wiring later
+    # without a second migration.
+    provider_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -203,6 +209,14 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS volume_gb INTEGER"
         ))
+        # Per-app cloud-account selection — API surface; autoscaler still
+        # uses the global env-driven provider for now.
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS provider_id VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_apps_provider_id ON apps(provider_id)"
+        ))
         await conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users(email) WHERE email IS NOT NULL"
         ))
@@ -265,6 +279,13 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS reject_reason VARCHAR(1024)"
+        ))
+        # Per-pod RunPod-account selection. NULL = use gateway env key.
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS provider_id VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_compute_pods_provider_id ON compute_pods(provider_id)"
         ))
         # GitHub SSO: column for linking platform accounts to GitHub user IDs.
         await conn.execute(text(

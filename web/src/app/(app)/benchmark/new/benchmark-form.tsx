@@ -583,6 +583,8 @@ export function BenchmarkForm({
     initialProviderId ? "vm" : "cloud",
   );
   const [providerId, setProviderId] = useState<string>(initialProviderId ?? "");
+  // RunPod-account selection for cloud target. Empty = gateway-default key.
+  const [runpodProviderId, setRunpodProviderId] = useState<string>("");
   const [cleanupModel, setCleanupModel] = useState(true);
 
   // Live SSH probe of the selected VM. Re-fires when the user changes the
@@ -692,7 +694,10 @@ export function BenchmarkForm({
       const created = await gateway.createBenchmark({
         name: name.trim(),
         config_yaml,
-        provider_id: target === "vm" ? providerId : null,
+        provider_id:
+          target === "vm"
+            ? providerId
+            : runpodProviderId || null,
         cleanup_model: target === "vm" ? cleanupModel : undefined,
       });
       toast.success(`Created ${created.id}`, { duration: 4000 });
@@ -999,6 +1004,36 @@ export function BenchmarkForm({
           )}
           {target === "cloud" && (
             <Grid>
+              <FieldWrap
+                label="RunPod account (API key)"
+                hint="Which RunPod provider to bill against. Default = gateway env key."
+                wide
+              >
+                <Select
+                  value={runpodProviderId || "__default__"}
+                  onValueChange={(v) => setRunpodProviderId(v === "__default__" ? "" : v)}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__default__">Gateway default</SelectItem>
+                    {providers
+                      .filter((p) => p.kind === "runpod")
+                      .map((p) => (
+                        <SelectItem key={p.id} value={p.id}>
+                          {p.name}
+                          {p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+                {providers.filter((p) => p.kind === "runpod").length === 0 && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    None registered. <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add a RunPod account →</a>
+                  </p>
+                )}
+              </FieldWrap>
               <FieldWrap
                 label="GPU type"
                 hint="Pick what fits your model in VRAM."
