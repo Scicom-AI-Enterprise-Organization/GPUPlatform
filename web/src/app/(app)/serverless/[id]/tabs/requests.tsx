@@ -6,11 +6,11 @@ import {
   ChevronRight,
   Copy,
   ExternalLink,
+  Eye,
+  EyeOff,
   Loader2,
   Play,
-  RefreshCw,
   Search,
-  Trash2,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -18,8 +18,16 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { NumberField } from "@/components/ui/number-field";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { gateway } from "@/lib/gateway";
+import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type RequestStatus =
@@ -48,12 +56,12 @@ const STORAGE_KEY = (appId: string) => `serverless-ui:requests:${appId}`;
 const POLL_MS = 4_000;
 const MAX_HISTORY = 100;
 
-export function RequestsTab({ appId }: { appId?: string } = {}) {
-  // The endpoint detail page renders this with no props today; we lift app_id
-  // out of the URL via a hook below. Accepting an optional prop keeps the
-  // door open for callers that want to pass it explicitly.
-  const resolvedAppId = appId ?? useAppIdFromPath();
-  return resolvedAppId ? <RequestsTabInner appId={resolvedAppId} /> : null;
+export function RequestsTab({ app, appId }: { app?: AppRecord; appId?: string } = {}) {
+  // Prefer the passed-in app (gives us the model list for the dropdown); fall
+  // back to app_id from props or the URL. Hook is called unconditionally.
+  const fromPath = useAppIdFromPath();
+  const resolvedAppId = app?.app_id ?? appId ?? fromPath;
+  return resolvedAppId ? <RequestsTabInner appId={resolvedAppId} app={app} /> : null;
 }
 
 function useAppIdFromPath(): string {
@@ -67,7 +75,17 @@ function useAppIdFromPath(): string {
   return id;
 }
 
-function RequestsTabInner({ appId }: { appId: string }) {
+function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
+  // Models this endpoint serves: multi-model members, else the single model.
+  // The `model` field both routes the job (multi-model) and tells vLLM which
+  // served model to use.
+  const models = useMemo(() => {
+    if (app?.mode === "multi" && app.models?.length) {
+      return app.models.map((m) => m.model).filter(Boolean);
+    }
+    return app?.model ? [app.model] : [];
+  }, [app]);
+
   const [history, setHistory] = useState<StoredRequest[]>([]);
   const historyRef = useRef(history);
   historyRef.current = history;
@@ -142,25 +160,86 @@ function RequestsTabInner({ appId }: { appId: string }) {
 
   // ---- Send a test request ----
   const [prompt, setPrompt] = useState("Hello, world");
-  const [maxTokens, setMaxTokens] = useState(16);
+  const [maxTokens, setMaxTokens] = useState(1024);
+  const [model, setModel] = useState("");
+  const [effort, setEffort] = useState<"none" | "low" | "medium" | "high">("none");
+  const [disableThinking, setDisableThinking] = useState(false);
+  const [stream, setStream] = useState(false);
   const [sending, setSending] = useState(false);
+  // Live streaming state (the SSE path doesn't use request history).
+  const [streaming, setStreaming] = useState(false);
+  const [streamText, setStreamText] = useState("");
+  const [streamReasoning, setStreamReasoning] = useState("");
+  const [streamErr, setStreamErr] = useState<string | null>(null);
+  const streamAbort = useRef<AbortController | null>(null);
 
-  async function send() {
+  // Equivalent OpenAI curl for the last-sent request (shared on Run).
+  const [sentBody, setSentBody] = useState<Record<string, unknown> | null>(null);
+  const [revealToken, setRevealToken] = useState(false);
+  const [token, setToken] = useState<string | null>(null);
+  useEffect(() => {
+    let abort = false;
+    fetch("/api/auth/token", { cache: "no-store" })
+      .then(async (r) => {
+        if (abort) return;
+        const b = r.ok ? ((await r.json()) as { token?: string }) : null;
+        setToken(b?.token ?? null);
+      })
+      .catch(() => !abort && setToken(null));
+    return () => {
+      abort = true;
+    };
+  }, []);
+  const base = process.env.NEXT_PUBLIC_GATEWAY_URL ?? gateway.baseUrl;
+
+  // Derived (not stored) so a model arriving after first render still selects.
+  const selectedModel = model || models[0] || "";
+
+  // Chat-completion payload so chat-template params apply. `endpoint` is a
+  // control field the gateway pops; everything else is forwarded to vLLM.
+  function buildBody(): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      endpoint: "/v1/chat/completions",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+    };
+    if (selectedModel) body.model = selectedModel;
+    if (effort !== "none") body.reasoning_effort = effort;
+    if (disableThinking) body.chat_template_kwargs = { enable_thinking: false };
+    return body;
+  }
+
+  // The public, OpenAI-compatible body (no internal `endpoint` control field;
+  // `stream` exposed as the standard flag) — what the shareable curl runs.
+  function publicBody(): Record<string, unknown> {
+    const b = buildBody();
+    delete b.endpoint;
+    if (stream) b.stream = true;
+    return b;
+  }
+
+  function onSend() {
     if (!prompt.trim()) {
       toast.error("Prompt is required.", { duration: 5000 });
       return;
     }
+    setSentBody(publicBody()); // share the equivalent curl for this request
+    if (stream) void sendStream();
+    else void send();
+  }
+
+  async function send() {
     setSending(true);
     try {
       const r = await fetch(`/api/proxy/run/${encodeURIComponent(appId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, max_tokens: maxTokens }),
+        body: JSON.stringify(buildBody()),
       });
-      const body = await r.json();
-      if (!r.ok) throw new Error(body?.detail ?? body?.error ?? r.statusText);
+      const respBody = await r.json();
+      if (!r.ok) throw new Error(respBody?.detail ?? respBody?.error ?? r.statusText);
       const stored: StoredRequest = {
-        id: body.request_id,
+        id: respBody.request_id,
         ts: Date.now(),
         prompt: prompt.slice(0, 80),
         status: "pending",
@@ -169,10 +248,85 @@ function RequestsTabInner({ appId }: { appId: string }) {
       upsert(stored);
       toast.success(`Queued ${stored.id}`, { duration: 3000 });
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e)), { duration: 5000 };
+      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
     } finally {
       setSending(false);
     }
+  }
+
+  // SSE streaming via POST /stream/{appId}. The gateway relays each vLLM chunk
+  // as `data: {...}`; we accumulate choices[0].delta.content live.
+  async function sendStream() {
+    streamAbort.current?.abort();
+    const ctrl = new AbortController();
+    streamAbort.current = ctrl;
+    setStreaming(true);
+    setStreamErr(null);
+    setStreamText("");
+    setStreamReasoning("");
+    try {
+      const res = await fetch(`/api/proxy/stream/${encodeURIComponent(appId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildBody()),
+        signal: ctrl.signal,
+      });
+      if (!res.ok || !res.body) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(txt || res.statusText);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let acc = "";
+      let accR = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const frames = buf.split("\n\n");
+        buf = frames.pop() ?? "";
+        for (const frame of frames) {
+          for (const lineRaw of frame.split("\n")) {
+            const line = lineRaw.trimStart();
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (!data || data === "[DONE]") continue;
+            let chunk: Record<string, unknown>;
+            try {
+              chunk = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            if (chunk.error) {
+              setStreamErr(String(chunk.error));
+              continue;
+            }
+            const reason = reasoningOf(chunk);
+            if (reason) {
+              accR += reason;
+              setStreamReasoning(accR);
+            }
+            const piece = deltaOf(chunk);
+            if (piece) {
+              acc += piece;
+              setStreamText(acc);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (!ctrl.signal.aborted) {
+        setStreamErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setStreaming(false);
+    }
+  }
+
+  function stopStream() {
+    streamAbort.current?.abort();
+    setStreaming(false);
   }
 
   // ---- Look up a known request id ----
@@ -200,7 +354,9 @@ function RequestsTabInner({ appId }: { appId: string }) {
           <div>
             <CardTitle className="text-sm font-medium">Send a test request</CardTitle>
             <p className="text-xs text-muted-foreground">
-              Fires <code className="font-mono">POST /run/{appId}</code> via the gateway and tracks the result here.
+              Fires a chat completion via <code className="font-mono">POST /run/{appId}</code> (vLLM{" "}
+              <code className="font-mono">/v1/chat/completions</code>). Streaming relays tokens live;
+              otherwise the result is tracked below.
             </p>
           </div>
         </CardHeader>
@@ -208,27 +364,152 @@ function RequestsTabInner({ appId }: { appId: string }) {
           <Textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Prompt"
+            placeholder="Prompt — sent as a single user message"
             rows={2}
             className="font-mono text-sm"
           />
-          <div className="flex items-center gap-2">
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              max_tokens
+          <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+            {models.length > 0 && (
+              <div className="flex flex-col gap-1">
+                <span className="text-xs text-muted-foreground">model</span>
+                <Select value={selectedModel} onValueChange={setModel}>
+                  <SelectTrigger className="h-8 w-[260px] font-mono text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {models.map((m) => (
+                      <SelectItem key={m} value={m} className="font-mono text-xs">
+                        {m}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            <div className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">reasoning_effort</span>
+              <Select value={effort} onValueChange={(v) => setEffort(v as typeof effort)}>
+                <SelectTrigger className="h-8 w-[150px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">none (omit)</SelectItem>
+                  <SelectItem value="low">low</SelectItem>
+                  <SelectItem value="medium">medium</SelectItem>
+                  <SelectItem value="high">high</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">max_tokens</span>
               <NumberField
                 min={1}
-                max={2048}
+                max={32768}
                 value={maxTokens}
                 onChange={setMaxTokens}
-                className="h-8 w-20 font-mono"
+                className="h-8 w-24 font-mono"
               />
+            </div>
+            <label className="flex h-8 items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={disableThinking}
+                onChange={(e) => setDisableThinking(e.target.checked)}
+                className="h-4 w-4 cursor-pointer accent-primary"
+              />
+              <span>
+                disable thinking
+                <span className="ml-1 font-mono text-[10px]">enable_thinking=false</span>
+              </span>
+            </label>
+            <label className="flex h-8 items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={stream}
+                onChange={(e) => setStream(e.target.checked)}
+                className="h-4 w-4 cursor-pointer accent-primary"
+              />
+              <span>stream</span>
             </label>
             <div className="flex-1" />
-            <Button onClick={send} disabled={sending}>
-              {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-              Send
-            </Button>
+            {streaming ? (
+              <Button variant="outline" onClick={stopStream}>
+                <X className="h-4 w-4" />
+                Stop
+              </Button>
+            ) : (
+              <Button onClick={onSend} disabled={sending}>
+                {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                Send
+              </Button>
+            )}
           </div>
+
+          {(streaming || streamText || streamReasoning || streamErr) && (
+            <div className="space-y-2">
+              {streamErr ? (
+                <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  {streamErr}
+                </div>
+              ) : (
+                <>
+                  {streamReasoning && (
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                        {streaming && !streamText && <Loader2 className="h-3 w-3 animate-spin" />}
+                        <span>Reasoning</span>
+                      </div>
+                      <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-dashed border-border bg-muted/20 p-3 font-mono text-[11px] italic leading-relaxed text-muted-foreground scrollbar-thin">
+                        {streamReasoning}
+                      </pre>
+                    </div>
+                  )}
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                      {streaming && <Loader2 className="h-3 w-3 animate-spin" />}
+                      <span>{streamReasoning ? "Answer" : "Streaming output"}</span>
+                    </div>
+                    <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">
+                      {streamText || (streaming ? "…" : "")}
+                    </pre>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {sentBody && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">cURL for this request</span>
+                {token && (
+                  <Button variant="ghost" size="xs" onClick={() => setRevealToken((v) => !v)}>
+                    {revealToken ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                    {revealToken ? "Hide" : "Reveal"} key
+                  </Button>
+                )}
+              </div>
+              <div className="relative">
+                <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
+                  {curlFor(base, revealToken && token ? token : token ? maskToken(token) : "YOUR_API_KEY", sentBody)}
+                </pre>
+                <Button
+                  variant="outline"
+                  size="icon-sm"
+                  className="absolute right-2 top-2"
+                  aria-label="Copy cURL"
+                  onClick={() => {
+                    navigator.clipboard.writeText(
+                      curlFor(base, token ?? "YOUR_API_KEY", sentBody),
+                    );
+                    toast.success("cURL copied", { duration: 3000 });
+                  }}
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -402,6 +683,41 @@ function StatusPill({ status }: { status: RequestStatus }) {
       {status}
     </span>
   );
+}
+
+// Pull the text delta out of a streamed chunk — OpenAI chat shape
+// (choices[0].delta.content) or the fake worker's {delta: "..."}.
+function deltaOf(chunk: Record<string, unknown>): string {
+  const choices = chunk.choices as Array<{ delta?: { content?: unknown } }> | undefined;
+  const c = choices?.[0]?.delta?.content;
+  if (typeof c === "string") return c;
+  if (typeof chunk.delta === "string") return chunk.delta;
+  return "";
+}
+
+// Reasoning (thinking) delta. vLLM emits it under `delta.reasoning`; some
+// builds use `reasoning_content` — accept either.
+function reasoningOf(chunk: Record<string, unknown>): string {
+  const choices = chunk.choices as
+    | Array<{ delta?: { reasoning?: unknown; reasoning_content?: unknown } }>
+    | undefined;
+  const d = choices?.[0]?.delta;
+  const r = d?.reasoning ?? d?.reasoning_content;
+  return typeof r === "string" ? r : "";
+}
+
+function maskToken(t: string) {
+  if (t.length <= 8) return "•".repeat(t.length);
+  return `${t.slice(0, 4)}${"•".repeat(Math.max(8, t.length - 8))}${t.slice(-4)}`;
+}
+
+// Equivalent OpenAI cURL for a request body. `-N` (unbuffered) when streaming.
+function curlFor(base: string, token: string, body: Record<string, unknown>): string {
+  const flag = body.stream ? "-N " : "";
+  return `curl ${flag}-X POST '${base}/v1/chat/completions' \\
+  -H 'Content-Type: application/json' \\
+  -H 'Authorization: Bearer ${token}' \\
+  -d '${JSON.stringify(body, null, 2)}'`;
 }
 
 function isTerminal(status: RequestStatus) {

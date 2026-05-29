@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AlertTriangle, ChevronDown, ChevronRight, FileText, Loader2, RefreshCw, X } from "lucide-react";
+import { AlertTriangle, Ban, ChevronDown, ChevronRight, FileText, Loader2, RefreshCw, RotateCw, X } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
@@ -586,7 +587,7 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
               <th className="px-4 py-2 font-medium">GPUs</th>
               <th className="px-4 py-2 font-medium">TP</th>
               <th className="px-4 py-2 font-medium">In-flight</th>
-              <th className="px-4 py-2 font-medium text-right">Logs</th>
+              <th className="px-4 py-2 font-medium text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -597,6 +598,7 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
                 m={m}
                 isOpen={openLogs.has(m.model)}
                 onToggle={() => toggleLog(m.model)}
+                onRefresh={fetchStatus}
               />
             ))}
             {rows.length === 0 && (
@@ -612,9 +614,38 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
 }
 
 function FleetModelRow({
-  appId, m, isOpen, onToggle,
-}: { appId: string; m: FleetModel; isOpen: boolean; onToggle: () => void }) {
+  appId, m, isOpen, onToggle, onRefresh,
+}: {
+  appId: string; m: FleetModel; isOpen: boolean; onToggle: () => void; onRefresh: () => void;
+}) {
   const dead = m.state === "dead";
+  const [busy, setBusy] = useState<"kill" | "restart" | null>(null);
+
+  async function doAction(action: "kill" | "restart") {
+    setBusy(action);
+    try {
+      const r = await fetch(`/api/proxy/apps/${encodeURIComponent(appId)}/model-action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: m.model, action }),
+      });
+      const body = await r.json().catch(() => ({} as Record<string, unknown>));
+      if (!r.ok) {
+        const d = (body as { detail?: unknown; error?: string }).detail;
+        const msg = typeof d === "string" ? d : (d as { error?: string })?.error ?? (body as { error?: string }).error ?? r.statusText;
+        throw new Error(msg);
+      }
+      const verb = action === "kill" ? "Kill" : "Restart";
+      toast.success(`${verb} queued for ${m.model.split("/").pop()} — worker applies it on its next heartbeat`, { duration: 4000 });
+      // Give the worker a heartbeat (≤5s) to pick the command up, then refresh.
+      window.setTimeout(onRefresh, 2000);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <>
       <tr className={cn("border-b border-border/60 last:border-b-0", dead && "bg-status-down/[0.05]")}>
@@ -641,16 +672,33 @@ function FleetModelRow({
         <td className="px-4 py-3 align-top font-mono text-xs">{m.gpus?.length ? m.gpus.join(",") : "—"}</td>
         <td className="px-4 py-3 align-top font-mono text-xs">{m.tp ?? "—"}</td>
         <td className="px-4 py-3 align-top font-mono text-xs">{m.inflight ?? 0}</td>
-        <td className="px-4 py-3 align-top text-right">
-          <Button
-            variant={isOpen ? "secondary" : dead ? "default" : "outline"}
-            size="xs"
-            onClick={onToggle}
-            aria-expanded={isOpen}
-          >
-            {isOpen ? <ChevronDown className="h-3 w-3" /> : <FileText className="h-3 w-3" />}
-            {isOpen ? "Hide" : "Logs"}
-          </Button>
+        <td className="px-4 py-3 align-top">
+          <div className="flex items-center justify-end gap-1.5">
+            <Button
+              variant="outline" size="xs" onClick={() => doAction("restart")}
+              disabled={busy !== null}
+              title="Kill and relaunch this model's vLLM"
+            >
+              {busy === "restart" ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCw className="h-3 w-3" />}
+              Restart
+            </Button>
+            <Button
+              variant="outline" size="xs" onClick={() => doAction("kill")}
+              disabled={busy !== null || dead}
+              className="text-destructive hover:text-destructive"
+              title="Stop this model and free its GPUs (its tp workers too)"
+            >
+              {busy === "kill" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Ban className="h-3 w-3" />}
+              Kill
+            </Button>
+            <Button
+              variant={isOpen ? "secondary" : "outline"} size="xs"
+              onClick={onToggle} aria-expanded={isOpen}
+            >
+              {isOpen ? <ChevronDown className="h-3 w-3" /> : <FileText className="h-3 w-3" />}
+              {isOpen ? "Hide" : "Logs"}
+            </Button>
+          </div>
         </td>
       </tr>
       {isOpen && (
@@ -717,12 +765,12 @@ function ModelLogs({ appId, model, onClose }: { appId: string; model: string; on
 
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-between text-xs text-muted-foreground">
-        <div className="flex items-center gap-2">
-          <span className="font-mono">model = {model}</span>
-          {loading && <Loader2 className="h-3 w-3 animate-spin" />}
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate font-mono">model = {model}</span>
+          {loading && <Loader2 className="h-3 w-3 shrink-0 animate-spin" />}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <label className="flex items-center gap-1 text-[10px]">
             <input
               type="checkbox"
@@ -753,7 +801,7 @@ function ModelLogs({ appId, model, onClose }: { appId: string; model: string; on
       ) : (
         <pre
           ref={(el) => { scrollRef.current = el; }}
-          className="terminal-block max-h-80 overflow-auto rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin"
+          className="terminal-block max-h-80 w-full overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin"
         >
           {lines.map((l, i) => (
             <div key={i}>{l}</div>

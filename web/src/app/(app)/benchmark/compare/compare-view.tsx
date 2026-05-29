@@ -22,6 +22,13 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { gateway } from "@/lib/gateway";
 import {
@@ -209,21 +216,21 @@ export function CompareView({ ids }: { ids: string[] }) {
         </div>
         <div className="flex items-center gap-2">
           {selectedShape && shapes.length > 1 && (
-            <select
-              value={selectedKey ?? ""}
-              onChange={(e) => setShapeSel(e.target.value)}
-              className="h-9 rounded-md border border-input bg-background px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
-              title="Input/output shape to compare on"
-            >
-              {shapes.map(({ shape, benches: bset }) => {
-                const k = shapeKey(shape);
-                return (
-                  <option key={k} value={k}>
-                    {shapeLabel(shape)} ({bset.size}/{ids.length})
-                  </option>
-                );
-              })}
-            </select>
+            <Select value={selectedKey ?? ""} onValueChange={setShapeSel}>
+              <SelectTrigger className="h-9 w-[200px] text-sm" title="Input/output shape to compare on">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {shapes.map(({ shape, benches: bset }) => {
+                  const k = shapeKey(shape);
+                  return (
+                    <SelectItem key={k} value={k}>
+                      {shapeLabel(shape)} ({bset.size}/{ids.length})
+                    </SelectItem>
+                  );
+                })}
+              </SelectContent>
+            </Select>
           )}
           <Tabs value={statMode} onValueChange={(v) => setStatMode(v as StatMode)}>
             <TabsList>

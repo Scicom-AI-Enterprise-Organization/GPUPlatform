@@ -168,18 +168,31 @@ async def log_shipper_loop(
                 pass
 
 
+async def _safe_cmd(cmd_fn, model: str, action: str) -> None:
+    try:
+        await cmd_fn(model, action)
+    except Exception:
+        logger.exception("worker command failed: %s %s", action, model)
+
+
 async def heartbeat_loop(
     gateway_url: str,
     machine_id: str,
     app_id: str,
     drain_event: asyncio.Event,
     snapshot_fn=None,
+    cmd_fn=None,
 ) -> None:
     """Heartbeat to gateway every 5s. Set drain_event if gateway tells us to drain.
 
     `snapshot_fn`, when given (multi-model), returns the per-model state list the
     gateway surfaces in the endpoint status; `status` flips to "loading" until
-    the fleet has finished launching."""
+    the fleet has finished launching.
+
+    `cmd_fn`, when given, runs operator commands the gateway returns in the
+    heartbeat response (kill/restart a member). Each runs in its own task so a
+    slow restart (model reload) never stalls the heartbeat — a stalled heartbeat
+    would let the worker's TTL lapse and trigger a needless re-provision."""
     url = f"{gateway_url.rstrip('/')}/workers/heartbeat"
     async with httpx.AsyncClient(timeout=5.0) as client:
         while not drain_event.is_set():
@@ -193,10 +206,18 @@ async def heartbeat_loop(
                     logger.exception("snapshot_fn failed")
             try:
                 r = await client.post(url, json=body)
-                if r.status_code == 200 and r.json().get("drain"):
-                    logger.info("drain signal received from gateway")
-                    drain_event.set()
-                    return
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("drain"):
+                        logger.info("drain signal received from gateway")
+                        drain_event.set()
+                        return
+                    if cmd_fn is not None:
+                        for cmd in data.get("commands") or []:
+                            model, action = cmd.get("model"), cmd.get("action")
+                            if model and action:
+                                logger.info("received command: %s %s", action, model)
+                                asyncio.create_task(_safe_cmd(cmd_fn, model, action))
             except httpx.HTTPError as e:
                 logger.warning("heartbeat error: %s", e)
             try:
@@ -427,8 +448,16 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     def snapshot():
         return sched.states_snapshot(), sched.all_ready()
 
+    async def cmd_fn(model: str, action: str) -> None:
+        if action == "kill":
+            await sched.kill_model(model)
+        elif action == "restart":
+            await sched.restart_model(model)
+        else:
+            logger.warning("ignoring unknown command action: %s", action)
+
     hb_task = asyncio.create_task(
-        heartbeat_loop(gateway_url, machine_id, app_id, drain_event, snapshot_fn=snapshot)
+        heartbeat_loop(gateway_url, machine_id, app_id, drain_event, snapshot_fn=snapshot, cmd_fn=cmd_fn)
     )
     # One log shipper per member, each tagged with the model's served_name so the
     # gateway buckets logs per model (the single-file shipper can't — every model

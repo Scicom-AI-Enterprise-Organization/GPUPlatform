@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import shlex
 import signal
 import time
 
@@ -83,6 +84,69 @@ class MultiModelScheduler:
             rt.log_path = launcher.log_path_for(rt.member, self.log_dir)
         self._by_model: dict[str, ModelRuntime] = {rt.member.served_name: rt for rt in self._runtimes}
 
+    async def _kill_stale_vllm(self) -> None:
+        """Kill leftover vLLM from a prior worker that was SIGKILLed before it
+        could clean up its children.
+
+        Matching is by command name, which is namespace-independent (an
+        nvidia-smi PID match can't find them inside a container — host-namespaced
+        PIDs). The catch: vLLM renames its tp workers + engine cores via
+        setproctitle to `VLLM::Worker_TP` / `VLLM::EngineCore`, which REWRITES
+        /proc/PID/cmdline — so a match on the interpreter path or `--port` misses
+        them entirely (this exact gap let orphaned workers hoard GPU memory).
+        So we kill three patterns: the renamed `VLLM::` processes, the
+        api_server, and anything from the endpoint's venv (resource trackers).
+        Safe at start(): we launch nothing until after this runs."""
+        venv = (self.cfg.venv_path or "").strip()
+        patterns = ["VLLM::", "vllm.entrypoints.openai.api_server"]
+        if venv:
+            patterns.append(f"{venv}/bin/python")
+        cmd = "; ".join(f"pkill -9 -f {shlex.quote(p)} 2>/dev/null" for p in patterns) + "; true"
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            logger.info("preflight: killed any stale vllm (patterns: %s)", ", ".join(patterns))
+        except Exception:
+            logger.exception("preflight stale-vllm cleanup failed")
+
+    async def kill_model(self, served_name: str) -> None:
+        """Operator action: stop a model's engine (and all its tp workers) and
+        leave it DEAD. The monitor won't relaunch it (proc is cleared)."""
+        rt = self._by_model.get(served_name)
+        if rt is None:
+            raise UnknownModelError(served_name)
+        logger.info("operator kill: %s", served_name)
+        async with self._cond:
+            old = rt.proc
+            rt.proc = None
+            rt.state = ModelState.DEAD
+            rt.reason = "stopped by operator (kill)"
+            rt.inflight = 0
+            rt.swapping = False
+            self._cond.notify_all()
+        await launcher.terminate(old)
+
+    async def restart_model(self, served_name: str) -> None:
+        """Operator action: kill + relaunch a model (then sleep it, ready to be
+        woken on demand). Resets the crash-retry counter."""
+        rt = self._by_model.get(served_name)
+        if rt is None:
+            raise UnknownModelError(served_name)
+        logger.info("operator restart: %s", served_name)
+        async with self._cond:
+            old = rt.proc
+            rt.proc = None
+            rt.state = ModelState.LAUNCHING
+            rt.reason = None
+            rt.inflight = 0
+            rt.swapping = False
+            rt.restart_count = 0
+            self._cond.notify_all()
+        await launcher.terminate(old)
+        await self._launch_and_sleep(rt)
+
     def _mark_dead(self, rt: ModelRuntime) -> None:
         """Set DEAD and distill a human reason from the model's vLLM log (best
         effort). Call under the Condition."""
@@ -100,6 +164,10 @@ class MultiModelScheduler:
         """Launch every member sequentially (so two models sharing GPUs never
         load at once and OOM), sleep each after it's healthy, then wake a
         non-overlapping resident set up to GPU capacity."""
+        # Kill any vLLM left bound to our ports by a prior crashed/killed worker —
+        # we haven't launched ours yet, so anything on these ports is an orphan
+        # holding GPU memory that would block our launches.
+        await self._kill_stale_vllm()
         # Ensure the requested vLLM version is present in the venv before any
         # model launches (no-op when venv_path/vllm_version aren't set).
         await launcher.ensure_vllm(self.cfg.venv_path, self.cfg.vllm_version)
@@ -127,8 +195,11 @@ class MultiModelScheduler:
         try:
             rt.reason = None  # clear any stale cause from a prior attempt
             rt.proc = await launcher.launch_member(rt.member, self.log_dir, self._python_exe)
-            ok = await launcher.wait_health(self._client, rt.member, rt.proc)
+            ok = await launcher.wait_health(self._client, rt.member, rt.proc, log_path=rt.log_path)
             if not ok:
+                # Kill the failed/hung engine so it can't leak and keep holding
+                # GPU/CPU after we give up on it.
+                await launcher.terminate(rt.proc)
                 async with self._cond:
                     self._mark_dead(rt)
                 return
@@ -138,6 +209,7 @@ class MultiModelScheduler:
                 self._cond.notify_all()
         except Exception:
             logger.exception("launch_and_sleep failed for %s", rt.member.model)
+            await launcher.terminate(rt.proc)
             async with self._cond:
                 self._mark_dead(rt)
 

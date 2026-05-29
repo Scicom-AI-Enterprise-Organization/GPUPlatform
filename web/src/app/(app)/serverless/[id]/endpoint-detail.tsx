@@ -114,7 +114,7 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 scrollbar-thin">
         <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)}>
           <TabsContent value="overview"><OverviewTab app={app} /></TabsContent>
-          <TabsContent value="playground"><RequestsTab /></TabsContent>
+          <TabsContent value="playground"><RequestsTab app={app} /></TabsContent>
           <TabsContent value="queue"><QueueTab app={app} /></TabsContent>
           <TabsContent value="workers"><WorkersTab app={app} /></TabsContent>
         </Tabs>

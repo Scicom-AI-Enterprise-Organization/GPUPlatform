@@ -708,6 +708,11 @@ export function BenchmarkForm({
     }
   }
 
+  // Only enabled S3 storages can hold a run's logs + result files. A benchmark
+  // can't be created without one, so this gates the submit button.
+  const eligibleStorages = storages.filter((s) => s.kind === "s3" && s.enabled);
+  const hasStorage = eligibleStorages.length > 0;
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
@@ -1193,7 +1198,7 @@ export function BenchmarkForm({
           >
             <div className="space-y-1.5">
               <Label htmlFor="bench-storage" className="text-xs">Storage</Label>
-              {storages.filter((s) => s.kind === "s3" && s.enabled).length === 0 ? (
+              {!hasStorage ? (
                 <p className="text-xs text-muted-foreground">
                   No S3 storage configured. Add one at{" "}
                   <a href="/storage/new" className="underline underline-offset-2 hover:text-foreground">
@@ -1207,14 +1212,12 @@ export function BenchmarkForm({
                     <SelectValue placeholder="Pick a storage…" />
                   </SelectTrigger>
                   <SelectContent>
-                    {storages
-                      .filter((s) => s.kind === "s3" && s.enabled)
-                      .map((s) => (
-                        <SelectItem key={s.id} value={s.id}>
-                          {s.name}
-                          {s.bucket ? ` · s3://${s.bucket}${s.prefix ? `/${s.prefix.replace(/^\/+|\/+$/g, "")}` : ""}` : ""}
-                        </SelectItem>
-                      ))}
+                    {eligibleStorages.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>
+                        {s.name}
+                        {s.bucket ? ` · s3://${s.bucket}${s.prefix ? `/${s.prefix.replace(/^\/+|\/+$/g, "")}` : ""}` : ""}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               )}
@@ -1467,6 +1470,15 @@ export function BenchmarkForm({
           {submitError && (
             <p className="text-sm text-destructive">{submitError}</p>
           )}
+          {!hasStorage && !submitError && (
+            <p className="text-sm text-muted-foreground">
+              Add an S3 storage at{" "}
+              <a href="/storage/new" className="underline underline-offset-2 hover:text-foreground">
+                Storage → New storage
+              </a>{" "}
+              to create a benchmark.
+            </p>
+          )}
           <Button
             type="button"
             variant="outline"
@@ -1474,7 +1486,12 @@ export function BenchmarkForm({
           >
             Cancel
           </Button>
-          <Button type="submit" disabled={submitting} className="min-w-36">
+          <Button
+            type="submit"
+            disabled={submitting || !hasStorage}
+            className="min-w-36"
+            title={!hasStorage ? "Add an S3 storage backend first" : undefined}
+          >
             {submitting ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin" />

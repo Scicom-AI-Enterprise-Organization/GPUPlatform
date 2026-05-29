@@ -176,6 +176,12 @@ class WorkerLogsRequest(BaseModel):
     source: Optional[str] = None
 
 
+class ModelActionRequest(BaseModel):
+    """Operator action on one member of a multi-model VM endpoint."""
+    model: str
+    action: str  # "kill" | "restart"
+
+
 # Per-worker container log retention. The worker-agent ships batches every
 # few seconds; we cap the list so a chatty worker can't blow up Redis.
 WORKER_LOGS_CAP = 5000
@@ -1464,6 +1470,36 @@ async def get_app_model_logs(
     return {"app_id": app.app_id, "model": model, "lines": lines, "count": len(lines)}
 
 
+@app.post("/apps/{app_id}/model-action")
+async def app_model_action(
+    app_id: str,
+    req: ModelActionRequest,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Queue a kill/restart for one member of a multi-model VM endpoint. The
+    worker picks it up on its next heartbeat (≤5s) and acts via the scheduler:
+    kill → stop the engine + all its tp workers, leave it dead; restart →
+    kill + relaunch (then asleep, woken on demand)."""
+    app = await _load_owned_app(session, app_id, user)
+    if (getattr(app, "mode", "single") or "single") != "multi":
+        raise HTTPException(status_code=400, detail="model actions apply only to multi-model endpoints")
+    action = (req.action or "").strip().lower()
+    if action not in ("kill", "restart"):
+        raise HTTPException(status_code=400, detail="action must be 'kill' or 'restart'")
+    members = [m.get("model") for m in (app.models or [])]
+    if req.model not in members:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "unknown model for this endpoint", "model": req.model, "members": members},
+        )
+    rdb = request.app.state.redis
+    await rdb.rpush(f"app:{app_id}:model_cmds", json.dumps({"model": req.model, "action": action}))
+    await rdb.expire(f"app:{app_id}:model_cmds", 300)
+    return {"ok": True, "queued": action, "model": req.model}
+
+
 @app.patch("/apps/{app_id}/autoscaler", response_model=AppRecord)
 async def update_app_autoscaler(
     app_id: str,
@@ -1674,8 +1710,22 @@ async def run(
     session: AsyncSession = Depends(get_session),
 ):
     rdb = request.app.state.redis
-    request_id, _ = await _admit_and_enqueue(rdb, session, app_id, user, payload, stream=False)
-    logger.info("enqueued %s on %s (user=%s)", request_id, app_id, user.username)
+    # Optional control field: which path on the worker's local vLLM to POST to.
+    # Defaults to legacy /v1/completions; the playground sends
+    # /v1/chat/completions so chat-only params (reasoning_effort,
+    # chat_template_kwargs.enable_thinking) actually apply. Popped so it isn't
+    # forwarded to vLLM as an unknown body field.
+    ep = payload.pop("endpoint", None)
+    endpoint = ep if isinstance(ep, str) and ep.startswith("/v1/") else "/v1/completions"
+    # Multi-model endpoints route by the member-model name in `payload.model`;
+    # single-mode workers serve one model and ignore target_model.
+    model_field = payload.get("model")
+    target_model = model_field if isinstance(model_field, str) and model_field else None
+    request_id, _ = await _admit_and_enqueue(
+        rdb, session, app_id, user, payload, stream=False,
+        endpoint=endpoint, target_model=target_model,
+    )
+    logger.info("enqueued %s on %s (user=%s, endpoint=%s)", request_id, app_id, user.username, endpoint)
     return RunResponse(request_id=request_id, poll_url=f"/result/{request_id}")
 
 
@@ -1704,8 +1754,20 @@ async def stream(
     pubsub = rdb.pubsub()
     await pubsub.subscribe(channel)
 
+    # Same control fields as /run: which vLLM path to POST to, and the
+    # member-model name multi-model workers route by.
+    ep = payload.pop("endpoint", None)
+    endpoint = ep if isinstance(ep, str) and ep.startswith("/v1/") else "/v1/completions"
+    model_field = payload.get("model")
+    target_model = model_field if isinstance(model_field, str) and model_field else None
+
     timeout_s = int(app.request_timeout_s)
-    job = {"request_id": request_id, "payload": payload, "stream": True, "timeout_s": timeout_s}
+    job = {
+        "request_id": request_id, "payload": payload, "stream": True,
+        "timeout_s": timeout_s, "endpoint": endpoint,
+    }
+    if target_model:
+        job["target_model"] = target_model
     await rdb.lpush(f"queue:{app_id}", json.dumps(job))
     await rdb.set(f"result:{request_id}", json.dumps({"status": "pending"}), ex=3600)
     await rdb.set(f"app:{app_id}:last_request_ts", str(time.time()))
@@ -2116,8 +2178,21 @@ async def heartbeat(req: WorkerHeartbeatRequest, request: Request):
             json.dumps(req.models),
             ex=WORKER_TTL_S * 3,
         )
+    # Hand back any queued operator commands (kill/restart a member). One worker
+    # per multi-model VM endpoint, so app-scoped is unambiguous; we pop them so
+    # each command is delivered exactly once.
+    commands: list[dict] = []
+    cmd_key = f"app:{req.app_id}:model_cmds"
+    raw_cmds = await rdb.lrange(cmd_key, 0, -1)
+    if raw_cmds:
+        await rdb.delete(cmd_key)
+        for x in raw_cmds:
+            try:
+                commands.append(json.loads(x))
+            except (json.JSONDecodeError, TypeError):
+                pass
     drain = await rdb.exists(f"worker:{req.machine_id}:drain")
-    return {"ok": True, "drain": bool(drain)}
+    return {"ok": True, "drain": bool(drain), "commands": commands}
 
 
 @app.post("/workers/logs")

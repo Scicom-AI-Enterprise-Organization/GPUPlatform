@@ -218,7 +218,13 @@ function formatAgo(d: Date): string {
 function RequestPanel({ app }: { app: AppRecord }) {
   const [reveal, setReveal] = useState(false);
   const { token, loading: tokenLoading } = useApiToken();
-  const endpoint = `${gateway.baseUrl}/run/${app.app_id}`;
+  const base = process.env.NEXT_PUBLIC_GATEWAY_URL ?? gateway.baseUrl;
+  // The OpenAI `model` field. A multi-model endpoint rejects the endpoint name
+  // (you must name a member), so default to the first member; single-mode keeps
+  // using the endpoint name, which resolves back-compat.
+  const isMulti = app.mode === "multi";
+  const exampleModel =
+    isMulti && app.models && app.models.length > 0 ? app.models[0].model : app.app_id;
 
   // The visible / copyable forms of every snippet. Visible may be masked;
   // copy always pastes the real key so the user gets a working command.
@@ -231,7 +237,7 @@ function RequestPanel({ app }: { app: AppRecord }) {
         <div className="flex items-center gap-3">
           <CardTitle className="text-sm font-medium">Run a job</CardTitle>
           <span className="text-xs text-muted-foreground">
-            Autoscales to meet demand.
+            OpenAI-compatible. Autoscales to meet demand.
           </span>
         </div>
         {token ? (
@@ -252,40 +258,42 @@ function RequestPanel({ app }: { app: AppRecord }) {
         <Tabs defaultValue="curl">
           <TabsList variant="line" className="bg-transparent">
             <TabsTrigger value="curl">cURL</TabsTrigger>
-            <TabsTrigger value="curl-poll">cURL (poll)</TabsTrigger>
+            <TabsTrigger value="curl-stream">cURL (stream)</TabsTrigger>
             <TabsTrigger value="openai">OpenAI client</TabsTrigger>
           </TabsList>
 
           <TabsContent value="curl" className="mt-3 space-y-3">
             <p className="text-sm text-muted-foreground">
-              Async — returns a <code className="font-mono">request_id</code> immediately, then poll{" "}
-              <code className="font-mono">/result/&#123;id&#125;</code> for the output.
+              OpenAI <code className="font-mono">/v1/chat/completions</code> — returns the full completion JSON in one call.
             </p>
             <CodeBlock
-              displayCode={curlSnippet(endpoint, visibleToken)}
-              copyCode={curlSnippet(endpoint, realToken)}
+              displayCode={curlChatSnippet(base, visibleToken, exampleModel)}
+              copyCode={curlChatSnippet(base, realToken, exampleModel)}
             />
             <DocsLink />
           </TabsContent>
 
-          <TabsContent value="curl-poll" className="mt-3 space-y-3">
+          <TabsContent value="curl-stream" className="mt-3 space-y-3">
             <p className="text-sm text-muted-foreground">
-              Sync — gateway polls internally and returns the completion in one call (60s ceiling). No request_id juggling.
+              Same endpoint with <code className="font-mono">&quot;stream&quot;: true</code> — token-by-token Server-Sent Events.
             </p>
             <CodeBlock
-              displayCode={curlPollSnippet(app.app_id, visibleToken)}
-              copyCode={curlPollSnippet(app.app_id, realToken)}
+              displayCode={curlChatStreamSnippet(base, visibleToken, exampleModel)}
+              copyCode={curlChatStreamSnippet(base, realToken, exampleModel)}
             />
             <DocsLink />
           </TabsContent>
 
           <TabsContent value="openai" className="mt-3 space-y-3">
             <p className="text-sm text-muted-foreground">
-              vLLM exposes an OpenAI-compatible API. Point any OpenAI client at the gateway and use the endpoint name as the <code className="font-mono">model</code>.
+              Point any OpenAI client at the gateway.{" "}
+              {isMulti
+                ? "Set model to one of this endpoint's member models."
+                : "Use the endpoint name as the model."}
             </p>
             <CodeBlock
-              displayCode={openaiSnippet(app.app_id, visibleToken)}
-              copyCode={openaiSnippet(app.app_id, realToken)}
+              displayCode={openaiSnippet(base, visibleToken, exampleModel)}
+              copyCode={openaiSnippet(base, realToken, exampleModel)}
             />
             <DocsLink />
           </TabsContent>
@@ -370,39 +378,41 @@ function DocsLink() {
   );
 }
 
-function curlSnippet(endpoint: string, token: string) {
-  return `curl -X POST '${endpoint}' \\
-  -H 'Content-Type: application/json' \\
-  -H 'Authorization: Bearer ${token}' \\
-  -d '{
-    "prompt": "Hello, world",
-    "max_tokens": 64
-  }'`;
-}
-
-function curlPollSnippet(appId: string, token: string) {
-  // Hits the OpenAI-compatible chat-completions endpoint, which polls
-  // internally for up to 60s before returning the actual completion JSON.
-  const base = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
+function curlChatSnippet(base: string, token: string, model: string) {
+  // OpenAI-compatible chat completions. The gateway polls internally and
+  // returns the full completion JSON in one call (60s ceiling).
   return `curl -X POST '${base}/v1/chat/completions' \\
   -H 'Content-Type: application/json' \\
   -H 'Authorization: Bearer ${token}' \\
   -d '{
-    "model": "${appId}",
-    "messages": [{"role": "user", "content": "Hello, world"}]
+    "model": "${model}",
+    "messages": [{"role": "user", "content": "Hello, world"}],
+    "max_tokens": 1024
   }'`;
 }
 
-function openaiSnippet(appId: string, token: string) {
+function curlChatStreamSnippet(base: string, token: string, model: string) {
+  return `curl -N -X POST '${base}/v1/chat/completions' \\
+  -H 'Content-Type: application/json' \\
+  -H 'Authorization: Bearer ${token}' \\
+  -d '{
+    "model": "${model}",
+    "messages": [{"role": "user", "content": "Hello, world"}],
+    "max_tokens": 1024,
+    "stream": true
+  }'`;
+}
+
+function openaiSnippet(base: string, token: string, model: string) {
   return `from openai import OpenAI
 
 client = OpenAI(
-    base_url="${process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080"}/v1",
+    base_url="${base}/v1",
     api_key="${token}",
 )
 
 resp = client.chat.completions.create(
-    model="${appId}",
+    model="${model}",
     messages=[{"role": "user", "content": "Hello"}],
     stream=True,
 )

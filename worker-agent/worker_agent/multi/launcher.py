@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import time
 
 import httpx
@@ -120,13 +121,18 @@ async def launch_member(
         *member.extra_args,
     ]
     log_path = log_path_for(member, log_dir)
-    logf = open(log_path, "ab", buffering=0)
+    # Truncate (not append) per launch: each attempt gets a fresh log so the
+    # health-wait fatal-error scan can't match a PREVIOUS attempt's traceback and
+    # abort instantly. The log shipper detects the size reset and re-tails from 0.
+    logf = open(log_path, "wb", buffering=0)
     logger.info(
         "launching vllm: model=%s gpus=%s tp=%d port=%d → %s",
         member.model, env["CUDA_VISIBLE_DEVICES"], member.tp, member.port, log_path,
     )
+    # start_new_session=True puts the engine + its tp worker children in their
+    # own process group so terminate() can SIGKILL the whole group (no orphans).
     proc = await asyncio.create_subprocess_exec(
-        *args, env=env, stdout=logf, stderr=logf,
+        *args, env=env, stdout=logf, stderr=logf, start_new_session=True,
     )
     return proc
 
@@ -159,14 +165,87 @@ async def ensure_vllm(venv_path: str | None, vllm_version: str | None) -> None:
         logger.exception("vllm ensure failed (continuing — launch will validate)")
 
 
+# Definitive "this launch is doomed" markers. Seeing any of these in the log
+# means the engine won't recover, so we abort the health wait immediately rather
+# than block the whole startup for the full 900s timeout (which is what happens
+# when a pinned GPU is held by another tenant and vLLM spins retrying).
+_FATAL_MARKERS = (
+    "less than desired GPU memory utilization",
+    "Free memory on device",
+    "CUDA out of memory",
+    "torch.OutOfMemoryError",
+    "Engine core initialization failed",
+    "WorkerProc initialization failed",
+    "unrecognized arguments",
+    "ModuleNotFoundError",
+    "No module named",
+)
+
+
+def has_fatal_error(log_path: str | None, tail_bytes: int = 32768) -> bool:
+    """True if the model's log already shows an unrecoverable engine error."""
+    if not log_path:
+        return False
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return any(marker in text for marker in _FATAL_MARKERS)
+
+
+async def terminate(proc: asyncio.subprocess.Process | None, grace_s: float = 10.0) -> None:
+    """Stop a vLLM engine and ALL its children (SIGTERM group, then SIGKILL).
+
+    A tp>1 vLLM spawns one worker process per GPU; killing only the api_server
+    orphans those workers, which keep hoarding GPU memory and OOM the next model
+    that touches the same GPUs. We launch each engine in its own process group
+    (start_new_session) and signal the whole group here so every worker dies."""
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+
+    def _signal(sig: int) -> None:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, OSError):
+                pass
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+    _signal(signal.SIGTERM)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace_s)
+    except asyncio.TimeoutError:
+        _signal(signal.SIGKILL)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def wait_health(
     client: httpx.AsyncClient,
     member: MemberModel,
     proc: asyncio.subprocess.Process,
+    log_path: str | None = None,
     timeout_s: float = LAUNCH_HEALTH_TIMEOUT_S,
 ) -> bool:
-    """Poll /health until 200, or the process dies, or we time out."""
+    """Poll /health until 200, or the process dies, or a fatal error shows up in
+    the log, or we time out. The log check lets us fail fast (~seconds) instead
+    of blocking the whole fleet startup for 900s when a GPU is unavailable."""
     deadline = time.monotonic() + timeout_s
+    i = 0
     while time.monotonic() < deadline:
         if proc.returncode is not None:
             logger.error("vllm for %s exited during startup (rc=%s)", member.model, proc.returncode)
@@ -174,6 +253,11 @@ async def wait_health(
         if await vllm_ctl.is_healthy(client, member.base_url):
             logger.info("vllm ready: %s on port %d", member.model, member.port)
             return True
+        # Cheap log peek every ~5s — abort early on an unrecoverable error.
+        if i % 5 == 4 and has_fatal_error(log_path):
+            logger.error("vllm for %s hit a fatal error during startup — aborting wait", member.model)
+            return False
+        i += 1
         await asyncio.sleep(1.0)
     logger.error("vllm for %s never became healthy within %.0fs", member.model, timeout_s)
     return False

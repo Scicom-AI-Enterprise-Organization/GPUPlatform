@@ -14,6 +14,12 @@ permissions:
   contents: read
   id-token: write   # needed for AWS OIDC (ECR + ECR Public push)
 
+env:
+  AWS_REGION: ap-southeast-5
+  ECR_ROLE: arn:aws:iam::865626945255:role/AIES-Serverlessgpu-ECRAccessRole
+  ECR_REGISTRY: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com
+  PUBLIC_GATEWAY_URL: https://serverlessgpu.aies.scicom.dev
+
 jobs:
   # Detect which components changed so image builds can be skipped when
   # nothing in their context tree was modified. Workflow changes always
@@ -47,6 +53,24 @@ jobs:
               - 'deploy/helm/**'
               - '.github/workflows/**'
 
+  # Single source of truth for the image tag + whether to push. Pushing only
+  # happens on main when the ENABLE_ECR_PUSH repo variable is set; PRs build
+  # for validation but never push.
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      sha_short: ${{ steps.m.outputs.sha_short }}
+      push: ${{ steps.m.outputs.push }}
+    steps:
+      - id: m
+        run: |
+          echo "sha_short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ vars.ENABLE_ECR_PUSH }}" = "true" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
   helm:
     runs-on: ubuntu-latest
     steps:
@@ -71,30 +95,53 @@ jobs:
           # Sanity check the rendered manifests parse as YAML
           python -c "import yaml; list(yaml.safe_load_all(open('/tmp/rendered.yaml')))"
 
-  # Image builds are split by target arch so each runs on a native runner —
-  # no QEMU emulation. Both jobs run in parallel.
+  # ── Multi-arch images: gateway + web ──────────────────────────────────────
+  # Matrix builds each component on BOTH a native amd64 runner and a native
+  # arm64 runner (no QEMU emulation) and pushes a per-platform tag
+  # `<repo>:<sha>-<amd64|arm64>`. The merge-images job then stitches those into
+  # a single multi-arch manifest `<repo>:<sha>` + `:latest`.
   #
-  #   images-arm  → gateway + web        (arm64 only, native on ubuntu-24.04-arm)
-  #                 EKS Bottlerocket nodes are arm64/Graviton, so single-arch
-  #                 is enough. Engineers running these locally use docker
-  #                 compose (builds from source), not `docker pull`.
-  #   images-amd  → pi-worker + local    (amd64 only, native on ubuntu-latest)
-  #                 vLLM is x86-only; PI's GPU hosts are x86.
+  #   amd64 → ubuntu-latest        arm64 → ubuntu-24.04-arm
   #
-  # Tags: <short-sha> + `latest` (push only on main).
+  # Tags: <short-sha> + `latest` (push only on main when ENABLE_ECR_PUSH=true).
   # Auth: GitHub OIDC → IAM role `AIES-Serverlessgpu-ECRAccessRole`.
-  images-arm:
-    runs-on: ubuntu-24.04-arm
-    needs: [helm, changes]
+  build-images:
+    name: build ${{ matrix.component }} (${{ matrix.suffix }})
+    needs: [helm, changes, meta]
     if: needs.changes.outputs.gateway == 'true' || needs.changes.outputs.web == 'true'
-    env:
-      AWS_REGION: ap-southeast-5
-      AWS_ACCOUNT_ID: "865626945255"
-      ECR_ROLE: arn:aws:iam::865626945255:role/AIES-Serverlessgpu-ECRAccessRole
-      ECR_REGISTRY: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com
-      GATEWAY_REPO: aies/serverlessgpu-gateway-ecr
-      WEB_REPO: aies/serverlessgpu-web-ecr
-      PUBLIC_GATEWAY_URL: https://serverlessgpu.aies.scicom.dev
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: gateway
+            platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+            repo: aies/serverlessgpu-gateway-ecr
+            context: ./gateway
+            dockerfile: ./gateway/Dockerfile
+          - component: gateway
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+            repo: aies/serverlessgpu-gateway-ecr
+            context: ./gateway
+            dockerfile: ./gateway/Dockerfile
+          - component: web
+            platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+            repo: aies/serverlessgpu-web-ecr
+            context: ./web
+            dockerfile: ./web/Dockerfile
+          - component: web
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+            repo: aies/serverlessgpu-web-ecr
+            context: ./web
+            dockerfile: ./web/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -102,7 +149,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Configure AWS credentials (GitHub OIDC)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_ECR_PUSH == 'true'
+        if: needs.meta.outputs.push == 'true' && needs.changes.outputs[matrix.component] == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ECR_ROLE }}
@@ -110,59 +157,76 @@ jobs:
           role-session-name: GitHubActions-Serverlessgpu
 
       - name: Login to ECR (private)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_ECR_PUSH == 'true'
+        if: needs.meta.outputs.push == 'true' && needs.changes.outputs[matrix.component] == 'true'
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Compute tags
-        id: meta
-        run: |
-          SHA_SHORT=${GITHUB_SHA::7}
-          echo "sha_short=$SHA_SHORT" >> $GITHUB_OUTPUT
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ vars.ENABLE_ECR_PUSH }}" = "true" ]; then
-            echo "push=true" >> $GITHUB_OUTPUT
-          else
-            echo "push=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Build & maybe push gateway image (arm64)
-        if: needs.changes.outputs.gateway == 'true'
-        uses: docker/build-push-action@v5
+      - name: Build & maybe push ${{ matrix.component }} (${{ matrix.platform }})
+        if: needs.changes.outputs[matrix.component] == 'true'
+        uses: docker/build-push-action@v6
         with:
-          context: ./gateway
-          file: ./gateway/Dockerfile
-          platforms: linux/arm64
-          push: ${{ steps.meta.outputs.push == 'true' }}
-          tags: |
-            ${{ env.ECR_REGISTRY }}/${{ env.GATEWAY_REPO }}:${{ steps.meta.outputs.sha_short }}
-            ${{ env.ECR_REGISTRY }}/${{ env.GATEWAY_REPO }}:latest
-          cache-from: type=gha,scope=gateway
-          cache-to: type=gha,scope=gateway,mode=max
-          provenance: false
-
-      - name: Build & maybe push web image (arm64)
-        if: needs.changes.outputs.web == 'true'
-        uses: docker/build-push-action@v5
-        with:
-          context: ./web
-          file: ./web/Dockerfile
-          platforms: linux/arm64
-          push: ${{ steps.meta.outputs.push == 'true' }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          push: ${{ needs.meta.outputs.push == 'true' }}
           build-args: |
             NEXT_PUBLIC_GATEWAY_URL=${{ env.PUBLIC_GATEWAY_URL }}
-          tags: |
-            ${{ env.ECR_REGISTRY }}/${{ env.WEB_REPO }}:${{ steps.meta.outputs.sha_short }}
-            ${{ env.ECR_REGISTRY }}/${{ env.WEB_REPO }}:latest
-          cache-from: type=gha,scope=web
-          cache-to: type=gha,scope=web,mode=max
+          tags: ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:${{ needs.meta.outputs.sha_short }}-${{ matrix.suffix }}
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.suffix }}
+          cache-to: type=gha,scope=${{ matrix.component }}-${{ matrix.suffix }},mode=max
           provenance: false
 
-  images-amd:
+  # ── Merge per-platform images into a multi-arch manifest ──────────────────
+  # Only runs when pushing (the per-platform tags must already be in ECR).
+  merge-images:
+    name: merge ${{ matrix.component }} manifest
+    needs: [build-images, changes, meta]
+    if: needs.meta.outputs.push == 'true' && (needs.changes.outputs.gateway == 'true' || needs.changes.outputs.web == 'true')
     runs-on: ubuntu-latest
-    needs: [helm, changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: gateway
+            repo: aies/serverlessgpu-gateway-ecr
+          - component: web
+            repo: aies/serverlessgpu-web-ecr
+    steps:
+      - name: Configure AWS credentials (GitHub OIDC)
+        if: needs.changes.outputs[matrix.component] == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ECR_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Serverlessgpu
+
+      - name: Login to ECR (private)
+        if: needs.changes.outputs[matrix.component] == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        if: needs.changes.outputs[matrix.component] == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifest
+        if: needs.changes.outputs[matrix.component] == 'true'
+        run: |
+          IMAGE="${{ env.ECR_REGISTRY }}/${{ matrix.repo }}"
+          TAG="${{ needs.meta.outputs.sha_short }}"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${TAG}" \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:${TAG}-amd64" \
+            "${IMAGE}:${TAG}-arm64"
+
+  # ── PI worker (amd64 only) ────────────────────────────────────────────────
+  # vLLM is x86-only and PI's GPU hosts are x86, so this image is single-arch
+  # (an arm64 build would fail) and lives in ECR Public, not the private ECR.
+  build-worker:
+    name: build pi-worker (amd64)
+    runs-on: ubuntu-latest
+    needs: [helm, changes, meta]
     if: needs.changes.outputs.worker == 'true'
     env:
-      AWS_REGION: ap-southeast-5
-      ECR_ROLE: arn:aws:iam::865626945255:role/AIES-Serverlessgpu-ECRAccessRole
       ECR_PUBLIC_ALIAS: o6x1g6b0
       WORKER_REPO: serverlessgpu-pi-worker
     steps:
@@ -172,7 +236,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Configure AWS credentials (GitHub OIDC)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_ECR_PUSH == 'true'
+        if: needs.meta.outputs.push == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ECR_ROLE }}
@@ -180,34 +244,22 @@ jobs:
           role-session-name: GitHubActions-Serverlessgpu
 
       - name: Login to ECR Public
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_ECR_PUSH == 'true'
+        if: needs.meta.outputs.push == 'true'
         uses: aws-actions/amazon-ecr-login@v2
         with:
           registry-type: public
 
-      - name: Compute tags
-        id: meta
-        run: |
-          SHA_SHORT=${GITHUB_SHA::7}
-          echo "sha_short=$SHA_SHORT" >> $GITHUB_OUTPUT
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ vars.ENABLE_ECR_PUSH }}" = "true" ]; then
-            echo "push=true" >> $GITHUB_OUTPUT
-          else
-            echo "push=false" >> $GITHUB_OUTPUT
-          fi
-
       - name: Build & maybe push PI worker image (amd64)
-        # vLLM is x86 only; PI's GPU hosts are x86 → amd64 single-arch.
         # Build context is repo root because Dockerfile.pi COPYs
         # `worker-agent/...` and `entrypoint-pi.sh`.
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./worker-agent/Dockerfile.pi
           platforms: linux/amd64
-          push: ${{ steps.meta.outputs.push == 'true' }}
+          push: ${{ needs.meta.outputs.push == 'true' }}
           tags: |
-            public.ecr.aws/${{ env.ECR_PUBLIC_ALIAS }}/${{ env.WORKER_REPO }}:${{ steps.meta.outputs.sha_short }}
+            public.ecr.aws/${{ env.ECR_PUBLIC_ALIAS }}/${{ env.WORKER_REPO }}:${{ needs.meta.outputs.sha_short }}
             public.ecr.aws/${{ env.ECR_PUBLIC_ALIAS }}/${{ env.WORKER_REPO }}:latest
           cache-from: type=gha,scope=pi-worker
           cache-to: type=gha,scope=pi-worker,mode=max
@@ -217,7 +269,7 @@ jobs:
       # this just verifies it builds so `make compose-up` doesn't break for
       # someone who pulled main fresh.
       - name: Build local worker image (verify only, no push)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./worker-agent
           file: ./worker-agent/Dockerfile
