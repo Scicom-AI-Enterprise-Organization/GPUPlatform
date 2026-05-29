@@ -18,6 +18,7 @@ import logging
 import shlex
 import signal
 import time
+from contextlib import asynccontextmanager
 
 import httpx
 
@@ -79,13 +80,35 @@ class MultiModelScheduler:
         self._python_exe = f"{cfg.venv_path}/bin/python" if cfg.venv_path else "python3"
         self._client = httpx.AsyncClient(timeout=None)
         self._cond = asyncio.Condition()
-        # Serializes GPU-memory-mutating work (load, wake, evict) so a launch and
-        # a swap can never run at once and double-allocate the same GPUs.
-        self._gpu_lock = asyncio.Lock()
         self._runtimes: list[ModelRuntime] = [ModelRuntime(m) for m in cfg.members]
+        # Per-GPU locks: a load/wake/evict holds the locks for ITS GPUs only, so
+        # models on disjoint GPUs (e.g. [0,1], [2,3], [4,5]) run concurrently
+        # while overlapping ones serialize on the shared GPU. Acquired in sorted
+        # order to avoid deadlock. This is what lets non-overlapping members load
+        # at the same time instead of one-by-one.
+        self._gpu_locks: dict[int, asyncio.Lock] = {}
+        for rt in self._runtimes:
+            for g in rt.member.gpu_indices:
+                self._gpu_locks.setdefault(g, asyncio.Lock())
         for rt in self._runtimes:
             rt.log_path = launcher.log_path_for(rt.member, self.log_dir)
         self._by_model: dict[str, ModelRuntime] = {rt.member.served_name: rt for rt in self._runtimes}
+
+    @asynccontextmanager
+    async def _hold_gpus(self, gpus):
+        """Hold the locks for exactly `gpus` (sorted, to avoid deadlock). Two
+        operations on disjoint GPU sets proceed concurrently; overlapping ones
+        block on the shared GPU's lock."""
+        locks = [self._gpu_locks[g] for g in sorted(set(gpus))]
+        acquired = []
+        try:
+            for lk in locks:
+                await lk.acquire()
+                acquired.append(lk)
+            yield
+        finally:
+            for lk in reversed(acquired):
+                lk.release()
 
     async def _kill_stale_vllm(self) -> None:
         """Kill leftover vLLM from a prior worker that was SIGKILLed before it
@@ -150,6 +173,39 @@ class MultiModelScheduler:
         await launcher.terminate(old)
         await self._launch_and_sleep(rt)
 
+    async def operator_sleep(self, served_name: str) -> None:
+        """Operator action: put an AWAKE model to sleep now (drain in-flight,
+        then /sleep at its level), freeing its GPUs. No-op if not awake."""
+        rt = self._by_model.get(served_name)
+        if rt is None:
+            raise UnknownModelError(served_name)
+        async with self._hold_gpus(rt.gpus):
+            async with self._cond:
+                if rt.state != ModelState.AWAKE:
+                    return
+                rt.state = ModelState.DRAINING
+                self._cond.notify_all()
+            await self._drain(rt)
+            async with self._cond:
+                rt.state = ModelState.SLEEPING
+                self._cond.notify_all()
+            await vllm_ctl.sleep_model(self._client, rt.base_url, rt.member.sleep_level)
+            async with self._cond:
+                rt.state = ModelState.ASLEEP
+                rt.last_used = time.time()
+                self._cond.notify_all()
+        logger.info("operator sleep: %s", served_name)
+
+    async def operator_sleep_all(self) -> None:
+        """Operator action: sleep every awake model (free all GPUs)."""
+        names = [rt.member.served_name for rt in self._runtimes if rt.state == ModelState.AWAKE]
+        logger.info("operator sleep_all: %s", names)
+        for name in names:
+            try:
+                await self.operator_sleep(name)
+            except Exception:
+                logger.exception("sleep_all: %s failed", name)
+
     def _mark_dead(self, rt: ModelRuntime) -> None:
         """Set DEAD and distill a human reason from the model's vLLM log (best
         effort). Call under the Condition."""
@@ -174,8 +230,28 @@ class MultiModelScheduler:
         # Ensure the requested vLLM version is present in the venv before any
         # model launches (no-op when venv_path/vllm_version aren't set).
         await launcher.ensure_vllm(self.cfg.venv_path, self.cfg.vllm_version)
-        for rt in self._runtimes:
-            await self._launch_and_sleep(rt)
+        # Load in WAVES: each wave is a set of mutually NON-overlapping members
+        # (disjoint gpu_indices) loaded concurrently; waves run in sequence. On
+        # 6 GPUs this loads qwen[0,1] + 35B[2,3] + gemma[4,5] all at once, then
+        # Mistral[0,1,2,3] in the next wave — instead of one model at a time.
+        remaining = list(self._runtimes)
+        while remaining:
+            wave: list[ModelRuntime] = []
+            rest: list[ModelRuntime] = []
+            used: set[int] = set()
+            for rt in remaining:
+                if rt.gpus & used:
+                    rest.append(rt)
+                else:
+                    wave.append(rt)
+                    used |= rt.gpus
+            logger.info("loading wave (%d concurrent): %s", len(wave),
+                        [rt.member.served_name for rt in wave])
+            await asyncio.gather(
+                *(self._launch_and_sleep(rt) for rt in wave),
+                return_exceptions=True,
+            )
+            remaining = rest
         # Greedily choose residents: first model per free GPU set, in config order.
         held: set[int] = set()
         for rt in self._runtimes:
@@ -193,7 +269,7 @@ class MultiModelScheduler:
     async def _launch_and_sleep(self, rt: ModelRuntime) -> None:
         try:
             rt.reason = None  # clear any stale cause from a prior attempt
-            async with self._gpu_lock:
+            async with self._hold_gpus(rt.gpus):
                 # Free rt's GPUs before loading: sleep any AWAKE model that shares
                 # them, or the load OOMs against a resident (e.g. relaunching a
                 # 2,3 model while Mistral holds 0,1,2,3). At initial startup this
@@ -262,7 +338,7 @@ class MultiModelScheduler:
 
     async def _evict_overlapping(self, rt: ModelRuntime) -> None:
         """Drain + sleep every AWAKE model whose GPUs overlap rt's, so rt's GPUs
-        are free to load into or wake into. Caller MUST hold _gpu_lock."""
+        are free to load into or wake into. Caller MUST hold rt's GPU locks."""
         async with self._cond:
             needed = rt.gpus
             victims = sorted(
@@ -285,9 +361,10 @@ class MultiModelScheduler:
 
     async def _wake(self, rt: ModelRuntime) -> None:
         """Free rt's GPUs (sleeping overlapping awake models) then wake rt. Holds
-        the GPU lock so it can't race a concurrent load/swap. Used by both the
-        on-demand swap and the startup resident warm-up."""
-        async with self._gpu_lock:
+        rt's GPU locks so it can't race a concurrent load/swap on the same GPUs;
+        non-overlapping wakes run concurrently. Used by both the on-demand swap
+        and the startup resident warm-up."""
+        async with self._hold_gpus(rt.gpus):
             async with self._cond:
                 if rt.state == ModelState.AWAKE:
                     rt.swapping = False

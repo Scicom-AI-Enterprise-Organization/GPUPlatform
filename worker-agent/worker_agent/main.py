@@ -464,6 +464,10 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
             await sched.kill_model(model)
         elif action == "restart":
             await sched.restart_model(model)
+        elif action == "sleep":
+            await sched.operator_sleep(model)
+        elif action == "sleep_all":
+            await sched.operator_sleep_all()
         else:
             logger.warning("ignoring unknown command action: %s", action)
 

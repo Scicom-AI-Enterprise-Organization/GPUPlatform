@@ -177,9 +177,10 @@ class WorkerLogsRequest(BaseModel):
 
 
 class ModelActionRequest(BaseModel):
-    """Operator action on one member of a multi-model VM endpoint."""
-    model: str
-    action: str  # "kill" | "restart"
+    """Operator action on a multi-model VM endpoint. `model` targets one member
+    (kill/restart/sleep); it's ignored by the fleet-wide `sleep_all`."""
+    model: Optional[str] = None
+    action: str  # "kill" | "restart" | "sleep" | "sleep_all"
 
 
 # Per-worker container log retention. The worker-agent ships batches every
@@ -1115,8 +1116,11 @@ async def create_app(
                 status_code=400,
                 detail="VM provider has no probed GPUs — run Test on the provider first",
             )
-        # Usable GPU universe: a visible_devices pin narrows it to that subset;
-        # tp must divide it and the fleet packs onto exactly those ids.
+        # Usable GPU universe: a visible_devices pin narrows it to that subset.
+        # Each model needs tp GPUs (tp <= usable); the fleet packs each onto a
+        # tp-wide slot via build_multi_model_config, which handles tp NOT dividing
+        # the total (e.g. tp=4 on 6 GPUs → [0,1,2,3], leaving [4,5] for tp=2
+        # members). So we only require tp <= usable, not tp | usable.
         usable_gpus = len(vd_ids) if vd_ids else total_gpus
         seen: set[str] = set()
         for m in members:
@@ -1124,8 +1128,6 @@ async def create_app(
                 raise HTTPException(status_code=400, detail=f"model {m.model}: tp must be >= 1")
             if m.tp > usable_gpus:
                 raise HTTPException(status_code=400, detail=f"model {m.model}: tp={m.tp} exceeds the {usable_gpus} selected GPUs")
-            if usable_gpus % m.tp != 0:
-                raise HTTPException(status_code=400, detail=f"model {m.model}: tp={m.tp} must divide the {usable_gpus} selected GPUs")
             if m.model in seen:
                 raise HTTPException(status_code=400, detail=f"duplicate model in members: {m.model}")
             seen.add(m.model)
@@ -1478,23 +1480,30 @@ async def app_model_action(
     user: User = Depends(require_section("inference")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Queue a kill/restart for one member of a multi-model VM endpoint. The
-    worker picks it up on its next heartbeat (≤5s) and acts via the scheduler:
-    kill → stop the engine + all its tp workers, leave it dead; restart →
-    kill + relaunch (then asleep, woken on demand)."""
+    """Queue an action for a multi-model VM endpoint; the worker applies it on
+    its next heartbeat (≤5s) via the scheduler:
+      kill      → stop the engine + all its tp workers, leave it dead
+      restart   → kill + relaunch (then asleep, woken on demand)
+      sleep     → drain + /sleep one awake model now (free its GPUs)
+      sleep_all → sleep every awake model (free all GPUs)
+    `sleep_all` ignores `model`; the others target one member."""
     app = await _load_owned_app(session, app_id, user)
     if (getattr(app, "mode", "single") or "single") != "multi":
         raise HTTPException(status_code=400, detail="model actions apply only to multi-model endpoints")
     action = (req.action or "").strip().lower()
-    if action not in ("kill", "restart"):
-        raise HTTPException(status_code=400, detail="action must be 'kill' or 'restart'")
+    if action not in ("kill", "restart", "sleep", "sleep_all"):
+        raise HTTPException(status_code=400, detail="action must be one of: kill, restart, sleep, sleep_all")
+    rdb = request.app.state.redis
+    if action == "sleep_all":
+        await rdb.rpush(f"app:{app_id}:model_cmds", json.dumps({"model": "*", "action": "sleep_all"}))
+        await rdb.expire(f"app:{app_id}:model_cmds", 300)
+        return {"ok": True, "queued": action}
     members = [m.get("model") for m in (app.models or [])]
     if req.model not in members:
         raise HTTPException(
             status_code=404,
             detail={"error": "unknown model for this endpoint", "model": req.model, "members": members},
         )
-    rdb = request.app.state.redis
     await rdb.rpush(f"app:{app_id}:model_cmds", json.dumps({"model": req.model, "action": action}))
     await rdb.expire(f"app:{app_id}:model_cmds", 300)
     return {"ok": True, "queued": action, "model": req.model}

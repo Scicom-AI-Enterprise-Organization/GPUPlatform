@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AlertTriangle, Ban, ChevronDown, ChevronRight, FileText, Loader2, RefreshCw, RotateCw, X } from "lucide-react";
+import { AlertTriangle, Ban, ChevronDown, ChevronRight, FileText, Loader2, Moon, RefreshCw, RotateCw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
@@ -553,6 +553,25 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
   }));
   const rows = status?.models?.length ? status.models : configured;
   const workerUp = (status?.workers ?? 0) > 0;
+  const anyAwake = rows.some((m) => m.state === "awake");
+
+  const [sleepingAll, setSleepingAll] = useState(false);
+  async function sleepAll() {
+    setSleepingAll(true);
+    try {
+      const r = await fetch(`/api/proxy/apps/${encodeURIComponent(app.app_id)}/model-action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "sleep_all" }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
+      window.setTimeout(fetchStatus, 2000);
+    } catch {
+      // best-effort; the table will reflect reality on the next poll
+    } finally {
+      setSleepingAll(false);
+    }
+  }
 
   return (
     <Card className="overflow-hidden">
@@ -569,10 +588,20 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
           </span>
           <span className="text-muted-foreground">sleep level {app.sleep_level ?? 1}</span>
         </div>
-        <Button variant="outline" size="xs" onClick={fetchStatus} disabled={loading}>
-          {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline" size="xs" onClick={sleepAll}
+            disabled={sleepingAll || !anyAwake}
+            title="Sleep all awake models (free their GPUs)"
+          >
+            {sleepingAll ? <Loader2 className="h-3 w-3 animate-spin" /> : <Moon className="h-3 w-3" />}
+            Sleep all
+          </Button>
+          <Button variant="outline" size="xs" onClick={fetchStatus} disabled={loading}>
+            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+            Refresh
+          </Button>
+        </div>
       </div>
       {err && (
         <div className="border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">{err}</div>
@@ -618,11 +647,12 @@ function FleetModelRow({
   appId: string; m: FleetModel; isOpen: boolean; onToggle: () => void; onRefresh: () => void;
 }) {
   const dead = m.state === "dead";
-  const [busy, setBusy] = useState<"kill" | "restart" | null>(null);
+  const awake = m.state === "awake";
+  const [busy, setBusy] = useState<"kill" | "restart" | "sleep" | null>(null);
   // Inline feedback shown in the row instead of a toast.
   const [note, setNote] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
 
-  async function doAction(action: "kill" | "restart") {
+  async function doAction(action: "kill" | "restart" | "sleep") {
     setBusy(action);
     setNote(null);
     try {
@@ -676,6 +706,14 @@ function FleetModelRow({
         <td className="px-4 py-3 align-top font-mono text-xs">{m.inflight ?? 0}</td>
         <td className="px-4 py-3 align-top">
           <div className="flex items-center justify-end gap-0.5">
+            <Button
+              variant="ghost" size="icon-xs" onClick={() => doAction("sleep")}
+              disabled={busy !== null || !awake}
+              title="Sleep — drain + put this model to sleep, freeing its GPUs"
+              aria-label="Sleep model"
+            >
+              {busy === "sleep" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Moon className="h-3.5 w-3.5" />}
+            </Button>
             <Button
               variant="ghost" size="icon-xs" onClick={() => doAction("restart")}
               disabled={busy !== null}
