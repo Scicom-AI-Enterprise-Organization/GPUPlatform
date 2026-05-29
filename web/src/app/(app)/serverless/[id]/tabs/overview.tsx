@@ -23,6 +23,10 @@ import { gateway, type AppStatus } from "@/lib/gateway";
 import { restartEndpoint, updateAutoscaler } from "../../actions";
 
 export function OverviewTab({ app }: { app: AppRecord }) {
+  // A multi-model VM endpoint is one fixed, always-on node that time-shares
+  // its GPUs via vLLM sleep/wake — none of the RunPod autoscaler knobs apply,
+  // and each member model has its own vLLM args. Swap those cards out.
+  const isMulti = app.mode === "multi";
   return (
     <div className="space-y-4">
       <ProvisionErrorBanner appId={app.app_id} />
@@ -30,11 +34,118 @@ export function OverviewTab({ app }: { app: AppRecord }) {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <DetailCard app={app} />
-        <ScaleStrategyCard app={app} />
+        {isMulti ? <VmServingCard app={app} /> : <ScaleStrategyCard app={app} />}
       </div>
 
-      <EngineArgsCard app={app} />
+      {isMulti ? <MultiModelArgsCard app={app} /> : <EngineArgsCard app={app} />}
+
+      <EnvVarsCard app={app} />
     </div>
+  );
+}
+
+// The export env the endpoint was created with (HF_HOME, cache dirs, …),
+// applied to every vLLM process on the worker. Read-only; secret-looking
+// values are masked behind a reveal toggle.
+function EnvVarsCard({ app }: { app: AppRecord }) {
+  const [reveal, setReveal] = useState(false);
+  const entries = Object.entries(app.env_vars ?? {});
+  if (entries.length === 0) return null;
+
+  const isSecret = (k: string) => /TOKEN|KEY|SECRET|PASSWORD|CRED/i.test(k);
+  const line = (k: string, v: string, masked: boolean) =>
+    `export ${k}=${JSON.stringify(masked && isSecret(k) ? "••••••••" : v)}`;
+  const displayCode = entries.map(([k, v]) => line(k, v, !reveal)).join("\n");
+  const copyCode = entries.map(([k, v]) => line(k, v, false)).join("\n");
+  const hasSecret = entries.some(([k]) => isSecret(k));
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between gap-2">
+        <div className="flex flex-col gap-0.5">
+          <CardTitle className="text-sm font-medium">Environment variables</CardTitle>
+          <span className="text-xs text-muted-foreground">
+            {entries.length} var{entries.length === 1 ? "" : "s"} exported into every vLLM process on the worker.
+          </span>
+        </div>
+        {hasSecret && (
+          <Button variant="outline" size="xs" onClick={() => setReveal((v) => !v)}>
+            {reveal ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+            {reveal ? "Hide" : "Reveal"} values
+          </Button>
+        )}
+      </CardHeader>
+      <CardContent>
+        <CodeBlock displayCode={displayCode} copyCode={copyCode} />
+      </CardContent>
+    </Card>
+  );
+}
+
+// Multi-model VM serving: a single fixed node, always-on, GPU-pinned, with
+// idle models evicted via vLLM sleep/wake. Read-only — there's nothing to
+// autoscale.
+function VmServingCard({ app }: { app: AppRecord }) {
+  const models = app.models ?? [];
+  const gpuIds = (app.visible_devices ?? "").trim();
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm font-medium">VM serving</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        <Row label="Mode" value="Multi-model (always-on)" />
+        <Row label="Models" value={<code className="font-mono">{models.length}</code>} />
+        <Row label="GPUs" value={<code className="font-mono">{gpuIds || `×${app.gpu_count ?? 0}`}</code>} />
+        <Row label="Eviction" value={`Sleep/wake · level ${app.sleep_level ?? 1}`} />
+        {app.vllm_version && (
+          <Row label="vLLM" value={<code className="font-mono">{app.vllm_version}</code>} />
+        )}
+        {app.venv_path && (
+          <Row label="venv" value={<code className="font-mono text-xs">{app.venv_path}</code>} />
+        )}
+        <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+          One fixed VM node, always on — no scale-to-zero. Models whose GPUs are
+          contended are slept (level {app.sleep_level ?? 1}) and woken on demand; the first
+          request to a sleeping model waits for the swap.
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
+// Per-model vLLM args for a multi-model endpoint: each member has its own
+// tensor-parallel size + extra args. Read-only (edit by recreating the endpoint).
+function MultiModelArgsCard({ app }: { app: AppRecord }) {
+  const models = app.models ?? [];
+  return (
+    <Card>
+      <CardHeader className="flex flex-col gap-0.5">
+        <CardTitle className="text-sm font-medium">vLLM engine args — per model</CardTitle>
+        <span className="text-xs text-muted-foreground">
+          Each model launches its own <code className="font-mono">vllm serve</code> with these args.
+        </span>
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        {models.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No models configured.</p>
+        ) : (
+          models.map((m) => (
+            <div key={m.model} className="rounded-md border border-border">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/30 px-3 py-1.5">
+                <code className="font-mono text-xs text-foreground">{m.model}</code>
+                <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                  TP={m.tp}
+                </span>
+              </div>
+              <pre className="overflow-x-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
+                {(m.extra_args ?? "").trim() || "(no extra args)"}
+              </pre>
+            </div>
+          ))
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

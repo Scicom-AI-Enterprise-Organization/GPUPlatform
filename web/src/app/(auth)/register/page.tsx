@@ -1,7 +1,11 @@
 import { RegisterForm } from "./register-form";
 import Link from "next/link";
+import { redirect } from "next/navigation";
 
 export default function RegisterPage() {
+  if (process.env.REGISTRATION_DISABLED === "1") {
+    redirect("/login");
+  }
   return (
     <div className="space-y-6">
       <div className="space-y-1">

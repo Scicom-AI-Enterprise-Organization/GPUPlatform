@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import yaml from "js-yaml";
-import { CheckSquare, Inbox, LayoutGrid, List, Search, Trash2, X } from "lucide-react";
+import { CheckSquare, GitCompare, Inbox, LayoutGrid, List, Search, Trash2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkRecord } from "@/lib/types";
@@ -63,6 +63,10 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const [single, setSingle] = useState<BenchmarkRecord | null>(null);
   const [singleDeleting, setSingleDeleting] = useState(false);
   const [singleError, setSingleError] = useState<string | null>(null);
+  const [renameTarget, setRenameTarget] = useState<BenchmarkRecord | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
   const [view, setView] = useState<"rows" | "grid">("rows");
   useEffect(() => {
     const v = window.localStorage.getItem("sgpu_bench_view");
@@ -85,6 +89,32 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const exitSelect = () => {
     setSelectMode(false);
     setSelected(new Set());
+  };
+
+  const onCompare = () => {
+    const ids = Array.from(selected);
+    if (ids.length < 2) return;
+    router.push(`/benchmark/compare?ids=${ids.map(encodeURIComponent).join(",")}`);
+  };
+
+  const onRename = async () => {
+    if (!renameTarget) return;
+    const name = renameDraft.trim();
+    if (!name || name === renameTarget.name) {
+      setRenameTarget(null);
+      return;
+    }
+    setRenameError(null);
+    setRenaming(true);
+    try {
+      await gateway.renameBenchmark(renameTarget.id, name);
+      setRenameTarget(null);
+      router.refresh();
+    } catch (e) {
+      setRenameError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRenaming(false);
+    }
   };
 
   const onSingleDelete = async () => {
@@ -251,15 +281,27 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
               </>
             )}
           </span>
-          <button
-            type="button"
-            onClick={() => setConfirmOpen(true)}
-            disabled={selected.size === 0 || deleting}
-            className="inline-flex items-center gap-1.5 rounded-md bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            {deleting ? "Deleting…" : `Delete ${selected.size > 0 ? selected.size : ""}`.trim()}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onCompare}
+              disabled={selected.size < 2 || deleting}
+              title={selected.size < 2 ? "Select 2 or more to compare" : "Compare selected"}
+              className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium shadow-xs hover:bg-muted disabled:opacity-50"
+            >
+              <GitCompare className="h-3.5 w-3.5" />
+              {`Compare ${selected.size >= 2 ? selected.size : ""}`.trim()}
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmOpen(true)}
+              disabled={selected.size === 0 || deleting}
+              className="inline-flex items-center gap-1.5 rounded-md bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              {deleting ? "Deleting…" : `Delete ${selected.size > 0 ? selected.size : ""}`.trim()}
+            </button>
+          </div>
         </div>
       )}
 
@@ -301,6 +343,11 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
               selected={selected.has(b.id)}
               onToggle={toggle}
               onDelete={(bench) => setSingle(bench)}
+              onRename={(bench) => {
+                setRenameTarget(bench);
+                setRenameDraft(bench.name);
+                setRenameError(null);
+              }}
             />
           ))}
         </div>
@@ -367,6 +414,49 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
             </Button>
             <Button variant="destructive" onClick={onSingleDelete} disabled={singleDeleting}>
               {singleDeleting ? "Deleting…" : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!renameTarget}
+        onOpenChange={(o) => {
+          if (!renaming && !o) {
+            setRenameTarget(null);
+            setRenameError(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Rename benchmark</DialogTitle>
+            <DialogDescription>
+              Updates the display name only. The run, S3 files, and config are
+              unchanged.
+            </DialogDescription>
+          </DialogHeader>
+          <input
+            autoFocus
+            value={renameDraft}
+            onChange={(e) => setRenameDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !renaming && renameDraft.trim()) onRename();
+            }}
+            disabled={renaming}
+            maxLength={200}
+            placeholder="Benchmark name"
+            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
+          />
+          <DialogFooter>
+            {renameError && (
+              <p className="mr-auto text-sm text-destructive">{renameError}</p>
+            )}
+            <Button variant="outline" onClick={() => setRenameTarget(null)} disabled={renaming}>
+              Cancel
+            </Button>
+            <Button onClick={onRename} disabled={renaming || !renameDraft.trim()}>
+              {renaming ? "Saving…" : "Save"}
             </Button>
           </DialogFooter>
         </DialogContent>

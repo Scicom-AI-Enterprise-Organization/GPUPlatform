@@ -118,6 +118,33 @@ class App(Base):
     # API surface is stable and we can backfill the resolver wiring later
     # without a second migration.
     provider_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    # Serving mode. "single" = one model per endpoint (the original behaviour).
+    # "multi" = a fleet of vLLM servers on one VM, model-routed with vLLM
+    # sleep/wake eviction. Multi requires a kind="vm" provider_id.
+    mode: Mapped[str] = mapped_column(String(8), default="single", server_default="single", nullable=False)
+    # Multi-model member spec; NULL/empty for single mode. Shape:
+    #   [{"model": str, "tp": int, "extra_args": str}]
+    # For multi, `model` is "" and `gpu_count` holds the VM's total GPU count.
+    models: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # vLLM sleep level used when evicting an idle model (1 = offload weights to
+    # CPU RAM, fast wake; 2 = discard weights, reload from disk). Multi only.
+    sleep_level: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    # Extra environment variables applied to every vLLM process on the worker
+    # (e.g. HF_HOME=/share/huggingface, TRITON_CACHE_DIR=…). Absolute-path values
+    # are mkdir -p'd on the worker before launch. NULL/empty = none.
+    env_vars: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # VM-only: pin to specific physical GPU indices, e.g. "0,1,2,3". NULL/empty =
+    # use all of the VM's GPUs. Single-model sets CUDA_VISIBLE_DEVICES on the
+    # worker; multi-model maps its slot packer onto exactly these ids (instead
+    # of always starting at GPU 0). `gpu_count` is set to the count of these ids.
+    visible_devices: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # VM-only: the uv venv the worker runs `vllm serve` from, e.g.
+    # "/share/vllm-venv" → launches {venv_path}/bin/python -m vllm. NULL = bare
+    # `python3` on PATH.
+    venv_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    # VM-only: pin vLLM to this version in venv_path — the worker `uv pip install`s
+    # it if missing/mismatched, e.g. "0.19.1". NULL = use whatever's installed.
+    vllm_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -146,6 +173,37 @@ class Provider(Base):
     )
 
 
+class Storage(Base):
+    """A storage backend the platform writes to — where AutoTrain datasets,
+    benchmark logs, serverless inference logs, etc. get persisted. NOT a single
+    dataset; a reusable destination that features reference by id.
+
+    Two kinds:
+    - `s3`          — an S3 (or S3-compatible: R2, MinIO) bucket.
+    - `huggingface` — a HuggingFace token holder for pushing repos.
+
+    `config` is a JSON blob whose schema depends on `kind`. Secrets live under
+    `credentials_enc` (Fernet-encrypted JSON) and are never returned to the UI:
+        s3:          { "bucket": str, "prefix": str|None, "region": str|None,
+                       "endpoint": str|None,
+                       "credentials_enc": <enc {accessKeyId, secretAccessKey}> }
+        huggingface: { "credentials_enc": <enc {token}> }
+    When `credentials_enc` is absent the runtime falls back to env (AWS_* for
+    s3, HF_TOKEN for huggingface). `description` holds free-form notes.
+    """
+    __tablename__ = "storage"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    kind: Mapped[str] = mapped_column(String(16), index=True)  # "s3" | "huggingface"
+    description: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)  # notes
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    config: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class Request(Base):
     __tablename__ = "requests"
     request_id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -160,6 +218,25 @@ class Request(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ApiKey(Base):
+    """A long-lived, revocable API token tied to a user. The plaintext key
+    (`sgpu_…`) is shown once at creation; only its SHA-256 hash is stored. A key
+    authenticates as its owner and inherits that user's role + section access —
+    there are no separate per-key scopes. Revoking sets `revoked_at`."""
+    __tablename__ = "api_keys"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # ak-<hex>
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    # First ~12 chars of the key ("sgpu_AbCd…") for display — never the secret.
+    prefix: Mapped[str] = mapped_column(String(16))
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # sha256 hex
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 _engine = None
@@ -216,6 +293,29 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_apps_provider_id ON apps(provider_id)"
+        ))
+        # Multi-model serving on VMs: per-endpoint mode, member-model spec, and
+        # vLLM sleep level. Existing rows backfill to single-model behaviour.
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS mode VARCHAR(8) NOT NULL DEFAULT 'single'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS models JSON"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS sleep_level INTEGER NOT NULL DEFAULT 1"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS env_vars JSON"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS visible_devices VARCHAR(128)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS venv_path VARCHAR(512)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_version VARCHAR(32)"
         ))
         await conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users(email) WHERE email IS NOT NULL"
@@ -318,18 +418,40 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS cleanup_model BOOLEAN NOT NULL DEFAULT TRUE"
         ))
+        # Extra env applied to the benchmark run (exported on the VM / passed to
+        # the RunPod pod) + CUDA_VISIBLE_DEVICES pinning. NULL = none.
+        await conn.execute(text(
+            "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS env_vars JSON"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS visible_devices VARCHAR(128)"
+        ))
+        # Per-benchmark storage backend for logs + results. NULL = env bucket.
+        await conn.execute(text(
+            "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS storage_id VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_benchmarks_storage_id ON benchmarks(storage_id)"
+        ))
         # Providers table is created by Base.metadata.create_all above; nothing
         # to migrate yet since it landed on a fresh schema.
+        # Storage: `enabled` toggle landed after the table's first cut, so add
+        # it in place for any DB that created `storage` without it.
+        await conn.execute(text(
+            "ALTER TABLE storage ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
 
 
 async def seed_admin_user() -> None:
     """If ADMIN_USERNAME + ADMIN_PASSWORD env are set, upsert that user with
-    is_admin=true. Idempotent: re-running is safe and doesn't overwrite the
-    password if the user already exists."""
+    is_admin=true. ADMIN_EMAIL is optional and backfilled when set (never
+    cleared). Idempotent: re-running is safe and doesn't overwrite the password
+    if the user already exists."""
     import os as _os
     from .auth import hash_password
     username = _os.environ.get("ADMIN_USERNAME", "").strip()
     password = _os.environ.get("ADMIN_PASSWORD", "").strip()
+    email = _os.environ.get("ADMIN_EMAIL", "").strip() or None
     if not username or not password:
         return
     async with session_factory()() as session:
@@ -337,14 +459,17 @@ async def seed_admin_user() -> None:
         if existing is None:
             session.add(User(
                 username=username,
+                email=email,
                 password_hash=hash_password(password),
                 is_admin=True,
                 role="admin",
             ))
             await session.commit()
-        elif not existing.is_admin or existing.role != "admin":
+        elif not existing.is_admin or existing.role != "admin" or (email and existing.email != email):
             existing.is_admin = True
             existing.role = "admin"
+            if email:
+                existing.email = email
             await session.commit()
 
 

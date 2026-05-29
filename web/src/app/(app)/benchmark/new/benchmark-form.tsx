@@ -13,6 +13,7 @@ import {
   ChevronDown,
   ChevronRight,
   Cpu,
+  Database,
   FileCode2,
   FlaskConical,
   Gauge,
@@ -65,7 +66,7 @@ import {
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
-import type { BenchmarkTemplate, ProviderRecord, VmAvailability } from "@/lib/types";
+import type { BenchmarkTemplate, ProviderRecord, StorageRecord, VmAvailability } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const GPU_OPTIONS = [
@@ -206,6 +207,27 @@ function parseCsvInts(s: string): number[] {
     .filter(Boolean)
     .map((x) => parseInt(x, 10))
     .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+// Parse a pasted env block into a dict. Accepts `KEY=value` and
+// `export KEY=value`; skips blanks, comments, and `mkdir`/other shell lines.
+function parseEnvVars(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of text.split("\n")) {
+    let line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("export ")) line = line.slice("export ".length).trim();
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    out[key] = val;
+  }
+  return out;
 }
 
 function modelSlug(repo: string): string {
@@ -586,7 +608,14 @@ export function BenchmarkForm({
   const [providerId, setProviderId] = useState<string>(initialProviderId ?? "");
   // RunPod-account selection for cloud target. Empty = gateway-default key.
   const [runpodProviderId, setRunpodProviderId] = useState<string>("");
+  // Storage backend for this run's logs + result files. Required. Only s3-kind,
+  // enabled storages are eligible.
+  const [storages, setStorages] = useState<StorageRecord[]>([]);
+  const [storageId, setStorageId] = useState<string>("");
   const [cleanupModel, setCleanupModel] = useState(true);
+  // CUDA_VISIBLE_DEVICES pin + extra env exported for the run (cache/home dirs).
+  const [visibleDevices, setVisibleDevices] = useState("");
+  const [envText, setEnvText] = useState("");
 
   // Live SSH probe of the selected VM. Re-fires when the user changes the
   // provider, and when they hit the refresh button.
@@ -630,6 +659,7 @@ export function BenchmarkForm({
   useEffect(() => {
     gateway.listBenchmarkTemplates().then(setTemplates).catch(() => {});
     gateway.listProviders().then(setProviders).catch(() => {});
+    gateway.listStorage().then(setStorages).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -690,8 +720,13 @@ export function BenchmarkForm({
       setSubmitError("Pick a VM provider, or switch back to Default cloud.");
       return;
     }
+    if (!storageId) {
+      setSubmitError("Pick a storage for the run's logs and metrics.");
+      return;
+    }
     setSubmitting(true);
     try {
+      const envVars = parseEnvVars(envText);
       const created = await gateway.createBenchmark({
         name: name.trim(),
         config_yaml,
@@ -699,7 +734,10 @@ export function BenchmarkForm({
           target === "vm"
             ? providerId
             : runpodProviderId || null,
+        storage_id: storageId,
         cleanup_model: target === "vm" ? cleanupModel : undefined,
+        ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
+        ...(visibleDevices.trim() ? { visible_devices: visibleDevices.trim() } : {}),
       });
       toast.success(`Created ${created.id}`, { duration: 4000 });
       router.push(`/benchmark/${encodeURIComponent(created.id)}`);
@@ -1098,6 +1136,94 @@ export function BenchmarkForm({
               </FieldWrap>
             </Grid>
           )}
+          </SectionCard>
+
+          {/* Runtime environment — GPU pinning + extra env exported for the run. */}
+          <SectionCard
+            icon={<Cpu className="h-4 w-4" />}
+            title="Runtime environment"
+            description="GPU pinning and environment variables for the run."
+          >
+            <div className="space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="bench-cuda" className="text-xs">CUDA_VISIBLE_DEVICES</Label>
+                <Input
+                  id="bench-cuda"
+                  value={visibleDevices}
+                  onChange={(e) => setVisibleDevices(e.target.value)}
+                  placeholder="e.g. 0,1,2,3 (empty = all GPUs)"
+                  className="font-mono text-xs"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Pins which GPUs the run uses. Empty = all visible GPUs.
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="bench-env" className="text-xs">Environment variables</Label>
+                <Textarea
+                  id="bench-env"
+                  value={envText}
+                  onChange={(e) => setEnvText(e.target.value)}
+                  rows={6}
+                  placeholder={"export HF_HOME=/share/huggingface\nexport TRITON_CACHE_DIR=/share/triton_cache\nexport VLLM_CACHE_ROOT=/share/vllm_cache"}
+                  className="font-mono text-xs"
+                />
+                <p className="text-xs text-muted-foreground">
+                  One <span className="font-mono">KEY=value</span> per line (<span className="font-mono">export</span> /{" "}
+                  <span className="font-mono">mkdir</span> lines are fine). On a VM these are exported before the run and
+                  absolute-path values are auto-created; on RunPod they&apos;re passed to the pod.
+                  {Object.keys(parseEnvVars(envText)).length > 0 && (
+                    <>
+                      {" "}· parsed:{" "}
+                      <span className="font-mono">{Object.keys(parseEnvVars(envText)).join(", ")}</span>
+                    </>
+                  )}
+                </p>
+              </div>
+            </div>
+          </SectionCard>
+
+          {/* Storage — where this run's logs.txt + result files land. Required;
+              only enabled S3 storages are eligible (HF storages can't hold the
+              raw log/result objects). */}
+          <SectionCard
+            icon={<Database className="h-4 w-4" />}
+            title="Storage"
+            description="S3 bucket the run's logs and metrics are written to."
+          >
+            <div className="space-y-1.5">
+              <Label htmlFor="bench-storage" className="text-xs">Storage</Label>
+              {storages.filter((s) => s.kind === "s3" && s.enabled).length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  No S3 storage configured. Add one at{" "}
+                  <a href="/storage/new" className="underline underline-offset-2 hover:text-foreground">
+                    Storage → New storage
+                  </a>
+                  .
+                </p>
+              ) : (
+                <Select value={storageId} onValueChange={setStorageId}>
+                  <SelectTrigger id="bench-storage">
+                    <SelectValue placeholder="Pick a storage…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {storages
+                      .filter((s) => s.kind === "s3" && s.enabled)
+                      .map((s) => (
+                        <SelectItem key={s.id} value={s.id}>
+                          {s.name}
+                          {s.bucket ? ` · s3://${s.bucket}${s.prefix ? `/${s.prefix.replace(/^\/+|\/+$/g, "")}` : ""}` : ""}
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+              )}
+              <p className="text-xs text-muted-foreground">
+                logs.txt + result files are written under{" "}
+                <span className="font-mono">&lt;bucket&gt;/&lt;prefix&gt;/benchmarks/&lt;id&gt;/</span>.
+                Manage backends under <a href="/storage" className="underline underline-offset-2 hover:text-foreground">Storage</a>.
+              </p>
+            </div>
           </SectionCard>
 
           {/* Container image — picks the CUDA / pytorch baseline on the pod.
@@ -1960,7 +2086,7 @@ function VmAvailabilityRow({
           <RefreshCw className="h-3 w-3" /> Refresh
         </button>
       </div>
-      <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[10px] text-muted-foreground">
+      <div className="flex flex-col gap-0.5 font-mono text-[10px] text-muted-foreground">
         {data.gpus.map((g) => (
           <span key={g.index}>
             #{g.index} {g.name.replace(/^NVIDIA\s+/, "")} · {fmtMib(g.mem_free_mib)}/{fmtMib(g.mem_total_mib)} free · {g.util_pct}% util

@@ -9,6 +9,7 @@ export default async function LoginPage({
 }) {
   const { next, sso_error: ssoError } = await searchParams;
   const githubEnabled = !!process.env.GITHUB_CLIENT_ID;
+  const registrationDisabled = process.env.REGISTRATION_DISABLED === "1";
   const target = next ?? "/serverless";
   return (
     <div className="space-y-6">
@@ -40,12 +41,14 @@ export default async function LoginPage({
       )}
 
       <LoginForm next={target} />
-      <p className="text-xs text-muted-foreground">
-        No account?{" "}
-        <Link href="/register" className="text-primary hover:underline">
-          Create one
-        </Link>
-      </p>
+      {!registrationDisabled && (
+        <p className="text-xs text-muted-foreground">
+          No account?{" "}
+          <Link href="/register" className="text-primary hover:underline">
+            Create one
+          </Link>
+        </p>
+      )}
     </div>
   );
 }

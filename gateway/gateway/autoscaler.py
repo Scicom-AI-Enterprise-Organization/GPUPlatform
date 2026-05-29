@@ -42,6 +42,62 @@ WORKER_EVENTS_CAP = 200
 WORKER_EVENTS_TTL_S = 3600
 
 
+def build_multi_model_config(app) -> dict:
+    """Translate an App's `models` member spec into the JSON the multi-model
+    worker-agent consumes (`MULTI_MODEL_CONFIG`).
+
+    Assigns each member to a GPU "slot" of `tp` consecutive GPUs, packing models
+    of the same tp round-robin across the floor(total/tp) slots for that tp. When
+    members outnumber slots, the extras reuse earlier slots' GPU sets — the
+    worker time-shares those GPUs via vLLM sleep/wake. Per-model vLLM servers
+    bind localhost ports starting at MULTI_MODEL_PORT_BASE (default 18001) — high
+    enough to dodge anything already running on a shared VM (8000/8001/…).
+    """
+    total = int(getattr(app, "gpu_count", 0) or 0)
+    # Physical GPU ids this endpoint may use. An explicit visible_devices pin
+    # (e.g. "4,5,6,7") becomes the universe slots are carved from; otherwise we
+    # use 0..total-1 (the historical behaviour). gpu_indices below are real
+    # physical ids the worker passes to CUDA_VISIBLE_DEVICES per model.
+    vd = (getattr(app, "visible_devices", None) or "").strip()
+    if vd:
+        phys = [int(x.strip()) for x in vd.split(",") if x.strip() != ""]
+    else:
+        phys = list(range(total))
+    universe = len(phys) or total
+    members = getattr(app, "models", None) or []
+    default_level = int(getattr(app, "sleep_level", 1) or 1)
+    slot_cursor: dict[int, int] = {}
+    out: list[dict] = []
+    port = int(os.environ.get("MULTI_MODEL_PORT_BASE", "18001") or "18001")
+    for m in members:
+        model = m["model"]
+        tp = max(1, int(m.get("tp", 1) or 1))
+        n_slots = max(1, universe // tp) if universe else 1
+        si = slot_cursor.get(tp, 0) % n_slots
+        slot_cursor[tp] = si + 1
+        start = si * tp
+        gpu_indices = phys[start:start + tp] if phys else list(range(start, start + tp))
+        out.append({
+            "model": model,
+            "served_name": model,
+            "tp": tp,
+            "port": port,
+            "gpu_indices": gpu_indices,
+            "extra_args": (m.get("extra_args", "") or ""),
+            "sleep_level": default_level,
+        })
+        port += 1
+    return {
+        "total_gpus": universe,
+        "sleep_level": default_level,
+        # VM serving: which uv venv to run `vllm serve` from + the version the
+        # worker should ensure is installed there. None → bare python3 on PATH.
+        "venv_path": (getattr(app, "venv_path", None) or None),
+        "vllm_version": (getattr(app, "vllm_version", None) or None),
+        "models": out,
+    }
+
+
 def build_metrics_env(app_id: str, provider_name: str) -> dict[str, str]:
     """Per-worker observability env: tells the worker entrypoint to run
     ansible-pull on the gpu-metrics-exporter playbook so it self-installs the
@@ -100,12 +156,15 @@ async def autoscaler_loop(
     rdb: "redis_async.Redis",
     provider: "Provider",
     sm: "async_sessionmaker[AsyncSession]",
+    provider_cache: dict | None = None,
 ) -> None:
     logger.info("autoscaler running")
+    if provider_cache is None:
+        provider_cache = {}
     while True:
         try:
             await asyncio.sleep(TICK_S)
-            await tick(rdb, provider, sm)
+            await tick(rdb, provider, sm, provider_cache)
         except asyncio.CancelledError:
             logger.info("autoscaler cancelled")
             raise
@@ -115,23 +174,50 @@ async def autoscaler_loop(
 
 async def tick(
     rdb: "redis_async.Redis",
-    provider: "Provider",
+    fallback_provider: "Provider",
     sm: "async_sessionmaker[AsyncSession]",
+    provider_cache: dict | None = None,
 ) -> None:
+    from .provider import resolve_app_provider
+
+    if provider_cache is None:
+        provider_cache = {}
+    # Resolve each app's provider while the session is open, then close it so we
+    # don't hold a DB connection across slow provider.provision() network/SSH I/O.
+    # expire_on_commit=False keeps the detached App attributes readable below.
     async with sm() as session:
-        result = await session.execute(select(App))
-        apps = list(result.scalars().all())
+        apps = list((await session.execute(select(App))).scalars().all())
+        resolved: list[tuple[App, "Provider | None"]] = []
+        for app in apps:
+            try:
+                prov = await resolve_app_provider(
+                    session, app, redis=rdb, fallback=fallback_provider, cache=provider_cache
+                )
+            except Exception as e:
+                logger.warning("autoscaler: provider resolve failed for app=%s: %s", app.app_id, e)
+                await _record_provision_error(rdb, app.app_id, f"provider resolution failed: {e}")
+                prov = None
+            resolved.append((app, prov))
     # Reconcile per-app inside a per-app try/except so one bad app (provider
     # rejecting its GPU spec, etc.) doesn't starve the others on this tick.
-    for app in apps:
+    for app, prov in resolved:
+        if prov is None:
+            continue
         try:
-            await _reconcile_app(rdb, provider, app)
+            await _reconcile_app(rdb, prov, app)
         except Exception:
             logger.exception("autoscaler: reconcile failed for app=%s", app.app_id)
 
 
 async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: App) -> None:
     app_id = app.app_id
+    # Self-heal provider-level connectivity (VM reverse tunnel) before we look at
+    # workers — after a gateway restart the in-process tunnel is gone, and a
+    # steady always-on worker won't trigger a re-provision to rebuild it.
+    try:
+        await provider.ensure_connectivity()
+    except Exception:
+        logger.exception("autoscaler: ensure_connectivity failed for app=%s", app_id)
     autoscaler_cfg = app.autoscaler
     max_containers = int(autoscaler_cfg["max_containers"])
     tasks_per_container = int(autoscaler_cfg["tasks_per_container"])
@@ -179,6 +265,19 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
                 env["VLLM_EXTRA_ARGS"] = extra
             if bool(getattr(app, "enable_metrics", True)):
                 env.update(build_metrics_env(app_id, provider.name))
+            # Multi-model VM fleet: hand the worker its whole model spec.
+            if getattr(app, "mode", "single") == "multi":
+                env["WORKER_MODE"] = "multi"
+                env["MULTI_MODEL_CONFIG"] = json.dumps(build_multi_model_config(app))
+                env["SLEEP_LEVEL"] = str(int(getattr(app, "sleep_level", 1) or 1))
+                env["TOTAL_GPUS"] = str(int(getattr(app, "gpu_count", 0) or 0))
+            elif (getattr(app, "visible_devices", None) or "").strip():
+                # Single-model VM GPU pin. Multi sets this per model from
+                # gpu_indices, so only apply the global var outside multi.
+                env["CUDA_VISIBLE_DEVICES"] = app.visible_devices.strip()
+            # User-supplied env applied to every vLLM process (cache/home dirs, …).
+            if getattr(app, "env_vars", None):
+                env["WORKER_ENV_JSON"] = json.dumps(app.env_vars)
             try:
                 result = await provider.provision(
                     app_id=app_id,
@@ -278,6 +377,19 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
             await rdb.delete(f"worker:{victim}")
             await rdb.srem(f"worker_index:{app_id}", victim)
             logger.info("scaled down %s: -1 worker (%s, idle %.0fs)", app_id, victim, idle_for)
+
+
+async def _record_provision_error(rdb: "redis_async.Redis", app_id: str, msg: str) -> None:
+    """Surface a provisioning/resolution failure to the UI and back off, so a
+    misconfigured app doesn't spam the upstream every tick."""
+    error_msg = (msg or "")[:1000]
+    await rdb.set(
+        f"app:{app_id}:provision_cooldown_until",
+        str(time.time() + PROVISION_COOLDOWN_S),
+        ex=PROVISION_COOLDOWN_S + 30,
+    )
+    await rdb.set(f"app:{app_id}:last_provision_error", error_msg, ex=PROVISION_ERROR_TTL_S)
+    await rdb.set(f"app:{app_id}:last_provision_error_at", str(time.time()), ex=PROVISION_ERROR_TTL_S)
 
 
 async def _live_workers(rdb: "redis_async.Redis", app_id: str) -> list[str]:

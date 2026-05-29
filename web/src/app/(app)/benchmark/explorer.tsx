@@ -287,6 +287,14 @@ function ChartPanel({
     }));
   }, [decorated, seriesStyles]);
 
+  // Explicit X ticks = the distinct context lengths. Without this, recharts'
+  // log-scale auto-ticks can emit the same value twice (e.g. two "128" ticks),
+  // which collide on React key ("two children with the same key").
+  const xTicks = useMemo(
+    () => Array.from(new Set(decorated.map((p) => p._x))).sort((a, b) => a - b),
+    [decorated],
+  );
+
   return (
     <div className="rounded-lg border border-border p-3">
       <div className="mb-2">
@@ -306,6 +314,8 @@ function ChartPanel({
               scale={logScale ? "log" : "linear"}
               domain={["auto", "auto"]}
               allowDataOverflow
+              ticks={xTicks.length > 0 ? xTicks : undefined}
+              interval={0}
               tick={{ fontSize: 10, fill: "currentColor" }}
               tickLine={false}
               axisLine={false}

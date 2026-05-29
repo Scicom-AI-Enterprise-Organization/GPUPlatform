@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import yaml from "js-yaml";
-import { Clock, Cpu, Layers, MoreHorizontal, Trash2, TrendingUp, User } from "lucide-react";
+import { Clock, Cpu, Layers, MoreHorizontal, Pencil, Trash2, TrendingUp, User } from "lucide-react";
 import type { BenchmarkRecord } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
@@ -58,12 +58,14 @@ export function BenchmarkRow({
   selected = false,
   onToggle,
   onDelete,
+  onRename,
 }: {
   bench: BenchmarkRecord;
   selectMode?: boolean;
   selected?: boolean;
   onToggle?: (id: string) => void;
   onDelete?: (bench: BenchmarkRecord) => void;
+  onRename?: (bench: BenchmarkRecord) => void;
 }) {
   const avatar = avatarFor(bench.name);
   const result = (bench.result_json ?? {}) as Record<string, unknown>;
@@ -153,7 +155,7 @@ export function BenchmarkRow({
               </div>
             </div>
           )}
-          {!selectMode && onDelete && (
+          {!selectMode && (onDelete || onRename) && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -170,16 +172,29 @@ export function BenchmarkRow({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-                <DropdownMenuItem
-                  variant="destructive"
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    onDelete(bench);
-                  }}
-                >
-                  <Trash2 className="h-4 w-4" />
-                  Delete benchmark
-                </DropdownMenuItem>
+                {onRename && (
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      onRename(bench);
+                    }}
+                  >
+                    <Pencil className="h-4 w-4" />
+                    Rename
+                  </DropdownMenuItem>
+                )}
+                {onDelete && (
+                  <DropdownMenuItem
+                    variant="destructive"
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      onDelete(bench);
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    Delete benchmark
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           )}

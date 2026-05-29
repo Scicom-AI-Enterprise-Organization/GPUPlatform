@@ -1,10 +1,19 @@
-# Serverless-GPU
+# GPUPlatform
 
-A serverless GPU inference platform. Deploy a model with a Python decorator,
-get an autoscaling HTTP endpoint backed by GPU pods on **Prime Intellect**.
-Scales to zero when idle, autoscales up under load.
+A multi-tenant GPU workload platform. One control plane, three product surfaces:
+
+- **Serverless** — deploy a model with the `serverlessgpu` Python decorator, get an autoscaling HTTP endpoint backed by vLLM. Scales to zero when idle.
+- **Compute** — provision long-lived bare-metal GPU pods with SSH (and Jupyter on PI). Admin approval gate optional.
+- **Benchmark** — SSH-orchestrated `llm-benchmaq` runs on RunPod / Prime Intellect / your own VM, with live log streaming and S3-archived results.
+
+Users bring their own provider credentials (RunPod / Prime Intellect / VM SSH); the gateway routes each workload to the right account.
+
+## The `serverlessgpu` library
+
+The SDK + CLI is the first-class way to ship a serverless endpoint:
 
 ```python
+# app.py
 from serverlessgpu import endpoint, QueueDepthAutoscaler
 
 @endpoint(
@@ -20,103 +29,97 @@ def qwen():
 serverlessgpu deploy app.py:qwen
 serverlessgpu run    qwen --payload '{"prompt": "hello"}'
 serverlessgpu stream qwen --payload '{"prompt": "tell me a story"}'   # SSE token streaming
+serverlessgpu list
+serverlessgpu show   qwen
+serverlessgpu delete qwen
 ```
+
+Endpoints are also reachable via an **OpenAI-compatible API** at `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` — point any OpenAI client at the gateway URL and pass an API key from `/api-keys` in the web UI.
+
+The same endpoint can be created from the web UI (`/serverless/new`); the SDK is for code-first workflows and CI deploys.
 
 ## What's in here
 
-- **Control plane** (Python, FastAPI + redis-py + asyncio) — gateway, scheduler, autoscaler, reconciler, provider abstraction, Prometheus metrics
-- **Worker agent** (Python, asyncio) — BRPOPs jobs, runs vLLM, publishes streaming tokens via Redis pub/sub
-- **SDK + CLI** (`serverlessgpu` Python package) — `@endpoint` decorator + deploy/run/stream/list/delete/show/pi-check
-- **K8s Helm chart** (`deploy/helm/`) — gateway Deployment + Redis StatefulSet + Ingress with SSE-friendly proxy settings
-- **Worker image** (`worker-agent/Dockerfile.pi`) — vLLM + worker-agent in one container, baked as a PI custom template
-- **Grafana dashboard** (`deploy/grafana/`) — 8 panels matching the metrics
+- **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/providers`, `/auth`, `/admin/*`, `/metrics`
+- **Worker agent** (`worker-agent/`) — BRPOPs jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub
+- **SDK + CLI** (`sdk/serverlessgpu/`) — `@endpoint` decorator, `QueueDepthAutoscaler`, and the `serverlessgpu` CLI
+- **Web** (`web/`) — Next.js UI: Serverless, Compute, Benchmark, Providers, API Keys, Admin (users / roles / audit / approvals / provisioned)
+- **Helm chart** (`deploy/helm/serverlessgpu/`) — gateway + web + Postgres + Redis + Ingress (SSE-safe) + ServiceMonitor
+- **Grafana dashboard** (`deploy/grafana/`) — metrics panels wired to the gateway's Prometheus exporter
 
-## 5-minute quickstart (no real GPU)
+## Providers (BYO credentials)
 
-```bash
-make install              # uv venv + install all 3 packages editable + pytest
-make test                 # 24 tests pass in ~0.5s
+Each user registers their own providers under `/providers`. Supported kinds:
 
-cp .env.example .env
-docker compose up --build # gateway + redis + 1 fake worker (no real GPU)
+| Kind | What it is | Used by |
+|---|---|---|
+| `runpod` | RunPod API key | Serverless, Compute, Benchmark |
+| `pi` | Prime Intellect API key | Serverless, Compute, Benchmark |
+| `vm` | Your own SSH-reachable box | Benchmark (bare-metal) |
+| `fake` | In-process dev provider | Local development only |
 
-# new terminal
-serverlessgpu deploy sdk/examples/qwen.py:qwen
-serverlessgpu run qwen --payload '{"prompt": "hello"}'
-```
+Provider resolution per request: explicit `provider_id` → the user's sole provider of that kind → gateway-wide env fallback (`RUNPOD_API_KEY`, `PI_API_KEY`).
 
-The fake worker emits canned responses — proves the full control-plane round-trip
-without burning GPU money. Phase 1 swaps it for a real PI worker.
+## Running locally
 
-## Running Locally
+Full stack on your laptop with the `fake` provider — no external GPU billing.
 
-Develop the full stack on your laptop — UI, backend, db — with a fake provider so
-nothing tries to dial out to RunPod / PI. Three terminals.
-
-**Pre-reqs:** Docker, [uv](https://docs.astral.sh/uv/) (Python deps), Node 20+.
+**Pre-reqs:** Docker, [uv](https://docs.astral.sh/uv/), Node 20+.
 
 ```bash
-# 1. Postgres + Redis (only — leave the gateway/worker services off)
+# 1. Install Python packages (gateway + sdk + worker-agent, editable)
+make install
+
+# 2. Postgres + Redis (leave gateway/worker services off — we run them locally)
 docker compose up -d postgres redis
 
-# 2. Gateway (FastAPI on :8080, reads gateway/.env)
-uv venv .venv
-uv pip install -e ./gateway
+# 3. Gateway — FastAPI on :8080, reads gateway/.env
 .venv/bin/gateway
 
-# 3. Web (Next.js on :3000, reads web/.env.local)
+# 4. Web — Next.js on :3000, reads web/.env.local
 cd web && npm install && npm run dev
 ```
 
-Or, if you've already run `make install` (which uvs all three Python packages
-into `.venv/`), just `.venv/bin/gateway` directly.
+Open `http://localhost:3000`. With `AUTH_DISABLED=1` in `gateway/.env`, login is `admin / admin`. Deploy from the UI or `serverlessgpu deploy ...` — the fake worker handles requests in-process.
 
-Open `http://localhost:3000`. Login `admin / admin`. Deploy an endpoint from the UI
-(or `serverlessgpu deploy ...`) → an in-process fake worker handles the request.
-
-**Env files:**
-
-| File | What it sets |
+| Env file | Sets |
 |---|---|
-| `gateway/.env` | `DATABASE_URL`, `REDIS_URL`, `AUTH_DISABLED=1`, `PROVIDER=fake`, `AUTOSCALER=0` |
+| `gateway/.env` | `DATABASE_URL`, `REDIS_URL`, `AUTH_DISABLED`, `PROVIDER` (default `fake`), `AUTOSCALER`, optional `RUNPOD_API_KEY` / `PI_API_KEY` |
 | `web/.env.local` | `NEXT_PUBLIC_GATEWAY_URL=http://localhost:8080` |
 
-Both are gitignored. Templates: `gateway/.env.example`, `web/.env.example`.
+Both are gitignored — templates live next to them as `.env.example`.
 
-**Reset state:**
+**Reset:** `docker compose down -v` (wipes Postgres + Redis volumes).
 
-```bash
-docker compose down -v   # nukes postgres + redis volumes
-```
+**Why no real GPU locally?** Real provisioning (`PROVIDER=runpod` / `=pi`) spawns a pod on the provider's network that has to phone home to your gateway + Redis. `localhost` isn't reachable from the public internet. For real workers, deploy the gateway to k8s — see [docs/DEPLOY.md](docs/DEPLOY.md).
 
-**Why no real GPU locally?** Real provisioning (`PROVIDER=runpod` or `=primeintellect`)
-spawns a pod on the provider's network that has to phone home to your gateway and
-redis. `localhost` isn't reachable from the public internet, so the worker can't
-register. For real-GPU testing, use the deployed prod gateway instead — see
-[docs/DEPLOY.md](docs/DEPLOY.md).
+## Auth, RBAC, and admin
+
+- **GitHub SSO** at `/auth/github/upsert`, plus password login at `/auth/login`. `AUTH_DISABLED=1` short-circuits to `admin/admin` for local dev.
+- **Tier roles** (`user` / `developer` / `admin`) gate the sidebar; **policy roles** layer fine-grained RBAC on top.
+- **Audit log** at `/admin/audit` records every mutating action.
+- **Compute approvals** at `/admin/compute-approvals` — pods land in `pending` until an admin clears them (toggle off per role).
+- **Provisioned** at `/admin/provisioned` — live view of every pod + serverless app across users, with cost tracking.
 
 ## Going further
 
 | Doc | What's in it |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | ASCII flow diagram, component-by-component walk-through, Redis key schema, design rationale |
-| [docs/DEPLOY.md](docs/DEPLOY.md) | Three deploy paths (local fake / local + real PI / k8s + helm), copy-pasteable |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Component walk-through, Redis key schema, design rationale |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | Local-fake / local-real / k8s+helm deploy paths |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Auth, health probes, timeouts, observability, tear-down |
-| [deploy/helm/serverlessgpu/README.md](deploy/helm/serverlessgpu/README.md) | k8s deployment with Prime Intellect compute |
+| [deploy/helm/serverlessgpu/README.md](deploy/helm/serverlessgpu/README.md) | k8s chart values + production wiring |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Local dev, tests, code layout |
 
-## Status
+## Architecture
 
-V0 control plane is **deployment-ready**. CI runs 24 tests + helm lint on every PR.
-What's left to actually run on Prime Intellect is **operator work** — build & push the
-worker image, create a PI custom template, expose the gateway publicly, set env, deploy.
+Split control-plane / data-plane:
 
-Architecture is split control-plane / data-plane:
-- **Control plane** (this repo) runs in your k8s cluster — small, CPU-only, ~$50/mo
-- **GPU workers** run on PI, provisioned on demand by the autoscaler — pay only when serving
+- **Control plane** (this repo) — gateway + web + Postgres + Redis, runs in k8s, CPU-only
+- **GPU workers / pods** — spawned on demand on the user's provider account (RunPod / PI / VM), pay only while running
 
-This is the same pattern Beam Cloud / Modal / RunPod use.
+Same shape as Modal / Beam / RunPod Serverless, but multi-tenant on top of users' own provider credentials rather than a single platform-owned fleet.
 
 ## License
 
-[Apache License 2.0](LICENSE) — permissive, allows commercial use, standard for cloud platform code. If you have a strong preference for AGPL or MIT, change `LICENSE` and this section before public release.
+[Apache License 2.0](LICENSE).

@@ -7,7 +7,9 @@
 import type {
   AdminUserRecord,
   AggregatePoint,
+  ApiKeyRecord,
   AppRecord,
+  CreateApiKeyResponse,
   AuditLogRecord,
   BenchmarkFile,
   BenchmarkRecord,
@@ -23,9 +25,14 @@ import type {
   CreateBenchmarkRequest,
   CreateComputeRequest,
   CreateProviderRequest,
+  CreateStorageRequest,
   PolicyRole,
   ProviderRecord,
   SectionKey,
+  StorageRecord,
+  TestStorageRequest,
+  TestStorageResponse,
+  UpdateStorageRequest,
   TestProviderRequest,
   TestProviderResponse,
   VmAvailability,
@@ -135,11 +142,28 @@ export const gateway = {
   getAppStatus: (id: string) =>
     request<AppStatus>(`/apps/${encodeURIComponent(id)}/status`),
 
+  // ---- API keys ----
+  listApiKeys: () => request<ApiKeyRecord[]>("/api-keys"),
+  createApiKey: (name: string) =>
+    request<CreateApiKeyResponse>("/api-keys", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+  revokeApiKey: (id: string) =>
+    request<{ ok: boolean; id: string }>(`/api-keys/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+
   // ---- Benchmarks ----
   listBenchmarks: (scope: "mine" | "all" = "mine") =>
     request<BenchmarkRecord[]>(`/benchmarks?scope=${scope}`),
   getBenchmark: (id: string) =>
     request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}`),
+  renameBenchmark: (id: string, name: string) =>
+    request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    }),
   createBenchmark: (body: CreateBenchmarkRequest) =>
     request<BenchmarkRecord>("/benchmarks", {
       method: "POST",
@@ -161,6 +185,11 @@ export const gateway = {
    * session cookie is translated to a Bearer token server-side. */
   benchmarkLogsStreamUrl: (id: string) =>
     `/api/proxy/benchmarks/${encodeURIComponent(id)}/logs/stream`,
+  /** Same-origin URL for a result file's bytes, served through the gateway
+   * (cookie→Bearer via the Next proxy). Avoids browser→S3 CORS on the
+   * presigned download_url. */
+  benchmarkFileContentUrl: (id: string, name: string) =>
+    `/api/proxy/benchmarks/${encodeURIComponent(id)}/files/content?path=${encodeURIComponent(name)}`,
 
   // ---- Cross-benchmark aggregate (one point per result.json across all benches) ----
   aggregateBenchmarks: (scope: "mine" | "all" = "mine") =>
@@ -258,6 +287,29 @@ export const gateway = {
   getVmAvailability: (id: string) =>
     request<VmAvailability>(`/v1/providers/${encodeURIComponent(id)}/availability`),
 
+  // ---- Storage backends ----
+  listStorage: () => request<StorageRecord[]>("/v1/storage"),
+  createStorage: (body: CreateStorageRequest) =>
+    request<StorageRecord>("/v1/storage", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateStorage: (id: string, body: UpdateStorageRequest) =>
+    request<StorageRecord>(`/v1/storage/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  testStorage: (body: TestStorageRequest) =>
+    request<TestStorageResponse>("/v1/storage/test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteStorage: (id: string) =>
+    request<{ ok: boolean; id: string }>(
+      `/v1/storage/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+
   // ---- Admin: users, policy roles, audit ----
   adminListUsers: () => request<AdminUserRecord[]>("/admin/users"),
   adminGetUser: (id: number) =>
@@ -319,6 +371,16 @@ export const gateway = {
   },
 };
 
+// Per-model state reported by a multi-model worker's heartbeat.
+export type ModelState = {
+  model: string;
+  state: "awake" | "asleep" | "loading" | "waking" | "draining" | "error";
+  inflight?: number;
+  slot?: number | null;
+  last_used_ts?: number | null;
+  queue_len?: number;
+};
+
 export type AppStatus = {
   app_id: string;
   queue_len: number;
@@ -326,4 +388,7 @@ export type AppStatus = {
   last_provision_error: string | null;
   last_provision_error_at: number | null;
   provision_cooldown_remaining_s: number;
+  mode?: "single" | "multi";
+  models?: ModelState[];
+  sleep_level?: number;
 };

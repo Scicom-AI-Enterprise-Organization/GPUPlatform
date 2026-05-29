@@ -7,8 +7,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import bcrypt
@@ -19,6 +21,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .db import User, get_session, get_user_by_id
 
 SESSION_TTL_S = 7 * 24 * 3600  # 7 days
+
+# Long-lived API keys: `sgpu_<random>`. Distinguished from session tokens by the
+# prefix so `current_user` can route to the right validation path.
+API_KEY_PREFIX = "sgpu_"
+# Don't write last_used_at on every request — only when it's this stale.
+API_KEY_LAST_USED_THROTTLE_S = 60
+
+
+def hash_api_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def mint_api_key() -> str:
+    """A fresh plaintext API key. Returned to the user once; only its hash is stored."""
+    return API_KEY_PREFIX + secrets.token_urlsafe(32)
 
 
 def hash_password(plain: str) -> str:
@@ -80,6 +97,11 @@ async def current_user(
         raise HTTPException(status_code=401, detail={"error": "missing or malformed Authorization header"})
     token = header[len("Bearer "):].strip()
 
+    # API key path: `sgpu_…` validates against the api_keys table (hashed) and
+    # authenticates as its owner, inheriting that user's role + section access.
+    if token.startswith(API_KEY_PREFIX):
+        return await _user_from_api_key(session, token)
+
     rdb = request.app.state.redis
     user_id = await resolve_session(rdb, token)
     if user_id is None:
@@ -90,6 +112,30 @@ async def current_user(
         # Session points at a deleted user; clean up.
         await revoke_session(rdb, token)
         raise HTTPException(status_code=401, detail={"error": "user no longer exists"})
+    return user
+
+
+async def _user_from_api_key(session: AsyncSession, key: str) -> User:
+    """Resolve a `sgpu_…` API key to its owner. 401 if unknown/revoked. Updates
+    last_used_at at most once per throttle window to avoid a write per request."""
+    from .db import ApiKey
+    key_hash = hash_api_key(key)
+    result = await session.execute(
+        select(ApiKey).where(ApiKey.key_hash == key_hash, ApiKey.revoked_at.is_(None))
+    )
+    ak = result.scalar_one_or_none()
+    if ak is None:
+        raise HTTPException(status_code=401, detail={"error": "invalid or revoked API key"})
+    user = await get_user_by_id(session, ak.owner_id)
+    if user is None:
+        raise HTTPException(status_code=401, detail={"error": "API key owner no longer exists"})
+    now = datetime.now(timezone.utc)
+    last = ak.last_used_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if last is None or (now - last) > timedelta(seconds=API_KEY_LAST_USED_THROTTLE_S):
+        ak.last_used_at = now
+        await session.commit()
     return user
 
 

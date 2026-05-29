@@ -12,7 +12,6 @@ import {
   YAxis,
 } from "recharts";
 import { Loader2, RefreshCw, TrendingUp, Zap, Clock, Activity } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -22,98 +21,51 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { gateway } from "@/lib/gateway";
 import type { BenchmarkRecord } from "@/lib/types";
+import {
+  bestBy,
+  fetchBenchRows,
+  fmt,
+  LINE_COLORS,
+  type Row,
+  type StatMode,
+  statPick,
+} from "@/lib/bench-results";
 import { cn } from "@/lib/utils";
 
-/** Shape of the rows we feed the table + charts. Sourced from vllm bench
- * serve's result.json (top-level keys) plus filename-extracted dimensions. */
-type Row = {
-  filename: string;
-  input_len: number;
-  output_len: number;
-  num_prompts: number;
-  concurrency: number;
-  duration_s: number | null;
-  output_throughput: number | null;
-  request_throughput: number | null;
-  total_token_throughput: number | null;
-  mean_ttft_ms: number | null;
-  median_ttft_ms: number | null;
-  p99_ttft_ms: number | null;
-  mean_tpot_ms: number | null;
-  median_tpot_ms: number | null;
-  p99_tpot_ms: number | null;
-  mean_itl_ms: number | null;
-  median_itl_ms: number | null;
-  p99_itl_ms: number | null;
-  mean_e2el_ms: number | null;
-  median_e2el_ms: number | null;
-  p99_e2el_ms: number | null;
-};
-
-type StatMode = "median" | "p99" | "mean";
-
-// Monochrome series palette — same input_len keeps the same shade across
-// throughput / TTFT / TPOT / E2EL charts so they're still readable side-by-
-// side. Inside the colour rule (no decorative hue, only status/availability).
-const LINE_COLORS = [
-  "#18181b", // zinc-900
-  "#3f3f46", // zinc-700
-  "#52525b", // zinc-600
-  "#71717a", // zinc-500
-  "#a1a1aa", // zinc-400
-  "#27272a", // zinc-800
-  "#d4d4d8", // zinc-300
-  "#e4e4e7", // zinc-200
-];
-
-function num(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
-}
-
-function parseFilenameDims(name: string): {
-  input_len: number;
-  output_len: number;
-  num_prompts: number;
-  concurrency: number;
-} {
-  // benchmaq emits filenames like:
-  //   sgpu-qwen-quick_qwen-quick_in256_out128_p50_c4_56c405.json
-  const m = name.match(/_in(\d+)_out(\d+)_p(\d+)_c(\d+)/);
-  return {
-    input_len: m ? parseInt(m[1], 10) : 0,
-    output_len: m ? parseInt(m[2], 10) : 0,
-    num_prompts: m ? parseInt(m[3], 10) : 0,
-    concurrency: m ? parseInt(m[4], 10) : 0,
-  };
-}
-
-function rowFromJson(filename: string, json: Record<string, unknown>): Row {
-  const dims = parseFilenameDims(filename);
-  return {
-    filename,
-    input_len: dims.input_len,
-    output_len: dims.output_len,
-    num_prompts: (num(json.num_prompts) ?? dims.num_prompts) || 0,
-    concurrency: (num(json.max_concurrency) ?? dims.concurrency) || 0,
-    duration_s: num(json.duration),
-    output_throughput: num(json.output_throughput),
-    request_throughput: num(json.request_throughput),
-    total_token_throughput: num(json.total_token_throughput),
-    mean_ttft_ms: num(json.mean_ttft_ms),
-    median_ttft_ms: num(json.median_ttft_ms),
-    p99_ttft_ms: num(json.p99_ttft_ms),
-    mean_tpot_ms: num(json.mean_tpot_ms),
-    median_tpot_ms: num(json.median_tpot_ms),
-    p99_tpot_ms: num(json.p99_tpot_ms),
-    mean_itl_ms: num(json.mean_itl_ms),
-    median_itl_ms: num(json.median_itl_ms),
-    p99_itl_ms: num(json.p99_itl_ms),
-    mean_e2el_ms: num(json.mean_e2el_ms),
-    median_e2el_ms: num(json.median_e2el_ms),
-    p99_e2el_ms: num(json.p99_e2el_ms),
-  };
+// Custom recharts legend content: recharts sorts its default legend
+// lexicographically by dataKey (in=0, in=1024, in=128…). We re-sort the
+// payload numerically by the digits in each label.
+function SortedLegend(props: {
+  payload?: ReadonlyArray<{ value?: unknown; color?: string; id?: string }>;
+}) {
+  const numOf = (v: unknown) => parseInt(String(v).replace(/\D/g, ""), 10) || 0;
+  const items = (props.payload ?? []).slice().sort((a, b) => numOf(a.value) - numOf(b.value));
+  return (
+    <ul
+      style={{
+        display: "flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "4px 12px",
+        listStyle: "none",
+        margin: 0,
+        padding: 0,
+        paddingBottom: 8,
+        fontSize: 11,
+      }}
+    >
+      {items.map((it, i) => (
+        <li key={it.id ?? String(i)} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+          <span
+            style={{ display: "inline-block", width: 8, height: 8, borderRadius: 9999, background: it.color }}
+          />
+          <span>{String(it.value)}</span>
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
@@ -127,27 +79,7 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
     setLoading(true);
     setError(null);
     try {
-      const files = await gateway.listBenchmarkFiles(bench.id);
-      const jsonFiles = files.filter(
-        (f) => f.name.toLowerCase().endsWith(".json") && !f.name.endsWith("_DONE"),
-      );
-      if (jsonFiles.length === 0) {
-        setRows([]);
-        return;
-      }
-      const parsed = await Promise.all(
-        jsonFiles.map(async (f) => {
-          try {
-            const r = await fetch(f.download_url);
-            if (!r.ok) throw new Error(`fetch ${f.name}: ${r.status}`);
-            const json = (await r.json()) as Record<string, unknown>;
-            return rowFromJson(f.name, json);
-          } catch (e) {
-            return null;
-          }
-        }),
-      );
-      setRows(parsed.filter((x): x is Row => x !== null));
+      setRows(await fetchBenchRows(bench.id));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setRows([]);
@@ -379,26 +311,6 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
   );
 }
 
-function bestBy(rows: Row[], pick: (r: Row) => number | null, lower = false): Row | null {
-  let best: Row | null = null;
-  let bestV: number | null = null;
-  for (const r of rows) {
-    const v = pick(r);
-    if (v == null) continue;
-    if (bestV == null || (lower ? v < bestV : v > bestV)) {
-      best = r;
-      bestV = v;
-    }
-  }
-  return best;
-}
-
-function statPick(r: Row, metric: "ttft" | "tpot" | "itl" | "e2el", mode: StatMode): number | null {
-  const k = `${mode}_${metric}_ms` as keyof Row;
-  const v = r[k];
-  return typeof v === "number" ? v : null;
-}
-
 function KpiCard({
   icon,
   label,
@@ -489,7 +401,7 @@ function SweepChart({
 
   return (
     <ResponsiveContainer width="100%" height="100%">
-      <LineChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+      <LineChart data={data} margin={{ top: 8, right: 8, left: 12, bottom: 8 }}>
         <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
         <XAxis
           dataKey="concurrency"
@@ -497,15 +409,26 @@ function SweepChart({
           className="text-[10px] text-muted-foreground"
           tickLine={false}
           axisLine={false}
-          label={{ value: "concurrency", position: "insideBottom", offset: -4, fontSize: 10, fill: "currentColor" }}
+          height={40}
+          tickMargin={6}
+          label={{ value: "concurrency", position: "insideBottom", offset: -16, fontSize: 10, fill: "currentColor" }}
         />
         <YAxis
           stroke="currentColor"
           className="text-[10px] text-muted-foreground"
           tickLine={false}
           axisLine={false}
-          width={48}
-          label={{ value: yLabel, angle: -90, position: "insideLeft", fontSize: 10, fill: "currentColor" }}
+          width={68}
+          tickMargin={4}
+          label={{
+            value: yLabel,
+            angle: -90,
+            position: "insideLeft",
+            offset: -2,
+            fontSize: 10,
+            fill: "currentColor",
+            style: { textAnchor: "middle" },
+          }}
         />
         <Tooltip
           contentStyle={{
@@ -515,12 +438,17 @@ function SweepChart({
             fontSize: 11,
           }}
           labelStyle={{ color: "rgb(244 244 245)" }}
+          // recharts colors each item's text with the series stroke; the darkest
+          // series (in=128 → zinc-900) is invisible on this dark tooltip. Force
+          // light item text — the colored marker still distinguishes series.
+          itemStyle={{ color: "rgb(228 228 231)" }}
+          itemSorter={(item) =>
+            parseInt(String(item.name).replace(/\D/g, ""), 10) || 0
+          }
         />
-        <Legend
-          wrapperStyle={{ fontSize: 11 }}
-          iconType="circle"
-          iconSize={8}
-        />
+        {/* Custom content: recharts sorts the default legend lexicographically
+            by dataKey (in=0, in=1024, in=128…). We re-sort numerically. */}
+        <Legend verticalAlign="top" align="center" content={<SortedLegend />} />
         {inputLens
           .filter((il) => !hidden.has(il))
           .map((il, i) => (
@@ -635,10 +563,4 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
       </table>
     </div>
   );
-}
-
-function fmt(v: number | null, digits: number): string {
-  if (v == null) return "—";
-  if (Math.abs(v) >= 1000) return v.toFixed(0);
-  return v.toFixed(digits);
 }

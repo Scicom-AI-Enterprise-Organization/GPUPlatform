@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState, useTransition } from "react";
+import { useCallback, useEffect, useId, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { AlertCircle, AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, RefreshCw, Server, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,7 +29,7 @@ import { deployEndpoint } from "../actions";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
-import type { ProviderRecord } from "@/lib/types";
+import type { ProviderRecord, VmAvailability } from "@/lib/types";
 
 // vLLM is what the live RunPod template runs. SGLang is a placeholder for a
 // future template — keep it disabled so the option is visible but inert.
@@ -133,7 +133,11 @@ export function InferenceForm() {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [framework, setFramework] = useState("vllm");
-  const [name, setName] = useState(suggestName());
+  // Derive the default name from useId() (stable across SSR + client) rather
+  // than Math.random() in the initializer, which runs twice with different
+  // values → hydration mismatch.
+  const reactId = useId();
+  const [name, setName] = useState(() => suggestName(reactId));
   const [model, setModel] = useState("");
   const [gpu, setGpu] = useState("RTX3090");
   const [gpuCount, setGpuCount] = useState<number>(1);
@@ -143,13 +147,76 @@ export function InferenceForm() {
   const [idleInput, setIdleInput] = useState("0");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [enableMetrics, setEnableMetrics] = useState(true);
-  const [providerId, setProviderId] = useState<string>("");
+  // Run-on target (mirrors the benchmark form): "cloud" spawns a fresh RunPod
+  // pod, "vm" SSHes onto a registered VM. Each keeps its own provider pick.
+  const [target, setTarget] = useState<"cloud" | "vm">("cloud");
+  const [vmProviderId, setVmProviderId] = useState<string>("");
+  const [runpodProviderId, setRunpodProviderId] = useState<string>("");
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [vllm, setVllm] = useState({ ...DEFAULT_VLLM_ARGS });
+  // Serving mode + multi-model fleet (multi requires a VM provider).
+  const [mode, setMode] = useState<"single" | "multi">("single");
+  const [members, setMembers] = useState<{ model: string; tp: number; extra_args: string }[]>([
+    { model: "", tp: 1, extra_args: "" },
+  ]);
+  const [sleepLevel, setSleepLevel] = useState<1 | 2>(1);
+  // VM-only: pin to specific physical GPU ids, e.g. "0,1,2,3". Empty = all GPUs.
+  const [visibleDevices, setVisibleDevices] = useState("");
+  // VM-only: uv venv the worker runs `vllm serve` from + the vLLM version to pin.
+  const [venvPath, setVenvPath] = useState("");
+  const [vllmVersion, setVllmVersion] = useState("");
+  // Endpoint-level env applied to every vLLM process (cache/home dirs, etc.).
+  // Pasted as `KEY=value` / `export KEY=value` lines; `mkdir` lines are ignored
+  // (the worker auto-creates absolute-path values).
+  const [envText, setEnvText] = useState("");
 
   useEffect(() => {
     gateway.listProviders().then(setProviders).catch(() => {});
   }, []);
+
+  // Live SSH probe of the selected VM — re-fires on provider change + refresh.
+  type VmAvailState =
+    | { status: "idle" }
+    | { status: "loading" }
+    | { status: "ok"; data: VmAvailability }
+    | { status: "error"; message: string };
+  const [vmAvail, setVmAvail] = useState<VmAvailState>({ status: "idle" });
+  const refreshVmAvail = useCallback(async (id: string) => {
+    if (!id) {
+      setVmAvail({ status: "idle" });
+      return;
+    }
+    setVmAvail({ status: "loading" });
+    try {
+      const data = await gateway.getVmAvailability(id);
+      setVmAvail({ status: "ok", data });
+    } catch (e) {
+      setVmAvail({ status: "error", message: e instanceof Error ? e.message : String(e) });
+    }
+  }, []);
+
+  // Effective provider id sent to the gateway: the VM when target=vm, else the
+  // chosen RunPod account ("" = gateway default). isVm now keys off the target.
+  const providerId = target === "vm" ? vmProviderId : runpodProviderId;
+  const isVm = target === "vm";
+  const selectedProvider = providers.find((p) => p.id === vmProviderId) || null;
+  const vmGpuCount = selectedProvider?.gpu_count ?? 0;
+  // Optional GPU pin. vdIds = chosen physical ids; vdInvalid flags bad input;
+  // effectiveVmGpuCount (pin length, or all VM GPUs) drives TP choices + packing.
+  const vdRaw = visibleDevices.trim();
+  const vdIds = vdRaw
+    ? vdRaw.split(",").map((s) => s.trim()).filter(Boolean).map(Number)
+    : [];
+  const vdInvalid =
+    isVm &&
+    vdRaw !== "" &&
+    (vdIds.some((n) => !Number.isInteger(n) || n < 0 || (vmGpuCount > 0 && n >= vmGpuCount)) ||
+      new Set(vdIds).size !== vdIds.length);
+  const effectiveVmGpuCount = isVm && vdIds.length > 0 && !vdInvalid ? vdIds.length : vmGpuCount;
+  // tp choices for multi: divisors of the usable (possibly pinned) GPU count.
+  const tpChoices = effectiveVmGpuCount > 0
+    ? GPU_COUNT_CHOICES.filter((n) => n <= effectiveVmGpuCount && effectiveVmGpuCount % n === 0)
+    : [1, 2, 4, 8];
   const [unavailableModal, setUnavailableModal] = useState<
     | { gpu: string; gpu_count: number; reason: string }
     | null
@@ -179,35 +246,102 @@ export function InferenceForm() {
   const volumeInvalid =
     !Number.isFinite(parsedVolume) || parsedVolume < 0 || parsedVolume > 4000;
 
-  const availability = useGpuAvailability(gpu, gpuCount, true, cloudType);
+  // VM hardware is fixed/known — don't hit the RunPod availability API for it.
+  const availability = useGpuAvailability(gpu, gpuCount, !isVm, cloudType);
   const explicitlyUnavailable =
-    availability.status === "ok" && availability.data.available === false;
+    !isVm && availability.status === "ok" && availability.data.available === false;
 
   const parsedIdle = Number.parseInt(idleInput, 10);
   const idleInvalid =
     !Number.isFinite(parsedIdle) || parsedIdle < 0 || parsedIdle > 86400;
 
+  const cleanedMembers = members
+    .map((m) => ({ model: m.model.trim(), tp: m.tp, extra_args: m.extra_args.trim() }))
+    .filter((m) => m.model);
+  const sumTp = cleanedMembers.reduce((acc, m) => acc + m.tp, 0);
+  const oversubscribed = mode === "multi" && effectiveVmGpuCount > 0 && sumTp > effectiveVmGpuCount;
+  const envVars = parseEnvVars(envText);
+  const hasEnvVars = Object.keys(envVars).length > 0;
+
+  type DeployArg = Parameters<typeof deployEndpoint>[0];
+  function applyResult(res: Awaited<ReturnType<typeof deployEndpoint>>) {
+    if (!res.ok) {
+      if (res.unavailable) setUnavailableModal(res.unavailable);
+      else setSubmitError(res.error);
+      return;
+    }
+    toast.success(`Endpoint ${res.app_id} created`, { duration: 4000 });
+    router.push(`/serverless/${encodeURIComponent(res.app_id)}`);
+  }
+
   function submit() {
     setSubmitError(null);
-    if (!name.trim() || !model.trim()) {
-      setSubmitError("Endpoint name and model name are required.");
+    if (!name.trim()) {
+      setSubmitError("Endpoint name is required.");
+      return;
+    }
+
+    if (mode === "multi") {
+      if (!isVm) {
+        setSubmitError("Multi-model mode requires a VM provider.");
+        return;
+      }
+      if (cleanedMembers.length === 0) {
+        setSubmitError("Add at least one model.");
+        return;
+      }
+      const names = cleanedMembers.map((m) => m.model);
+      if (new Set(names).size !== names.length) {
+        setSubmitError("Duplicate model names — each member must be unique.");
+        return;
+      }
+      if (vdInvalid) {
+        setSubmitError(`GPU IDs must be unique indices in 0..${(vmGpuCount || 1) - 1}.`);
+        return;
+      }
+      for (const m of cleanedMembers) {
+        if (effectiveVmGpuCount > 0 && (m.tp > effectiveVmGpuCount || effectiveVmGpuCount % m.tp !== 0)) {
+          setSubmitError(`tp=${m.tp} for ${m.model} must divide the ${effectiveVmGpuCount} selected GPUs.`);
+          return;
+        }
+      }
+      const body: DeployArg = {
+        name: slugify(name),
+        gpu: "vm",
+        gpu_count: effectiveVmGpuCount,
+        provider_id: providerId || null,
+        mode: "multi",
+        models: cleanedMembers,
+        sleep_level: sleepLevel,
+        autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: 0 },
+        enable_metrics: enableMetrics,
+        ...(hasEnvVars ? { env_vars: envVars } : {}),
+        ...(vdRaw ? { visible_devices: vdRaw } : {}),
+        ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
+        ...(vllmVersion.trim() ? { vllm_version: vllmVersion.trim() } : {}),
+      };
+      startTransition(async () => applyResult(await deployEndpoint(body)));
+      return;
+    }
+
+    // single mode
+    if (!model.trim()) {
+      setSubmitError("Model name is required.");
       return;
     }
     if (idleInvalid) {
-      setSubmitError(
-        "Enter a non-negative idle timeout in seconds (0 keeps the worker on forever).",
-      );
+      setSubmitError("Enter a non-negative idle timeout in seconds (0 keeps the worker on forever).");
       return;
     }
     if (advancedInvalid) {
       setSubmitError("Fix the invalid values in Advanced options.");
       return;
     }
-    if (diskInvalid) {
+    if (!isVm && diskInvalid) {
       setSubmitError("Container disk must be between 1 and 2000 GB.");
       return;
     }
-    if (volumeInvalid) {
+    if (!isVm && volumeInvalid) {
       setSubmitError("Volume must be between 0 and 4000 GB.");
       return;
     }
@@ -218,35 +352,30 @@ export function InferenceForm() {
       setSubmitError(reason);
       return;
     }
+    if (isVm && vdInvalid) {
+      setSubmitError(`GPU IDs must be unique indices in 0..${(vmGpuCount || 1) - 1}.`);
+      return;
+    }
     const vllmArgs = buildVllmArgs(vllm);
-    startTransition(async () => {
-      const res = await deployEndpoint({
-        name: slugify(name),
-        model: model.trim(),
-        gpu,
-        gpu_count: gpuCount,
-        autoscaler: {
-          max_containers: MAX_WORKERS,
-          idle_timeout_s: parsedIdle,
-        },
-        vllm_args: vllmArgs,
-        enable_metrics: enableMetrics,
-        cloud_type: cloudType,
-        container_disk_gb: parsedDisk,
-        volume_gb: parsedVolume,
-        provider_id: providerId || null,
-      });
-      if (!res.ok) {
-        if (res.unavailable) {
-          setUnavailableModal(res.unavailable);
-        } else {
-          setSubmitError(res.error);
-        }
-        return;
-      }
-      toast.success(`Endpoint ${res.app_id} created`, { duration: 4000 });
-      router.push(`/serverless/${encodeURIComponent(res.app_id)}`);
-    });
+    const body: DeployArg = {
+      name: slugify(name),
+      model: model.trim(),
+      gpu: isVm ? "vm" : gpu,
+      gpu_count: isVm ? effectiveVmGpuCount : gpuCount,
+      autoscaler: { max_containers: MAX_WORKERS, idle_timeout_s: parsedIdle },
+      vllm_args: vllmArgs,
+      enable_metrics: enableMetrics,
+      provider_id: providerId || null,
+      ...(hasEnvVars ? { env_vars: envVars } : {}),
+      ...(isVm
+        ? {
+            ...(vdRaw ? { visible_devices: vdRaw } : {}),
+            ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
+            ...(vllmVersion.trim() ? { vllm_version: vllmVersion.trim() } : {}),
+          }
+        : { cloud_type: cloudType, container_disk_gb: parsedDisk, volume_gb: parsedVolume }),
+    };
+    startTransition(async () => applyResult(await deployEndpoint(body)));
   }
 
   return (
@@ -259,81 +388,228 @@ export function InferenceForm() {
       </div>
 
       <div className="space-y-5">
-        <Section title="Instance" description="GPU, count, and cloud tier the workers run on.">
-          <div className="space-y-5">
-            <Field
-              label="GPU"
-              hint={(() => {
-                const g = GPU_CHOICES.find((c) => c.value === gpu);
-                return g ? capacityHint(g.vramGb, gpuCount) : undefined;
-              })()}
-              extra={<AvailabilityBadge state={availability} count={gpuCount} />}
+        <Section
+          title="Run on"
+          description="Default cloud spawns a fresh RunPod pod per worker. Bare metal runs on a VM you've registered under GPU Providers. Multi-model serving requires a VM."
+        >
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => {
+                setTarget("cloud");
+                setMode("single");
+                setVmAvail({ status: "idle" });
+              }}
+              className={cn(
+                "flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
+                target === "cloud"
+                  ? "border-primary/60 bg-primary/5"
+                  : "border-border hover:border-primary/40 hover:bg-muted/40",
+              )}
             >
-              <div className="flex gap-2">
-                <SearchableSelect
-                  className="flex-1"
-                  value={gpu}
-                  onChange={setGpu}
-                  options={GPU_CHOICES.map((g) => ({
-                    value: g.value,
-                    label: g.label,
-                    group: g.group,
-                    hint: capacityHint(g.vramGb, 1),
-                  }))}
-                  placeholder="Choose a GPU"
-                  searchPlaceholder="Search GPUs (e.g. h100, 24gb, ada)…"
-                />
+              <Cpu className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="font-medium">Default cloud (RunPod)</div>
+                <div className="text-xs text-muted-foreground">
+                  Provision a fresh pod on demand. Pay-per-second.
+                </div>
+              </div>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setTarget("vm");
+                if (vmProviderId) refreshVmAvail(vmProviderId);
+              }}
+              className={cn(
+                "flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
+                target === "vm"
+                  ? "border-primary/60 bg-primary/5"
+                  : "border-border hover:border-primary/40 hover:bg-muted/40",
+              )}
+            >
+              <Server className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="font-medium">Bare metal (VM)</div>
+                <div className="text-xs text-muted-foreground">
+                  SSH onto a registered VM. No spin-up cost.
+                </div>
+              </div>
+            </button>
+          </div>
+        </Section>
+
+        <Section
+          title="Pod"
+          description={
+            target === "cloud"
+              ? "GPU, count, and cloud tier for the RunPod workers."
+              : "Which registered VM workers SSH into. Hardware is fixed by the VM."
+          }
+        >
+          <div className="space-y-5">
+            {target === "cloud" ? (
+              <Field
+                label="RunPod account"
+                hint="Which RunPod provider to bill against. Default = gateway env key."
+              >
                 <Select
-                  value={String(gpuCount)}
-                  onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}
+                  value={runpodProviderId || "__default__"}
+                  onValueChange={(v) => setRunpodProviderId(v === "__default__" ? "" : v)}
                 >
-                  <SelectTrigger className="w-24 shrink-0">
+                  <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {GPU_COUNT_CHOICES.map((n) => (
-                      <SelectItem key={n} value={String(n)}>
-                        ×{n}
-                      </SelectItem>
-                    ))}
+                    <SelectItem value="__default__">Gateway default (RunPod)</SelectItem>
+                    {providers
+                      .filter((p) => p.kind === "runpod")
+                      .map((p) => (
+                        <SelectItem key={p.id} value={p.id}>
+                          {p.name}
+                          {p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
+                        </SelectItem>
+                      ))}
                   </SelectContent>
                 </Select>
-              </div>
-            </Field>
-
-            <Field
-              label="RunPod account (API key)"
-              hint="Which RunPod provider to bill against. Stored on the endpoint row. Note: the autoscaler currently still uses the gateway-default key at runtime — per-app routing is the next refactor."
-            >
-              <Select
-                value={providerId || "__default__"}
-                onValueChange={(v) => setProviderId(v === "__default__" ? "" : v)}
+              </Field>
+            ) : (
+              <Field
+                label="VM provider"
+                hint="The registered VM workers SSH into. Hardware is fixed by the VM."
               >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__default__">Gateway default</SelectItem>
-                  {providers
-                    .filter((p) => p.kind === "runpod")
-                    .map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name}
-                        {p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
-                      </SelectItem>
-                    ))}
-                </SelectContent>
-              </Select>
-              {providers.filter((p) => p.kind === "runpod").length === 0 && (
-                <p className="mt-1 text-xs text-muted-foreground">
-                  None registered.{" "}
-                  <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">
-                    Add a RunPod account →
-                  </a>
-                </p>
-              )}
-            </Field>
+                {providers.filter((p) => p.kind === "vm").length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No VM providers registered. Add one at{" "}
+                    <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">
+                      GPU Providers → New provider
+                    </a>
+                    .
+                  </p>
+                ) : (
+                  <Select
+                    value={vmProviderId}
+                    onValueChange={(id) => {
+                      setVmProviderId(id);
+                      refreshVmAvail(id);
+                    }}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Pick a VM…" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {providers
+                        .filter((p) => p.kind === "vm")
+                        .map((p) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.name}
+                            {p.gpu_count != null && p.gpu_count > 0 ? ` · ${p.gpu_count} GPU` : ""}
+                            {p.host ? ` · ${p.host}` : ""}
+                          </SelectItem>
+                        ))}
+                    </SelectContent>
+                  </Select>
+                )}
+                {vmProviderId && (
+                  <div className="mt-1.5">
+                    <VmAvailabilityRow state={vmAvail} onRefresh={() => refreshVmAvail(vmProviderId)} />
+                  </div>
+                )}
+              </Field>
+            )}
 
+            {isVm ? (
+              <>
+              <Field
+                label="GPUs (fixed)"
+                hint="Detected on this VM. Multi-model packs models across these GPUs and time-shares them via sleep/wake."
+              >
+                <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
+                  {vmGpuCount > 0
+                    ? `${vmGpuCount} × ${selectedProvider?.gpus?.[0] ?? "GPU"}`
+                    : "Not probed yet — run Test on the provider first."}
+                </div>
+              </Field>
+              <Field
+                label="GPU IDs (optional)"
+                hint="Pin to specific GPU indices on the VM, e.g. 0,1,2,3 or 1,2,3,4. Empty = all the VM's GPUs. Sets CUDA_VISIBLE_DEVICES (single model) / restricts the multi-model packer to these GPUs."
+              >
+                <Input
+                  value={visibleDevices}
+                  onChange={(e) => setVisibleDevices(e.target.value)}
+                  placeholder={
+                    vmGpuCount
+                      ? `e.g. ${Array.from({ length: Math.min(vmGpuCount, 4) }, (_, i) => i).join(",")}`
+                      : "e.g. 0,1,2,3"
+                  }
+                  aria-invalid={vdInvalid}
+                />
+                {vdInvalid ? (
+                  <p className="text-xs text-destructive">
+                    Use unique indices in 0..{(vmGpuCount || 1) - 1}, comma-separated.
+                  </p>
+                ) : vdIds.length > 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    Using {vdIds.length} GPU{vdIds.length === 1 ? "" : "s"}: {vdIds.join(", ")}.
+                  </p>
+                ) : null}
+              </Field>
+              <Field
+                label="vLLM venv path (optional)"
+                hint="A uv venv on the VM that has vLLM, e.g. /share/vllm-venv. The worker runs {venv}/bin/python -m vllm. Empty = bare python3 on the VM's PATH."
+              >
+                <Input
+                  value={venvPath}
+                  onChange={(e) => setVenvPath(e.target.value)}
+                  placeholder="/share/vllm-venv"
+                  className="font-mono text-xs"
+                />
+              </Field>
+              </>
+            ) : (
+              <Field
+                label="GPU"
+                hint={(() => {
+                  const g = GPU_CHOICES.find((c) => c.value === gpu);
+                  return g ? capacityHint(g.vramGb, gpuCount) : undefined;
+                })()}
+                extra={<AvailabilityBadge state={availability} count={gpuCount} />}
+              >
+                <div className="flex gap-2">
+                  <SearchableSelect
+                    className="flex-1"
+                    value={gpu}
+                    onChange={setGpu}
+                    options={GPU_CHOICES.map((g) => ({
+                      value: g.value,
+                      label: g.label,
+                      group: g.group,
+                      hint: capacityHint(g.vramGb, 1),
+                    }))}
+                    placeholder="Choose a GPU"
+                    searchPlaceholder="Search GPUs (e.g. h100, 24gb, ada)…"
+                  />
+                  <Select
+                    value={String(gpuCount)}
+                    onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}
+                  >
+                    <SelectTrigger className="w-24 shrink-0">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {GPU_COUNT_CHOICES.map((n) => (
+                        <SelectItem key={n} value={String(n)}>
+                          ×{n}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </Field>
+            )}
+
+            {!isVm && (
+            <>
             <Field
               label="Cloud tier"
               hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity."
@@ -400,6 +676,8 @@ export function InferenceForm() {
                 weights plus KV cache exceed GPU memory.
               </span>
             </div>
+            </>
+            )}
           </div>
         </Section>
 
@@ -423,6 +701,57 @@ export function InferenceForm() {
               </Select>
             </Field>
 
+            {isVm && (
+              <Field
+                label="vLLM version (optional)"
+                hint="Pin vLLM to this version in the VM's vLLM venv (set under Pod) — the worker uv pip installs it if missing. Empty = use whatever's installed."
+              >
+                <Input
+                  value={vllmVersion}
+                  onChange={(e) => setVllmVersion(e.target.value)}
+                  placeholder="0.19.1"
+                  className="font-mono text-xs"
+                />
+              </Field>
+            )}
+
+            <Field
+              label="Serving mode"
+              hint={
+                isVm
+                  ? "Single = one model. Multi = a fleet of models on this VM, routed by name with sleep/wake eviction."
+                  : "Multi-model serving requires a VM provider (select one above)."
+              }
+            >
+              <div className="grid grid-cols-2 gap-2">
+                {(["single", "multi"] as const).map((mo) => {
+                  const disabled = mo === "multi" && !isVm;
+                  return (
+                    <button
+                      key={mo}
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => setMode(mo)}
+                      className={cn(
+                        "rounded-md border p-3 text-left transition-colors",
+                        mode === mo
+                          ? "border-foreground/60 ring-1 ring-foreground/20"
+                          : "border-border hover:border-foreground/40",
+                        disabled && "cursor-not-allowed opacity-50 hover:border-border",
+                      )}
+                    >
+                      <div className="text-sm font-medium">
+                        {mo === "single" ? "Single model" : "Multi-model"}
+                      </div>
+                      <div className="mt-0.5 text-xs text-muted-foreground">
+                        {mo === "single" ? "one model per endpoint" : "many models, sleep/wake"}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </Field>
+
             <Field label="Endpoint name" required>
               <Input
                 value={name}
@@ -432,19 +761,123 @@ export function InferenceForm() {
               />
             </Field>
 
-            <Field label="Model" hint="Hugging Face repo (e.g. Qwen/Qwen2.5-7B-Instruct)" required>
-              <Input
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-                placeholder="Qwen/Qwen2.5-7B-Instruct"
-                className="bg-muted/50"
-              />
-            </Field>
+            {mode === "single" ? (
+              <Field label="Model" hint="Hugging Face repo (e.g. Qwen/Qwen2.5-7B-Instruct)" required>
+                <Input
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="Qwen/Qwen2.5-7B-Instruct"
+                  className="bg-muted/50"
+                />
+              </Field>
+            ) : (
+              <div className="space-y-4">
+                <Field
+                  label="Models"
+                  hint={`Each model has its own TP (set by the dropdown — don't add --tensor-parallel-size) and its own vLLM args (e.g. --reasoning-parser / --tool-call-parser). Slots = ${vmGpuCount || "N"} GPUs ÷ TP; extra models share GPUs and swap in via sleep/wake.`}
+                  required
+                >
+                  <div className="space-y-2">
+                    {members.map((m, i) => (
+                      <div key={i} className="space-y-2 rounded-md border border-border p-2">
+                        <div className="flex items-start gap-2">
+                          <Input
+                            className="flex-1 bg-muted/50"
+                            value={m.model}
+                            onChange={(e) =>
+                              setMembers((arr) => arr.map((x, j) => (j === i ? { ...x, model: e.target.value } : x)))
+                            }
+                            placeholder="Qwen/Qwen3.6-35B-A3B"
+                          />
+                          <Select
+                            value={String(m.tp)}
+                            onValueChange={(v) =>
+                              setMembers((arr) =>
+                                arr.map((x, j) => (j === i ? { ...x, tp: Number.parseInt(v, 10) } : x)),
+                              )
+                            }
+                          >
+                            <SelectTrigger className="w-28 shrink-0">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {tpChoices.map((n) => (
+                                <SelectItem key={n} value={String(n)}>
+                                  TP={n}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="shrink-0"
+                            disabled={members.length <= 1}
+                            onClick={() => setMembers((arr) => arr.filter((_, j) => j !== i))}
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                        <Input
+                          className="bg-muted/50 font-mono text-xs"
+                          value={m.extra_args}
+                          onChange={(e) =>
+                            setMembers((arr) => arr.map((x, j) => (j === i ? { ...x, extra_args: e.target.value } : x)))
+                          }
+                          placeholder="vLLM args, e.g. --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice --max-model-len 262144"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setMembers((arr) => [...arr, { model: "", tp: 1, extra_args: "" }])}
+                    className="mt-2 text-xs text-primary hover:underline"
+                  >
+                    + Add model
+                  </button>
+                </Field>
+
+                {oversubscribed && (
+                  <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      Models need {sumTp} GPUs but the VM has {vmGpuCount} — they won&apos;t all stay
+                      resident. Extra models are swapped in on demand via vLLM sleep/wake (first
+                      request to a sleeping model waits for the swap).
+                    </span>
+                  </div>
+                )}
+
+                <Field
+                  label="Sleep level"
+                  hint="How an evicted model frees VRAM. L1 offloads weights to CPU RAM (fast wake, needs RAM); L2 discards them and reloads from disk (minimal RAM, slower wake)."
+                >
+                  <Select value={String(sleepLevel)} onValueChange={(v) => setSleepLevel(Number.parseInt(v, 10) as 1 | 2)}>
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="1">Level 1 — offload to CPU RAM (fast)</SelectItem>
+                      <SelectItem value="2">Level 2 — discard + reload from disk</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </Field>
+              </div>
+            )}
           </div>
         </Section>
 
         <Section title="Engine" description="Scaling behaviour, vLLM args, and metrics.">
           <div className="space-y-5">
+            {mode === "multi" && (
+              <p className="text-xs text-muted-foreground">
+                Multi-model endpoints are always-on (no scale-to-zero); per-model vLLM args
+                are set per model above. Models are evicted via sleep/wake, not torn down.
+              </p>
+            )}
+            {mode === "single" && (
+            <>
             <Field
               label="Idle timeout (s)"
               hint="Worker is torn down after this many seconds with no traffic. 0 keeps the worker on forever."
@@ -595,6 +1028,31 @@ export function InferenceForm() {
             </div>
           )}
         </div>
+            </>
+            )}
+
+            {isVm && (
+              <div className="border-t border-border pt-4">
+                <Field
+                  label="Environment variables"
+                  hint="Applied to every vLLM process on the VM. One KEY=value per line (export / mkdir lines are fine — absolute-path values are auto-created). CUDA_VISIBLE_DEVICES is set per model automatically."
+                >
+                  <textarea
+                    value={envText}
+                    onChange={(e) => setEnvText(e.target.value)}
+                    rows={6}
+                    placeholder={"export HF_HOME=/share/huggingface\nexport TRITON_CACHE_DIR=/share/triton_cache\nexport VLLM_CACHE_ROOT=/share/vllm_cache\nexport TORCHINDUCTOR_CACHE_DIR=/share/torchinductor_cache"}
+                    className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs shadow-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                  />
+                  {hasEnvVars && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {Object.keys(envVars).length} variable(s) parsed:{" "}
+                      <span className="font-mono">{Object.keys(envVars).join(", ")}</span>
+                    </p>
+                  )}
+                </Field>
+              </div>
+            )}
 
             <div className="border-t border-border pt-4">
               <label className="flex items-start gap-3 cursor-pointer">
@@ -612,7 +1070,7 @@ export function InferenceForm() {
                     <code className="font-mono text-[11px]">endpoint=&lt;name&gt;</code>{" "}
                     label so you can filter the Grafana dashboard per endpoint.
                     Adds ~20 s to cold-start; runs in the background after vLLM is
-                    ready so requests aren't delayed.
+                    ready so requests aren&apos;t delayed.
                   </p>
                 </div>
               </label>
@@ -631,7 +1089,13 @@ export function InferenceForm() {
         <Button
           onClick={submit}
           disabled={
-            pending || idleInvalid || advancedInvalid || diskInvalid || volumeInvalid || explicitlyUnavailable
+            pending ||
+            (isVm && vdInvalid) ||
+            (mode === "single" &&
+              (idleInvalid ||
+                advancedInvalid ||
+                (!isVm && (diskInvalid || volumeInvalid)) ||
+                explicitlyUnavailable))
           }
         >
           {pending && <Loader2 className="h-4 w-4 animate-spin" />}
@@ -656,7 +1120,7 @@ export function InferenceForm() {
               <span className="font-mono text-foreground">
                 {unavailableModal?.gpu}
               </span>{" "}
-              ×{unavailableModal?.gpu_count}. The endpoint wasn't created so you
+              ×{unavailableModal?.gpu_count}. The endpoint wasn&apos;t created so you
               can pick a different combo and retry.
             </DialogDescription>
           </DialogHeader>
@@ -728,11 +1192,122 @@ function Field({
   );
 }
 
+// Parse a pasted env block into a dict. Accepts `KEY=value` and
+// `export KEY=value`; skips blanks, comments, and `mkdir`/other shell lines.
+function parseEnvVars(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of text.split("\n")) {
+    let line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("export ")) line = line.slice("export ".length).trim();
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue; // not a KEY=value line (e.g. mkdir -p …)
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
 function slugify(s: string) {
   return s.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-function suggestName() {
-  const suffix = Math.floor(Math.random() * 9000 + 1000);
+function suggestName(seed: string) {
+  // Stable across SSR + client (seed is React's useId). Keep the last few
+  // alphanumerics so the default looks like "endpoint-ab12c".
+  const suffix = seed.replace(/[^a-z0-9]/gi, "").slice(-5).toLowerCase() || "1";
   return `endpoint-${suffix}`;
+}
+
+// Live VM availability row — mirrors the benchmark form's SSH probe summary.
+function VmAvailabilityRow({
+  state,
+  onRefresh,
+}: {
+  state:
+    | { status: "idle" }
+    | { status: "loading" }
+    | { status: "ok"; data: VmAvailability }
+    | { status: "error"; message: string };
+  onRefresh: () => void;
+}) {
+  if (state.status === "idle") return null;
+  if (state.status === "loading") {
+    return (
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Loader2 className="h-3 w-3 animate-spin" />
+        Checking availability via SSH…
+      </div>
+    );
+  }
+  if (state.status === "error") {
+    return (
+      <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive">
+        <span className="inline-flex items-center gap-1.5 truncate">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate" title={state.message}>{state.message}</span>
+        </span>
+        <button type="button" onClick={onRefresh} className="inline-flex items-center gap-1 underline-offset-2 hover:underline">
+          <RefreshCw className="h-3 w-3" /> Retry
+        </button>
+      </div>
+    );
+  }
+  const { data } = state;
+  if (!data.ok) {
+    return (
+      <div className="flex items-center justify-between gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+        <span className="inline-flex items-center gap-1.5 truncate">
+          <X className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate" title={data.message}>{data.message}</span>
+        </span>
+        <button type="button" onClick={onRefresh} className="inline-flex items-center gap-1 underline-offset-2 hover:underline">
+          <RefreshCw className="h-3 w-3" /> Retry
+        </button>
+      </div>
+    );
+  }
+  const totalFreeMib = data.gpus.reduce((s, g) => s + g.mem_free_mib, 0);
+  const totalMib = data.gpus.reduce((s, g) => s + g.mem_total_mib, 0);
+  // Treat a GPU as "busy" if <20% memory free OR utilisation > 50%.
+  const busy = data.gpus.filter((g) => g.mem_free_mib < g.mem_total_mib * 0.2 || g.util_pct > 50).length;
+  const allFree = busy === 0;
+  return (
+    <div
+      className={cn(
+        "space-y-1 rounded-md border px-2.5 py-1.5 text-xs",
+        allFree
+          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+          : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="inline-flex items-center gap-1.5">
+          {allFree ? <Check className="h-3.5 w-3.5" /> : <AlertTriangle className="h-3.5 w-3.5" />}
+          {data.gpus.length} GPU{data.gpus.length === 1 ? "" : "s"} · {fmtMib(totalFreeMib)} free / {fmtMib(totalMib)}
+          {!allFree && ` · ${busy} busy`}
+        </span>
+        <button type="button" onClick={onRefresh} className="inline-flex items-center gap-1 underline-offset-2 hover:underline">
+          <RefreshCw className="h-3 w-3" /> Refresh
+        </button>
+      </div>
+      <div className="flex flex-col gap-0.5 font-mono text-[10px] text-muted-foreground">
+        {data.gpus.map((g) => (
+          <span key={g.index}>
+            #{g.index} {g.name.replace(/^NVIDIA\s+/, "")} · {fmtMib(g.mem_free_mib)}/{fmtMib(g.mem_total_mib)} free · {g.util_pct}% util
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function fmtMib(mib: number): string {
+  if (mib >= 1024) return `${(mib / 1024).toFixed(1)} GiB`;
+  return `${mib} MiB`;
 }

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import time
 import uuid
@@ -25,18 +26,21 @@ from .auth import (
     create_session,
     current_user,
     has_section,
+    hash_api_key,
     hash_password,
+    mint_api_key,
     require_admin,
     require_developer,
     require_section,
     revoke_session,
     verify_password,
 )
-from .db import App, AuditLog, PolicyRole, Request as ReqRow, User, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
+from .db import ApiKey, App, AuditLog, PolicyRole, Request as ReqRow, User, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
 from . import audit as audit_module
 from . import bench as bench_module
 from . import compute as compute_module
 from . import providers_api as providers_module
+from . import storage_api as storage_module
 
 logger = logging.getLogger("gateway")
 
@@ -57,9 +61,17 @@ class UpdateAutoscalerRequest(BaseModel):
     gpu_count: Optional[int] = None
 
 
+class MultiModelMember(BaseModel):
+    # A model served by a multi-model endpoint. `model` is the HuggingFace id;
+    # it doubles as the served-model-name clients send in payload["model"].
+    model: str
+    tp: int = 1                 # tensor-parallel size = GPUs this model needs
+    extra_args: str = ""        # per-model vLLM CLI args
+
+
 class CreateAppRequest(BaseModel):
     name: str
-    model: str
+    model: str = ""
     gpu: str
     gpu_count: int = 1
     autoscaler: AutoscalerSpec = Field(default_factory=AutoscalerSpec)
@@ -73,10 +85,23 @@ class CreateAppRequest(BaseModel):
     # Per-worker disk sizing. None = provider default.
     container_disk_gb: Optional[int] = None
     volume_gb: Optional[int] = None
-    # Per-app cloud-account selection (kind=runpod / pi provider row).
-    # NULL = use gateway-wide env keys. The autoscaler singleton still uses
-    # env today — per-app routing through resolve_cloud_creds is a follow-up.
+    # Per-app cloud-account selection (kind=runpod / pi / vm provider row).
+    # NULL = use gateway-wide env keys.
     provider_id: Optional[str] = None
+    # Serving mode. "single" (default) = one model. "multi" = a vLLM fleet on a
+    # VM with sleep/wake eviction; requires a kind="vm" provider_id and `models`.
+    mode: str = "single"
+    models: Optional[list[MultiModelMember]] = None
+    sleep_level: int = 1
+    # Extra env applied to every vLLM process (HF_HOME, cache dirs, …). Absolute
+    # path values are created on the worker before launch.
+    env_vars: Optional[dict[str, str]] = None
+    # VM-only GPU pin, e.g. "0,1,2,3". None/empty = all the VM's GPUs.
+    visible_devices: Optional[str] = None
+    # VM-only: uv venv the worker runs `vllm serve` from (e.g. "/share/vllm-venv").
+    venv_path: Optional[str] = None
+    # VM-only: pin vLLM to this version in venv_path (e.g. "0.19.1").
+    vllm_version: Optional[str] = None
 
 
 class CreateAppResponse(BaseModel):
@@ -100,6 +125,13 @@ class AppRecord(BaseModel):
     container_disk_gb: Optional[int] = None
     volume_gb: Optional[int] = None
     provider_id: Optional[str] = None
+    mode: str = "single"
+    models: Optional[list[MultiModelMember]] = None
+    sleep_level: int = 1
+    env_vars: Optional[dict[str, str]] = None
+    visible_devices: Optional[str] = None
+    venv_path: Optional[str] = None
+    vllm_version: Optional[str] = None
     created_at: str
     owner: str
 
@@ -130,17 +162,29 @@ class WorkerHeartbeatRequest(BaseModel):
     machine_id: str
     app_id: str
     status: str = "ready"
+    # Multi-model workers report per-model state here:
+    #   [{"model","state","inflight","slot","last_used_ts","queue_len"}]
+    models: Optional[list[dict]] = None
 
 
 class WorkerLogsRequest(BaseModel):
     machine_id: str
     app_id: str
     lines: list[str] = Field(default_factory=list)
+    # Multi-model workers tag each batch with the member's served_name so logs
+    # bucket per model (one vLLM process per model). None → single-mode worker.
+    source: Optional[str] = None
 
 
 # Per-worker container log retention. The worker-agent ships batches every
 # few seconds; we cap the list so a chatty worker can't blow up Redis.
 WORKER_LOGS_CAP = 5000
+
+
+def _logs_slug(s: str) -> str:
+    """Stable, Redis-key-safe slug for a model's served_name (used to bucket
+    per-model logs). Mirrors nothing on the worker — the gateway owns the key."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", s or "")[:128]
 
 
 class RegisterRequest(BaseModel):
@@ -263,6 +307,13 @@ def _to_app_record(app: App) -> AppRecord:
         container_disk_gb=getattr(app, "container_disk_gb", None),
         volume_gb=getattr(app, "volume_gb", None),
         provider_id=getattr(app, "provider_id", None),
+        mode=getattr(app, "mode", "single") or "single",
+        models=[MultiModelMember(**m) for m in (getattr(app, "models", None) or [])] or None,
+        sleep_level=int(getattr(app, "sleep_level", 1) or 1),
+        env_vars=getattr(app, "env_vars", None) or None,
+        visible_devices=getattr(app, "visible_devices", None) or None,
+        venv_path=getattr(app, "venv_path", None) or None,
+        vllm_version=getattr(app, "vllm_version", None) or None,
         created_at=app.created_at.isoformat() if app.created_at else "",
         owner=app.owner.username if app.owner else "",
     )
@@ -282,6 +333,7 @@ async def lifespan(app: FastAPI):
     logger.info("postgres ready")
 
     app.state.provider = None
+    app.state.provider_cache = {}
     app.state.autoscaler_task = None
     app.state.reconciler_task = None
     app.state.bench_janitor_task = None
@@ -341,11 +393,18 @@ async def lifespan(app: FastAPI):
                 )
 
         app.state.provider = build_provider(provider_name)
+        # Per-app provider instances (kind=vm/runpod/pi from a providers row) are
+        # cached in app.state.provider_cache (initialised above) and shared by
+        # the autoscaler + reconciler so we don't re-decrypt creds every tick.
         app.state.autoscaler_task = asyncio.create_task(
-            autoscaler_loop(app.state.redis, app.state.provider, session_factory())
+            autoscaler_loop(
+                app.state.redis, app.state.provider, session_factory(), app.state.provider_cache
+            )
         )
         app.state.reconciler_task = asyncio.create_task(
-            reconciler_loop(app.state.redis, app.state.provider)
+            reconciler_loop(
+                app.state.redis, app.state.provider, session_factory(), app.state.provider_cache
+            )
         )
         logger.info("autoscaler + reconciler enabled (provider=%s)", app.state.provider.name)
 
@@ -376,6 +435,7 @@ app = FastAPI(
 app.include_router(bench_module.router)
 app.include_router(compute_module.router)
 app.include_router(providers_module.router)
+app.include_router(storage_module.router)
 
 
 @app.middleware("http")
@@ -534,6 +594,97 @@ async def logout(request: Request, user: User = Depends(current_user)):
     token = header[len("Bearer "):].strip()
     await revoke_session(request.app.state.redis, token)
     return {"ok": True}
+
+
+# ----- API keys -----
+# Long-lived, revocable tokens for scripting the platform API. A key
+# authenticates as its owner and inherits that user's role + section access.
+
+
+class CreateApiKeyRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
+class ApiKeyRecord(BaseModel):
+    id: str
+    name: str
+    prefix: str
+    created_at: str
+    last_used_at: Optional[str] = None
+
+
+class CreateApiKeyResponse(ApiKeyRecord):
+    # The full plaintext key — returned ONCE at creation, never again.
+    key: str
+
+
+@app.get("/api-keys", response_model=list[ApiKeyRecord])
+async def list_api_keys(
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    from sqlalchemy import select
+    rows = (
+        await session.execute(
+            select(ApiKey)
+            .where(ApiKey.owner_id == user.id, ApiKey.revoked_at.is_(None))
+            .order_by(ApiKey.created_at.desc())
+        )
+    ).scalars().all()
+    return [
+        ApiKeyRecord(
+            id=k.id,
+            name=k.name,
+            prefix=k.prefix,
+            created_at=k.created_at.isoformat() if k.created_at else "",
+            last_used_at=k.last_used_at.isoformat() if k.last_used_at else None,
+        )
+        for k in rows
+    ]
+
+
+@app.post("/api-keys", response_model=CreateApiKeyResponse)
+async def create_api_key(
+    req: CreateApiKeyRequest,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    raw = mint_api_key()
+    rec = ApiKey(
+        id=f"ak-{uuid.uuid4().hex[:12]}",
+        owner_id=user.id,
+        name=req.name.strip(),
+        prefix=raw[:12],
+        key_hash=hash_api_key(raw),
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(rec)
+    await session.commit()
+    await audit_module.record(user, "apikey.create", "apikey", rec.id, rec.name)
+    logger.info("api key created: id=%s name=%s user=%s", rec.id, rec.name, user.username)
+    return CreateApiKeyResponse(
+        id=rec.id,
+        name=rec.name,
+        prefix=rec.prefix,
+        created_at=rec.created_at.isoformat(),
+        last_used_at=None,
+        key=raw,
+    )
+
+
+@app.delete("/api-keys/{key_id}")
+async def revoke_api_key(
+    key_id: str,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    rec = await session.get(ApiKey, key_id)
+    if rec is None or rec.owner_id != user.id or rec.revoked_at is not None:
+        raise HTTPException(status_code=404, detail="no such api key")
+    rec.revoked_at = datetime.now(timezone.utc)
+    await session.commit()
+    await audit_module.record(user, "apikey.revoke", "apikey", rec.id, rec.name)
+    return {"ok": True, "id": key_id}
 
 
 async def _user_to_record(u: User, session: AsyncSession) -> UserRecord:
@@ -895,29 +1046,120 @@ async def create_app(
         raise HTTPException(status_code=400, detail="container_disk_gb must be 1..2000")
     if req.volume_gb is not None and (req.volume_gb < 0 or req.volume_gb > 4000):
         raise HTTPException(status_code=400, detail="volume_gb must be 0..4000")
-    # Validate provider_id if the user picked one. Today the autoscaler
-    # still builds a global provider from env, so per-app routing is a
-    # no-op at run-time — but persist it so the UI stays consistent and
-    # the follow-up wiring can pick it up without re-asking the user.
+
+    mode = (req.mode or "single").lower()
+    if mode not in ("single", "multi"):
+        raise HTTPException(status_code=400, detail="mode must be 'single' or 'multi'")
+
+    # Validate the chosen provider row. VM is now allowed for serverless;
+    # multi-model REQUIRES a probed VM provider (a fixed multi-GPU node).
+    prov = None
     if req.provider_id:
         from .db import Provider
         prov = await session.get(Provider, req.provider_id)
         if prov is None:
             raise HTTPException(status_code=400, detail="unknown provider_id")
-        if prov.kind not in ("runpod", "pi"):
+        if prov.kind not in ("runpod", "pi", "vm"):
             raise HTTPException(
                 status_code=400,
-                detail=f"provider {req.provider_id} is kind={prov.kind}, serverless requires runpod or pi",
+                detail=f"provider {req.provider_id} is kind={prov.kind}, serverless requires runpod, pi or vm",
             )
+    is_vm = prov is not None and prov.kind == "vm"
+
+    # VM-only GPU pin (e.g. "0,1,2,3"). Validated against the VM's probed GPU
+    # count. The number of ids becomes the endpoint's effective gpu_count.
+    visible_devices_norm: Optional[str] = None
+    vd_ids: Optional[list[int]] = None
+    if is_vm and (req.visible_devices or "").strip():
+        try:
+            parsed = [int(x.strip()) for x in req.visible_devices.split(",") if x.strip() != ""]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="visible_devices must be comma-separated GPU ids, e.g. 0,1,2,3")
+        if parsed:
+            if len(set(parsed)) != len(parsed):
+                raise HTTPException(status_code=400, detail="visible_devices has duplicate GPU ids")
+            vm_total = int((prov.config or {}).get("gpu_count") or 0)
+            if any(i < 0 for i in parsed):
+                raise HTTPException(status_code=400, detail="visible_devices ids must be >= 0")
+            if vm_total and any(i >= vm_total for i in parsed):
+                raise HTTPException(status_code=400, detail=f"visible_devices ids must be within 0..{vm_total - 1}")
+            vd_ids = parsed
+            visible_devices_norm = ",".join(str(i) for i in parsed)
+
+    # Per-mode normalization of the fields we persist.
+    gpu = req.gpu
+    gpu_count = req.gpu_count
+    model = req.model
+    models_json: Optional[list] = None
+    sleep_level = 1
+    autoscaler_dict = req.autoscaler.model_dump()
+
+    if mode == "multi":
+        if not is_vm:
+            raise HTTPException(
+                status_code=400,
+                detail="multi-model mode requires a VM provider (provider_id of kind 'vm')",
+            )
+        members = req.models or []
+        if not members:
+            raise HTTPException(status_code=400, detail="multi-model mode requires at least one model in 'models'")
+        total_gpus = int((prov.config or {}).get("gpu_count") or 0)
+        if total_gpus <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="VM provider has no probed GPUs — run Test on the provider first",
+            )
+        # Usable GPU universe: a visible_devices pin narrows it to that subset;
+        # tp must divide it and the fleet packs onto exactly those ids.
+        usable_gpus = len(vd_ids) if vd_ids else total_gpus
+        seen: set[str] = set()
+        for m in members:
+            if m.tp < 1:
+                raise HTTPException(status_code=400, detail=f"model {m.model}: tp must be >= 1")
+            if m.tp > usable_gpus:
+                raise HTTPException(status_code=400, detail=f"model {m.model}: tp={m.tp} exceeds the {usable_gpus} selected GPUs")
+            if usable_gpus % m.tp != 0:
+                raise HTTPException(status_code=400, detail=f"model {m.model}: tp={m.tp} must divide the {usable_gpus} selected GPUs")
+            if m.model in seen:
+                raise HTTPException(status_code=400, detail=f"duplicate model in members: {m.model}")
+            seen.add(m.model)
+        if req.sleep_level not in (1, 2):
+            raise HTTPException(status_code=400, detail="sleep_level must be 1 or 2")
+        # One always-on VM fleet — no scale-to-zero, one machine, deeper queue.
+        gpu = "vm"
+        gpu_count = usable_gpus
+        model = ""
+        models_json = [m.model_dump() for m in members]
+        sleep_level = req.sleep_level
+        autoscaler_dict["max_containers"] = 1
+        autoscaler_dict["idle_timeout_s"] = 0
+        if int(autoscaler_dict.get("tasks_per_container", 30) or 30) < 64:
+            autoscaler_dict["tasks_per_container"] = 64
+    else:
+        if not (req.model or "").strip():
+            raise HTTPException(status_code=400, detail="model is required for single-model endpoints")
+        if is_vm:
+            gpu = "vm"
+            total_gpus = int((prov.config or {}).get("gpu_count") or 0)
+            if total_gpus and req.gpu_count > total_gpus:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"gpu_count={req.gpu_count} exceeds the VM's {total_gpus} GPUs",
+                )
+            # A GPU pin fixes how many GPUs this endpoint uses.
+            if vd_ids:
+                gpu_count = len(vd_ids)
+            autoscaler_dict["max_containers"] = 1  # a VM is one fixed node
+
     record = App(
         app_id=req.name,
         owner_id=user.id,
         name=req.name,
-        model=req.model,
-        gpu=req.gpu,
-        gpu_count=req.gpu_count,
+        model=model,
+        gpu=gpu,
+        gpu_count=gpu_count,
         enable_metrics=req.enable_metrics,
-        autoscaler=req.autoscaler.model_dump(),
+        autoscaler=autoscaler_dict,
         cpu=req.cpu,
         memory=req.memory,
         request_timeout_s=req.request_timeout_s,
@@ -926,6 +1168,14 @@ async def create_app(
         container_disk_gb=req.container_disk_gb,
         volume_gb=req.volume_gb,
         provider_id=req.provider_id,
+        mode=mode,
+        models=models_json,
+        sleep_level=sleep_level,
+        env_vars={k: str(v) for k, v in (req.env_vars or {}).items()} or None,
+        visible_devices=visible_devices_norm,
+        # VM serving knobs; ignored for cloud (RunPod/PI images bring their own vLLM).
+        venv_path=((req.venv_path or "").strip() or None) if is_vm else None,
+        vllm_version=((req.vllm_version or "").strip() or None) if is_vm else None,
         created_at=datetime.now(timezone.utc),
     )
     session.add(record)
@@ -941,9 +1191,30 @@ async def create_app(
     # can fail the create cleanly if the provider rejects the spec
     # (out of stock, GPU not on this cloud tier, etc.) — instead of leaving
     # the user with a phantom endpoint they have to delete.
-    provider = getattr(request.app.state, "provider", None)
-    if req.autoscaler.idle_timeout_s == 0 and provider is not None:
-        rdb = request.app.state.redis
+    rdb = request.app.state.redis
+    effective_idle = int(autoscaler_dict.get("idle_timeout_s", 300) or 0)
+    provider = None
+    if effective_idle == 0:
+        from .provider import resolve_app_provider
+        try:
+            provider = await resolve_app_provider(
+                session, record, redis=rdb,
+                fallback=getattr(request.app.state, "provider", None),
+                cache=request.app.state.provider_cache,
+            )
+        except Exception as e:
+            # Bad provider config (unreachable VM, missing template env, …) — fail
+            # the create cleanly rather than leaving a phantom endpoint.
+            try:
+                await session.delete(record)
+                await session.commit()
+            except Exception:
+                await session.rollback()
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "provider unavailable", "reason": (str(e) or repr(e))[:500]},
+            )
+    if effective_idle == 0 and provider is not None:
         # Block the autoscaler tick from racing this attempt.
         await rdb.set(
             f"app:{req.name}:provision_cooldown_until",
@@ -955,16 +1226,28 @@ async def create_app(
         extra = (req.vllm_args or "").strip()
         if extra:
             env["VLLM_EXTRA_ARGS"] = extra
-        from .autoscaler import REGISTRATION_TOKEN_TTL_S, emit_worker_event, build_metrics_env
+        from .autoscaler import (
+            REGISTRATION_TOKEN_TTL_S, emit_worker_event, build_metrics_env, build_multi_model_config,
+        )
         if req.enable_metrics:
             env.update(build_metrics_env(req.name, provider.name))
+        if mode == "multi":
+            env["WORKER_MODE"] = "multi"
+            env["MULTI_MODEL_CONFIG"] = json.dumps(build_multi_model_config(record))
+            env["SLEEP_LEVEL"] = str(sleep_level)
+            env["TOTAL_GPUS"] = str(gpu_count)
+        elif visible_devices_norm:
+            # Single-model VM GPU pin (multi sets it per model from gpu_indices).
+            env["CUDA_VISIBLE_DEVICES"] = visible_devices_norm
+        if record.env_vars:
+            env["WORKER_ENV_JSON"] = json.dumps(record.env_vars)
         try:
             result = await provider.provision(
                 app_id=req.name,
-                model=req.model,
-                gpu=req.gpu,
+                model=record.model,
+                gpu=record.gpu,
                 env=env,
-                gpu_count=req.gpu_count,
+                gpu_count=record.gpu_count,
                 cloud_type=cloud_type_norm,
                 container_disk_gb=req.container_disk_gb,
                 volume_gb=req.volume_gb,
@@ -974,7 +1257,7 @@ async def create_app(
             error_msg = (str(e) or repr(e))[:500]
             logger.warning(
                 "create_app pre-flight provision failed for %s gpu=%sx%d: %s",
-                req.name, req.gpu, req.gpu_count, error_msg,
+                req.name, record.gpu, record.gpu_count, error_msg,
             )
             # Roll back: delete the app so the user can retry with a different
             # combo without bumping into the unique-name 409.
@@ -990,8 +1273,8 @@ async def create_app(
                 detail={
                     "error": "GPU not available right now",
                     "reason": error_msg,
-                    "gpu": req.gpu,
-                    "gpu_count": req.gpu_count,
+                    "gpu": record.gpu,
+                    "gpu_count": record.gpu_count,
                 },
             )
         # Success — register the worker so the autoscaler sees current=1.
@@ -1015,7 +1298,7 @@ async def create_app(
             )
         await emit_worker_event(
             rdb, machine_id, req.name, "info",
-            f"provisioned on {provider.name} (gpu={req.gpu}x{req.gpu_count}, pre-flight at create"
+            f"provisioned on {provider.name} (gpu={record.gpu}x{record.gpu_count}, pre-flight at create"
             + (f", ${result.cost_per_hr:.4f}/hr)" if result.cost_per_hr is not None else ")"),
         )
         await rdb.delete(f"app:{req.name}:provision_cooldown_until")
@@ -1023,7 +1306,13 @@ async def create_app(
 
     await audit_module.record(
         user, "inference.create", "app", req.name, req.name,
-        details={"model": req.model, "gpu": req.gpu, "gpu_count": req.gpu_count},
+        details={
+            "mode": mode,
+            "model": record.model or None,
+            "models": [m.get("model") for m in (models_json or [])] or None,
+            "gpu": record.gpu,
+            "gpu_count": record.gpu_count,
+        },
     )
     return CreateAppResponse(app_id=req.name, url=f"/run/{req.name}")
 
@@ -1061,6 +1350,23 @@ async def _load_owned_app(session: AsyncSession, app_id: str, user: User) -> App
     return app
 
 
+async def _provider_for_app(session: AsyncSession, app_id: str, user: User, app_state) -> Optional["Provider"]:
+    """Resolve the Provider an app's workers run on (vm/runpod/pi per-row, else
+    the global fallback). Used by teardown paths so e.g. a VM fleet is actually
+    SSH-killed. Falls back to the global provider if resolution fails."""
+    app = await _load_owned_app(session, app_id, user)
+    from .provider import resolve_app_provider
+    try:
+        return await resolve_app_provider(
+            session, app, redis=app_state.redis,
+            fallback=getattr(app_state, "provider", None),
+            cache=getattr(app_state, "provider_cache", {}),
+        )
+    except Exception:
+        logger.exception("provider resolve failed for app=%s during teardown", app_id)
+        return getattr(app_state, "provider", None)
+
+
 @app.get("/apps/{app_id}", response_model=AppRecord)
 async def get_app_endpoint(
     app_id: str,
@@ -1081,14 +1387,23 @@ async def get_app_status(
     """Operational state for the overview tab: live worker count, queue depth,
     and the most recent provision error (if any). Empty error means the
     autoscaler is either idle or scaling cleanly."""
-    await _load_owned_app(session, app_id, user)
+    app = await _load_owned_app(session, app_id, user)
     rdb = request.app.state.redis
     queue_len = await rdb.llen(f"queue:{app_id}")
     workers = await rdb.smembers(f"worker_index:{app_id}")
     live_workers = 0
+    models_state: list[dict] = []
+    is_multi = (getattr(app, "mode", "single") or "single") == "multi"
     for mid in workers:
         if await rdb.exists(f"worker:{mid}"):
             live_workers += 1
+            if is_multi:
+                blob = await rdb.get(f"worker:{mid}:models")
+                if blob:
+                    try:
+                        models_state.extend(json.loads(blob))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
     err = await rdb.get(f"app:{app_id}:last_provision_error")
     err_at_blob = await rdb.get(f"app:{app_id}:last_provision_error_at")
     cooldown_blob = await rdb.get(f"app:{app_id}:provision_cooldown_until")
@@ -1112,7 +1427,41 @@ async def get_app_status(
         "last_provision_error": err,
         "last_provision_error_at": err_at,
         "provision_cooldown_remaining_s": cooldown_remaining,
+        "mode": getattr(app, "mode", "single") or "single",
+        "models": models_state,
+        "sleep_level": int(getattr(app, "sleep_level", 1) or 1),
     }
+
+
+@app.get("/apps/{app_id}/models/logs")
+async def get_app_model_logs(
+    app_id: str,
+    request: Request,
+    model: str,
+    tail: int = 400,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Per-model vLLM stdout/stderr for a multi-model VM endpoint. The worker
+    ships one log stream per member tagged by served_name; we bucket those under
+    `worker_logs:{mid}:{slug(model)}` and return the live worker's tail here so
+    the fleet UI can show why a specific model failed."""
+    if tail < 1 or tail > WORKER_LOGS_CAP:
+        raise HTTPException(status_code=400, detail=f"tail must be 1..{WORKER_LOGS_CAP}")
+    app = await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    slug = _logs_slug(model)
+    workers = await rdb.smembers(f"worker_index:{app_id}")
+    lines: list[str] = []
+    # Take the first worker that still has buffered logs for this model — the
+    # crash log outlives the heartbeat TTL (~1h), so a dead model's reason
+    # remains visible after its worker stops beating.
+    for mid in workers:
+        raw = await rdb.lrange(f"worker_logs:{mid}:{slug}", 0, tail - 1)
+        if raw:
+            lines = list(reversed(raw))  # stored newest-first → chronological
+            break
+    return {"app_id": app.app_id, "model": model, "lines": lines, "count": len(lines)}
 
 
 @app.patch("/apps/{app_id}/autoscaler", response_model=AppRecord)
@@ -1183,7 +1532,7 @@ async def restart_app_workers(
         await rdb.set(f"worker:{mid}:drain", "1", ex=600)
         await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (restart)")
 
-    provider = getattr(request.app.state, "provider", None)
+    provider = await _provider_for_app(session, app_id, user, request.app.state)
     all_machines = set(tracked)
     if provider is not None:
         try:
@@ -1202,7 +1551,7 @@ async def restart_app_workers(
                 await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (restart)")
 
     for mid in all_machines:
-        await rdb.delete(f"worker:{mid}", f"register_token:{mid}")
+        await rdb.delete(f"worker:{mid}", f"register_token:{mid}", f"worker:{mid}:models")
     if all_machines:
         await rdb.srem(f"worker_index:{app_id}", *all_machines)
 
@@ -1229,7 +1578,7 @@ async def delete_app(
         await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (app deleted)")
     logger.info("delete app %s: marked %d tracked workers for drain", app_id, len(tracked))
 
-    provider = getattr(request.app.state, "provider", None)
+    provider = await _provider_for_app(session, app_id, user, request.app.state)
     all_machines = set(tracked)
     if provider is not None:
         try:
@@ -1248,7 +1597,7 @@ async def delete_app(
                 await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (app delete)")
 
     for mid in all_machines:
-        await rdb.delete(f"worker:{mid}", f"register_token:{mid}")
+        await rdb.delete(f"worker:{mid}", f"register_token:{mid}", f"worker:{mid}:models")
     await rdb.delete(
         f"queue:{app_id}",
         f"app:{app_id}:last_request_ts",
@@ -1276,6 +1625,7 @@ async def _admit_and_enqueue(
     *,
     stream: bool,
     endpoint: str = "/v1/completions",
+    target_model: Optional[str] = None,
 ) -> tuple[str, int]:
     app = await _load_owned_app(db_session, app_id, user)
     cfg = app.autoscaler
@@ -1294,6 +1644,10 @@ async def _admit_and_enqueue(
         "timeout_s": timeout_s,
         "endpoint": endpoint,
     }
+    # Multi-model: the worker routes by the real member-model name. Single-mode
+    # leaves this unset (the worker serves one model and ignores the field).
+    if target_model:
+        job["target_model"] = target_model
     if stream:
         job["stream"] = True
     db_session.add(ReqRow(
@@ -1530,6 +1884,65 @@ async def _mirror_status_to_db(
     await session.commit()
 
 
+async def _resolve_model_to_app(session: AsyncSession, user: User, model_name: str) -> tuple[str, Optional[str]]:
+    """Map an OpenAI `model` field to the endpoint that serves it.
+
+    Returns (app_id, target_model). `target_model` is the real member-model name
+    for a multi-model endpoint (so the worker can route locally), else None.
+
+    Resolution order, scoped to the requesting user (admins keep the fast path):
+      1. Exact app_id match — back-compat: single-mode clients send the endpoint
+         name as `model`, and that's how it's worked.
+      2. A multi-model endpoint whose `models[]` contains this model name.
+      3. A single-mode endpoint whose `model` equals this name (real HF id).
+    Ambiguity (>1 owned endpoint) → 409; none → 404.
+    """
+    from sqlalchemy import select
+
+    # 1. Exact endpoint-name match.
+    app = await session.get(App, model_name)
+    if app is not None and (app.owner_id == user.id or user.is_admin):
+        if (getattr(app, "mode", "single") or "single") == "multi":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "this is a multi-model endpoint — set 'model' to one of its member models, not the endpoint name",
+                    "endpoint": model_name,
+                    "models": [m.get("model") for m in (app.models or [])],
+                },
+            )
+        return model_name, None
+
+    # 2 + 3. Search the user's own endpoints for a model match.
+    rows = (await session.execute(select(App).where(App.owner_id == user.id))).scalars().all()
+    matches: list[tuple[str, Optional[str]]] = []
+    for a in rows:
+        if (a.mode or "single") == "multi":
+            if any((m or {}).get("model") == model_name for m in (a.models or [])):
+                matches.append((a.app_id, model_name))
+        elif a.model == model_name:
+            matches.append((a.app_id, None))
+    # de-dupe by app_id, preserve order
+    seen: set[str] = set()
+    uniq = [m for m in matches if not (m[0] in seen or seen.add(m[0]))]
+    if len(uniq) == 1:
+        return uniq[0]
+    if len(uniq) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "ambiguous model name — multiple of your endpoints serve it",
+                "model": model_name,
+                "candidates": [m[0] for m in uniq],
+                "hint": "send the endpoint name as 'model' to disambiguate",
+            },
+        )
+    raise HTTPException(
+        status_code=404,
+        detail={"error": "no endpoint serves this model for your account", "model": model_name},
+    )
+
+
 async def _openai_endpoint(
     request: Request,
     db_session: AsyncSession,
@@ -1538,13 +1951,15 @@ async def _openai_endpoint(
     vllm_path: str,
 ):
     rdb = request.app.state.redis
-    app_id = payload.get("model")
-    if not app_id:
+    model_field = payload.get("model")
+    if not model_field:
         raise HTTPException(status_code=400, detail={"error": "missing 'model' field in request body"})
+    app_id, target_model = await _resolve_model_to_app(db_session, user, model_field)
 
     is_stream = bool(payload.get("stream"))
     request_id, _timeout_s = await _admit_and_enqueue(
-        rdb, db_session, app_id, user, payload, stream=is_stream, endpoint=vllm_path
+        rdb, db_session, app_id, user, payload, stream=is_stream, endpoint=vllm_path,
+        target_model=target_model,
     )
 
     if not is_stream:
@@ -1692,6 +2107,15 @@ async def heartbeat(req: WorkerHeartbeatRequest, request: Request):
     }
     await rdb.set(f"worker:{req.machine_id}", json.dumps(state), ex=WORKER_TTL_S)
     await rdb.sadd(f"worker_index:{req.app_id}", req.machine_id)
+    # Multi-model workers report per-model state (awake/asleep/loading + queue);
+    # stash it for the status endpoint. Longer TTL than the heartbeat so a missed
+    # beat doesn't blank the UI.
+    if req.models is not None:
+        await rdb.set(
+            f"worker:{req.machine_id}:models",
+            json.dumps(req.models),
+            ex=WORKER_TTL_S * 3,
+        )
     drain = await rdb.exists(f"worker:{req.machine_id}:drain")
     return {"ok": True, "drain": bool(drain)}
 
@@ -1704,7 +2128,12 @@ async def ingest_worker_logs(req: WorkerLogsRequest, request: Request):
     if not req.lines:
         return {"ok": True, "stored": 0}
     rdb = request.app.state.redis
-    key = f"worker_logs:{req.machine_id}"
+    # Multi-model batches carry a `source` (served_name) → bucket per model so
+    # each model's tab shows only its own vLLM output. Single-mode → flat key.
+    key = (
+        f"worker_logs:{req.machine_id}:{_logs_slug(req.source)}"
+        if req.source else f"worker_logs:{req.machine_id}"
+    )
     # Newest first (LPUSH); LTRIM keeps only the most recent N. Each line is
     # bounded to 4 KB to keep one runaway log line from eating the cap budget.
     truncated = [l[:4096] for l in req.lines if l]
@@ -1799,7 +2228,20 @@ def run():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     host, port = os.environ.get("GATEWAY_BIND", "0.0.0.0:8080").rsplit(":", 1)
-    uvicorn.run("gateway.main:app", host=host, port=int(port), log_level="info")
+    # Local-dev hot reload: set GATEWAY_RELOAD=1 to restart the server on any
+    # edit under the gateway package. Off by default so prod runs a single
+    # stable process. We pass the app as an import string (above) which is what
+    # uvicorn needs to respawn the worker; reload_dirs is scoped to this
+    # package so the watcher doesn't crawl .venv / the web/ tree.
+    reload = os.environ.get("GATEWAY_RELOAD", "").strip().lower() in ("1", "true", "yes")
+    uvicorn.run(
+        "gateway.main:app",
+        host=host,
+        port=int(port),
+        log_level="info",
+        reload=reload,
+        reload_dirs=[os.path.dirname(__file__)] if reload else None,
+    )
 
 
 if __name__ == "__main__":

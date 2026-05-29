@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Copy, Octagon, Trash2 } from "lucide-react";
+import { Check, Copy, Octagon, Pencil, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -62,7 +62,42 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
   const [pending, startTransition] = useTransition();
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [terminateError, setTerminateError] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState(bench.name);
+  const [renaming, setRenaming] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
   const inFlight = bench.status === "queued" || bench.status === "running";
+
+  function startRename() {
+    setNameDraft(bench.name);
+    setRenameError(null);
+    setEditingName(true);
+  }
+
+  function cancelRename() {
+    setEditingName(false);
+    setNameDraft(bench.name);
+    setRenameError(null);
+  }
+
+  async function handleRename() {
+    const name = nameDraft.trim();
+    if (!name || name === bench.name) {
+      cancelRename();
+      return;
+    }
+    setRenameError(null);
+    setRenaming(true);
+    try {
+      const next = await gateway.renameBenchmark(bench.id, name);
+      setBench(next);
+      setEditingName(false);
+    } catch (e) {
+      setRenameError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRenaming(false);
+    }
+  }
 
   // Auto-refresh while not terminal so KPIs (status, exit_code, etc.) stay live.
   useEffect(() => {
@@ -124,15 +159,63 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-xl font-semibold tracking-tight">{bench.name}</h1>
-              <span
-                className={`rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide ${
-                  STATUS_STYLES[bench.status] ?? STATUS_STYLES.queued
-                }`}
-              >
-                {bench.status}
-              </span>
+              {editingName ? (
+                <>
+                  <input
+                    autoFocus
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleRename();
+                      else if (e.key === "Escape") cancelRename();
+                    }}
+                    disabled={renaming}
+                    maxLength={200}
+                    className="h-9 w-72 max-w-full rounded-md border border-input bg-background px-2 text-xl font-semibold tracking-tight outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
+                    aria-label="Benchmark name"
+                  />
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    onClick={handleRename}
+                    disabled={renaming}
+                    aria-label="Save name"
+                  >
+                    <Check className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    onClick={cancelRename}
+                    disabled={renaming}
+                    aria-label="Cancel rename"
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <h1 className="text-xl font-semibold tracking-tight">{bench.name}</h1>
+                  <button
+                    type="button"
+                    onClick={startRename}
+                    className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    title="Rename benchmark"
+                    aria-label="Rename benchmark"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide ${
+                      STATUS_STYLES[bench.status] ?? STATUS_STYLES.queued
+                    }`}
+                  >
+                    {bench.status}
+                  </span>
+                </>
+              )}
             </div>
+            {renameError && <p className="mt-1 text-xs text-destructive">{renameError}</p>}
             <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
               <span className="font-mono">{bench.id}</span>
               <span>·</span>

@@ -4,6 +4,9 @@ import { setAuthCookies } from "@/lib/auth-cookie";
 const GATEWAY = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
 export async function POST(req: NextRequest) {
+  if (process.env.REGISTRATION_DISABLED === "1") {
+    return NextResponse.json({ error: "registration is disabled" }, { status: 403 });
+  }
   const body = await req.json().catch(() => ({}));
   const { username, password, email } = body as {
     username?: string;

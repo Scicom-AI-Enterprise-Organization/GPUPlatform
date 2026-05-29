@@ -45,6 +45,12 @@ export function ProviderForm() {
 
   const isApiKind = kind === "runpod" || kind === "pi";
 
+  // Any edit to a tested field invalidates a prior pass, so the user must
+  // re-test before the Create button re-enables. No-op when already idle to
+  // avoid re-render churn on every keystroke.
+  const invalidateTest = () =>
+    setTest((t) => (t.status === "idle" ? t : { status: "idle" }));
+
   const validate = (): string | null => {
     if (!name.trim()) return "Name is required.";
     if (kind === "vm") {
@@ -66,6 +72,7 @@ export function ProviderForm() {
     if (!f) return;
     const text = await f.text();
     setPrivateKey(text);
+    invalidateTest();
     e.target.value = "";
   };
 
@@ -166,7 +173,7 @@ export function ProviderForm() {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="vm">VM (bare metal SSH)</SelectItem>
+                <SelectItem value="vm">SSH</SelectItem>
                 <SelectItem value="runpod">RunPod (API key)</SelectItem>
                 <SelectItem value="pi">Prime Intellect (API key)</SelectItem>
               </SelectContent>
@@ -205,7 +212,10 @@ export function ProviderForm() {
               <Input
                 id="vm-host"
                 value={host}
-                onChange={(e) => setHost(e.target.value)}
+                onChange={(e) => {
+                  setHost(e.target.value);
+                  invalidateTest();
+                }}
                 placeholder="10.0.0.5 or vm.example.com"
                 className="mt-1.5"
               />
@@ -215,7 +225,10 @@ export function ProviderForm() {
               <Input
                 id="vm-port"
                 value={port}
-                onChange={(e) => setPort(e.target.value)}
+                onChange={(e) => {
+                  setPort(e.target.value);
+                  invalidateTest();
+                }}
                 inputMode="numeric"
                 className="mt-1.5"
               />
@@ -225,7 +238,10 @@ export function ProviderForm() {
               <Input
                 id="vm-user"
                 value={user}
-                onChange={(e) => setUser(e.target.value)}
+                onChange={(e) => {
+                  setUser(e.target.value);
+                  invalidateTest();
+                }}
                 placeholder="root"
                 className="mt-1.5"
               />
@@ -250,7 +266,10 @@ export function ProviderForm() {
             <Textarea
               id="vm-key"
               value={privateKey}
-              onChange={(e) => setPrivateKey(e.target.value)}
+              onChange={(e) => {
+                setPrivateKey(e.target.value);
+                invalidateTest();
+              }}
               placeholder={"-----BEGIN OPENSSH PRIVATE KEY-----\n..."}
               rows={8}
               className="mt-1.5 font-mono text-xs"
@@ -280,7 +299,10 @@ export function ProviderForm() {
                 id="api-key"
                 type="password"
                 value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
+                onChange={(e) => {
+                  setApiKey(e.target.value);
+                  invalidateTest();
+                }}
                 placeholder={kind === "runpod" ? "rpa_..." : "pi_..."}
                 className="mt-1.5 font-mono text-xs"
                 autoComplete="off"
@@ -324,7 +346,11 @@ export function ProviderForm() {
             {test.status === "running" && <Loader2 className="h-4 w-4 animate-spin" />}
             {test.status === "running" ? "Testing…" : "Test"}
           </Button>
-          <Button type="submit" disabled={submitting || test.status === "running"}>
+          <Button
+            type="submit"
+            disabled={submitting || test.status !== "ok"}
+            title={test.status !== "ok" ? "Pass the connection test first" : undefined}
+          >
             {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
             {submitting ? "Creating…" : "Create provider"}
           </Button>

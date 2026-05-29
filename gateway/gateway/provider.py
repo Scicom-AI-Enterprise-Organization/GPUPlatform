@@ -101,6 +101,11 @@ class Provider(ABC):
     async def shutdown(self) -> None:
         """Kill everything. Called on gateway shutdown."""
 
+    async def ensure_connectivity(self) -> None:
+        """Hook called each autoscaler tick before reconciling. Default no-op;
+        the VM provider uses it to (re)establish its reverse SSH tunnel so the
+        worker can reach the gateway + Redis after a gateway restart."""
+
 
 class FakeProvider(Provider):
     """In-process worker spawner, for tests and offline dev.
@@ -197,3 +202,65 @@ def build_provider(name: str) -> Provider:
         from .runpod_provider import RunPodProvider
         return RunPodProvider()
     raise ValueError(f"unknown provider: {name}")
+
+
+async def resolve_app_provider(session, app, *, redis, fallback: Optional[Provider], cache: dict) -> Provider:
+    """Return the Provider an app should use.
+
+    `provider_id is None` → the gateway-wide env-built singleton (`fallback`),
+    preserving every existing env-driven deployment. Otherwise build a Provider
+    bound to that provider-row's credentials and cache it by id so we don't
+    re-decrypt / re-instantiate every autoscaler tick.
+
+    `redis` is needed by VMProvider (it tracks its machines there). Raises
+    RuntimeError if the row is missing or its kind is unsupported.
+    """
+    pid = getattr(app, "provider_id", None)
+    if not pid:
+        if fallback is None:
+            raise RuntimeError("no provider_id and no global provider configured")
+        return fallback
+    if pid in cache:
+        return cache[pid]
+
+    from .db import Provider as ProviderRow
+    from . import crypto
+
+    row = await session.get(ProviderRow, pid)
+    if row is None:
+        raise RuntimeError(f"provider {pid} not found")
+
+    if row.kind == "vm":
+        from .vm_serverless_provider import VMProvider
+        cfg = row.config or {}
+        enc = cfg.get("private_key_enc")
+        if not enc:
+            raise RuntimeError(f"vm provider {pid} has no stored private key")
+        inst: Provider = VMProvider(
+            provider_id=pid,
+            host=cfg.get("host", ""),
+            port=int(cfg.get("port") or 22),
+            user=cfg.get("user", "root"),
+            private_key_pem=crypto.decrypt(enc),
+            gpu_count=int(cfg.get("gpu_count") or 0),
+            rdb=redis,
+            # Local dev / single-gateway: forward gateway+redis to the VM over
+            # SSH so a remote VM can phone home to a non-public gateway.
+            reverse_tunnel=os.environ.get("VM_REVERSE_TUNNEL", "").strip() in ("1", "true", "yes"),
+        )
+    elif row.kind == "runpod":
+        from .provider_resolve import resolve_cloud_creds
+        from .runpod_provider import RunPodProvider
+        creds = await resolve_cloud_creds(session, pid, "runpod")
+        inst = RunPodProvider(api_key=creds.api_key)
+    elif row.kind == "pi":
+        from .provider_resolve import resolve_cloud_creds
+        from .pi_provider import PrimeIntellectProvider
+        creds = await resolve_cloud_creds(session, pid, "pi")
+        inst = PrimeIntellectProvider(api_key=creds.api_key)
+    else:
+        raise RuntimeError(f"unsupported provider kind {row.kind!r} for serverless")
+
+    logger.info("resolved app=%s → provider %s (kind=%s)", getattr(app, "app_id", "?"), pid, row.kind)
+    cache[pid] = inst
+    return inst

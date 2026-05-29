@@ -233,6 +233,35 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
         </ParamsCard>
       )}
 
+      {(bench.visible_devices || (bench.env_vars && Object.keys(bench.env_vars).length > 0)) && (
+        <ParamsCard
+          icon={<Cpu className="h-4 w-4" />}
+          title="Runtime environment"
+          description={
+            provider?.kind === "vm"
+              ? "Exported on the VM before the run (absolute-path values are auto-created). Applied at run time — not part of the submitted YAML above."
+              : "Passed to the pod at launch. Applied at run time — not part of the submitted YAML above."
+          }
+        >
+          {bench.visible_devices && (
+            <KvGrid>
+              <Kv label="CUDA_VISIBLE_DEVICES" value={bench.visible_devices} mono wide />
+            </KvGrid>
+          )}
+          {bench.env_vars && Object.keys(bench.env_vars).length > 0 && (
+            <Detail label="Environment variables">
+              <div className="flex flex-wrap gap-1">
+                {Object.entries(bench.env_vars).map(([k, v]) => (
+                  <Badge key={k} variant="secondary" className="font-mono text-[10px]">
+                    {k}={String(v)}
+                  </Badge>
+                ))}
+              </div>
+            </Detail>
+          )}
+        </ParamsCard>
+      )}
+
       <ParamsCard
         icon={<Cpu className="h-4 w-4" />}
         title="Model"

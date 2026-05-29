@@ -29,7 +29,7 @@ import httpx
 import yaml
 from botocore.client import Config as BotoConfig
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import (
     JSON,
@@ -45,9 +45,12 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
+from dataclasses import dataclass
+
 from . import audit
+from . import crypto
 from .auth import require_section
-from .db import Base, User, get_session, session_factory
+from .db import Base, Storage, User, get_session, session_factory
 
 logger = logging.getLogger("gateway.bench")
 
@@ -94,71 +97,138 @@ class Benchmark(Base):
     # FK omitted to keep this column nullable without cascade headaches; we
     # validate ownership at create time.
     provider_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    # User-selected storage backend (Storage row, kind=s3) for logs + result
+    # files. NULL = fall back to the BENCHMARK_S3_BUCKET env. The chosen
+    # storage's bucket/prefix/region/endpoint/creds are baked into `s3_prefix`
+    # and used by the S3 helpers via the resolved target.
+    storage_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     # VM runs only: SSH back in after benchmaq exits to rm -rf the model's
     # local_dir + HF hub cache. Default true so users don't fill the VM disk.
     cleanup_model: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    # Extra env exported for the run (VM: exported in the remote script + mkdir'd
+    # for path values; RunPod: passed to the pod via runpod.env). NULL = none.
+    env_vars: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # CUDA_VISIBLE_DEVICES pin, e.g. "0,1,2,3". NULL/empty = all GPUs.
+    visible_devices: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
 
 # ---------- S3 ----------------------------------------------------------
 
 
-def _bucket() -> str:
-    b = os.environ.get("BENCHMARK_S3_BUCKET", "").strip()
-    if not b:
-        raise RuntimeError("BENCHMARK_S3_BUCKET not set")
-    return b
+@dataclass
+class S3Target:
+    """Resolved destination for a benchmark's S3 I/O. Built either from the
+    gateway env (the default) or from a user-selected Storage row."""
+    bucket: str
+    region: str
+    endpoint: Optional[str]
+    access_key: Optional[str]
+    secret_key: Optional[str]
+    prefix_root: str  # always ends with "/"
 
 
-def _s3_prefix_root() -> str:
-    p = os.environ.get("BENCHMARK_S3_PREFIX", "benchmarks/").strip().lstrip("/")
-    if not p.endswith("/"):
-        p += "/"
-    return p
-
-
-def _aws_region() -> str:
-    return os.environ.get("AWS_REGION", "ap-southeast-5")
-
-
-def _s3_client():
-    region = _aws_region()
-    return boto3.client(
-        "s3",
-        region_name=region,
-        # Pin to the regional endpoint. Default `s3.amazonaws.com` redirects
-        # to the bucket's region, but presigned URLs signed with a non-default
-        # region get a 400 on the global host before the redirect can happen.
-        endpoint_url=f"https://s3.{region}.amazonaws.com",
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", ""),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-        config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+def _env_s3_target() -> S3Target:
+    """The historical env-driven destination (BENCHMARK_S3_BUCKET et al.)."""
+    prefix = os.environ.get("BENCHMARK_S3_PREFIX", "benchmarks/").strip().lstrip("/")
+    if not prefix.endswith("/"):
+        prefix += "/"
+    return S3Target(
+        bucket=os.environ.get("BENCHMARK_S3_BUCKET", "").strip(),
+        region=os.environ.get("AWS_REGION", "ap-southeast-5"),
+        endpoint=None,
+        access_key=os.environ.get("AWS_ACCESS_KEY_ID") or None,
+        secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY") or None,
+        prefix_root=prefix,
     )
 
 
-def s3_put_text(key: str, body: str) -> None:
-    _s3_client().put_object(Bucket=_bucket(), Key=key, Body=body.encode("utf-8"))
+def _target_from_storage_row(row: Optional[Storage]) -> S3Target:
+    """Build a target from a kind=s3 Storage row, decrypting its credentials.
+    Falls back to env for any field the row leaves blank. None → env target."""
+    if row is None:
+        return _env_s3_target()
+    cfg = row.config or {}
+    enc = cfg.get("credentials_enc")
+    if enc:
+        creds = json.loads(crypto.decrypt(enc))
+        access_key = creds.get("accessKeyId")
+        secret_key = creds.get("secretAccessKey")
+    else:
+        access_key = os.environ.get("AWS_ACCESS_KEY_ID") or None
+        secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or None
+    prefix = (cfg.get("prefix") or "").strip().strip("/")
+    prefix_root = f"{prefix}/benchmarks/" if prefix else "benchmarks/"
+    return S3Target(
+        bucket=(cfg.get("bucket") or "").strip(),
+        region=(cfg.get("region") or os.environ.get("AWS_REGION", "ap-southeast-5")),
+        endpoint=(cfg.get("endpoint") or None),
+        access_key=access_key,
+        secret_key=secret_key,
+        prefix_root=prefix_root,
+    )
 
 
-def s3_put_file(key: str, path: str) -> None:
+async def _bench_s3_target(storage_id: Optional[str]) -> S3Target:
+    """Resolve the target for a benchmark by its storage_id. Opens its own
+    short-lived session; storage_id=None (or a missing row) → env target."""
+    if not storage_id:
+        return _env_s3_target()
+    async with session_factory()() as s:
+        row = await s.get(Storage, storage_id)
+    return _target_from_storage_row(row)
+
+
+def _s3_client(target: S3Target):
+    if not target.bucket:
+        raise RuntimeError(
+            "no S3 bucket configured — set BENCHMARK_S3_BUCKET or select a storage"
+        )
+    kwargs: dict = {
+        "region_name": target.region,
+        # Pin to the regional endpoint. Default `s3.amazonaws.com` redirects to
+        # the bucket's region, but presigned URLs signed with a non-default
+        # region get a 400 on the global host before the redirect can happen.
+        # A custom endpoint (R2 / MinIO) overrides this and wants path-style.
+        "endpoint_url": target.endpoint or f"https://s3.{target.region}.amazonaws.com",
+        "config": BotoConfig(
+            signature_version="s3v4",
+            s3={"addressing_style": "path" if target.endpoint else "virtual"},
+        ),
+    }
+    if target.access_key and target.secret_key:
+        kwargs["aws_access_key_id"] = target.access_key
+        kwargs["aws_secret_access_key"] = target.secret_key
+    return boto3.client("s3", **kwargs)
+
+
+def s3_put_text(key: str, body: str, target: Optional[S3Target] = None) -> None:
+    t = target or _env_s3_target()
+    _s3_client(t).put_object(Bucket=t.bucket, Key=key, Body=body.encode("utf-8"))
+
+
+def s3_put_file(key: str, path: str, target: Optional[S3Target] = None) -> None:
+    t = target or _env_s3_target()
     with open(path, "rb") as f:
-        _s3_client().put_object(Bucket=_bucket(), Key=key, Body=f.read())
+        _s3_client(t).put_object(Bucket=t.bucket, Key=key, Body=f.read())
 
 
-def s3_get_text(key: str) -> Optional[str]:
+def s3_get_text(key: str, target: Optional[S3Target] = None) -> Optional[str]:
     """Read an S3 object as utf-8 text. Returns None if the key is missing."""
+    t = target or _env_s3_target()
     try:
-        obj = _s3_client().get_object(Bucket=_bucket(), Key=key)
+        obj = _s3_client(t).get_object(Bucket=t.bucket, Key=key)
         return obj["Body"].read().decode("utf-8", "replace")
     except Exception:
         return None
 
 
-def s3_list(prefix: str) -> list[dict]:
-    cli = _s3_client()
+def s3_list(prefix: str, target: Optional[S3Target] = None) -> list[dict]:
+    t = target or _env_s3_target()
+    cli = _s3_client(t)
     out: list[dict] = []
     token = None
     while True:
-        kwargs = {"Bucket": _bucket(), "Prefix": prefix}
+        kwargs = {"Bucket": t.bucket, "Prefix": prefix}
         if token:
             kwargs["ContinuationToken"] = token
         r = cli.list_objects_v2(**kwargs)
@@ -174,17 +244,19 @@ def s3_list(prefix: str) -> list[dict]:
     return out
 
 
-def s3_presign_get(key: str, expires: int = 3600) -> str:
-    return _s3_client().generate_presigned_url(
-        "get_object", Params={"Bucket": _bucket(), "Key": key}, ExpiresIn=expires
+def s3_presign_get(key: str, expires: int = 3600, target: Optional[S3Target] = None) -> str:
+    t = target or _env_s3_target()
+    return _s3_client(t).generate_presigned_url(
+        "get_object", Params={"Bucket": t.bucket, "Key": key}, ExpiresIn=expires
     )
 
 
 # ---------- Helpers -----------------------------------------------------
 
 
-def benchmark_s3_prefix(bench_id: str) -> str:
-    return f"{_s3_prefix_root()}{bench_id}/"
+def benchmark_s3_prefix(bench_id: str, target: Optional[S3Target] = None) -> str:
+    t = target or _env_s3_target()
+    return f"{t.prefix_root}{bench_id}/"
 
 
 def _gen_id() -> str:
@@ -207,9 +279,20 @@ def _ssh_key_path() -> str:
     return os.path.expanduser(p)
 
 
+def _merge_run_env(env_vars: Optional[dict], visible_devices: Optional[str]) -> dict:
+    """User env + CUDA_VISIBLE_DEVICES pin into one dict for the run."""
+    env = {str(k): str(v) for k, v in (env_vars or {}).items()}
+    vd = (visible_devices or "").strip()
+    if vd:
+        env["CUDA_VISIBLE_DEVICES"] = vd
+    return env
+
+
 def _resolve_config(
     raw_yaml: str,
     vm_target: Optional[dict] = None,
+    env_vars: Optional[dict] = None,
+    visible_devices: Optional[str] = None,
 ) -> str:
     """Inject runtime values (SSH key path, RunPod API key) into the user's YAML.
 
@@ -226,12 +309,17 @@ def _resolve_config(
     if not isinstance(cfg, dict):
         return raw_yaml
 
+    run_env = _merge_run_env(env_vars, visible_devices)
+
     if vm_target is None:
         rp = cfg.setdefault("runpod", {})
         if not rp.get("ssh_private_key") or "path/to/your" in str(rp.get("ssh_private_key")):
             rp["ssh_private_key"] = _ssh_key_path()
         if not rp.get("runpod_api_key"):
             rp["runpod_api_key"] = os.environ.get("RUNPOD_API_KEY", "")
+        # RunPod path: benchmaq's runner forwards `runpod.env` to the pod (--env).
+        if run_env:
+            rp["env"] = {**(rp.get("env") or {}), **run_env}
 
         rem = cfg.setdefault("remote", {})
         if not rem.get("key_filename") or "path/to/your" in str(rem.get("key_filename")):
@@ -250,6 +338,11 @@ def _resolve_config(
         rem["port"] = int(vm_target.get("port") or 22)
         rem["username"] = vm_target.get("user", "root")
         rem["key_filename"] = vm_target["key_filename"]
+        # Consumed by pyremote_shim's run_remote_ssh: exported (and path values
+        # mkdir'd) on the VM before install + benchmark. Stripped from the
+        # config uploaded to the VM, so it only shapes the remote shell env.
+        if run_env:
+            rem["env"] = run_env
         uv = rem.setdefault("uv", {})
         uv.setdefault("path", "~/.bench-venv")
         uv.setdefault("python_version", "3.11")
@@ -614,7 +707,11 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         b.status = "running"
         b.started_at = datetime.now(timezone.utc)
         provider_id = b.provider_id
+        storage_id = b.storage_id
+        s3_prefix = b.s3_prefix
         cleanup_model = bool(getattr(b, "cleanup_model", True))
+        run_env_vars = getattr(b, "env_vars", None) or None
+        run_visible_devices = getattr(b, "visible_devices", None) or None
         await s.commit()
 
     # Disambiguate provider kind. A runpod-kind provider_id picks WHICH
@@ -640,6 +737,31 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     vm_target: Optional[dict] = None
     runpod_creds = None
     if provider_kind == "vm":
+        # Guard against benchmaq version drift: the VM path needs the `backend:
+        # ssh` runner (run_remote_ssh). If the installed benchmaq is older and
+        # only has the pyremote run_remote, fail loudly here instead of silently
+        # falling back to it (which breaks on VMs that print an SSH MOTD banner).
+        try:
+            import benchmaq.runner as _bmr
+            has_ssh_backend = hasattr(_bmr, "run_remote_ssh")
+        except Exception:
+            has_ssh_backend = False
+        if not has_ssh_backend:
+            msg = (
+                "installed benchmaq lacks the SSH backend (run_remote_ssh) — VM "
+                "benchmarks need the pinned ref. Reinstall: uv pip install "
+                "--reinstall-package benchmaq "
+                "'benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@75d1353'"
+            )
+            await _push_log(redis, bench_id, f"[gateway] {msg}")
+            async with session_factory()() as s:
+                b2 = await s.get(Benchmark, bench_id)
+                if b2 is not None:
+                    b2.status = "failed"
+                    b2.error_text = msg[:4000]
+                    b2.ended_at = datetime.now(timezone.utc)
+                    await s.commit()
+            return
         try:
             vm_target = await _materialise_vm_key(work, provider_id)
             await _push_log(redis, bench_id, f"[gateway] bare-metal target: {vm_target['user']}@{vm_target['host']}:{vm_target['port']}")
@@ -671,7 +793,10 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
             return
 
     cfg_path = work / "config.yaml"
-    cfg_path.write_text(_resolve_config(raw_yaml, vm_target=vm_target))
+    cfg_path.write_text(_resolve_config(
+        raw_yaml, vm_target=vm_target,
+        env_vars=run_env_vars, visible_devices=run_visible_devices,
+    ))
 
     if vm_target:
         sub_cmd = _pick_engine_subcommand(raw_yaml)
@@ -765,9 +890,16 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     elif vm_target is not None:
         await _push_log(redis, bench_id, "[gateway] vm cleanup: skipped (cleanup_model=false)")
 
-    # Sync any result files dropped under work/ into S3.
-    prefix = benchmark_s3_prefix(bench_id)
-    s3_put_text(f"{prefix}config.yaml", _resolve_config(raw_yaml, vm_target=vm_target))
+    # Sync any result files dropped under work/ into S3 — to the storage the
+    # user picked at create time (or the env bucket when none was set). Use the
+    # prefix baked into the row so reads + writes always agree.
+    target = await _bench_s3_target(storage_id)
+    prefix = s3_prefix
+    s3_put_text(
+        f"{prefix}config.yaml",
+        _resolve_config(raw_yaml, vm_target=vm_target, env_vars=run_env_vars, visible_devices=run_visible_devices),
+        target=target,
+    )
     result_json: Optional[dict] = None
     error_excerpt: Optional[str] = None
 
@@ -777,29 +909,70 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     full_log = _full_log_path(bench_id)
     if full_log.exists():
         try:
-            s3_put_file(f"{prefix}logs.txt", str(full_log))
+            s3_put_file(f"{prefix}logs.txt", str(full_log), target=target)
         except Exception as e:
             await _push_log(redis, bench_id, f"[gateway] s3 upload failed for logs.txt: {e}")
 
+    # Never upload secrets/control files. `vm_key` is the decrypted SSH private
+    # key materialised for the run — uploading it leaks the VM credential to S3.
+    _NO_UPLOAD = {"config.yaml", "_full.log", "vm_key", "vm_key.pub"}
+    # Big per-request arrays — dropped from the aggregate result.json summary.
+    _DROP_KEYS = {
+        "generated_texts", "input_texts", "itls", "tpots", "ttfts", "e2els",
+        "input_lens", "output_lens", "errors",
+    }
+    per_config_results: list[dict] = []
     for path in sorted(work.rglob("*")):
-        if not path.is_file() or path.name in ("config.yaml", "_full.log"):
+        if not path.is_file() or path.name in _NO_UPLOAD:
             continue
         rel = path.relative_to(work).as_posix()
         try:
-            s3_put_file(f"{prefix}{rel}", str(path))
+            s3_put_file(f"{prefix}{rel}", str(path), target=target)
         except Exception as e:
             await _push_log(redis, bench_id, f"[gateway] s3 upload failed for {rel}: {e}")
-        # First plausible result.json wins for the Metrics tab.
-        if result_json is None and path.suffix == ".json":
+        # Collect each per-config result.json (benchmaq writes one per bench row).
+        if path.suffix == ".json" and path.name != "result.json":
             try:
                 with path.open() as f:
                     candidate = json.load(f)
                 if isinstance(candidate, dict):
-                    result_json = candidate
+                    if result_json is None:  # first wins for the DB column
+                        result_json = candidate
+                    per_config_results.append(
+                        {"file": rel, **{k: v for k, v in candidate.items() if k not in _DROP_KEYS}}
+                    )
             except Exception:
                 pass
 
-    if rc != 0:
+    # Build a canonical, aggregate `result.json` (summary across all bench
+    # configs, heavy per-request arrays stripped) and put it in storage if one
+    # doesn't already exist. benchmaq only emits per-config files; this is the
+    # single artifact tools/UI can read for the whole run.
+    if per_config_results:
+        try:
+            if s3_get_text(f"{prefix}result.json", target=target) is None:
+                agg = {"bench_id": bench_id, "count": len(per_config_results), "results": per_config_results}
+                s3_put_text(f"{prefix}result.json", json.dumps(agg, indent=2), target=target)
+                await _push_log(redis, bench_id, f"[gateway] built result.json ({len(per_config_results)} configs)")
+        except Exception as e:
+            await _push_log(redis, bench_id, f"[gateway] failed to build result.json: {e}")
+
+    # A run where benchmaq exits 0 but EVERY request failed (0 successful across
+    # all bench configs) is not a valid result — almost always the vLLM server
+    # never actually served (port already in use, 404s, model-load failure). The
+    # exit code lies in that case, so we inspect the per-config "Successful
+    # requests" tallies and fail the run if they're all zero.
+    all_requests_failed = False
+    if rc == 0 and full_log.exists():
+        try:
+            _text = full_log.read_text(encoding="utf-8", errors="replace")
+            _succ = [int(m) for m in re.findall(r"Successful requests:\s*(\d+)", _text)]
+            if _succ and all(s == 0 for s in _succ):
+                all_requests_failed = True
+        except Exception:
+            pass
+
+    if rc != 0 or all_requests_failed:
         # Tail the full on-disk log for the error_text card on the list page.
         try:
             if full_log.exists():
@@ -815,17 +988,28 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                     error_excerpt = _cuda_m.group(0).strip()
         except Exception:
             error_excerpt = None
+        if all_requests_failed:
+            # Prepend a clear reason so the UI doesn't just show a metrics wall.
+            _addr = "the vLLM serve port was already in use" if (
+                full_log.exists() and "Address already in use" in (error_excerpt or "")
+            ) else "the vLLM server didn't serve the model (check for 404s / load errors)"
+            error_excerpt = (
+                f"All requests failed — 0 successful across every bench config. Likely {_addr}.\n\n"
+                + (error_excerpt or "")
+            )[:4000]
 
     async with session_factory()() as s:
         b = await s.get(Benchmark, bench_id)
         if b is None:
             return
-        b.status = "done" if rc == 0 else "failed"
+        b.status = "done" if (rc == 0 and not all_requests_failed) else "failed"
         b.exit_code = rc
         b.error_text = error_excerpt
         b.result_json = result_json
         b.ended_at = datetime.now(timezone.utc)
         await s.commit()
+        if all_requests_failed:
+            await _push_log(redis, bench_id, "[gateway] marked failed: 0 successful requests across all bench configs")
 
     # TTL on the log list so old runs eventually drop out of redis.
     try:
@@ -955,7 +1139,11 @@ async def cleanup_orphaned_running(redis) -> int:
         full_log = _full_log_path(bid)
         if full_log.exists():
             try:
-                s3_put_file(f"{benchmark_s3_prefix(bid)}logs.txt", str(full_log))
+                async with session_factory()() as s:
+                    _row = await s.get(Benchmark, bid)
+                _target = await _bench_s3_target(_row.storage_id if _row else None)
+                _prefix = _row.s3_prefix if _row else benchmark_s3_prefix(bid, _target)
+                s3_put_file(f"{_prefix}logs.txt", str(full_log), target=_target)
             except Exception as e:
                 logger.warning("orphan %s: failed to upload _full.log: %s", bid, e)
     return len(ids)
@@ -971,9 +1159,21 @@ class CreateBenchmarkRequest(BaseModel):
     # provider id (from /v1/providers) to bind this run to a user-registered
     # VM. Phase 2 just persists the choice; phase 3 will route execution.
     provider_id: Optional[str] = None
+    # Storage backend (Storage row, kind=s3) for logs + result files. NULL/absent
+    # falls back to the BENCHMARK_S3_BUCKET env. The web form requires it.
+    storage_id: Optional[str] = None
     # VM runs only: remove the model from the VM after the run. Ignored for
     # cloud runs since the RunPod pod is torn down anyway.
     cleanup_model: Optional[bool] = None
+    # Extra env for the run (cache/home dirs, etc.). Absolute-path values are
+    # mkdir -p'd on the VM. RunPod runs pass these to the pod.
+    env_vars: Optional[dict[str, str]] = None
+    # CUDA_VISIBLE_DEVICES pin, e.g. "0,1,2,3". Empty/None = all GPUs.
+    visible_devices: Optional[str] = None
+
+
+class RenameBenchmarkRequest(BaseModel):
+    name: str
 
 
 class BenchmarkRecord(BaseModel):
@@ -991,6 +1191,9 @@ class BenchmarkRecord(BaseModel):
     ended_at: Optional[str] = None
     cost_per_hr: Optional[float] = None
     provider_id: Optional[str] = None
+    storage_id: Optional[str] = None
+    env_vars: Optional[dict[str, str]] = None
+    visible_devices: Optional[str] = None
 
 
 class FileRecord(BaseModel):
@@ -1034,6 +1237,9 @@ def _to_record(b: Benchmark, owner_username: str) -> BenchmarkRecord:
         ended_at=b.ended_at.isoformat() if b.ended_at else None,
         cost_per_hr=b.cost_per_hr,
         provider_id=b.provider_id,
+        storage_id=b.storage_id,
+        env_vars=getattr(b, "env_vars", None) or None,
+        visible_devices=getattr(b, "visible_devices", None) or None,
     )
 
 
@@ -1131,8 +1337,22 @@ async def create_benchmark(
         if prov is None:
             raise HTTPException(status_code=400, detail={"error": "unknown provider_id"})
 
+    # Resolve the storage backend for logs + result files. The web form requires
+    # one; if omitted we fall back to the env bucket for API/back-compat.
+    if body.storage_id:
+        st = await session.get(Storage, body.storage_id)
+        if st is None:
+            raise HTTPException(status_code=400, detail={"error": "unknown storage_id"})
+        if st.kind != "s3":
+            raise HTTPException(status_code=400, detail={"error": "storage must be kind=s3 for benchmark logs"})
+        if not st.enabled:
+            raise HTTPException(status_code=400, detail={"error": "selected storage is disabled"})
+        target = _target_from_storage_row(st)
+    else:
+        target = _env_s3_target()
+
     bench_id = _gen_id()
-    s3_prefix = benchmark_s3_prefix(bench_id)
+    s3_prefix = benchmark_s3_prefix(bench_id, target)
 
     bench = Benchmark(
         id=bench_id,
@@ -1142,8 +1362,11 @@ async def create_benchmark(
         s3_prefix=s3_prefix,
         owner_id=user.id,
         provider_id=body.provider_id,
+        storage_id=body.storage_id,
         # Only honoured when provider_id is set (VM path). Default True.
         cleanup_model=True if body.cleanup_model is None else bool(body.cleanup_model),
+        env_vars={k: str(v) for k, v in (body.env_vars or {}).items()} or None,
+        visible_devices=(body.visible_devices or "").strip() or None,
     )
     session.add(bench)
     await session.commit()
@@ -1302,9 +1525,6 @@ async def aggregate(
         )
     benches = list(rows.scalars().all())
 
-    cli = _s3_client()
-    bucket = _bucket()
-
     async def fetch_one(b: Benchmark) -> list[AggregatePoint]:
         cfg_meta = _parse_config(b.config_yaml or "")
         # VM (bare-metal) benches don't have a runpod.pod block in the YAML,
@@ -1327,6 +1547,11 @@ async def aggregate(
             except Exception as e:
                 logger.warning("aggregate: provider lookup for %s failed: %s", b.id, e)
         try:
+            # Resolve this bench's storage so aggregates read from wherever its
+            # results actually live — each bench may use a different backend.
+            target = await _bench_s3_target(b.storage_id)
+            cli = _s3_client(target)
+            bucket = target.bucket
             keys = []
             token = None
             while True:
@@ -1403,6 +1628,124 @@ async def get_benchmark(
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
     owner = await session.get(User, b.owner_id)
     return _to_record(b, owner.username if owner else "")
+
+
+@router.patch("/{bench_id}", response_model=BenchmarkRecord)
+async def rename_benchmark(
+    bench_id: str,
+    body: RenameBenchmarkRequest,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Rename a benchmark. Owner (or admin) only. Cosmetic — the run, S3 prefix,
+    and config are untouched."""
+    b = await session.get(Benchmark, bench_id)
+    if not b:
+        raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
+    if not user.is_admin and b.owner_id != user.id:
+        raise HTTPException(status_code=403, detail={"error": "forbidden"})
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail={"error": "name must not be empty"})
+    name = name[:200]
+    old = b.name
+    b.name = name
+    await session.commit()
+    await audit.record(
+        user, "benchmark.rename", "benchmark", bench_id, name,
+        details={"from": old, "to": name},
+    )
+    owner = await session.get(User, b.owner_id)
+    return _to_record(b, owner.username if owner else "")
+
+
+@router.get("/{bench_id}/logs")
+async def get_benchmark_logs(
+    bench_id: str,
+    request: Request,
+    tail: int = 200,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Plain (non-streaming) log fetch for scripting/polling — returns the last
+    `tail` lines as JSON. Source priority mirrors the stream endpoint: on-disk
+    full log → S3 logs.txt (terminal runs) → Redis live-tail."""
+    b = await session.get(Benchmark, bench_id)
+    if not b:
+        raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
+    if not user.is_admin and b.owner_id != user.id:
+        raise HTTPException(status_code=403, detail={"error": "forbidden"})
+    n = max(1, min(int(tail or 200), 5000))
+
+    lines: list[str] = []
+    full_log = _full_log_path(bench_id)
+    if full_log.exists():
+        try:
+            lines = full_log.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            lines = []
+    if not lines and b.status in ("done", "failed", "cancelled"):
+        _target = await _bench_s3_target(b.storage_id)
+        txt = s3_get_text(f"{b.s3_prefix}logs.txt", target=_target)
+        if txt:
+            lines = txt.splitlines()
+    if not lines:
+        try:
+            lines = await request.app.state.redis.lrange(f"bench:logs:{bench_id}", 0, -1)
+        except Exception:
+            lines = []
+
+    return {
+        "bench_id": bench_id,
+        "status": b.status,
+        "error_text": b.error_text,
+        "total_lines": len(lines),
+        "lines": lines[-n:],
+    }
+
+
+@router.post("/{bench_id}/duplicate", response_model=BenchmarkRecord)
+async def duplicate_benchmark(
+    bench_id: str,
+    request: Request,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Re-run: create a fresh benchmark copying this one's config + provider +
+    storage + env/GPU settings, and start it. The copy is owned by the caller."""
+    src = await session.get(Benchmark, bench_id)
+    if not src:
+        raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
+    if not user.is_admin and src.owner_id != user.id:
+        raise HTTPException(status_code=403, detail={"error": "forbidden"})
+
+    target = await _bench_s3_target(src.storage_id)
+    new_id = _gen_id()
+    new = Benchmark(
+        id=new_id,
+        name=f"{src.name}-copy",
+        config_yaml=src.config_yaml,
+        status="queued",
+        s3_prefix=benchmark_s3_prefix(new_id, target),
+        owner_id=user.id,
+        provider_id=src.provider_id,
+        storage_id=src.storage_id,
+        cleanup_model=bool(getattr(src, "cleanup_model", True)),
+        env_vars=getattr(src, "env_vars", None),
+        visible_devices=getattr(src, "visible_devices", None),
+    )
+    session.add(new)
+    await session.commit()
+
+    redis = request.app.state.redis
+    task = asyncio.create_task(_safe_run(redis, new_id, src.config_yaml))
+    _active_runners[new_id] = task
+    task.add_done_callback(lambda _t, _bid=new_id: _active_runners.pop(_bid, None))
+
+    await audit.record(user, "benchmark.create", "benchmark", new_id, new.name)
+    logger.info("benchmark %s duplicated from %s by user=%s", new_id, bench_id, user.username)
+    new = await session.get(Benchmark, new_id)
+    return _to_record(new, user.username)
 
 
 # Strong refs to terminate-cleanup tasks so they don't get GC'd mid-flight.
@@ -1507,7 +1850,11 @@ async def terminate_benchmark(
         try:
             full = _full_log_path(bench_id)
             if full.exists():
-                s3_put_file(f"{benchmark_s3_prefix(bench_id)}logs.txt", str(full))
+                async with session_factory()() as s:
+                    _row = await s.get(Benchmark, bench_id)
+                _target = await _bench_s3_target(_row.storage_id if _row else None)
+                _prefix = _row.s3_prefix if _row else benchmark_s3_prefix(bench_id, _target)
+                s3_put_file(f"{_prefix}logs.txt", str(full), target=_target)
         except Exception as e:
             await _push_log(redis, bench_id, f"[gateway] terminate: s3 log upload failed: {e}")
 
@@ -1570,7 +1917,8 @@ async def stream_logs(
     # last-resort fallback for benches that ran before the on-disk tee landed.
     s3_full_log: Optional[str] = None
     if initial_status in ("done", "failed", "cancelled"):
-        s3_full_log = s3_get_text(f"{benchmark_s3_prefix(bench_id)}logs.txt")
+        _target = await _bench_s3_target(b.storage_id)
+        s3_full_log = s3_get_text(f"{b.s3_prefix}logs.txt", target=_target)
     full_log = _full_log_path(bench_id)
 
     async def gen() -> AsyncIterator[bytes]:
@@ -1651,7 +1999,8 @@ async def list_files(
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
     if not user.is_admin and b.owner_id != user.id:
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
-    items = s3_list(b.s3_prefix)
+    target = await _bench_s3_target(b.storage_id)
+    items = s3_list(b.s3_prefix, target=target)
     out: list[FileRecord] = []
     for it in items:
         rel = it["key"][len(b.s3_prefix):] if it["key"].startswith(b.s3_prefix) else it["key"]
@@ -1659,6 +2008,34 @@ async def list_files(
             name=rel or it["key"],
             size=it["size"],
             modified=it["modified"],
-            download_url=s3_presign_get(it["key"]),
+            download_url=s3_presign_get(it["key"], target=target),
         ))
     return out
+
+
+@router.get("/{bench_id}/files/content")
+async def get_file_content(
+    bench_id: str,
+    path: str,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Serve a result file's bytes THROUGH the gateway (same-origin, authed)
+    instead of a presigned S3 URL. The browser can't fetch presigned S3 URLs
+    cross-origin unless the bucket has a CORS policy for the web origin — this
+    endpoint sidesteps that so the results/files tabs work regardless of bucket
+    CORS. `path` is relative to the benchmark's S3 prefix."""
+    b = await session.get(Benchmark, bench_id)
+    if not b:
+        raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
+    if not user.is_admin and b.owner_id != user.id:
+        raise HTTPException(status_code=403, detail={"error": "forbidden"})
+    rel = (path or "").lstrip("/")
+    if not rel or ".." in rel:
+        raise HTTPException(status_code=400, detail={"error": "invalid path"})
+    target = await _bench_s3_target(b.storage_id)
+    txt = s3_get_text(f"{b.s3_prefix}{rel}", target=target)
+    if txt is None:
+        raise HTTPException(status_code=404, detail={"error": "file not found"})
+    media = "application/json" if rel.endswith(".json") else "text/plain; charset=utf-8"
+    return Response(content=txt, media_type=media)

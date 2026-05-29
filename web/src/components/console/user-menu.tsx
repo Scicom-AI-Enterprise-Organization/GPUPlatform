@@ -36,6 +36,13 @@ export function UserMenu({ username }: { username: string }) {
           size="icon"
           className="rounded-full p-0"
           aria-label="Account menu"
+          // Radix derives this trigger's id/aria-controls from useId. Under the
+          // async App Router shell (React 19 + Next 16), the server emits this
+          // client component at a different useId tree-offset than hydration
+          // reproduces, so the generated id mismatches. It's an aria-only id
+          // (menu wiring is via context/refs, not the DOM id) — harmless, so we
+          // suppress the dev-only hydration warning here rather than mask it app-wide.
+          suppressHydrationWarning
         >
           <span className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-600 text-xs font-semibold text-emerald-50">
             {initial}

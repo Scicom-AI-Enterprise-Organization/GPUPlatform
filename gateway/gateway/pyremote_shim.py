@@ -170,8 +170,10 @@ def install() -> None:
         # habit of silently dropping the fd-2 stream — and the real exit
         # code comes back through, so we don't need a sentinel either.
         #
-        # We still inject `--clear` into `uv venv` so re-runs against an
-        # existing ~/.bench-venv don't abort with "already exists".
+        # Inject `--clear` into `uv venv` for a clean rebuild — reusing a venv
+        # left half-installed by an orphaned run gives "No module named
+        # 'requests'" / broken .pth. The setup script kills any leftover venv
+        # process first (below) so --clear isn't blocked by held files.
         def _patched_ssh_run_stream(ssh_client, cmd: str, label: str = "") -> int:
             cmd = cmd.replace("uv venv ", "uv venv --clear ")
             prefix = f"[{label}] " if label else ""
@@ -243,6 +245,21 @@ def install() -> None:
             if key_filename:
                 key_filename = os.path.expanduser(key_filename)
 
+            # User env (incl CUDA_VISIBLE_DEVICES) exported on the VM before
+            # install + benchmark, with absolute-path values mkdir'd. Set by the
+            # gateway under remote.env; stripped from the uploaded config below.
+            user_env = remote_cfg.get("env") or {}
+            env_prefix = ""
+            if user_env:
+                _lines = []
+                for _k, _v in user_env.items():
+                    _vs = str(_v)
+                    _lines.append(f"export {_k}={_shlex.quote(_vs)}")
+                    if _vs.startswith("/"):
+                        _lines.append(f"mkdir -p {_shlex.quote(_vs)}")
+                env_prefix = "\n".join(_lines) + "\n"
+                print(f"[shim] applying {len(user_env)} user env var(s) on remote", flush=True)
+
             def _connect():
                 ssh = paramiko.SSHClient()
                 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -267,6 +284,7 @@ def install() -> None:
             setup_script = (
                 "set -e\n"
                 "export TERM=dumb NO_COLOR=1 UV_NO_PROGRESS=1\n"
+                + env_prefix +
                 # Preflight: stale root-owned ~/.config from a prior run breaks
                 # the uv installer's fish-completion drop. Best-effort repair.
                 'sudo -n chown -R "$USER:$USER" "$HOME/.config" 2>/dev/null || true\n'
@@ -275,9 +293,23 @@ def install() -> None:
                 "    curl -LsSf https://astral.sh/uv/install.sh | sh\n"
                 "fi\n"
                 'export PATH="$HOME/.local/bin:$PATH"\n'
+                # Kill leftover python procs from a prior (gateway-orphaned) run
+                # that still hold this venv open + occupy the GPUs — otherwise
+                # `uv venv --clear` fails ("Directory not empty"). `grep -vw $$`
+                # excludes THIS shell (pgrep -f also matches the script's own
+                # argv, which contains the pattern). Scoped to our `.benchmark-venv`
+                # so it never touches the user's own vLLM/services.
+                'kill -9 $(pgrep -f "/.benchmark-venv/bin/python" 2>/dev/null | grep -vw "$$") 2>/dev/null || true\n'
+                "sleep 1\n"
                 f"uv venv {venv_path} --python {python_version}\n"
                 f"source {venv_path}/bin/activate\n"
                 f'uv pip install "benchmaq[vllm] @ {benchmaq_ref}"{vllm_pin}\n'
+                # huggingface_hub 1.x removed the `huggingface-cli` entrypoint
+                # that benchmaq's model downloader still shells out to ("no
+                # longer works. Use `hf` instead."). Forward it to the new `hf`
+                # CLI — same `download <repo> --local-dir <dir>` argument shape.
+                f'printf \'#!/usr/bin/env bash\\nexec hf "$@"\\n\' > {venv_path}/bin/huggingface-cli\n'
+                f"chmod +x {venv_path}/bin/huggingface-cli\n"
             )
             print()
             print("=" * 64)
@@ -299,21 +331,39 @@ def install() -> None:
             # tries to SSH back to itself through the proxy.
             remote_config = {k: v for k, v in config.items() if k != "remote"}
             config_bytes = yaml.dump(remote_config, default_flow_style=False).encode("utf-8")
+            # Write via an exec channel (base64-pipe), NOT SFTP: some SSH proxies
+            # fronting managed GPU VMs (PAI DSW, TM) don't support the SFTP
+            # subsystem at all — `open_sftp()` fails with "EOF during
+            # negotiation". exec is the only channel type these proxies allow,
+            # and it's what the install step already uses. base64 keeps the
+            # payload to a single safe argv (no quoting/heredoc/newline issues).
+            import base64 as _base64
+            b64 = _base64.b64encode(config_bytes).decode("ascii")
+            write_cmd = (
+                f"mkdir -p \"$(dirname {remote_config_path})\" && "
+                f"printf %s {_shlex.quote(b64)} | base64 -d > {remote_config_path}"
+            )
             ssh = _connect()
             try:
-                with ssh.open_sftp() as sftp:
-                    sftp.putfo(io.BytesIO(config_bytes), remote_config_path)
+                chan = ssh.get_transport().open_session()
+                chan.exec_command(f"bash -c {_shlex.quote(write_cmd)}")
+                up_rc = chan.recv_exit_status()
             finally:
                 ssh.close()
+            if up_rc != 0:
+                raise RuntimeError(f"Remote config upload failed (exit {up_rc})")
 
             run_script = (
                 "set -e\n"
                 "export TERM=dumb NO_COLOR=1\n"
-                # XetHub CAS backend is single-stream serial (~7 MB/s); disabling
-                # it lets hf-transfer's parallel chunked GETs kick in (~140 MB/s).
-                "export HF_HUB_DISABLE_XET=1\n"
+                # Force plain HTTP downloads: disable the Xet CAS backend and the
+                # (now-deprecated) hf_transfer accelerator. Both have caused the
+                # hf download to abort on these VMs; plain HTTP is slower but
+                # reliable.
+                "export HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0\n"
                 'export PATH="$HOME/.local/bin:$PATH"\n'
                 f"source {venv_path}/bin/activate\n"
+                + env_prefix +
                 f"benchmaq bench {remote_config_path}\n"
             )
             print()

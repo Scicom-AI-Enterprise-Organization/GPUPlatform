@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Loader2, RefreshCw } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { AlertTriangle, ChevronDown, ChevronRight, FileText, Loader2, RefreshCw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
@@ -41,6 +42,14 @@ const POLL_MS = 10_000;
 const STORAGE_KEY = (appId: string) => `serverless-ui:workers:${appId}`;
 
 export function WorkersTab({ app }: { app: AppRecord }) {
+  // A multi-model VM endpoint has no RunPod pods — the meaningful unit is the
+  // model fleet (each member's resident/asleep state + GPUs), from the status
+  // endpoint. The RunPod pods table below only applies to cloud endpoints.
+  if (app.mode === "multi") return <MultiModelFleet app={app} />;
+  return <RunpodWorkersTab app={app} />;
+}
+
+function RunpodWorkersTab({ app }: { app: AppRecord }) {
   const [live, setLive] = useState<WorkerRow[] | null>(null);
   const [remembered, setRemembered] = useState<WorkerRow[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -464,6 +473,303 @@ const LEVEL_BADGES: Record<string, string> = {
   warning: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
   error:   "bg-red-500/15 text-red-600 dark:text-red-400",
 };
+
+// ---- Multi-model VM fleet view -------------------------------------------
+
+type FleetModel = {
+  model: string;
+  state: string;        // launching | awake | asleep | dead | …
+  inflight?: number;
+  gpus?: number[];
+  tp?: number;
+  last_used_ts?: number | null;
+  reason?: string | null;  // human cause when state === "dead"
+  port?: number;
+};
+type FleetStatus = { workers: number; models: FleetModel[] };
+
+const FLEET_STATE_STYLES: Record<string, string> = {
+  awake:     "bg-status-active/15 text-status-active",
+  launching: "bg-status-idle/15 text-status-idle",
+  asleep:    "bg-muted text-muted-foreground",
+  dead:      "bg-status-down/15 text-status-down",
+};
+
+function MultiModelFleet({ app }: { app: AppRecord }) {
+  const [status, setStatus] = useState<FleetStatus | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  // Open log panels live in the URL as a comma-joined list (?log=modelA,modelB)
+  // so the set is shareable/deep-linkable and survives the 10s status poll.
+  // Multiple can be open at once; each toggles independently.
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const openLogs = useMemo(
+    () => new Set((searchParams.get("log") ?? "").split(",").filter(Boolean)),
+    [searchParams],
+  );
+  const toggleLog = useCallback(
+    (model: string) => {
+      const next = new Set((searchParams.get("log") ?? "").split(",").filter(Boolean));
+      if (next.has(model)) next.delete(model);
+      else next.add(model);
+      const params = new URLSearchParams(searchParams.toString());
+      if (next.size) params.set("log", Array.from(next).join(","));
+      else params.delete("log");
+      const qs = params.toString();
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+    },
+    [router, pathname, searchParams],
+  );
+
+  const fetchStatus = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await fetch(`/api/proxy/apps/${encodeURIComponent(app.app_id)}/status`, { cache: "no-store" });
+      if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
+      setStatus((await r.json()) as FleetStatus);
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [app.app_id]);
+
+  useEffect(() => {
+    // First poll on mount (matches the RunPod workers tab's pattern in this file).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchStatus();
+    const id = window.setInterval(fetchStatus, POLL_MS);
+    return () => window.clearInterval(id);
+  }, [fetchStatus]);
+
+  // Fall back to the configured members (from the app record) until the worker
+  // reports live state, so the table isn't empty while the fleet boots.
+  const configured: FleetModel[] = (app.models ?? []).map((m) => ({
+    model: m.model, state: "—", tp: m.tp,
+  }));
+  const rows = status?.models?.length ? status.models : configured;
+  const workerUp = (status?.workers ?? 0) > 0;
+
+  return (
+    <Card className="overflow-hidden">
+      <div className="flex items-center justify-between gap-3 border-b border-border bg-muted/30 px-4 py-2 text-xs">
+        <div className="flex items-center gap-3">
+          <span className="text-muted-foreground">
+            VM worker:{" "}
+            <span className={cn("font-medium", workerUp ? "text-status-active" : "text-muted-foreground")}>
+              {workerUp ? "up" : status === null ? "…" : "down"}
+            </span>
+          </span>
+          <span className="text-muted-foreground">
+            <span className="font-mono text-foreground">{rows.length}</span> models
+          </span>
+          <span className="text-muted-foreground">sleep level {app.sleep_level ?? 1}</span>
+        </div>
+        <Button variant="outline" size="xs" onClick={fetchStatus} disabled={loading}>
+          {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+          Refresh
+        </Button>
+      </div>
+      {err && (
+        <div className="border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">{err}</div>
+      )}
+      <CardContent className="px-0 py-0">
+        <table className="w-full text-sm">
+          <thead className="border-b border-border bg-muted/20 text-left text-xs uppercase tracking-wide text-muted-foreground">
+            <tr>
+              <th className="px-4 py-2 font-medium">Model</th>
+              <th className="px-4 py-2 font-medium">State</th>
+              <th className="px-4 py-2 font-medium">GPUs</th>
+              <th className="px-4 py-2 font-medium">TP</th>
+              <th className="px-4 py-2 font-medium">In-flight</th>
+              <th className="px-4 py-2 font-medium text-right">Logs</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((m) => (
+              <FleetModelRow
+                key={m.model}
+                appId={app.app_id}
+                m={m}
+                isOpen={openLogs.has(m.model)}
+                onToggle={() => toggleLog(m.model)}
+              />
+            ))}
+            {rows.length === 0 && (
+              <tr><td colSpan={6} className="px-4 py-12 text-center text-sm text-muted-foreground">
+                {loading ? "Loading fleet…" : "No models reported yet."}
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </CardContent>
+    </Card>
+  );
+}
+
+function FleetModelRow({
+  appId, m, isOpen, onToggle,
+}: { appId: string; m: FleetModel; isOpen: boolean; onToggle: () => void }) {
+  const dead = m.state === "dead";
+  return (
+    <>
+      <tr className={cn("border-b border-border/60 last:border-b-0", dead && "bg-status-down/[0.05]")}>
+        <td className="px-4 py-3 align-top">
+          <div className="font-mono text-xs">{m.model}</div>
+          {m.reason && (
+            // Surface *why* a model isn't serving (e.g. "GPU is not enough")
+            // right under its name — the single most useful thing when dead.
+            <div className="mt-1 flex items-start gap-1 text-[11px] leading-snug text-status-down">
+              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+              <span className="break-words">{m.reason}</span>
+            </div>
+          )}
+        </td>
+        <td className="px-4 py-3 align-top">
+          <span className={cn(
+            "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs",
+            FLEET_STATE_STYLES[m.state] ?? "bg-muted text-muted-foreground",
+          )}>
+            <span className="h-1.5 w-1.5 rounded-full bg-current" />
+            {m.state}
+          </span>
+        </td>
+        <td className="px-4 py-3 align-top font-mono text-xs">{m.gpus?.length ? m.gpus.join(",") : "—"}</td>
+        <td className="px-4 py-3 align-top font-mono text-xs">{m.tp ?? "—"}</td>
+        <td className="px-4 py-3 align-top font-mono text-xs">{m.inflight ?? 0}</td>
+        <td className="px-4 py-3 align-top text-right">
+          <Button
+            variant={isOpen ? "secondary" : dead ? "default" : "outline"}
+            size="xs"
+            onClick={onToggle}
+            aria-expanded={isOpen}
+          >
+            {isOpen ? <ChevronDown className="h-3 w-3" /> : <FileText className="h-3 w-3" />}
+            {isOpen ? "Hide" : "Logs"}
+          </Button>
+        </td>
+      </tr>
+      {isOpen && (
+        <tr className="border-b border-border/60 bg-muted/20">
+          <td colSpan={6} className="px-4 py-3">
+            <ModelLogs appId={appId} model={m.model} onClose={onToggle} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function ModelLogs({ appId, model, onClose }: { appId: string; model: string; onClose: () => void }) {
+  const [lines, setLines] = useState<string[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [autoTail, setAutoTail] = useState(true);
+
+  const fetchLogs = useCallback(async () => {
+    try {
+      const url = `/api/proxy/apps/${encodeURIComponent(appId)}/models/logs?model=${encodeURIComponent(model)}&tail=400`;
+      const r = await fetch(url, { cache: "no-store" });
+      const text = await r.text();
+      if (!r.ok) {
+        let msg = r.statusText;
+        try {
+          const b = JSON.parse(text) as { error?: string; detail?: string };
+          msg = b.error ?? b.detail ?? msg;
+        } catch {
+          if (text) msg = text;
+        }
+        setErr(msg);
+        return;
+      }
+      setErr(null);
+      const body = JSON.parse(text) as { lines?: string[] };
+      setLines(body.lines ?? []);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [appId, model]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchLogs();
+    if (!autoTail) return;
+    const id = window.setInterval(fetchLogs, 2500);
+    return () => window.clearInterval(id);
+  }, [fetchLogs, autoTail]);
+
+  // Auto-tail: keep pinned to the bottom unless the user scrolled up to read.
+  const scrollRef = useRef<HTMLPreElement | null>(null);
+  const wasAtBottomRef = useRef(true);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (wasAtBottomRef.current) el.scrollTop = el.scrollHeight;
+    wasAtBottomRef.current = distance < 32;
+  }, [lines]);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between text-xs text-muted-foreground">
+        <div className="flex items-center gap-2">
+          <span className="font-mono">model = {model}</span>
+          {loading && <Loader2 className="h-3 w-3 animate-spin" />}
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-1 text-[10px]">
+            <input
+              type="checkbox"
+              checked={autoTail}
+              onChange={(e) => setAutoTail(e.target.checked)}
+              className="h-3 w-3"
+            />
+            tail (poll every 2.5s)
+          </label>
+          <Button variant="outline" size="xs" onClick={fetchLogs}>
+            <RefreshCw className="h-3 w-3" />
+          </Button>
+          <Button variant="outline" size="xs" onClick={onClose} aria-label="Close logs" className="text-foreground">
+            <X className="h-3 w-3" />
+            Close
+          </Button>
+        </div>
+      </div>
+
+      {err ? (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          {err}
+        </div>
+      ) : lines.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border bg-background/40 px-3 py-4 text-center text-xs text-muted-foreground">
+          {loading ? "loading…" : "no logs yet — vLLM may still be booting, or this model hasn't launched"}
+        </div>
+      ) : (
+        <pre
+          ref={(el) => { scrollRef.current = el; }}
+          className="terminal-block max-h-80 overflow-auto rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin"
+        >
+          {lines.map((l, i) => (
+            <div key={i}>{l}</div>
+          ))}
+        </pre>
+      )}
+
+      <p className="text-[10px] leading-relaxed text-muted-foreground">
+        Source: this model&apos;s vLLM <code className="font-mono">stdout/stderr</code> on the VM, shipped
+        per-model by the worker-agent log-shipper. Capped at {WORKER_LOGS_CAP_HINT} lines, kept for 1h.
+      </p>
+    </div>
+  );
+}
+
+const WORKER_LOGS_CAP_HINT = "5000";
 
 function EventRow({ event }: { event: GatewayEvent }) {
   const date = new Date(event.ts * 1000);

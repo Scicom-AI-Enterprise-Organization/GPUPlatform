@@ -31,13 +31,16 @@ async def register(gateway_url: str, machine_id: str, app_id: str, token: str) -
     raise RuntimeError("gateway never accepted registration after 30 attempts")
 
 
-async def handle(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/completions") -> Any:
+async def handle(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/completions", base_url: str | None = None) -> Any:
     """Run a unary (non-streaming) request.
 
     `endpoint` is the path on localhost vLLM to POST to. Defaults to the
     legacy /v1/completions; OpenAI-compat /run uses /v1/chat/completions or
     /v1/embeddings. The body is forwarded verbatim — vLLM is OpenAI-shaped
     natively, so the gateway's job is just queue + auth + autoscale.
+
+    `base_url` overrides the target vLLM (multi-model: one server per model on a
+    distinct port); single-mode leaves it None and uses $VLLM_URL.
     """
     if mode == "fake":
         return {
@@ -48,7 +51,7 @@ async def handle(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/c
             "completion": f"[fake response from {model_id}] you sent: {payload}",
         }
     if mode == "vllm":
-        url = os.environ.get("VLLM_URL", "http://localhost:8000")
+        url = base_url or os.environ.get("VLLM_URL", "http://localhost:8000")
         async with httpx.AsyncClient(timeout=300.0) as client:
             try:
                 r = await client.post(f"{url}{endpoint}", json=payload)
@@ -59,7 +62,7 @@ async def handle(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/c
     return {"error": f"unknown WORKER_MODE: {mode}"}
 
 
-async def handle_stream(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/completions"):
+async def handle_stream(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/completions", base_url: str | None = None):
     """Async generator yielding chunks. Final chunk is `{"done": True}`."""
     if mode == "fake":
         # Simulate token-by-token output from a real LLM.
@@ -71,7 +74,7 @@ async def handle_stream(mode: str, model_id: str, payload: dict, endpoint: str =
         return
 
     if mode == "vllm":
-        url = os.environ.get("VLLM_URL", "http://localhost:8000")
+        url = base_url or os.environ.get("VLLM_URL", "http://localhost:8000")
         body = {**payload, "stream": True}
         async with httpx.AsyncClient(timeout=None) as client:
             try:
@@ -102,12 +105,16 @@ async def log_shipper_loop(
     app_id: str,
     log_path: str,
     drain_event: asyncio.Event,
+    source: str | None = None,
 ) -> None:
     """Tail the vLLM stdout file and ship batches to the gateway.
 
     Tracks a byte offset across iterations. If the file is rotated/truncated
     we reset to 0. Failures are logged but never raise — log shipping is
-    best-effort, never block the worker."""
+    best-effort, never block the worker.
+
+    `source`, when set (multi-model: one shipper per member), tags the batch so
+    the gateway buckets logs per model and the UI can show each model's tail."""
     url = f"{gateway_url.rstrip('/')}/workers/logs"
     offset = 0
     leftover = b""
@@ -147,6 +154,8 @@ async def log_shipper_loop(
                             "app_id": app_id,
                             "lines": [b[:MAX_LINE_BYTES].decode("utf-8", errors="replace") for b in batch],
                         }
+                        if source is not None:
+                            body["source"] = source
                         try:
                             await client.post(url, json=body)
                         except httpx.HTTPError as e:
@@ -159,12 +168,29 @@ async def log_shipper_loop(
                 pass
 
 
-async def heartbeat_loop(gateway_url: str, machine_id: str, app_id: str, drain_event: asyncio.Event) -> None:
-    """Heartbeat to gateway every 5s. Set drain_event if gateway tells us to drain."""
+async def heartbeat_loop(
+    gateway_url: str,
+    machine_id: str,
+    app_id: str,
+    drain_event: asyncio.Event,
+    snapshot_fn=None,
+) -> None:
+    """Heartbeat to gateway every 5s. Set drain_event if gateway tells us to drain.
+
+    `snapshot_fn`, when given (multi-model), returns the per-model state list the
+    gateway surfaces in the endpoint status; `status` flips to "loading" until
+    the fleet has finished launching."""
     url = f"{gateway_url.rstrip('/')}/workers/heartbeat"
-    body = {"machine_id": machine_id, "app_id": app_id, "status": "ready"}
     async with httpx.AsyncClient(timeout=5.0) as client:
         while not drain_event.is_set():
+            body = {"machine_id": machine_id, "app_id": app_id, "status": "ready"}
+            if snapshot_fn is not None:
+                try:
+                    models, ready = snapshot_fn()
+                    body["models"] = models
+                    body["status"] = "ready" if ready else "loading"
+                except Exception:
+                    logger.exception("snapshot_fn failed")
             try:
                 r = await client.post(url, json=body)
                 if r.status_code == 200 and r.json().get("drain"):
@@ -206,9 +232,9 @@ async def poll_loop(rdb, queue_key: str, machine_id: str, mode: str, model_id: s
             await asyncio.sleep(1.0)
 
 
-async def _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint="/v1/completions"):
+async def _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint="/v1/completions", base_url=None):
     try:
-        output = await asyncio.wait_for(handle(mode, model_id, payload, endpoint), timeout=timeout_s)
+        output = await asyncio.wait_for(handle(mode, model_id, payload, endpoint, base_url=base_url), timeout=timeout_s)
         result = {"status": "completed", "output": output, "machine_id": machine_id}
     except asyncio.TimeoutError:
         logger.warning("%s timed out after %ss", request_id, timeout_s)
@@ -221,7 +247,7 @@ async def _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeo
     logger.info("wrote result for %s status=%s", request_id, result["status"])
 
 
-async def _run_stream(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint="/v1/completions"):
+async def _run_stream(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint="/v1/completions", base_url=None):
     """Stream with both per-request timeout AND mid-stream cancel."""
     channel = f"stream:{request_id}"
     cancel_key = f"cancel:{request_id}"
@@ -231,7 +257,7 @@ async def _run_stream(rdb, request_id, machine_id, mode, model_id, payload, time
     deadline = asyncio.get_event_loop().time() + timeout_s
 
     try:
-        gen = handle_stream(mode, model_id, payload, endpoint)
+        gen = handle_stream(mode, model_id, payload, endpoint, base_url=base_url)
         while True:
             now = asyncio.get_event_loop().time()
             remaining = deadline - now
@@ -272,7 +298,63 @@ async def _run_stream(rdb, request_id, machine_id, mode, model_id, payload, time
     logger.info("streamed %s status=%s", request_id, status)
 
 
+def _load_config_file() -> None:
+    """When launched over SSH on a VM, the provider drops all env in a JSON file
+    and points WORKER_CONFIG_FILE at it (keeps the big MULTI_MODEL_CONFIG + the
+    registration token off the process arg list). Load it into os.environ
+    without clobbering anything already set in the real environment."""
+    path = os.environ.get("WORKER_CONFIG_FILE")
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        for k, v in (data or {}).items():
+            os.environ.setdefault(str(k), str(v))
+        logger.info("loaded worker config from %s (%d keys)", path, len(data or {}))
+    except Exception:
+        logger.exception("failed to load WORKER_CONFIG_FILE=%s", path)
+
+
+_RESERVED_ENV = {
+    "APP_ID", "MACHINE_ID", "GATEWAY_URL", "WORKER_REDIS_URL", "REGISTRATION_TOKEN",
+    "WORKER_MODE", "MULTI_MODEL_CONFIG", "MULTI_MODEL_CONFIG_PATH", "SLEEP_LEVEL",
+    "TOTAL_GPUS", "WORKER_CONFIG_FILE", "WORKER_ENV_JSON",
+}
+
+
+def _apply_user_env() -> None:
+    """Apply endpoint-level env vars (WORKER_ENV_JSON) to this process so every
+    vLLM subprocess inherits them, and mkdir -p any absolute-path values (HF_HOME,
+    TRITON_CACHE_DIR, …). Reserved control vars can't be overridden.
+
+    CUDA_VISIBLE_DEVICES is intentionally allowed here as a global default, but
+    the multi-model launcher sets it per-model afterwards, so the per-model
+    pinning always wins."""
+    raw = os.environ.get("WORKER_ENV_JSON")
+    if not raw:
+        return
+    try:
+        custom = json.loads(raw)
+    except Exception:
+        logger.exception("failed to parse WORKER_ENV_JSON")
+        return
+    for k, v in (custom or {}).items():
+        if k in _RESERVED_ENV:
+            continue
+        v = str(v)
+        os.environ[k] = v
+        if v.startswith("/"):
+            try:
+                os.makedirs(v, exist_ok=True)
+            except Exception as e:
+                logger.warning("could not mkdir %s=%s: %s", k, v, e)
+    logger.info("applied %d user env var(s)", len(custom or {}))
+
+
 async def main_async() -> None:
+    _load_config_file()
+    _apply_user_env()
     app_id = os.environ.get("APP_ID")
     if not app_id:
         raise SystemExit("APP_ID env var required")
@@ -294,6 +376,11 @@ async def main_async() -> None:
     rdb = redis_async.from_url(redis_url, decode_responses=True)
     drain_event = asyncio.Event()
     log_path = os.environ.get("WORKER_LOG_PATH", "/var/log/vllm.log")
+
+    if mode == "multi":
+        await _run_multi(rdb, app_id, machine_id, gateway_url, drain_event)
+        return
+
     try:
         await rdb.ping()
         hb_task = asyncio.create_task(
@@ -318,6 +405,57 @@ async def main_async() -> None:
                 except (asyncio.CancelledError, BaseException):
                     pass
     finally:
+        await rdb.aclose()
+
+
+async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
+    """WORKER_MODE=multi: launch the vLLM fleet, route jobs by model name, and
+    evict idle models via sleep/wake to fit the GPU budget."""
+    from .multi.config import parse_multi_config
+    from .multi.scheduler import MultiModelScheduler
+    from .multi.dispatch import multi_poll_loop
+    from .multi.launcher import log_path_for
+
+    cfg = parse_multi_config(
+        os.environ.get("MULTI_MODEL_CONFIG"),
+        os.environ.get("MULTI_MODEL_CONFIG_PATH"),
+    )
+    log_dir = os.environ.get("WORKER_LOG_DIR", "/var/log/vllm")
+    sched = MultiModelScheduler(cfg, machine_id, log_dir=log_dir)
+    logger.info("multi mode: %d models, %d GPUs", len(cfg.members), cfg.total_gpus)
+
+    def snapshot():
+        return sched.states_snapshot(), sched.all_ready()
+
+    hb_task = asyncio.create_task(
+        heartbeat_loop(gateway_url, machine_id, app_id, drain_event, snapshot_fn=snapshot)
+    )
+    # One log shipper per member, each tagged with the model's served_name so the
+    # gateway buckets logs per model (the single-file shipper can't — every model
+    # has its own vLLM process + log file).
+    log_tasks = [
+        asyncio.create_task(
+            log_shipper_loop(
+                gateway_url, machine_id, app_id,
+                log_path_for(m, log_dir), drain_event, source=m.served_name,
+            )
+        )
+        for m in cfg.members
+    ]
+    monitor_task = asyncio.create_task(sched.monitor_loop(drain_event))
+    try:
+        await rdb.ping()
+        await sched.start()
+        await multi_poll_loop(rdb, f"queue:{app_id}", machine_id, sched, drain_event)
+    finally:
+        drain_event.set()
+        for t in (hb_task, monitor_task, *log_tasks):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, BaseException):
+                pass
+        await sched.shutdown()
         await rdb.aclose()
 
 

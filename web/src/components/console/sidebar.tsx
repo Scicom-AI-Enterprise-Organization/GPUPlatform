@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { Box, Boxes, CheckSquare, Cloud, FlaskConical, KeyRound, Lock, Plus, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
+import { BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, KeyRound, Lock, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -14,32 +14,24 @@ type Item = {
   locked?: boolean;
   // If set, only render when sections[section] is true.
   section?: "inference" | "benchmark" | "compute";
-  // Inline shortcut rendered to the right of the row — used for
-  // "+ new pod" / "+ new endpoint" style quick-create links so users
-  // don't have to land on the list page first.
-  quickAction?: { href: string; label: string };
 };
 
 const RESOURCES: Item[] = [
   { label: "Serverless Inference", href: "/serverless", icon: Boxes, section: "inference" },
-  {
-    label: "Compute",
-    href: "/compute",
-    icon: Box,
-    section: "compute",
-    quickAction: { href: "/compute/new", label: "New pod" },
-  },
   { label: "Benchmark", href: "/benchmark", icon: FlaskConical, section: "benchmark" },
+  { label: "Compute", href: "/compute", icon: Box, section: "compute" },
+  { label: "GPU Providers", href: "/providers", icon: Cloud },
+  { label: "Storage", href: "/storage", icon: Database },
   { label: "Autotrain", href: "#", icon: Sparkles, locked: true },
 ];
 const ACCOUNT: Item[] = [
-  { label: "API keys", href: "/api-keys", icon: KeyRound },
+  { label: "API tokens", href: "/api-keys", icon: KeyRound },
+  { label: "API docs", href: "/api-docs", icon: BookOpen },
   { label: "Settings", href: "/settings", icon: Settings },
 ];
 const ADMIN: Item[] = [
   { label: "Organization", href: "/organization", icon: Users },
   { label: "Roles", href: "/admin/roles", icon: Shield },
-  { label: "GPU Providers", href: "/providers", icon: Cloud, quickAction: { href: "/providers/new", label: "New provider" } },
   { label: "Audit log", href: "/admin/audit", icon: ScrollText },
 ];
 const MANAGE: Item[] = [
@@ -82,6 +74,9 @@ export function ConsoleSidebar({
     if (href === "/providers") {
       return pathname === "/providers" || pathname.startsWith("/providers/");
     }
+    if (href === "/storage") {
+      return pathname === "/storage" || pathname.startsWith("/storage/");
+    }
     return pathname === href;
   };
 
@@ -101,6 +96,21 @@ export function ConsoleSidebar({
         ))}
       </SidebarGroup>
 
+      {isAdmin && (
+        <SidebarGroup label="Manage" collapsed={collapsed}>
+          {MANAGE.map((item) => (
+            <SidebarItem
+              key={item.label}
+              item={item}
+              active={isActive(item.href)}
+              collapsed={collapsed}
+              onNavigate={closeMobile}
+              badge={BADGES[item.href]}
+            />
+          ))}
+        </SidebarGroup>
+      )}
+
       <SidebarGroup label="Account" collapsed={collapsed}>
         {ACCOUNT.map((item) => (
           <SidebarItem
@@ -114,31 +124,17 @@ export function ConsoleSidebar({
       </SidebarGroup>
 
       {isAdmin && (
-        <>
-          <SidebarGroup label="Manage" collapsed={collapsed}>
-            {MANAGE.map((item) => (
-              <SidebarItem
-                key={item.label}
-                item={item}
-                active={isActive(item.href)}
-                collapsed={collapsed}
-                onNavigate={closeMobile}
-                badge={BADGES[item.href]}
-              />
-            ))}
-          </SidebarGroup>
-          <SidebarGroup label="Admin" collapsed={collapsed}>
-            {ADMIN.map((item) => (
-              <SidebarItem
-                key={item.label}
-                item={item}
-                active={isActive(item.href)}
-                collapsed={collapsed}
-                onNavigate={closeMobile}
-              />
-            ))}
-          </SidebarGroup>
-        </>
+        <SidebarGroup label="Admin" collapsed={collapsed}>
+          {ADMIN.map((item) => (
+            <SidebarItem
+              key={item.label}
+              item={item}
+              active={isActive(item.href)}
+              collapsed={collapsed}
+              onNavigate={closeMobile}
+            />
+          ))}
+        </SidebarGroup>
       )}
     </>
   );
@@ -262,9 +258,6 @@ function SidebarItem({
         className={cn(
           "group flex w-full items-center rounded-md px-2 py-1.5 text-sm transition-colors",
           collapsed ? "justify-center" : "gap-2",
-          // Reserve space on the right so quickAction sits inline without
-          // overlapping the label.
-          !collapsed && item.quickAction && "pr-9",
           active
             ? "bg-sidebar-accent text-sidebar-accent-foreground"
             : "text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground",
@@ -278,17 +271,6 @@ function SidebarItem({
           </span>
         )}
       </Link>
-      {!collapsed && item.quickAction && (
-        <Link
-          href={item.quickAction.href}
-          onClick={onNavigate}
-          aria-label={item.quickAction.label}
-          title={item.quickAction.label}
-          className="absolute right-1.5 top-1/2 inline-flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md border border-border bg-background text-muted-foreground transition-colors hover:border-foreground/40 hover:bg-sidebar-accent/60 hover:text-foreground"
-        >
-          <Plus className="h-3.5 w-3.5" />
-        </Link>
-      )}
     </li>
   );
 }

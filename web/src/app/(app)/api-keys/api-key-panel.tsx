@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Copy, Eye, EyeOff, Loader2, RotateCw } from "lucide-react";
-import { toast } from "sonner";
+import { useCallback, useEffect, useState } from "react";
+import { Check, Copy, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -14,198 +15,239 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { gateway } from "@/lib/gateway";
-import { cn } from "@/lib/utils";
-
-type TokenResponse = {
-  token: string;
-  username: string | null;
-};
+import type { ApiKeyRecord } from "@/lib/types";
 
 export function ApiKeyPanel() {
-  const [data, setData] = useState<TokenResponse | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [reveal, setReveal] = useState(false);
+  const [tokens, setTokens] = useState<ApiKeyRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [rotating, setRotating] = useState(false);
-  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [listErr, setListErr] = useState<string | null>(null);
 
-  useEffect(() => {
-    let abort = false;
-    fetch("/api/auth/token", { cache: "no-store" })
-      .then(async (r) => {
-        const body = await r.json();
-        if (abort) return;
-        if (!r.ok) {
-          setErr(body?.error ?? r.statusText);
-          return;
-        }
-        setData(body);
+  const [name, setName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createErr, setCreateErr] = useState<string | null>(null);
+
+  // Raw token shown once after creation, and the copy-feedback toggle.
+  const [rawDialog, setRawDialog] = useState<{ raw: string; name: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const [confirmRevoke, setConfirmRevoke] = useState<ApiKeyRecord | null>(null);
+  const [revoking, setRevoking] = useState(false);
+
+  const refetch = useCallback((spinner = false) => {
+    if (spinner) setLoading(true);
+    return gateway
+      .listApiKeys()
+      .then((rows) => {
+        setTokens(rows);
+        setListErr(null);
       })
-      .catch((e) => !abort && setErr(e instanceof Error ? e.message : String(e)))
-      .finally(() => !abort && setLoading(false));
+      .catch((e) => setListErr(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  // Initial load — inlined so no setState runs synchronously in the effect body.
+  useEffect(() => {
+    let alive = true;
+    gateway
+      .listApiKeys()
+      .then((rows) => alive && (setTokens(rows), setListErr(null)))
+      .catch((e) => alive && setListErr(e instanceof Error ? e.message : String(e)))
+      .finally(() => alive && setLoading(false));
     return () => {
-      abort = true;
+      alive = false;
     };
   }, []);
 
-  function copy(text: string, label: string) {
-    navigator.clipboard.writeText(text);
-    toast.success(`${label} copied`, { duration: 3000 });
-  }
-
-  async function rotate() {
-    if (!data) return;
-    setConfirmOpen(false);
-    setRotating(true);
+  async function handleCreate() {
+    const trimmed = name.trim();
+    setCreateErr(null);
+    if (!trimmed) return;
+    setCreating(true);
     try {
-      // "Rotate" = invalidate the current session and create a new one. The
-      // simplest path is logout then re-login; the user will need to re-enter
-      // their password. We don't store passwords, so the practical UX here
-      // is: bounce them to /login with a "key rotated" flash.
-      await fetch("/api/auth/logout", { method: "POST" });
-      window.location.href = "/login?next=/api-keys";
+      const created = await gateway.createApiKey(trimmed);
+      setRawDialog({ raw: created.key, name: trimmed });
+      setName("");
+      refetch();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
+      setCreateErr(e instanceof Error ? e.message : String(e));
     } finally {
-      setRotating(false);
+      setCreating(false);
     }
   }
 
-  if (loading) {
-    return (
-      <Card>
-        <CardContent className="flex items-center justify-center px-6 py-12">
-          <Loader2 className="h-4 w-4 animate-spin" />
-        </CardContent>
-      </Card>
-    );
+  async function handleRevoke(t: ApiKeyRecord) {
+    setConfirmRevoke(null);
+    setListErr(null);
+    setRevoking(true);
+    try {
+      await gateway.revokeApiKey(t.id);
+      refetch();
+    } catch (e) {
+      setListErr(e instanceof Error ? e.message : `Failed to revoke "${t.name}"`);
+    } finally {
+      setRevoking(false);
+    }
   }
-  if (err) {
-    return (
-      <Card>
-        <CardContent className="px-6 py-6 text-sm text-destructive">
-          {err}
-        </CardContent>
-      </Card>
-    );
-  }
-  if (!data) return null;
 
-  const masked = data.token.replace(/.(?=.{4})/g, "•");
-  const display = reveal ? data.token : masked;
+  async function copyToken(s: string) {
+    try {
+      await navigator.clipboard?.writeText(s);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard can be blocked in insecure contexts — the user can select
+      // the visible <pre> and copy manually.
+    }
+  }
 
   return (
     <div className="space-y-4">
-      <Card>
-        <CardHeader className="flex-row items-center justify-between space-y-0">
-          <div>
-            <CardTitle className="text-sm font-medium">Default key</CardTitle>
-            <p className="text-xs text-muted-foreground">
-              Tied to your current session
-              {data.username && (
-                <>
-                  {" "}
-                  (<span className="font-mono">{data.username}</span>)
-                </>
-              )}
-              . Logging out invalidates it.
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setReveal((v) => !v)}
-            >
-              {reveal ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-              {reveal ? "Hide" : "Reveal"}
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => copy(data.token, "Token")}>
-              <Copy className="h-4 w-4" />
-              Copy
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setConfirmOpen(true)}
-              disabled={rotating}
-            >
-              {rotating ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <RotateCw className="h-4 w-4" />
-              )}
-              Rotate
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <pre
-            className={cn(
-              "overflow-x-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-sm scrollbar-thin",
-              !reveal && "select-none",
-            )}
-          >
-            {display}
-          </pre>
-        </CardContent>
-      </Card>
-
+      {/* Create */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-sm font-medium">Use it</CardTitle>
+          <CardTitle className="text-base">Create a new token</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-3">
-          <Snippet
-            label="cURL"
-            code={`curl -X POST '${gateway.baseUrl}/v1/chat/completions' \\
-  -H 'Content-Type: application/json' \\
-  -H 'Authorization: Bearer YOUR_API_KEY' \\
-  -d '{
-    "model": "<your-endpoint-name>",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'`}
-          />
-          <Snippet
-            label="Python (OpenAI SDK)"
-            code={`from openai import OpenAI
-
-client = OpenAI(
-    base_url="${gateway.baseUrl}/v1",
-    api_key="YOUR_API_KEY",
-)
-
-resp = client.chat.completions.create(
-    model="<your-endpoint-name>",
-    messages=[{"role": "user", "content": "Hello"}],
-)
-print(resp.choices[0].message.content)`}
-          />
+        <CardContent className="space-y-2">
+          <div className="flex flex-wrap gap-2">
+            <Input
+              placeholder="e.g. ci-bot, laptop, airflow-prod"
+              value={name}
+              onChange={(e) => {
+                setName(e.target.value);
+                setCreateErr(null);
+              }}
+              onKeyDown={(e) => e.key === "Enter" && handleCreate()}
+              className="max-w-sm"
+            />
+            <Button onClick={handleCreate} disabled={creating || !name.trim()}>
+              {creating ? "Creating…" : "Create"}
+            </Button>
+          </div>
+          {createErr && <p className="text-xs text-destructive">{createErr}</p>}
+          <p className="text-xs text-muted-foreground">
+            A token inherits your role + section access — it can do whatever you can. The raw
+            token is shown exactly once, so copy it now.
+          </p>
         </CardContent>
       </Card>
 
-      <p className="text-xs text-muted-foreground">
-        Multi-key support (named keys, separate revoke, last-used timestamps) needs a small gateway
-        change. Today, your bearer token <em>is</em> your session — rotate by signing out and back in.
-      </p>
+      {/* List */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Your tokens</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {listErr && <p className="mb-2 text-xs text-destructive">{listErr}</p>}
+          {loading ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : tokens.length === 0 ? (
+            <p className="text-sm text-muted-foreground">You don&apos;t have any tokens yet.</p>
+          ) : (
+            <div className="overflow-hidden rounded-md border border-border">
+              <table className="w-full text-sm">
+                <thead className="bg-muted/40 text-xs uppercase text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-medium">Name</th>
+                    <th className="px-3 py-2 text-left font-medium">Prefix</th>
+                    <th className="px-3 py-2 text-left font-medium">Created</th>
+                    <th className="px-3 py-2 text-left font-medium">Last used</th>
+                    <th className="px-3 py-2 text-left font-medium">Status</th>
+                    <th className="px-3 py-2 text-right font-medium">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {tokens.map((t) => (
+                    <tr key={t.id}>
+                      <td className="px-3 py-2 font-medium">{t.name}</td>
+                      <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{t.prefix}…</td>
+                      <td className="px-3 py-2 text-xs text-muted-foreground">
+                        <span suppressHydrationWarning>{fmtDate(t.created_at)}</span>
+                      </td>
+                      <td className="px-3 py-2 text-xs text-muted-foreground">
+                        {t.last_used_at ? (
+                          <span suppressHydrationWarning>{fmtDate(t.last_used_at)}</span>
+                        ) : (
+                          "never"
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        <Badge className="border-transparent bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200">
+                          active
+                        </Badge>
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          title="Revoke"
+                          disabled={revoking}
+                          onClick={() => setConfirmRevoke(t)}
+                        >
+                          <Trash2 className="h-4 w-4 text-destructive" />
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
-      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-        <DialogContent className="sm:max-w-md">
+      {/* Raw-token one-shot dialog */}
+      <Dialog
+        open={!!rawDialog}
+        onOpenChange={(o) => {
+          if (!o) {
+            setRawDialog(null);
+            setCopied(false);
+          }
+        }}
+      >
+        <DialogContent>
           <DialogHeader>
-            <DialogTitle>Rotate API key?</DialogTitle>
+            <DialogTitle>New token — {rawDialog?.name}</DialogTitle>
             <DialogDescription>
-              The current key stops working immediately. Anything still using it
-              (CI jobs, scripts, SDK clients) will start receiving 401 until you
-              update them with the new token.
+              Copy this now. We never show the raw token again — only a prefix for identification.
+            </DialogDescription>
+          </DialogHeader>
+          <pre className="break-all rounded-md border border-border bg-muted p-3 font-mono text-xs">
+            {rawDialog?.raw}
+          </pre>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => copyToken(rawDialog?.raw ?? "")} aria-live="polite">
+              {copied ? (
+                <>
+                  <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" /> Copied
+                </>
+              ) : (
+                <>
+                  <Copy className="h-3.5 w-3.5" /> Copy
+                </>
+              )}
+            </Button>
+            <Button onClick={() => setRawDialog(null)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Revoke confirm */}
+      <Dialog open={!!confirmRevoke} onOpenChange={(o) => !o && setConfirmRevoke(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Revoke {confirmRevoke?.name}?</DialogTitle>
+            <DialogDescription>
+              Any script using this token starts getting <code>401 Unauthorized</code> immediately.
+              This can&apos;t be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirmOpen(false)}>
+            <Button variant="outline" onClick={() => setConfirmRevoke(null)}>
               Cancel
             </Button>
-            <Button variant="destructive" onClick={rotate}>
-              <RotateCw className="h-4 w-4" />
-              Rotate now
+            <Button variant="destructive" onClick={() => confirmRevoke && handleRevoke(confirmRevoke)}>
+              Revoke
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -214,26 +256,8 @@ print(resp.choices[0].message.content)`}
   );
 }
 
-function Snippet({ label, code }: { label: string; code: string }) {
-  return (
-    <div>
-      <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className="relative">
-        <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed scrollbar-thin">
-          {code}
-        </pre>
-        <Button
-          variant="outline"
-          size="icon-xs"
-          className="absolute right-2 top-2"
-          onClick={() => {
-            navigator.clipboard.writeText(code);
-            toast.success("Snippet copied", { duration: 3000 });
-          }}
-        >
-          <Copy className="h-3 w-3" />
-        </Button>
-      </div>
-    </div>
-  );
+function fmtDate(iso: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }

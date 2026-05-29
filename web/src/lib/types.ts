@@ -6,6 +6,16 @@ export type AutoscalerSpec = {
   idle_timeout_s: number;
 };
 
+// A model served by a multi-model endpoint. `model` is the HuggingFace id and
+// doubles as the served-model-name clients send in the OpenAI `model` field.
+export type MultiModelMember = {
+  model: string;
+  tp: number;          // tensor-parallel size = GPUs this model needs
+  extra_args: string;  // per-model vLLM CLI args
+};
+
+export type ServingMode = "single" | "multi";
+
 export type AppRecord = {
   app_id: string;
   name: string;
@@ -21,13 +31,21 @@ export type AppRecord = {
   cloud_type?: "COMMUNITY" | "SECURE" | null;
   container_disk_gb?: number | null;
   volume_gb?: number | null;
+  provider_id?: string | null;
+  mode?: ServingMode;
+  models?: MultiModelMember[] | null;
+  sleep_level?: number;
+  env_vars?: Record<string, string> | null;
+  visible_devices?: string | null;
+  venv_path?: string | null;
+  vllm_version?: string | null;
   created_at: string;
   owner: string;
 };
 
 export type CreateAppRequest = {
   name: string;
-  model: string;
+  model?: string;
   gpu: string;
   gpu_count?: number;
   autoscaler?: Partial<AutoscalerSpec>;
@@ -40,6 +58,16 @@ export type CreateAppRequest = {
   container_disk_gb?: number;
   volume_gb?: number;
   provider_id?: string | null;
+  mode?: ServingMode;
+  models?: MultiModelMember[];
+  sleep_level?: number;
+  env_vars?: Record<string, string>;
+  // VM-only GPU pin, e.g. "0,1,2,3". Empty/omitted = all the VM's GPUs.
+  visible_devices?: string | null;
+  // VM-only: uv venv the worker runs `vllm serve` from, e.g. "/share/vllm-venv".
+  venv_path?: string | null;
+  // VM-only: pin vLLM to this version in venv_path, e.g. "0.19.1".
+  vllm_version?: string | null;
 };
 
 export type CreateAppResponse = {
@@ -76,6 +104,18 @@ export type Me = {
   username: string;
 };
 
+// ---- API keys (long-lived, revocable bearer tokens) ----
+export type ApiKeyRecord = {
+  id: string;
+  name: string;
+  prefix: string;
+  created_at: string;
+  last_used_at?: string | null;
+};
+
+// The create response additionally carries the full plaintext key — shown once.
+export type CreateApiKeyResponse = ApiKeyRecord & { key: string };
+
 // ---- Benchmarks ----
 
 export type BenchmarkRecord = {
@@ -93,15 +133,26 @@ export type BenchmarkRecord = {
   ended_at?: string | null;
   cost_per_hr?: number | null;
   provider_id?: string | null;
+  storage_id?: string | null;
+  env_vars?: Record<string, string> | null;
+  visible_devices?: string | null;
 };
 
 export type CreateBenchmarkRequest = {
   name: string;
   config_yaml: string;
   provider_id?: string | null;
+  // Storage backend (Storage row, kind=s3) for logs + result files. Required
+  // by the form.
+  storage_id?: string | null;
   // VM runs only: rm -rf the model's local_dir + HF hub cache on the VM after
   // the run exits. Default true on the UI side.
   cleanup_model?: boolean;
+  // Extra env exported for the run (cache/home dirs, etc.). Absolute-path
+  // values are mkdir -p'd on the VM; RunPod runs pass these to the pod.
+  env_vars?: Record<string, string>;
+  // CUDA_VISIBLE_DEVICES pin, e.g. "0,1,2,3". Empty = all GPUs.
+  visible_devices?: string;
 };
 
 export type BenchmarkFile = {
@@ -251,6 +302,55 @@ export type ProviderRecord = {
   ssh_pub?: string | null;
   validated_at?: string | null;
   account_email?: string | null;
+};
+
+// ---- Storage backends (S3 / HuggingFace destinations the platform writes to) ----
+export type StorageKind = "s3" | "huggingface";
+
+export type StorageRecord = {
+  id: string;
+  name: string;
+  kind: StorageKind;
+  bucket?: string | null;
+  prefix?: string | null;
+  region?: string | null;
+  endpoint?: string | null;
+  has_credentials: boolean;
+  enabled: boolean;
+  notes?: string | null;
+  created_at: string;
+  created_by: string;
+};
+
+export type CreateStorageRequest = {
+  name: string;
+  kind: StorageKind;
+  bucket?: string | null;
+  prefix?: string | null;
+  region?: string | null;
+  endpoint?: string | null;
+  access_key_id?: string | null;
+  secret_access_key?: string | null;
+  hf_token?: string | null;
+  notes?: string | null;
+  enabled?: boolean;
+};
+
+export type UpdateStorageRequest = Partial<Omit<CreateStorageRequest, "kind">>;
+
+export type TestStorageRequest = {
+  kind: StorageKind;
+  bucket?: string | null;
+  region?: string | null;
+  endpoint?: string | null;
+  access_key_id?: string | null;
+  secret_access_key?: string | null;
+  hf_token?: string | null;
+};
+
+export type TestStorageResponse = {
+  ok: boolean;
+  message: string;
 };
 
 export type VmConfigInput = {
