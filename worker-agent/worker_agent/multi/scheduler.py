@@ -79,6 +79,9 @@ class MultiModelScheduler:
         self._python_exe = f"{cfg.venv_path}/bin/python" if cfg.venv_path else "python3"
         self._client = httpx.AsyncClient(timeout=None)
         self._cond = asyncio.Condition()
+        # Serializes GPU-memory-mutating work (load, wake, evict) so a launch and
+        # a swap can never run at once and double-allocate the same GPUs.
+        self._gpu_lock = asyncio.Lock()
         self._runtimes: list[ModelRuntime] = [ModelRuntime(m) for m in cfg.members]
         for rt in self._runtimes:
             rt.log_path = launcher.log_path_for(rt.member, self.log_dir)
@@ -181,11 +184,7 @@ class MultiModelScheduler:
             if rt.gpus & held:
                 continue  # GPUs already taken by a chosen resident
             try:
-                await vllm_ctl.wake_model(self._client, rt.base_url, rt.member.sleep_level)
-                async with self._cond:
-                    rt.state = ModelState.AWAKE
-                    rt.last_used = time.time()
-                    self._cond.notify_all()
+                await self._wake(rt)
                 held |= rt.gpus
                 logger.info("resident: %s on gpus %s", rt.member.model, sorted(rt.gpus))
             except Exception:
@@ -194,19 +193,25 @@ class MultiModelScheduler:
     async def _launch_and_sleep(self, rt: ModelRuntime) -> None:
         try:
             rt.reason = None  # clear any stale cause from a prior attempt
-            rt.proc = await launcher.launch_member(rt.member, self.log_dir, self._python_exe)
-            ok = await launcher.wait_health(self._client, rt.member, rt.proc, log_path=rt.log_path)
-            if not ok:
-                # Kill the failed/hung engine so it can't leak and keep holding
-                # GPU/CPU after we give up on it.
-                await launcher.terminate(rt.proc)
+            async with self._gpu_lock:
+                # Free rt's GPUs before loading: sleep any AWAKE model that shares
+                # them, or the load OOMs against a resident (e.g. relaunching a
+                # 2,3 model while Mistral holds 0,1,2,3). At initial startup this
+                # is a no-op since nothing is awake yet.
+                await self._evict_overlapping(rt)
+                rt.proc = await launcher.launch_member(rt.member, self.log_dir, self._python_exe)
+                ok = await launcher.wait_health(self._client, rt.member, rt.proc, log_path=rt.log_path)
+                if not ok:
+                    # Kill the failed/hung engine so it can't leak and keep holding
+                    # GPU/CPU after we give up on it.
+                    await launcher.terminate(rt.proc)
+                    async with self._cond:
+                        self._mark_dead(rt)
+                    return
+                await vllm_ctl.sleep_model(self._client, rt.base_url, rt.member.sleep_level)
                 async with self._cond:
-                    self._mark_dead(rt)
-                return
-            await vllm_ctl.sleep_model(self._client, rt.base_url, rt.member.sleep_level)
-            async with self._cond:
-                rt.state = ModelState.ASLEEP
-                self._cond.notify_all()
+                    rt.state = ModelState.ASLEEP
+                    self._cond.notify_all()
         except Exception:
             logger.exception("launch_and_sleep failed for %s", rt.member.model)
             await launcher.terminate(rt.proc)
@@ -255,35 +260,52 @@ class MultiModelScheduler:
 
     # ---- the swap (LRU-drain eviction → wake) -----------------------------
 
-    async def _swap_to(self, rt: ModelRuntime) -> None:
-        try:
+    async def _evict_overlapping(self, rt: ModelRuntime) -> None:
+        """Drain + sleep every AWAKE model whose GPUs overlap rt's, so rt's GPUs
+        are free to load into or wake into. Caller MUST hold _gpu_lock."""
+        async with self._cond:
+            needed = rt.gpus
+            victims = sorted(
+                [r for r in self._runtimes
+                 if r is not rt and r.state == ModelState.AWAKE and (r.gpus & needed)],
+                key=lambda r: r.last_used,  # LRU first
+            )
+            for v in victims:
+                v.state = ModelState.DRAINING
+            self._cond.notify_all()
+        for v in victims:
+            await self._drain(v)
             async with self._cond:
-                rt.state = ModelState.WAKING
-                needed = rt.gpus
-                victims = sorted(
-                    [r for r in self._runtimes
-                     if r is not rt and r.state == ModelState.AWAKE and (r.gpus & needed)],
-                    key=lambda r: r.last_used,  # LRU first
-                )
-                for v in victims:
-                    v.state = ModelState.DRAINING
+                v.state = ModelState.SLEEPING
+                self._cond.notify_all()
+            await vllm_ctl.sleep_model(self._client, v.base_url, v.member.sleep_level)
+            async with self._cond:
+                v.state = ModelState.ASLEEP
                 self._cond.notify_all()
 
-            for v in victims:
-                await self._drain(v)
-                async with self._cond:
-                    v.state = ModelState.SLEEPING
+    async def _wake(self, rt: ModelRuntime) -> None:
+        """Free rt's GPUs (sleeping overlapping awake models) then wake rt. Holds
+        the GPU lock so it can't race a concurrent load/swap. Used by both the
+        on-demand swap and the startup resident warm-up."""
+        async with self._gpu_lock:
+            async with self._cond:
+                if rt.state == ModelState.AWAKE:
+                    rt.swapping = False
                     self._cond.notify_all()
-                await vllm_ctl.sleep_model(self._client, v.base_url, v.member.sleep_level)
-                async with self._cond:
-                    v.state = ModelState.ASLEEP
-                    self._cond.notify_all()
-
+                    return
+                rt.state = ModelState.WAKING
+                self._cond.notify_all()
+            await self._evict_overlapping(rt)
             await vllm_ctl.wake_model(self._client, rt.base_url, rt.member.sleep_level)
             async with self._cond:
                 rt.state = ModelState.AWAKE
+                rt.last_used = time.time()
                 rt.swapping = False
                 self._cond.notify_all()
+
+    async def _swap_to(self, rt: ModelRuntime) -> None:
+        try:
+            await self._wake(rt)
         except Exception:
             logger.exception("swap_to %s failed", rt.member.model)
             async with self._cond:
@@ -352,23 +374,13 @@ class MultiModelScheduler:
         return all(rt.state != ModelState.LAUNCHING for rt in self._runtimes)
 
     async def shutdown(self) -> None:
-        for rt in self._runtimes:
-            proc = rt.proc
-            if proc is None or proc.returncode is not None:
-                continue
-            try:
-                proc.send_signal(signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        await asyncio.sleep(3.0)
-        for rt in self._runtimes:
-            proc = rt.proc
-            if proc is None or proc.returncode is not None:
-                continue
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+        # Group-kill each engine so its tp worker children (VLLM::Worker_TP) and
+        # EngineCore die too — signalling only the api_server (rt.proc) orphans
+        # them, leaving GPU-hogging processes behind after a drain/delete.
+        await asyncio.gather(
+            *(launcher.terminate(rt.proc) for rt in self._runtimes if rt.proc is not None),
+            return_exceptions=True,
+        )
         try:
             await self._client.aclose()
         except Exception:

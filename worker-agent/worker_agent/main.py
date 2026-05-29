@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import uuid
 from typing import Any
 
@@ -396,6 +397,16 @@ async def main_async() -> None:
 
     rdb = redis_async.from_url(redis_url, decode_responses=True)
     drain_event = asyncio.Event()
+    # Drain gracefully on SIGTERM/SIGINT so the `finally` runs sched.shutdown(),
+    # which group-kills every vLLM engine + its tp workers. Without this, the
+    # provider terminating the worker (SIGTERM) skips cleanup and the engines
+    # orphan, holding GPU ("vllm worker still in top" after a delete).
+    try:
+        loop = asyncio.get_running_loop()
+        for _sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(_sig, drain_event.set)
+    except (NotImplementedError, RuntimeError):
+        pass  # add_signal_handler unsupported on this platform — best effort
     log_path = os.environ.get("WORKER_LOG_PATH", "/var/log/vllm.log")
 
     if mode == "multi":

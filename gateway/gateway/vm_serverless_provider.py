@@ -312,6 +312,13 @@ class VMProvider(Provider):
                 f"  sleep 2; kill -KILL $PID 2>/dev/null || true; "
                 f"fi; "
                 f"pkill -9 -f {cfg_tag} 2>/dev/null || true; "
+                # The worker launches each vLLM in its OWN session (start_new_session),
+                # so the engines are NOT in the worker's process group and survive the
+                # kill above — orphaned, still holding GPU. Kill them by name too:
+                # the renamed tp workers/engine (VLLM::*) and the api_server. (One
+                # multi-model endpoint per VM, so this won't touch another tenant.)
+                f"pkill -9 -f 'VLLM::' 2>/dev/null || true; "
+                f"pkill -9 -f 'vllm.entrypoints.openai.api_server' 2>/dev/null || true; "
                 f"rm -f {pid_path}; true"
             )
             self._run(client, f"bash -lc {shlex.quote(script)}")

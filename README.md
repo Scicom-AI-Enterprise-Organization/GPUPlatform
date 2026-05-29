@@ -93,6 +93,62 @@ Both are gitignored — templates live next to them as `.env.example`.
 
 **Why no real GPU locally?** Real provisioning (`PROVIDER=runpod` / `=pi`) spawns a pod on the provider's network that has to phone home to your gateway + Redis. `localhost` isn't reachable from the public internet. For real workers, deploy the gateway to k8s — see [docs/DEPLOY.md](docs/DEPLOY.md).
 
+## Testing
+
+### JS unit tests (gateway API layer)
+
+The web client's API calls are covered by [vitest](https://vitest.dev) specs that assert creating serverless endpoints and SSH/VM benchmarks produces the exact request the gateway expects. The network and the `sgpu_token` cookie → `Bearer` auth are mocked, so **no live gateway and no API key are needed**:
+
+```bash
+cd web
+npm install
+npm test            # run once
+npm run test:watch  # watch mode
+```
+
+Specs live under `web/src/**/*.test.ts`:
+
+| Spec | Covers |
+|---|---|
+| `src/lib/benchmark-ssh.test.ts` | SSH/VM benchmark create — replicates a 16-cell vLLM sweep pinned to chosen GPUs (`visible_devices`) — plus the get / list / rename / terminate / delete / files routes |
+| `src/lib/__tests__/create-inference.test.ts` | Multi-model VM serverless endpoint create |
+| `src/app/(app)/serverless/__tests__/deploy-endpoint.test.ts` | Endpoint deploy flow |
+
+### Running a real benchmark via the API (with an API key)
+
+The same request the SSH-benchmark spec asserts can be fired at a live gateway with a real key — an end-to-end "battle test" on actual GPUs.
+
+1. **Mint a key** on the **API tokens** page in the UI (or `POST /api-keys`). It's shown once; prefix `sgpu_`.
+2. **Find your VM provider + storage ids** — `GET /v1/providers` (a `kind: vm` SSH box) and `GET /v1/storage` (an enabled `s3` backend).
+3. **Create the benchmark** — pin it to specific GPUs with `visible_devices` (this becomes `CUDA_VISIBLE_DEVICES` on the VM; the count is the tensor-parallel size). The gateway rewrites the `remote:` block to run on the registered VM over SSH.
+
+```bash
+export SGPU_API_KEY=sgpu_...            # your key
+export SGPU_URL=http://localhost:8080
+
+# config_yaml is the benchmaq YAML the New-Benchmark form produces; the easiest
+# way to get a real one is to copy the `config_yaml` field of an existing run
+# (GET /benchmarks/<id>) and tweak it. Minimal one-cell example below.
+curl -s -X POST "$SGPU_URL/benchmarks" \
+  -H "Authorization: Bearer $SGPU_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "battletest-gpu67",
+    "provider_id": "prov-xxxx",
+    "storage_id":  "store-xxxx",
+    "visible_devices": "6,7",
+    "cleanup_model": false,
+    "config_yaml": "remote:\n  uv: {path: ~/.benchmark-venv, python_version: \"3.11\"}\n  dependencies: [vllm==0.19.1, huggingface_hub, hf_transfer]\nbenchmark:\n- name: bt\n  engine: vllm\n  model: {repo_id: qwen/qwen3.6-27b, local_dir: ~/models/qwen3p6-27b}\n  serve: {tensor_parallel_size: 2, port: 18017}\n  bench:\n  - {endpoint: /v1/completions, dataset_name: random, random_input_len: 128, random_output_len: 128, num_prompts: 50, max_concurrency: 50}\n  results: {save_result: true}"
+  }'
+# → {"id":"bench-...","status":"queued"}
+
+# Poll status + stream the log tail:
+curl -s -H "Authorization: Bearer $SGPU_API_KEY" "$SGPU_URL/benchmarks/<id>"
+curl -s -H "Authorization: Bearer $SGPU_API_KEY" "$SGPU_URL/benchmarks/<id>/logs?tail=200"
+```
+
+A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `result.json` to your S3 storage (readable in the UI **Results** / **Compare** tabs). Same key works for the serverless (`/run/{app}`, `/v1/chat/completions`), compute, and storage APIs.
+
 ## Auth, RBAC, and admin
 
 - **GitHub SSO** at `/auth/github/upsert`, plus password login at `/auth/login`. `AUTH_DISABLED=1` short-circuits to `admin/admin` for local dev.

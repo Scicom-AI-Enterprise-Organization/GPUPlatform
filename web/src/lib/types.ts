@@ -75,6 +75,39 @@ export type CreateAppResponse = {
   url: string;
 };
 
+// ---- OpenAI-compatible inference (request a specific model) ----
+
+export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+export type ChatCompletionRequest = {
+  // For a multi-model endpoint this is the member model name the gateway routes
+  // by (e.g. "Qwen/Qwen3.6-27B"); for a single endpoint it's the endpoint name.
+  model: string;
+  messages: ChatMessage[];
+  max_tokens?: number;
+  temperature?: number;
+  reasoning_effort?: "low" | "medium" | "high";
+  chat_template_kwargs?: Record<string, unknown>;
+  stream?: boolean;
+};
+
+export type ChatCompletionResponse = {
+  id: string;
+  object: string;
+  model: string;
+  choices: {
+    index: number;
+    message: { role: string; content: string | null; reasoning_content?: string | null };
+    finish_reason: string | null;
+  }[];
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+};
+
+export type ModelsListResponse = {
+  object: "list";
+  data: { id: string; object: "model"; created: number; owned_by: string }[];
+};
+
 // Worker types are not exposed by the gateway directly today — mock data
 // shapes matching what the dashboard renders.
 export type WorkerStatus = "idle" | "running" | "initializing" | "throttled" | "down";

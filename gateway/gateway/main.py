@@ -1672,6 +1672,46 @@ async def _admit_and_enqueue(
             status_code=429,
             detail={"error": "capacity exceeded", "queue_length": queue_len, "cap": cap, "retry_after_s": 5},
         )
+    # Multi-model fleets only serve once every member has finished loading and gone
+    # to sleep (the worker's warm-up runs before its request dispatcher starts).
+    # Fail fast with a precise reason instead of letting the request sit in the
+    # queue until the sync timeout: warming-up, a dead member, or no worker yet.
+    if (getattr(app, "mode", "single") or "single") == "multi":
+        target = target_model or (payload.get("model") if isinstance(payload, dict) else None)
+        workers = await rdb.smembers(f"worker_index:{app_id}")
+        live = [m for m in workers if await rdb.exists(f"worker:{m}")]
+        if not live:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "no worker is up yet — the endpoint is still provisioning. Retry shortly.", "state": "provisioning"},
+            )
+        mid = live[0]
+        try:
+            wstate = json.loads(await rdb.get(f"worker:{mid}") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            wstate = {}
+        try:
+            models_state = json.loads(await rdb.get(f"worker:{mid}:models") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            models_state = []
+        tinfo = next((m for m in models_state if m.get("model") == target), None) if target else None
+        if tinfo and tinfo.get("state") == "dead":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": f"model '{target}' is not running (dead) — restart it from the Workers tab.",
+                    "state": "dead", "model": target, "reason": tinfo.get("reason"),
+                },
+            )
+        if wstate.get("status") and wstate.get("status") != "ready":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "the model fleet is still warming up — every model must finish loading and go to sleep before any can serve. Retry shortly.",
+                    "state": "warming_up",
+                    "models": [{"model": m.get("model"), "state": m.get("state")} for m in models_state],
+                },
+            )
     request_id = f"req-{uuid.uuid4().hex[:12]}"
     timeout_s = int(app.request_timeout_s)
     job = {
@@ -2121,6 +2161,30 @@ async def openai_embeddings(
 ):
     payload.pop("stream", None)
     return await _openai_endpoint(request, session, user, payload, "/v1/embeddings")
+
+
+@app.get("/v1/models")
+async def openai_list_models(session: AsyncSession = Depends(get_session)):
+    """OpenAI-compatible model list. Public (no auth) — pure model discovery.
+    Lists every servable model id across all endpoints: multi-model members +
+    single endpoint names (what clients send in the `model` field)."""
+    from sqlalchemy import select
+
+    rows = (await session.execute(select(App))).scalars().all()
+    data: list[dict] = []
+    seen: set[str] = set()
+    for a in rows:
+        created = int(a.created_at.timestamp()) if a.created_at else 0
+        if (getattr(a, "mode", "single") or "single") == "multi":
+            for m in (a.models or []):
+                mid = m.get("model")
+                if mid and mid not in seen:
+                    seen.add(mid)
+                    data.append({"id": mid, "object": "model", "created": created, "owned_by": a.app_id})
+        elif a.app_id not in seen:
+            seen.add(a.app_id)
+            data.append({"id": a.app_id, "object": "model", "created": created, "owned_by": a.app_id})
+    return {"object": "list", "data": data}
 
 
 # ----- workers (machine auth, not user auth) -----

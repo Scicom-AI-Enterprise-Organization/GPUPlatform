@@ -22,6 +22,9 @@ import type {
   RunpodTemplateSearchResult,
   CreateAppRequest,
   CreateAppResponse,
+  ChatCompletionRequest,
+  ChatCompletionResponse,
+  ModelsListResponse,
   CreateBenchmarkRequest,
   CreateComputeRequest,
   CreateProviderRequest,
@@ -141,6 +144,19 @@ export const gateway = {
   },
   getAppStatus: (id: string) =>
     request<AppStatus>(`/apps/${encodeURIComponent(id)}/status`),
+
+  // ---- inference (OpenAI-compatible) ----
+  /** Send a chat-completion to a specific model. For a multi-model endpoint,
+   * `body.model` is the member model the gateway routes/wakes (e.g.
+   * "Qwen/Qwen3.6-27B"). Returns the completion synchronously (gateway polls
+   * internally up to 60s); a dead/warming member surfaces as a GatewayError. */
+  chatCompletion: (body: ChatCompletionRequest) =>
+    request<ChatCompletionResponse>("/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Public model-discovery list (every model id usable in the `model` field). */
+  listModels: () => request<ModelsListResponse>("/v1/models"),
 
   // ---- API keys ----
   listApiKeys: () => request<ApiKeyRecord[]>("/api-keys"),

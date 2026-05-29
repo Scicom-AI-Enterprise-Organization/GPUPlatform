@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { ChevronDown, ChevronRight, Copy, Loader2, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -45,10 +46,26 @@ const BUCKET_TONE: Record<Bucket, string> = {
 };
 
 export function QueueTab({ app }: { app: AppRecord }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [data, setData] = useState<QueueResponse | null>(null);
   const [err, setErr] = useState<{ msg: string; hint?: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState<Bucket | "all">("all");
+
+  // Clicking a request id deep-links it via ?req=<id> (shareable). Clicking the
+  // same id again clears it.
+  const selectedReq = searchParams.get("req") ?? "";
+  const selectReq = useCallback(
+    (id: string) => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (params.get("req") === id) params.delete("req");
+      else params.set("req", id);
+      router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+    },
+    [router, pathname, searchParams],
+  );
 
   const fetchQueue = useCallback(async () => {
     setLoading(true);
@@ -162,7 +179,13 @@ export function QueueTab({ app }: { app: AppRecord }) {
           </thead>
           <tbody>
             {filtered.map((it) => (
-              <Row key={it.request_id} item={it} position={queuePositions.get(it.request_id)} />
+              <Row
+                key={it.request_id}
+                item={it}
+                position={queuePositions.get(it.request_id)}
+                selected={it.request_id === selectedReq}
+                onSelect={selectReq}
+              />
             ))}
             {data && filtered.length === 0 && (
               <tr>
@@ -192,38 +215,63 @@ export function QueueTab({ app }: { app: AppRecord }) {
   );
 }
 
-function Row({ item, position }: { item: Item; position?: number }) {
-  const [open, setOpen] = useState(false);
+function Row({
+  item,
+  position,
+  selected,
+  onSelect,
+}: {
+  item: Item;
+  position?: number;
+  selected: boolean;
+  onSelect: (id: string) => void;
+}) {
+  // Deep-linked row (?req=<id>) starts expanded; clicking the id also opens it.
+  const [open, setOpen] = useState(selected);
+  const expanded = open || selected;
 
   const inputSummary = useMemo(() => summariseInput(item), [item]);
   const outputSummary = useMemo(() => summariseOutput(item), [item]);
 
   return (
     <>
-      <tr className="border-b border-border/60 last:border-b-0">
+      <tr className={cn("border-b border-border/60 last:border-b-0", selected && "bg-primary/5")}>
         <td className="px-2 py-2 align-top">
           <button
             onClick={() => setOpen((v) => !v)}
             className="text-muted-foreground hover:text-foreground"
             aria-label="Toggle details"
           >
-            {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+            {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
           </button>
         </td>
         <td className="px-3 py-2 font-mono text-xs text-muted-foreground">
           {position != null ? `#${position}` : "—"}
         </td>
         <td className="px-3 py-2">
-          <button
-            className="font-mono text-xs hover:text-primary"
-            onClick={() => {
-              navigator.clipboard.writeText(item.request_id);
-              toast.success("Request ID copied", { duration: 3000 });
-            }}
-            title="Copy request_id"
-          >
-            {item.request_id}
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              className={cn("font-mono text-xs hover:text-primary", selected && "font-medium text-primary")}
+              onClick={() => {
+                onSelect(item.request_id);
+                setOpen(true);
+              }}
+              title="Select — adds ?req=<id> to the URL"
+            >
+              {item.request_id}
+            </button>
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(item.request_id);
+                toast.success("Request ID copied", { duration: 3000 });
+              }}
+              className="text-muted-foreground hover:text-foreground"
+              title="Copy request_id"
+              aria-label="Copy request_id"
+            >
+              <Copy className="h-3 w-3" />
+            </button>
+          </div>
         </td>
         <td className="px-3 py-2">
           <span
@@ -250,7 +298,7 @@ function Row({ item, position }: { item: Item; position?: number }) {
           )}
         </td>
       </tr>
-      {open && (
+      {expanded && (
         <tr className="border-b border-border/60 bg-muted/20">
           <td colSpan={6} className="px-4 py-3">
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">

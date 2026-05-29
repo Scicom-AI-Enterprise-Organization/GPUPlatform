@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   ChevronDown,
   ChevronRight,
@@ -50,6 +51,8 @@ type StoredRequest = {
   output?: unknown;    // last fetched output
   error?: string;
   app_id: string;
+  tokens?: number;     // completion tokens (from usage), when known
+  tps?: number;        // ≈ completion tokens / wall time (incl. queue+RTT)
 };
 
 const STORAGE_KEY = (appId: string) => `serverless-ui:requests:${appId}`;
@@ -159,18 +162,40 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   }, [upsert]);
 
   // ---- Send a test request ----
+  // The request config is mirrored into the URL so a playground setup is
+  // shareable / deep-linkable. Initial values are read from the query string.
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const syncParam = useCallback(
+    (key: string, value: string | null) => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (value == null || value === "") params.delete(key);
+      else params.set(key, value);
+      const qs = params.toString();
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+    },
+    [router, pathname, searchParams],
+  );
+
   const [prompt, setPrompt] = useState("Hello, world");
   const [maxTokens, setMaxTokens] = useState(1024);
-  const [model, setModel] = useState("");
-  const [effort, setEffort] = useState<"none" | "low" | "medium" | "high">("none");
-  const [disableThinking, setDisableThinking] = useState(false);
-  const [stream, setStream] = useState(false);
+  const [model, setModel] = useState(searchParams.get("model") ?? "");
+  const [effort, setEffort] = useState<"none" | "low" | "medium" | "high">(() => {
+    const e = searchParams.get("effort");
+    return e === "low" || e === "medium" || e === "high" ? e : "none";
+  });
+  const [disableThinking, setDisableThinking] = useState(searchParams.get("disable_thinking") === "1");
+  const [stream, setStream] = useState(searchParams.get("stream") === "1");
   const [sending, setSending] = useState(false);
   // Live streaming state (the SSE path doesn't use request history).
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [streamReasoning, setStreamReasoning] = useState("");
   const [streamErr, setStreamErr] = useState<string | null>(null);
+  // Live throughput while streaming: TTFT + tokens/sec (output tokens since the
+  // first token). Finalised from `usage` when the model reports it.
+  const [streamStats, setStreamStats] = useState<{ ttftMs: number; tokens: number; tps: number } | null>(null);
   const streamAbort = useRef<AbortController | null>(null);
 
   // Equivalent OpenAI curl for the last-sent request (shared on Run).
@@ -214,7 +239,10 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   function publicBody(): Record<string, unknown> {
     const b = buildBody();
     delete b.endpoint;
-    if (stream) b.stream = true;
+    if (stream) {
+      b.stream = true;
+      b.stream_options = { include_usage: true }; // so the final chunk carries token usage
+    }
     return b;
   }
 
@@ -230,6 +258,8 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
 
   async function send() {
     setSending(true);
+    const t0 = perfNow();
+    const ts = Date.now();
     try {
       const r = await fetch(`/api/proxy/run/${encodeURIComponent(appId)}`, {
         method: "POST",
@@ -238,19 +268,45 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
       });
       const respBody = await r.json();
       if (!r.ok) throw new Error(respBody?.detail ?? respBody?.error ?? r.statusText);
-      const stored: StoredRequest = {
-        id: respBody.request_id,
-        ts: Date.now(),
-        prompt: prompt.slice(0, 80),
-        status: "pending",
-        app_id: appId,
-      };
-      upsert(stored);
-      toast.success(`Queued ${stored.id}`, { duration: 3000 });
+      const id = respBody.request_id as string;
+      const promptShort = prompt.slice(0, 80);
+      upsert({ id, ts, prompt: promptShort, status: "pending", app_id: appId });
+      toast.success(`Queued ${id}`, { duration: 3000 });
+      // Fast measured poll so we can report tokens/sec on completion. The
+      // generic 4 s poll (above) still covers imported/curl-fired ids.
+      void measuredPoll(id, ts, promptShort, t0);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
     } finally {
       setSending(false);
+    }
+  }
+
+  // Poll a just-fired async request quickly (250 ms) until terminal, then store
+  // tokens + a tokens/sec estimate. TPS is wall-time based (includes RTT + any
+  // queue wait), so it's a lower bound on raw generation speed — shown as "≈".
+  async function measuredPoll(id: string, ts: number, promptShort: string, t0: number) {
+    const deadline = perfNow() + 130_000;
+    while (perfNow() < deadline) {
+      await new Promise((res) => setTimeout(res, 250));
+      let body: { status?: string; output?: unknown } | null = null;
+      try {
+        const res = await fetch(`/api/proxy/result/${encodeURIComponent(id)}`, { cache: "no-store" });
+        if (res.status === 404) {
+          upsert({ id, ts, prompt: promptShort, status: "expired", app_id: appId });
+          return;
+        }
+        body = await res.json();
+      } catch {
+        continue;
+      }
+      const status = normalizeStatus(body?.status ?? "unknown");
+      if (!isTerminal(status)) continue;
+      const elapsedS = (perfNow() - t0) / 1000;
+      const tokens = completionTokensOf(body?.output) ?? undefined;
+      const tps = tokens != null && elapsedS > 0 ? tokens / elapsedS : undefined;
+      upsert({ id, ts, prompt: promptShort, status, output: body?.output, app_id: appId, tokens, tps });
+      return;
     }
   }
 
@@ -264,11 +320,28 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
     setStreamErr(null);
     setStreamText("");
     setStreamReasoning("");
+    setStreamStats(null);
+    // include_usage → vLLM appends a final chunk with exact token usage.
+    const body = { ...buildBody(), stream_options: { include_usage: true } };
+    const t0 = perfNow();
+    let tFirst: number | null = null;
+    let count = 0; // tokens seen (≈ one per delta), refined by usage at the end
+    let usageTokens: number | null = null;
+    const bump = () => {
+      if (tFirst === null) tFirst = perfNow();
+      count += 1;
+      const secs = (perfNow() - tFirst) / 1000;
+      setStreamStats({
+        ttftMs: Math.round(tFirst - t0),
+        tokens: count,
+        tps: secs > 0 ? count / secs : 0,
+      });
+    };
     try {
       const res = await fetch(`/api/proxy/stream/${encodeURIComponent(appId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildBody()),
+        body: JSON.stringify(body),
         signal: ctrl.signal,
       });
       if (!res.ok || !res.body) {
@@ -302,18 +375,32 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
               setStreamErr(String(chunk.error));
               continue;
             }
+            const ct = completionTokensOf(chunk);
+            if (ct != null) usageTokens = ct;
             const reason = reasoningOf(chunk);
             if (reason) {
               accR += reason;
               setStreamReasoning(accR);
+              bump();
             }
             const piece = deltaOf(chunk);
             if (piece) {
               acc += piece;
               setStreamText(acc);
+              bump();
             }
           }
         }
+      }
+      // Finalise with exact usage when the model reported it.
+      if (tFirst !== null) {
+        const secs = (perfNow() - tFirst) / 1000;
+        const toks = usageTokens ?? count;
+        setStreamStats({
+          ttftMs: Math.round(tFirst - t0),
+          tokens: toks,
+          tps: secs > 0 ? toks / secs : 0,
+        });
       }
     } catch (e) {
       if (!ctrl.signal.aborted) {
@@ -372,7 +459,13 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
             {models.length > 0 && (
               <div className="flex flex-col gap-1">
                 <span className="text-xs text-muted-foreground">model</span>
-                <Select value={selectedModel} onValueChange={setModel}>
+                <Select
+                  value={selectedModel}
+                  onValueChange={(v) => {
+                    setModel(v);
+                    syncParam("model", v);
+                  }}
+                >
                   <SelectTrigger className="h-8 w-[260px] font-mono text-xs">
                     <SelectValue />
                   </SelectTrigger>
@@ -388,7 +481,13 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
             )}
             <div className="flex flex-col gap-1">
               <span className="text-xs text-muted-foreground">reasoning_effort</span>
-              <Select value={effort} onValueChange={(v) => setEffort(v as typeof effort)}>
+              <Select
+                value={effort}
+                onValueChange={(v) => {
+                  setEffort(v as typeof effort);
+                  syncParam("effort", v === "none" ? null : v);
+                }}
+              >
                 <SelectTrigger className="h-8 w-[150px] text-xs">
                   <SelectValue />
                 </SelectTrigger>
@@ -414,7 +513,10 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
               <input
                 type="checkbox"
                 checked={disableThinking}
-                onChange={(e) => setDisableThinking(e.target.checked)}
+                onChange={(e) => {
+                  setDisableThinking(e.target.checked);
+                  syncParam("disable_thinking", e.target.checked ? "1" : null);
+                }}
                 className="h-4 w-4 cursor-pointer accent-primary"
               />
               <span>
@@ -426,7 +528,10 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
               <input
                 type="checkbox"
                 checked={stream}
-                onChange={(e) => setStream(e.target.checked)}
+                onChange={(e) => {
+                  setStream(e.target.checked);
+                  syncParam("stream", e.target.checked ? "1" : null);
+                }}
                 className="h-4 w-4 cursor-pointer accent-primary"
               />
               <span>stream</span>
@@ -465,9 +570,16 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
                     </div>
                   )}
                   <div className="space-y-1">
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      {streaming && <Loader2 className="h-3 w-3 animate-spin" />}
-                      <span>{streamReasoning ? "Answer" : "Streaming output"}</span>
+                    <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                      <div className="flex items-center gap-2">
+                        {streaming && <Loader2 className="h-3 w-3 animate-spin" />}
+                        <span>{streamReasoning ? "Answer" : "Streaming output"}</span>
+                      </div>
+                      {streamStats && (
+                        <span className="font-mono tabular-nums">
+                          {streamStats.tps.toFixed(1)} tok/s · {streamStats.tokens} tok · TTFT {streamStats.ttftMs} ms
+                        </span>
+                      )}
                     </div>
                     <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">
                       {streamText || (streaming ? "…" : "")}
@@ -635,7 +747,17 @@ function RequestRow({ req, onRemove }: { req: StoredRequest; onRemove: () => voi
           </button>
         </td>
         <td className="px-3 py-2">
-          <StatusPill status={req.status} />
+          <div className="flex flex-col items-start gap-1">
+            <StatusPill status={req.status} />
+            {req.tps != null && (
+              <span
+                className="font-mono text-[10px] tabular-nums text-muted-foreground"
+                title="completion tokens / wall time (includes queue + round-trip)"
+              >
+                ≈{req.tps.toFixed(1)} tok/s{req.tokens != null ? ` · ${req.tokens} tok` : ""}
+              </span>
+            )}
+          </div>
         </td>
         <td className="max-w-xs truncate px-3 py-2 text-xs text-muted-foreground" title={req.prompt}>
           {req.prompt}
@@ -693,6 +815,18 @@ function deltaOf(chunk: Record<string, unknown>): string {
   if (typeof c === "string") return c;
   if (typeof chunk.delta === "string") return chunk.delta;
   return "";
+}
+
+function perfNow(): number {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+// completion_tokens from an OpenAI `usage` block (a streamed usage chunk or a
+// full non-streaming response). Null when absent.
+function completionTokensOf(obj: unknown): number | null {
+  const u = (obj as { usage?: { completion_tokens?: unknown } } | null | undefined)?.usage;
+  const c = u?.completion_tokens;
+  return typeof c === "number" && Number.isFinite(c) ? c : null;
 }
 
 // Reasoning (thinking) delta. vLLM emits it under `delta.reasoning`; some
