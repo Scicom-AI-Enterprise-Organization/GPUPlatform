@@ -2054,18 +2054,65 @@ async def _resolve_model_to_app(session: AsyncSession, user: User, model_name: s
     )
 
 
+async def _resolve_endpoint_path(
+    session: AsyncSession, user: User, app_id: str, model_field: Optional[str]
+) -> tuple[str, Optional[str]]:
+    """Path-scoped OpenAI route (`/{app_id}/v1/...`): the endpoint is fixed by the
+    URL, so there's no global model-name resolution (and no cross-endpoint
+    ambiguity). For a multi-model fleet `model` must name one of its members; for a
+    single-model endpoint `model` is ignored (the endpoint serves its one model).
+    Returns (app_id, target_model) — `target_model` is None for single-model."""
+    app = await session.get(App, app_id)
+    if app is None or not (app.owner_id == user.id or user.is_admin):
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "no such endpoint for your account", "endpoint": app_id},
+        )
+    if (getattr(app, "mode", "single") or "single") == "multi":
+        members = [m.get("model") for m in (app.models or [])]
+        if not model_field:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "this is a multi-model endpoint — set 'model' to one of its member models",
+                    "endpoint": app_id,
+                    "models": members,
+                },
+            )
+        if model_field not in members:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "this endpoint does not serve that model",
+                    "endpoint": app_id,
+                    "model": model_field,
+                    "models": members,
+                },
+            )
+        return app_id, model_field
+    return app_id, None
+
+
 async def _openai_endpoint(
     request: Request,
     db_session: AsyncSession,
     user: User,
     payload: dict,
     vllm_path: str,
+    explicit_app_id: Optional[str] = None,
 ):
     rdb = request.app.state.redis
     model_field = payload.get("model")
-    if not model_field:
-        raise HTTPException(status_code=400, detail={"error": "missing 'model' field in request body"})
-    app_id, target_model = await _resolve_model_to_app(db_session, user, model_field)
+    if explicit_app_id is not None:
+        # Path-scoped route (/{app_id}/v1/...): endpoint fixed by the URL; `model`
+        # only selects the member of a multi-model fleet.
+        app_id, target_model = await _resolve_endpoint_path(
+            db_session, user, explicit_app_id, model_field
+        )
+    else:
+        if not model_field:
+            raise HTTPException(status_code=400, detail={"error": "missing 'model' field in request body"})
+        app_id, target_model = await _resolve_model_to_app(db_session, user, model_field)
 
     is_stream = bool(payload.get("stream"))
     request_id, _timeout_s = await _admit_and_enqueue(
@@ -2193,6 +2240,73 @@ async def openai_list_models(session: AsyncSession = Depends(get_session)):
         elif a.app_id not in seen:
             seen.add(a.app_id)
             data.append({"id": a.app_id, "object": "model", "created": created, "owned_by": a.app_id})
+    return {"object": "list", "data": data}
+
+
+# ----- per-endpoint OpenAI-compatible routes -----
+# `/{app_id}/v1/...` scopes the request to one endpoint by URL, so a client can
+# point an OpenAI SDK at `base_url=<gateway>/{app_id}/v1` and run many endpoints
+# side by side without the global `model`-name routing (no cross-endpoint
+# ambiguity). The fixed `/v1/...` suffix keeps these from shadowing the literal
+# global routes above (different segment count).
+
+@app.post("/{app_id}/v1/chat/completions")
+async def openai_chat_completions_scoped(
+    app_id: str,
+    payload: dict,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    return await _openai_endpoint(
+        request, session, user, payload, "/v1/chat/completions", explicit_app_id=app_id
+    )
+
+
+@app.post("/{app_id}/v1/completions")
+async def openai_completions_scoped(
+    app_id: str,
+    payload: dict,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    return await _openai_endpoint(
+        request, session, user, payload, "/v1/completions", explicit_app_id=app_id
+    )
+
+
+@app.post("/{app_id}/v1/embeddings")
+async def openai_embeddings_scoped(
+    app_id: str,
+    payload: dict,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    payload.pop("stream", None)
+    return await _openai_endpoint(
+        request, session, user, payload, "/v1/embeddings", explicit_app_id=app_id
+    )
+
+
+@app.get("/{app_id}/v1/models")
+async def openai_list_models_scoped(app_id: str, session: AsyncSession = Depends(get_session)):
+    """OpenAI-compatible model list for ONE endpoint (public, like the global
+    `/v1/models`). A multi-model fleet lists its members; a single-model endpoint
+    lists its own name."""
+    app = await session.get(App, app_id)
+    if app is None:
+        raise HTTPException(status_code=404, detail={"error": "no such endpoint", "endpoint": app_id})
+    created = int(app.created_at.timestamp()) if app.created_at else 0
+    data: list[dict] = []
+    if (getattr(app, "mode", "single") or "single") == "multi":
+        for m in (app.models or []):
+            mid = m.get("model")
+            if mid:
+                data.append({"id": mid, "object": "model", "created": created, "owned_by": app.app_id})
+    else:
+        data.append({"id": app.app_id, "object": "model", "created": created, "owned_by": app.app_id})
     return {"object": "list", "data": data}
 
 

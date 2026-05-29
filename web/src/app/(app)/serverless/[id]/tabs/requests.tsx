@@ -188,6 +188,8 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   const [disableThinking, setDisableThinking] = useState(searchParams.get("disable_thinking") === "1");
   const [stream, setStream] = useState(searchParams.get("stream") === "1");
   const [sending, setSending] = useState(false);
+  // Inline error for the non-stream run path (the user does not want a toast here).
+  const [sendErr, setSendErr] = useState<string | null>(null);
   // Live streaming state (the SSE path doesn't use request history).
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
@@ -247,8 +249,10 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   }
 
   function onSend() {
+    setSendErr(null);
+    setStreamErr(null);
     if (!prompt.trim()) {
-      toast.error("Prompt is required.", { duration: 5000 });
+      setSendErr("Prompt is required.");
       return;
     }
     setSentBody(publicBody()); // share the equivalent curl for this request
@@ -266,9 +270,14 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(buildBody()),
       });
-      const respBody = await r.json();
-      if (!r.ok) throw new Error(respBody?.detail ?? respBody?.error ?? r.statusText);
-      const id = respBody.request_id as string;
+      const text = await r.text();
+      let respBody: unknown = text;
+      try { respBody = text ? JSON.parse(text) : null; } catch { /* keep raw text */ }
+      if (!r.ok) {
+        setSendErr(errText(respBody, r.statusText));
+        return;
+      }
+      const id = (respBody as { request_id?: string })?.request_id as string;
       const promptShort = prompt.slice(0, 80);
       upsert({ id, ts, prompt: promptShort, status: "pending", app_id: appId });
       toast.success(`Queued ${id}`, { duration: 3000 });
@@ -276,7 +285,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
       // generic 4 s poll (above) still covers imported/curl-fired ids.
       void measuredPoll(id, ts, promptShort, t0);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
+      setSendErr(e instanceof Error ? e.message : String(e));
     } finally {
       setSending(false);
     }
@@ -346,7 +355,9 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
       });
       if (!res.ok || !res.body) {
         const txt = await res.text().catch(() => "");
-        throw new Error(txt || res.statusText);
+        let parsed: unknown = txt;
+        try { parsed = txt ? JSON.parse(txt) : ""; } catch { /* keep raw text */ }
+        throw new Error(errText(parsed, res.statusText));
       }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -372,7 +383,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
               continue;
             }
             if (chunk.error) {
-              setStreamErr(String(chunk.error));
+              setStreamErr(errText(chunk.error, "stream error"));
               continue;
             }
             const ct = completionTokensOf(chunk);
@@ -549,6 +560,12 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
               </Button>
             )}
           </div>
+
+          {sendErr && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {sendErr}
+            </div>
+          )}
 
           {(streaming || streamText || streamReasoning || streamErr) && (
             <div className="space-y-2">
@@ -809,6 +826,38 @@ function StatusPill({ status }: { status: RequestStatus }) {
 
 // Pull the text delta out of a streamed chunk — OpenAI chat shape
 // (choices[0].delta.content) or the fake worker's {delta: "..."}.
+/** Pull a human-readable message out of a gateway/proxy error body. The gateway
+ *  returns `{detail: "..."}`, `{detail: {error: "...", ...}}`, or `{error: "..."}`;
+ *  naively rendering `detail` when it's an object yields "[object Object]". When
+ *  the nested object carries extra context (e.g. a fleet's member `models`), fold
+ *  a short hint in so the message stays useful. */
+function errText(body: unknown, fallback: string): string {
+  if (body == null) return fallback;
+  if (typeof body === "string") return body || fallback;
+  if (typeof body === "object") {
+    const o = body as Record<string, unknown>;
+    const pick = (v: unknown): string | null => {
+      if (typeof v === "string") return v;
+      if (v && typeof v === "object") {
+        const inner = v as Record<string, unknown>;
+        if (typeof inner.error === "string") {
+          // Some errors carry a `models` list. Only fold it in when it's a list
+          // of strings (the endpoint-name hint); the warming-up error uses
+          // `models: [{model, state}]`, which would stringify to "[object Object]".
+          const names = Array.isArray(inner.models)
+            ? inner.models.filter((x): x is string => typeof x === "string")
+            : [];
+          return inner.error + (names.length ? ` (${names.join(", ")})` : "");
+        }
+      }
+      return null;
+    };
+    return pick(o.detail) ?? pick(o.error) ?? (typeof o.message === "string" ? o.message : null) ??
+      (() => { try { return JSON.stringify(body); } catch { return fallback; } })();
+  }
+  return fallback;
+}
+
 function deltaOf(chunk: Record<string, unknown>): string {
   const choices = chunk.choices as Array<{ delta?: { content?: unknown } }> | undefined;
   const c = choices?.[0]?.delta?.content;

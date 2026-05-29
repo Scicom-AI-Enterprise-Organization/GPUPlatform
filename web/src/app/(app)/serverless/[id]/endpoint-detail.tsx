@@ -20,12 +20,14 @@ import { cn } from "@/lib/utils";
 import { deleteEndpoint } from "../actions";
 import { OverviewTab } from "./tabs/overview";
 import { RequestsTab } from "./tabs/requests";
+import { StressTab } from "./tabs/stress";
 import { QueueTab } from "./tabs/queue";
 import { WorkersTab } from "./tabs/workers";
 
 const TABS = [
   { value: "overview", label: "Overview" },
   { value: "playground", label: "Playground" },
+  { value: "stress", label: "Stress test" },
   { value: "queue", label: "Queue" },
   { value: "workers", label: "Workers" },
 ] as const;
@@ -115,6 +117,7 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
         <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)}>
           <TabsContent value="overview"><OverviewTab app={app} /></TabsContent>
           <TabsContent value="playground"><RequestsTab app={app} /></TabsContent>
+          <TabsContent value="stress"><StressTab app={app} /></TabsContent>
           <TabsContent value="queue"><QueueTab app={app} /></TabsContent>
           <TabsContent value="workers"><WorkersTab app={app} /></TabsContent>
         </Tabs>
