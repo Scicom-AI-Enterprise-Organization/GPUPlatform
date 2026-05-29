@@ -590,6 +590,14 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
         </div>
         <div className="flex items-center gap-2">
           <Button
+            variant={openLogs.has("__worker__") ? "secondary" : "outline"}
+            size="xs" onClick={() => toggleLog("__worker__")}
+            title="Worker-agent scheduler log (wave-loading, sleep/wake, commands, dead reasons)"
+          >
+            <FileText className="h-3 w-3" />
+            Worker log
+          </Button>
+          <Button
             variant="outline" size="xs" onClick={sleepAll}
             disabled={sleepingAll || !anyAwake}
             title="Sleep all awake models (free their GPUs)"
@@ -607,6 +615,16 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
         <div className="border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">{err}</div>
       )}
       <CardContent className="px-0 py-0">
+        {openLogs.has("__worker__") && (
+          <div className="border-b border-border bg-muted/10 px-4 py-3">
+            <ModelLogs
+              appId={app.app_id}
+              model="__worker__"
+              label="worker-agent (scheduler)"
+              onClose={() => toggleLog("__worker__")}
+            />
+          </div>
+        )}
         <table className="w-full text-sm">
           <thead className="border-b border-border bg-muted/20 text-left text-xs uppercase tracking-wide text-muted-foreground">
             <tr>
@@ -762,7 +780,7 @@ function FleetModelRow({
   );
 }
 
-function ModelLogs({ appId, model, onClose }: { appId: string; model: string; onClose: () => void }) {
+function ModelLogs({ appId, model, onClose, label }: { appId: string; model: string; onClose: () => void; label?: string }) {
   const [lines, setLines] = useState<string[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -817,7 +835,7 @@ function ModelLogs({ appId, model, onClose }: { appId: string; model: string; on
     <div className="space-y-2">
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="truncate font-mono">model = {model}</span>
+          <span className="truncate font-mono">{label ?? `model = ${model}`}</span>
           {loading && <Loader2 className="h-3 w-3 shrink-0 animate-spin" />}
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -860,8 +878,18 @@ function ModelLogs({ appId, model, onClose }: { appId: string; model: string; on
       )}
 
       <p className="text-[10px] leading-relaxed text-muted-foreground">
-        Source: this model&apos;s vLLM <code className="font-mono">stdout/stderr</code> on the VM, shipped
-        per-model by the worker-agent log-shipper. Capped at {WORKER_LOGS_CAP_HINT} lines, kept for 1h.
+        {model === "__worker__" ? (
+          <>
+            Source: the worker-agent&apos;s own <code className="font-mono">stdout</code> on the VM —
+            wave-loading, sleep/wake, operator commands, dead-model reasons — shipped by the log-shipper.
+          </>
+        ) : (
+          <>
+            Source: this model&apos;s vLLM <code className="font-mono">stdout/stderr</code> on the VM, shipped
+            per-model by the worker-agent log-shipper.
+          </>
+        )}{" "}
+        Capped at {WORKER_LOGS_CAP_HINT} lines, kept for 1h.
       </p>
     </div>
   );

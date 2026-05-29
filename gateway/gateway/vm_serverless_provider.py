@@ -263,6 +263,9 @@ class VMProvider(Provider):
             home = self._run(client, "echo $HOME").strip() or f"/home/{self._user}"
             remote_dir = REMOTE_DIR.replace("~", home)
             remote_cfg = cfg_path.replace("~", home)
+            # Tell the worker where its own stdout log lives (the nohup target
+            # below) so it can ship it to the gateway as the "__worker__" source.
+            worker_env = {**worker_env, "WORKER_SELF_LOG_PATH": f"{remote_dir}/worker-{machine_id}.log"}
             cfg_b64 = base64.b64encode(json.dumps(worker_env).encode()).decode()
             rc0, out0, err0 = self._run_full(
                 client,

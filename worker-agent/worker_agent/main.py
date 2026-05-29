@@ -486,6 +486,14 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
         )
         for m in cfg.members
     ]
+    # Also ship the worker-agent's OWN stdout log (scheduler events: wave-loading,
+    # sleep/wake, operator commands, preflight, dead reasons) under a reserved
+    # "__worker__" source, so the UI can show the fleet's control-plane log too.
+    self_log = os.environ.get("WORKER_SELF_LOG_PATH")
+    if self_log:
+        log_tasks.append(asyncio.create_task(
+            log_shipper_loop(gateway_url, machine_id, app_id, self_log, drain_event, source="__worker__")
+        ))
     monitor_task = asyncio.create_task(sched.monitor_loop(drain_event))
     try:
         await rdb.ping()
@@ -509,6 +517,9 @@ def run() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpx logs an INFO line per request (heartbeat + log-ship POSTs every few
+    # seconds); silence it so the worker's own log stays readable + shippable.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     asyncio.run(main_async())
 
 

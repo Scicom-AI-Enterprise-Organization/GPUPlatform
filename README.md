@@ -2,7 +2,7 @@
 
 A multi-tenant GPU workload platform. One control plane, three product surfaces:
 
-- **Serverless** — deploy a model with the `serverlessgpu` Python decorator, get an autoscaling HTTP endpoint backed by vLLM. Scales to zero when idle.
+- **Serverless** — deploy a model with the `serverlessgpu` Python decorator, get an autoscaling HTTP endpoint backed by vLLM (scales to zero when idle) — or stand up a **multi-model fleet on one SSH VM** that time-shares its GPUs via vLLM sleep/wake.
 - **Compute** — provision long-lived bare-metal GPU pods with SSH (and Jupyter on PI). Admin approval gate optional.
 - **Benchmark** — SSH-orchestrated `llm-benchmaq` runs on RunPod / Prime Intellect / your own VM, with live log streaming and S3-archived results.
 
@@ -38,10 +38,32 @@ Endpoints are also reachable via an **OpenAI-compatible API** at `/v1/chat/compl
 
 The same endpoint can be created from the web UI (`/serverless/new`); the SDK is for code-first workflows and CI deploys.
 
+## Multi-model fleet on one VM (GPU time-sharing)
+
+Instead of one model per endpoint, a single SSH-reachable VM can host **several vLLM
+servers that share its GPUs** by sleeping and waking on demand. You pick the models,
+pin each to a tensor-parallel GPU slice, and the gateway packs them onto the VM's
+GPUs; the worker-agent loads them, puts the idle ones to sleep, and wakes the right
+one when a request arrives.
+
+- **Request-driven sleep/wake** — a request for an asleep model wakes it; if its GPUs
+  are held by other awake models, those are slept first (LRU), then the target wakes.
+  The OpenAI API returns a clean `503 warming_up` / `503 dead` (with the failure
+  reason) instead of hanging.
+- **Wave-loading** — models on non-overlapping GPUs load concurrently; overlapping
+  ones serialize behind a per-GPU lock, so a 119B model can't OOM a 27B one mid-boot.
+- **vLLM sleep levels** — level 1 offloads weights to CPU RAM (fast wake); level 2
+  discards them for a smaller footprint (slow wake = reload from disk). Chosen per fleet.
+- **Operate from the UI** — the Workers tab shows each model's state and *why* a dead
+  one died, with per-model **Sleep / Restart / Kill / Logs** actions, a fleet-wide
+  **Sleep all**, and a **Worker log** view of the scheduler itself.
+- **Public model list** — `GET /v1/models` lists every served model across the fleet
+  (no token required), so any OpenAI client can discover them.
+
 ## What's in here
 
 - **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/providers`, `/auth`, `/admin/*`, `/metrics`
-- **Worker agent** (`worker-agent/`) — BRPOPs jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub
+- **Worker agent** (`worker-agent/`) — BRPOPs jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub; also drives the **multi-model VM fleet** — wave-loads each vLLM, sleeps/wakes them per request, runs operator commands (sleep/restart/kill), and ships per-model + scheduler logs to the gateway
 - **SDK + CLI** (`sdk/serverlessgpu/`) — `@endpoint` decorator, `QueueDepthAutoscaler`, and the `serverlessgpu` CLI
 - **Web** (`web/`) — Next.js UI: Serverless, Compute, Benchmark, Providers, API Keys, Admin (users / roles / audit / approvals / provisioned)
 - **Helm chart** (`deploy/helm/serverlessgpu/`) — gateway + web + Postgres + Redis + Ingress (SSE-safe) + ServiceMonitor
@@ -55,7 +77,7 @@ Each user registers their own providers under `/providers`. Supported kinds:
 |---|---|---|
 | `runpod` | RunPod API key | Serverless, Compute, Benchmark |
 | `pi` | Prime Intellect API key | Serverless, Compute, Benchmark |
-| `vm` | Your own SSH-reachable box | Benchmark (bare-metal) |
+| `vm` | Your own SSH-reachable box | Serverless (multi-model fleet), Benchmark (bare-metal) |
 | `fake` | In-process dev provider | Local development only |
 
 Provider resolution per request: explicit `provider_id` → the user's sole provider of that kind → gateway-wide env fallback (`RUNPOD_API_KEY`, `PI_API_KEY`).
@@ -111,8 +133,17 @@ Specs live under `web/src/**/*.test.ts`:
 | Spec | Covers |
 |---|---|
 | `src/lib/benchmark-ssh.test.ts` | SSH/VM benchmark create — replicates a 16-cell vLLM sweep pinned to chosen GPUs (`visible_devices`) — plus the get / list / rename / terminate / delete / files routes |
-| `src/lib/__tests__/create-inference.test.ts` | Multi-model VM serverless endpoint create |
+| `src/lib/__tests__/create-inference.test.ts` | Multi-model VM serverless endpoint create — the GPU-pinned `export`-env vLLM fleet |
+| `src/lib/__tests__/request-inference.test.ts` | Requesting `/v1/chat/completions` + `/v1/models` for each fleet model (parametrized) |
 | `src/app/(app)/serverless/__tests__/deploy-endpoint.test.ts` | Endpoint deploy flow |
+
+One spec — `src/lib/__tests__/real-api.integration.test.ts` — fires the same calls at a
+**live gateway** and is skipped unless `SGPU_API_KEY` is set:
+
+```bash
+cd web
+SGPU_API_KEY=sgpu_... SGPU_URL=http://localhost:8080 npm test -- real-api
+```
 
 ### Running a real benchmark via the API (with an API key)
 
