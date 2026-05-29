@@ -620,7 +620,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
               </div>
               <div className="relative">
                 <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
-                  {curlFor(base, revealToken && token ? token : token ? maskToken(token) : "YOUR_API_KEY", sentBody)}
+                  {curlFor(base, appId, revealToken && token ? token : token ? maskToken(token) : "YOUR_API_KEY", sentBody)}
                 </pre>
                 <Button
                   variant="outline"
@@ -629,7 +629,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
                   aria-label="Copy cURL"
                   onClick={() => {
                     navigator.clipboard.writeText(
-                      curlFor(base, token ?? "YOUR_API_KEY", sentBody),
+                      curlFor(base, appId, token ?? "YOUR_API_KEY", sentBody),
                     );
                     toast.success("cURL copied", { duration: 3000 });
                   }}
@@ -895,9 +895,9 @@ function maskToken(t: string) {
 }
 
 // Equivalent OpenAI cURL for a request body. `-N` (unbuffered) when streaming.
-function curlFor(base: string, token: string, body: Record<string, unknown>): string {
+function curlFor(base: string, appId: string, token: string, body: Record<string, unknown>): string {
   const flag = body.stream ? "-N " : "";
-  return `curl ${flag}-X POST '${base}/v1/chat/completions' \\
+  return `curl ${flag}-X POST '${base}/${appId}/v1/chat/completions' \\
   -H 'Content-Type: application/json' \\
   -H 'Authorization: Bearer ${token}' \\
   -d '${JSON.stringify(body, null, 2)}'`;

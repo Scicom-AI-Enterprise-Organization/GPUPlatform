@@ -264,11 +264,11 @@ function RequestPanel({ app }: { app: AppRecord }) {
 
           <TabsContent value="curl" className="mt-3 space-y-3">
             <p className="text-sm text-muted-foreground">
-              OpenAI <code className="font-mono">/v1/chat/completions</code> — returns the full completion JSON in one call.
+              OpenAI <code className="font-mono">/{app.app_id}/v1/chat/completions</code> — scoped to this endpoint; returns the full completion JSON in one call.
             </p>
             <CodeBlock
-              displayCode={curlChatSnippet(base, visibleToken, exampleModel)}
-              copyCode={curlChatSnippet(base, realToken, exampleModel)}
+              displayCode={curlChatSnippet(base, visibleToken, exampleModel, app.app_id)}
+              copyCode={curlChatSnippet(base, realToken, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>
@@ -278,22 +278,22 @@ function RequestPanel({ app }: { app: AppRecord }) {
               Same endpoint with <code className="font-mono">&quot;stream&quot;: true</code> — token-by-token Server-Sent Events.
             </p>
             <CodeBlock
-              displayCode={curlChatStreamSnippet(base, visibleToken, exampleModel)}
-              copyCode={curlChatStreamSnippet(base, realToken, exampleModel)}
+              displayCode={curlChatStreamSnippet(base, visibleToken, exampleModel, app.app_id)}
+              copyCode={curlChatStreamSnippet(base, realToken, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>
 
           <TabsContent value="openai" className="mt-3 space-y-3">
             <p className="text-sm text-muted-foreground">
-              Point any OpenAI client at the gateway.{" "}
+              Point any OpenAI client at this endpoint&apos;s base URL.{" "}
               {isMulti
-                ? "Set model to one of this endpoint's member models."
-                : "Use the endpoint name as the model."}
+                ? "Set model to one of its member models."
+                : "The model field is ignored — this endpoint serves one model."}
             </p>
             <CodeBlock
-              displayCode={openaiSnippet(base, visibleToken, exampleModel)}
-              copyCode={openaiSnippet(base, realToken, exampleModel)}
+              displayCode={openaiSnippet(base, visibleToken, exampleModel, app.app_id)}
+              copyCode={openaiSnippet(base, realToken, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>
@@ -378,10 +378,11 @@ function DocsLink() {
   );
 }
 
-function curlChatSnippet(base: string, token: string, model: string) {
-  // OpenAI-compatible chat completions. The gateway polls internally and
-  // returns the full completion JSON in one call (60s ceiling).
-  return `curl -X POST '${base}/v1/chat/completions' \\
+function curlChatSnippet(base: string, token: string, model: string, appId: string) {
+  // OpenAI-compatible chat completions, scoped to THIS endpoint by URL path
+  // (so multiple endpoints never collide on the `model` field). The gateway
+  // polls internally and returns the full completion JSON in one call.
+  return `curl -X POST '${base}/${appId}/v1/chat/completions' \\
   -H 'Content-Type: application/json' \\
   -H 'Authorization: Bearer ${token}' \\
   -d '{
@@ -391,8 +392,8 @@ function curlChatSnippet(base: string, token: string, model: string) {
   }'`;
 }
 
-function curlChatStreamSnippet(base: string, token: string, model: string) {
-  return `curl -N -X POST '${base}/v1/chat/completions' \\
+function curlChatStreamSnippet(base: string, token: string, model: string, appId: string) {
+  return `curl -N -X POST '${base}/${appId}/v1/chat/completions' \\
   -H 'Content-Type: application/json' \\
   -H 'Authorization: Bearer ${token}' \\
   -d '{
@@ -403,11 +404,11 @@ function curlChatStreamSnippet(base: string, token: string, model: string) {
   }'`;
 }
 
-function openaiSnippet(base: string, token: string, model: string) {
+function openaiSnippet(base: string, token: string, model: string, appId: string) {
   return `from openai import OpenAI
 
 client = OpenAI(
-    base_url="${base}/v1",
+    base_url="${base}/${appId}/v1",
     api_key="${token}",
 )
 
