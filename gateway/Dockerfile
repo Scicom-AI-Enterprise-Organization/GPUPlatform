@@ -24,6 +24,11 @@ COPY pyproject.toml ./
 COPY gateway ./gateway
 RUN uv pip install --system --no-cache-dir -e .
 
+# Bake the release version (git short-sha) so /health + /version report which
+# build is live. CI passes `--build-arg APP_VERSION=<sha>`; defaults to "dev".
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 EXPOSE 8080
 ENV GATEWAY_BIND=0.0.0.0:8080
 CMD ["python", "-m", "gateway.main"]

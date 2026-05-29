@@ -186,6 +186,23 @@ export function ConsoleSidebar({
         </Link>
 
         <nav className="flex-1 overflow-y-auto py-3 scrollbar-thin">{groups}</nav>
+
+        {/* Build version — baked in at `next build` from APP_VERSION (git
+            short-sha in CI). Defaults to "dev" for local/unversioned builds so
+            the footer is always populated. */}
+        <div
+          className={cn(
+            "shrink-0 border-t border-sidebar-border py-2",
+            collapsed ? "px-2 text-center" : "px-4",
+          )}
+          title={`Build ${process.env.NEXT_PUBLIC_APP_VERSION || "dev"}`}
+        >
+          <p className="truncate font-mono text-[10px] text-muted-foreground">
+            {collapsed
+              ? (process.env.NEXT_PUBLIC_APP_VERSION || "dev").slice(0, 4)
+              : `v${process.env.NEXT_PUBLIC_APP_VERSION || "dev"}`}
+          </p>
+        </div>
       </aside>
     </>
   );

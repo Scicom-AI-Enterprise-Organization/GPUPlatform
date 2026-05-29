@@ -163,7 +163,9 @@ export function InferenceForm() {
   // VM-only: pin to specific physical GPU ids, e.g. "0,1,2,3". Empty = all GPUs.
   const [visibleDevices, setVisibleDevices] = useState("");
   // VM-only: uv venv the worker runs `vllm serve` from + the vLLM version to pin.
-  const [venvPath, setVenvPath] = useState("");
+  // Default to the standard shared venv on the VM — leaving this empty makes the
+  // worker fall back to bare `python3` (no vLLM), which silently never launches.
+  const [venvPath, setVenvPath] = useState("/share/vllm-venv");
   const [vllmVersion, setVllmVersion] = useState("");
   // Endpoint-level env applied to every vLLM process (cache/home dirs, etc.).
   // Pasted as `KEY=value` / `export KEY=value` lines; `mkdir` lines are ignored

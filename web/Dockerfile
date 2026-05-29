@@ -13,6 +13,10 @@ COPY . .
 # `http://localhost:8080` fallback.
 ARG NEXT_PUBLIC_GATEWAY_URL=https://serverlessgpu.aies.scicom.dev
 ENV NEXT_PUBLIC_GATEWAY_URL=${NEXT_PUBLIC_GATEWAY_URL}
+# Release version (git short-sha) shown in the sidebar footer. CI passes
+# `--build-arg APP_VERSION=<sha>`; defaults to "dev" for local builds.
+ARG APP_VERSION=dev
+ENV NEXT_PUBLIC_APP_VERSION=${APP_VERSION}
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

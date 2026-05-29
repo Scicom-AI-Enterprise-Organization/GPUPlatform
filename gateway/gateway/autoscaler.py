@@ -68,7 +68,13 @@ def build_multi_model_config(app) -> dict:
     default_level = int(getattr(app, "sleep_level", 1) or 1)
     slot_cursor: dict[int, int] = {}
     out: list[dict] = []
-    port = int(os.environ.get("MULTI_MODEL_PORT_BASE", "18001") or "18001")
+    # Per-endpoint port window so multiple fleets sharing ONE VM don't collide on
+    # localhost ports. Coexisting endpoints must use disjoint GPUs, so the lowest
+    # physical GPU id this endpoint owns gives each a stable, non-overlapping
+    # window (e.g. GPUs 0-5 → 18001+, GPUs 6,7 → 18601+ at stride 100).
+    port_base = int(os.environ.get("MULTI_MODEL_PORT_BASE", "18001") or "18001")
+    port_stride = int(os.environ.get("MULTI_MODEL_PORT_STRIDE", "100") or "100")
+    port = port_base + (min(phys) if phys else 0) * port_stride
     for m in members:
         model = m["model"]
         tp = max(1, int(m.get("tp", 1) or 1))

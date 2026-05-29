@@ -264,8 +264,14 @@ class VMProvider(Provider):
             remote_dir = REMOTE_DIR.replace("~", home)
             remote_cfg = cfg_path.replace("~", home)
             # Tell the worker where its own stdout log lives (the nohup target
-            # below) so it can ship it to the gateway as the "__worker__" source.
-            worker_env = {**worker_env, "WORKER_SELF_LOG_PATH": f"{remote_dir}/worker-{machine_id}.log"}
+            # below) so it can ship it to the gateway as the "__worker__" source,
+            # and where to persist the engine process-groups it owns so terminate
+            # can reap ONLY our processes (never a box-wide pkill).
+            worker_env = {
+                **worker_env,
+                "WORKER_SELF_LOG_PATH": f"{remote_dir}/worker-{machine_id}.log",
+                "WORKER_ENGINE_PIDS_PATH": f"{remote_dir}/worker-{machine_id}.enginepids",
+            }
             cfg_b64 = base64.b64encode(json.dumps(worker_env).encode()).decode()
             rc0, out0, err0 = self._run_full(
                 client,
@@ -304,10 +310,18 @@ class VMProvider(Provider):
         client = self._connect_sync()
         try:
             pid_path = f"{REMOTE_DIR}/worker-{machine_id}.pid"
-            # Kill the worker's process tree by its recorded pid, then a
-            # belt-and-braces pkill scoped to this machine's config path so we
-            # never touch unrelated processes on the box.
+            pids_path = f"{REMOTE_DIR}/worker-{machine_id}.enginepids"
+            venv = f"{REMOTE_DIR}/venv"
+            # Kill the worker's process tree by its recorded pid, then a pkill
+            # scoped to THIS machine's config path (so we never touch another
+            # worker on the box).
             cfg_tag = shlex.quote(f"worker-{machine_id}.json")
+            # The engines run in their OWN sessions (start_new_session), so they
+            # survive the worker kill — orphaned, still holding GPU. We reap them
+            # PRECISELY: the worker persisted the exact process-groups it owns to
+            # `pids_path`, and the cleanup module kills only those (reuse-guarded
+            # by start-time). NEVER a box-wide `pkill -f VLLM::` — the VM may be
+            # shared with another endpoint or a user's own vLLM.
             script = (
                 f"if [ -f {pid_path} ]; then "
                 f"  PID=$(cat {pid_path}); "
@@ -315,13 +329,7 @@ class VMProvider(Provider):
                 f"  sleep 2; kill -KILL $PID 2>/dev/null || true; "
                 f"fi; "
                 f"pkill -9 -f {cfg_tag} 2>/dev/null || true; "
-                # The worker launches each vLLM in its OWN session (start_new_session),
-                # so the engines are NOT in the worker's process group and survive the
-                # kill above — orphaned, still holding GPU. Kill them by name too:
-                # the renamed tp workers/engine (VLLM::*) and the api_server. (One
-                # multi-model endpoint per VM, so this won't touch another tenant.)
-                f"pkill -9 -f 'VLLM::' 2>/dev/null || true; "
-                f"pkill -9 -f 'vllm.entrypoints.openai.api_server' 2>/dev/null || true; "
+                f"{venv}/bin/python -m worker_agent.multi.cleanup {pids_path} 2>/dev/null || true; "
                 f"rm -f {pid_path}; true"
             )
             self._run(client, f"bash -lc {shlex.quote(script)}")

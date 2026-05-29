@@ -458,9 +458,21 @@ async def metrics_mw(request: Request, call_next):
         metrics.INFLIGHT.dec()
 
 
+# The build the gateway is serving. CI bakes the git short-sha in as APP_VERSION
+# at image-build time (see the Dockerfile + ci.yml build-args); "dev" for local /
+# unbaked runs.
+GATEWAY_VERSION = os.environ.get("APP_VERSION", "dev")
+
+
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "version": GATEWAY_VERSION}
+
+
+@app.get("/version")
+async def version():
+    """Which build is live — so you can confirm what the platform is serving."""
+    return {"version": GATEWAY_VERSION}
 
 
 @app.get("/ready")

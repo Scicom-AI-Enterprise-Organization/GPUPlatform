@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-import shlex
+import os
 import signal
 import time
 from contextlib import asynccontextmanager
@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 import httpx
 
 from .config import MemberModel, MultiModelConfig
-from . import launcher, vllm_ctl
+from . import launcher, vllm_ctl, cleanup
 
 logger = logging.getLogger("worker-agent.scheduler")
 
@@ -55,6 +55,7 @@ class ModelRuntime:
         self.member = member
         self.state = ModelState.LAUNCHING
         self.proc: asyncio.subprocess.Process | None = None
+        self.pgid: int | None = None  # engine's process group (leader + tp workers)
         self.inflight = 0
         self.last_used = 0.0
         self.swapping = False  # a _swap_to task is converging this model → AWAKE
@@ -93,6 +94,10 @@ class MultiModelScheduler:
         for rt in self._runtimes:
             rt.log_path = launcher.log_path_for(rt.member, self.log_dir)
         self._by_model: dict[str, ModelRuntime] = {rt.member.served_name: rt for rt in self._runtimes}
+        # Where we persist the engine process-groups we own, so preflight + the
+        # provider's terminate can kill ONLY our processes (never a box-wide
+        # pkill). Set by the provider; None → no persistence (cleanup no-ops).
+        self._pids_path: str | None = os.environ.get("WORKER_ENGINE_PIDS_PATH")
 
     @asynccontextmanager
     async def _hold_gpus(self, gpus):
@@ -111,31 +116,24 @@ class MultiModelScheduler:
                 lk.release()
 
     async def _kill_stale_vllm(self) -> None:
-        """Kill leftover vLLM from a prior worker that was SIGKILLed before it
-        could clean up its children.
+        """Reap engines orphaned by a PRIOR run of this worker that was SIGKILLed
+        before it could clean up its children.
 
-        Matching is by command name, which is namespace-independent (an
-        nvidia-smi PID match can't find them inside a container — host-namespaced
-        PIDs). The catch: vLLM renames its tp workers + engine cores via
-        setproctitle to `VLLM::Worker_TP` / `VLLM::EngineCore`, which REWRITES
-        /proc/PID/cmdline — so a match on the interpreter path or `--port` misses
-        them entirely (this exact gap let orphaned workers hoard GPU memory).
-        So we kill three patterns: the renamed `VLLM::` processes, the
-        api_server, and anything from the endpoint's venv (resource trackers).
-        Safe at start(): we launch nothing until after this runs."""
-        venv = (self.cfg.venv_path or "").strip()
-        patterns = ["VLLM::", "vllm.entrypoints.openai.api_server"]
-        if venv:
-            patterns.append(f"{venv}/bin/python")
-        cmd = "; ".join(f"pkill -9 -f {shlex.quote(p)} 2>/dev/null" for p in patterns) + "; true"
+        We kill ONLY the process groups that prior run recorded in our pids file
+        (`WORKER_ENGINE_PIDS_PATH`) — never a box-wide `pkill -f 'VLLM::'`. The VM
+        may be shared: another endpoint, or a user outside the platform, can be
+        running their own vLLM, and we must not touch it. The cleanup is
+        reuse-guarded by start-time (see cleanup.cleanup_records), so a recycled
+        pid/pgid can't be mistaken for ours. Safe at start(): we launch nothing
+        until after this runs."""
+        if not self._pids_path:
+            return
         try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            logger.info("preflight: killed any stale vllm (patterns: %s)", ", ".join(patterns))
+            killed = await asyncio.to_thread(cleanup.cleanup_file, self._pids_path, logger.info)
+            if killed:
+                logger.info("preflight: reaped %d orphaned engine process(es) from a prior run", len(killed))
         except Exception:
-            logger.exception("preflight stale-vllm cleanup failed")
+            logger.exception("preflight engine cleanup failed")
 
     async def kill_model(self, served_name: str) -> None:
         """Operator action: stop a model's engine (and all its tp workers) and
@@ -266,6 +264,39 @@ class MultiModelScheduler:
             except Exception:
                 logger.exception("failed to warm %s", rt.member.model)
 
+    @staticmethod
+    def _safe_pgid(proc: asyncio.subprocess.Process | None) -> int | None:
+        """Process-group id of a launched engine (== its pid, since the launcher
+        uses start_new_session). The whole tp-worker family shares it."""
+        if proc is None or proc.pid is None:
+            return None
+        try:
+            return os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            return None
+
+    def _dump_pids(self) -> None:
+        """Persist the engine process-groups we currently own (leader + tp-worker
+        children, each with its start-time) so preflight + the provider's
+        terminate can reap ONLY our processes — never anything else on the VM."""
+        if not self._pids_path:
+            return
+        live = {
+            rt.pgid: rt
+            for rt in self._runtimes
+            if rt.proc is not None and rt.proc.returncode is None and rt.pgid
+        }
+        groups = cleanup.snapshot_groups(live.keys())
+        records = [
+            {"model": live[pgid].member.served_name, "pgid": pgid, "pids": pids}
+            for pgid, pids in groups.items()
+            if pids
+        ]
+        try:
+            cleanup.dump_records(self._pids_path, records)
+        except OSError:
+            logger.warning("could not write engine pids file %s", self._pids_path)
+
     async def _launch_and_sleep(self, rt: ModelRuntime) -> None:
         try:
             rt.reason = None  # clear any stale cause from a prior attempt
@@ -276,6 +307,11 @@ class MultiModelScheduler:
                 # is a no-op since nothing is awake yet.
                 await self._evict_overlapping(rt)
                 rt.proc = await launcher.launch_member(rt.member, self.log_dir, self._python_exe)
+                # Record the engine's process group right away (before health) so a
+                # worker SIGKILL mid-load still leaves a trackable orphan, not a
+                # leak we'd have to pkill box-wide.
+                rt.pgid = self._safe_pgid(rt.proc)
+                self._dump_pids()
                 ok = await launcher.wait_health(self._client, rt.member, rt.proc, log_path=rt.log_path)
                 if not ok:
                     # Kill the failed/hung engine so it can't leak and keep holding
@@ -283,16 +319,23 @@ class MultiModelScheduler:
                     await launcher.terminate(rt.proc)
                     async with self._cond:
                         self._mark_dead(rt)
+                    rt.pgid = None
+                    self._dump_pids()
                     return
                 await vllm_ctl.sleep_model(self._client, rt.base_url, rt.member.sleep_level)
                 async with self._cond:
                     rt.state = ModelState.ASLEEP
                     self._cond.notify_all()
+                # Re-dump now that the tp workers have spawned, so the recorded
+                # group includes every child.
+                self._dump_pids()
         except Exception:
             logger.exception("launch_and_sleep failed for %s", rt.member.model)
             await launcher.terminate(rt.proc)
             async with self._cond:
                 self._mark_dead(rt)
+            rt.pgid = None
+            self._dump_pids()
 
     # ---- routing / admission ---------------------------------------------
 
@@ -426,6 +469,9 @@ class MultiModelScheduler:
                     else:
                         async with self._cond:
                             self._mark_dead(rt)
+            # Refresh the persisted engine groups: picks up tp workers that
+            # spawned after launch and drops any engine that has since died.
+            self._dump_pids()
             try:
                 await asyncio.wait_for(drain_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
@@ -458,6 +504,13 @@ class MultiModelScheduler:
             *(launcher.terminate(rt.proc) for rt in self._runtimes if rt.proc is not None),
             return_exceptions=True,
         )
+        # Engines are down — drop the pids file so the next start has nothing
+        # stale to reap (a crash leaves it in place for terminate/preflight).
+        if self._pids_path:
+            try:
+                os.remove(self._pids_path)
+            except OSError:
+                pass
         try:
             await self._client.aclose()
         except Exception:
