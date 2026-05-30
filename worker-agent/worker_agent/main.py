@@ -270,18 +270,41 @@ async def _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeo
 
 
 async def _run_stream(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint="/v1/completions", base_url=None):
-    """Stream with both per-request timeout AND mid-stream cancel."""
+    """Stream with per-request timeout + mid-stream cancel.
+
+    Token chunks are PIPELINED to Redis in small batches (one round-trip per
+    batch instead of one per token), and the cancel key is polled at most every
+    ~250ms rather than per token. Over a reverse-SSH tunnel the per-token Redis
+    round-trip is what serialized streaming throughput (~670 vs ~985 tok/s
+    unary); batching closes that gap. The gateway still gets one pub/sub message
+    per chunk, so the SSE wire protocol is unchanged."""
+    loop = asyncio.get_event_loop()
     channel = f"stream:{request_id}"
     cancel_key = f"cancel:{request_id}"
     last = None
     cancelled = False
     timed_out = False
-    deadline = asyncio.get_event_loop().time() + timeout_s
+    deadline = loop.time() + timeout_s
+
+    buf: list[dict] = []
+    last_flush = loop.time()
+    last_cancel_check = 0.0
+    FLUSH_S = 0.02   # flush at least every 20ms (keeps streaming smooth)
+    FLUSH_N = 16     # ...or every 16 chunks, whichever comes first
+
+    async def flush():
+        if not buf:
+            return
+        pipe = rdb.pipeline(transaction=False)
+        for ch in buf:
+            pipe.publish(channel, json.dumps(ch))
+        await pipe.execute()
+        buf.clear()
 
     try:
         gen = handle_stream(mode, model_id, payload, endpoint, base_url=base_url)
         while True:
-            now = asyncio.get_event_loop().time()
+            now = loop.time()
             remaining = deadline - now
             if remaining <= 0:
                 timed_out = True
@@ -294,16 +317,22 @@ async def _run_stream(rdb, request_id, machine_id, mode, model_id, payload, time
                 timed_out = True
                 break
 
-            if await rdb.exists(cancel_key):
-                logger.info("client cancelled %s, stopping mid-stream", request_id)
-                cancelled = True
-                chunk = {"cancelled": True, "done": True}
-                last = chunk
-                await rdb.publish(channel, json.dumps(chunk))
-                break
+            if now - last_cancel_check > 0.25:
+                last_cancel_check = now
+                if await rdb.exists(cancel_key):
+                    logger.info("client cancelled %s, stopping mid-stream", request_id)
+                    cancelled = True
+                    last = {"cancelled": True, "done": True}
+                    buf.append(last)
+                    await flush()
+                    break
             last = chunk
-            await rdb.publish(channel, json.dumps(chunk))
+            buf.append(chunk)
+            if len(buf) >= FLUSH_N or (now - last_flush) >= FLUSH_S:
+                await flush()
+                last_flush = now
     finally:
+        await flush()
         if timed_out:
             chunk = {"timeout": True, "timeout_s": timeout_s, "done": True}
             last = chunk

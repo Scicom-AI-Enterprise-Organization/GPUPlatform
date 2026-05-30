@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Activity, Clock, Loader2, Play, TrendingUp, X, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -91,16 +92,39 @@ export function StressTab({ app }: { app: AppRecord }) {
     return app.model ? [app.model] : [];
   }, [app]);
 
-  const [model, setModel] = useState("");
+  // Test config is seeded from the URL and mirrored back to it on change, so a
+  // configured run is shareable / survives reload (?model=&input_len=&output_len=
+  // &num_prompts=&concurrency=).
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  const [model, setModel] = useState(searchParams.get("model") ?? "");
   const selectedModel = model || models[0] || "";
 
-  const [inputLen, setInputLen] = useState(128);
-  const [outputLen, setOutputLen] = useState(128);
-  const [numPrompts, setNumPrompts] = useState(50);
-  const [concurrency, setConcurrency] = useState(10);
+  const [inputLen, setInputLen] = useState(() => Number(searchParams.get("input_len")) || 128);
+  const [outputLen, setOutputLen] = useState(() => Number(searchParams.get("output_len")) || 128);
+  const [numPrompts, setNumPrompts] = useState(() => Number(searchParams.get("num_prompts")) || 50);
+  const [concurrency, setConcurrency] = useState(() => Number(searchParams.get("concurrency")) || 10);
+
+  const writeUrl = useCallback(
+    (next: { model?: string; inputLen?: number; outputLen?: number; numPrompts?: number; concurrency?: number }) => {
+      const p = new URLSearchParams();
+      p.set("tab", "stress");
+      const m = next.model ?? selectedModel;
+      if (m) p.set("model", m);
+      p.set("input_len", String(next.inputLen ?? inputLen));
+      p.set("output_len", String(next.outputLen ?? outputLen));
+      p.set("num_prompts", String(next.numPrompts ?? numPrompts));
+      p.set("concurrency", String(next.concurrency ?? concurrency));
+      router.replace(`${pathname}?${p.toString()}`, { scroll: false });
+    },
+    [selectedModel, inputLen, outputLen, numPrompts, concurrency, pathname, router],
+  );
 
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState(0);
+  const [logLines, setLogLines] = useState<string[]>([]);
   const [errText, setErrText] = useState<string | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -193,6 +217,7 @@ export function StressTab({ app }: { app: AppRecord }) {
     setErrText(null);
     setSummary(null);
     setDone(0);
+    setLogLines([]);
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     const total = Math.max(1, numPrompts);
@@ -209,6 +234,11 @@ export function StressTab({ app }: { app: AppRecord }) {
         results.push(r);
         completed += 1;
         setDone(completed);
+        const n = String(completed).padStart(4);
+        const line = r.ok
+          ? `#${n}  ok    ttft=${r.ttftMs.toFixed(0).padStart(5)}ms  e2e=${r.e2eMs.toFixed(0).padStart(6)}ms  out=${r.outTokens}tok  tpot=${r.tpotMs.toFixed(1)}ms`
+          : `#${n}  FAIL  ${r.error ?? "error"}`;
+        setLogLines((prev) => (prev.length >= 2000 ? [...prev.slice(prev.length - 1999), line] : [...prev, line]));
       }
     };
     try {
@@ -259,7 +289,7 @@ export function StressTab({ app }: { app: AppRecord }) {
           <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
             {models.length > 0 && (
               <Field label="model" width="w-[240px]">
-                <Select value={selectedModel} onValueChange={setModel} disabled={running}>
+                <Select value={selectedModel} onValueChange={(v) => { setModel(v); writeUrl({ model: v }); }} disabled={running}>
                   <SelectTrigger className="h-8 font-mono text-xs">
                     <SelectValue />
                   </SelectTrigger>
@@ -274,16 +304,16 @@ export function StressTab({ app }: { app: AppRecord }) {
               </Field>
             )}
             <Field label="input len (≈tok)">
-              <NumberField min={1} max={32768} value={inputLen} onChange={setInputLen} disabled={running} className="h-8 w-28 font-mono" />
+              <NumberField min={1} max={32768} value={inputLen} onChange={(v) => { setInputLen(v); writeUrl({ inputLen: v }); }} disabled={running} className="h-8 w-28 font-mono" />
             </Field>
             <Field label="output len">
-              <NumberField min={1} max={8192} value={outputLen} onChange={setOutputLen} disabled={running} className="h-8 w-28 font-mono" />
+              <NumberField min={1} max={8192} value={outputLen} onChange={(v) => { setOutputLen(v); writeUrl({ outputLen: v }); }} disabled={running} className="h-8 w-28 font-mono" />
             </Field>
             <Field label="num prompts">
-              <NumberField min={1} max={5000} value={numPrompts} onChange={setNumPrompts} disabled={running} className="h-8 w-28 font-mono" />
+              <NumberField min={1} max={5000} value={numPrompts} onChange={(v) => { setNumPrompts(v); writeUrl({ numPrompts: v }); }} disabled={running} className="h-8 w-28 font-mono" />
             </Field>
             <Field label="concurrency">
-              <NumberField min={1} max={1024} value={concurrency} onChange={setConcurrency} disabled={running} className="h-8 w-28 font-mono" />
+              <NumberField min={1} max={1024} value={concurrency} onChange={(v) => { setConcurrency(v); writeUrl({ concurrency: v }); }} disabled={running} className="h-8 w-28 font-mono" />
             </Field>
             <div className="flex-1" />
             {running ? (
@@ -308,6 +338,8 @@ export function StressTab({ app }: { app: AppRecord }) {
               </div>
             </div>
           )}
+
+          {logLines.length > 0 && <StressLog lines={logLines} />}
 
           <p className="text-[11px] leading-relaxed text-muted-foreground">
             Client-driven — effective concurrency is capped by the browser&apos;s per-host connection limit. For
@@ -357,6 +389,34 @@ export function StressTab({ app }: { app: AppRecord }) {
           </Card>
         </>
       )}
+    </div>
+  );
+}
+
+function StressLog({ lines }: { lines: string[] }) {
+  const ref = useRef<HTMLPreElement | null>(null);
+  const atBottom = useRef(true);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (atBottom.current) el.scrollTop = el.scrollHeight;
+    atBottom.current = dist < 40;
+  }, [lines]);
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between text-xs text-muted-foreground">
+        <span>Request log</span>
+        <span className="font-mono">{lines.length} completed</span>
+      </div>
+      <pre
+        ref={(el) => { ref.current = el; }}
+        className="terminal-block max-h-72 w-full overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin"
+      >
+        {lines.map((l, i) => (
+          <div key={i} className={l.includes("FAIL") ? "text-red-400" : undefined}>{l}</div>
+        ))}
+      </pre>
     </div>
   );
 }

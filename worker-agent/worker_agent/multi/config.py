@@ -73,6 +73,7 @@ def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiMo
         served = (m.get("served_name") or model).strip()
         tp = int(m.get("tp") or 1)
         port = int(m.get("port") or (8001 + i))
+        explicit_idxs = bool(m.get("gpu_indices"))
         idxs = tuple(int(x) for x in (m.get("gpu_indices") or []))
         if not idxs:
             # Auto-assign: pack tp consecutive GPUs round-robin (deterministic).
@@ -80,7 +81,13 @@ def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiMo
             idxs = tuple((start + j) % max(1, total) for j in range(tp)) if total else tuple(range(tp))
         if len(idxs) != tp:
             raise ValueError(f"{model}: gpu_indices {idxs} length != tp {tp}")
-        if total and any(g >= total or g < 0 for g in idxs):
+        if any(g < 0 for g in idxs):
+            raise ValueError(f"{model}: negative gpu index in {idxs}")
+        # Only range-check AUTO-assigned indices against the device count. Explicit
+        # gpu_indices are physical CUDA ids — an endpoint pinned to a high subset
+        # (e.g. visible_devices "6,7") legitimately has ids >= the count, so the
+        # count is not a valid upper bound for them.
+        if not explicit_idxs and total and any(g >= total for g in idxs):
             raise ValueError(f"{model}: gpu_indices {idxs} out of range for total_gpus={total}")
         if served in seen_names:
             raise ValueError(f"duplicate served_name {served}")

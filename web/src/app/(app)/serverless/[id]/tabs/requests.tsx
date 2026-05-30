@@ -180,6 +180,11 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
 
   const [prompt, setPrompt] = useState("Hello, world");
   const [maxTokens, setMaxTokens] = useState(1024);
+  const [temperature, setTemperature] = useState(() => {
+    const t = searchParams.get("temp");
+    const n = Number(t);
+    return t != null && t !== "" && Number.isFinite(n) ? n : 0.7;
+  });
   const [model, setModel] = useState(searchParams.get("model") ?? "");
   const [effort, setEffort] = useState<"none" | "low" | "medium" | "high">(() => {
     const e = searchParams.get("effort");
@@ -229,6 +234,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
       endpoint: "/v1/chat/completions",
       messages: [{ role: "user", content: prompt }],
       max_tokens: maxTokens,
+      temperature,
     };
     if (selectedModel) body.model = selectedModel;
     if (effort !== "none") body.reasoning_effort = effort;
@@ -262,6 +268,11 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
 
   async function send() {
     setSending(true);
+    setSendErr(null);
+    setStreamErr(null);
+    setStreamText("");
+    setStreamReasoning("");
+    setStreamStats(null);
     const t0 = perfNow();
     const ts = Date.now();
     try {
@@ -280,10 +291,9 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
       const id = (respBody as { request_id?: string })?.request_id as string;
       const promptShort = prompt.slice(0, 80);
       upsert({ id, ts, prompt: promptShort, status: "pending", app_id: appId });
-      toast.success(`Queued ${id}`, { duration: 3000 });
-      // Fast measured poll so we can report tokens/sec on completion. The
-      // generic 4 s poll (above) still covers imported/curl-fired ids.
-      void measuredPoll(id, ts, promptShort, t0);
+      // Await so the Send button stays busy and the reasoning/answer panels
+      // fill in when the result lands (same display as the streaming path).
+      await measuredPoll(id, ts, promptShort, t0);
     } catch (e) {
       setSendErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -291,9 +301,9 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
     }
   }
 
-  // Poll a just-fired async request quickly (250 ms) until terminal, then store
-  // tokens + a tokens/sec estimate. TPS is wall-time based (includes RTT + any
-  // queue wait), so it's a lower bound on raw generation speed — shown as "≈".
+  // Poll a just-fired async request quickly (250 ms) until terminal, store
+  // tokens + a tokens/sec estimate, and render its reasoning + answer in the
+  // shared panels. TPS is wall-time based (includes RTT + any queue wait).
   async function measuredPoll(id: string, ts: number, promptShort: string, t0: number) {
     const deadline = perfNow() + 130_000;
     while (perfNow() < deadline) {
@@ -303,6 +313,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
         const res = await fetch(`/api/proxy/result/${encodeURIComponent(id)}`, { cache: "no-store" });
         if (res.status === 404) {
           upsert({ id, ts, prompt: promptShort, status: "expired", app_id: appId });
+          setSendErr("Result expired before it could be read.");
           return;
         }
         body = await res.json();
@@ -315,8 +326,19 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
       const tokens = completionTokensOf(body?.output) ?? undefined;
       const tps = tokens != null && elapsedS > 0 ? tokens / elapsedS : undefined;
       upsert({ id, ts, prompt: promptShort, status, output: body?.output, app_id: appId, tokens, tps });
+      const out = body?.output;
+      const oErr = (out as { error?: unknown } | null | undefined)?.error;
+      if (status === "failed" || status === "timeout" || status === "cancelled" || oErr) {
+        setSendErr(typeof oErr === "string" ? oErr : `Request ${status}.`);
+        return;
+      }
+      const { content, reasoning } = parseResult(out);
+      setStreamReasoning(reasoning);
+      setStreamText(content);
+      setStreamStats({ ttftMs: 0, tokens: tokens ?? 0, tps: tps ?? 0 });
       return;
     }
+    setSendErr("Timed out waiting for the result.");
   }
 
   // SSE streaming via POST /stream/{appId}. The gateway relays each vLLM chunk
@@ -520,6 +542,20 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
                 className="h-8 w-24 font-mono"
               />
             </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">temperature</span>
+              <NumberField
+                allowDecimal
+                min={0}
+                max={2}
+                value={temperature}
+                onChange={(v) => {
+                  setTemperature(v);
+                  syncParam("temp", String(v));
+                }}
+                className="h-8 w-24 font-mono"
+              />
+            </div>
             <label className="flex h-8 items-center gap-2 text-xs text-muted-foreground">
               <input
                 type="checkbox"
@@ -561,49 +597,42 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
             )}
           </div>
 
-          {sendErr && (
+          {(sendErr || streamErr) && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-              {sendErr}
+              {sendErr ?? streamErr}
             </div>
           )}
 
-          {(streaming || streamText || streamReasoning || streamErr) && (
+          {(streaming || sending || streamText || streamReasoning) && (
             <div className="space-y-2">
-              {streamErr ? (
-                <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                  {streamErr}
-                </div>
-              ) : (
-                <>
-                  {streamReasoning && (
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                        {streaming && !streamText && <Loader2 className="h-3 w-3 animate-spin" />}
-                        <span>Reasoning</span>
-                      </div>
-                      <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-dashed border-border bg-muted/20 p-3 font-mono text-[11px] italic leading-relaxed text-muted-foreground scrollbar-thin">
-                        {streamReasoning}
-                      </pre>
-                    </div>
-                  )}
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                      <div className="flex items-center gap-2">
-                        {streaming && <Loader2 className="h-3 w-3 animate-spin" />}
-                        <span>{streamReasoning ? "Answer" : "Streaming output"}</span>
-                      </div>
-                      {streamStats && (
-                        <span className="font-mono tabular-nums">
-                          {streamStats.tps.toFixed(1)} tok/s · {streamStats.tokens} tok · TTFT {streamStats.ttftMs} ms
-                        </span>
-                      )}
-                    </div>
-                    <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">
-                      {streamText || (streaming ? "…" : "")}
-                    </pre>
+              {streamReasoning && (
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    {(streaming || sending) && !streamText && <Loader2 className="h-3 w-3 animate-spin" />}
+                    <span>Reasoning</span>
                   </div>
-                </>
+                  <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-dashed border-border bg-muted/20 p-3 font-mono text-[11px] italic leading-relaxed text-muted-foreground scrollbar-thin">
+                    {streamReasoning}
+                  </pre>
+                </div>
               )}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <div className="flex items-center gap-2">
+                    {(streaming || sending) && <Loader2 className="h-3 w-3 animate-spin" />}
+                    <span>Answer</span>
+                  </div>
+                  {streamStats && (
+                    <span className="font-mono tabular-nums">
+                      {streamStats.tps.toFixed(1)} tok/s · {streamStats.tokens} tok
+                      {streamStats.ttftMs > 0 ? ` · TTFT ${streamStats.ttftMs} ms` : ""}
+                    </span>
+                  )}
+                </div>
+                <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">
+                  {streamText || ((streaming || sending) ? "…" : "")}
+                </pre>
+              </div>
             </div>
           )}
 
@@ -887,6 +916,21 @@ function reasoningOf(chunk: Record<string, unknown>): string {
   const d = choices?.[0]?.delta;
   const r = d?.reasoning ?? d?.reasoning_content;
   return typeof r === "string" ? r : "";
+}
+
+// Pull content + reasoning out of a non-streaming chat completion response
+// (choices[0].message), so the result renders in the same panels as streaming.
+function parseResult(output: unknown): { content: string; reasoning: string } {
+  const o = output as
+    | { choices?: Array<{ message?: { content?: unknown; reasoning?: unknown; reasoning_content?: unknown } }> }
+    | null
+    | undefined;
+  const msg = o?.choices?.[0]?.message;
+  const r = msg?.reasoning ?? msg?.reasoning_content;
+  return {
+    content: typeof msg?.content === "string" ? msg.content : "",
+    reasoning: typeof r === "string" ? r : "",
+  };
 }
 
 function maskToken(t: string) {

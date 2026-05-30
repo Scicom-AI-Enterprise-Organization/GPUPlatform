@@ -701,6 +701,11 @@ function FleetModelRow({
       <tr className={cn("border-b border-border/60 last:border-b-0", dead && "bg-status-down/[0.05]")}>
         <td className="px-4 py-3 align-top">
           <div className="font-mono text-xs">{m.model}</div>
+          {m.port != null && (
+            <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+              localhost:{m.port}
+            </div>
+          )}
           {m.reason && (
             // Surface *why* a model isn't serving (e.g. "GPU is not enough")
             // right under its name — the single most useful thing when dead.

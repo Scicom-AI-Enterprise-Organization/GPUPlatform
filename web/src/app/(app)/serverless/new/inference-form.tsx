@@ -129,6 +129,30 @@ function buildVllmArgs(v: typeof DEFAULT_VLLM_ARGS): string {
   return parts.join(" ");
 }
 
+// Flags the platform sets on the `vllm serve` command itself — passing them in
+// user args makes vLLM see a duplicate and refuse to start. Mirrors the
+// gateway's create-time validation so the form catches it instantly.
+const VLLM_RESERVED_SINGLE = ["--model", "--served-model-name", "--port"];
+const VLLM_RESERVED_MULTI = [...VLLM_RESERVED_SINGLE, "--tensor-parallel-size", "-tp", "--enable-sleep-mode"];
+
+/** Returns an error string for obviously-broken vLLM args (stray line-continuation
+ * backslash, unbalanced quotes, platform-reserved flags), else null. */
+function vllmArgsError(args: string, reserved: string[], label: string): string | null {
+  const s = (args ?? "").trim();
+  if (!s) return null;
+  if (/(^|\s)\\(\s|$)/.test(s)) {
+    return `${label}: stray "\\" — looks like a pasted shell line-continuation. Put all args on one line.`;
+  }
+  if (((s.match(/"/g) ?? []).length % 2 !== 0) || ((s.match(/'/g) ?? []).length % 2 !== 0)) {
+    return `${label}: unbalanced quotes in vLLM args.`;
+  }
+  for (const tok of s.split(/\s+/)) {
+    const flag = tok.split("=")[0];
+    if (reserved.includes(flag)) return `${label}: remove "${flag}" — the platform sets it automatically.`;
+  }
+  return null;
+}
+
 export function InferenceForm() {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -306,6 +330,11 @@ export function InferenceForm() {
           setSubmitError(`tp=${m.tp} for ${m.model} must divide the ${effectiveVmGpuCount} selected GPUs.`);
           return;
         }
+        const argErr = vllmArgsError(m.extra_args, VLLM_RESERVED_MULTI, `model ${m.model}`);
+        if (argErr) {
+          setSubmitError(argErr);
+          return;
+        }
       }
       const body: DeployArg = {
         name: slugify(name),
@@ -359,6 +388,11 @@ export function InferenceForm() {
       return;
     }
     const vllmArgs = buildVllmArgs(vllm);
+    const vllmArgErr = vllmArgsError(vllmArgs, VLLM_RESERVED_SINGLE, "vLLM args");
+    if (vllmArgErr) {
+      setSubmitError(vllmArgErr);
+      return;
+    }
     const body: DeployArg = {
       name: slugify(name),
       model: model.trim(),

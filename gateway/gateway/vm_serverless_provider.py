@@ -14,11 +14,14 @@ worker thread (mirroring `vm_probe` / `bench`), since paramiko is sync.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import os
 import shlex
+import tarfile
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from .provider import Provider, ProvisionResult, GpuAvailability
@@ -27,13 +30,45 @@ from . import vm_probe
 logger = logging.getLogger("gateway.vm_provider")
 
 SSH_TIMEOUT_S = 20
-# Where the worker-agent lives so a fresh VM can `uv pip install` it. Overridable
-# for forks / private mirrors. The default points at the public repo's subdir.
-DEFAULT_INSTALL_SPEC = os.environ.get(
-    "WORKER_AGENT_INSTALL_SPEC",
-    "git+https://github.com/AIES-Infra/GPUPlatform.git#subdirectory=worker-agent",
-)
 REMOTE_DIR = "~/.sgpu"
+
+
+def _worker_agent_src_dir() -> str:
+    """Where the worker-agent SOURCE lives so the gateway can ship it to the VM
+    (no git clone of the private repo). `WORKER_AGENT_SRC_DIR` overrides it — set
+    that in the gateway image where worker-agent is bundled; in a source checkout
+    it's the sibling `worker-agent/` of the gateway package."""
+    env = os.environ.get("WORKER_AGENT_SRC_DIR")
+    if env and os.path.isdir(env):
+        return env
+    # gateway/gateway/vm_serverless_provider.py → <repo>/worker-agent
+    cand = Path(__file__).resolve().parents[2] / "worker-agent"
+    if cand.is_dir():
+        return str(cand)
+    raise RuntimeError(
+        "worker-agent source not found — set WORKER_AGENT_SRC_DIR to its directory"
+    )
+
+
+def _worker_agent_tarball_b64() -> str:
+    """A gzip tarball of the worker-agent source, base64-encoded for shipping over
+    the SSH exec channel (proxied front-ends like PAI DSW have no SFTP). Built
+    fresh per call so a code change is picked up without restarting the gateway."""
+    src = _worker_agent_src_dir()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for root, dirs, files in os.walk(src):
+            dirs[:] = [
+                d for d in dirs
+                if d not in ("__pycache__", ".venv", "venv", ".git", "build", "dist")
+                and not d.endswith(".egg-info")
+            ]
+            for f in files:
+                if f.endswith((".pyc", ".pyo")):
+                    continue
+                full = os.path.join(root, f)
+                tar.add(full, arcname=os.path.relpath(full, src))
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 class VMProvider(Provider):
@@ -76,7 +111,9 @@ class VMProvider(Provider):
             or os.environ.get("REDIS_URL")
             or "redis://127.0.0.1:6379"
         )
-        self._install_spec = install_spec or DEFAULT_INSTALL_SPEC
+        # Retained for back-compat; the worker-agent is now shipped as a source
+        # tarball from the gateway (see _launch_sync), not pip-installed from git.
+        self._install_spec = install_spec
         # Reverse-tunnel mode: forward the gateway + Redis back over SSH so the
         # VM reaches them at its own localhost. We compute the local targets from
         # the gateway's own bind/redis env, and tell the worker to use the VM's
@@ -280,20 +317,30 @@ class VMProvider(Provider):
             )
             if rc0 != 0:
                 raise RuntimeError(f"failed to write worker config (rc={rc0}): {err0[:300] or out0[:300]}")
-            # 2. Bootstrap venv + worker-agent (idempotent), then nohup the worker
-            #    pointed at the config file. `uv` is assumed present (same as the
-            #    bench VM flow); fall back to python -m venv + pip if not.
-            install = shlex.quote(self._install_spec)
+            # 2. Ship the worker-agent SOURCE from the gateway — NOT a git clone.
+            #    The repo is private and the VM has no GitHub creds, so we base64
+            #    the source tarball over the same exec channel as the config and
+            #    install it from the local dir. Always reinstalls so a code change
+            #    on the gateway propagates on the next provision.
+            wa_b64 = _worker_agent_tarball_b64()
+            remote_wa_tgz = f"{remote_dir}/wa.tgz"
+            rc_wa, out_wa, err_wa = self._run_full(
+                client,
+                f"echo {wa_b64} | base64 -d > {shlex.quote(remote_wa_tgz)}",
+            )
+            if rc_wa != 0:
+                raise RuntimeError(f"failed to upload worker-agent tarball (rc={rc_wa}): {err_wa[:300] or out_wa[:300]}")
+            wa_dir = f"{REMOTE_DIR}/worker-agent"
             script = (
                 f"set -e; mkdir -p {REMOTE_DIR}; "
                 f"if [ ! -x {venv}/bin/python ]; then "
                 f"  (command -v uv >/dev/null 2>&1 && uv venv {venv}) "
                 f"  || python3 -m venv {venv}; "
                 f"fi; "
-                f"if ! {venv}/bin/python -c 'import worker_agent' 2>/dev/null; then "
-                f"  (command -v uv >/dev/null 2>&1 && uv pip install --python {venv}/bin/python {install}) "
-                f"  || {venv}/bin/pip install {install}; "
-                f"fi; "
+                # Extract the shipped source + install it locally (no network/git).
+                f"rm -rf {wa_dir} && mkdir -p {wa_dir} && tar xzf {REMOTE_DIR}/wa.tgz -C {wa_dir}; "
+                f"(command -v uv >/dev/null 2>&1 && uv pip install --python {venv}/bin/python {wa_dir}) "
+                f"  || {venv}/bin/pip install {wa_dir}; "
                 f"WORKER_CONFIG_FILE={cfg_path} nohup {venv}/bin/python -m worker_agent.main "
                 f"  > {log_path} 2>&1 & echo $! > {pid_path}"
             )

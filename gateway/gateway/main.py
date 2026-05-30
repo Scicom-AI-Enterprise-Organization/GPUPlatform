@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -1049,6 +1050,45 @@ async def get_gpu_availability(
     }
 
 
+# Flags the platform sets on the `vllm serve` command itself — a user passing
+# them in their args makes vLLM see a duplicate argument and refuse to start, so
+# we reject them at create time rather than letting the worker fail to provision.
+_VLLM_RESERVED_SINGLE = {"--model", "--served-model-name", "--port"}
+_VLLM_RESERVED_MULTI = _VLLM_RESERVED_SINGLE | {"--tensor-parallel-size", "-tp", "--enable-sleep-mode"}
+
+
+def _validate_vllm_args(args: Optional[str], *, label: str, reserved: set[str]) -> None:
+    """Reject obviously-broken vLLM arg strings *before* an endpoint is created,
+    so a bad config surfaces as a clear create-time error instead of a worker
+    that silently fails to launch. Catches the common copy-paste mistakes:
+    a stray shell line-continuation backslash, unbalanced quotes, and flags the
+    platform already sets itself. Raises HTTPException(400) on the first problem."""
+    s = (args or "").strip()
+    if not s:
+        return
+    # A bare `\` token is almost always a multi-line shell continuation pasted
+    # onto one line (e.g. `--mm-encoder-tp-mode data \ --mm-processor-cache-type shm`).
+    if re.search(r"(^|\s)\\(\s|$)", s):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label}: stray '\\' in vLLM args — looks like a pasted shell line-continuation. Put all args on one line.",
+        )
+    try:
+        tokens = shlex.split(s)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label}: can't parse vLLM args ({e}). Check for unbalanced quotes.",
+        )
+    for tok in tokens:
+        flag = tok.split("=", 1)[0]
+        if flag in reserved:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label}: remove '{flag}' — the platform sets it automatically.",
+            )
+
+
 @app.post("/apps", response_model=CreateAppResponse)
 async def create_app(
     req: CreateAppRequest,
@@ -1143,6 +1183,7 @@ async def create_app(
             if m.model in seen:
                 raise HTTPException(status_code=400, detail=f"duplicate model in members: {m.model}")
             seen.add(m.model)
+            _validate_vllm_args(m.extra_args, label=f"model {m.model}", reserved=_VLLM_RESERVED_MULTI)
         if req.sleep_level not in (1, 2):
             raise HTTPException(status_code=400, detail="sleep_level must be 1 or 2")
         # One always-on VM fleet — no scale-to-zero, one machine, deeper queue.
@@ -1158,6 +1199,7 @@ async def create_app(
     else:
         if not (req.model or "").strip():
             raise HTTPException(status_code=400, detail="model is required for single-model endpoints")
+        _validate_vllm_args(req.vllm_args, label="vLLM args", reserved=_VLLM_RESERVED_SINGLE)
         if is_vm:
             gpu = "vm"
             total_gpus = int((prov.config or {}).get("gpu_count") or 0)
@@ -1424,6 +1466,22 @@ async def get_app_status(
                         models_state.extend(json.loads(blob))
                     except (json.JSONDecodeError, TypeError):
                         pass
+    # Attach each model's localhost vLLM port. The gateway assigns these
+    # deterministically when it builds the fleet config, so we can recompute
+    # them here and surface `localhost:<port>` per model in the Workers tab —
+    # no worker change needed.
+    if is_multi and models_state:
+        try:
+            from .autoscaler import build_multi_model_config
+            cfg = build_multi_model_config(app)
+            port_by_model = {m["model"]: m.get("port") for m in cfg.get("models", [])}
+            for ms in models_state:
+                p = port_by_model.get(ms.get("model"))
+                if p is not None:
+                    ms["port"] = p
+                    ms["base_url"] = f"localhost:{p}"
+        except Exception:
+            pass
     err = await rdb.get(f"app:{app_id}:last_provision_error")
     err_at_blob = await rdb.get(f"app:{app_id}:last_provision_error_at")
     cooldown_blob = await rdb.get(f"app:{app_id}:provision_cooldown_until")
