@@ -293,6 +293,7 @@ def _resolve_config(
     vm_target: Optional[dict] = None,
     env_vars: Optional[dict] = None,
     visible_devices: Optional[str] = None,
+    runpod_key_path: Optional[str] = None,
 ) -> str:
     """Inject runtime values (SSH key path, RunPod API key) into the user's YAML.
 
@@ -312,9 +313,13 @@ def _resolve_config(
     run_env = _merge_run_env(env_vars, visible_devices)
 
     if vm_target is None:
+        # Prefer the per-run ephemeral key (minted in run_benchmark); fall back to
+        # the legacy static BENCHMARK_SSH_KEY_PATH only if no ephemeral key was
+        # passed (keeps any old explicit-path configs working).
+        rp_key = runpod_key_path or _ssh_key_path()
         rp = cfg.setdefault("runpod", {})
         if not rp.get("ssh_private_key") or "path/to/your" in str(rp.get("ssh_private_key")):
-            rp["ssh_private_key"] = _ssh_key_path()
+            rp["ssh_private_key"] = rp_key
         if not rp.get("runpod_api_key"):
             rp["runpod_api_key"] = os.environ.get("RUNPOD_API_KEY", "")
         # RunPod path: benchmaq's runner forwards `runpod.env` to the pod (--env).
@@ -323,7 +328,7 @@ def _resolve_config(
 
         rem = cfg.setdefault("remote", {})
         if not rem.get("key_filename") or "path/to/your" in str(rem.get("key_filename")):
-            rem["key_filename"] = _ssh_key_path()
+            rem["key_filename"] = rp_key
     else:
         # Bare-metal VM: drop runpod block (irrelevant + would confuse benchmaq)
         # and rewrite remote to use benchmaq's `backend: ssh` runner — a
@@ -434,6 +439,28 @@ async def _materialise_vm_key(work_dir: Path, provider_id: str) -> dict:
         "user": cfg.get("user", "root"),
         "key_filename": str(key_path),
     }
+
+
+def _gen_ephemeral_runpod_key(work_dir: Path, bench_id: str) -> str:
+    """Mint a throwaway SSH keypair for a single RunPod run and return the
+    private-key path.
+
+    benchmaq's RunPod runner reads `<priv>.pub` to inject PUBLIC_KEY into the pod
+    (so the pod's authorized_keys gets our key at boot) and SSHes in with `<priv>`.
+    Generating the pair per-run means the gateway needs no pre-provisioned key on
+    disk (the old BENCHMARK_SSH_KEY_PATH footgun) and works identically in local
+    dev and prod. Both files live under the per-run work dir, are excluded from S3
+    upload (see `_NO_UPLOAD`), and are deleted once benchmaq exits.
+    """
+    import paramiko
+    key = paramiko.RSAKey.generate(2048)
+    priv = work_dir / "rp_key"
+    key.write_private_key_file(str(priv))
+    os.chmod(priv, 0o600)
+    (work_dir / "rp_key.pub").write_text(
+        f"{key.get_name()} {key.get_base64()} sgpu-bench-{bench_id}\n"
+    )
+    return str(priv)
 
 
 def _hf_cache_dir(repo_id: str) -> str:
@@ -736,6 +763,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
 
     vm_target: Optional[dict] = None
     runpod_creds = None
+    runpod_key_path: Optional[str] = None
     if provider_kind == "vm":
         # Guard against benchmaq version drift: the VM path needs the `backend:
         # ssh` runner (run_remote_ssh). If the installed benchmaq is older and
@@ -792,10 +820,22 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                     await s.commit()
             return
 
+    # RunPod path (no VM target): mint a throwaway SSH keypair per run so we
+    # don't depend on a pre-provisioned key on disk. benchmaq injects the .pub
+    # into the pod (PUBLIC_KEY) and SSHes with the private half; both are deleted
+    # once benchmaq exits.
+    if vm_target is None:
+        try:
+            runpod_key_path = _gen_ephemeral_runpod_key(work, bench_id)
+            await _push_log(redis, bench_id, "[gateway] minted ephemeral SSH keypair for pod access")
+        except Exception as e:
+            await _push_log(redis, bench_id, f"[gateway] could not mint SSH keypair: {e}")
+
     cfg_path = work / "config.yaml"
     cfg_path.write_text(_resolve_config(
         raw_yaml, vm_target=vm_target,
         env_vars=run_env_vars, visible_devices=run_visible_devices,
+        runpod_key_path=runpod_key_path,
     ))
 
     if vm_target:
@@ -878,6 +918,16 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
 
     await _push_log(redis, bench_id, f"[gateway] benchmaq exited rc={rc}")
 
+    # Shred the per-run ephemeral SSH keypair now that the pod work is done. The
+    # pod (and its injected PUBLIC_KEY) is torn down separately; the private key
+    # has no further use and shouldn't linger in /tmp.
+    if runpod_key_path:
+        for _p in (Path(runpod_key_path), Path(runpod_key_path + ".pub")):
+            try:
+                _p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     # Bare-metal runs leave the model in the VM's HF cache + local_dir. Clean
     # both up so a series of benchmarks on different models doesn't fill the
     # VM's disk. Best-effort: failures are logged but don't change the run
@@ -897,7 +947,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     prefix = s3_prefix
     s3_put_text(
         f"{prefix}config.yaml",
-        _resolve_config(raw_yaml, vm_target=vm_target, env_vars=run_env_vars, visible_devices=run_visible_devices),
+        _resolve_config(raw_yaml, vm_target=vm_target, env_vars=run_env_vars, visible_devices=run_visible_devices, runpod_key_path=runpod_key_path),
         target=target,
     )
     result_json: Optional[dict] = None
@@ -915,7 +965,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
 
     # Never upload secrets/control files. `vm_key` is the decrypted SSH private
     # key materialised for the run — uploading it leaks the VM credential to S3.
-    _NO_UPLOAD = {"config.yaml", "_full.log", "vm_key", "vm_key.pub"}
+    _NO_UPLOAD = {"config.yaml", "_full.log", "vm_key", "vm_key.pub", "rp_key", "rp_key.pub"}
     # Big per-request arrays — dropped from the aggregate result.json summary.
     _DROP_KEYS = {
         "generated_texts", "input_texts", "itls", "tpots", "ttfts", "e2els",

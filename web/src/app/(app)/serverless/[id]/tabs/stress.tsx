@@ -476,15 +476,15 @@ function SavedRunsComparison({
 
   return (
     <Card>
-      <CardHeader className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:space-y-0">
-        <div className="flex flex-col gap-0.5">
+      <CardHeader className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3 sm:space-y-0">
+        <div className="flex min-w-0 flex-col gap-0.5">
           <CardTitle className="text-sm font-medium">Saved runs · compare</CardTitle>
           <CardDescription className="text-xs">
             Completed runs are saved server-side. Pick which to compare below, then copy a link to share the exact
             comparison with anyone who can view this endpoint. Best value per row is highlighted.
           </CardDescription>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <Button variant="outline" size="xs" onClick={copyLink} disabled={included.length === 0}>
             {copied ? <Check className="h-3 w-3" /> : <Link2 className="h-3 w-3" />}
             {copied ? "Copied" : "Copy link"}
