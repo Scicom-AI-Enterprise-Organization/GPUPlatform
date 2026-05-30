@@ -1269,21 +1269,17 @@ async def create_app(
         if int(autoscaler_dict.get("tasks_per_container", 30) or 30) < 64:
             autoscaler_dict["tasks_per_container"] = 64
     else:
+        # VM providers serve multi-model fleets only — a 1-model fleet covers the
+        # single-model case and adds sleep/wake, and single-model VM serving was
+        # never wired up. Single-model mode is for cloud (RunPod / PI) scale-to-zero.
+        if is_vm:
+            raise HTTPException(
+                status_code=400,
+                detail="VM providers serve multi-model fleets — use mode='multi' with at least one model.",
+            )
         if not (req.model or "").strip():
             raise HTTPException(status_code=400, detail="model is required for single-model endpoints")
         _validate_vllm_args(req.vllm_args, label="vLLM args", reserved=_VLLM_RESERVED_SINGLE)
-        if is_vm:
-            gpu = "vm"
-            total_gpus = int((prov.config or {}).get("gpu_count") or 0)
-            if total_gpus and req.gpu_count > total_gpus:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"gpu_count={req.gpu_count} exceeds the VM's {total_gpus} GPUs",
-                )
-            # A GPU pin fixes how many GPUs this endpoint uses.
-            if vd_ids:
-                gpu_count = len(vd_ids)
-            autoscaler_dict["max_containers"] = 1  # a VM is one fixed node
 
     record = App(
         app_id=req.name,
@@ -1523,6 +1519,7 @@ async def get_app_status(
     autoscaler is either idle or scaling cleanly."""
     app = await _load_owned_app(session, app_id, user)
     rdb = request.app.state.redis
+    paused = bool(await rdb.get(f"app:{app_id}:paused"))
     queue_len = await rdb.llen(f"queue:{app_id}")
     workers = await rdb.smembers(f"worker_index:{app_id}")
     live_workers = 0
@@ -1580,6 +1577,7 @@ async def get_app_status(
         "mode": getattr(app, "mode", "single") or "single",
         "models": models_state,
         "sleep_level": int(getattr(app, "sleep_level", 1) or 1),
+        "paused": paused,
     }
 
 
@@ -1743,10 +1741,30 @@ async def restart_app_workers(
     session: AsyncSession = Depends(get_session),
 ):
     """Drain + terminate every worker so the autoscaler respawns with the latest
-    config (e.g. updated vllm_args)."""
+    config (e.g. updated vllm_args). Also resumes a killed/paused fleet."""
     await _load_owned_app(session, app_id, user)
-    n = await _reprovision_workers(request.app.state.redis, session, app_id, user, request.app.state)
+    rdb = request.app.state.redis
+    await rdb.delete(f"app:{app_id}:paused")  # resume if it was killed
+    n = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
     return {"ok": True, "app_id": app_id, "drained_workers": n}
+
+
+@app.post("/apps/{app_id}/workers/kill")
+async def kill_app_workers(
+    app_id: str,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Drain + terminate every worker AND pause the autoscaler so it stays down —
+    unlike /restart, which respawns. Frees the GPUs until you resume with Restart
+    all / Redeploy (/restart) or by editing the model list."""
+    await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    await rdb.set(f"app:{app_id}:paused", "1")
+    n = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
+    logger.info("kill workers app=%s by user=%s: terminated %d, paused", app_id, user.username, n)
+    return {"ok": True, "app_id": app_id, "killed_workers": n, "paused": True}
 
 
 @app.patch("/apps/{app_id}/models", response_model=AppRecord)
@@ -1808,7 +1826,9 @@ async def update_app_models(
     await session.commit()
     await session.refresh(target)
 
-    n = await _reprovision_workers(request.app.state.redis, session, app_id, user, request.app.state)
+    rdb = request.app.state.redis
+    await rdb.delete(f"app:{app_id}:paused")  # editing implies you want it running
+    n = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
     logger.info("models updated app=%s by user=%s: %d models, reprovisioned %d worker(s)",
                 app_id, user.username, len(req.models), n)
     return _to_app_record(target)

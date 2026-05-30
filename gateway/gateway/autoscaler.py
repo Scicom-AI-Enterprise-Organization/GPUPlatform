@@ -252,6 +252,12 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
             desired = max(desired, 1)
     desired = min(max_containers, desired)
 
+    # Killed / paused (POST /apps/{id}/workers/kill): keep the fleet down. Override
+    # the always-on bump so we don't immediately respawn the worker the user just
+    # killed. Cleared by Redeploy (restart) or editing the model list.
+    if await rdb.get(f"app:{app_id}:paused"):
+        desired = 0
+
     last_request_blob = await rdb.get(f"app:{app_id}:last_request_ts")
     last_request_ts = float(last_request_blob) if last_request_blob else 0.0
     idle_for = time.time() - last_request_ts if last_request_ts else float("inf")

@@ -12,6 +12,7 @@ import {
   Loader2,
   Play,
   Search,
+  Trash2,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -30,6 +31,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { DEFAULT_TOOLS_JSON } from "@/lib/playground-tools";
 
 type RequestStatus =
   | "pending"
@@ -203,11 +205,17 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   // Live throughput while streaming: TTFT + tokens/sec (output tokens since the
   // first token). Finalised from `usage` when the model reports it.
   const [streamStats, setStreamStats] = useState<{ ttftMs: number; tokens: number; tps: number } | null>(null);
+  const [streamToolCalls, setStreamToolCalls] = useState("");
   const streamAbort = useRef<AbortController | null>(null);
 
   // Equivalent OpenAI curl for the last-sent request (shared on Run).
   const [sentBody, setSentBody] = useState<Record<string, unknown> | null>(null);
   const [revealToken, setRevealToken] = useState(false);
+  // Tool calling (function calling): when on, the request carries `tools` +
+  // `tool_choice` and the model can reply with tool_calls instead of prose.
+  const [useTools, setUseTools] = useState(false);
+  const [toolsText, setToolsText] = useState(DEFAULT_TOOLS_JSON);
+  const [showToolsEditor, setShowToolsEditor] = useState(false);
   const [token, setToken] = useState<string | null>(null);
   useEffect(() => {
     let abort = false;
@@ -227,6 +235,17 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   // Derived (not stored) so a model arriving after first render still selects.
   const selectedModel = model || models[0] || "";
 
+  // Parse the tools JSON once per edit; null = invalid (don't send it).
+  const parsedTools = useMemo<unknown[] | null>(() => {
+    try {
+      const p = JSON.parse(toolsText);
+      return Array.isArray(p) ? p : null;
+    } catch {
+      return null;
+    }
+  }, [toolsText]);
+  const toolsCount = parsedTools?.length ?? 0;
+
   // Chat-completion payload so chat-template params apply. `endpoint` is a
   // control field the gateway pops; everything else is forwarded to vLLM.
   function buildBody(): Record<string, unknown> {
@@ -239,6 +258,10 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
     if (selectedModel) body.model = selectedModel;
     if (effort !== "none") body.reasoning_effort = effort;
     if (disableThinking) body.chat_template_kwargs = { enable_thinking: false };
+    if (useTools && parsedTools && parsedTools.length > 0) {
+      body.tools = parsedTools;
+      body.tool_choice = "auto";
+    }
     return body;
   }
 
@@ -257,6 +280,11 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   function onSend() {
     setSendErr(null);
     setStreamErr(null);
+    setStreamToolCalls("");
+    if (useTools && !parsedTools) {
+      setSendErr("Tools JSON is invalid — fix it or turn off tools.");
+      return;
+    }
     if (!prompt.trim()) {
       setSendErr("Prompt is required.");
       return;
@@ -272,6 +300,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
     setStreamErr(null);
     setStreamText("");
     setStreamReasoning("");
+    setStreamToolCalls("");
     setStreamStats(null);
     const t0 = perfNow();
     const ts = Date.now();
@@ -332,9 +361,10 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
         setSendErr(typeof oErr === "string" ? oErr : `Request ${status}.`);
         return;
       }
-      const { content, reasoning } = parseResult(out);
+      const { content, reasoning, toolCalls } = parseResult(out);
       setStreamReasoning(reasoning);
       setStreamText(content);
+      setStreamToolCalls(toolCalls);
       setStreamStats({ ttftMs: 0, tokens: tokens ?? 0, tps: tps ?? 0 });
       return;
     }
@@ -351,9 +381,11 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
     setStreamErr(null);
     setStreamText("");
     setStreamReasoning("");
+    setStreamToolCalls("");
     setStreamStats(null);
     // include_usage → vLLM appends a final chunk with exact token usage.
     const body = { ...buildBody(), stream_options: { include_usage: true } };
+    const toolAcc: ToolCallAcc[] = [];
     const t0 = perfNow();
     let tFirst: number | null = null;
     let count = 0; // tokens seen (≈ one per delta), refined by usage at the end
@@ -420,6 +452,17 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
             if (piece) {
               acc += piece;
               setStreamText(acc);
+              bump();
+            }
+            const tcDeltas = toolCallDeltasOf(chunk);
+            if (tcDeltas.length) {
+              for (const d of tcDeltas) {
+                const i = typeof d.index === "number" ? d.index : toolAcc.length;
+                if (!toolAcc[i]) toolAcc[i] = { name: "", args: "" };
+                if (typeof d.function?.name === "string") toolAcc[i].name = d.function.name;
+                if (typeof d.function?.arguments === "string") toolAcc[i].args += d.function.arguments;
+              }
+              setStreamToolCalls(formatToolCalls(toolAcc.filter(Boolean)));
               bump();
             }
           }
@@ -583,6 +626,26 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
               />
               <span>stream</span>
             </label>
+            <label className="flex h-8 items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={useTools}
+                onChange={(e) => {
+                  setUseTools(e.target.checked);
+                  if (e.target.checked) setShowToolsEditor(true);
+                }}
+                className="h-4 w-4 cursor-pointer accent-primary"
+              />
+              <span>
+                tools
+                <span className="ml-1 font-mono text-[10px]">tool_choice=auto</span>
+              </span>
+            </label>
+            {useTools && (
+              <Button variant="ghost" size="xs" onClick={() => setShowToolsEditor((v) => !v)}>
+                {showToolsEditor ? "Hide" : "Edit"} tools ({toolsCount})
+              </Button>
+            )}
             <div className="flex-1" />
             {streaming ? (
               <Button variant="outline" onClick={stopStream}>
@@ -597,13 +660,43 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
             )}
           </div>
 
+          {useTools && showToolsEditor && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <span className="text-muted-foreground">
+                  tools (OpenAI function schema) — sent with <code className="font-mono">tool_choice: &quot;auto&quot;</code>
+                </span>
+                <div className="flex items-center gap-2">
+                  {parsedTools ? (
+                    <span className="text-muted-foreground">{toolsCount} function{toolsCount === 1 ? "" : "s"}</span>
+                  ) : (
+                    <span className="text-destructive">invalid JSON</span>
+                  )}
+                  <Button variant="ghost" size="xs" onClick={() => setToolsText(DEFAULT_TOOLS_JSON)}>
+                    Reset
+                  </Button>
+                </div>
+              </div>
+              <Textarea
+                value={toolsText}
+                onChange={(e) => setToolsText(e.target.value)}
+                rows={8}
+                spellCheck={false}
+                className={cn(
+                  "max-h-72 font-mono text-[11px] leading-relaxed",
+                  !parsedTools && "border-destructive focus-visible:ring-destructive/30",
+                )}
+              />
+            </div>
+          )}
+
           {(sendErr || streamErr) && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
               {sendErr ?? streamErr}
             </div>
           )}
 
-          {(streaming || sending || streamText || streamReasoning) && (
+          {(streaming || sending || streamText || streamReasoning || streamToolCalls) && (
             <div className="space-y-2">
               {streamReasoning && (
                 <div className="space-y-1">
@@ -616,23 +709,35 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
                   </pre>
                 </div>
               )}
-              <div className="space-y-1">
-                <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                  <div className="flex items-center gap-2">
-                    {(streaming || sending) && <Loader2 className="h-3 w-3 animate-spin" />}
-                    <span>Answer</span>
+              {streamToolCalls && (
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <span>Tool calls</span>
                   </div>
-                  {streamStats && (
-                    <span className="font-mono tabular-nums">
-                      {streamStats.tps.toFixed(1)} tok/s · {streamStats.tokens} tok
-                      {streamStats.ttftMs > 0 ? ` · TTFT ${streamStats.ttftMs} ms` : ""}
-                    </span>
-                  )}
+                  <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-status-active/40 bg-status-active/5 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
+                    {streamToolCalls}
+                  </pre>
                 </div>
-                <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">
-                  {streamText || ((streaming || sending) ? "…" : "")}
-                </pre>
-              </div>
+              )}
+              {(streamText || streaming || sending) && (
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                    <div className="flex items-center gap-2">
+                      {(streaming || sending) && <Loader2 className="h-3 w-3 animate-spin" />}
+                      <span>Answer</span>
+                    </div>
+                    {streamStats && (
+                      <span className="font-mono tabular-nums">
+                        {streamStats.tps.toFixed(1)} tok/s · {streamStats.tokens} tok
+                        {streamStats.ttftMs > 0 ? ` · TTFT ${streamStats.ttftMs} ms` : ""}
+                      </span>
+                    )}
+                  </div>
+                  <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">
+                    {streamText || ((streaming || sending) ? "…" : "")}
+                  </pre>
+                </div>
+              )}
             </div>
           )}
 
@@ -648,7 +753,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
                 )}
               </div>
               <div className="relative">
-                <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
+                <pre className="max-h-80 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
                   {curlFor(base, appId, revealToken && token ? token : token ? maskToken(token) : "YOUR_API_KEY", sentBody)}
                 </pre>
                 <Button
@@ -680,7 +785,13 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
             </p>
           </div>
           {history.length > 0 && (
-            <Button variant="ghost" size="xs" onClick={clearAll}>
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={clearAll}
+              className="text-muted-foreground hover:text-destructive"
+            >
+              <Trash2 className="h-3 w-3" />
               Clear all
             </Button>
           )}
@@ -918,18 +1029,65 @@ function reasoningOf(chunk: Record<string, unknown>): string {
   return typeof r === "string" ? r : "";
 }
 
-// Pull content + reasoning out of a non-streaming chat completion response
-// (choices[0].message), so the result renders in the same panels as streaming.
-function parseResult(output: unknown): { content: string; reasoning: string } {
+type ToolCallAcc = { name: string; args: string };
+
+// Render accumulated tool calls as `name({pretty-args})`, one per block.
+function formatToolCalls(calls: ToolCallAcc[]): string {
+  return calls
+    .filter((c) => c.name || c.args)
+    .map((c) => {
+      let args = c.args;
+      try {
+        args = JSON.stringify(JSON.parse(c.args || "{}"), null, 2);
+      } catch {
+        /* keep raw partial args (e.g. mid-stream) */
+      }
+      return `${c.name || "?"}(${args})`;
+    })
+    .join("\n\n");
+}
+
+// Streamed tool-call fragments: choices[0].delta.tool_calls = [{index, function:{name?, arguments?}}].
+function toolCallDeltasOf(chunk: Record<string, unknown>): Array<{
+  index?: number;
+  function?: { name?: unknown; arguments?: unknown };
+}> {
+  const choices = chunk.choices as Array<{ delta?: { tool_calls?: unknown } }> | undefined;
+  const tc = choices?.[0]?.delta?.tool_calls;
+  return Array.isArray(tc) ? tc : [];
+}
+
+// Pull content + reasoning + tool calls out of a non-streaming chat completion
+// response (choices[0].message), so the result renders in the same panels.
+function parseResult(output: unknown): { content: string; reasoning: string; toolCalls: string } {
   const o = output as
-    | { choices?: Array<{ message?: { content?: unknown; reasoning?: unknown; reasoning_content?: unknown } }> }
+    | {
+        choices?: Array<{
+          message?: {
+            content?: unknown;
+            reasoning?: unknown;
+            reasoning_content?: unknown;
+            tool_calls?: Array<{ function?: { name?: unknown; arguments?: unknown } }>;
+          };
+        }>;
+      }
     | null
     | undefined;
   const msg = o?.choices?.[0]?.message;
   const r = msg?.reasoning ?? msg?.reasoning_content;
+  const calls: ToolCallAcc[] = Array.isArray(msg?.tool_calls)
+    ? msg!.tool_calls.map((tc) => ({
+        name: typeof tc?.function?.name === "string" ? tc.function.name : "?",
+        args:
+          typeof tc?.function?.arguments === "string"
+            ? tc.function.arguments
+            : JSON.stringify(tc?.function?.arguments ?? {}),
+      }))
+    : [];
   return {
     content: typeof msg?.content === "string" ? msg.content : "",
     reasoning: typeof r === "string" ? r : "",
+    toolCalls: formatToolCalls(calls),
   };
 }
 

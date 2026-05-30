@@ -10,7 +10,7 @@
 #   make helm-template render the helm chart with sample values
 #   make clean         remove .venv and __pycache__
 
-.PHONY: install test test-fast compose-up compose-down compose-nuke \
+.PHONY: install runpodctl test test-fast compose-up compose-down compose-nuke \
         helm-lint helm-template clean pi-check pi-up verify-values \
         ecr-create-repos ecr-build-push ecr-build-push-gateway ecr-build-push-worker
 
@@ -23,6 +23,18 @@ install:
 	VIRTUAL_ENV=$(PWD)/$(VENV) uv pip install -e ./gateway -e ./worker-agent -e ./sdk
 	VIRTUAL_ENV=$(PWD)/$(VENV) uv pip install \
 	  pytest pytest-asyncio fakeredis httpx
+	$(MAKE) runpodctl
+
+# runpodctl — RunPod's CLI. benchmaq shells out to it for RunPod-target runs,
+# and the gateway prepends $(VENV)/bin to benchmaq's PATH, so it must live here
+# (alongside the gateway/benchmaq binaries), not rely on a system-wide install.
+runpodctl:
+	@os=$$(uname -s | tr 'A-Z' 'a-z'); arch=$$(uname -m); \
+	  case "$$arch" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; esac; \
+	  url="https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-$$os-$$arch"; \
+	  echo "installing runpodctl ($$os-$$arch) -> $(VENV)/bin/runpodctl"; \
+	  curl -fsSL -o "$(VENV)/bin/runpodctl" "$$url" && chmod +x "$(VENV)/bin/runpodctl"; \
+	  "$(VENV)/bin/runpodctl" version
 
 test:
 	$(PY) -m pytest tests/ -v

@@ -486,7 +486,7 @@ type FleetModel = {
   reason?: string | null;  // human cause when state === "dead"
   port?: number;
 };
-type FleetStatus = { workers: number; models: FleetModel[] };
+type FleetStatus = { workers: number; models: FleetModel[]; paused?: boolean };
 
 const FLEET_STATE_STYLES: Record<string, string> = {
   awake:     "bg-status-active/15 text-status-active",
@@ -573,14 +573,42 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
     }
   }
 
+  // Kill: tear the worker down AND pause the autoscaler so it stays down (frees
+  // the GPUs). Resume with Restart all. Restart: drain + reprovision (cold
+  // restart), which also clears the paused flag.
+  const [killing, setKilling] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  async function workerAction(path: string, busy: (b: boolean) => void) {
+    busy(true);
+    setErr(null);
+    try {
+      const r = await fetch(`/api/proxy/apps/${encodeURIComponent(app.app_id)}/${path}`, { method: "POST" });
+      if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
+      window.setTimeout(fetchStatus, 1500);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      busy(false);
+    }
+  }
+  const killAll = () => workerAction("workers/kill", setKilling);
+  const restartAll = () => workerAction("restart", setRestarting);
+  const paused = status?.paused ?? false;
+  const busy = sleepingAll || killing || restarting;
+
   return (
     <Card className="overflow-hidden">
       <div className="flex items-center justify-between gap-3 border-b border-border bg-muted/30 px-4 py-2 text-xs">
         <div className="flex items-center gap-3">
           <span className="text-muted-foreground">
             VM worker:{" "}
-            <span className={cn("font-medium", workerUp ? "text-status-active" : "text-muted-foreground")}>
-              {workerUp ? "up" : status === null ? "…" : "down"}
+            <span
+              className={cn(
+                "font-medium",
+                workerUp ? "text-status-active" : paused ? "text-status-down" : "text-muted-foreground",
+              )}
+            >
+              {workerUp ? "up" : paused ? "killed (paused)" : status === null ? "…" : "down"}
             </span>
           </span>
           <span className="text-muted-foreground">
@@ -599,11 +627,27 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
           </Button>
           <Button
             variant="outline" size="xs" onClick={sleepAll}
-            disabled={sleepingAll || !anyAwake}
-            title="Sleep all awake models (free their GPUs)"
+            disabled={busy || !anyAwake}
+            title="Sleep all awake models (free their VRAM; worker stays up)"
           >
             {sleepingAll ? <Loader2 className="h-3 w-3 animate-spin" /> : <Moon className="h-3 w-3" />}
             Sleep all
+          </Button>
+          <Button
+            variant="outline" size="xs" onClick={restartAll} disabled={busy}
+            title="Drain + reprovision the worker (cold restart). Also resumes a killed fleet."
+          >
+            {restarting ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCw className="h-3 w-3" />}
+            Restart all
+          </Button>
+          <Button
+            variant="outline" size="xs" onClick={killAll}
+            disabled={busy || !workerUp}
+            title="Terminate the worker and keep it down (frees the GPUs). Resume with Restart all."
+            className="text-destructive hover:text-destructive"
+          >
+            {killing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Ban className="h-3 w-3" />}
+            Kill all workers
           </Button>
           <Button variant="outline" size="xs" onClick={fetchStatus} disabled={loading}>
             {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}

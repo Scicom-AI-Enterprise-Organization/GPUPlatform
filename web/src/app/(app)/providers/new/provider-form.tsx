@@ -320,23 +320,23 @@ export function ProviderForm() {
       )}
 
       <div className="flex items-center gap-3">
-        {test.status === "ok" && (
-          <span className="text-sm text-emerald-600 dark:text-emerald-400">
-            ✓ {test.message}
-            {test.gpus.length > 0 && (
-              <span className="ml-1 font-mono text-xs text-muted-foreground">
-                ({test.gpus.slice(0, 2).join(", ")}{test.gpus.length > 2 ? `, …+${test.gpus.length - 2}` : ""})
-              </span>
-            )}
-          </span>
-        )}
-        {test.status === "fail" && (
-          <span className="text-sm text-destructive">✕ {test.message}</span>
-        )}
         {submitError && (
           <span className="text-sm text-destructive">{submitError}</span>
         )}
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-3">
+          {test.status === "ok" && (
+            <span className="text-sm text-emerald-600 dark:text-emerald-400">
+              ✓ {test.message}
+              {test.gpus.length > 0 && (
+                <span className="ml-1 font-mono text-xs text-muted-foreground">
+                  ({test.gpus.slice(0, 2).join(", ")}{test.gpus.length > 2 ? `, …+${test.gpus.length - 2}` : ""})
+                </span>
+              )}
+            </span>
+          )}
+          {test.status === "fail" && (
+            <span className="text-sm text-destructive">✕ {test.message}</span>
+          )}
           <Button
             type="button"
             variant="outline"

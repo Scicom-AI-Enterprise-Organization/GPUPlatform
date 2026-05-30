@@ -48,6 +48,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Tabs,
@@ -66,18 +67,34 @@ import {
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
-import type { BenchmarkTemplate, ProviderRecord, StorageRecord, VmAvailability } from "@/lib/types";
+import type { BenchmarkTemplate, GpuTypeOption, ProviderRecord, StorageRecord, VmAvailability } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-const GPU_OPTIONS = [
-  { id: "NVIDIA RTX A4000", label: "RTX A4000", hint: "16 GB · cheap baseline" },
-  { id: "NVIDIA RTX A5000", label: "RTX A5000", hint: "24 GB" },
-  { id: "NVIDIA RTX A6000", label: "RTX A6000", hint: "48 GB" },
-  { id: "NVIDIA GeForce RTX 4090", label: "RTX 4090", hint: "24 GB · consumer" },
-  { id: "NVIDIA L40", label: "L40", hint: "48 GB" },
-  { id: "NVIDIA L40S", label: "L40S", hint: "48 GB · faster L40" },
-  { id: "NVIDIA A100 80GB PCIe", label: "A100 80GB", hint: "datacenter" },
-  { id: "NVIDIA H100 80GB HBM3", label: "H100 80GB", hint: "fastest" },
+// Fallback only — the live list comes from the gateway (/compute/runpod/gpu-types).
+// Used until that fetch lands, or if it fails (offline / no key).
+const GPU_COUNT_CHOICES = [1, 2, 4, 8] as const;
+
+// Rough capacity estimate (mirrors the serverless form): ~55% of total VRAM for
+// weights, the rest for KV cache / activations / overhead.
+function capacityHint(vramGb: number, count: number): string {
+  const total = vramGb * count;
+  const weights = total * 0.55;
+  const fp16 = weights / 2;
+  const q4 = weights / 0.6;
+  const r = (b: number) => (b >= 100 ? `${Math.round(b / 10) * 10}B` : `${Math.round(b)}B`);
+  const totalStr = total >= 100 ? `${Math.round(total)} GB` : `${total} GB`;
+  return `${totalStr} VRAM${count > 1 ? ` · TP=${count} sharding` : ""} · fits ~${r(fp16)} FP16 / ~${r(q4)} 4-bit (KV-cache budgeted)`;
+}
+
+const RUNPOD_GPU_FALLBACK: GpuTypeOption[] = [
+  { id: "NVIDIA RTX A4000", label: "RTX A4000", vram_gb: 16, hint: "16 GB · cheap baseline" },
+  { id: "NVIDIA RTX A5000", label: "RTX A5000", vram_gb: 24, hint: "24 GB" },
+  { id: "NVIDIA RTX A6000", label: "RTX A6000", vram_gb: 48, hint: "48 GB" },
+  { id: "NVIDIA GeForce RTX 4090", label: "RTX 4090", vram_gb: 24, hint: "24 GB · consumer" },
+  { id: "NVIDIA L40", label: "L40", vram_gb: 48, hint: "48 GB" },
+  { id: "NVIDIA L40S", label: "L40S", vram_gb: 48, hint: "48 GB · faster L40" },
+  { id: "NVIDIA A100 80GB PCIe", label: "A100 80GB", vram_gb: 80, hint: "datacenter" },
+  { id: "NVIDIA H100 80GB HBM3", label: "H100 80GB", vram_gb: 80, hint: "fastest" },
 ];
 
 // Container image presets for the RunPod pod. CUDA version matters because
@@ -134,6 +151,7 @@ type FormState = {
   gpu_count: number;
   secure_cloud: boolean;
   disk_size: number;
+  volume_size: number;
   container_image: string;
   model_repo_id: string;
   // All vLLM engine args are strings so empty = "use vLLM default" — same
@@ -172,8 +190,9 @@ const DEFAULTS: FormState = {
   benchName: "qwen-quick",
   gpu_type: "NVIDIA RTX A4000",
   gpu_count: 1,
-  secure_cloud: false,
+  secure_cloud: true,
   disk_size: 80,
+  volume_size: 80,
   container_image: DEFAULT_CONTAINER_IMAGE,
   model_repo_id: "Qwen/Qwen2.5-0.5B-Instruct",
   tensor_parallel_size: "",
@@ -344,7 +363,7 @@ function renderYaml(s: FormState, target: "cloud" | "vm" = "cloud"): string {
     image: "${s.container_image || DEFAULT_CONTAINER_IMAGE}"
     disk_size: ${s.disk_size}
   storage:
-    volume_size: ${s.disk_size}
+    volume_size: ${s.volume_size}
     mount_path: "/workspace"
   ports:
     http: [8000]
@@ -612,6 +631,8 @@ export function BenchmarkForm({
   // enabled storages are eligible.
   const [storages, setStorages] = useState<StorageRecord[]>([]);
   const [storageId, setStorageId] = useState<string>("");
+  // RunPod GPU catalog — fetched live from the gateway, fallback until it lands.
+  const [gpuOptions, setGpuOptions] = useState<GpuTypeOption[]>(RUNPOD_GPU_FALLBACK);
   const [cleanupModel, setCleanupModel] = useState(true);
   // CUDA_VISIBLE_DEVICES pin + extra env exported for the run (cache/home dirs).
   const [visibleDevices, setVisibleDevices] = useState("");
@@ -660,6 +681,15 @@ export function BenchmarkForm({
     gateway.listBenchmarkTemplates().then(setTemplates).catch(() => {});
     gateway.listProviders().then(setProviders).catch(() => {});
     gateway.listStorage().then(setStorages).catch(() => {});
+    gateway
+      .listRunpodGpuTypes()
+      .then((rows) => {
+        if (rows.length === 0) return;
+        setGpuOptions(rows);
+        // If the current pick isn't in the live catalog, fall to the first.
+        setForm((f) => (rows.some((g) => g.id === f.gpu_type) ? f : { ...f, gpu_type: rows[0].id }));
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -959,16 +989,8 @@ export function BenchmarkForm({
             title="Pod"
             description={
               target === "cloud"
-                ? "GPU and disk for the RunPod instance benchmaq spawns."
+                ? "GPU, count, and cloud tier for the RunPod instance benchmaq spawns."
                 : "Which registered VM benchmaq should SSH into. Hardware is fixed by the VM."
-            }
-            action={
-              target === "cloud" ? (
-                <AvailabilityBadge
-                  state={availability}
-                  count={form.gpu_count}
-                />
-              ) : undefined
             }
           >
           {target === "vm" && (
@@ -1047,11 +1069,10 @@ export function BenchmarkForm({
             </div>
           )}
           {target === "cloud" && (
-            <Grid>
+            <div className="space-y-5">
               <FieldWrap
-                label="RunPod account (API key)"
+                label="RunPod account"
                 hint="Which RunPod provider to bill against. Default = gateway env key."
-                wide
               >
                 <Select
                   value={runpodProviderId || "__default__"}
@@ -1061,7 +1082,7 @@ export function BenchmarkForm({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__default__">Gateway default</SelectItem>
+                    <SelectItem value="__default__">Gateway default (RunPod)</SelectItem>
                     {providers
                       .filter((p) => p.kind === "runpod")
                       .map((p) => (
@@ -1073,73 +1094,97 @@ export function BenchmarkForm({
                   </SelectContent>
                 </Select>
                 {providers.filter((p) => p.kind === "runpod").length === 0 && (
-                  <p className="mt-1 text-xs text-muted-foreground">
+                  <p className="text-xs text-muted-foreground">
                     None registered. <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add a RunPod account →</a>
                   </p>
                 )}
               </FieldWrap>
+
               <FieldWrap
-                label="GPU type"
-                hint="Pick what fits your model in VRAM."
-                wide
+                label="Cloud tier"
+                hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity."
               >
-                <Select
-                  value={form.gpu_type}
-                  onValueChange={(v) => field("gpu_type", v)}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {GPU_OPTIONS.map((g) => (
-                      <SelectItem key={g.id} value={g.id}>
-                        <div className="flex w-full items-center justify-between gap-3">
-                          <span>{g.label}</span>
-                          <span className="text-xs text-muted-foreground">
-                            {g.hint}
-                          </span>
-                        </div>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <div className="grid grid-cols-2 gap-2">
+                  {([["secure", "Secure", "vetted hosts, more capacity"], ["community", "Community", "cheaper, variable hosts"]] as const).map(
+                    ([val, title, sub]) => {
+                      const selected = (val === "secure") === form.secure_cloud;
+                      return (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => field("secure_cloud", val === "secure")}
+                          className={cn(
+                            "rounded-md border p-3 text-left transition-colors",
+                            selected
+                              ? "border-foreground/60 ring-1 ring-foreground/20"
+                              : "border-border hover:border-foreground/40",
+                          )}
+                        >
+                          <div className="text-sm font-medium">{title}</div>
+                          <div className="mt-0.5 text-xs text-muted-foreground">{sub}</div>
+                        </button>
+                      );
+                    },
+                  )}
+                </div>
               </FieldWrap>
-              <FieldWrap label="GPU count" hint="Set > 1 for tensor parallelism.">
-                <NumberField
-                  min={1}
-                  max={8}
-                  value={form.gpu_count}
-                  onChange={(v) => field("gpu_count", v)}
-                />
-              </FieldWrap>
-              <FieldWrap label="Disk (GB)" hint="Container + volume. Big models need more.">
-                <NumberField
-                  min={20}
-                  value={form.disk_size}
-                  onChange={(v) => field("disk_size", v)}
-                />
-              </FieldWrap>
+
               <FieldWrap
-                label="Cloud type"
-                hint="Community = cheaper, sometimes flaky."
-                wide
+                label="GPU"
+                hint={(() => {
+                  const g = gpuOptions.find((o) => o.id === form.gpu_type);
+                  return g ? capacityHint(g.vram_gb, form.gpu_count) : undefined;
+                })()}
+                extra={<AvailabilityBadge state={availability} count={form.gpu_count} />}
               >
-                <Select
-                  value={form.secure_cloud ? "secure" : "community"}
-                  onValueChange={(v) =>
-                    field("secure_cloud", v === "secure")
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="community">Community</SelectItem>
-                    <SelectItem value="secure">Secure</SelectItem>
-                  </SelectContent>
-                </Select>
+                <div className="flex gap-2">
+                  <SearchableSelect
+                    className="flex-1"
+                    value={form.gpu_type}
+                    onChange={(v) => field("gpu_type", v)}
+                    options={gpuOptions.map((g) => ({
+                      value: g.id,
+                      label: g.label,
+                      hint: capacityHint(g.vram_gb, 1),
+                    }))}
+                    placeholder="Choose a GPU"
+                    searchPlaceholder="Search GPUs (e.g. h100, 24gb, ada)…"
+                  />
+                  <Select
+                    value={String(form.gpu_count)}
+                    onValueChange={(v) => field("gpu_count", Number.parseInt(v, 10))}
+                  >
+                    <SelectTrigger className="w-24 shrink-0">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {GPU_COUNT_CHOICES.map((n) => (
+                        <SelectItem key={n} value={String(n)}>
+                          ×{n}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
               </FieldWrap>
-            </Grid>
+
+              <div className="grid grid-cols-2 gap-3">
+                <FieldWrap label="Container disk (GB)" hint="Ephemeral workspace. Resets when the pod stops.">
+                  <NumberField min={20} value={form.disk_size} onChange={(v) => field("disk_size", v)} />
+                </FieldWrap>
+                <FieldWrap label="Volume (GB)" hint="Persistent volume mounted at /workspace (model cache).">
+                  <NumberField min={0} value={form.volume_size} onChange={(v) => field("volume_size", v)} />
+                </FieldWrap>
+              </div>
+
+              <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  Pick a GPU with enough VRAM for your model. vLLM will fail to load if the
+                  weights plus KV cache exceed GPU memory.
+                </span>
+              </div>
+            </div>
           )}
           </SectionCard>
 
@@ -1955,16 +2000,21 @@ function FieldWrap({
   label,
   hint,
   wide,
+  extra,
   children,
 }: {
   label: string;
   hint?: string;
   wide?: boolean;
+  extra?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
     <div className={cn("space-y-1.5", wide ? "sm:col-span-2 lg:col-span-2" : "")}>
-      <Label className="text-xs font-medium">{label}</Label>
+      <div className="flex items-center justify-between gap-2">
+        <Label className="text-xs font-medium">{label}</Label>
+        {extra}
+      </div>
       {children}
       {hint && <p className="text-[11px] leading-snug text-muted-foreground">{hint}</p>}
     </div>

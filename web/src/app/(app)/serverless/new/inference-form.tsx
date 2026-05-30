@@ -170,7 +170,7 @@ export function InferenceForm() {
   const [cloudType, setCloudType] = useState<"COMMUNITY" | "SECURE">("COMMUNITY");
   const [containerDisk, setContainerDisk] = useState<string>("50");
   const [volumeGb, setVolumeGb] = useState<string>("0");
-  const [idleInput, setIdleInput] = useState("0");
+  const [idleInput, setIdleInput] = useState("120"); // 2 min scale-to-zero (single-model only; multi VM fleets are always-on)
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [enableMetrics, setEnableMetrics] = useState(true);
   // Run-on target (mirrors the benchmark form): "cloud" spawns a fresh RunPod
@@ -180,8 +180,6 @@ export function InferenceForm() {
   const [runpodProviderId, setRunpodProviderId] = useState<string>("");
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [vllm, setVllm] = useState({ ...DEFAULT_VLLM_ARGS });
-  // Serving mode + multi-model fleet (multi requires a VM provider).
-  const [mode, setMode] = useState<"single" | "multi">("single");
   const [members, setMembers] = useState<{ model: string; tp: number; extra_args: string; gpus: string }[]>([
     { model: "", tp: 1, extra_args: "", gpus: "" },
   ]);
@@ -227,6 +225,10 @@ export function InferenceForm() {
   // chosen RunPod account ("" = gateway default). isVm now keys off the target.
   const providerId = target === "vm" ? vmProviderId : runpodProviderId;
   const isVm = target === "vm";
+  // Serving mode follows the target: VM → multi-model fleet (single-model serving
+  // + sleep/wake eviction); cloud (RunPod/PI) → single-model scale-to-zero. There
+  // is no single-model mode on a VM.
+  const mode: "single" | "multi" = isVm ? "multi" : "single";
   const selectedProvider = providers.find((p) => p.id === vmProviderId) || null;
   const vmGpuCount = selectedProvider?.gpu_count ?? 0;
   // Optional GPU pin. vdIds = chosen physical ids; vdInvalid flags bad input;
@@ -478,7 +480,6 @@ export function InferenceForm() {
               type="button"
               onClick={() => {
                 setTarget("cloud");
-                setMode("single");
                 setVmAvail({ status: "idle" });
               }}
               className={cn(
@@ -647,47 +648,7 @@ export function InferenceForm() {
                 />
               </Field>
               </>
-            ) : (
-              <Field
-                label="GPU"
-                hint={(() => {
-                  const g = GPU_CHOICES.find((c) => c.value === gpu);
-                  return g ? capacityHint(g.vramGb, gpuCount) : undefined;
-                })()}
-                extra={<AvailabilityBadge state={availability} count={gpuCount} />}
-              >
-                <div className="flex gap-2">
-                  <SearchableSelect
-                    className="flex-1"
-                    value={gpu}
-                    onChange={setGpu}
-                    options={GPU_CHOICES.map((g) => ({
-                      value: g.value,
-                      label: g.label,
-                      group: g.group,
-                      hint: capacityHint(g.vramGb, 1),
-                    }))}
-                    placeholder="Choose a GPU"
-                    searchPlaceholder="Search GPUs (e.g. h100, 24gb, ada)…"
-                  />
-                  <Select
-                    value={String(gpuCount)}
-                    onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}
-                  >
-                    <SelectTrigger className="w-24 shrink-0">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {GPU_COUNT_CHOICES.map((n) => (
-                        <SelectItem key={n} value={String(n)}>
-                          ×{n}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </Field>
-            )}
+            ) : null}
 
             {!isVm && (
             <>
@@ -718,6 +679,46 @@ export function InferenceForm() {
                     </div>
                   </button>
                 ))}
+              </div>
+            </Field>
+
+            <Field
+              label="GPU"
+              hint={(() => {
+                const g = GPU_CHOICES.find((c) => c.value === gpu);
+                return g ? capacityHint(g.vramGb, gpuCount) : undefined;
+              })()}
+              extra={<AvailabilityBadge state={availability} count={gpuCount} />}
+            >
+              <div className="flex gap-2">
+                <SearchableSelect
+                  className="flex-1"
+                  value={gpu}
+                  onChange={setGpu}
+                  options={GPU_CHOICES.map((g) => ({
+                    value: g.value,
+                    label: g.label,
+                    group: g.group,
+                    hint: capacityHint(g.vramGb, 1),
+                  }))}
+                  placeholder="Choose a GPU"
+                  searchPlaceholder="Search GPUs (e.g. h100, 24gb, ada)…"
+                />
+                <Select
+                  value={String(gpuCount)}
+                  onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}
+                >
+                  <SelectTrigger className="w-24 shrink-0">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {GPU_COUNT_CHOICES.map((n) => (
+                      <SelectItem key={n} value={String(n)}>
+                        ×{n}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
             </Field>
 
@@ -796,42 +797,20 @@ export function InferenceForm() {
               </Field>
             )}
 
-            <Field
-              label="Serving mode"
-              hint={
-                isVm
-                  ? "Single = one model. Multi = a fleet of models on this VM, routed by name with sleep/wake eviction."
-                  : "Multi-model serving requires a VM provider (select one above)."
-              }
-            >
-              <div className="grid grid-cols-2 gap-2">
-                {(["single", "multi"] as const).map((mo) => {
-                  const disabled = mo === "multi" && !isVm;
-                  return (
-                    <button
-                      key={mo}
-                      type="button"
-                      disabled={disabled}
-                      onClick={() => setMode(mo)}
-                      className={cn(
-                        "rounded-md border p-3 text-left transition-colors",
-                        mode === mo
-                          ? "border-foreground/60 ring-1 ring-foreground/20"
-                          : "border-border hover:border-foreground/40",
-                        disabled && "cursor-not-allowed opacity-50 hover:border-border",
-                      )}
-                    >
-                      <div className="text-sm font-medium">
-                        {mo === "single" ? "Single model" : "Multi-model"}
-                      </div>
-                      <div className="mt-0.5 text-xs text-muted-foreground">
-                        {mo === "single" ? "one model per endpoint" : "many models, sleep/wake"}
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            </Field>
+            <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              {isVm ? (
+                <>
+                  <span className="font-medium text-foreground">Multi-model fleet</span> — models share this VM&apos;s
+                  GPUs and swap in via sleep/wake. Add one model for a single-model endpoint (you still get the
+                  sleep/wake benefits).
+                </>
+              ) : (
+                <>
+                  <span className="font-medium text-foreground">Single-model endpoint</span> — one model per RunPod /
+                  PI pod, scale-to-zero. Use a VM provider for a multi-model fleet.
+                </>
+              )}
+            </div>
 
             <Field label="Endpoint name" required>
               <Input

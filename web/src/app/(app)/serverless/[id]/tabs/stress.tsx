@@ -223,7 +223,7 @@ export function StressTab({ app }: { app: AppRecord }) {
             {models.length > 0 && (
               <Field label="model" width="w-[240px]">
                 <Select value={selectedModel} onValueChange={(v) => { setModel(v); writeUrl({ model: v }); }} disabled={running}>
-                  <SelectTrigger className="h-8 font-mono text-xs">
+                  <SelectTrigger className="h-8 w-full min-w-0 font-mono text-xs" title={selectedModel}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -250,7 +250,7 @@ export function StressTab({ app }: { app: AppRecord }) {
             </Field>
             <Field label="run from" width="w-[180px]">
               <Select value={mode} onValueChange={(v) => setMode(v as RunMode)} disabled={running}>
-                <SelectTrigger className="h-8 text-xs">
+                <SelectTrigger className="h-8 w-full min-w-0 text-xs">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

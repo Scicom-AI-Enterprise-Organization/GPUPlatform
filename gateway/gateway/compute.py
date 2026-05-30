@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from . import audit
-from .auth import require_admin, require_section
+from .auth import current_user, require_admin, require_section
 from .db import Base, User, get_session, session_factory
 from .runpod_provider import _map_gpu
 
@@ -1379,13 +1379,15 @@ class GpuTypeOption(BaseModel):
     hint: str = ""
 
 
+# Static GPU catalogs (just names + VRAM) — any authenticated user can read them
+# (the Benchmark form needs them too, not only Compute users).
 @router.get("/runpod/gpu-types", response_model=list[GpuTypeOption])
-async def list_runpod_gpu_types(_: User = Depends(require_section("compute"))):
+async def list_runpod_gpu_types(_: User = Depends(current_user)):
     return [GpuTypeOption(**g) for g in RUNPOD_GPU_TYPES]
 
 
 @router.get("/pi/gpu-types", response_model=list[GpuTypeOption])
-async def list_pi_gpu_types(_: User = Depends(require_section("compute"))):
+async def list_pi_gpu_types(_: User = Depends(current_user)):
     return [GpuTypeOption(**g) for g in PI_GPU_TYPES]
 
 
