@@ -78,11 +78,18 @@ def build_multi_model_config(app) -> dict:
     for m in members:
         model = m["model"]
         tp = max(1, int(m.get("tp", 1) or 1))
-        n_slots = max(1, universe // tp) if universe else 1
-        si = slot_cursor.get(tp, 0) % n_slots
-        slot_cursor[tp] = si + 1
-        start = si * tp
-        gpu_indices = phys[start:start + tp] if phys else list(range(start, start + tp))
+        # Explicit pin wins: the user chose exactly which physical GPUs this model
+        # runs on (validated at create/update time). Otherwise auto-pack into the
+        # next free tp-wide slot, round-robin per tp size.
+        pinned = [int(x) for x in (m.get("gpu_indices") or [])]
+        if pinned:
+            gpu_indices = pinned
+        else:
+            n_slots = max(1, universe // tp) if universe else 1
+            si = slot_cursor.get(tp, 0) % n_slots
+            slot_cursor[tp] = si + 1
+            start = si * tp
+            gpu_indices = phys[start:start + tp] if phys else list(range(start, start + tp))
         out.append({
             "model": model,
             "served_name": model,

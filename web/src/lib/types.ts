@@ -12,6 +12,9 @@ export type MultiModelMember = {
   model: string;
   tp: number;          // tensor-parallel size = GPUs this model needs
   extra_args: string;  // per-model vLLM CLI args
+  // Optional explicit GPU pin (physical ids within visible_devices, len == tp).
+  // null/omitted = auto-pack into the next free tp-wide slot.
+  gpu_indices?: number[] | null;
 };
 
 export type ServingMode = "single" | "multi";

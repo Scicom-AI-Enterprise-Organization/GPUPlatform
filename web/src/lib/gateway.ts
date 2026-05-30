@@ -123,6 +123,16 @@ export const gateway = {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
+  // Edit a multi-model fleet in place (add/remove members, change tp, change
+  // per-model vLLM args) and re-provision. Pass the FULL new member list.
+  updateModels: (
+    id: string,
+    body: { models: { model: string; tp?: number; extra_args?: string }[]; sleep_level?: number; visible_devices?: string },
+  ) =>
+    request<AppRecord>(`/apps/${encodeURIComponent(id)}/models`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
   deleteApp: (id: string) =>
     request<{ ok: boolean; app_id: string; drained_workers: number }>(
       `/apps/${encodeURIComponent(id)}`,

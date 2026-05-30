@@ -25,6 +25,8 @@ import {
 } from "@/components/ui/select";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { cn } from "@/lib/utils";
+import { parseGpuIds, suggestPacking } from "@/lib/gpu-pin";
+import { cleanVllmArgs } from "@/lib/vllm-args";
 import { deployEndpoint } from "../actions";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
@@ -180,8 +182,8 @@ export function InferenceForm() {
   const [vllm, setVllm] = useState({ ...DEFAULT_VLLM_ARGS });
   // Serving mode + multi-model fleet (multi requires a VM provider).
   const [mode, setMode] = useState<"single" | "multi">("single");
-  const [members, setMembers] = useState<{ model: string; tp: number; extra_args: string }[]>([
-    { model: "", tp: 1, extra_args: "" },
+  const [members, setMembers] = useState<{ model: string; tp: number; extra_args: string; gpus: string }[]>([
+    { model: "", tp: 1, extra_args: "", gpus: "" },
   ]);
   const [sleepLevel, setSleepLevel] = useState<1 | 2>(1);
   // VM-only: pin to specific physical GPU ids, e.g. "0,1,2,3". Empty = all GPUs.
@@ -239,10 +241,22 @@ export function InferenceForm() {
     (vdIds.some((n) => !Number.isInteger(n) || n < 0 || (vmGpuCount > 0 && n >= vmGpuCount)) ||
       new Set(vdIds).size !== vdIds.length);
   const effectiveVmGpuCount = isVm && vdIds.length > 0 && !vdInvalid ? vdIds.length : vmGpuCount;
-  // tp choices for multi: divisors of the usable (possibly pinned) GPU count.
+  // tp choices for multi: any (power-of-two) size up to the usable GPU count. We
+  // do NOT require tp to divide the count — the packer + optional per-model GPU
+  // pin handle non-dividing layouts, e.g. tp=4 on 7 GPUs → [0,1,2,3].
   const tpChoices = effectiveVmGpuCount > 0
-    ? GPU_COUNT_CHOICES.filter((n) => n <= effectiveVmGpuCount && effectiveVmGpuCount % n === 0)
+    ? GPU_COUNT_CHOICES.filter((n) => n <= effectiveVmGpuCount)
     : [1, 2, 4, 8];
+  // Physical GPU universe used to suggest per-model pins: an explicit
+  // visible_devices pin, else 0..vmGpuCount-1. Suggestions mirror the gateway's
+  // auto-packer so "what you see is what deploys".
+  const physForSuggest =
+    isVm && vdIds.length > 0 && !vdInvalid
+      ? vdIds
+      : isVm
+        ? Array.from({ length: vmGpuCount }, (_, i) => i)
+        : [];
+  const memberSuggestions = suggestPacking(members.map((m) => m.tp), physForSuggest);
   const [unavailableModal, setUnavailableModal] = useState<
     | { gpu: string; gpu_count: number; reason: string }
     | null
@@ -325,16 +339,47 @@ export function InferenceForm() {
         setSubmitError(`GPU IDs must be unique indices in 0..${(vmGpuCount || 1) - 1}.`);
         return;
       }
-      for (const m of cleanedMembers) {
-        if (effectiveVmGpuCount > 0 && (m.tp > effectiveVmGpuCount || effectiveVmGpuCount % m.tp !== 0)) {
-          setSubmitError(`tp=${m.tp} for ${m.model} must divide the ${effectiveVmGpuCount} selected GPUs.`);
+      const allowedGpus =
+        vdIds.length > 0 && !vdInvalid
+          ? new Set(vdIds)
+          : new Set(Array.from({ length: vmGpuCount }, (_, k) => k));
+      const modelsPayload: { model: string; tp: number; extra_args: string; gpu_indices?: number[] }[] = [];
+      for (let i = 0; i < members.length; i++) {
+        const raw = members[i];
+        const mdl = raw.model.trim();
+        if (!mdl) continue;
+        if (effectiveVmGpuCount > 0 && raw.tp > effectiveVmGpuCount) {
+          setSubmitError(`tp=${raw.tp} for ${mdl} exceeds the ${effectiveVmGpuCount} selected GPUs.`);
           return;
         }
-        const argErr = vllmArgsError(m.extra_args, VLLM_RESERVED_MULTI, `model ${m.model}`);
+        const argErr = vllmArgsError(raw.extra_args.trim(), VLLM_RESERVED_MULTI, `model ${mdl}`);
         if (argErr) {
           setSubmitError(argErr);
           return;
         }
+        // The field shows the suggested pin by default; submit what's shown so
+        // "what you see is what deploys". Blank only happens when no GPUs are known.
+        let gpu_indices: number[] | null;
+        try {
+          gpu_indices = parseGpuIds(raw.gpus || memberSuggestions[i] || "", raw.tp, `model ${mdl}`);
+        } catch (e) {
+          setSubmitError(e instanceof Error ? e.message : String(e));
+          return;
+        }
+        if (gpu_indices && effectiveVmGpuCount > 0) {
+          const bad = gpu_indices.filter((g) => !allowedGpus.has(g));
+          if (bad.length) {
+            const pool = [...allowedGpus].sort((a, b) => a - b).join(",");
+            setSubmitError(`model ${mdl}: GPU id(s) ${bad.join(",")} aren't in the selected GPUs (${pool}).`);
+            return;
+          }
+        }
+        modelsPayload.push({
+          model: mdl,
+          tp: raw.tp,
+          extra_args: raw.extra_args.trim(),
+          ...(gpu_indices ? { gpu_indices } : {}),
+        });
       }
       const body: DeployArg = {
         name: slugify(name),
@@ -342,7 +387,7 @@ export function InferenceForm() {
         gpu_count: effectiveVmGpuCount,
         provider_id: providerId || null,
         mode: "multi",
-        models: cleanedMembers,
+        models: modelsPayload,
         sleep_level: sleepLevel,
         autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: 0 },
         enable_metrics: enableMetrics,
@@ -810,7 +855,7 @@ export function InferenceForm() {
               <div className="space-y-4">
                 <Field
                   label="Models"
-                  hint={`Each model has its own TP (set by the dropdown — don't add --tensor-parallel-size) and its own vLLM args (e.g. --reasoning-parser / --tool-call-parser). Slots = ${vmGpuCount || "N"} GPUs ÷ TP; extra models share GPUs and swap in via sleep/wake.`}
+                  hint={`Each model has its own TP (set by the dropdown — don't add --tensor-parallel-size), its own GPU ids (pre-filled with a suggestion — edit to pin, e.g. 0,1,2,3 or 3,4,5,6), and its own vLLM args (e.g. --reasoning-parser / --tool-call-parser). Models on disjoint GPUs stay resident together; overlapping ones swap in via sleep/wake.`}
                   required
                 >
                   <div className="space-y-2">
@@ -854,11 +899,34 @@ export function InferenceForm() {
                             Remove
                           </Button>
                         </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="shrink-0 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                            GPU ids
+                          </span>
+                          <Input
+                            className="w-44 bg-muted/50 font-mono text-xs"
+                            value={m.gpus || memberSuggestions[i]}
+                            onChange={(e) =>
+                              setMembers((arr) => arr.map((x, j) => (j === i ? { ...x, gpus: e.target.value } : x)))
+                            }
+                            placeholder="auto"
+                            aria-label="GPU ids"
+                          />
+                          {memberSuggestions[i] && (
+                            <span className="text-[11px] text-muted-foreground">
+                              {(m.gpus || memberSuggestions[i]) === memberSuggestions[i]
+                                ? "suggested — edit to pin different GPUs"
+                                : `suggested: ${memberSuggestions[i]}`}
+                            </span>
+                          )}
+                        </div>
                         <Input
                           className="bg-muted/50 font-mono text-xs"
                           value={m.extra_args}
                           onChange={(e) =>
-                            setMembers((arr) => arr.map((x, j) => (j === i ? { ...x, extra_args: e.target.value } : x)))
+                            setMembers((arr) =>
+                              arr.map((x, j) => (j === i ? { ...x, extra_args: cleanVllmArgs(e.target.value) } : x)),
+                            )
                           }
                           placeholder="vLLM args, e.g. --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice --max-model-len 262144"
                         />
@@ -867,7 +935,7 @@ export function InferenceForm() {
                   </div>
                   <button
                     type="button"
-                    onClick={() => setMembers((arr) => [...arr, { model: "", tp: 1, extra_args: "" }])}
+                    onClick={() => setMembers((arr) => [...arr, { model: "", tp: 1, extra_args: "", gpus: "" }])}
                     className="mt-2 text-xs text-primary hover:underline"
                   >
                     + Add model

@@ -3,6 +3,7 @@
 
 import { cookies } from "next/headers";
 import { TOKEN_COOKIE } from "./auth-cookie";
+import { disabledSections } from "./sections";
 
 const GATEWAY = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
@@ -28,7 +29,17 @@ export async function getMe(): Promise<Me | null> {
       cache: "no-store",
     });
     if (!r.ok) return null;
-    return (await r.json()) as Me;
+    const me = (await r.json()) as Me;
+    // Honor the web's own DISABLED_SECTIONS — zero out disabled surfaces so the
+    // sidebar nav AND every page that gates on `me.sections.*` treat them as off,
+    // even if the gateway hasn't disabled them.
+    const disabled = disabledSections();
+    if (disabled.size && me.sections) {
+      for (const s of disabled) {
+        if (s in me.sections) (me.sections as Record<string, boolean>)[s] = false;
+      }
+    }
+    return me;
   } catch {
     return null;
   }

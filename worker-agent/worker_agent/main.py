@@ -169,6 +169,32 @@ async def log_shipper_loop(
                 pass
 
 
+async def metrics_shipper_loop(gateway_url, machine_id, app_id, members_fn, drain_event, interval_s: float = 15.0) -> None:
+    """Scrape each live member's local vLLM /metrics and ship them to the gateway
+    for the combined /metrics/workers scrape target. `members_fn()` returns
+    [(served_name, base_url)]. Best-effort — never blocks the worker."""
+    url = f"{gateway_url.rstrip('/')}/workers/metrics"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while not drain_event.is_set():
+            metrics: dict[str, str] = {}
+            for served, base_url in members_fn():
+                try:
+                    r = await client.get(f"{base_url}/metrics", timeout=5.0)
+                    if r.status_code == 200 and r.text:
+                        metrics[served] = r.text
+                except Exception:
+                    pass
+            if metrics:
+                try:
+                    await client.post(url, json={"machine_id": machine_id, "app_id": app_id, "metrics": metrics})
+                except httpx.HTTPError as e:
+                    logger.warning("metrics shipper post failed: %s", e)
+            try:
+                await asyncio.wait_for(drain_event.wait(), timeout=interval_s)
+            except asyncio.TimeoutError:
+                pass
+
+
 async def _safe_cmd(cmd_fn, model: str, action: str) -> None:
     try:
         await cmd_fn(model, action)
@@ -523,6 +549,10 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
         log_tasks.append(asyncio.create_task(
             log_shipper_loop(gateway_url, machine_id, app_id, self_log, drain_event, source="__worker__")
         ))
+    # Ship each member's vLLM /metrics to the gateway's combined scrape target.
+    log_tasks.append(asyncio.create_task(
+        metrics_shipper_loop(gateway_url, machine_id, app_id, sched.live_members, drain_event)
+    ))
     monitor_task = asyncio.create_task(sched.monitor_loop(drain_event))
     try:
         await rdb.ping()

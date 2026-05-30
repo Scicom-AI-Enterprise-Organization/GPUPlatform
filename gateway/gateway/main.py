@@ -36,7 +36,7 @@ from .auth import (
     revoke_session,
     verify_password,
 )
-from .db import ApiKey, App, AuditLog, PolicyRole, Request as ReqRow, User, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
+from .db import ApiKey, App, AuditLog, PolicyRole, Request as ReqRow, StressRun, User, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
 from . import audit as audit_module
 from . import bench as bench_module
 from . import compute as compute_module
@@ -68,6 +68,42 @@ class MultiModelMember(BaseModel):
     model: str
     tp: int = 1                 # tensor-parallel size = GPUs this model needs
     extra_args: str = ""        # per-model vLLM CLI args
+    # Optional explicit GPU pin: the physical ids (within `visible_devices`) this
+    # model runs on, e.g. [0,1,2,3]. len must == tp. None/empty = auto-pack into
+    # the next free tp-wide slot. Models with disjoint pins load concurrently;
+    # overlapping pins time-share those GPUs via vLLM sleep/wake.
+    gpu_indices: Optional[list[int]] = None
+
+
+class UpdateModelsRequest(BaseModel):
+    # Edit a multi-model fleet in place (PATCH /apps/{id}/models): the full new
+    # member list (add/remove/retp/re-arg), optionally re-pinning the GPUs.
+    models: list[MultiModelMember]
+    sleep_level: Optional[int] = None
+    visible_devices: Optional[str] = None
+
+
+class StressRunCreate(BaseModel):
+    # A completed browser-driven stress run to persist (POST /apps/{id}/stress-runs).
+    model: str = ""
+    input_len: int
+    output_len: int
+    num_prompts: int
+    concurrency: int
+    summary: dict  # opaque client-computed metric block (throughput + percentiles)
+
+
+class StressRunRecord(BaseModel):
+    id: str
+    app_id: str
+    created_by: str
+    model: str
+    input_len: int
+    output_len: int
+    num_prompts: int
+    concurrency: int
+    summary: dict
+    created_at: datetime
 
 
 class CreateAppRequest(BaseModel):
@@ -175,6 +211,14 @@ class WorkerLogsRequest(BaseModel):
     # Multi-model workers tag each batch with the member's served_name so logs
     # bucket per model (one vLLM process per model). None → single-mode worker.
     source: Optional[str] = None
+
+
+class WorkerMetricsRequest(BaseModel):
+    # A worker ships each member's raw vLLM /metrics (Prometheus text), keyed by
+    # served_name, for the gateway's combined /metrics/workers scrape target.
+    machine_id: str
+    app_id: str
+    metrics: dict[str, str] = Field(default_factory=dict)
 
 
 class ModelActionRequest(BaseModel):
@@ -1089,6 +1133,29 @@ def _validate_vllm_args(args: Optional[str], *, label: str, reserved: set[str]) 
             )
 
 
+def _normalize_member_gpu_indices(m, *, vd_ids, usable_gpus: int, label: str):
+    """Validate + normalize an optional per-model GPU pin (`gpu_indices`). Returns
+    the cleaned list of physical ids, or None when unset → the packer auto-assigns
+    a tp-wide slot. `vd_ids` is the endpoint's visible_devices id list (or falsy
+    when it spans 0..usable_gpus-1). Raises ValueError(msg) on a bad pin."""
+    idxs = [int(x) for x in (m.gpu_indices or [])]
+    if not idxs:
+        return None
+    if any(g < 0 for g in idxs):
+        raise ValueError(f"{label}: gpu_indices must be >= 0")
+    if len(set(idxs)) != len(idxs):
+        raise ValueError(f"{label}: gpu_indices has duplicate ids {idxs}")
+    if len(idxs) != int(m.tp):
+        raise ValueError(f"{label}: gpu_indices {idxs} must have exactly tp={m.tp} id(s)")
+    if vd_ids:
+        bad = [g for g in idxs if g not in set(vd_ids)]
+        if bad:
+            raise ValueError(f"{label}: gpu_indices {bad} not in this endpoint's GPUs {sorted(set(vd_ids))}")
+    elif usable_gpus and any(g >= usable_gpus for g in idxs):
+        raise ValueError(f"{label}: gpu_indices {idxs} out of range — pick from 0..{usable_gpus - 1}")
+    return idxs
+
+
 @app.post("/apps", response_model=CreateAppResponse)
 async def create_app(
     req: CreateAppRequest,
@@ -1184,6 +1251,11 @@ async def create_app(
                 raise HTTPException(status_code=400, detail=f"duplicate model in members: {m.model}")
             seen.add(m.model)
             _validate_vllm_args(m.extra_args, label=f"model {m.model}", reserved=_VLLM_RESERVED_MULTI)
+            try:
+                m.gpu_indices = _normalize_member_gpu_indices(
+                    m, vd_ids=vd_ids, usable_gpus=usable_gpus, label=f"model {m.model}")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
         if req.sleep_level not in (1, 2):
             raise HTTPException(status_code=400, detail="sleep_level must be 1 or 2")
         # One always-on VM fleet — no scale-to-zero, one machine, deeper queue.
@@ -1623,6 +1695,46 @@ async def update_app_autoscaler(
     return _to_app_record(target)
 
 
+async def _reprovision_workers(rdb, session, app_id: str, user: User, app_state) -> int:
+    """Drain + terminate every worker for this app so the autoscaler respawns it
+    with the app's latest config (updated vllm_args, model list, tp, …). Drain
+    lets in-flight requests wrap up; terminate() actually frees the pod/engines
+    (RunPod doesn't reap exited containers; VM engines are reaped per-PID). Picks
+    up orphan machines (in the provider but not in worker_index) too. Returns the
+    number of machines terminated."""
+    from .autoscaler import emit_worker_event
+
+    tracked = set(await rdb.smembers(f"worker_index:{app_id}"))
+    for mid in tracked:
+        await rdb.set(f"worker:{mid}:drain", "1", ex=600)
+        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (reprovision)")
+
+    provider = await _provider_for_app(session, app_id, user, app_state)
+    all_machines = set(tracked)
+    if provider is not None:
+        try:
+            orphans = set(await provider.list_machines_for_app(app_id)) - tracked
+            if orphans:
+                logger.info("reprovision app %s: also terminating %d orphan machines", app_id, len(orphans))
+                all_machines |= orphans
+        except Exception:
+            logger.exception("reprovision app %s: list_machines_for_app failed", app_id)
+        for mid in all_machines:
+            try:
+                await provider.terminate(mid)
+                await emit_worker_event(rdb, mid, app_id, "info", "terminated (reprovision)")
+            except Exception:
+                logger.exception("reprovision app %s: provider.terminate(%s) failed", app_id, mid)
+                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (reprovision)")
+
+    for mid in all_machines:
+        await rdb.delete(f"worker:{mid}", f"register_token:{mid}", f"worker:{mid}:models")
+    if all_machines:
+        await rdb.srem(f"worker_index:{app_id}", *all_machines)
+    logger.info("reprovision app %s: drained=%d terminated=%d", app_id, len(tracked), len(all_machines))
+    return len(all_machines)
+
+
 @app.post("/apps/{app_id}/restart")
 async def restart_app_workers(
     app_id: str,
@@ -1630,50 +1742,199 @@ async def restart_app_workers(
     user: User = Depends(require_section("inference")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Drain + terminate every worker for this app so the autoscaler
-    respawns with the latest config (e.g. updated vllm_args).
-
-    Setting the drain marker lets in-flight heartbeat-bound requests wrap up
-    cleanly; calling provider.terminate() actually deletes the underlying
-    RunPod pod (otherwise it lingers, since RunPod doesn't reap exited
-    containers and we'd accumulate phantom pods on each restart). Picks up
-    orphan pods (in the provider but not in worker_index) too."""
-    rdb = request.app.state.redis
+    """Drain + terminate every worker so the autoscaler respawns with the latest
+    config (e.g. updated vllm_args)."""
     await _load_owned_app(session, app_id, user)
-    from .autoscaler import emit_worker_event
+    n = await _reprovision_workers(request.app.state.redis, session, app_id, user, request.app.state)
+    return {"ok": True, "app_id": app_id, "drained_workers": n}
 
-    tracked = set(await rdb.smembers(f"worker_index:{app_id}"))
-    for mid in tracked:
-        await rdb.set(f"worker:{mid}:drain", "1", ex=600)
-        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (restart)")
 
-    provider = await _provider_for_app(session, app_id, user, request.app.state)
-    all_machines = set(tracked)
-    if provider is not None:
+@app.patch("/apps/{app_id}/models", response_model=AppRecord)
+async def update_app_models(
+    app_id: str,
+    req: UpdateModelsRequest,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Edit a multi-model VM fleet in place: add/remove members, change a model's
+    `tp`, or tweak its vLLM `extra_args` — then re-provision so the worker reloads
+    the new fleet. (Same validation as create.) Single-model endpoints use
+    `PATCH /apps/{id}/autoscaler` (vllm_args) instead."""
+    target = await _load_owned_app(session, app_id, user)
+    if (getattr(target, "mode", "single") or "single") != "multi":
+        raise HTTPException(status_code=400, detail={"error": "only multi-model endpoints have an editable model list"})
+    if not req.models:
+        raise HTTPException(status_code=400, detail={"error": "models cannot be empty — delete the endpoint instead"})
+    if req.sleep_level is not None and req.sleep_level not in (1, 2):
+        raise HTTPException(status_code=400, detail={"error": "sleep_level must be 1 or 2"})
+
+    # GPU universe: an updated visible_devices pin (else the app's current one).
+    vd = (req.visible_devices if req.visible_devices is not None else (target.visible_devices or "")).strip()
+    vd_ids: list[int] = []
+    if vd:
         try:
-            orphans = set(await provider.list_machines_for_app(app_id)) - tracked
-            if orphans:
-                logger.info("restart app %s: also terminating %d orphan pods", app_id, len(orphans))
-                all_machines |= orphans
-        except Exception:
-            logger.exception("restart app %s: list_machines_for_app failed", app_id)
-        for mid in all_machines:
-            try:
-                await provider.terminate(mid)
-                await emit_worker_event(rdb, mid, app_id, "info", "terminated (restart)")
-            except Exception:
-                logger.exception("restart app %s: provider.terminate(%s) failed", app_id, mid)
-                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (restart)")
+            vd_ids = [int(x.strip()) for x in vd.split(",") if x.strip() != ""]
+        except ValueError:
+            raise HTTPException(status_code=400, detail={"error": "visible_devices must be comma-separated GPU ids, e.g. 6,7"})
+        if len(set(vd_ids)) != len(vd_ids):
+            raise HTTPException(status_code=400, detail={"error": "visible_devices has duplicate GPU ids"})
+    usable_gpus = len(vd_ids) if vd_ids else int(target.gpu_count or 0)
 
-    for mid in all_machines:
-        await rdb.delete(f"worker:{mid}", f"register_token:{mid}", f"worker:{mid}:models")
-    if all_machines:
-        await rdb.srem(f"worker_index:{app_id}", *all_machines)
+    seen: set[str] = set()
+    for m in req.models:
+        if m.tp < 1:
+            raise HTTPException(status_code=400, detail={"error": f"model {m.model}: tp must be >= 1"})
+        if usable_gpus and m.tp > usable_gpus:
+            raise HTTPException(status_code=400, detail={"error": f"model {m.model}: tp={m.tp} exceeds the {usable_gpus} GPUs"})
+        if m.model in seen:
+            raise HTTPException(status_code=400, detail={"error": f"duplicate model in members: {m.model}"})
+        seen.add(m.model)
+        _validate_vllm_args(m.extra_args, label=f"model {m.model}", reserved=_VLLM_RESERVED_MULTI)
+        try:
+            m.gpu_indices = _normalize_member_gpu_indices(
+                m, vd_ids=vd_ids, usable_gpus=usable_gpus, label=f"model {m.model}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail={"error": str(e)})
 
-    logger.info(
-        "restart app %s: drained=%d terminated=%d", app_id, len(tracked), len(all_machines),
+    target.models = [m.model_dump() for m in req.models]
+    flag_modified(target, "models")
+    if req.visible_devices is not None:
+        target.visible_devices = vd or None
+        if vd_ids:
+            target.gpu_count = len(vd_ids)
+    if req.sleep_level is not None:
+        target.sleep_level = req.sleep_level
+    await session.commit()
+    await session.refresh(target)
+
+    n = await _reprovision_workers(request.app.state.redis, session, app_id, user, request.app.state)
+    logger.info("models updated app=%s by user=%s: %d models, reprovisioned %d worker(s)",
+                app_id, user.username, len(req.models), n)
+    return _to_app_record(target)
+
+
+# ── Stress-test run history: persisted per endpoint so runs / models can be
+# compared and the comparison shared by link. Access mirrors the endpoint
+# (owner/admin via _load_owned_app), so a shared link works for anyone who can
+# already see the app.
+def _to_stress_record(r: StressRun) -> StressRunRecord:
+    return StressRunRecord(
+        id=r.id, app_id=r.app_id, created_by=r.created_by, model=r.model or "",
+        input_len=r.input_len, output_len=r.output_len, num_prompts=r.num_prompts,
+        concurrency=r.concurrency, summary=r.summary or {}, created_at=r.created_at,
     )
-    return {"ok": True, "app_id": app_id, "drained_workers": len(all_machines)}
+
+
+_STRESS_MAX_RUNS = 200  # per app; oldest pruned beyond this
+
+
+@app.get("/apps/{app_id}/stress-runs", response_model=list[StressRunRecord])
+async def list_stress_runs(
+    app_id: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Saved stress runs for an endpoint, newest first. Visible to anyone who can
+    access the app — that's what makes a shared comparison link resolve."""
+    from sqlalchemy import select
+    await _load_owned_app(session, app_id, user)
+    rows = (
+        await session.execute(
+            select(StressRun)
+            .where(StressRun.app_id == app_id)
+            .order_by(StressRun.created_at.desc())
+            .limit(_STRESS_MAX_RUNS)
+        )
+    ).scalars().all()
+    return [_to_stress_record(r) for r in rows]
+
+
+@app.post("/apps/{app_id}/stress-runs", response_model=StressRunRecord)
+async def create_stress_run(
+    app_id: str,
+    req: StressRunCreate,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    from sqlalchemy import delete as _delete, select
+    await _load_owned_app(session, app_id, user)
+    for field, val, lo, hi in (
+        ("input_len", req.input_len, 1, 1_048_576),
+        ("output_len", req.output_len, 1, 1_048_576),
+        ("num_prompts", req.num_prompts, 1, 1_000_000),
+        ("concurrency", req.concurrency, 1, 100_000),
+    ):
+        if not (lo <= val <= hi):
+            raise HTTPException(status_code=400, detail=f"{field} must be between {lo} and {hi}")
+    if len(req.model) > 255:
+        raise HTTPException(status_code=400, detail="model name too long")
+    row = StressRun(
+        id=f"sr-{uuid.uuid4().hex[:12]}",
+        app_id=app_id,
+        created_by=user.username,
+        model=req.model or "",
+        input_len=req.input_len,
+        output_len=req.output_len,
+        num_prompts=req.num_prompts,
+        concurrency=req.concurrency,
+        summary=req.summary or {},
+    )
+    session.add(row)
+    # Prune the oldest beyond the cap so history can't grow unbounded.
+    excess = (
+        await session.execute(
+            select(StressRun.id)
+            .where(StressRun.app_id == app_id)
+            .order_by(StressRun.created_at.desc())
+            .offset(_STRESS_MAX_RUNS - 1)
+        )
+    ).scalars().all()
+    if excess:
+        await session.execute(_delete(StressRun).where(StressRun.id.in_(excess)))
+    await session.commit()
+    await session.refresh(row)
+    logger.info("stress run saved app=%s by user=%s model=%s", app_id, user.username, req.model)
+    return _to_stress_record(row)
+
+
+@app.delete("/apps/{app_id}/stress-runs/{run_id}")
+async def delete_stress_run(
+    app_id: str,
+    run_id: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    from sqlalchemy import select
+    await _load_owned_app(session, app_id, user)
+    row = (
+        await session.execute(
+            select(StressRun).where(StressRun.id == run_id, StressRun.app_id == app_id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such stress run")
+    await session.delete(row)
+    await session.commit()
+    return {"ok": True, "id": run_id}
+
+
+@app.delete("/apps/{app_id}/stress-runs")
+async def clear_stress_runs(
+    app_id: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    from sqlalchemy import delete as _delete, func, select
+    await _load_owned_app(session, app_id, user)
+    n = (
+        await session.execute(
+            select(func.count()).select_from(StressRun).where(StressRun.app_id == app_id)
+        )
+    ).scalar_one()
+    await session.execute(_delete(StressRun).where(StressRun.app_id == app_id))
+    await session.commit()
+    return {"ok": True, "deleted": int(n or 0)}
 
 
 @app.delete("/apps/{app_id}")
@@ -2476,6 +2737,79 @@ async def ingest_worker_logs(req: WorkerLogsRequest, request: Request):
     # 1h TTL so logs naturally expire after the worker is gone.
     await rdb.expire(key, 3600)
     return {"ok": True, "stored": len(truncated)}
+
+
+_METRIC_LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?(\s+.+)$")
+
+
+def _relabel_metrics(text: str, extra: str) -> str:
+    """Rewrite a vLLM /metrics block so its series carry `extra` labels
+    (sgpu_app/sgpu_machine/sgpu_model). Drops # HELP/# TYPE — they'd duplicate
+    across sources — and merges the labels into each metric line, so many
+    workers' identical metric names don't collide into one series."""
+    out: list[str] = []
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        m = _METRIC_LINE_RE.match(line)
+        if not m:
+            continue
+        name, labels, rest = m.group(1), m.group(2), m.group(3)
+        if labels:
+            inner = labels[1:-1].strip()
+            merged = "{" + (f"{inner},{extra}" if inner else extra) + "}"
+        else:
+            merged = "{" + extra + "}"
+        out.append(f"{name}{merged}{rest}")
+    return "\n".join(out)
+
+
+@app.post("/workers/metrics")
+async def ingest_worker_metrics(req: WorkerMetricsRequest, request: Request):
+    """A worker ships each member's raw vLLM /metrics here; we stash per
+    machine+model with a short TTL (metrics are a live snapshot). No auth —
+    same machine_id trust model as /workers/heartbeat + /workers/logs."""
+    rdb = request.app.state.redis
+    stored = 0
+    for model, text in (req.metrics or {}).items():
+        if not text:
+            continue
+        key = f"worker_metrics:{req.machine_id}:{_logs_slug(model)}"
+        await rdb.set(
+            key,
+            json.dumps({"app_id": req.app_id, "machine_id": req.machine_id, "model": model, "text": text[:200_000]}),
+            ex=120,
+        )
+        stored += 1
+    return {"ok": True, "stored": stored}
+
+
+@app.get("/metrics/workers")
+async def workers_metrics(request: Request):
+    """Combined Prometheus scrape target: every worker's vLLM /metrics, relabeled
+    with sgpu_app/sgpu_machine/sgpu_model so the series don't collide. Public
+    (like /metrics) — pure telemetry, scrape it with Prometheus/VictoriaMetrics."""
+    rdb = request.app.state.redis
+    keys = await rdb.keys("worker_metrics:*")
+    parts: list[str] = []
+    for k in keys:
+        blob = await rdb.get(k)
+        if not blob:
+            continue
+        try:
+            d = json.loads(blob)
+        except (ValueError, TypeError):
+            continue
+        extra = (
+            f'sgpu_app="{d.get("app_id","")}",'
+            f'sgpu_machine="{d.get("machine_id","")}",'
+            f'sgpu_model="{d.get("model","")}"'
+        )
+        block = _relabel_metrics(d.get("text", ""), extra)
+        if block:
+            parts.append(block)
+    body = ("\n".join(parts) + "\n") if parts else "# no worker metrics\n"
+    return Response(content=body, media_type="text/plain; version=0.0.4")
 
 
 async def _resolve_worker_app_id(rdb: Any, machine_id: str) -> Optional[str]:

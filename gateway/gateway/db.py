@@ -151,6 +151,31 @@ class App(Base):
     owner: Mapped[User] = relationship(back_populates="apps")
 
 
+class StressRun(Base):
+    """A saved stress-test run for a serverless endpoint. The stress test is a
+    browser-driven load generator (web tabs/stress.tsx); this persists each
+    completed run's metric summary so runs / models can be compared over time and
+    the comparison shared by link. Scoped to an app — visible to anyone who can
+    access that app (same owner/admin check as the endpoint itself)."""
+    __tablename__ = "stress_runs"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    app_id: Mapped[str] = mapped_column(
+        ForeignKey("apps.app_id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[str] = mapped_column(String(64), index=True)
+    model: Mapped[str] = mapped_column(String(255), default="", server_default="", nullable=False)
+    input_len: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_len: Mapped[int] = mapped_column(Integer, nullable=False)
+    num_prompts: Mapped[int] = mapped_column(Integer, nullable=False)
+    concurrency: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The client-computed metric block (throughput + latency percentiles). Opaque
+    # JSON — the gateway stores and returns it verbatim.
+    summary: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class Provider(Base):
     """User-registered cloud provider — VM (bare metal), RunPod, PI.
 

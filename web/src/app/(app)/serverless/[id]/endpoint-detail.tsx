@@ -2,8 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Loader2, Trash2 } from "lucide-react";
-import { toast } from "sonner";
+import { Loader2, RotateCw, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -16,8 +15,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { AppRecord } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
-import { cn } from "@/lib/utils";
-import { deleteEndpoint } from "../actions";
+import { deleteEndpoint, restartEndpoint } from "../actions";
 import { OverviewTab } from "./tabs/overview";
 import { RequestsTab } from "./tabs/requests";
 import { StressTab } from "./tabs/stress";
@@ -53,6 +51,9 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [pending, startTransition] = useTransition();
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [confirmRedeploy, setConfirmRedeploy] = useState(false);
+  const [redeployPending, startRedeploy] = useTransition();
+  const [redeployError, setRedeployError] = useState<string | null>(null);
   const avatar = avatarFor(app.name);
 
   function handleDelete() {
@@ -64,6 +65,19 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
         return;
       }
       router.push("/serverless");
+    });
+  }
+
+  function handleRedeploy() {
+    setRedeployError(null);
+    startRedeploy(async () => {
+      const res = await restartEndpoint(app.app_id);
+      if (!res.ok) {
+        setRedeployError(res.error);
+        return;
+      }
+      setConfirmRedeploy(false);
+      router.refresh();
     });
   }
 
@@ -85,6 +99,14 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setConfirmRedeploy(true)}
+            >
+              <RotateCw className="h-4 w-4" />
+              Redeploy
+            </Button>
             <Button
               variant="outline"
               size="sm"
@@ -119,6 +141,36 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
           <TabsContent value="workers"><WorkersTab app={app} /></TabsContent>
         </Tabs>
       </div>
+
+      <Dialog
+        open={confirmRedeploy}
+        onOpenChange={(o) => {
+          setConfirmRedeploy(o);
+          if (!o) setRedeployError(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Redeploy {app.name}?</DialogTitle>
+            <DialogDescription>
+              Re-provisions the worker with the latest worker-agent code and current config. In-flight requests drain
+              first, then the fleet reloads — there&apos;s a brief cold start while models come back up.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {redeployError && (
+              <p className="mr-auto text-sm text-destructive">{redeployError}</p>
+            )}
+            <Button variant="ghost" onClick={() => setConfirmRedeploy(false)} disabled={redeployPending}>
+              Cancel
+            </Button>
+            <Button onClick={handleRedeploy} disabled={redeployPending}>
+              {redeployPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCw className="h-4 w-4" />}
+              Redeploy
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={confirmDelete}

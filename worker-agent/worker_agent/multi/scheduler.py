@@ -496,6 +496,15 @@ class MultiModelScheduler:
         """True once startup has settled (no model still LAUNCHING)."""
         return all(rt.state != ModelState.LAUNCHING for rt in self._runtimes)
 
+    def live_members(self) -> list[tuple[str, str]]:
+        """(served_name, base_url) for members whose engine is running — for the
+        metrics shipper to scrape each one's local vLLM /metrics."""
+        return [
+            (rt.member.served_name, rt.base_url)
+            for rt in self._runtimes
+            if rt.proc is not None and rt.proc.returncode is None
+        ]
+
     async def shutdown(self) -> None:
         # Group-kill each engine so its tp worker children (VLLM::Worker_TP) and
         # EngineCore die too — signalling only the api_server (rt.proc) orphans

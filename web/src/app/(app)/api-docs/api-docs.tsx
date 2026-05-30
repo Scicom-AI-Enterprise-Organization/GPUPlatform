@@ -343,6 +343,72 @@ const ENDPOINTS: Endpoint[] = [
     ],
   },
   {
+    id: "completions",
+    group: "inference",
+    method: "POST",
+    path: "/v1/completions",
+    title: "Completions (OpenAI-compatible)",
+    description: (
+      <>
+        <p>Legacy OpenAI text completions (prompt-in, text-out). Body is forwarded to vLLM verbatim; <code>stream: true</code> returns SSE. Prefer <code>/v1/chat/completions</code> for instruct / chat models.</p>
+        <p className="mt-2 text-xs text-muted-foreground">Scope to one endpoint without the <code>model</code> field via <code>{`<base>/<endpoint>/v1/completions`}</code>.</p>
+      </>
+    ),
+    parameters: [
+      { name: "model", in: "body", type: "string", required: true, doc: "Endpoint name (single) or member model (multi)." },
+      { name: "prompt", in: "body", type: "string | string[]", required: true, doc: "Prompt(s) to complete." },
+      { name: "max_tokens", in: "body", type: "integer", doc: "Upper bound on generated tokens." },
+      { name: "stream", in: "body", type: "boolean", doc: "true → text/event-stream." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/v1/completions" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"model": "my-endpoint", "prompt": "The capital of France is", "max_tokens": 16}'`,
+    },
+    responses: [
+      {
+        code: 200,
+        codeLabel: "OK",
+        sample: `{
+  "id": "cmpl-…",
+  "object": "text_completion",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "choices": [{"index": 0, "text": " Paris.", "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+}`,
+      },
+    ],
+  },
+  {
+    id: "list-models",
+    group: "inference",
+    method: "GET",
+    path: "/v1/models",
+    title: "List models",
+    description: (
+      <>
+        <p>OpenAI-compatible model list. A single-model endpoint returns its one served model; a multi-model fleet lists every member you can target in the <code>model</code> field.</p>
+        <p className="mt-2 text-xs text-muted-foreground">The scoped form <code>{`<base>/<endpoint>/v1/models`}</code> lists just that endpoint&apos;s models.</p>
+      </>
+    ),
+    request: {
+      sample: `curl -s "$SGPU/my-endpoint/v1/models" \\
+  -H "Authorization: Bearer $SGPU_API_KEY"`,
+    },
+    responses: [
+      {
+        code: 200,
+        codeLabel: "OK",
+        sample: `{
+  "object": "list",
+  "data": [
+    {"id": "Qwen/Qwen2.5-7B-Instruct", "object": "model", "owned_by": "sgpu"}
+  ]
+}`,
+      },
+    ],
+  },
+  {
     id: "run-sync",
     group: "inference",
     method: "POST",
@@ -376,6 +442,49 @@ const ENDPOINTS: Endpoint[] = [
     responses: [{ code: 200, codeLabel: "OK · text/event-stream", sample: `data: {"index": 0, "delta": "Hel"}
 data: {"index": 1, "delta": "lo"}
 data: {"done": true}` }],
+  },
+  {
+    id: "metrics",
+    group: "inference",
+    method: "GET",
+    path: "/metrics",
+    title: "Metrics (Prometheus)",
+    description: (
+      <>
+        <p>Prometheus exposition for the gateway itself. For per-worker vLLM metrics — queue depth, throughput, GPU KV-cache usage — across the whole fleet, scrape <code>/metrics/workers</code>: it relabels each live worker&apos;s <code>/metrics</code> with its <code>app_id</code> + model and concatenates them.</p>
+      </>
+    ),
+    request: {
+      sample: `curl -s "$SGPU/metrics/workers" \\
+  -H "Authorization: Bearer $SGPU_API_KEY"`,
+    },
+    responses: [
+      {
+        code: 200,
+        codeLabel: "OK · text/plain",
+        sample: `vllm:num_requests_running{app_id="my-endpoint",model="…"} 2
+vllm:num_requests_waiting{app_id="my-endpoint",model="…"} 0
+vllm:gpu_cache_usage_perc{app_id="my-endpoint",model="…"} 0.41`,
+      },
+    ],
+  },
+  {
+    id: "health",
+    group: "inference",
+    method: "GET",
+    path: "/health",
+    title: "Health check",
+    description: (
+      <>
+        <p>Liveness probe for the gateway — <code>200</code> when healthy. Each vLLM worker also exposes its own <code>/health</code> (sometimes <code>/healthz</code>) once it finishes loading; a cold-starting worker is unhealthy until the model is resident.</p>
+      </>
+    ),
+    request: {
+      sample: `curl -s -o /dev/null -w "%{http_code}\\n" "$SGPU/health"`,
+    },
+    responses: [
+      { code: 200, codeLabel: "OK", doc: "Gateway is up and serving.", sample: `200` },
+    ],
   },
 
   // ───── Benchmarks ─────

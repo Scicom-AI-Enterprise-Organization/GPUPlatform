@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useTransition } from "react";
-import { AlertTriangle, ArrowUpRight, Copy, Eye, EyeOff, Loader2, Pencil, RotateCw } from "lucide-react";
+import { AlertTriangle, ArrowUpRight, Copy, Eye, EyeOff, Loader2, Pencil, Plus, RotateCw, Save, Trash2, X } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -17,9 +17,19 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import type { AppRecord } from "@/lib/types";
 import { gateway, type AppStatus } from "@/lib/gateway";
+import { parseGpuIds, parsePhys, suggestPacking } from "@/lib/gpu-pin";
+import { cleanVllmArgs } from "@/lib/vllm-args";
 import { restartEndpoint, updateAutoscaler } from "../../actions";
 
 export function OverviewTab({ app }: { app: AppRecord }) {
@@ -115,34 +125,313 @@ function VmServingCard({ app }: { app: AppRecord }) {
 }
 
 // Per-model vLLM args for a multi-model endpoint: each member has its own
-// tensor-parallel size + extra args. Read-only (edit by recreating the endpoint).
+// tensor-parallel size + extra args. Editable inline — click "Edit" to add /
+// remove models, change TP, or rewrite args, then "Save" re-provisions the
+// worker (in-flight requests drain first) via PATCH /apps/{id}/models.
+type ModelRow = { model: string; tp: number; extra_args: string; gpus: string };
+
+const TP_CHOICES = [1, 2, 4, 8];
+
+function toRows(models: AppRecord["models"]): ModelRow[] {
+  return (models ?? []).map((m) => ({
+    model: m.model,
+    tp: m.tp ?? 1,
+    extra_args: m.extra_args ?? "",
+    gpus: (m.gpu_indices ?? []).join(","),
+  }));
+}
+
+/** Pull a readable message out of the gateway's {detail:{error}} / {detail} shape. */
+function errText(body: unknown, fallback: string): string {
+  if (typeof body === "string") return body || fallback;
+  if (body && typeof body === "object") {
+    const o = body as Record<string, unknown>;
+    const d = o.detail;
+    if (typeof d === "string") return d;
+    if (d && typeof d === "object" && typeof (d as Record<string, unknown>).error === "string") {
+      return (d as Record<string, string>).error;
+    }
+    if (typeof o.error === "string") return o.error;
+  }
+  return fallback;
+}
+
 function MultiModelArgsCard({ app }: { app: AppRecord }) {
+  const router = useRouter();
+  const [editing, setEditing] = useState(false);
+  const [rows, setRows] = useState<ModelRow[]>(() => toRows(app.models));
+  const [visibleDevices, setVisibleDevices] = useState(app.visible_devices ?? "");
+  const [sleepLevel, setSleepLevel] = useState<number>(app.sleep_level ?? 1);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
   const models = app.models ?? [];
+  const physIds = parsePhys(visibleDevices);
+  const gpuCount = physIds.length;
+  const suggestions = suggestPacking(rows.map((r) => r.tp), physIds);
+
+  function startEdit() {
+    setRows(toRows(app.models));
+    setVisibleDevices(app.visible_devices ?? "");
+    setSleepLevel(app.sleep_level ?? 1);
+    setErr(null);
+    setMsg(null);
+    setEditing(true);
+  }
+  function cancel() {
+    setEditing(false);
+    setErr(null);
+  }
+  const update = (i: number, patch: Partial<ModelRow>) =>
+    setRows((rs) => rs.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  const addRow = () => setRows((rs) => [...rs, { model: "", tp: 1, extra_args: "", gpus: "" }]);
+  const removeRow = (i: number) => setRows((rs) => rs.filter((_, idx) => idx !== i));
+
+  async function save() {
+    setSaving(true);
+    setErr(null);
+    setMsg(null);
+    let payload: Array<{ model: string; tp: number; extra_args: string; gpu_indices?: number[] }>;
+    try {
+      payload = rows
+        .filter((r) => r.model.trim())
+        .map((r) => {
+          const gpu_indices = parseGpuIds(r.gpus, r.tp, r.model.trim() || "model");
+          return {
+            model: r.model.trim(),
+            tp: r.tp,
+            extra_args: r.extra_args.trim(),
+            ...(gpu_indices ? { gpu_indices } : {}),
+          };
+        });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setSaving(false);
+      return;
+    }
+    if (!payload.length) {
+      setErr("Add at least one model (or delete the endpoint instead).");
+      setSaving(false);
+      return;
+    }
+    try {
+      const r = await fetch(`/api/proxy/apps/${encodeURIComponent(app.app_id)}/models`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          models: payload,
+          sleep_level: sleepLevel,
+          ...(visibleDevices.trim() ? { visible_devices: visibleDevices.trim() } : {}),
+        }),
+      });
+      const text = await r.text();
+      let parsed: unknown = text;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        /* keep raw */
+      }
+      if (!r.ok) {
+        setErr(errText(parsed, r.statusText));
+        return;
+      }
+      setEditing(false);
+      setMsg(`Saved — ${payload.length} model(s). The fleet is re-provisioning; watch the Workers tab as it reloads.`);
+      router.refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <Card>
-      <CardHeader className="flex flex-col gap-0.5">
-        <CardTitle className="text-sm font-medium">vLLM engine args — per model</CardTitle>
-        <span className="text-xs text-muted-foreground">
-          Each model launches its own <code className="font-mono">vllm serve</code> with these args.
-        </span>
+      <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0">
+        <div className="flex flex-col gap-0.5">
+          <CardTitle className="text-sm font-medium">vLLM engine args — per model</CardTitle>
+          <span className="text-xs text-muted-foreground">
+            {editing
+              ? "Add or remove models, change tensor-parallel size, or edit args. Saving re-provisions the worker — in-flight requests drain first."
+              : "Each model launches its own "}
+            {!editing && <code className="font-mono">vllm serve</code>}
+            {!editing && " with these args."}
+          </span>
+        </div>
+        {!editing && (
+          <Button variant="outline" size="xs" onClick={startEdit}>
+            <Pencil className="h-3 w-3" /> Edit
+          </Button>
+        )}
       </CardHeader>
+
       <CardContent className="space-y-3 text-sm">
-        {models.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No models configured.</p>
-        ) : (
-          models.map((m) => (
-            <div key={m.model} className="rounded-md border border-border">
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/30 px-3 py-1.5">
-                <code className="font-mono text-xs text-foreground">{m.model}</code>
-                <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-                  TP={m.tp}
-                </span>
+        {/* ---- read-only view ---- */}
+        {!editing &&
+          (models.length === 0 ? (
+            <p className="text-xs text-muted-foreground">No models configured.</p>
+          ) : (
+            models.map((m) => (
+              <div key={m.model} className="rounded-md border border-border">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/30 px-3 py-1.5">
+                  <code className="font-mono text-xs text-foreground">{m.model}</code>
+                  <div className="flex items-center gap-1.5">
+                    {m.gpu_indices && m.gpu_indices.length > 0 && (
+                      <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                        GPU {m.gpu_indices.join(",")}
+                      </span>
+                    )}
+                    <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                      TP={m.tp}
+                    </span>
+                  </div>
+                </div>
+                <pre className="overflow-x-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
+                  {(m.extra_args ?? "").trim() || "(no extra args)"}
+                </pre>
               </div>
-              <pre className="overflow-x-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
-                {(m.extra_args ?? "").trim() || "(no extra args)"}
-              </pre>
+            ))
+          ))}
+
+        {/* ---- edit view: one card per model ---- */}
+        {editing && (
+          <>
+            {rows.map((r, i) => {
+              const tpOpts = Array.from(new Set([...TP_CHOICES, r.tp])).sort((a, b) => a - b);
+              return (
+                <div key={i} className="rounded-md border border-border">
+                  <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/30 px-3 py-2">
+                    <Input
+                      value={r.model}
+                      onChange={(e) => update(i, { model: e.target.value })}
+                      placeholder="qwen/qwen3.6-27b"
+                      disabled={saving}
+                      className="h-8 min-w-[200px] flex-1 font-mono text-xs"
+                    />
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">TP</span>
+                      <Select
+                        value={String(r.tp)}
+                        onValueChange={(v) => update(i, { tp: Number(v) })}
+                        disabled={saving}
+                      >
+                        <SelectTrigger className="h-8 w-[68px] font-mono text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {tpOpts.map((n) => (
+                            <SelectItem
+                              key={n}
+                              value={String(n)}
+                              disabled={gpuCount > 0 && n > gpuCount}
+                            >
+                              {n}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">GPUs</span>
+                      <Input
+                        value={r.gpus}
+                        onChange={(e) => update(i, { gpus: e.target.value })}
+                        placeholder={suggestions[i] || "auto"}
+                        disabled={saving}
+                        aria-label="GPU ids"
+                        className="h-8 w-28 font-mono text-xs"
+                      />
+                      {r.gpus.trim() === "" && suggestions[i] && (
+                        <button
+                          type="button"
+                          onClick={() => update(i, { gpus: suggestions[i] })}
+                          disabled={saving}
+                          className="text-[10px] text-primary hover:underline"
+                        >
+                          use {suggestions[i]}
+                        </button>
+                      )}
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => removeRow(i)}
+                      disabled={saving}
+                      aria-label="Remove model"
+                      className="text-muted-foreground hover:text-destructive"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                  <div className="px-3 py-2">
+                    <Textarea
+                      value={r.extra_args}
+                      onChange={(e) => update(i, { extra_args: cleanVllmArgs(e.target.value) })}
+                      placeholder="--gpu-memory-utilization 0.9 --reasoning-parser qwen3 --max-model-len 262144 ..."
+                      disabled={saving}
+                      rows={2}
+                      className="font-mono text-[11px] leading-relaxed"
+                    />
+                  </div>
+                </div>
+              );
+            })}
+
+            <Button variant="outline" size="xs" onClick={addRow} disabled={saving}>
+              <Plus className="h-3 w-3" /> Add model
+            </Button>
+
+            <div className="flex flex-wrap items-end gap-x-4 gap-y-2 border-t border-border pt-3">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                  visible_devices {gpuCount > 0 && <span className="normal-case">({gpuCount} GPU)</span>}
+                </span>
+                <Input
+                  value={visibleDevices}
+                  onChange={(e) => setVisibleDevices(e.target.value)}
+                  placeholder="0,1,2,3"
+                  disabled={saving}
+                  className="h-8 w-32 font-mono text-xs"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] uppercase tracking-wide text-muted-foreground">sleep level</span>
+                <Select
+                  value={String(sleepLevel)}
+                  onValueChange={(v) => setSleepLevel(Number(v))}
+                  disabled={saving}
+                >
+                  <SelectTrigger className="h-8 w-16 font-mono text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="1">1</SelectItem>
+                    <SelectItem value="2">2</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex-1" />
+              <Button variant="ghost" size="sm" onClick={cancel} disabled={saving}>
+                <X className="h-4 w-4" /> Cancel
+              </Button>
+              <Button size="sm" onClick={save} disabled={saving}>
+                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                Save &amp; re-provision
+              </Button>
             </div>
-          ))
+          </>
+        )}
+
+        {err && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {err}
+          </div>
+        )}
+        {msg && !editing && (
+          <div className="flex items-center gap-2 rounded-md border border-status-active/40 bg-status-active/10 px-3 py-2 text-xs text-status-active">
+            <RotateCw className="h-3 w-3" /> {msg}
+          </div>
         )}
       </CardContent>
     </Card>
@@ -370,9 +659,11 @@ function DocsLink() {
   return (
     <a
       className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-      href="#"
+      href="/api-docs#inference"
+      target="_blank"
+      rel="noopener noreferrer"
     >
-      Job operations documentation
+      API reference — chat/completions, models, metrics, health
       <ArrowUpRight className="h-3 w-3" />
     </a>
   );
@@ -715,7 +1006,7 @@ function EngineArgsCard({ app }: { app: AppRecord }) {
           <>
             <textarea
               value={value}
-              onChange={(e) => setValue(e.target.value)}
+              onChange={(e) => setValue(cleanVllmArgs(e.target.value))}
               placeholder="--max-model-len 4096 --gpu-memory-utilization 0.9"
               rows={3}
               aria-invalid={tooLong}

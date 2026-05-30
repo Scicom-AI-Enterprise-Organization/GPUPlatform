@@ -164,10 +164,22 @@ async def require_admin(user: User = Depends(current_user)) -> User:
 SECTIONS = ("inference", "benchmark", "compute")
 
 
+def _disabled_sections() -> set[str]:
+    """Sections turned OFF platform-wide via the `DISABLED_SECTIONS` env
+    (comma-separated, e.g. `DISABLED_SECTIONS=compute`). A disabled section is
+    denied to everyone — admins included — so `/auth/me` reports it false (the web
+    hides its nav + pages) and its routes 403. Use this to ship without a surface."""
+    raw = os.environ.get("DISABLED_SECTIONS", "")
+    return {s.strip().lower() for s in raw.split(",") if s.strip()}
+
+
 async def has_section(user: User, section: str, session: AsyncSession) -> bool:
-    """Effective permission lookup. Admins bypass; developers resolve through
-    their attached policy role's `sections` map. Tier `user` always denied.
+    """Effective permission lookup. A platform-wide `DISABLED_SECTIONS` env wins
+    over everything; otherwise admins bypass and developers resolve through their
+    attached policy role's `sections` map. Tier `user` always denied.
     """
+    if section in _disabled_sections():
+        return False
     if _has_role(user, "admin"):
         return True
     if not _has_role(user, "developer"):
