@@ -317,30 +317,46 @@ class VMProvider(Provider):
             )
             if rc0 != 0:
                 raise RuntimeError(f"failed to write worker config (rc={rc0}): {err0[:300] or out0[:300]}")
-            # 2. Ship the worker-agent SOURCE from the gateway — NOT a git clone.
-            #    The repo is private and the VM has no GitHub creds, so we base64
-            #    the source tarball over the same exec channel as the config and
-            #    install it from the local dir. Always reinstalls so a code change
-            #    on the gateway propagates on the next provision.
-            wa_b64 = _worker_agent_tarball_b64()
-            remote_wa_tgz = f"{remote_dir}/wa.tgz"
-            rc_wa, out_wa, err_wa = self._run_full(
-                client,
-                f"echo {wa_b64} | base64 -d > {shlex.quote(remote_wa_tgz)}",
-            )
-            if rc_wa != 0:
-                raise RuntimeError(f"failed to upload worker-agent tarball (rc={rc_wa}): {err_wa[:300] or out_wa[:300]}")
+            # 2. Install the worker-agent on the VM — NEVER a git clone (the repo
+            #    is private and the VM has no creds). Preferred path: ship the
+            #    SOURCE tarball from the gateway (base64 over the same exec channel
+            #    as the config) and `uv pip install` it, so a gateway code change
+            #    propagates on the next provision. If the gateway image doesn't
+            #    bundle the source (WORKER_AGENT_SRC_DIR unset / dir missing), fall
+            #    back to whatever worker-agent is already installed in the VM venv
+            #    rather than hard-failing the whole provision.
             wa_dir = f"{REMOTE_DIR}/worker-agent"
+            try:
+                wa_b64 = _worker_agent_tarball_b64()
+            except Exception as e:
+                wa_b64 = None
+                logger.warning("worker-agent source not bundled (%s); using the VM's existing venv", e)
+            if wa_b64:
+                remote_wa_tgz = f"{remote_dir}/wa.tgz"
+                rc_wa, out_wa, err_wa = self._run_full(
+                    client, f"echo {wa_b64} | base64 -d > {shlex.quote(remote_wa_tgz)}",
+                )
+                if rc_wa != 0:
+                    raise RuntimeError(f"failed to upload worker-agent tarball (rc={rc_wa}): {err_wa[:300] or out_wa[:300]}")
+                install_block = (
+                    f"rm -rf {wa_dir} && mkdir -p {wa_dir} && tar xzf {REMOTE_DIR}/wa.tgz -C {wa_dir}; "
+                    f"(command -v uv >/dev/null 2>&1 && uv pip install --python {venv}/bin/python {wa_dir}) "
+                    f"  || {venv}/bin/pip install {wa_dir}; "
+                )
+            else:
+                install_block = (
+                    f"if ! {venv}/bin/python -c 'import worker_agent' 2>/dev/null; then "
+                    f"  echo 'worker_agent not installed on the VM and no source bundled in the gateway "
+                    f"image — set WORKER_AGENT_SRC_DIR or COPY worker-agent/ into the image' >&2; exit 3; "
+                    f"fi; "
+                )
             script = (
                 f"set -e; mkdir -p {REMOTE_DIR}; "
                 f"if [ ! -x {venv}/bin/python ]; then "
                 f"  (command -v uv >/dev/null 2>&1 && uv venv {venv}) "
                 f"  || python3 -m venv {venv}; "
                 f"fi; "
-                # Extract the shipped source + install it locally (no network/git).
-                f"rm -rf {wa_dir} && mkdir -p {wa_dir} && tar xzf {REMOTE_DIR}/wa.tgz -C {wa_dir}; "
-                f"(command -v uv >/dev/null 2>&1 && uv pip install --python {venv}/bin/python {wa_dir}) "
-                f"  || {venv}/bin/pip install {wa_dir}; "
+                + install_block +
                 f"WORKER_CONFIG_FILE={cfg_path} nohup {venv}/bin/python -m worker_agent.main "
                 f"  > {log_path} 2>&1 & echo $! > {pid_path}"
             )
