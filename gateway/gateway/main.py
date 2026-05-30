@@ -2784,12 +2784,10 @@ async def ingest_worker_metrics(req: WorkerMetricsRequest, request: Request):
     return {"ok": True, "stored": stored}
 
 
-@app.get("/metrics/workers")
-async def workers_metrics(request: Request):
-    """Combined Prometheus scrape target: every worker's vLLM /metrics, relabeled
-    with sgpu_app/sgpu_machine/sgpu_model so the series don't collide. Public
-    (like /metrics) — pure telemetry, scrape it with Prometheus/VictoriaMetrics."""
-    rdb = request.app.state.redis
+async def _collect_worker_metrics(rdb: Any, app_id: Optional[str] = None) -> str:
+    """Concatenate every worker's vLLM /metrics (or just one app's, when app_id is
+    given), each relabeled with sgpu_app/sgpu_machine/sgpu_model so series from
+    different workers/models don't collide."""
     keys = await rdb.keys("worker_metrics:*")
     parts: list[str] = []
     for k in keys:
@@ -2800,6 +2798,8 @@ async def workers_metrics(request: Request):
             d = json.loads(blob)
         except (ValueError, TypeError):
             continue
+        if app_id is not None and d.get("app_id") != app_id:
+            continue
         extra = (
             f'sgpu_app="{d.get("app_id","")}",'
             f'sgpu_machine="{d.get("machine_id","")}",'
@@ -2808,7 +2808,24 @@ async def workers_metrics(request: Request):
         block = _relabel_metrics(d.get("text", ""), extra)
         if block:
             parts.append(block)
-    body = ("\n".join(parts) + "\n") if parts else "# no worker metrics\n"
+    return ("\n".join(parts) + "\n") if parts else "# no worker metrics\n"
+
+
+@app.get("/metrics/workers")
+async def workers_metrics(request: Request):
+    """Combined Prometheus scrape target: every worker's vLLM /metrics, relabeled
+    with sgpu_app/sgpu_machine/sgpu_model so the series don't collide. Public
+    (like /metrics) — pure telemetry, scrape it with Prometheus/VictoriaMetrics."""
+    body = await _collect_worker_metrics(request.app.state.redis)
+    return Response(content=body, media_type="text/plain; version=0.0.4")
+
+
+@app.get("/{app_id}/metrics")
+async def app_metrics(app_id: str, request: Request):
+    """Per-endpoint Prometheus scrape: just this app's workers' vLLM /metrics,
+    relabeled. The natural sibling of the serving URL `{base}/{app_id}/v1/...`.
+    Public like /metrics + /metrics/workers — pure telemetry."""
+    body = await _collect_worker_metrics(request.app.state.redis, app_id=app_id)
     return Response(content=body, media_type="text/plain; version=0.0.4")
 
 
