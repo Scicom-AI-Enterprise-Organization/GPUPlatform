@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -1034,6 +1035,45 @@ def _to_record(
     )
 
 
+def _parse_gpu_indices(visible_devices: Optional[str]) -> list[int]:
+    """Parse a CUDA_VISIBLE_DEVICES string into GPU indices, rejecting anything
+    that isn't a non-negative integer or that repeats — with a clear 400."""
+    toks = [t.strip() for t in (visible_devices or "").split(",") if t.strip()]
+    ids: list[int] = []
+    for t in toks:
+        if not re.fullmatch(r"\d+", t):
+            raise HTTPException(
+                status_code=400,
+                detail=f"visible_devices: '{t}' is not a valid GPU index — use non-negative integers like 0,1",
+            )
+        ids.append(int(t))
+    if len(set(ids)) != len(ids):
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        raise HTTPException(status_code=400, detail=f"visible_devices has duplicate GPU indices: {dup}")
+    return ids
+
+
+def _validate_sweep(sweep: dict) -> None:
+    """Reject non-numeric sweep values up front (learning_rate must be positive
+    numbers; the count-like knobs positive integers) so a bad cell can't silently
+    drop a trial or blow up mid-run."""
+    for v in (sweep.get("learning_rate") or []):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"sweep learning_rate: {v!r} is not a number like 1e-4")
+        if not math.isfinite(f) or f <= 0:
+            raise HTTPException(status_code=400, detail=f"sweep learning_rate: {v!r} must be a positive number like 1e-4")
+    for key in ("batch_size", "grad_accum", "max_epochs", "block_size"):
+        for v in (sweep.get(key) or []):
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"sweep {key}: {v!r} must be a positive integer")
+            if n <= 0:
+                raise HTTPException(status_code=400, detail=f"sweep {key}: {v!r} must be a positive integer")
+
+
 @router.post("", response_model=TrainingRunRecord)
 async def create_training_run(
     body: CreateTrainingRunRequest,
@@ -1067,6 +1107,40 @@ async def create_training_run(
             vm_gpus = (prov.config or {}).get("gpus") or []
             if vm_gpus:
                 eff_gpu_type = vm_gpus[0]
+
+    # ---- validate GPU pin, learning rate, and sweep values (clear 400s) ----
+    if is_vm_run:
+        gpu_bound = len(vm_gpus) or int((prov.config or {}).get("gpu_count") or 0)
+        target_label = "this VM"
+    else:
+        gpu_bound = body.gpu_count
+        target_label = "the pod"
+    pinned_ids = _parse_gpu_indices(body.visible_devices)
+    if gpu_bound and pinned_ids:
+        oob = sorted({i for i in pinned_ids if i >= gpu_bound})
+        if oob:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"visible_devices out of range: {oob} — {target_label} has {gpu_bound} "
+                        f"GPU(s), valid indices are 0–{gpu_bound - 1}"),
+            )
+    if not math.isfinite(body.learning_rate) or body.learning_rate <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"learning_rate must be a positive number like 1e-4 (got {body.learning_rate!r})",
+        )
+    _validate_sweep(body.sweep or {})
+    sweep_on = any(isinstance(v, list) and v for v in (body.sweep or {}).values())
+    if sweep_on:
+        if body.gpus_per_trial < 1:
+            raise HTTPException(status_code=400, detail="gpus_per_trial must be at least 1")
+        slots = len(pinned_ids) if pinned_ids else gpu_bound
+        if slots and body.gpus_per_trial > slots:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"gpus_per_trial ({body.gpus_per_trial}) exceeds the {slots} GPU(s) "
+                        f"available to the sweep on {target_label}"),
+            )
 
     run_id = _gen_id()
     target = await _training_s3_target(body.storage_id)

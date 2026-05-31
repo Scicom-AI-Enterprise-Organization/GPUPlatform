@@ -130,6 +130,20 @@ function parseCsvNums(s: string, asInt: boolean): number[] {
     .filter((n) => Number.isFinite(n));
 }
 
+// Comma/space-separated tokens that AREN'T a positive number (kind="int" also
+// requires an integer). Used to reject bad sweep cells instead of dropping them.
+function invalidNumTokens(s: string, kind: "num" | "int"): string[] {
+  return s
+    .split(/[,\s]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .filter((t) => {
+      const n = Number(t);
+      if (!Number.isFinite(n) || n <= 0) return true;
+      return kind === "int" && !Number.isInteger(n);
+    });
+}
+
 // Rough capacity estimate (mirrors the benchmark/serverless forms).
 function capacityHint(vramGb: number, count: number): string {
   const total = vramGb * count;
@@ -279,6 +293,26 @@ export function TrainingForm() {
   const wandbCreds = useMemo(() => trackingCreds.filter((c) => c.kind === "wandb"), [trackingCreds]);
   const mlflowCreds = useMemo(() => trackingCreds.filter((c) => c.kind === "mlflow"), [trackingCreds]);
   const baseModel = modelChoice === CUSTOM ? customModel.trim() : modelChoice;
+  // GPUs available on the chosen target — a VM's registered GPU count, or the
+  // RunPod pod's chosen count. 0 = unknown (skip the upper-bound check).
+  const gpuBound = useMemo(
+    () => (target === "vm" ? (vmProviders.find((p) => p.id === providerId)?.gpu_count ?? 0) : gpuCount),
+    [target, vmProviders, providerId, gpuCount],
+  );
+  // Live validation of the GPU pin (shown inline under the field as you type).
+  const vdError = useMemo(() => {
+    const vd = visibleDevices.trim();
+    if (!vd) return null;
+    const toks = vd.split(",").map((t) => t.trim()).filter(Boolean);
+    for (const t of toks) if (!/^\d+$/.test(t)) return `"${t}" isn't a valid GPU index — use non-negative integers like 0,1.`;
+    const ids = toks.map(Number);
+    if (new Set(ids).size !== ids.length) return "Duplicate GPU indices.";
+    if (gpuBound > 0) {
+      const oob = [...new Set(ids.filter((i) => i >= gpuBound))].sort((a, b) => a - b);
+      if (oob.length) return `GPU ${oob.join(", ")} out of range — valid indices are 0–${gpuBound - 1}.`;
+    }
+    return null;
+  }, [visibleDevices, gpuBound]);
   const hasStorage = s3Storages.length > 0;
   const isTts = taskType === "tts";
   const MODELS = isTts ? TTS_BASE_MODELS : WHISPER_MODELS;
@@ -326,6 +360,64 @@ export function TrainingForm() {
     if (!datasetId) return setError("Pick a training dataset.");
     if (!storageId) return setError("Pick an S3 storage for artifacts + logs.");
     if (target === "vm" && !providerId) return setError("Pick a VM provider, or switch to Default cloud.");
+
+    // --- GPU pin: non-negative integers, no dupes, within the target's count ---
+    const vd = visibleDevices.trim();
+    const pinned: number[] = [];
+    if (vd) {
+      const toks = vd.split(",").map((t) => t.trim()).filter(Boolean);
+      for (const t of toks) {
+        if (!/^\d+$/.test(t)) {
+          return setError(`CUDA_VISIBLE_DEVICES: "${t}" is not a valid GPU index — use non-negative integers like 0,1.`);
+        }
+        pinned.push(Number(t));
+      }
+      if (new Set(pinned).size !== pinned.length) {
+        return setError("CUDA_VISIBLE_DEVICES has duplicate GPU indices.");
+      }
+      if (gpuBound > 0) {
+        const oob = [...new Set(pinned.filter((i) => i >= gpuBound))].sort((a, b) => a - b);
+        if (oob.length) {
+          return setError(
+            `GPU index ${oob.join(", ")} out of range — ${target === "vm" ? "this VM" : "the pod"} has ` +
+            `${gpuBound} GPU${gpuBound === 1 ? "" : "s"} (valid indices 0–${gpuBound - 1}).`,
+          );
+        }
+      }
+    }
+
+    // --- learning rate must be a positive number like 1e-4 ---
+    if (!sweepOn) {
+      const lr = Number(learningRate);
+      if (!learningRate.trim() || !Number.isFinite(lr) || lr <= 0) {
+        return setError(`Learning rate must be a positive number like 1e-4 (got "${learningRate}").`);
+      }
+    } else {
+      const badLr = invalidNumTokens(sweepLr, "num");
+      if (sweepLr.trim() && badLr.length) {
+        return setError(`Learning rates (sweep): ${badLr.map((b) => `"${b}"`).join(", ")} — use positive numbers like 1e-4.`);
+      }
+      const intFields = [
+        { label: "Batch sizes", val: sweepBatch },
+        { label: "Grad-accum steps", val: sweepGradAccum },
+        { label: "Max epochs", val: sweepEpochs },
+        ...(isTts ? [{ label: "Block sizes", val: sweepBlock }] : []),
+      ];
+      for (const f of intFields) {
+        const bad = invalidNumTokens(f.val, "int");
+        if (f.val.trim() && bad.length) {
+          return setError(`${f.label} (sweep): ${bad.map((b) => `"${b}"`).join(", ")} — use positive integers.`);
+        }
+      }
+      // GPUs per trial can't exceed the GPUs available to the sweep
+      const slots = pinned.length || gpuBound;
+      if (slots > 0 && gpusPerTrial > slots) {
+        return setError(
+          `GPUs per trial (${gpusPerTrial}) exceeds the ${slots} GPU${slots === 1 ? "" : "s"} ` +
+          `available to the sweep${pinned.length ? " (pinned)" : ` on ${target === "vm" ? "this VM" : "the pod"}`}.`,
+        );
+      }
+    }
 
     const body: CreateTrainingRunRequest = {
       name: name.trim(),
@@ -852,9 +944,20 @@ export function TrainingForm() {
 
         <div className="mt-5 space-y-1.5 border-t border-border pt-4">
           <Label htmlFor="train-cuda" className="text-xs">CUDA_VISIBLE_DEVICES</Label>
-          <Input id="train-cuda" className="font-mono text-xs" placeholder="e.g. 0,1 (empty = all GPUs)"
+          <Input id="train-cuda"
+            className={cn("font-mono text-xs", vdError && "border-destructive focus-visible:ring-destructive")}
+            placeholder="e.g. 0,1 (empty = all GPUs)"
             value={visibleDevices} onChange={(e) => setVisibleDevices(e.target.value)} />
-          <p className="text-xs text-muted-foreground">Pins which GPUs the trainer uses. Empty = all visible GPUs.</p>
+          {vdError ? (
+            <p className="text-xs text-destructive">{vdError}</p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Pins which GPUs the trainer uses. Empty = all visible GPUs.
+              {gpuBound > 0 && (
+                <> {target === "vm" ? "This VM" : "The pod"} has {gpuBound} GPU{gpuBound === 1 ? "" : "s"} — valid indices <span className="font-mono">0–{gpuBound - 1}</span>.</>
+              )}
+            </p>
+          )}
         </div>
 
         <div className="mt-4 space-y-1.5">
@@ -988,7 +1091,7 @@ export function TrainingForm() {
       <div className="flex items-center justify-end gap-3 border-t border-border pt-4">
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Button type="button" variant="outline" onClick={() => router.push("/autotrain")}>Cancel</Button>
-        <Button type="submit" disabled={submitting || !hasStorage} className="min-w-36">
+        <Button type="submit" disabled={submitting || !hasStorage || !!vdError} className="min-w-36">
           {submitting ? (<><Loader2 className="h-4 w-4 animate-spin" /> Creating…</>)
             : (<><FlaskConical className="h-4 w-4" /> Start training</>)}
         </Button>
