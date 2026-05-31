@@ -205,6 +205,143 @@ export type BenchmarkTemplate = {
   created_at: string;
 };
 
+// ---- Autotrain (Whisper finetuning) ----
+
+export type TrainingEpoch = {
+  epoch: number;
+  wer?: number | null;
+  cer?: number | null;
+  eval_loss?: number | null;
+  train_loss?: number | null;
+};
+
+export type TrainingTrial = {
+  trial: number;
+  params: Record<string, number | string>;
+  metric?: number | null;
+  status?: string;
+};
+
+export type TrainingStep = {
+  step: number;
+  loss?: number | null;
+  lr?: number | null;
+  epoch?: number | null;
+};
+
+export type TrainingResult = {
+  epochs?: TrainingEpoch[];
+  // Per-N-step training loss (@@STEP) for the live loss curve.
+  steps?: TrainingStep[];
+  best?: {
+    epoch?: number; wer?: number | null; cer?: number | null; eval_loss?: number | null;
+    loss?: number | null;
+    // sweep winner
+    trial?: number; params?: Record<string, number | string>; metric?: number | null;
+  } | null;
+  artifact?: { s3_uri?: string | null; hf_repo?: string | null } | null;
+  stopped_early?: boolean;
+  trials?: TrainingTrial[];
+  progress?: { step?: string; percent?: number } | null;
+  error?: string;
+};
+
+export type TrainingRunRecord = {
+  id: string;
+  name: string;
+  status: "queued" | "running" | "done" | "failed" | "cancelled";
+  dataset_id: string;
+  test_dataset_id?: string | null;
+  base_model: string;
+  task_type?: "asr" | "tts";
+  s3_prefix: string;
+  config_json: Record<string, unknown>;
+  exit_code?: number | null;
+  error_text?: string | null;
+  result_json?: TrainingResult | null;
+  created_by: string;
+  created_at: string;
+  started_at?: string | null;
+  ended_at?: string | null;
+  cost_per_hr?: number | null;
+  provider_id?: string | null;
+  storage_id?: string | null;
+  gpu_type?: string | null;
+  gpu_count: number;
+  visible_devices?: string | null;
+};
+
+export type CreateTrainingRunRequest = {
+  name: string;
+  dataset_id: string;
+  base_model: string;
+  task_type?: "asr" | "tts";
+  test_dataset_id?: string | null;
+  // TTS-only (Qwen3 + NeuCodec)
+  tokenizer?: string | null;
+  block_size?: number;
+  pack_sequence_length?: number;
+  default_speaker?: string | null;
+  speaker_field?: string | null;
+  // hyperparameter sweep: {param: [values]} → cross-product = trials
+  sweep?: Record<string, number[]>;
+  gpus_per_trial?: number;
+  eval_metric?: "wer" | "cer";
+  max_epochs?: number;
+  patience?: number;
+  eval_split_pct?: number;
+  split_seed?: number;
+  batch_size?: number;
+  grad_accum?: number;
+  learning_rate?: number;
+  warmup_steps?: number;
+  weight_decay?: number;
+  precision?: "fp16" | "bf16" | "fp32";
+  language?: string | null;
+  task?: string;
+  provider_id?: string | null;
+  gpu_type?: string;
+  gpu_count?: number;
+  secure_cloud?: boolean;
+  disk_gb?: number;
+  volume_gb?: number;
+  visible_devices?: string | null;
+  storage_id?: string | null;
+  hf_push_repo?: string | null;
+  // experiment tracking — non-secret per-run knobs only; creds come from the
+  // global Secrets page.
+  report_to?: ("mlflow" | "wandb")[];
+  wandb_project?: string | null;
+  wandb_entity?: string | null;
+  mlflow_tracking_uri?: string | null;
+  mlflow_experiment?: string | null;
+  // Emit a training-loss point every N steps (@@STEP) for the live loss curve.
+  logging_steps?: number;
+  // OS env vars exported on the remote before the trainer (HOME, cache dirs, …).
+  env_vars?: Record<string, string>;
+};
+
+export type TrainingFile = {
+  name: string;
+  size: number;
+  modified: string;
+  download_url: string;
+};
+
+export type TrainingGpu = {
+  index: number;
+  util: number;        // % GPU utilisation
+  mem_used: number;    // MiB
+  mem_total: number;   // MiB
+  name: string;
+};
+
+export type TrainingGpuResponse = {
+  status?: string;
+  gpus: TrainingGpu[];
+  error?: string;
+};
+
 export type AggregatePoint = {
   benchmark_id: string;
   benchmark_name: string;
@@ -352,10 +489,103 @@ export type StorageRecord = {
   region?: string | null;
   endpoint?: string | null;
   has_credentials: boolean;
+  hf_token_secret?: string | null;
   enabled: boolean;
   notes?: string | null;
   created_at: string;
   created_by: string;
+};
+
+// ---- Datasets (Autotrain) ----
+
+export type DatasetKind = "upload" | "s3" | "hf";
+
+export type DatasetRecord = {
+  id: string;
+  name: string;
+  description?: string | null;
+  kind: DatasetKind;
+  storage_id?: string | null;
+  storage_name?: string | null;
+  audio_prefix?: string | null;
+  s3_metadata_uri?: string | null;
+  size_bytes?: number | null;
+  metadata_filename?: string | null;
+  format?: string | null;
+  num_rows?: number | null;
+  audio_field: string;
+  transcription_field: string;
+  split_fields?: Record<string, string> | null; // per-split transcription overrides
+  audio_dataset_id?: string | null; // materialised S3 audio dataset (source → output link)
+  hf_repo?: string | null;
+  hf_revision?: string | null;
+  hf_synced_at?: string | null;
+  transform_status?: string | null; // "" | running | done | failed
+  transform_log?: string | null;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+};
+
+export type CreateDatasetRequest = {
+  name: string;
+  kind: DatasetKind;
+  storage_id?: string | null;
+  description?: string | null;
+  audio_prefix?: string | null;
+  s3_metadata_uri?: string | null;
+  hf_repo?: string | null;
+};
+
+export type UpdateDatasetRequest = {
+  name?: string;
+  description?: string | null;
+  audio_prefix?: string | null;
+  audio_field?: string;
+  transcription_field?: string;
+};
+
+export type DatasetUploadResult = {
+  filename: string;
+  format: string;
+  num_rows: number;
+  columns: string[];
+  audio_field: string;
+  transcription_field: string;
+  preview: Record<string, unknown>[];
+};
+
+export type DatasetPreviewRow = {
+  audio_url?: string | null;
+  transcription?: unknown;
+  [k: string]: unknown;
+};
+
+export type DatasetPreview = {
+  audio_field: string;
+  transcription_field: string;
+  rows: DatasetPreviewRow[];
+  offset?: number;
+  limit?: number;
+  total?: number | null;
+  split?: string | null; // which HF split these rows came from
+  splits?: string[] | null; // available HF splits (for a picker)
+  error?: string | null;
+};
+
+export type SyncDatasetRequest = { hf_repo: string; private: boolean };
+
+// Org-wide env var / secret (admin-managed). Mirrors gateway GlobalEnvRecord.
+// `value` is plaintext for non-secrets, null for secrets; `value_preview` is a
+// masked hint for secrets.
+export type GlobalEnvRecord = {
+  key: string;
+  is_secret: boolean;
+  value: string | null;
+  value_preview: string | null;
+  description: string | null;
+  updated_by: string;
+  updated_at: string;
 };
 
 export type CreateStorageRequest = {
@@ -368,6 +598,8 @@ export type CreateStorageRequest = {
   access_key_id?: string | null;
   secret_access_key?: string | null;
   hf_token?: string | null;
+  // Reference a global secret (admin Secrets) by key instead of a pasted token.
+  hf_token_secret?: string | null;
   notes?: string | null;
   enabled?: boolean;
 };
@@ -382,6 +614,7 @@ export type TestStorageRequest = {
   access_key_id?: string | null;
   secret_access_key?: string | null;
   hf_token?: string | null;
+  hf_token_secret?: string | null;
 };
 
 export type TestStorageResponse = {
@@ -438,7 +671,7 @@ export type VmAvailability = {
 
 // ---- Admin: roles + audit ----
 
-export type SectionKey = "inference" | "benchmark" | "compute";
+export type SectionKey = "inference" | "benchmark" | "compute" | "datasets";
 
 export type AdminUserRecord = {
   id: number;

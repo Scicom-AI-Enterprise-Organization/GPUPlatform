@@ -29,6 +29,11 @@ import type {
   CreateComputeRequest,
   CreateProviderRequest,
   CreateStorageRequest,
+  CreateDatasetRequest,
+  UpdateDatasetRequest,
+  DatasetRecord,
+  DatasetPreview,
+  SyncDatasetRequest,
   PolicyRole,
   ProviderRecord,
   SectionKey,
@@ -39,6 +44,10 @@ import type {
   TestProviderRequest,
   TestProviderResponse,
   VmAvailability,
+  TrainingRunRecord,
+  TrainingGpuResponse,
+  CreateTrainingRunRequest,
+  TrainingFile,
 } from "./types";
 
 export type GpuAvailability = {
@@ -217,6 +226,34 @@ export const gateway = {
   benchmarkFileContentUrl: (id: string, name: string) =>
     `/api/proxy/benchmarks/${encodeURIComponent(id)}/files/content?path=${encodeURIComponent(name)}`,
 
+  // ---- Autotrain runs ----
+  listTrainingRuns: (scope: "mine" | "all" = "mine") =>
+    request<TrainingRunRecord[]>(`/v1/training-runs?scope=${scope}`),
+  getTrainingRun: (id: string) =>
+    request<TrainingRunRecord>(`/v1/training-runs/${encodeURIComponent(id)}`),
+  createTrainingRun: (body: CreateTrainingRunRequest) =>
+    request<TrainingRunRecord>("/v1/training-runs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteTrainingRun: (id: string) =>
+    request<{ ok: boolean; id: string }>(
+      `/v1/training-runs/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+  terminateTrainingRun: (id: string) =>
+    request<TrainingRunRecord>(
+      `/v1/training-runs/${encodeURIComponent(id)}/terminate`,
+      { method: "POST" },
+    ),
+  listTrainingFiles: (id: string) =>
+    request<TrainingFile[]>(`/v1/training-runs/${encodeURIComponent(id)}/files`),
+  /** Live per-GPU utilisation for the run's GPUs only (poll while running). */
+  getTrainingGpu: (id: string) =>
+    request<TrainingGpuResponse>(`/v1/training-runs/${encodeURIComponent(id)}/gpu`),
+  trainingLogsStreamUrl: (id: string) =>
+    `/api/proxy/v1/training-runs/${encodeURIComponent(id)}/logs/stream`,
+
   // ---- Cross-benchmark aggregate (one point per result.json across all benches) ----
   aggregateBenchmarks: (scope: "mine" | "all" = "mine") =>
     request<AggregatePoint[]>(`/benchmarks/_aggregate?scope=${scope}`),
@@ -335,6 +372,39 @@ export const gateway = {
       `/v1/storage/${encodeURIComponent(id)}`,
       { method: "DELETE" },
     ),
+
+  // ---- Datasets (Autotrain) ----
+  listDatasets: (scope: "mine" | "all" = "mine") =>
+    request<DatasetRecord[]>(`/v1/datasets?scope=${scope}`),
+  getDataset: (id: string) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}`),
+  createDataset: (body: CreateDatasetRequest) =>
+    request<DatasetRecord>("/v1/datasets", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateDataset: (id: string, body: UpdateDatasetRequest) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteDataset: (id: string) =>
+    request<{ ok: boolean; id: string }>(
+      `/v1/datasets/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+  getDatasetPreview: (id: string, limit = 20, offset = 0, split?: string | null) => {
+    const q = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (split) q.set("split", split);
+    return request<DatasetPreview>(
+      `/v1/datasets/${encodeURIComponent(id)}/preview?${q.toString()}`,
+    );
+  },
+  syncDataset: (id: string, body: SyncDatasetRequest) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/sync`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   // ---- Admin: users, policy roles, audit ----
   adminListUsers: () => request<AdminUserRecord[]>("/admin/users"),

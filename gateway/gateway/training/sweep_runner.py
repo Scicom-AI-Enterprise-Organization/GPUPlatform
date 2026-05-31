@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Hyperparameter-sweep orchestrator (AutoTrain) — runs N trials of a worker
+trainer (whisper_finetune.py / tts_finetune.py) in a GPU-pinned pool on ONE box,
+ranks by the sweep metric, and reports the best. Shipped to the pod/VM alongside
+the worker by the gateway when a run is in sweep mode.
+
+Config (JSON via --config) = the base trainer config PLUS:
+  sweep:          {param: [values], ...}     cross-product of these = the trials
+  gpus_per_trial: int                         GPUs each trial pins
+  sweep_gpus:     ["6","7", …] | []           the GPU ids to schedule across
+  sweep_metric:   "wer" | "cer" | "loss"      ranked ascending (lower = better)
+  task_type:      "asr" | "tts"               selects the worker
+
+Each trial gets its own config (base + the swept overrides), its own work_dir,
+its own artifacts prefix (…/trials/<i>/), and CUDA_VISIBLE_DEVICES pinned to its
+GPU slice. Concurrency = floor(#gpus / gpus_per_trial).
+
+Emits (parsed by the gateway):
+  @@TRIAL {trial, params, metric, status}     one per finished trial
+  @@DONE  {best:{trial,params,metric}, trials:[…]}
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import itertools
+import json
+import os
+import subprocess
+import sys
+import threading
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKERS = {"asr": "whisper_finetune.py", "tts": "tts_finetune.py"}
+
+
+def log(m: str) -> None:
+    print(m, flush=True)
+
+
+def emit(tag: str, obj: dict) -> None:
+    print(f"@@{tag} {json.dumps(obj)}", flush=True)
+
+
+def expand(sweep: dict) -> list[dict]:
+    """{param: [v1, v2]} → [{param: v1}, {param: v2}, …] (cross-product)."""
+    keys = [k for k, v in (sweep or {}).items() if isinstance(v, list) and v]
+    if not keys:
+        return [{}]
+    grids = [sweep[k] for k in keys]
+    return [dict(zip(keys, combo)) for combo in itertools.product(*grids)]
+
+
+def run(cfg: dict) -> None:
+    task = cfg.get("task_type", "asr")
+    worker = os.path.join(THIS_DIR, WORKERS.get(task, WORKERS["asr"]))
+    metric = (cfg.get("sweep_metric") or "wer").lower()
+    per = max(1, int(cfg.get("gpus_per_trial", 1)))
+    gpus = [str(g) for g in (cfg.get("sweep_gpus") or [])]
+
+    if gpus:
+        slices = [gpus[i:i + per] for i in range(0, len(gpus), per)]
+        slices = [s for s in slices if len(s) == per] or [gpus[:per]]
+    else:
+        slices = [None]  # no pin → one slot, all visible GPUs
+    concurrency = max(1, len(slices))
+
+    combos = expand(cfg.get("sweep") or {})
+    log(f"[sweep] {len(combos)} trial(s) · {concurrency} GPU slot(s) · "
+        f"{per} GPU/trial · rank by {metric} (asc)")
+
+    # Install deps ONCE up front (avoids N concurrent pip races on first run).
+    log("[sweep] preparing dependencies …")
+    subprocess.call([sys.executable, worker, "--deps-only", "--config", cfg["_config_path"]])
+
+    work = os.path.abspath(cfg.get("work_dir") or "/workspace/autotrain-sweep")
+    os.makedirs(work, exist_ok=True)
+    base_prefix = (cfg.get("artifacts") or {}).get("prefix", "").rstrip("/")
+
+    results: list[dict | None] = [None] * len(combos)
+    sem = threading.Semaphore(concurrency)
+    slot_lock = threading.Lock()
+    free_slots = list(range(len(slices)))
+    io_lock = threading.Lock()
+
+    def emit_line(s: str) -> None:
+        with io_lock:
+            sys.stdout.write(s)
+            sys.stdout.flush()
+
+    def run_trial(i: int, params: dict) -> None:
+        with sem:
+            with slot_lock:
+                slot = free_slots.pop()
+            gpu_slice = slices[slot]
+            try:
+                tcfg = copy.deepcopy(cfg)
+                for k in ("sweep", "sweep_gpus", "sweep_metric", "gpus_per_trial", "_config_path"):
+                    tcfg.pop(k, None)
+                tcfg.update(params)  # override the swept hyperparameters
+                tcfg["work_dir"] = os.path.join(work, f"trial{i}")
+                tcfg["run_name"] = f"{cfg.get('run_name', 'run')}-t{i}"
+                if base_prefix and tcfg.get("artifacts"):
+                    tcfg["artifacts"] = {**cfg["artifacts"], "prefix": f"{base_prefix}/trials/{i}"}
+                tpath = os.path.join(work, f"trial{i}.json")
+                with open(tpath, "w") as f:
+                    json.dump(tcfg, f)
+
+                env = dict(os.environ)
+                if gpu_slice:
+                    env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_slice)
+                pin = env.get("CUDA_VISIBLE_DEVICES", "(all)")
+                emit_line(f"[sweep] trial {i} START params={json.dumps(params)} gpus={pin}\n")
+
+                proc = subprocess.Popen(
+                    [sys.executable, "-u", worker, "--config", tpath],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+                best = None
+                for line in proc.stdout:  # type: ignore[union-attr]
+                    emit_line(f"[trial {i}] {line}")
+                    if line.startswith("@@DONE "):
+                        try:
+                            best = json.loads(line[len("@@DONE "):]).get("best")
+                        except Exception:
+                            pass
+                proc.wait()
+                m = best.get(metric) if isinstance(best, dict) else None
+                results[i] = {
+                    "trial": i, "params": params, "metric": m,
+                    "status": "done" if proc.returncode == 0 else "failed",
+                }
+                emit("TRIAL", results[i])
+            except Exception as e:  # noqa: BLE001
+                results[i] = {"trial": i, "params": params, "metric": None,
+                              "status": "failed", "error": str(e)}
+                emit("TRIAL", results[i])
+            finally:
+                with slot_lock:
+                    free_slots.append(slot)
+
+    threads = [threading.Thread(target=run_trial, args=(i, c)) for i, c in enumerate(combos)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    done = [r for r in results if r]
+    ranked = sorted((r for r in done if r["metric"] is not None), key=lambda r: r["metric"])
+    best = ranked[0] if ranked else None
+    if best:
+        log(f"[sweep] best: trial {best['trial']} · {metric}={best['metric']} · {best['params']}")
+    emit("DONE", {"best": best, "trials": done})
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    a = ap.parse_args()
+    with open(a.config) as f:
+        cfg = json.load(f)
+    cfg["_config_path"] = a.config
+    run(cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
