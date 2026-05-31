@@ -1,12 +1,15 @@
 # GPUPlatform
 
-A multi-tenant GPU workload platform. One control plane, three product surfaces:
+A multi-tenant GPU workload platform. One control plane, four product surfaces:
 
 - **Serverless** — deploy a model with the `serverlessgpu` Python decorator (or the web UI) and get an autoscaling, OpenAI-compatible HTTP endpoint backed by vLLM (scales to zero when idle) — or stand up a **multi-model fleet on one SSH VM** that time-shares its GPUs via vLLM sleep/wake.
-- **Compute** — provision long-lived bare-metal GPU pods with SSH (and JupyterLab on Prime Intellect). Optional admin-approval gate.
+- **Autotrain** — finetune **Whisper (ASR)** or **Qwen3 + NeuCodec (TTS)** on your own datasets. Hyperparameter sweeps, audio augmentation, live per-step loss + per-epoch WER/CER, GPU telemetry, and W&B / MLflow tracking — orchestrated over SSH on your VM or a RunPod pod, with the model pushed to S3 / Hugging Face.
 - **Benchmark** — SSH-orchestrated [`llm-benchmaq`](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) sweeps on RunPod / Prime Intellect / your own VM, with live log streaming, S3-archived results, and a side-by-side compare view.
+- **Compute** — provision long-lived bare-metal GPU pods with SSH (and JupyterLab on Prime Intellect). Optional admin-approval gate.
 
-Users bring their own provider credentials (RunPod / Prime Intellect / VM SSH); the gateway routes each workload to the right account and bills nothing of its own — you pay the provider only while a worker runs.
+These sit on shared infrastructure you configure once: **Providers** (BYO RunPod / Prime Intellect / VM SSH credentials), **Storage** (S3 / Hugging Face backends), **Datasets** (audio + transcription corpora for Autotrain), and org-wide **Secrets** (global env vars + W&B / MLflow tracking credentials).
+
+Users bring their own provider credentials; the gateway routes each workload to the right account and bills nothing of its own — you pay the provider only while a worker runs.
 
 ## Contents
 
@@ -17,9 +20,13 @@ Users bring their own provider credentials (RunPod / Prime Intellect / VM SSH); 
   - [Call it — OpenAI-compatible API](#call-it--openai-compatible-api)
   - [Operate it — the endpoint console](#operate-it--the-endpoint-console)
 - [Multi-model fleet on one VM](#multi-model-fleet-on-one-vm-gpu-time-sharing)
+- [Autotrain (finetuning)](#autotrain-finetuning)
+- [Datasets](#datasets)
 - [Benchmark](#benchmark)
 - [Compute](#compute)
 - [Providers (BYO credentials)](#providers-byo-credentials)
+- [Storage](#storage)
+- [Secrets (global env + tracking)](#secrets-global-env--tracking)
 - [API keys & the HTTP API](#api-keys--the-http-api)
 - [Testing](#testing)
 - [Auth, RBAC, and admin](#auth-rbac-and-admin)
@@ -46,7 +53,9 @@ Split control-plane / data-plane — the same shape as Modal / Beam / RunPod Ser
 ```
 
 - **Control plane** (this repo) — gateway + web + Postgres + Redis. CPU-only, runs in k8s (Helm chart included).
-- **Data plane** — GPU workers/pods spawned on demand on the user's provider account. A worker registers with the gateway, `BRPOP`s jobs off its Redis queue, runs vLLM, and publishes streaming tokens back via pub/sub.
+- **Data plane** — two patterns, both on the user's own provider account:
+  - **Serverless (long-lived workers)** — a GPU worker registers with the gateway, `BRPOP`s jobs off its Redis queue, runs vLLM, and publishes streaming tokens back via pub/sub.
+  - **SSH-orchestrated jobs (Autotrain + Benchmark)** — the gateway connects over SSH to a VM (or a freshly-spawned RunPod/PI pod), ships the runner script, runs it pinned to the chosen GPUs, parses structured progress off stdout (loss/metrics/log tail) for the live UI + SSE, and archives the artifacts (trained model / `result.json`) to your S3 storage.
 
 Deeper dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (component walk-through, Redis key schema, design rationale).
 
@@ -109,6 +118,7 @@ serverlessgpu stream qwen --payload '{"prompt": "tell me a story"}'   # SSE toke
 serverlessgpu list
 serverlessgpu show   qwen
 serverlessgpu delete qwen
+serverlessgpu pi-check                                                 # preflight a Prime Intellect key + list pods
 ```
 
 The same endpoint can be created from the web UI at `/serverless/new` (provider, GPU, autoscaler, and vLLM engine args — which are validated at create time, so a bad flag is rejected up front instead of failing the worker later).
@@ -177,6 +187,46 @@ one when a request arrives.
 
 Stand one up and drive it entirely with `curl`: [docs/MULTI_MODEL_FLEET.md](docs/MULTI_MODEL_FLEET.md).
 
+## Autotrain (finetuning)
+
+Finetune a speech model on your own [dataset](#datasets) — orchestrated over SSH on a `vm` provider (bare-metal) or a RunPod pod the gateway spawns, with the trained model pushed to S3 (and optionally Hugging Face). Create a run in the form at `/autotrain/new` or via `POST /v1/training-runs`.
+
+- **Two task types** — **ASR** (Whisper: `whisper-large-v3`, `-v3-turbo`, …) and **TTS** (Qwen3 + NeuCodec). ASR is evaluated on **WER / CER**; training stops at the max-epoch cap or early on patience.
+- **Hyperparameter sweep** — pass a `sweep` grid (e.g. `{"learning_rate":[1e-4,1e-5],"precision":["fp32-bf16","bf16-bf16"]}`) and the gateway runs the cross-product of trials, packing `gpus_per_trial` onto the GPUs you pinned with `visible_devices`. The detail page lists every trial (pending / running / done / failed) and splits the loss + WER/CER curves **per trial**, legended by params.
+- **Audio augmentation** — apply any of 8 techniques (`telephone`, `noise`, `dropout`, `gain`, `pitch`, `speed`, `reverb`, `bandpass`) at a chosen probability to the training split only (eval is never augmented).
+- **Live + persisted metrics** — per-step training loss, per-epoch eval (WER/CER/eval-loss), and a **GPU telemetry** graph (util / memory / temperature per GPU). All are persisted, so a finished run still renders its charts. Pull everything programmatically from `GET /v1/training-runs/{id}/metrics`.
+- **Lazy data loading** — the trainer indexes **metadata only** up front and fetches each clip's audio from S3 / HF inside the DataLoader (`__getitem__`), so a multi-GB corpus costs ~nothing to start and doesn't stall on a slow shared mount.
+- **Experiment tracking** — point a run at a [tracking credential](#secrets-global-env--tracking) to log to **Weights & Biases** or **MLflow**.
+- **Operate it** — live log SSE, a Config tab (the VM/provider, GPU type + ids, storage, dataset, base model), per-run **Rename / Restart / Terminate / Delete** (a clean confirmation dialog, no native alert), and `work_dir` + `cleanup_checkpoints` to control scratch/checkpoint disk. Arbitrary OS `env_vars` (e.g. `HF_HOME`, cache dirs) are exported around the trainer.
+
+```bash
+curl -s -X POST "$GATEWAY/v1/training-runs" -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{
+    "name":"whisper-emgs", "task_type":"asr",
+    "base_model":"openai/whisper-large-v3-turbo",
+    "dataset_id":"ds-...", "test_dataset_id":"ds-...",
+    "provider_id":"prov-...", "visible_devices":"6,7", "gpus_per_trial":1,
+    "storage_id":"store-...", "max_epochs":10, "batch_size":8,
+    "augment_techniques":["telephone","noise","reverb"], "augment_prob":0.5,
+    "sweep":{"learning_rate":[1e-4,1e-5],"precision":["fp32-bf16","bf16-bf16"]}
+  }'
+# poll metrics (steps / per-epoch WER+CER / per-trial status / GPU samples):
+curl -s -H "Authorization: Bearer $KEY" "$GATEWAY/v1/training-runs/<id>/metrics"
+```
+
+## Datasets
+
+A dataset is a named pointer to a metadata table of `{audio, transcription}` rows that Autotrain consumes. Manage them at `/datasets` or `POST /v1/datasets`. Four source kinds:
+
+| Kind | Source |
+|---|---|
+| `upload` | a CSV / JSON / JSONL metadata file you upload to an S3 [storage](#storage) backend |
+| `s3` | a metadata file already in S3 — a full `s3://bucket/key` URI **or** a key relative to the storage bucket |
+| `hf` | a Hugging Face audio dataset (read lazily, per-split, with a token from a HF storage backend) |
+| `label` | a live project on a labeling platform |
+
+The detail page (`/datasets/{id}`) previews rows with inline **audio playback + waveform**, lets you map the `audio` / `transcription` columns (and per-split overrides), lists HF **splits**, and can **transform** a zip/tar-of-audio HF dataset into one with a real audio column (materialized to S3 or pushed to HF) or **sync** uploaded metadata to a HF repo.
+
 ## Benchmark
 
 Run [`llm-benchmaq`](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) (which wraps `vllm bench serve`) against a model and archive the results — on a RunPod/PI pod the gateway spins up, or on your own SSH VM (bare-metal).
@@ -205,6 +255,24 @@ Each user registers their own providers under `/providers`. Supported kinds:
 
 Credentials are encrypted at rest. Provider resolution per request: explicit `provider_id` → the user's sole provider of that kind → gateway-wide env fallback (`RUNPOD_API_KEY`, `PI_API_KEY`).
 
+## Storage
+
+Where artifacts and datasets live. Register a backend at `/storage` or `POST /v1/storage`:
+
+| Kind | What it holds | Used by |
+|---|---|---|
+| `s3` | bucket + region + (optional) endpoint + access key — Benchmark `result.json`, trained models, dataset metadata + audio | Benchmark, Autotrain, Datasets |
+| `huggingface` | an HF token (or a reference to a [global secret](#secrets-global-env--tracking)) | Datasets (`hf` source / sync), Autotrain (model push) |
+
+Credentials are Fernet-encrypted at rest and never returned by the API; `POST /v1/storage/test` validates connectivity before you save. Reads are org-wide; writes are admin-only.
+
+## Secrets (global env + tracking)
+
+Org-wide secrets managed by admins at `/admin/secrets`:
+
+- **Global env** (`/v1/global-env`) — key/value pairs merged into every workload's environment (benchmark pods, serverless workers, training runs). Values are encrypted; ones flagged secret are masked in API responses. A storage/dataset can reference one by name (e.g. an HF token) instead of inlining it.
+- **Tracking credentials** (`/v1/tracking-credentials`) — named **Weights & Biases** / **MLflow** credentials an Autotrain run points at to stream metrics; the runner decrypts the chosen one and injects the tracker's env vars.
+
 ## API keys & the HTTP API
 
 Mint a long-lived bearer token on the **API tokens** page (or `POST /api-keys`). It's shown once, hashed at rest, prefix `sgpu_`. Send it as `Authorization: Bearer sgpu_...`. One key works across every surface:
@@ -212,9 +280,11 @@ Mint a long-lived bearer token on the **API tokens** page (or `POST /api-keys`).
 | Area | Key endpoints |
 |---|---|
 | Serverless | `POST /apps` · `GET /apps` · `GET /apps/{id}/status` · `POST /v1/chat/completions` · `GET /v1/models` · `POST /run/{app}` · `GET /result/{id}` |
+| Autotrain | `POST /v1/training-runs` · `GET /v1/training-runs` · `GET /v1/training-runs/{id}` · `GET /v1/training-runs/{id}/metrics` · `GET /v1/training-runs/{id}/logs/stream` · `POST /v1/training-runs/{id}/restart` · `POST /v1/training-runs/{id}/terminate` |
+| Datasets | `GET /v1/datasets` · `POST /v1/datasets` · `POST /v1/datasets/{id}/upload` · `GET /v1/datasets/{id}/preview` · `POST /v1/datasets/{id}/transform` |
 | Benchmark | `POST /benchmarks` · `GET /benchmarks/{id}` · `GET /benchmarks/{id}/logs?tail=` · `POST /benchmarks/{id}/duplicate` · `PATCH /benchmarks/{id}` (rename) · `POST /benchmarks/{id}/terminate` |
 | Compute | `POST /compute` · `GET /compute` · `GET /compute/{id}/ssh` |
-| Providers / storage | `GET /v1/providers` · `GET /v1/storage` |
+| Providers / storage / secrets | `GET /v1/providers` · `GET /v1/storage` · `GET /v1/global-env` · `GET /v1/tracking-credentials` |
 | Ops | `GET /health` · `GET /ready` · `GET /metrics` |
 
 ```bash
@@ -297,13 +367,15 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 - **Audit log** at `/admin/audit` records every mutating action.
 - **Compute approvals** at `/admin/compute-approvals` — pods land in `pending` until an admin clears them (toggle off per role).
 - **Provisioned** at `/admin/provisioned` — live view of every pod + serverless app across users, with cost tracking.
+- **Secrets** at `/admin/secrets` — org-wide global env vars + W&B / MLflow [tracking credentials](#secrets-global-env--tracking).
 
 ## Repo layout
 
-- **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/providers`, `/v1/storage`, `/api-keys`, `/auth`, `/admin/*`, `/metrics`
+- **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/training-runs`, `/v1/datasets`, `/v1/providers`, `/v1/storage`, `/v1/global-env`, `/v1/tracking-credentials`, `/api-keys`, `/auth`, `/admin/*`, `/metrics`
+- **Trainers** (`gateway/gateway/training/`) — standalone runner scripts shipped over SSH per run: `whisper_finetune.py` (ASR), `tts_finetune.py` (Qwen3 + NeuCodec TTS), and `sweep_runner.py` (GPU-pinned multi-trial orchestrator)
 - **Worker agent** (`worker-agent/`) — `BRPOP`s jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub; also drives the **multi-model VM fleet** — wave-loads each vLLM, sleeps/wakes them per request, runs operator commands (sleep/restart/kill), and ships per-model + scheduler logs to the gateway
 - **SDK + CLI** (`sdk/serverlessgpu/`) — `@endpoint` decorator, `QueueDepthAutoscaler`, and the `serverlessgpu` CLI
-- **Web** (`web/`) — Next.js UI: Serverless, Compute, Benchmark, Providers, API tokens, Admin (users / roles / audit / approvals / provisioned)
+- **Web** (`web/`) — Next.js UI: Serverless, Autotrain, Datasets, Benchmark, Compute, Providers, Storage, API tokens, Admin (users / roles / audit / approvals / provisioned / secrets)
 - **Helm chart** (`deploy/helm/serverlessgpu/`) — gateway + web + Postgres + Redis + Ingress (SSE-safe) + ServiceMonitor
 - **Grafana dashboard** (`deploy/grafana/`) — metrics panels wired to the gateway's Prometheus exporter
 - **CI** (`.github/workflows/ci.yml`) — helm lint + e2e (kind), and matrix multi-arch image builds (gateway + web → amd64/arm64 → merged manifest; PI worker → amd64)
