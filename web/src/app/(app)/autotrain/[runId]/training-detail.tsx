@@ -24,7 +24,7 @@ import {
   YAxis,
 } from "recharts";
 import { gateway } from "@/lib/gateway";
-import type { TrainingFile, TrainingGpu, TrainingRunRecord, TrainingStep } from "@/lib/types";
+import type { TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep } from "@/lib/types";
 
 const STATUS_STYLES: Record<string, string> = {
   queued: "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400",
@@ -319,8 +319,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </TabsList>
 
         <TabsContent value="metrics" className="mt-4 !flex-none space-y-4">
-          <LossCurve steps={steps} live={!terminal} />
-          <GpuCard gpus={gpus} running={!terminal} />
+          <LossCurve steps={steps} epochs={epochs} live={!terminal} />
+          <EvalCurve epochs={epochs} />
+          <GpuCard gpus={gpus} samples={run.result_json?.gpu_samples ?? []} running={!terminal} />
           {epochs.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               No per-epoch metrics yet. They appear here as each epoch finishes evaluating.
@@ -388,11 +389,11 @@ function Stat({ label, value, mono }: { label: string; value: string; mono?: boo
 const GPU_HIST_CAP = 150; // ~6 min at the 2.5s poll
 type GpuSample = { i: number; util: number; mem: number; memGiB: number; temp: number };
 
-function GpuCard({ gpus, running }: { gpus: TrainingGpu[]; running: boolean }) {
+function GpuCard({ gpus, samples, running }: { gpus: TrainingGpu[]; samples: TrainingGpuSample[]; running: boolean }) {
   const [hist, setHist] = useState<Record<number, GpuSample[]>>({});
   const tick = useRef(0);
   useEffect(() => {
-    if (!gpus.length) return;
+    if (!running || !gpus.length) return;
     tick.current += 1;
     const i = tick.current;
     setHist((prev) => {
@@ -405,17 +406,34 @@ function GpuCard({ gpus, running }: { gpus: TrainingGpu[]; running: boolean }) {
       }
       return next;
     });
-  }, [gpus]);
+  }, [gpus, running]);
 
-  if (!running && !gpus.length) return null;
-  const sorted = [...gpus].sort((a, b) => a.index - b.index);
+  // Finished run → render the persisted gpu_samples (the live poll returns
+  // nothing once a run ends). "current" = the last sample for the value chips.
+  const fromSamples = !running && samples.length > 0;
+  const series: Record<number, GpuSample[]> = {};
+  let current: TrainingGpu[] = gpus;
+  if (fromSamples) {
+    for (const s of samples) {
+      for (const g of s.gpus) {
+        const mem = g.mem_total > 0 ? (g.mem_used / g.mem_total) * 100 : 0;
+        (series[g.index] ??= []).push({ i: s.t, util: g.util, mem, memGiB: g.mem_used / 1024, temp: g.temp });
+      }
+    }
+    current = samples[samples.length - 1].gpus;
+  } else {
+    Object.assign(series, hist);
+  }
+
+  if (!running && !current.length) return null;
+  const sorted = [...current].sort((a, b) => a.index - b.index);
 
   return (
     <Card>
       <CardHeader className="pb-2">
         <CardTitle className="flex items-center gap-2 text-sm">
-          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
-          GPU telemetry · live
+          <span className={cn("h-1.5 w-1.5 rounded-full", running ? "animate-pulse bg-emerald-500" : "bg-muted-foreground")} />
+          GPU telemetry · {running ? "live" : "final"}
           {sorted.length > 0 && (
             <span className="text-[11px] font-normal text-muted-foreground">
               {sorted.length} GPU{sorted.length === 1 ? "" : "s"}
@@ -430,7 +448,7 @@ function GpuCard({ gpus, running }: { gpus: TrainingGpu[]; running: boolean }) {
         <div className="grid gap-3 lg:grid-cols-2">
           {sorted.map((g) => {
             const mem = g.mem_total > 0 ? (g.mem_used / g.mem_total) * 100 : 0;
-            const data = hist[g.index] ?? [];
+            const data = series[g.index] ?? [];
             return (
               <div key={g.index} className="rounded-lg border border-border p-3">
                 <div className="flex items-center justify-between gap-2">
@@ -483,16 +501,28 @@ function GpuCard({ gpus, running }: { gpus: TrainingGpu[]; running: boolean }) {
 
 // Live training-loss curve. Points come from the page-level @@STEP stream
 // while running, or result_json.steps once finalized.
-function LossCurve({ steps, live }: { steps: TrainingStep[]; live: boolean }) {
+function LossCurve({ steps, epochs, live }: { steps: TrainingStep[]; epochs: TrainingEpoch[]; live: boolean }) {
   const data = steps
     .filter((s) => typeof s.loss === "number")
-    .map((s) => ({ step: s.step, loss: s.loss as number, epoch: s.epoch ?? undefined }));
+    .map((s) => ({ step: s.step, loss: s.loss as number, eval_loss: null as number | null, epoch: s.epoch ?? undefined }));
+  // Per-epoch eval_loss is sparse; pin each to the last training step within that
+  // epoch so it overlays the per-step train loss on the same step axis.
+  for (const e of epochs) {
+    if (typeof e.eval_loss !== "number") continue;
+    let idx = -1;
+    for (let i = 0; i < steps.length; i++) {
+      if ((steps[i].epoch ?? 0) <= (e.epoch ?? 0) + 1e-6) idx = i;
+    }
+    if (idx < 0) idx = data.length - 1;
+    if (data[idx]) data[idx].eval_loss = e.eval_loss;
+  }
+  const hasEval = data.some((d) => d.eval_loss != null);
 
   return (
     <Card>
       <CardHeader className="pb-2">
         <CardTitle className="flex items-center gap-2 text-sm">
-          Training loss
+          Loss
           {live && (
             <span className="inline-flex items-center gap-1 text-[11px] font-normal text-muted-foreground">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" /> live
@@ -510,33 +540,76 @@ function LossCurve({ steps, live }: { steps: TrainingStep[]; live: boolean }) {
             <span className="font-mono">logging_steps</span> as training runs.
           </p>
         ) : (
-          <div className="h-64 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
-                <XAxis
-                  dataKey="step" type="number" domain={["dataMin", "dataMax"]}
-                  tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
-                  label={{ value: "step", position: "insideBottomRight", offset: -4, fontSize: 11 }}
-                />
-                <YAxis
-                  tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
-                  width={48} domain={["auto", "auto"]}
-                  tickFormatter={(v: number) => v.toFixed(2)}
-                />
-                <RTooltip
-                  contentStyle={{ fontSize: 12, borderRadius: 8 }}
-                  formatter={(v) => [Number(v).toFixed(4), "loss"]}
-                  labelFormatter={(s) => `step ${s}`}
-                />
-                <Line
-                  type="monotone" dataKey="loss" stroke="#6366f1" strokeWidth={2}
-                  dot={false} isAnimationActive={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
+          <>
+            <div className="h-64 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+                  <XAxis
+                    dataKey="step" type="number" domain={["dataMin", "dataMax"]}
+                    tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                    label={{ value: "step", position: "insideBottomRight", offset: -4, fontSize: 11 }}
+                  />
+                  <YAxis
+                    tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                    width={48} domain={["auto", "auto"]}
+                    tickFormatter={(v: number) => v.toFixed(2)}
+                  />
+                  <RTooltip
+                    contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                    formatter={(v, n) => [Number(v).toFixed(4), n === "eval_loss" ? "eval loss" : "train loss"]}
+                    labelFormatter={(s) => `step ${s}`}
+                  />
+                  <Line type="monotone" dataKey="loss" name="train loss" stroke="#6366f1" strokeWidth={2}
+                    dot={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="eval_loss" name="eval loss" stroke="#f59e0b" strokeWidth={2}
+                    connectNulls dot={{ r: 3 }} isAnimationActive={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              <span className="text-indigo-500">■</span> train loss (per step)
+              {hasEval && <> · <span className="text-amber-500">■</span> eval loss (per epoch)</>}
+            </p>
+          </>
         )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// WER / CER per epoch (lower is better). Hidden until there's eval data.
+function EvalCurve({ epochs }: { epochs: TrainingEpoch[] }) {
+  const data = epochs
+    .filter((e) => typeof e.wer === "number" || typeof e.cer === "number")
+    .map((e) => ({ epoch: e.epoch, wer: e.wer ?? null, cer: e.cer ?? null }));
+  if (data.length === 0) return null;
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm">Eval metrics · WER / CER <span className="text-[11px] font-normal text-muted-foreground">(per epoch, lower is better)</span></CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="h-56 w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+              <XAxis dataKey="epoch" type="number" domain={["dataMin", "dataMax"]} allowDecimals={false}
+                tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                label={{ value: "epoch", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
+              <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                width={44} domain={["auto", "auto"]} tickFormatter={(v: number) => `${v.toFixed(0)}%`} />
+              <RTooltip contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                formatter={(v, n) => [`${Number(v).toFixed(2)}%`, String(n).toUpperCase()]}
+                labelFormatter={(e) => `epoch ${e}`} />
+              <Line type="monotone" dataKey="wer" name="wer" stroke="#ef4444" strokeWidth={2} dot={{ r: 3 }} connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="cer" name="cer" stroke="#8b5cf6" strokeWidth={2} dot={{ r: 3 }} connectNulls isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+        <p className="mt-1 text-[10px] text-muted-foreground">
+          <span className="text-red-500">■</span> WER · <span className="text-violet-500">■</span> CER
+        </p>
       </CardContent>
     </Card>
   );

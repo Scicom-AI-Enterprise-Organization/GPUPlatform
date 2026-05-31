@@ -598,8 +598,8 @@ async def run_training(redis, run_id: str) -> None:
         return
 
     # ---- ship + run the trainer over SSH, streaming stdout ----
-    result: dict = {"epochs": [], "steps": [], "best": None, "artifact": None,
-                    "stopped_early": False, "progress": None}
+    result: dict = {"epochs": [], "steps": [], "gpu_samples": [], "best": None,
+                    "artifact": None, "stopped_early": False, "progress": None}
     line_buf: list[str] = []
 
     def on_line(line: str) -> None:
@@ -655,6 +655,34 @@ async def run_training(redis, run_id: str) -> None:
                 sent["n"] += 1
 
     pump_task = asyncio.create_task(pump())
+
+    # Periodically sample the run's GPUs into result["gpu_samples"] so the
+    # metrics tab can show the util/mem/temp graph for a *finished* run (the
+    # live /gpu poll only works while running). Uses its own SSH (distinct
+    # _GPU_SSH key) so it doesn't fight the live /gpu endpoint's connection.
+    _gpu_t0 = time.time()
+
+    async def gpu_sampler() -> None:
+        if not host or not key_filename:
+            return
+        await asyncio.sleep(8)  # let the trainer get onto the GPU first
+        while True:
+            try:
+                gpus = await asyncio.to_thread(
+                    _gpu_query_sync, f"{run_id}:sampler", host, int(port), user,
+                    key_filename, visible_devices,
+                )
+                if gpus:
+                    result["gpu_samples"].append(
+                        {"t": int(time.time() - _gpu_t0), "gpus": gpus}
+                    )
+                    if len(result["gpu_samples"]) > 600:
+                        result["gpu_samples"] = result["gpu_samples"][-600:]
+            except Exception:
+                pass
+            await asyncio.sleep(6)
+
+    gpu_task = asyncio.create_task(gpu_sampler())
     rc = 1
     try:
         cfg["gpu_count"] = gpu_count
@@ -711,6 +739,12 @@ async def run_training(redis, run_id: str) -> None:
         await _push_log(redis, run_id, f"[gateway] run failed: {e}")
         result.setdefault("error", str(e))
     finally:
+        gpu_task.cancel()
+        try:
+            await gpu_task
+        except BaseException:
+            pass
+        _GPU_SSH.pop(f"{run_id}:sampler", None)
         pump_task.cancel()
         try:
             await pump_task
@@ -1048,6 +1082,31 @@ async def get_training_run(
     row = await _owned(run_id, user, session)
     u = await session.get(User, row.owner_id)
     return _to_record(row, u.username if u else "?")
+
+
+@router.get("/{run_id}/metrics")
+async def training_metrics(
+    run_id: str,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """All metrics for a run in one call — for dashboards + programmatic pulls.
+    Per-step training loss, per-epoch eval (WER/CER/loss), best checkpoint, and
+    the GPU util/mem/temp time series. Read straight from the persisted
+    result_json, so it works for finished runs too."""
+    row = await _owned(run_id, user, session)
+    r = row.result_json or {}
+    return {
+        "id": row.id,
+        "status": row.status,
+        "steps": r.get("steps") or [],
+        "epochs": r.get("epochs") or [],
+        "gpu_samples": r.get("gpu_samples") or [],
+        "best": r.get("best"),
+        "artifact": r.get("artifact"),
+        "stopped_early": bool(r.get("stopped_early")),
+        "error": r.get("error") or row.error_text,
+    }
 
 
 class RenameTrainingRunRequest(BaseModel):

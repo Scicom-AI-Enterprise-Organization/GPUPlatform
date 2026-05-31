@@ -34,6 +34,7 @@ import type {
   DatasetRecord,
   DatasetPreview,
   SyncDatasetRequest,
+  GlobalEnvRecord,
   PolicyRole,
   ProviderRecord,
   SectionKey,
@@ -46,6 +47,7 @@ import type {
   VmAvailability,
   TrainingRunRecord,
   TrainingGpuResponse,
+  TrainingMetrics,
   CreateTrainingRunRequest,
   TrainingFile,
   TrackingCredentialRecord,
@@ -233,6 +235,9 @@ export const gateway = {
     request<TrainingRunRecord[]>(`/v1/training-runs?scope=${scope}`),
   getTrainingRun: (id: string) =>
     request<TrainingRunRecord>(`/v1/training-runs/${encodeURIComponent(id)}`),
+  /** All persisted metrics in one call: loss steps, per-epoch eval, GPU samples. */
+  getTrainingMetrics: (id: string) =>
+    request<TrainingMetrics>(`/v1/training-runs/${encodeURIComponent(id)}/metrics`),
   renameTrainingRun: (id: string, name: string) =>
     request<TrainingRunRecord>(`/v1/training-runs/${encodeURIComponent(id)}`, {
       method: "PATCH",
@@ -434,6 +439,9 @@ export const gateway = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  // ---- Global secrets (admin-managed; values masked) ----
+  listGlobalEnv: () => request<GlobalEnvRecord[]>("/v1/global-env"),
 
   // ---- Admin: users, policy roles, audit ----
   adminListUsers: () => request<AdminUserRecord[]>("/admin/users"),

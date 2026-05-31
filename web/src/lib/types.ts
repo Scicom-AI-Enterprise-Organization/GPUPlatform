@@ -229,10 +229,14 @@ export type TrainingStep = {
   epoch?: number | null;
 };
 
+export type TrainingGpuSample = { t: number; gpus: TrainingGpu[] };
+
 export type TrainingResult = {
   epochs?: TrainingEpoch[];
   // Per-N-step training loss (@@STEP) for the live loss curve.
   steps?: TrainingStep[];
+  // Per-poll GPU util/mem/temp samples, persisted so finished runs show the graph.
+  gpu_samples?: TrainingGpuSample[];
   best?: {
     epoch?: number; wer?: number | null; cer?: number | null; eval_loss?: number | null;
     loss?: number | null;
@@ -244,6 +248,20 @@ export type TrainingResult = {
   trials?: TrainingTrial[];
   progress?: { step?: string; percent?: number } | null;
   error?: string;
+};
+
+// Response of GET /v1/training-runs/:id/metrics — all persisted metrics in one
+// call (works for finished runs too).
+export type TrainingMetrics = {
+  id: string;
+  status: string;
+  steps: TrainingStep[];
+  epochs: TrainingEpoch[];
+  gpu_samples: TrainingGpuSample[];
+  best: TrainingResult["best"];
+  artifact: TrainingResult["artifact"];
+  stopped_early: boolean;
+  error?: string | null;
 };
 
 export type TrainingRunRecord = {
@@ -552,6 +570,7 @@ export type DatasetRecord = {
   label_base_url?: string | null; // kind=label source (token never returned)
   label_project_id?: string | null;
   label_status?: string | null; // approved | rejected | not_reviewed | all
+  label_token_secret?: string | null; // global-secret key (if used instead of a stored token)
   transform_status?: string | null; // "" | running | done | failed
   transform_log?: string | null;
   created_at: string;
@@ -571,6 +590,7 @@ export type CreateDatasetRequest = {
   label_base_url?: string | null;
   label_project_id?: string | null;
   label_token?: string | null;
+  label_token_secret?: string | null; // OR: a global-secret key holding the token
   label_status?: string | null; // approved | rejected | not_reviewed | all
 };
 
