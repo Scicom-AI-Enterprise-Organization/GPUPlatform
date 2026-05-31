@@ -164,10 +164,29 @@ def _read_metadata_rows(ds: dict) -> list[dict]:
     return data if isinstance(data, list) else data.get("data", data.get("rows", []))
 
 
+def _s3_url_key_for_bucket(ref: str, bucket: str | None) -> str | None:
+    """If `ref` is an http(s) S3 URL for `bucket` (virtual-hosted
+    `bucket.s3….amazonaws.com/key` or path-style `…/bucket/key`), return the
+    decoded object key, so the caller can re-fetch via boto3 instead of trusting
+    a possibly-expired presigned signature baked into the metadata. Returns None
+    for non-S3 / other-bucket URLs (those fall through to a plain HTTP GET)."""
+    if not bucket or not (ref.startswith("http://") or ref.startswith("https://")):
+        return None
+    from urllib.parse import urlparse, unquote
+
+    u = urlparse(ref)
+    host, path, b = u.netloc.lower(), u.path.lstrip("/"), bucket.lower()
+    if host.startswith(f"{b}.s3") or host.startswith(f"{b}.s3-"):  # virtual-hosted
+        return unquote(path)
+    if path.lower().startswith(f"{b}/"):  # path-style
+        return unquote(path[len(bucket) + 1:])
+    return None
+
+
 def _download_audio_s3(ds: dict, ref: str, dest_dir: str) -> str | None:
-    """Resolve a metadata audio reference to a local file. `ref` is either a
-    full http(s) presigned URL (post-transform datasets) or a key relative to
-    the storage prefix + audio_prefix."""
+    """Resolve a metadata audio reference to a local file. `ref` is either an
+    http(s) URL (possibly a presigned S3 link) or a key relative to the storage
+    prefix + audio_prefix."""
     import urllib.request
 
     fname = os.path.basename(ref.split("?")[0]) or "audio.wav"
@@ -175,7 +194,13 @@ def _download_audio_s3(ds: dict, ref: str, dest_dir: str) -> str | None:
     if os.path.exists(local):
         return local
     try:
-        if ref.startswith("http://") or ref.startswith("https://"):
+        own_key = _s3_url_key_for_bucket(ref, ds.get("bucket"))
+        if own_key is not None:
+            # The metadata stored an http(s) S3 URL for our own bucket — fetch via
+            # boto3 with the dataset creds rather than the URL, since a stored
+            # presigned link can expire during a long, multi-trial sweep.
+            _s3_client(ds).download_file(ds["bucket"], own_key, local)
+        elif ref.startswith("http://") or ref.startswith("https://"):
             urllib.request.urlretrieve(ref, local)
         else:
             cli = _s3_client(ds)

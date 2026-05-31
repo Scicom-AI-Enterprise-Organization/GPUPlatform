@@ -24,6 +24,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -221,11 +222,18 @@ async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str
 
     creds = _s3_creds_from_storage(storage)
     if ds.kind == "s3" and ds.s3_metadata_uri:
-        # s3://bucket/key
-        without = ds.s3_metadata_uri[len("s3://"):]
-        bucket, _, key = without.partition("/")
-        metadata_key = key
-        bucket = bucket or creds["bucket"]
+        # s3_metadata_uri is either a full "s3://bucket/key" URI or a key
+        # relative to the storage's bucket (used as-is). Mirror datasets_api's
+        # preview resolution so the trainer reads the exact object the UI does
+        # — the old code blindly chopped 5 chars assuming an "s3://" prefix,
+        # turning "datasets/…" into bucket="sets" → GetObject AccessDenied.
+        u = urlparse(ds.s3_metadata_uri)
+        if u.scheme == "s3":
+            bucket = u.netloc or creds["bucket"]
+            metadata_key = u.path.lstrip("/")
+        else:
+            bucket = creds["bucket"]
+            metadata_key = ds.s3_metadata_uri.lstrip("/")
     else:  # upload
         bucket = creds["bucket"]
         parts = [creds["prefix"], f"datasets/{ds.id}", ds.metadata_filename or "metadata.csv"]
