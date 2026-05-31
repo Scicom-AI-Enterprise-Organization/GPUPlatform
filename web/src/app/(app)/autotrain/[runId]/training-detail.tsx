@@ -24,6 +24,7 @@ import {
   YAxis,
 } from "recharts";
 import { gateway } from "@/lib/gateway";
+import { JsonView } from "@/components/json-view";
 import { cn } from "@/lib/utils";
 import type { TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
 
@@ -361,7 +362,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
 
         <TabsContent value="metrics" className="mt-4 !flex-none space-y-4">
           <LossCurve steps={steps} epochs={epochs} live={!terminal} sweep={isSweep} trials={trials} />
-          <EvalCurve epochs={epochs} />
+          <EvalCurve epochs={epochs} sweep={isSweep} trials={trials} />
           <GpuCard gpus={gpus} samples={run.result_json?.gpu_samples ?? []} running={!terminal} />
           {epochs.length === 0 ? (
             <p className="text-sm text-muted-foreground">
@@ -372,6 +373,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               <table className="w-full text-sm">
                 <thead className="bg-muted/50 text-xs text-muted-foreground">
                   <tr>
+                    {isSweep && <th className="px-3 py-2 text-left">Trial</th>}
                     <th className="px-3 py-2 text-left">Epoch</th>
                     <th className="px-3 py-2 text-right">WER</th>
                     <th className="px-3 py-2 text-right">CER</th>
@@ -380,10 +382,23 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {epochs.map((e, i) => {
+                  {(isSweep
+                    ? [...epochs].sort((a, b) => (a.trial ?? 0) - (b.trial ?? 0) || a.epoch - b.epoch)
+                    : epochs
+                  ).map((e, i) => {
                     const isBest = best?.epoch != null && Math.round(e.epoch) === best.epoch;
+                    const ti = e.trial;
                     return (
                       <tr key={i} className={`border-t border-border ${isBest ? "bg-emerald-500/5" : ""}`}>
+                        {isSweep && (
+                          <td className="px-3 py-2 font-mono text-xs">
+                            {ti == null ? "—" : (
+                              <span title={trialLabel(ti, trials)}>
+                                <span style={{ color: TRIAL_COLORS[ti % TRIAL_COLORS.length] }}>■</span> {trialLabel(ti, trials)}
+                              </span>
+                            )}
+                          </td>
+                        )}
                         <td className="px-3 py-2 font-mono">{e.epoch}</td>
                         <td className="px-3 py-2 text-right font-mono">{fmt(e.wer)}</td>
                         <td className="px-3 py-2 text-right font-mono">{fmt(e.cer)}</td>
@@ -406,10 +421,30 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           <FilesTab run={run} />
         </TabsContent>
 
-        <TabsContent value="config" className="mt-4 !flex-none">
-          <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 px-4 py-3 font-mono text-xs leading-relaxed">
-            {JSON.stringify(run.config_json, null, 2)}
-          </pre>
+        <TabsContent value="config" className="mt-4 !flex-none space-y-4">
+          <Card>
+            <CardHeader className="pb-2"><CardTitle className="text-sm">Compute</CardTitle></CardHeader>
+            <CardContent className="flex flex-wrap gap-x-8 gap-y-3 text-sm">
+              <Stat
+                label={run.provider_kind === "vm" ? "VM" : "Provider"}
+                value={
+                  run.provider_name
+                    ? `${run.provider_name}${run.provider_kind ? ` (${run.provider_kind})` : ""}`
+                    : run.provider_id || "—"
+                }
+              />
+              <Stat
+                label="GPU"
+                value={run.gpu_type ? `${run.gpu_type}${run.gpu_count > 1 ? ` × ${run.gpu_count}` : ""}` : "—"}
+              />
+              {run.visible_devices && <Stat label="GPU ids" value={run.visible_devices} mono />}
+              <Stat label="Storage" value={run.storage_name || run.storage_id || "—"} />
+              <Stat label="Dataset" value={run.dataset_id} mono />
+              {run.test_dataset_id && <Stat label="Test dataset" value={run.test_dataset_id} mono />}
+              <Stat label="Base model" value={run.base_model} mono />
+            </CardContent>
+          </Card>
+          <JsonView value={run.config_json} />
         </TabsContent>
       </Tabs>
     </div>
@@ -682,12 +717,81 @@ function LossCurve({ steps, epochs, live, sweep, trials }: { steps: TrainingStep
   );
 }
 
-// WER / CER per epoch (lower is better). Hidden until there's eval data.
-function EvalCurve({ epochs }: { epochs: TrainingEpoch[] }) {
+// One per-trial metric chart (WER or CER): a line per trial, legended by params.
+function PerTrialEvalChart({ epochs, metric, idxs, trials }: {
+  epochs: TrainingEpoch[]; metric: "wer" | "cer"; idxs: number[]; trials: TrainingTrial[];
+}) {
+  const byEpoch = new Map<number, Record<string, number>>();
+  for (const e of epochs) {
+    const v = e[metric];
+    if (typeof v !== "number" || e.trial == null) continue;
+    const row = byEpoch.get(e.epoch) ?? { epoch: e.epoch };
+    row[`t${e.trial}`] = v;
+    byEpoch.set(e.epoch, row);
+  }
+  const data = [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch);
+  if (data.length === 0) return null;
+  return (
+    <div>
+      <div className="mb-1 text-xs font-medium text-muted-foreground">{metric.toUpperCase()}</div>
+      <div className="h-56 w-full">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+            <XAxis dataKey="epoch" type="number" domain={["dataMin", "dataMax"]} allowDecimals={false}
+              tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+              label={{ value: "epoch", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
+            <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+              width={44} domain={["auto", "auto"]} tickFormatter={(v: number) => `${v.toFixed(0)}%`} />
+            <RTooltip contentStyle={{ fontSize: 12, borderRadius: 8 }}
+              formatter={(v, n) => [`${Number(v).toFixed(2)}%`, trialLabel(Number(String(n).slice(1)), trials)]}
+              labelFormatter={(e) => `epoch ${e}`} />
+            {idxs.map((i) => (
+              <Line key={i} type="monotone" dataKey={`t${i}`} name={`t${i}`}
+                stroke={TRIAL_COLORS[i % TRIAL_COLORS.length]} strokeWidth={2} dot={{ r: 3 }}
+                connectNulls isAnimationActive={false} />
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+// WER / CER per epoch (lower is better). Hidden until there's eval data. Sweeps
+// split each metric into one line per trial, legended like the loss curve.
+function EvalCurve({ epochs, sweep, trials }: { epochs: TrainingEpoch[]; sweep: boolean; trials: TrainingTrial[] }) {
+  const hasData = epochs.some((e) => typeof e.wer === "number" || typeof e.cer === "number");
+  if (!hasData) return null;
+
+  if (sweep && epochs.some((e) => e.trial != null)) {
+    const idxs = [...new Set(epochs.map((e) => e.trial).filter((t): t is number => t != null))].sort((a, b) => a - b);
+    return (
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm">
+            Eval metrics · per trial{" "}
+            <span className="text-[11px] font-normal text-muted-foreground">(per epoch, lower is better)</span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <PerTrialEvalChart epochs={epochs} metric="wer" idxs={idxs} trials={trials} />
+          <PerTrialEvalChart epochs={epochs} metric="cer" idxs={idxs} trials={trials} />
+          <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
+            {idxs.map((i) => (
+              <span key={i}>
+                <span style={{ color: TRIAL_COLORS[i % TRIAL_COLORS.length] }}>■</span> {trialLabel(i, trials)}
+              </span>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
   const data = epochs
     .filter((e) => typeof e.wer === "number" || typeof e.cer === "number")
     .map((e) => ({ epoch: e.epoch, wer: e.wer ?? null, cer: e.cer ?? null }));
-  if (data.length === 0) return null;
   return (
     <Card>
       <CardHeader className="pb-2">

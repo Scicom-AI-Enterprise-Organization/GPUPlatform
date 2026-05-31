@@ -213,6 +213,8 @@ export type TrainingEpoch = {
   cer?: number | null;
   eval_loss?: number | null;
   train_loss?: number | null;
+  // Sweep runs: which trial this eval belongs to (for per-trial eval curves/table).
+  trial?: number | null;
 };
 
 export type TrainingTrial = {
@@ -260,6 +262,7 @@ export type TrainingMetrics = {
   steps: TrainingStep[];
   epochs: TrainingEpoch[];
   gpu_samples: TrainingGpuSample[];
+  trials?: TrainingTrial[] | null;
   best: TrainingResult["best"];
   artifact: TrainingResult["artifact"];
   stopped_early: boolean;
@@ -285,7 +288,10 @@ export type TrainingRunRecord = {
   ended_at?: string | null;
   cost_per_hr?: number | null;
   provider_id?: string | null;
+  provider_name?: string | null;
+  provider_kind?: string | null;
   storage_id?: string | null;
+  storage_name?: string | null;
   gpu_type?: string | null;
   gpu_count: number;
   visible_devices?: string | null;
@@ -761,6 +767,7 @@ export type AuditLogRecord = {
   id: number;
   actor_id: number | null;
   actor_username: string;
+  actor_email?: string | null;
   action: string;
   resource_type: string;
   resource_id: string | null;

@@ -980,7 +980,10 @@ class TrainingRunRecord(BaseModel):
     ended_at: Optional[str] = None
     cost_per_hr: Optional[float] = None
     provider_id: Optional[str] = None
+    provider_name: Optional[str] = None
+    provider_kind: Optional[str] = None  # "vm" | "runpod" | …
     storage_id: Optional[str] = None
+    storage_name: Optional[str] = None
     gpu_type: Optional[str] = None
     gpu_count: int = 1
     visible_devices: Optional[str] = None
@@ -1003,7 +1006,11 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
-def _to_record(row: TrainingRun, owner_username: str) -> TrainingRunRecord:
+def _to_record(
+    row: TrainingRun, owner_username: str,
+    provider_name: Optional[str] = None, provider_kind: Optional[str] = None,
+    storage_name: Optional[str] = None,
+) -> TrainingRunRecord:
     return TrainingRunRecord(
         id=row.id, name=row.name, status=row.status, dataset_id=row.dataset_id,
         test_dataset_id=row.test_dataset_id, base_model=row.base_model,
@@ -1012,7 +1019,9 @@ def _to_record(row: TrainingRun, owner_username: str) -> TrainingRunRecord:
         exit_code=row.exit_code, error_text=row.error_text, result_json=row.result_json,
         created_by=owner_username, created_at=_iso(row.created_at) or "",
         started_at=_iso(row.started_at), ended_at=_iso(row.ended_at),
-        cost_per_hr=row.cost_per_hr, provider_id=row.provider_id, storage_id=row.storage_id,
+        cost_per_hr=row.cost_per_hr, provider_id=row.provider_id,
+        provider_name=provider_name, provider_kind=provider_kind,
+        storage_id=row.storage_id, storage_name=storage_name,
         gpu_type=row.gpu_type, gpu_count=row.gpu_count, visible_devices=row.visible_devices,
     )
 
@@ -1183,7 +1192,14 @@ async def get_training_run(
 ):
     row = await _owned(run_id, user, session)
     u = await session.get(User, row.owner_id)
-    return _to_record(row, u.username if u else "?")
+    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+    store = await session.get(Storage, row.storage_id) if row.storage_id else None
+    return _to_record(
+        row, u.username if u else "?",
+        provider_name=prov.name if prov else None,
+        provider_kind=prov.kind if prov else None,
+        storage_name=store.name if store else None,
+    )
 
 
 @router.get("/{run_id}/metrics")
