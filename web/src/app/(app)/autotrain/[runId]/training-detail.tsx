@@ -24,6 +24,7 @@ import {
   YAxis,
 } from "recharts";
 import { gateway } from "@/lib/gateway";
+import { cn } from "@/lib/utils";
 import type { TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep } from "@/lib/types";
 
 const STATUS_STYLES: Record<string, string> = {
