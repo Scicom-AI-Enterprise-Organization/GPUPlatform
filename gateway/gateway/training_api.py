@@ -1224,6 +1224,10 @@ async def stream_training_logs(
                 raw = []
             for b in raw:
                 line = b.decode("utf-8", "replace") if isinstance(b, bytes) else str(b)
+                # Strip carriage returns: tqdm progress bars use \r, which SSE
+                # treats as a line terminator — it would split the line and drop
+                # the trailing @@STEP/@@METRIC payload the live charts parse.
+                line = line.replace("\r", "")
                 yield f"data: {line}\n\n"
                 sent += 1
             async with session_factory()() as s:
