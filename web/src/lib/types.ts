@@ -227,6 +227,8 @@ export type TrainingStep = {
   loss?: number | null;
   lr?: number | null;
   epoch?: number | null;
+  // Sweep runs: which trial this step belongs to (for per-trial loss curves).
+  trial?: number | null;
 };
 
 export type TrainingGpuSample = { t: number; gpus: TrainingGpu[] };

@@ -1,7 +1,6 @@
 import Link from "next/link";
 import { Inbox, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
 import { gateway } from "@/lib/gateway";
@@ -9,6 +8,7 @@ import type { TrainingRunRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { ScopeToggle } from "@/components/scope-toggle";
+import { AutotrainList } from "./autotrain-list";
 
 async function loadRuns(
   scope: "mine" | "all",
@@ -19,14 +19,6 @@ async function loadRuns(
     return { items: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
-
-const STATUS_STYLES: Record<string, string> = {
-  queued: "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400",
-  running: "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400",
-  done: "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
-  failed: "border-destructive/40 bg-destructive/10 text-destructive",
-  cancelled: "border-border bg-muted text-muted-foreground",
-};
 
 export default async function AutotrainPage({
   searchParams,
@@ -94,43 +86,7 @@ export default async function AutotrainPage({
                 </p>
               </div>
             ) : (
-              <ul className="divide-y divide-border rounded-md border border-border">
-                {items.map((r) => {
-                  const best = r.result_json?.best;
-                  return (
-                    <li key={r.id}>
-                      <Link
-                        href={`/autotrain/${encodeURIComponent(r.id)}`}
-                        className="flex items-center justify-between gap-4 px-4 py-3 hover:bg-muted/40"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="truncate font-medium">{r.name}</span>
-                            <Badge
-                              variant="outline"
-                              className={`text-[10px] ${STATUS_STYLES[r.status] ?? ""}`}
-                            >
-                              {r.status}
-                            </Badge>
-                          </div>
-                          <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
-                            {r.base_model} · {r.id}
-                          </div>
-                        </div>
-                        <div className="shrink-0 text-right text-xs text-muted-foreground">
-                          {best?.wer != null && (
-                            <div>
-                              WER {best.wer.toFixed(2)}
-                              {best.cer != null ? ` · CER ${best.cer.toFixed(2)}` : ""}
-                            </div>
-                          )}
-                          <div>{new Date(r.created_at).toLocaleString()}</div>
-                        </div>
-                      </Link>
-                    </li>
-                  );
-                })}
-              </ul>
+              <AutotrainList items={items} />
             )}
           </section>
         )}

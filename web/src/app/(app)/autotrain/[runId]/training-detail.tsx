@@ -25,15 +25,51 @@ import {
 } from "recharts";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
-import type { TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep } from "@/lib/types";
+import type { TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
+
+// Distinct colours for per-trial sweep loss curves.
+const TRIAL_COLORS = ["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9", "#ec4899", "#84cc16"];
+
+function trialLabel(i: number, trials: TrainingTrial[]): string {
+  const p = trials.find((x) => x.trial === i)?.params;
+  if (!p) return `t${i}`;
+  const parts = Object.entries(p).map(([k, v]) =>
+    k === "learning_rate" ? `lr ${v}`
+    : k === "precision" ? String(v)
+    : k === "batch_size" ? `bs ${v}`
+    : k === "grad_accum" ? `ga ${v}`
+    : k === "max_epochs" ? `ep ${v}`
+    : `${k}=${v}`,
+  );
+  return `t${i}: ${parts.join(" · ")}`;
+}
 
 const STATUS_STYLES: Record<string, string> = {
   queued: "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+  pending: "border-border bg-muted text-muted-foreground",
   running: "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400",
   done: "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
   failed: "border-destructive/40 bg-destructive/10 text-destructive",
   cancelled: "border-border bg-muted text-muted-foreground",
 };
+
+// A run is a sweep if its config carries a non-empty sweep grid.
+export function isSweepConfig(config: Record<string, unknown> | undefined | null): boolean {
+  const sweep = (config?.sweep ?? null) as Record<string, unknown> | null;
+  return !!sweep && Object.values(sweep).some((v) => Array.isArray(v) && v.length > 0);
+}
+
+// Single-run vs sweep badge (placed beside the status badge).
+export function RunKindBadge({ sweep, trials }: { sweep: boolean; trials?: number }) {
+  return (
+    <Badge variant="outline" className={
+      sweep ? "border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-300"
+            : "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-300"
+    }>
+      {sweep ? `sweep${trials ? ` · ${trials} trials` : ""}` : "single run"}
+    </Badge>
+  );
+}
 
 function fmt(v: number | null | undefined, digits = 2): string {
   return v == null ? "—" : v.toFixed(digits);
@@ -105,6 +141,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       if (i >= 0) {
         try {
           const pt = JSON.parse(ev.data.slice(i + "@@STEP ".length)) as TrainingStep;
+          // Sweep: the trial index comes from the "[trial N]" prefix on the line.
+          const tm = (ev.data as string).match(/\[trial (\d+)\]/);
+          if (tm && pt.trial == null) pt.trial = Number(tm[1]);
           if (typeof pt.step === "number") setLiveSteps((p) => [...p, pt]);
         } catch {
           /* ignore malformed */
@@ -122,7 +161,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const best = run.result_json?.best;
   const artifact = run.result_json?.artifact;
   const trials = run.result_json?.trials ?? [];
-  const isSweep = trials.length > 0;
+  const isSweep = isSweepConfig(run.config_json) || trials.length > 0;
   const metricLabel = run.task_type === "tts"
     ? "loss"
     : String((run.config_json?.eval_metric as string) || "wer").toUpperCase();
@@ -223,6 +262,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               </>
             )}
             <Badge variant="outline" className={STATUS_STYLES[run.status] ?? ""}>{run.status}</Badge>
+            <RunKindBadge sweep={isSweep} trials={isSweep ? trials.length : undefined} />
           </div>
           <p className="mt-1 font-mono text-xs text-muted-foreground">
             {run.base_model} · {run.id}
@@ -320,7 +360,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </TabsList>
 
         <TabsContent value="metrics" className="mt-4 !flex-none space-y-4">
-          <LossCurve steps={steps} epochs={epochs} live={!terminal} />
+          <LossCurve steps={steps} epochs={epochs} live={!terminal} sweep={isSweep} trials={trials} />
           <EvalCurve epochs={epochs} />
           <GpuCard gpus={gpus} samples={run.result_json?.gpu_samples ?? []} running={!terminal} />
           {epochs.length === 0 ? (
@@ -502,7 +542,70 @@ function GpuCard({ gpus, samples, running }: { gpus: TrainingGpu[]; samples: Tra
 
 // Live training-loss curve. Points come from the page-level @@STEP stream
 // while running, or result_json.steps once finalized.
-function LossCurve({ steps, epochs, live }: { steps: TrainingStep[]; epochs: TrainingEpoch[]; live: boolean }) {
+function LossCurve({ steps, epochs, live, sweep, trials }: { steps: TrainingStep[]; epochs: TrainingEpoch[]; live: boolean; sweep: boolean; trials: TrainingTrial[] }) {
+  // Sweep: one train-loss line per trial (steps carry a `trial` index), legended
+  // by each trial's hyperparameters.
+  if (sweep && steps.some((s) => s.trial != null)) {
+    const idxs = [...new Set(steps.map((s) => s.trial).filter((t): t is number => t != null))].sort((a, b) => a - b);
+    const byStep = new Map<number, Record<string, number>>();
+    for (const s of steps) {
+      if (typeof s.loss !== "number" || s.trial == null) continue;
+      const row = byStep.get(s.step) ?? { step: s.step };
+      row[`t${s.trial}`] = s.loss;
+      byStep.set(s.step, row);
+    }
+    const data = [...byStep.values()].sort((a, b) => a.step - b.step);
+    return (
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            Training loss · per trial
+            {live && (
+              <span className="inline-flex items-center gap-1 text-[11px] font-normal text-muted-foreground">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" /> live
+              </span>
+            )}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {data.length === 0 ? (
+            <p className="py-8 text-center text-sm text-muted-foreground">No loss points yet — trials stream in as they run.</p>
+          ) : (
+            <>
+              <div className="h-72 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+                    <XAxis dataKey="step" type="number" domain={["dataMin", "dataMax"]} tick={{ fontSize: 11 }}
+                      stroke="currentColor" className="text-muted-foreground"
+                      label={{ value: "step", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
+                    <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                      width={48} domain={["auto", "auto"]} tickFormatter={(v: number) => v.toFixed(2)} />
+                    <RTooltip contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                      formatter={(v, n) => [Number(v).toFixed(4), trialLabel(Number(String(n).slice(1)), trials)]}
+                      labelFormatter={(s) => `step ${s}`} />
+                    {idxs.map((i) => (
+                      <Line key={i} type="monotone" dataKey={`t${i}`} name={`t${i}`}
+                        stroke={TRIAL_COLORS[i % TRIAL_COLORS.length]} strokeWidth={2} dot={false}
+                        connectNulls isAnimationActive={false} />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
+                {idxs.map((i) => (
+                  <span key={i}>
+                    <span style={{ color: TRIAL_COLORS[i % TRIAL_COLORS.length] }}>■</span> {trialLabel(i, trials)}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
   const data = steps
     .filter((s) => typeof s.loss === "number")
     .map((s) => ({ step: s.step, loss: s.loss as number, eval_loss: null as number | null, epoch: s.epoch ?? undefined }));

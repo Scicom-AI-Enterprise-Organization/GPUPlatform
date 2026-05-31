@@ -457,6 +457,19 @@ async def _safe_run(redis, run_id: str) -> None:
         await _finalize(run_id, "failed", None, "internal error — see gateway logs")
 
 
+async def _flush_result(run_id: str, result: dict) -> None:
+    """Persist the in-flight result_json (steps, trials, gpu_samples, …) WITHOUT
+    touching status, so the UI shows live loss / per-trial status while running.
+    JSON-copy so SQLAlchemy sees a new value and the writer can't race the dict."""
+    snap = json.loads(json.dumps(result))
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None or row.status not in ("running",):
+            return
+        row.result_json = snap
+        await s.commit()
+
+
 async def _finalize(run_id: str, status: str, exit_code: Optional[int],
                     error_text: Optional[str], result_json: Optional[dict] = None) -> None:
     async with session_factory()() as s:
@@ -505,8 +518,19 @@ async def run_training(redis, run_id: str) -> None:
             return v if v not in (None, "") else (os.environ.get(k) or None)
 
         cfg["dataset"] = await _resolve_dataset_spec(dataset_id, g("HF_TOKEN"))
-        if test_dataset_id:
+        if test_dataset_id and test_dataset_id != dataset_id:
             cfg["test_dataset"] = await _resolve_dataset_spec(test_dataset_id, g("HF_TOKEN"))
+        elif test_dataset_id and test_dataset_id == dataset_id:
+            # Train + eval on the SAME dataset → evaluate on its built-in
+            # test/validation rows (the trainer's split_pairs prefers a `split`
+            # column, falling back to a seeded hold-out only if absent). Do NOT
+            # set a separate test_dataset (that would eval on the full set).
+            cfg["test_from_split"] = True
+            await _push_log(
+                redis, run_id,
+                "[gateway] test dataset == training dataset → evaluating on its "
+                "own test/validation split (split column).",
+            )
         target = await _training_s3_target(storage_id)
         cfg["artifacts"] = {
             "bucket": target.bucket, "region": target.region, "endpoint": target.endpoint,
@@ -617,6 +641,17 @@ async def run_training(redis, run_id: str) -> None:
                 result["progress"] = {"step": kv.get("step"), "percent": float(kv.get("percent") or 0)}
             except Exception:
                 pass
+        # Sweep: the orchestrator emits "[sweep] trial N START …" when a slot
+        # picks up a trial, and prefixes that trial's worker output with
+        # "[trial N]". Mark the trial running, and tag its step/epoch metrics.
+        ms = re.search(r"\[sweep\] trial (\d+) START", line)
+        if ms:
+            t = int(ms.group(1))
+            trials = result.get("trials") or []
+            if 0 <= t < len(trials) and trials[t].get("status") == "pending":
+                trials[t]["status"] = "running"
+        tm = re.match(r"\s*\[trial (\d+)\]", line)
+        trial_idx = int(tm.group(1)) if tm else None
         for tag, key in (("@@METRIC ", "metric"), ("@@STEP ", "step"),
                          ("@@DONE ", "done"),
                          ("@@ARTIFACT ", "artifact"), ("@@ERROR ", "error"),
@@ -624,26 +659,42 @@ async def run_training(redis, run_id: str) -> None:
             # The tag can be prefixed by a tqdm progress bar (\r, no newline) on
             # the same captured line, so find it anywhere — not just at the start.
             ti = line.find(tag)
-            if ti >= 0:
-                try:
-                    obj = json.loads(line[ti + len(tag):])
-                except Exception:
-                    continue
-                if key == "metric":
-                    result["epochs"].append(obj)
-                elif key == "step":  # per-N-step training loss for the live curve
-                    result["steps"].append(obj)
-                elif key == "done":
-                    result["best"] = obj.get("best")
-                    result["stopped_early"] = bool(obj.get("stopped_early"))
-                    if obj.get("trials") is not None:  # sweep summary
-                        result["trials"] = obj["trials"]
-                elif key == "trial":  # one finished sweep trial
+            if ti < 0:
+                continue
+            # A trial-prefixed @@DONE/@@ARTIFACT belongs to ONE trial's worker —
+            # don't let it clobber the sweep-level best/artifact (the sweep
+            # orchestrator emits its own un-prefixed @@DONE / @@TRIAL).
+            if trial_idx is not None and key in ("done", "artifact"):
+                break
+            try:
+                obj = json.loads(line[ti + len(tag):])
+            except Exception:
+                break
+            if key == "metric":
+                if trial_idx is not None:
+                    obj["trial"] = trial_idx
+                result["epochs"].append(obj)
+            elif key == "step":  # per-N-step training loss for the live curve
+                if trial_idx is not None:
+                    obj["trial"] = trial_idx
+                result["steps"].append(obj)
+            elif key == "done":
+                result["best"] = obj.get("best")
+                result["stopped_early"] = bool(obj.get("stopped_early"))
+                if obj.get("trials") is not None:  # sweep summary (final)
+                    result["trials"] = obj["trials"]
+            elif key == "trial":  # a finished sweep trial → update its plan entry
+                t = obj.get("trial")
+                trials = result.get("trials") or []
+                if isinstance(t, int) and 0 <= t < len(trials):
+                    trials[t].update(obj)
+                else:
                     result.setdefault("trials", []).append(obj)
-                elif key == "artifact":
-                    result["artifact"] = obj
-                elif key == "error":
-                    result["error"] = obj.get("message")
+            elif key == "artifact":
+                result["artifact"] = obj
+            elif key == "error":
+                result["error"] = obj.get("message")
+            break
 
     sent = {"n": 0}
 
@@ -685,6 +736,18 @@ async def run_training(redis, run_id: str) -> None:
             await asyncio.sleep(6)
 
     gpu_task = asyncio.create_task(gpu_sampler())
+
+    async def result_flusher() -> None:
+        # Persist the growing result (steps, per-trial status, gpu_samples) every
+        # few seconds so the metrics tab + trials list are live, not just at end.
+        while True:
+            await asyncio.sleep(8)
+            try:
+                await _flush_result(run_id, result)
+            except Exception:
+                pass
+
+    flush_task = asyncio.create_task(result_flusher())
     rc = 1
     try:
         cfg["gpu_count"] = gpu_count
@@ -700,6 +763,15 @@ async def run_training(redis, run_id: str) -> None:
             else:
                 cfg["sweep_gpus"] = []  # VM, no pin → single slot (all GPUs)
             cfg["sweep_metric"] = "loss" if task_type == "tts" else (cfg.get("eval_metric") or "wer")
+            # Seed the full trial plan (cross-product) as "pending" so the UI can
+            # list every trial up front; on_line flips each to running/done/failed.
+            import itertools
+            _sk = [k for k, v in (cfg.get("sweep") or {}).items() if isinstance(v, list) and v]
+            _grid = [dict(zip(_sk, combo)) for combo in itertools.product(*[cfg["sweep"][k] for k in _sk])]
+            result["trials"] = [
+                {"trial": i, "params": p, "status": "pending", "metric": None}
+                for i, p in enumerate(_grid)
+            ]
         cfg_path = work / "config.json"
         cfg_path.write_text(json.dumps(cfg))
         cli = await asyncio.to_thread(_ssh_connect, host, int(port), user, key_filename)
@@ -747,6 +819,11 @@ async def run_training(redis, run_id: str) -> None:
         except BaseException:
             pass
         _GPU_SSH.pop(f"{run_id}:sampler", None)
+        flush_task.cancel()
+        try:
+            await flush_task
+        except BaseException:
+            pass
         pump_task.cancel()
         try:
             await pump_task

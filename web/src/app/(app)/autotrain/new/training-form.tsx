@@ -199,6 +199,9 @@ export function TrainingForm() {
   const [sweepEpochs, setSweepEpochs] = useState("");
   const [sweepBlock, setSweepBlock] = useState("");
   const [sweepPrecisions, setSweepPrecisions] = useState<string[]>([]);
+  // compare augmentation on/off as a sweep dimension (the "on" arm uses the
+  // selected techniques + probability below; the "off" arm trains clean audio).
+  const [sweepAugment, setSweepAugment] = useState(false);
   // run on (pod card — mirrors benchmark/new)
   const [target, setTarget] = useState<"cloud" | "vm">("cloud");
   const [providerId, setProviderId] = useState(""); // vm provider
@@ -302,6 +305,9 @@ export function TrainingForm() {
     const ep = parseCsvNums(sweepEpochs, true);
     if (ep.length) s.max_epochs = ep;
     if (sweepPrecisions.length) s.precision = sweepPrecisions;
+    // Augment vs. no-augment. The "on" arm reuses augmentTechniques/augmentProb;
+    // only meaningful when at least one technique is selected.
+    if (sweepAugment && augmentTechniques.length) s.augment = ["on", "off"];
     if (isTts) {
       const bs = parseCsvNums(sweepBlock, true);
       if (bs.length) s.block_size = bs;
@@ -460,8 +466,11 @@ export function TrainingForm() {
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value={AUTO_SPLIT}>— Auto-split from training set —</SelectItem>
-                  {datasets.filter((d) => d.id !== datasetId).map((d) => (
-                    <SelectItem key={d.id} value={d.id}>{d.name} · {d.kind}</SelectItem>
+                  {datasets.map((d) => (
+                    <SelectItem key={d.id} value={d.id}>
+                      {d.name} · {d.kind}
+                      {d.id === datasetId ? " — its own test split" : ""}
+                    </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
@@ -472,6 +481,14 @@ export function TrainingForm() {
                     value={evalSplitPct} onChange={(e) => setEvalSplitPct(Number(e.target.value))} />
                   <span className="text-[11px] text-muted-foreground">uses a `split` column if present</span>
                 </div>
+              )}
+              {testDatasetId === datasetId && datasetId !== "" && (
+                <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+                  Same as training — evaluation uses this dataset&apos;s{" "}
+                  <span className="font-mono">test</span>/<span className="font-mono">validation</span>{" "}
+                  rows (its <span className="font-mono">split</span> column). Falls back to a seeded
+                  hold-out if it has none.
+                </p>
               )}
             </FieldWrap>
           )}
@@ -662,6 +679,34 @@ export function TrainingForm() {
                 fraction of training clips augmented ({augmentTechniques.length} technique{augmentTechniques.length === 1 ? "" : "s"})
               </span>
             </div>
+          )}
+          {sweepOn && !isTts && (
+            <label
+              className={cn(
+                "mt-2 flex items-start gap-2 rounded-md border px-3 py-2 text-xs",
+                augmentTechniques.length
+                  ? "cursor-pointer border-border hover:bg-muted/40"
+                  : "cursor-not-allowed border-dashed border-border opacity-60",
+              )}
+            >
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={sweepAugment && augmentTechniques.length > 0}
+                disabled={augmentTechniques.length === 0}
+                onChange={(e) => setSweepAugment(e.target.checked)}
+              />
+              <span>
+                <span className="block font-medium text-foreground">
+                  Sweep augmentation — compare augment vs. no-augment
+                </span>
+                <span className="block text-[11px] text-muted-foreground">
+                  {augmentTechniques.length
+                    ? "Adds an extra ×2 to the trial grid: one arm with the selected techniques, one without."
+                    : "Select at least one technique above to enable this."}
+                </span>
+              </span>
+            </label>
           )}
         </div>
       </Section>
