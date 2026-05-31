@@ -20,8 +20,11 @@ const PAGE_SIZES = [10, 20, 50];
 function audioOf(r: DatasetPreviewRow): string | null {
   const u = r.audio_url;
   if (typeof u !== "string" || !u) return null;
-  // Gateway-relative audio (the same-origin proxy) → reach it via /api/proxy;
-  // absolute URLs (e.g. HF) are used as-is.
+  // `/api/…` is already a same-origin Next route (binary-safe — e.g. the label
+  // platform's `label-audio` proxy), so use it directly. Other gateway-relative
+  // paths (`/v1/…`) reach the gateway via the generic proxy. Absolute URLs
+  // (e.g. HF) are used as-is.
+  if (u.startsWith("/api/")) return u;
   return u.startsWith("/") ? `/api/proxy${u}` : u;
 }
 
