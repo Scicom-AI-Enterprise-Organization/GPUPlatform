@@ -620,6 +620,50 @@ export function TrainingForm() {
             <span className="font-mono">…/trials/&lt;i&gt;/</span>.
           </p>
         )}
+        <div className="mt-5 space-y-1.5 border-t border-border pt-4">
+          <Label className="text-xs">Audio augmentation (training only)</Label>
+          <p className="text-xs text-muted-foreground">
+            Select techniques to harden the model against noisy / phone audio. One enabled
+            technique is applied at random to each augmented training clip; eval is never augmented.
+          </p>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {AUG_OPTIONS.map((o) => {
+              const on = augmentTechniques.includes(o.id);
+              return (
+                <button
+                  key={o.id}
+                  type="button"
+                  title={o.desc}
+                  onClick={() =>
+                    setAugmentTechniques((prev) =>
+                      prev.includes(o.id) ? prev.filter((x) => x !== o.id) : [...prev, o.id],
+                    )
+                  }
+                  className={cn(
+                    "rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors",
+                    on ? "border-primary/60 bg-primary/10 text-foreground"
+                       : "border-border text-muted-foreground hover:border-primary/40 hover:bg-muted/40",
+                  )}
+                >
+                  <span className="block font-medium">{o.label}</span>
+                  <span className="block truncate text-[10px] opacity-70">{o.desc}</span>
+                </button>
+              );
+            })}
+          </div>
+          {augmentTechniques.length > 0 && (
+            <div className="flex items-center gap-2 pt-1">
+              <Label htmlFor="aug-prob" className="text-xs">Augment probability</Label>
+              <Input id="aug-prob" type="number" min={0} max={1} step={0.05}
+                className="h-8 w-24 font-mono text-xs"
+                value={augmentProb}
+                onChange={(e) => setAugmentProb(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />
+              <span className="text-[11px] text-muted-foreground">
+                fraction of training clips augmented ({augmentTechniques.length} technique{augmentTechniques.length === 1 ? "" : "s"})
+              </span>
+            </div>
+          )}
+        </div>
       </Section>
 
       {/* Run on — pod card (mirrors benchmark/new) */}
@@ -791,51 +835,6 @@ export function TrainingForm() {
             </span>
           </span>
         </label>
-
-        <div className="mt-4 space-y-1.5">
-          <Label className="text-xs">Audio augmentation (training only)</Label>
-          <p className="text-xs text-muted-foreground">
-            Select techniques to harden the model against noisy / phone audio. One enabled
-            technique is applied at random to each augmented training clip; eval is never augmented.
-          </p>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {AUG_OPTIONS.map((o) => {
-              const on = augmentTechniques.includes(o.id);
-              return (
-                <button
-                  key={o.id}
-                  type="button"
-                  title={o.desc}
-                  onClick={() =>
-                    setAugmentTechniques((prev) =>
-                      prev.includes(o.id) ? prev.filter((x) => x !== o.id) : [...prev, o.id],
-                    )
-                  }
-                  className={cn(
-                    "rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors",
-                    on ? "border-primary/60 bg-primary/10 text-foreground"
-                       : "border-border text-muted-foreground hover:border-primary/40 hover:bg-muted/40",
-                  )}
-                >
-                  <span className="block font-medium">{o.label}</span>
-                  <span className="block truncate text-[10px] opacity-70">{o.desc}</span>
-                </button>
-              );
-            })}
-          </div>
-          {augmentTechniques.length > 0 && (
-            <div className="flex items-center gap-2 pt-1">
-              <Label htmlFor="aug-prob" className="text-xs">Augment probability</Label>
-              <Input id="aug-prob" type="number" min={0} max={1} step={0.05}
-                className="h-8 w-24 font-mono text-xs"
-                value={augmentProb}
-                onChange={(e) => setAugmentProb(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />
-              <span className="text-[11px] text-muted-foreground">
-                fraction of training clips augmented ({augmentTechniques.length} technique{augmentTechniques.length === 1 ? "" : "s"})
-              </span>
-            </div>
-          )}
-        </div>
 
         <div className="mt-4 space-y-1.5">
           <Label htmlFor="train-env" className="text-xs">Environment variables</Label>
