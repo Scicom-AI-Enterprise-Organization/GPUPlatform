@@ -1204,6 +1204,7 @@ async def training_metrics(
         "steps": r.get("steps") or [],
         "epochs": r.get("epochs") or [],
         "gpu_samples": r.get("gpu_samples") or [],
+        "trials": r.get("trials"),  # sweep plan + per-trial status; None for single runs
         "best": r.get("best"),
         "artifact": r.get("artifact"),
         "stopped_early": bool(r.get("stopped_early")),
