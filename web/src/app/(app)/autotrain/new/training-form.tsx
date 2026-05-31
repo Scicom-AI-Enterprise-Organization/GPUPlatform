@@ -215,7 +215,7 @@ export function TrainingForm() {
   // LoRA / PEFT (merged into base at save → drop-in checkpoint)
   const [useLora, setUseLora] = useState(false);
   const [loraR, setLoraR] = useState(16);
-  const [loraAlpha, setLoraAlpha] = useState(32);
+  const [loraAlphaRatio, setLoraAlphaRatio] = useState(2);
   const [loraDropout, setLoraDropout] = useState(0.05);
   const [freezeEncoder, setFreezeEncoder] = useState(false);
   // Multi-GPU single run: DDP (torchrun) vs DataParallel.
@@ -230,7 +230,6 @@ export function TrainingForm() {
   const [sweepBlock, setSweepBlock] = useState("");
   const [sweepWeightDecay, setSweepWeightDecay] = useState("");
   const [sweepLoraR, setSweepLoraR] = useState("");
-  const [sweepLoraAlpha, setSweepLoraAlpha] = useState("");
   const [sweepPrecisions, setSweepPrecisions] = useState<string[]>([]);
   // compare augmentation on/off as a sweep dimension (the "on" arm uses the
   // selected techniques + probability below; the "off" arm trains clean audio).
@@ -342,7 +341,7 @@ export function TrainingForm() {
         if (c.weight_decay != null) setWeightDecay(num(c.weight_decay, 0));
         if (c.use_lora != null) setUseLora(!!c.use_lora);
         if (c.lora_r != null) setLoraR(num(c.lora_r, 16));
-        if (c.lora_alpha != null) setLoraAlpha(num(c.lora_alpha, 32));
+        if (c.lora_alpha_ratio != null) setLoraAlphaRatio(num(c.lora_alpha_ratio, 2));
         if (c.lora_dropout != null) setLoraDropout(num(c.lora_dropout, 0.05));
         if (c.freeze_encoder != null) setFreezeEncoder(!!c.freeze_encoder);
         if (c.use_ddp != null) setUseDdp(!!c.use_ddp);
@@ -360,7 +359,6 @@ export function TrainingForm() {
           setSweepBlock(csv(sweep.block_size));
           setSweepWeightDecay(csv(sweep.weight_decay));
           setSweepLoraR(csv(sweep.lora_r));
-          setSweepLoraAlpha(csv(sweep.lora_alpha));
           setSweepPrecisions(arr(sweep.precision).map(String));
           setSweepAugment(arr(sweep.augment).length > 0);
           setSweepFreeze(arr(sweep.freeze_encoder).length > 0);
@@ -466,8 +464,6 @@ export function TrainingForm() {
     if (wd.length) s.weight_decay = wd;
     const lr_ = parseCsvNums(sweepLoraR, true);
     if (lr_.length) s.lora_r = lr_;
-    const la = parseCsvNums(sweepLoraAlpha, true);
-    if (la.length) s.lora_alpha = la;
     // Augment vs. no-augment. The "on" arm reuses augmentTechniques/augmentProb;
     // only meaningful when at least one technique is selected.
     if (sweepAugment && augmentTechniques.length) s.augment = ["on", "off"];
@@ -533,7 +529,6 @@ export function TrainingForm() {
         { label: "Grad-accum steps", val: sweepGradAccum, kind: "int" },
         { label: "Max epochs", val: sweepEpochs, kind: "int" },
         { label: "LoRA r", val: sweepLoraR, kind: "int" },
-        { label: "LoRA alpha", val: sweepLoraAlpha, kind: "int" },
         { label: "Weight decay", val: sweepWeightDecay, kind: "nonneg" },
         ...(isTts ? [{ label: "Block sizes", val: sweepBlock, kind: "int" as const }] : []),
       ];
@@ -569,9 +564,9 @@ export function TrainingForm() {
       grad_accum: gradAccum,
       learning_rate: Number(learningRate) || (isTts ? 2e-5 : 1e-5),
       weight_decay: weightDecay,
-      use_lora: useLora || (sweepOn && (sweepLoraR.trim() !== "" || sweepLoraAlpha.trim() !== "")),
+      use_lora: useLora || (sweepOn && sweepLoraR.trim() !== ""),
       lora_r: loraR,
-      lora_alpha: loraAlpha,
+      lora_alpha_ratio: loraAlphaRatio,
       lora_dropout: loraDropout,
       freeze_encoder: freezeEncoder,
       use_ddp: useDdp,
@@ -925,13 +920,14 @@ export function TrainingForm() {
                 ) : (
                   <FieldWrap label="LoRA r" hint="Adapter rank."><NumberField min={1} value={loraR} onChange={setLoraR} /></FieldWrap>
                 )}
-                {sweepOn ? (
-                  <FieldWrap label="LoRA alpha" hint="e.g. 16, 32, 64">
-                    <Input className="font-mono" placeholder="16, 32, 64" value={sweepLoraAlpha} onChange={(e) => setSweepLoraAlpha(e.target.value)} />
-                  </FieldWrap>
-                ) : (
-                  <FieldWrap label="LoRA alpha" hint="Scaling (≈2×r)."><NumberField min={1} value={loraAlpha} onChange={setLoraAlpha} /></FieldWrap>
-                )}
+                <FieldWrap
+                  label="LoRA alpha ratio"
+                  hint={sweepOn
+                    ? `alpha = round(r × ${loraAlphaRatio}) per trial (e.g. r 32 → ${Math.round(32 * loraAlphaRatio)})`
+                    : `alpha = ${Math.round(loraR * loraAlphaRatio)} (r ${loraR} × ${loraAlphaRatio}). 2× is typical.`}>
+                  <Input className="font-mono" type="number" min={0} step={0.5} value={loraAlphaRatio}
+                    onChange={(e) => setLoraAlphaRatio(Math.max(0, Number(e.target.value) || 0))} />
+                </FieldWrap>
                 <FieldWrap label="LoRA dropout" hint="0–1, on the adapters.">
                   <Input className="font-mono" type="number" min={0} max={1} step={0.01} value={loraDropout}
                     onChange={(e) => setLoraDropout(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />

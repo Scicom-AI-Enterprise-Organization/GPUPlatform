@@ -970,6 +970,10 @@ class CreateTrainingRunRequest(BaseModel):
     # so the artifact is a drop-in Whisper checkpoint (no peft to load/serve).
     use_lora: bool = False
     lora_r: int = 16
+    # alpha is conventionally a ratio of r (2× common). When set, alpha is derived
+    # as round(r × ratio) so a LoRA-r sweep carries alpha along (no permutation).
+    # `lora_alpha` is the absolute fallback when no ratio is given.
+    lora_alpha_ratio: Optional[float] = 2.0
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     # Freeze the encoder; train the decoder only (faster, less overfit on small data).
@@ -1223,6 +1227,7 @@ async def create_training_run(
         "grad_accum": body.grad_accum, "learning_rate": body.learning_rate,
         "warmup_steps": body.warmup_steps, "weight_decay": body.weight_decay,
         "use_lora": body.use_lora, "lora_r": body.lora_r,
+        "lora_alpha_ratio": body.lora_alpha_ratio,
         "lora_alpha": body.lora_alpha, "lora_dropout": body.lora_dropout,
         "freeze_encoder": body.freeze_encoder, "use_ddp": body.use_ddp,
         "logging_steps": body.logging_steps,

@@ -328,6 +328,8 @@ export type CreateTrainingRunRequest = {
   // LoRA / PEFT — adapters merged into the base at save time (drop-in checkpoint).
   use_lora?: boolean;
   lora_r?: number;
+  // alpha as a ratio of r (alpha = round(r × ratio)); avoids permuting alpha.
+  lora_alpha_ratio?: number;
   lora_alpha?: number;
   lora_dropout?: number;
   // Freeze the encoder; train the decoder only.

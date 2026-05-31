@@ -563,9 +563,15 @@ def run(cfg: dict) -> None:
         ensure_lora_deps()
         from peft import LoraConfig, get_peft_model
 
+        _r = int(cfg.get("lora_r", 16))
+        # alpha is conventionally a ratio of r (e.g. 2×). When lora_alpha_ratio is
+        # set, derive alpha = round(r × ratio) so sweeping r carries alpha with it
+        # (no separate alpha dimension to permute); else use an absolute lora_alpha.
+        _ratio = cfg.get("lora_alpha_ratio")
+        _alpha = int(round(_r * float(_ratio))) if _ratio is not None else int(cfg.get("lora_alpha", 32))
         lconf = LoraConfig(
-            r=int(cfg.get("lora_r", 16)),
-            lora_alpha=int(cfg.get("lora_alpha", 32)),
+            r=_r,
+            lora_alpha=_alpha,
             lora_dropout=float(cfg.get("lora_dropout", 0.05)),
             target_modules=["q_proj", "v_proj"],
             bias="none",
