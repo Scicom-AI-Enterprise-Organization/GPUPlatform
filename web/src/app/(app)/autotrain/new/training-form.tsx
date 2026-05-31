@@ -7,6 +7,7 @@ import {
   AlertCircle,
   AlertTriangle,
   Check,
+  ChevronDown,
   Cpu,
   Database,
   FlaskConical,
@@ -28,7 +29,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
 import { NumberField } from "@/components/ui/number-field";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import {
@@ -38,6 +38,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
@@ -48,6 +54,7 @@ import type {
   GpuTypeOption,
   ProviderRecord,
   StorageRecord,
+  TrackingCredentialRecord,
   VmAvailability,
 } from "@/lib/types";
 
@@ -71,6 +78,14 @@ const CUSTOM = "__custom__";
 const AUTO_SPLIT = "__auto__";
 
 const GPU_COUNT_CHOICES = [1, 2, 4, 8] as const;
+
+// precision = "<weight load dtype>-<mixed-precision (AMP) train dtype>".
+const PRECISIONS: { value: string; label: string }[] = [
+  { value: "fp32-bf16", label: "fp32 load · bf16 mixed (recommended)" },
+  { value: "bf16-bf16", label: "bf16 load · bf16 mixed" },
+  { value: "fp32-fp16", label: "fp32 load · fp16 mixed" },
+  { value: "fp16-fp16", label: "fp16 load · fp16 mixed" },
+];
 
 // Parse a pasted env block into a dict. Accepts `KEY=value` and
 // `export KEY=value`; skips blanks, comments, and non-KEY=value lines (mkdir …).
@@ -160,7 +175,7 @@ export function TrainingForm() {
   const [batchSize, setBatchSize] = useState(8);
   const [loggingSteps, setLoggingSteps] = useState(10);
   const [learningRate, setLearningRate] = useState("1e-5");
-  const [precision, setPrecision] = useState<"fp16" | "bf16" | "fp32">("bf16");
+  const [precision, setPrecision] = useState<string>("fp32-bf16");
   const [language, setLanguage] = useState("");
   // hyperparameter sweep
   const [sweepOn, setSweepOn] = useState(false);
@@ -170,6 +185,7 @@ export function TrainingForm() {
   const [sweepGradAccum, setSweepGradAccum] = useState("");
   const [sweepEpochs, setSweepEpochs] = useState("");
   const [sweepBlock, setSweepBlock] = useState("");
+  const [sweepPrecisions, setSweepPrecisions] = useState<string[]>([]);
   // run on (pod card — mirrors benchmark/new)
   const [target, setTarget] = useState<"cloud" | "vm">("cloud");
   const [providerId, setProviderId] = useState(""); // vm provider
@@ -185,13 +201,18 @@ export function TrainingForm() {
   // artifacts
   const [storageId, setStorageId] = useState("");
   const [hfPushRepo, setHfPushRepo] = useState("");
-  // experiment tracking (creds come from the global Secrets page)
-  const [wandbOn, setWandbOn] = useState(false);
+  const [workDir, setWorkDir] = useState("/share");
+  const [cleanupCheckpoints, setCleanupCheckpoints] = useState(true);
+  // experiment tracking — named credentials from the Secrets page (picked per run)
+  const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
+  const [wandbCredId, setWandbCredId] = useState("");
+  const [mlflowCredId, setMlflowCredId] = useState("");
   const [wandbProject, setWandbProject] = useState("");
   const [wandbEntity, setWandbEntity] = useState("");
-  const [mlflowOn, setMlflowOn] = useState(false);
   const [mlflowUri, setMlflowUri] = useState("");
   const [mlflowExperiment, setMlflowExperiment] = useState("");
+  const wandbOn = !!wandbCredId;
+  const mlflowOn = !!mlflowCredId;
 
   const availability = useGpuAvailability(
     gpuType, gpuCount, target === "cloud", secureCloud ? "SECURE" : "COMMUNITY",
@@ -215,6 +236,7 @@ export function TrainingForm() {
     gateway.listDatasets().then(setDatasets).catch(() => {});
     gateway.listStorage().then(setStorages).catch(() => {});
     gateway.listProviders().then(setProviders).catch(() => {});
+    gateway.listTrackingCredentials().then(setTrackingCreds).catch(() => {});
     gateway
       .listRunpodGpuTypes()
       .then((rows) => {
@@ -236,6 +258,8 @@ export function TrainingForm() {
   );
   const vmProviders = useMemo(() => providers.filter((p) => p.kind === "vm"), [providers]);
   const runpodProviders = useMemo(() => providers.filter((p) => p.kind === "runpod"), [providers]);
+  const wandbCreds = useMemo(() => trackingCreds.filter((c) => c.kind === "wandb"), [trackingCreds]);
+  const mlflowCreds = useMemo(() => trackingCreds.filter((c) => c.kind === "mlflow"), [trackingCreds]);
   const baseModel = modelChoice === CUSTOM ? customModel.trim() : modelChoice;
   const hasStorage = s3Storages.length > 0;
   const isTts = taskType === "tts";
@@ -252,8 +276,8 @@ export function TrainingForm() {
     }
   }
 
-  function buildSweep(): Record<string, number[]> {
-    const s: Record<string, number[]> = {};
+  function buildSweep(): Record<string, (number | string)[]> {
+    const s: Record<string, (number | string)[]> = {};
     const lr = parseCsvNums(sweepLr, false);
     if (lr.length) s.learning_rate = lr;
     const b = parseCsvNums(sweepBatch, true);
@@ -262,6 +286,7 @@ export function TrainingForm() {
     if (ga.length) s.grad_accum = ga;
     const ep = parseCsvNums(sweepEpochs, true);
     if (ep.length) s.max_epochs = ep;
+    if (sweepPrecisions.length) s.precision = sweepPrecisions;
     if (isTts) {
       const bs = parseCsvNums(sweepBlock, true);
       if (bs.length) s.block_size = bs;
@@ -295,7 +320,7 @@ export function TrainingForm() {
       grad_accum: gradAccum,
       learning_rate: Number(learningRate) || (isTts ? 2e-5 : 1e-5),
       logging_steps: loggingSteps,
-      precision,
+      precision: precision as CreateTrainingRunRequest["precision"],
       language: isTts ? null : (language.trim() || null),
       ...(isTts ? {
         tokenizer: ttsTokenizer.trim() || DEFAULT_TTS_TOKENIZER,
@@ -316,10 +341,14 @@ export function TrainingForm() {
       ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
       storage_id: storageId,
       hf_push_repo: hfPushRepo.trim() || null,
+      work_dir: workDir.trim() || "/share",
+      cleanup_checkpoints: cleanupCheckpoints,
       report_to: [
         ...(wandbOn ? (["wandb"] as const) : []),
         ...(mlflowOn ? (["mlflow"] as const) : []),
       ],
+      wandb_credential_id: wandbCredId || null,
+      mlflow_credential_id: mlflowCredId || null,
       wandb_project: wandbOn ? wandbProject.trim() || null : null,
       wandb_entity: wandbOn ? wandbEntity.trim() || null : null,
       mlflow_tracking_uri: mlflowOn ? mlflowUri.trim() || null : null,
@@ -439,6 +468,23 @@ export function TrainingForm() {
           : (isTts
             ? "Qwen3 + NeuCodec finetune hyperparameters (loss-only; no per-epoch WER/CER)."
             : "Epochs, early stopping, and core hyperparameters.")}>
+        <div className="mb-5 grid max-w-xl grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-2">
+          {!isTts && (
+            <FieldWrap label="Eval metric" hint={sweepOn ? "Ranks the trials (lower is better)." : "Drives early stopping + best-model selection."}>
+              <Select value={evalMetric} onValueChange={(v) => setEvalMetric(v as "wer" | "cer")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="wer">WER</SelectItem>
+                  <SelectItem value="cer">CER</SelectItem>
+                </SelectContent>
+              </Select>
+            </FieldWrap>
+          )}
+          <FieldWrap label="Log loss every N steps" hint="Streams a training-loss point every N steps (@@STEP) for the live loss curve. Smaller = smoother, more log lines.">
+            <NumberField min={1} value={loggingSteps} onChange={setLoggingSteps} />
+          </FieldWrap>
+        </div>
+
         <div className="mb-5 flex items-center gap-3">
           <div className="inline-flex rounded-md border border-border p-0.5 text-sm">
             {([["single", "Single run"], ["sweep", "Sweep"]] as const).map(([v, label]) => {
@@ -460,28 +506,22 @@ export function TrainingForm() {
         </div>
 
         <Grid>
-          {/* always-single knobs */}
-          {!isTts && (
-            <FieldWrap label="Eval metric" hint={sweepOn ? "Ranks the trials (lower is better)." : "Drives early stopping + best-model selection."}>
-              <Select value={evalMetric} onValueChange={(v) => setEvalMetric(v as "wer" | "cer")}>
+          {/* precision — single combo, or a multi-select to sweep over combos.
+              "<load dtype>-<AMP train dtype>". */}
+          {sweepOn ? (
+            <FieldWrap label="Precisions (sweep)" hint="Load · AMP combos to try — one trial each.">
+              <PrecisionMultiSelect selected={sweepPrecisions} onChange={setSweepPrecisions} />
+            </FieldWrap>
+          ) : (
+            <FieldWrap label="Precision" hint="Weight load dtype · mixed-precision (AMP) train dtype.">
+              <Select value={precision} onValueChange={setPrecision}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="wer">WER</SelectItem>
-                  <SelectItem value="cer">CER</SelectItem>
+                  {PRECISIONS.map((p) => <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>)}
                 </SelectContent>
               </Select>
             </FieldWrap>
           )}
-          <FieldWrap label="Precision">
-            <Select value={precision} onValueChange={(v) => setPrecision(v as "fp16" | "bf16" | "fp32")}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="bf16">bf16</SelectItem>
-                <SelectItem value="fp16">fp16</SelectItem>
-                {isTts && <SelectItem value="fp32">fp32</SelectItem>}
-              </SelectContent>
-            </Select>
-          </FieldWrap>
           {!isTts && (
             <FieldWrap label="Early-stop patience" hint="Epochs without eval improvement before stopping. 0 = off.">
               <NumberField min={0} value={patience} onChange={setPatience} />
@@ -522,10 +562,6 @@ export function TrainingForm() {
           ) : isTts ? (
             <FieldWrap label="Grad accumulation"><NumberField min={1} value={gradAccum} onChange={setGradAccum} /></FieldWrap>
           ) : null}
-
-          <FieldWrap label="Log loss every N steps" hint="Streams a training-loss point every N steps (@@STEP) for the live loss curve. Smaller = smoother, more log lines.">
-            <NumberField min={1} value={loggingSteps} onChange={setLoggingSteps} />
-          </FieldWrap>
 
           {/* TTS knobs */}
           {isTts && (sweepOn ? (
@@ -716,6 +752,30 @@ export function TrainingForm() {
         </div>
 
         <div className="mt-4 space-y-1.5">
+          <Label htmlFor="train-workdir" className="text-xs">Checkpoint / temp directory</Label>
+          <Input id="train-workdir" className="font-mono text-xs" placeholder="/share"
+            value={workDir} onChange={(e) => setWorkDir(e.target.value)} />
+          <p className="text-xs text-muted-foreground">
+            Roomy dir on the VM for checkpoints + temp (<span className="font-mono">TMPDIR</span>). Default{" "}
+            <span className="font-mono">/share</span> — avoid <span className="font-mono">/tmp</span> (small disk).
+            The best model is uploaded to S3 regardless.
+          </p>
+        </div>
+
+        <label className="mt-4 flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-sm hover:bg-muted/50">
+          <input type="checkbox" checked={cleanupCheckpoints}
+            onChange={(e) => setCleanupCheckpoints(e.target.checked)}
+            className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary" />
+          <span className="min-w-0">
+            <span className="font-medium">Clean checkpoints after run</span>
+            <span className="block text-xs text-muted-foreground">
+              Delete the checkpoint/work dir on the VM when the run ends (the best model is already on S3).
+              Keeps the disk from filling across runs.
+            </span>
+          </span>
+        </label>
+
+        <div className="mt-4 space-y-1.5">
           <Label htmlFor="train-env" className="text-xs">Environment variables</Label>
           <Textarea
             id="train-env"
@@ -741,35 +801,53 @@ export function TrainingForm() {
 
       {/* Experiment tracking */}
       <Section icon={<Activity className="h-4 w-4" />} title="Experiment tracking"
-        description="Push per-epoch metrics to W&B and/or MLflow via HF Trainer. Credentials are read from the global Secrets page at run time — set them under Secrets, not here.">
+        description="Push per-epoch metrics to W&B and/or MLflow via HF Trainer. Pick a named credential — manage them on the Secrets page (Tracking credentials).">
         <div className="space-y-4">
-          <label className="flex cursor-pointer items-center gap-2.5 text-sm">
-            <Switch checked={wandbOn} onCheckedChange={setWandbOn} />
-            <span className="font-medium">Weights &amp; Biases</span>
-            <span className="text-xs text-muted-foreground">uses <span className="font-mono">WANDB_API_KEY</span> from Secrets</span>
-          </label>
-          {wandbOn && (
-            <Grid>
-              <FieldWrap label="W&B project"><Input className="font-mono" placeholder="whisper-finetune" value={wandbProject} onChange={(e) => setWandbProject(e.target.value)} /></FieldWrap>
-              <FieldWrap label="W&B entity (optional)"><Input className="font-mono" placeholder="my-team" value={wandbEntity} onChange={(e) => setWandbEntity(e.target.value)} /></FieldWrap>
-            </Grid>
-          )}
+          <Grid>
+            <FieldWrap label="W&B credential" hint={wandbCreds.length ? "Select to enable W&B." : "None registered — add one under Secrets."}>
+              <Select value={wandbCredId || "__off__"} onValueChange={(v) => setWandbCredId(v === "__off__" ? "" : v)}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__off__">— Off —</SelectItem>
+                  {wandbCreds.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>{c.name} · {c.preview}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </FieldWrap>
+            {wandbOn && (
+              <>
+                <FieldWrap label="W&B project"><Input className="font-mono" placeholder="whisper-finetune" value={wandbProject} onChange={(e) => setWandbProject(e.target.value)} /></FieldWrap>
+                <FieldWrap label="W&B entity (optional)"><Input className="font-mono" placeholder="my-team" value={wandbEntity} onChange={(e) => setWandbEntity(e.target.value)} /></FieldWrap>
+              </>
+            )}
+          </Grid>
 
-          <label className="flex cursor-pointer items-center gap-2.5 border-t border-border pt-4 text-sm">
-            <Switch checked={mlflowOn} onCheckedChange={setMlflowOn} />
-            <span className="font-medium">MLflow</span>
-            <span className="text-xs text-muted-foreground">uses <span className="font-mono">MLFLOW_TRACKING_URI/USERNAME/PASSWORD</span> from Secrets</span>
-          </label>
-          {mlflowOn && (
+          <div className="border-t border-border pt-4">
             <Grid>
-              <FieldWrap label="Tracking URI (optional)" hint="Overrides MLFLOW_TRACKING_URI from Secrets for this run.">
-                <Input className="font-mono" placeholder="https://mlflow.aies.scicom.dev" value={mlflowUri} onChange={(e) => setMlflowUri(e.target.value)} />
+              <FieldWrap label="MLflow credential" hint={mlflowCreds.length ? "Select to enable MLflow (uri + user/pass)." : "None registered — add one under Secrets."}>
+                <Select value={mlflowCredId || "__off__"} onValueChange={(v) => setMlflowCredId(v === "__off__" ? "" : v)}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__off__">— Off —</SelectItem>
+                    {mlflowCreds.map((c) => (
+                      <SelectItem key={c.id} value={c.id}>{c.name} · {c.preview}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </FieldWrap>
-              <FieldWrap label="Experiment" hint="MLFLOW_EXPERIMENT_NAME, e.g. test-classification.">
-                <Input className="font-mono" placeholder="whisper-finetune" value={mlflowExperiment} onChange={(e) => setMlflowExperiment(e.target.value)} />
-              </FieldWrap>
+              {mlflowOn && (
+                <>
+                  <FieldWrap label="Experiment" hint="MLFLOW_EXPERIMENT_NAME, e.g. test-classification.">
+                    <Input className="font-mono" placeholder="whisper-finetune" value={mlflowExperiment} onChange={(e) => setMlflowExperiment(e.target.value)} />
+                  </FieldWrap>
+                  <FieldWrap label="Tracking URI override (optional)" hint="Overrides the credential's URI for this run.">
+                    <Input className="font-mono" placeholder="https://mlflow.aies.scicom.dev" value={mlflowUri} onChange={(e) => setMlflowUri(e.target.value)} />
+                  </FieldWrap>
+                </>
+              )}
             </Grid>
-          )}
+          </div>
         </div>
       </Section>
 
@@ -846,6 +924,39 @@ function FieldWrap({ label, hint, extra, children }: {
       {children}
       {hint && <p className="text-[11px] leading-snug text-muted-foreground">{hint}</p>}
     </div>
+  );
+}
+
+// Multi-select dropdown over the precision combos (sweep mode). Stays open on
+// toggle so several can be picked.
+function PrecisionMultiSelect({ selected, onChange }: {
+  selected: string[]; onChange: (v: string[]) => void;
+}) {
+  const toggle = (v: string) =>
+    onChange(selected.includes(v) ? selected.filter((x) => x !== v) : [...selected, v]);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button type="button" variant="outline" className="w-full justify-between font-normal">
+          <span className="truncate">
+            {selected.length ? `${selected.length} selected` : "Pick precisions…"}
+          </span>
+          <ChevronDown className="h-4 w-4 opacity-50" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent className="w-64">
+        {PRECISIONS.map((p) => (
+          <DropdownMenuCheckboxItem
+            key={p.value}
+            checked={selected.includes(p.value)}
+            onCheckedChange={() => toggle(p.value)}
+            onSelect={(e) => e.preventDefault()}
+          >
+            {p.label}
+          </DropdownMenuCheckboxItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

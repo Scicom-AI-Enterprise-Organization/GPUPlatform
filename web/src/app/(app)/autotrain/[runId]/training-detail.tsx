@@ -2,10 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Download, Loader2, Trash2, XCircle } from "lucide-react";
+import { Check, Download, Loader2, Pencil, RotateCcw, Trash2, X, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Tabs,
@@ -97,9 +98,12 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     const es = new EventSource(gateway.trainingLogsStreamUrl(run.id));
     es.onmessage = (ev) => {
       setLines((p) => [...p, ev.data]);
-      if (typeof ev.data === "string" && ev.data.startsWith("@@STEP ")) {
+      // @@STEP can be prefixed by a tqdm progress bar (\r, no newline) on the
+      // same captured line, so match it anywhere — not just at the start.
+      const i = typeof ev.data === "string" ? ev.data.indexOf("@@STEP ") : -1;
+      if (i >= 0) {
         try {
-          const pt = JSON.parse(ev.data.slice("@@STEP ".length)) as TrainingStep;
+          const pt = JSON.parse(ev.data.slice(i + "@@STEP ".length)) as TrainingStep;
           if (typeof pt.step === "number") setLiveSteps((p) => [...p, pt]);
         } catch {
           /* ignore malformed */
@@ -153,12 +157,70 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     }
   }
 
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState(run.name);
+  async function onRename() {
+    const n = nameDraft.trim();
+    if (!n || n === run.name) { setEditingName(false); return; }
+    try {
+      setRun(await gateway.renameTrainingRun(run.id, n));
+      setEditingName(false);
+      toast.success("Renamed", { duration: 2000 });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
+    }
+  }
+
+  async function onRestart() {
+    if (!confirm("Restart? Launches a fresh run with this run's exact config.")) return;
+    setBusy(true);
+    try {
+      const created = await gateway.restartTrainingRun(run.id);
+      toast.success(`Restarted → ${created.id}`, { duration: 3000 });
+      router.push(`/autotrain/${encodeURIComponent(created.id)}`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <h1 className="truncate text-2xl font-semibold tracking-tight">{run.name}</h1>
+            {editingName ? (
+              <span className="flex items-center gap-1">
+                <Input
+                  value={nameDraft}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  autoFocus
+                  className="h-8 w-72 text-lg font-semibold"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") onRename();
+                    if (e.key === "Escape") setEditingName(false);
+                  }}
+                />
+                <Button size="icon" variant="ghost" className="h-7 w-7" onClick={onRename} title="Save">
+                  <Check className="h-4 w-4" />
+                </Button>
+                <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => setEditingName(false)} title="Cancel">
+                  <X className="h-4 w-4" />
+                </Button>
+              </span>
+            ) : (
+              <>
+                <h1 className="truncate text-2xl font-semibold tracking-tight">{run.name}</h1>
+                <button
+                  type="button"
+                  onClick={() => { setNameDraft(run.name); setEditingName(true); }}
+                  className="text-muted-foreground hover:text-foreground"
+                  title="Rename"
+                >
+                  <Pencil className="h-4 w-4" />
+                </button>
+              </>
+            )}
             <Badge variant="outline" className={STATUS_STYLES[run.status] ?? ""}>{run.status}</Badge>
           </div>
           <p className="mt-1 font-mono text-xs text-muted-foreground">
@@ -172,6 +234,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <XCircle className="h-4 w-4" />} Terminate
             </Button>
           )}
+          <Button variant="outline" size="sm" onClick={onRestart} disabled={busy}>
+            <RotateCcw className="h-4 w-4" /> Restart
+          </Button>
           <Button variant="outline" size="sm" onClick={onDelete} disabled={busy}>
             <Trash2 className="h-4 w-4" /> Delete
           </Button>
@@ -255,7 +320,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
 
         <TabsContent value="metrics" className="mt-4 !flex-none space-y-4">
           <LossCurve steps={steps} live={!terminal} />
-          <GpuCard gpus={gpus} />
+          <GpuCard gpus={gpus} running={!terminal} />
           {epochs.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               No per-epoch metrics yet. They appear here as each epoch finishes evaluating.
@@ -318,45 +383,98 @@ function Stat({ label, value, mono }: { label: string; value: string; mono?: boo
   );
 }
 
-// Live per-GPU utilisation for the run's GPUs only (polled while running).
-// Returns null when there's nothing to show (terminal / not yet reported).
-function GpuCard({ gpus }: { gpus: TrainingGpu[] }) {
-  if (!gpus.length) return null;
+// Live per-GPU telemetry graph (util %, memory %, temperature °C over time) for
+// the run's GPUs only. Self-accumulates a rolling history from the poll prop.
+const GPU_HIST_CAP = 150; // ~6 min at the 2.5s poll
+type GpuSample = { i: number; util: number; mem: number; memGiB: number; temp: number };
+
+function GpuCard({ gpus, running }: { gpus: TrainingGpu[]; running: boolean }) {
+  const [hist, setHist] = useState<Record<number, GpuSample[]>>({});
+  const tick = useRef(0);
+  useEffect(() => {
+    if (!gpus.length) return;
+    tick.current += 1;
+    const i = tick.current;
+    setHist((prev) => {
+      const next: Record<number, GpuSample[]> = { ...prev };
+      for (const g of gpus) {
+        const mem = g.mem_total > 0 ? (g.mem_used / g.mem_total) * 100 : 0;
+        next[g.index] = (next[g.index] ?? [])
+          .concat({ i, util: g.util, mem, memGiB: g.mem_used / 1024, temp: g.temp })
+          .slice(-GPU_HIST_CAP);
+      }
+      return next;
+    });
+  }, [gpus]);
+
+  if (!running && !gpus.length) return null;
+  const sorted = [...gpus].sort((a, b) => a.index - b.index);
+
   return (
     <Card>
       <CardHeader className="pb-2">
-        <CardTitle className="text-sm">
-          <span className="inline-flex items-center gap-2">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
-            GPU utilisation · live ({gpus.length} GPU{gpus.length === 1 ? "" : "s"})
-          </span>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
+          GPU telemetry · live
+          {sorted.length > 0 && (
+            <span className="text-[11px] font-normal text-muted-foreground">
+              {sorted.length} GPU{sorted.length === 1 ? "" : "s"}
+            </span>
+          )}
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-2.5">
-        {gpus.map((g) => {
-          const memPct = g.mem_total > 0 ? (g.mem_used / g.mem_total) * 100 : 0;
-          return (
-            <div key={g.index} className="text-xs">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-mono">#{g.index} {g.name.replace(/^NVIDIA\s+/, "")}</span>
-                <span className="font-mono text-muted-foreground">
-                  {g.util.toFixed(0)}% util · {(g.mem_used / 1024).toFixed(1)}/{(g.mem_total / 1024).toFixed(1)} GiB
-                </span>
-              </div>
-              <div className="mt-1 flex items-center gap-2">
-                <div className="h-1.5 flex-1 overflow-hidden rounded bg-muted" title={`${g.util.toFixed(0)}% utilisation`}>
-                  <div className="h-full bg-emerald-500 transition-all" style={{ width: `${Math.min(100, Math.max(0, g.util))}%` }} />
+      <CardContent className="space-y-3">
+        {sorted.length === 0 && (
+          <p className="text-xs text-muted-foreground">Waiting for GPU telemetry…</p>
+        )}
+        <div className="grid gap-3 lg:grid-cols-2">
+          {sorted.map((g) => {
+            const mem = g.mem_total > 0 ? (g.mem_used / g.mem_total) * 100 : 0;
+            const data = hist[g.index] ?? [];
+            return (
+              <div key={g.index} className="rounded-lg border border-border p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate font-mono text-xs font-medium">
+                    #{g.index} {g.name.replace(/^NVIDIA\s+/, "")}
+                  </span>
                 </div>
-                <div className="h-1.5 flex-1 overflow-hidden rounded bg-muted" title={`${memPct.toFixed(0)}% memory`}>
-                  <div className="h-full bg-sky-500 transition-all" style={{ width: `${Math.min(100, Math.max(0, memPct))}%` }} />
+                <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px]">
+                  <span className="text-emerald-600 dark:text-emerald-400">{g.util.toFixed(0)}% util</span>
+                  <span className="text-sky-600 dark:text-sky-400">
+                    {mem.toFixed(0)}% mem · {(g.mem_used / 1024).toFixed(1)}/{(g.mem_total / 1024).toFixed(1)} GiB
+                  </span>
+                  <span className="text-amber-600 dark:text-amber-400">{g.temp.toFixed(0)}°C</span>
+                </div>
+                <div className="mt-2 h-28 w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={data} margin={{ top: 4, right: 4, left: -24, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+                      <XAxis dataKey="i" hide type="number" domain={["dataMin", "dataMax"]} />
+                      <YAxis domain={[0, 100]} tick={{ fontSize: 10 }} stroke="currentColor"
+                        className="text-muted-foreground" width={32} />
+                      <RTooltip
+                        contentStyle={{ fontSize: 11, borderRadius: 8 }}
+                        labelFormatter={() => ""}
+                        formatter={(v, n) => {
+                          const num = Number(v);
+                          return n === "temp" ? [`${num.toFixed(0)}°C`, "temp"]
+                            : [`${num.toFixed(0)}%`, n === "util" ? "util" : "mem"];
+                        }}
+                      />
+                      <Line type="monotone" dataKey="util" stroke="#10b981" strokeWidth={2} dot={false} isAnimationActive={false} />
+                      <Line type="monotone" dataKey="mem" stroke="#0ea5e9" strokeWidth={2} dot={false} isAnimationActive={false} />
+                      <Line type="monotone" dataKey="temp" stroke="#f59e0b" strokeWidth={2} dot={false} isAnimationActive={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
                 </div>
               </div>
-            </div>
-          );
-        })}
+            );
+          })}
+        </div>
         <p className="text-[10px] text-muted-foreground">
-          <span className="text-emerald-600 dark:text-emerald-400">■</span> util ·{" "}
-          <span className="text-sky-600 dark:text-sky-400">■</span> memory — only this run&apos;s GPUs.
+          <span className="text-emerald-600 dark:text-emerald-400">■</span> util % ·{" "}
+          <span className="text-sky-600 dark:text-sky-400">■</span> memory % ·{" "}
+          <span className="text-amber-600 dark:text-amber-400">■</span> temp °C — this run&apos;s GPUs, refreshed every 2.5s.
         </p>
       </CardContent>
     </Card>

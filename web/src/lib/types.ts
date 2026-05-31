@@ -283,8 +283,9 @@ export type CreateTrainingRunRequest = {
   pack_sequence_length?: number;
   default_speaker?: string | null;
   speaker_field?: string | null;
-  // hyperparameter sweep: {param: [values]} → cross-product = trials
-  sweep?: Record<string, number[]>;
+  // hyperparameter sweep: {param: [values]} → cross-product = trials.
+  // values are numbers for most knobs; `precision` is a string list.
+  sweep?: Record<string, (number | string)[]>;
   gpus_per_trial?: number;
   eval_metric?: "wer" | "cer";
   max_epochs?: number;
@@ -296,7 +297,8 @@ export type CreateTrainingRunRequest = {
   learning_rate?: number;
   warmup_steps?: number;
   weight_decay?: number;
-  precision?: "fp16" | "bf16" | "fp32";
+  // "<load>-<amp>": weight load dtype + mixed-precision (AMP) train dtype.
+  precision?: "fp32-bf16" | "bf16-bf16" | "fp32-fp16" | "fp16-fp16";
   language?: string | null;
   task?: string;
   provider_id?: string | null;
@@ -311,6 +313,9 @@ export type CreateTrainingRunRequest = {
   // experiment tracking — non-secret per-run knobs only; creds come from the
   // global Secrets page.
   report_to?: ("mlflow" | "wandb")[];
+  // named tracking credentials (Secrets page); selecting one enables that tracker
+  wandb_credential_id?: string | null;
+  mlflow_credential_id?: string | null;
   wandb_project?: string | null;
   wandb_entity?: string | null;
   mlflow_tracking_uri?: string | null;
@@ -319,6 +324,10 @@ export type CreateTrainingRunRequest = {
   logging_steps?: number;
   // OS env vars exported on the remote before the trainer (HOME, cache dirs, …).
   env_vars?: Record<string, string>;
+  // Roomy dir on the remote for checkpoints + temp (default /share; /tmp is small).
+  work_dir?: string;
+  // rm the checkpoint/work dir after the run (best model is on S3). Default true.
+  cleanup_checkpoints?: boolean;
 };
 
 export type TrainingFile = {
@@ -333,6 +342,7 @@ export type TrainingGpu = {
   util: number;        // % GPU utilisation
   mem_used: number;    // MiB
   mem_total: number;   // MiB
+  temp: number;        // °C
   name: string;
 };
 
@@ -340,6 +350,25 @@ export type TrainingGpuResponse = {
   status?: string;
   gpus: TrainingGpu[];
   error?: string;
+};
+
+// Named experiment-tracker credentials (Secrets page → Tracking credentials).
+export type TrackingCredentialRecord = {
+  id: string;
+  name: string;
+  kind: "wandb" | "mlflow";
+  preview: string;       // masked hint, never the secret
+  created_by: string;
+  created_at: string;
+};
+
+export type CreateTrackingCredentialRequest = {
+  name: string;
+  kind: "wandb" | "mlflow";
+  api_key?: string;      // wandb
+  uri?: string;          // mlflow
+  username?: string;     // mlflow
+  password?: string;     // mlflow
 };
 
 export type AggregatePoint = {
@@ -498,7 +527,7 @@ export type StorageRecord = {
 
 // ---- Datasets (Autotrain) ----
 
-export type DatasetKind = "upload" | "s3" | "hf";
+export type DatasetKind = "upload" | "s3" | "hf" | "label";
 
 export type DatasetRecord = {
   id: string;
@@ -520,6 +549,9 @@ export type DatasetRecord = {
   hf_repo?: string | null;
   hf_revision?: string | null;
   hf_synced_at?: string | null;
+  label_base_url?: string | null; // kind=label source (token never returned)
+  label_project_id?: string | null;
+  label_status?: string | null; // approved | rejected | not_reviewed | all
   transform_status?: string | null; // "" | running | done | failed
   transform_log?: string | null;
   created_at: string;
@@ -535,6 +567,11 @@ export type CreateDatasetRequest = {
   audio_prefix?: string | null;
   s3_metadata_uri?: string | null;
   hf_repo?: string | null;
+  // kind=label — import from a labeling-platform project
+  label_base_url?: string | null;
+  label_project_id?: string | null;
+  label_token?: string | null;
+  label_status?: string | null; // approved | rejected | not_reviewed | all
 };
 
 export type UpdateDatasetRequest = {

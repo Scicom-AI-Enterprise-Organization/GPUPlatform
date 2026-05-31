@@ -34,6 +34,26 @@ def emit(tag: str, obj: dict) -> None:
     print(f"@@{tag} {json.dumps(obj)}", flush=True)
 
 
+# Set by run() to the run's work dir; rm'd by main() when cleanup_checkpoints is on.
+_RUN_WORKDIR = None
+
+
+def parse_precision(p):
+    """'<load>-<amp>' → (torch_dtype_name, amp). The load part is the weight
+    dtype the model is loaded in; the amp part is the mixed-precision (AMP)
+    training dtype. Back-compat: a bare 'bf16'/'fp16' = load fp32 + that AMP;
+    'fp32' = full fp32 (no AMP)."""
+    p = (p or "fp32-bf16").lower()
+    if "-" in p:
+        load, amp = p.split("-", 1)
+    elif p == "fp32":
+        load, amp = "fp32", ""
+    else:
+        load, amp = "fp32", p
+    load_dt = {"fp32": "float32", "bf16": "bfloat16", "fp16": "float16"}.get(load, "float32")
+    return load_dt, (amp if amp in ("bf16", "fp16") else "")
+
+
 # --------------------------------------------------------------------------
 # Dependency bootstrap — runs before the heavy imports so a fresh pod works.
 # --------------------------------------------------------------------------
@@ -168,45 +188,91 @@ def _download_audio_s3(ds: dict, ref: str, dest_dir: str) -> str | None:
 
 
 def load_pairs(ds: dict, work: str) -> list[dict]:
-    """Return [{audio, text, split?}] for a dataset spec (S3 or HF)."""
+    """Return lightweight metadata items — NO audio decoded/downloaded here.
+    Each item carries the text + a lazy handle to its audio; the actual bytes
+    are fetched + decoded in _LazyAsrDataset.__getitem__ during training (so a
+    big dataset costs ~nothing up front, vs. the old eager HF .map that built a
+    multi-GB Arrow table and stalled on slow shared mounts).
+
+      HF item: {src:"hf", hf_split, hf_idx, audio_field, text, split}
+      S3 item: {src:"s3", s3_spec, s3_ref, text, split?}
+    """
     kind = ds.get("kind")
     audio_field = ds.get("audio_field") or "audio"
     text_field = ds.get("transcription_field") or "transcription"
 
     if kind == "hf":
-        from datasets import load_dataset
+        from datasets import Audio, load_dataset
 
         token = ds.get("hf_token") or None
         repo = ds["hf_repo"]
-        log(f"[data] loading HF dataset {repo}")
+        log(f"[data] loading HF dataset metadata: {repo} (audio fetched lazily per item)")
         dd = load_dataset(repo, token=token)
         out: list[dict] = []
         for split_name, split in dd.items():
             tf = (ds.get("split_fields") or {}).get(split_name, text_field)
-            for row in split:
-                out.append({"audio": row[audio_field], "text": row.get(tf, ""),
-                            "split": split_name})
+            # lazy 16 kHz resample on access — does NOT trigger a full decode pass
+            split = split.cast_column(audio_field, Audio(sampling_rate=16000))
+            texts = list(split[tf]) if tf in split.column_names else [""] * split.num_rows
+            for idx in range(split.num_rows):
+                out.append({
+                    "src": "hf", "hf_split": split, "hf_idx": idx,
+                    "audio_field": audio_field,
+                    "text": texts[idx] if idx < len(texts) else "",
+                    "split": split_name,
+                })
+        log(f"[data] {len(out)} examples indexed (metadata only)")
         return out
 
-    # S3 / upload metadata
-    audio_dir = os.path.join(work, "audio")
-    os.makedirs(audio_dir, exist_ok=True)
+    # S3 / upload metadata — keep only the per-row ref + text; download on access.
     rows = _read_metadata_rows(ds)
-    log(f"[data] {len(rows)} metadata rows from s3://{ds['bucket']}/{ds['metadata_key']}")
-    pairs: list[dict] = []
+    log(f"[data] {len(rows)} metadata rows from s3://{ds['bucket']}/{ds['metadata_key']} "
+        f"(audio fetched lazily per item)")
+    out = []
     for r in rows:
         ref = r.get(audio_field)
         text = r.get(text_field)
         if not ref or text is None:
             continue
-        local = _download_audio_s3(ds, str(ref), audio_dir)
-        if local is None:
-            continue
-        item = {"audio": local, "text": str(text)}
+        item = {"src": "s3", "s3_spec": ds, "s3_ref": str(ref), "text": str(text)}
         if r.get("split"):
             item["split"] = str(r["split"])
-        pairs.append(item)
-    return pairs
+        out.append(item)
+    return out
+
+
+class _LazyAsrDataset:
+    """Map-style dataset for HF Seq2SeqTrainer / torch DataLoader. Holds only the
+    metadata items; __getitem__ fetches + decodes the audio for one index from
+    its source (HF Arrow cache or S3) and returns {input_features, labels}. Plain
+    class (not a torch subclass) so it stays picklable for DataLoader workers,
+    which run __getitem__ in parallel and overlap audio I/O with GPU compute."""
+
+    def __init__(self, items: list[dict], processor, work: str):
+        self.items = items
+        self.processor = processor
+        self.audio_dir = os.path.join(work, "audio")
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> dict:
+        it = self.items[idx]
+        if it.get("src") == "hf":
+            a = it["hf_split"][it["hf_idx"]][it["audio_field"]]
+            array, sr = a["array"], a["sampling_rate"]
+        else:
+            import librosa
+            os.makedirs(self.audio_dir, exist_ok=True)
+            path = _download_audio_s3(it["s3_spec"], it["s3_ref"], self.audio_dir)
+            if path is None:
+                raise RuntimeError(f"audio fetch failed for {it.get('s3_ref')!r}")
+            array, sr = librosa.load(path, sr=16000)  # decode + resample to 16k
+        feat = self.processor.feature_extractor(
+            array, sampling_rate=sr
+        ).input_features[0]
+        labels = self.processor.tokenizer(it["text"]).input_ids
+        return {"input_features": feat, "labels": labels}
 
 
 # --------------------------------------------------------------------------
@@ -253,7 +319,21 @@ def run(cfg: dict) -> None:
     from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
     import evaluate as hf_evaluate
 
-    work = tempfile.mkdtemp(prefix="autotrain-")
+    # Checkpoints (model + Adam optimizer state) are huge — ~10 GB each, and
+    # save_total_limit rotation briefly holds two. Put the run's work dir under
+    # the configured work_dir (default /share, a roomy volume); /tmp is a small
+    # disk that overflows mid-save ("unexpected pos … inline_container.cc").
+    # main() rm's this dir afterwards when cleanup_checkpoints is set (the best
+    # model is uploaded to S3 first).
+    global _RUN_WORKDIR
+    _train_root = os.path.join((cfg.get("work_dir") or "/share").rstrip("/"), "sgpu-train")
+    try:
+        os.makedirs(_train_root, exist_ok=True)
+        work = tempfile.mkdtemp(prefix="autotrain-", dir=_train_root)
+    except OSError:
+        work = tempfile.mkdtemp(prefix="autotrain-")
+    _RUN_WORKDIR = work
+    log(f"[trainer] work dir: {work}")
     base_model = cfg["base_model"]
     language = cfg.get("language") or None
     task = cfg.get("task") or "transcribe"
@@ -274,37 +354,39 @@ def run(cfg: dict) -> None:
             f"need both train and eval examples (got {len(train_pairs)}/{len(eval_pairs)})"
         )
 
+    load_dt, amp = parse_precision(cfg.get("precision"))
+    _tdt = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[load_dt]
+    log(f"[train] precision: load={load_dt} amp={amp or 'none'}")
     processor = WhisperProcessor.from_pretrained(base_model, language=language, task=task)
-    model = WhisperForConditionalGeneration.from_pretrained(base_model)
+    model = WhisperForConditionalGeneration.from_pretrained(base_model, torch_dtype=_tdt)
     model.generation_config.language = language
     model.generation_config.task = task
     model.config.forced_decoder_ids = None
     model.config.suppress_tokens = []
 
-    def _to_ds(rows: list[dict]) -> "Dataset":
-        d = Dataset.from_dict({
-            "audio": [r["audio"] for r in rows],
-            "text": [r["text"] for r in rows],
-        })
-        return d.cast_column("audio", Audio(sampling_rate=16000))
-
-    train_ds, eval_ds = _to_ds(train_pairs), _to_ds(eval_pairs)
-
-    def prepare(batch):
-        audio = batch["audio"]
-        batch["input_features"] = processor.feature_extractor(
-            audio["array"], sampling_rate=audio["sampling_rate"]
-        ).input_features[0]
-        batch["labels"] = processor.tokenizer(batch["text"]).input_ids
-        return batch
-
-    train_ds = train_ds.map(prepare, remove_columns=train_ds.column_names)
-    eval_ds = eval_ds.map(prepare, remove_columns=eval_ds.column_names)
+    # Lazy datasets: no upfront decode / Arrow build. Feature extraction happens
+    # in __getitem__, parallelized by the DataLoader's workers and overlapped
+    # with GPU compute — so training starts immediately.
+    train_ds = _LazyAsrDataset(train_pairs, processor, work)
+    eval_ds = _LazyAsrDataset(eval_pairs, processor, work)
+    log(f"[trainer] {len(train_ds)} train / {len(eval_ds)} eval examples "
+        f"— audio fetched + decoded lazily per item during training")
 
     class Collator:
         def __call__(self, features):
             inp = [{"input_features": f["input_features"]} for f in features]
             batch = processor.feature_extractor.pad(inp, return_tensors="pt")
+            # Match input_features to the model's param dtype. Under nn.DataParallel
+            # (multi-GPU, plain `python`) HF half-converts the model for fp16/bf16
+            # but autocast doesn't reach the DP replica threads, so float32 input
+            # hits half weights → "Input type (float) and bias type (Half)". Casting
+            # here is a no-op on single-GPU/fp32 and fixes the DP case.
+            try:
+                md = next(model.parameters()).dtype
+                if batch["input_features"].dtype != md:
+                    batch["input_features"] = batch["input_features"].to(md)
+            except StopIteration:
+                pass
             labels = processor.tokenizer.pad(
                 [{"input_ids": f["labels"]} for f in features], return_tensors="pt"
             )
@@ -343,7 +425,6 @@ def run(cfg: dict) -> None:
         log(f"[track] reporting metrics to: {', '.join(report_to)}")
 
     out_dir = os.path.join(work, "out")
-    precision = (cfg.get("precision") or "fp16").lower()
     args = Seq2SeqTrainingArguments(
         output_dir=out_dir,
         per_device_train_batch_size=int(cfg.get("batch_size", 8)),
@@ -357,13 +438,15 @@ def run(cfg: dict) -> None:
         save_strategy="epoch",
         predict_with_generate=True,
         generation_max_length=int(cfg.get("generation_max_length", 225)),
-        fp16=(precision == "fp16"),
-        bf16=(precision == "bf16"),
+        fp16=(amp == "fp16"),
+        bf16=(amp == "bf16"),
         load_best_model_at_end=True,
         metric_for_best_model=metric_name,
         greater_is_better=False,
         save_total_limit=1,
         logging_steps=max(1, int(cfg.get("logging_steps", 10))),
+        # Parallel lazy audio fetch/decode in __getitem__, overlapped with GPU.
+        dataloader_num_workers=max(0, int(cfg.get("dataloader_num_workers", 4))),
         report_to=report_to,
         run_name=cfg.get("run_name") or None,
     )
@@ -463,6 +546,32 @@ def run(cfg: dict) -> None:
     emit("DONE", {"best": best, "epochs": epochs_ran, "stopped_early": stopped_early})
 
 
+def _redirect_tmp(base: str) -> None:
+    """Move TMPDIR off the small local /tmp onto a roomy dir (default /share).
+    DataLoader workers' multiprocessing temp (pymp-*), pip, and Python tempfile
+    all honour this — /tmp is often a small disk that overflows on big-model
+    runs (No space left on device)."""
+    base = (base or "/share").rstrip("/")
+    d = os.path.join(base, "tmp")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return
+    for k in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[k] = d
+    tempfile.tempdir = d
+    log(f"[trainer] TMPDIR → {d} (off small /tmp)")
+
+
+def _cleanup_workdir(enabled: bool) -> None:
+    """rm the run's checkpoints + work dir (the best model is already on S3)."""
+    if not enabled or not _RUN_WORKDIR:
+        return
+    import shutil
+    shutil.rmtree(_RUN_WORKDIR, ignore_errors=True)
+    log(f"[trainer] cleaned checkpoints + work dir: {_RUN_WORKDIR}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="path to JSON config")
@@ -471,6 +580,8 @@ def main() -> int:
     a = ap.parse_args()
     with open(a.config) as f:
         cfg = json.load(f)
+    _redirect_tmp(cfg.get("work_dir") or "/share")
+    cleanup = bool(cfg.get("cleanup_checkpoints", True))
     try:
         ensure_deps()
         ensure_tracker_deps((cfg.get("tracking") or {}).get("report_to") or [])
@@ -483,6 +594,8 @@ def main() -> int:
         emit("ERROR", {"message": str(e)})
         log(traceback.format_exc())
         return 1
+    finally:
+        _cleanup_workdir(cleanup)
 
 
 if __name__ == "__main__":

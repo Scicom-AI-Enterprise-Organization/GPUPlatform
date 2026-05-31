@@ -39,6 +39,21 @@ def emit(tag: str, obj: dict) -> None:
     print(f"@@{tag} {json.dumps(obj)}", flush=True)
 
 
+def parse_precision(p):
+    """'<load>-<amp>' → (torch_dtype_name, amp): weight load dtype + the
+    mixed-precision (AMP) train dtype. Back-compat: bare 'bf16'/'fp16' = load
+    fp32 + that AMP; 'fp32' = full fp32 (no AMP)."""
+    p = (p or "fp32-bf16").lower()
+    if "-" in p:
+        load, amp = p.split("-", 1)
+    elif p == "fp32":
+        load, amp = "fp32", ""
+    else:
+        load, amp = "fp32", p
+    load_dt = {"fp32": "float32", "bf16": "bfloat16", "fp16": "float16"}.get(load, "float32")
+    return load_dt, (amp if amp in ("bf16", "fp16") else "")
+
+
 def _run_loss(cmd: list[str], cwd: str, env: dict) -> float | None:
     """Run a command, tee its stdout, and return the last HF-logged train loss
     (so a sweep can rank TTS trials, which are loss-only)."""
@@ -208,7 +223,7 @@ def run(cfg: dict) -> None:
     batch = int(cfg.get("batch_size", 8))
     grad_accum = int(cfg.get("grad_accum", 4))
     lr = float(cfg.get("learning_rate", 2e-5))
-    precision = (cfg.get("precision") or "bf16").lower()
+    load_dt, amp = parse_precision(cfg.get("precision"))
     gpus = max(1, int(cfg.get("gpu_count", 1)))
 
     audio_paths, meta = build_dataset(cfg, work)
@@ -230,9 +245,12 @@ def run(cfg: dict) -> None:
           "--dataset", meta, "--output_dir", packed,
           "--tokenizer", tokenizer, "--sequence_length", str(seq_len)], cwd=work)
     # 3. finetune via torchrun
-    dtype_args = ["--bf16", "--torch_dtype", "bfloat16"] if precision == "bf16" \
-        else (["--fp16", "--torch_dtype", "float16"] if precision == "fp16"
-              else ["--torch_dtype", "float32"])
+    log(f"[train] precision: load={load_dt} amp={amp or 'none'}")
+    dtype_args = ["--torch_dtype", load_dt]
+    if amp == "bf16":
+        dtype_args += ["--bf16"]
+    elif amp == "fp16":
+        dtype_args += ["--fp16"]
     report_flag = ",".join(report_to) if report_to else "none"
     last_loss = _run_loss([
         "torchrun", f"--nproc_per_node={gpus}", os.path.join(TTS_DIR, "qwen3_tts_flash.py"),

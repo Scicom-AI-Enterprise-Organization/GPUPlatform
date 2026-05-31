@@ -48,6 +48,8 @@ import type {
   TrainingGpuResponse,
   CreateTrainingRunRequest,
   TrainingFile,
+  TrackingCredentialRecord,
+  CreateTrackingCredentialRequest,
 } from "./types";
 
 export type GpuAvailability = {
@@ -231,6 +233,11 @@ export const gateway = {
     request<TrainingRunRecord[]>(`/v1/training-runs?scope=${scope}`),
   getTrainingRun: (id: string) =>
     request<TrainingRunRecord>(`/v1/training-runs/${encodeURIComponent(id)}`),
+  renameTrainingRun: (id: string, name: string) =>
+    request<TrainingRunRecord>(`/v1/training-runs/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    }),
   createTrainingRun: (body: CreateTrainingRunRequest) =>
     request<TrainingRunRecord>("/v1/training-runs", {
       method: "POST",
@@ -246,6 +253,12 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/terminate`,
       { method: "POST" },
     ),
+  /** Clone a run's config into a fresh queued run and launch it. */
+  restartTrainingRun: (id: string) =>
+    request<TrainingRunRecord>(
+      `/v1/training-runs/${encodeURIComponent(id)}/restart`,
+      { method: "POST" },
+    ),
   listTrainingFiles: (id: string) =>
     request<TrainingFile[]>(`/v1/training-runs/${encodeURIComponent(id)}/files`),
   /** Live per-GPU utilisation for the run's GPUs only (poll while running). */
@@ -253,6 +266,22 @@ export const gateway = {
     request<TrainingGpuResponse>(`/v1/training-runs/${encodeURIComponent(id)}/gpu`),
   trainingLogsStreamUrl: (id: string) =>
     `/api/proxy/v1/training-runs/${encodeURIComponent(id)}/logs/stream`,
+
+  // ---- Experiment-tracker credentials (Secrets page card) ----
+  listTrackingCredentials: (kind?: "wandb" | "mlflow") =>
+    request<TrackingCredentialRecord[]>(
+      `/v1/tracking-credentials${kind ? `?kind=${kind}` : ""}`,
+    ),
+  createTrackingCredential: (body: CreateTrackingCredentialRequest) =>
+    request<TrackingCredentialRecord>("/v1/tracking-credentials", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteTrackingCredential: (id: string) =>
+    request<{ ok: boolean; id: string }>(
+      `/v1/tracking-credentials/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
 
   // ---- Cross-benchmark aggregate (one point per result.json across all benches) ----
   aggregateBenchmarks: (scope: "mine" | "all" = "mine") =>

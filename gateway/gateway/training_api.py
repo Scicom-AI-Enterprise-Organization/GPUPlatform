@@ -517,19 +517,30 @@ async def run_training(redis, run_id: str) -> None:
         # the global-env value; secrets (WANDB_API_KEY, MLFLOW_TRACKING_USERNAME/
         # PASSWORD) come from the Secrets page. Built here at run time, never
         # persisted on the row.
-        report_to = [t for t in (cfg.get("report_to") or []) if t in ("mlflow", "wandb")]
+        # Named tracking credentials (Secrets page) win; global-env is the
+        # fallback. A selected credential id implies that tracker is enabled.
+        from .tracking_creds_api import resolve_tracking_env
+        wandb_cred = await resolve_tracking_env(cfg.get("wandb_credential_id"))
+        mlflow_cred = await resolve_tracking_env(cfg.get("mlflow_credential_id"))
+        report_to = list(cfg.get("report_to") or [])
+        if cfg.get("wandb_credential_id") and "wandb" not in report_to:
+            report_to.append("wandb")
+        if cfg.get("mlflow_credential_id") and "mlflow" not in report_to:
+            report_to.append("mlflow")
+        report_to = [t for t in report_to if t in ("mlflow", "wandb")]
         if report_to:
             env: dict[str, Optional[str]] = {}
             if "wandb" in report_to:
-                env["WANDB_API_KEY"] = g("WANDB_API_KEY")
+                env["WANDB_API_KEY"] = wandb_cred.get("WANDB_API_KEY") or g("WANDB_API_KEY")
                 env["WANDB_PROJECT"] = cfg.get("wandb_project") or g("WANDB_PROJECT")
                 env["WANDB_ENTITY"] = cfg.get("wandb_entity") or g("WANDB_ENTITY")
                 env["WANDB_NAME"] = cfg.get("run_name")
             if "mlflow" in report_to:
-                env["MLFLOW_TRACKING_URI"] = cfg.get("mlflow_tracking_uri") or g("MLFLOW_TRACKING_URI")
+                env["MLFLOW_TRACKING_URI"] = (cfg.get("mlflow_tracking_uri")
+                                              or mlflow_cred.get("MLFLOW_TRACKING_URI") or g("MLFLOW_TRACKING_URI"))
                 env["MLFLOW_EXPERIMENT_NAME"] = cfg.get("mlflow_experiment") or g("MLFLOW_EXPERIMENT_NAME")
-                env["MLFLOW_TRACKING_USERNAME"] = g("MLFLOW_TRACKING_USERNAME")
-                env["MLFLOW_TRACKING_PASSWORD"] = g("MLFLOW_TRACKING_PASSWORD")
+                env["MLFLOW_TRACKING_USERNAME"] = mlflow_cred.get("MLFLOW_TRACKING_USERNAME") or g("MLFLOW_TRACKING_USERNAME")
+                env["MLFLOW_TRACKING_PASSWORD"] = mlflow_cred.get("MLFLOW_TRACKING_PASSWORD") or g("MLFLOW_TRACKING_PASSWORD")
                 env["HF_MLFLOW_LOG_ARTIFACTS"] = "0"
             cfg["tracking"] = {"report_to": report_to, "env": {k: v for k, v in env.items() if v}}
     except Exception as e:  # noqa: BLE001
@@ -608,9 +619,12 @@ async def run_training(redis, run_id: str) -> None:
                          ("@@DONE ", "done"),
                          ("@@ARTIFACT ", "artifact"), ("@@ERROR ", "error"),
                          ("@@TRIAL ", "trial")):
-            if line.startswith(tag):
+            # The tag can be prefixed by a tqdm progress bar (\r, no newline) on
+            # the same captured line, so find it anywhere — not just at the start.
+            ti = line.find(tag)
+            if ti >= 0:
                 try:
-                    obj = json.loads(line[len(tag):])
+                    obj = json.loads(line[ti + len(tag):])
                 except Exception:
                     continue
                 if key == "metric":
@@ -790,7 +804,7 @@ class CreateTrainingRunRequest(BaseModel):
     # Emit a training-loss point every N optimizer steps (@@STEP) for the live
     # loss curve. Smaller N = smoother graph, more log lines.
     logging_steps: int = 10
-    precision: str = "fp16"            # fp16 | bf16
+    precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
     # Where to run.
@@ -803,10 +817,21 @@ class CreateTrainingRunRequest(BaseModel):
     visible_devices: Optional[str] = None
     storage_id: Optional[str] = None
     hf_push_repo: Optional[str] = None
+    # Roomy dir on the remote for checkpoints + temp (TMPDIR). Defaults to
+    # /share (the VM's big volume); /tmp is a small disk that overflows on big
+    # models. The best model is uploaded to S3 regardless.
+    work_dir: str = "/share"
+    # rm the run's checkpoint/work dir on the remote once the run ends (the best
+    # model is already on S3). Keeps the volume from filling across runs.
+    cleanup_checkpoints: bool = True
     # Experiment tracking. report_to is a subset of ["mlflow", "wandb"]. Only
     # non-secret per-run knobs live here; the creds (WANDB_API_KEY,
     # MLFLOW_TRACKING_URI/USERNAME/PASSWORD) come from the global Secrets page.
     report_to: list[str] = []
+    # Named tracking credentials (Secrets page → Tracking credentials card).
+    # Selecting one enables that tracker for the run.
+    wandb_credential_id: Optional[str] = None
+    mlflow_credential_id: Optional[str] = None
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
     mlflow_tracking_uri: Optional[str] = None
@@ -916,8 +941,12 @@ async def create_training_run(
         "base_model": body.base_model, "secure_cloud": body.secure_cloud,
         "disk_gb": body.disk_gb, "volume_gb": body.volume_gb,
         "hf_push_repo": body.hf_push_repo,
-        # experiment tracking (non-secret; secrets stashed in Redis below)
+        "work_dir": (body.work_dir or "/share").strip() or "/share",
+        "cleanup_checkpoints": body.cleanup_checkpoints,
+        # experiment tracking — non-secret knobs + the chosen credential ids.
         "report_to": [t for t in body.report_to if t in ("mlflow", "wandb")],
+        "wandb_credential_id": body.wandb_credential_id,
+        "mlflow_credential_id": body.mlflow_credential_id,
         "wandb_project": body.wandb_project, "wandb_entity": body.wandb_entity,
         "mlflow_tracking_uri": body.mlflow_tracking_uri,
         "mlflow_experiment": body.mlflow_experiment,
@@ -946,6 +975,39 @@ async def create_training_run(
     _active_runners[run_id] = task
     task.add_done_callback(lambda _t: _active_runners.pop(run_id, None))
 
+    return _to_record(row, user.username)
+
+
+@router.post("/{run_id}/restart", response_model=TrainingRunRecord)
+async def restart_training_run(
+    run_id: str,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Clone a run's full config (dataset, model, hyperparams, env vars, …) into
+    a fresh queued run and launch it. Handy to re-run a finished/failed run
+    unchanged — the source run is left as-is."""
+    src = await _owned(run_id, user, session)
+    new_id = _gen_id()
+    target = await _training_s3_target(src.storage_id)
+    config = dict(src.config_json or {})
+    config["run_name"] = src.name  # run_name drives W&B/MLflow naming
+    row = TrainingRun(
+        id=new_id, name=src.name, dataset_id=src.dataset_id,
+        test_dataset_id=src.test_dataset_id, base_model=src.base_model,
+        task_type=src.task_type, config_json=config, status="queued",
+        s3_prefix=f"{target.prefix_root}{new_id}/", owner_id=user.id,
+        provider_id=src.provider_id, storage_id=src.storage_id,
+        gpu_type=src.gpu_type, gpu_count=src.gpu_count, visible_devices=src.visible_devices,
+    )
+    session.add(row)
+    await session.commit()
+
+    redis = request.app.state.redis
+    task = asyncio.create_task(_safe_run(redis, new_id))
+    _active_runners[new_id] = task
+    task.add_done_callback(lambda _t: _active_runners.pop(new_id, None))
     return _to_record(row, user.username)
 
 
@@ -984,6 +1046,29 @@ async def get_training_run(
     session: AsyncSession = Depends(get_session),
 ):
     row = await _owned(run_id, user, session)
+    u = await session.get(User, row.owner_id)
+    return _to_record(row, u.username if u else "?")
+
+
+class RenameTrainingRunRequest(BaseModel):
+    name: str
+
+
+@router.patch("/{run_id}", response_model=TrainingRunRecord)
+async def rename_training_run(
+    run_id: str,
+    body: RenameTrainingRunRequest,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Rename a run (display label only — does not touch the W&B/MLflow run_name
+    baked into config_json at create time)."""
+    row = await _owned(run_id, user, session)
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    row.name = name[:128]
+    await session.commit()
     u = await session.get(User, row.owner_id)
     return _to_record(row, u.username if u else "?")
 
@@ -1167,8 +1252,8 @@ def _gpu_query_sync(run_id: str, host: str, port: int, user: str,
         cli.connect(hostname=host, port=port, username=user, key_filename=key_filename,
                     timeout=8, banner_timeout=10, auth_timeout=10)
         _GPU_SSH[run_id] = cli
-    q = ("nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,name "
-         "--format=csv,noheader,nounits")
+    q = ("nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,"
+         "temperature.gpu,name --format=csv,noheader,nounits")
     if gpu_csv:
         q += f" -i {gpu_csv}"
     try:
@@ -1190,13 +1275,13 @@ def _gpu_query_sync(run_id: str, host: str, port: int, user: str,
     gpus: list[dict] = []
     for line in out.decode("utf-8", "replace").splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 5:
+        if len(parts) < 6:
             continue
         try:
             gpus.append({
                 "index": int(parts[0]), "util": float(parts[1]),
                 "mem_used": float(parts[2]), "mem_total": float(parts[3]),
-                "name": parts[4],
+                "temp": float(parts[4]), "name": parts[5],
             })
         except ValueError:
             continue
