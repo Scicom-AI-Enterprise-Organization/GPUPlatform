@@ -1035,10 +1035,21 @@ async def create_training_run(
         st = await session.get(Storage, body.storage_id)
         if st is None or st.kind != "s3" or not st.enabled:
             raise HTTPException(status_code=400, detail="storage must be an enabled s3 backend")
+    # On a VM the hardware is fixed by the box, so the RunPod-pod knobs
+    # (gpu_type / secure_cloud / disk_gb / volume_gb) don't apply — reflect the
+    # VM's actual GPU and drop the cloud-only fields so the config tab isn't
+    # misleading (e.g. "L40S" shown while it trains on the VM's H20s).
+    eff_gpu_type = body.gpu_type
+    is_vm_run = False
     if body.provider_id:
         prov = await session.get(Provider, body.provider_id)
         if prov is None:
             raise HTTPException(status_code=400, detail="unknown provider_id")
+        if prov.kind == "vm":
+            is_vm_run = True
+            vm_gpus = (prov.config or {}).get("gpus") or []
+            if vm_gpus:
+                eff_gpu_type = vm_gpus[0]
 
     run_id = _gen_id()
     target = await _training_s3_target(body.storage_id)
@@ -1058,8 +1069,13 @@ async def create_training_run(
         "augment_techniques": [t for t in (body.augment_techniques or []) if t in _AUG_TECHNIQUES],
         "augment_prob": body.augment_prob,
         "precision": body.precision, "language": body.language, "task": body.task,
-        "base_model": body.base_model, "secure_cloud": body.secure_cloud,
-        "disk_gb": body.disk_gb, "volume_gb": body.volume_gb,
+        "base_model": body.base_model,
+        # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab
+        # matches reality (VM hardware is fixed; gpu_type reflects the VM).
+        **({} if is_vm_run else {
+            "secure_cloud": body.secure_cloud,
+            "disk_gb": body.disk_gb, "volume_gb": body.volume_gb,
+        }),
         "hf_push_repo": body.hf_push_repo,
         "work_dir": (body.work_dir or "/share").strip() or "/share",
         "cleanup_checkpoints": body.cleanup_checkpoints,
@@ -1085,7 +1101,7 @@ async def create_training_run(
         task_type=body.task_type,
         config_json=config, status="queued", s3_prefix=s3_prefix, owner_id=user.id,
         provider_id=body.provider_id, storage_id=body.storage_id,
-        gpu_type=body.gpu_type, gpu_count=body.gpu_count, visible_devices=body.visible_devices,
+        gpu_type=eff_gpu_type, gpu_count=body.gpu_count, visible_devices=body.visible_devices,
     )
     session.add(row)
     await session.commit()
