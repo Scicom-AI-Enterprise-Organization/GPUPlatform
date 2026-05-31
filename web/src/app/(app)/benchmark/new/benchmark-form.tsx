@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import yaml from "js-yaml";
 import {
   AlertCircle,
@@ -97,22 +97,29 @@ const RUNPOD_GPU_FALLBACK: GpuTypeOption[] = [
   { id: "NVIDIA H100 80GB HBM3", label: "H100 80GB", vram_gb: 80, hint: "fastest" },
 ];
 
-// Container image presets for the RunPod pod. CUDA version matters because
-// flashinfer's Hopper kernels (used by Qwen3-Next + GDN linear attention)
-// need PTX intrinsics that only exist in CUDA 12.6+ — CUDA 12.4 will fail
-// to JIT-compile gdn_prefill_sm90 mid-inference.
+// Container image presets for the RunPod pod. We default to CUDA 12.8 for two
+// reasons:
+//   1. benchmaq derives `allowedCudaVersions` from the image tag and sends it
+//      to RunPod as an exact-match host filter. A CUDA 12.4 image yields
+//      ['12.4'], which excludes modern datacenter hosts (H100 SXM Secure report
+//      12.8 / driver 570+) → "no instances available" even when stock is High.
+//      A 12.8 image matches those hosts.
+//   2. flashinfer's Hopper kernels (Qwen3-Next + GDN linear attention) need PTX
+//      intrinsics that only exist in CUDA 12.6+ — CUDA 12.4 fails to JIT-compile
+//      gdn_prefill_sm90 mid-inference.
+// The CUDA 12.4 image stays available as a lighter/older baseline.
 const DEFAULT_CONTAINER_IMAGE =
-  "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04";
+  "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404";
 const CONTAINER_IMAGE_OPTIONS = [
   {
     id: DEFAULT_CONTAINER_IMAGE,
-    label: "CUDA 12.4 · pytorch 2.4",
-    hint: "default",
+    label: "CUDA 12.8 · torch 2.8",
+    hint: "default · modern hosts · Qwen3-Next / flashinfer GDN",
   },
   {
-    id: "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
-    label: "CUDA 12.8 · torch 2.8",
-    hint: "Qwen3-Next / flashinfer GDN · official RunPod template",
+    id: "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    label: "CUDA 12.4 · pytorch 2.4",
+    hint: "older / lighter baseline",
   },
 ];
 const CUSTOM_IMAGE_SENTINEL = "__custom__";
@@ -170,6 +177,13 @@ type FormState = {
   extra_args_raw: string;
   // Workload
   request_rate: string;
+  // Per-run warm-up: when on, each measured bench row carries vLLM's native
+  // `num_warmups` (= the row's own concurrency, one full wave). vLLM fires those
+  // requests at the run's exact shape + concurrency before measuring and
+  // excludes them from the reported metrics — kills first-request cold start
+  // (cuBLAS/cublasLt autotune, allocator growth, NCCL all-reduce at TP>1,
+  // torch.compile guards) without polluting results.
+  warmup: boolean;
   // Workload — single-value when sweep_mode is off, CSV-derived arrays when on.
   sweep_mode: boolean;
   input_len: number;
@@ -202,19 +216,20 @@ const DEFAULTS: FormState = {
   max_num_seqs: "",
   port: "",
   dtype: "auto",
-  vllm_version: "0.15.0",
+  vllm_version: "0.19.1",
   // Benchmark-default extras: prefix caching off (so cache hits don't skew
   // numbers). --disable-log-requests was removed in vLLM > 0.15 and now
   // causes the server to refuse to start, so it's no longer in the default.
   extra_args_raw: "--no-enable-prefix-caching",
   request_rate: "inf",
+  warmup: true,
   sweep_mode: false,
   input_len: 256,
   output_len: 128,
-  num_prompts: 50,
+  num_prompts: 100,
   max_concurrency: 4,
-  input_lens_csv: "128, 512, 1024, 2048",
-  concurrencies_csv: "10, 25, 50, 200",
+  input_lens_csv: "128, 512, 2048, 4096, 8192, 16384",
+  concurrencies_csv: "10, 50, 100",
   hf_home: "/workspace/hf_home",
   vm_base_dir: "~",
 };
@@ -272,11 +287,16 @@ function renderBenchEntries(s: FormState): string {
       const extra = s.sweep_mode
         ? `, percentile_metrics: "ttft,tpot,itl,e2el"`
         : "";
+      // Per-run warm-up via vLLM's native --num-warmups: fire one full wave (=
+      // this row's concurrency) at the run's exact shape before measuring.
+      // vLLM excludes warm-up requests from the reported metrics, so each row —
+      // and every sweep cell — self-warms with no separate row or filtering.
+      const warm = s.warmup ? `, num_warmups: ${c}` : "";
       lines.push(
         `      - { endpoint: /v1/completions, dataset_name: random, ` +
           `random_input_len: ${inLen}, random_output_len: ${s.output_len}, ` +
           `num_prompts: ${s.num_prompts}, max_concurrency: ${c}, ` +
-          `request_rate: ${rate}, ignore_eos: true${extra} }`,
+          `request_rate: ${rate}, ignore_eos: true${warm}${extra} }`,
       );
     }
   }
@@ -381,7 +401,7 @@ function renderYaml(s: FormState, target: "cloud" | "vm" = "cloud"): string {
     path: ~/.venv
     python_version: "3.11"
   dependencies:
-    - vllm==${s.vllm_version || "0.15.0"}
+    - vllm==${s.vllm_version || "0.19.1"}
     - huggingface_hub
     - hf_transfer
 `
@@ -392,7 +412,7 @@ remote:
     path: ~/.benchmark-venv
     python_version: "3.11"
   dependencies:
-    - vllm==${s.vllm_version || "0.15.0"}
+    - vllm==${s.vllm_version || "0.19.1"}
     - huggingface_hub
     - hf_transfer
 `;
@@ -542,9 +562,15 @@ function parseYamlToForm(src: string, fallback: FormState): ParseYamlResult {
   next.extra_args_raw = extras.join(" ");
 
   // ---- benchmark[0].bench[] — sweep detection + workload fields.
+  // Per-run warm-up is native now (vLLM `num_warmups` on each row); any row
+  // carrying num_warmups > 0 flips the warm-up toggle back on. The key is
+  // otherwise ignored by sweep/workload parsing.
   const benchRows = Array.isArray(first.bench)
     ? (first.bench as Record<string, unknown>[])
     : [];
+  next.warmup = benchRows.some(
+    (r) => typeof r.num_warmups === "number" && r.num_warmups > 0,
+  );
   if (benchRows.length > 0) {
     const inputLens = new Set<number>();
     const concs = new Set<number>();
@@ -598,10 +624,26 @@ export function BenchmarkForm({
   initialProviderId?: string | null;
 } = {}) {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   // Duplicate flow: start in YAML mode with the source config pre-filled so
   // the round-trip is exact. Switching back to Form mode parses the YAML
   // and back-fills the form (lossy for keys the form doesn't represent).
-  const [mode, setMode] = useState<"form" | "yaml">(initialYaml ? "yaml" : "form");
+  // ?tab= in the URL wins so the active tab is shareable / survives refresh;
+  // otherwise the duplicate flow's YAML preference decides the default.
+  const initialMode: "form" | "yaml" = (() => {
+    const t = searchParams.get("tab");
+    if (t === "form" || t === "yaml") return t;
+    return initialYaml ? "yaml" : "form";
+  })();
+  const [mode, setModeState] = useState<"form" | "yaml">(initialMode);
+  // Reflect the active tab in the URL (no history spam, no scroll jump).
+  const setMode = (next: "form" | "yaml") => {
+    setModeState(next);
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("tab", next);
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+  };
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -676,6 +718,8 @@ export function BenchmarkForm({
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>("");
   const [saveOpen, setSaveOpen] = useState(false);
   const [saveName, setSaveName] = useState("");
+  // Controlled disclosure for the YAML preview (see the note at its render).
+  const [yamlPreviewOpen, setYamlPreviewOpen] = useState(false);
 
   useEffect(() => {
     gateway.listBenchmarkTemplates().then(setTemplates).catch(() => {});
@@ -1318,7 +1362,7 @@ export function BenchmarkForm({
                   className="font-mono"
                   value={form.vllm_version}
                   onChange={(e) => field("vllm_version", e.target.value)}
-                  placeholder="0.15.0"
+                  placeholder="0.19.1"
                 />
               </FieldWrap>
             </Grid>
@@ -1358,6 +1402,14 @@ export function BenchmarkForm({
               />
             }
           >
+            <div className="mb-5">
+              <ToggleRow
+                label="Warm up each run"
+                hint="Adds vLLM --num-warmups (= each run's own concurrency) so every run fires one full warm-up wave at its exact shape before measuring. vLLM excludes these from the metrics — kills first-request cold start (cuBLAS/NCCL/torch.compile) without a separate row."
+                checked={form.warmup}
+                onChange={(v) => field("warmup", v)}
+              />
+            </div>
             {form.sweep_mode ? (
               <Grid>
                 <FieldWrap
@@ -1367,7 +1419,7 @@ export function BenchmarkForm({
                 >
                   <Input
                     className="font-mono"
-                    placeholder="128, 512, 1024, 2048"
+                    placeholder="128, 512, 2048, 4096, 8192, 16384"
                     value={form.input_lens_csv}
                     onChange={(e) => field("input_lens_csv", e.target.value)}
                   />
@@ -1380,7 +1432,7 @@ export function BenchmarkForm({
                 >
                   <Input
                     className="font-mono"
-                    placeholder="10, 25, 50, 200"
+                    placeholder="10, 50, 100"
                     value={form.concurrencies_csv}
                     onChange={(e) => field("concurrencies_csv", e.target.value)}
                   />
@@ -1461,12 +1513,28 @@ export function BenchmarkForm({
             )}
           </SectionCard>
 
-          {/* YAML preview — plain code block, not a terminal. Capped height so
-              long configs don't bleed under the sticky action bar. */}
-          <details className="group rounded-lg border border-border">
-            <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-4 py-3 text-sm font-medium hover:bg-muted/40 [&::-webkit-details-marker]:hidden">
+          {/* YAML preview — plain code block, not a terminal. Controlled
+              disclosure rather than a native <details>: when a <details> is
+              collapsed, recent Chrome builds still lay out its content and
+              reserve the capped-height <pre> at its full *intrinsic* height
+              (the whole rendered config, ignoring max-h/overflow). That leaked
+              ~a screenful of dead scroll space below the action bar on the Form
+              tab. Rendering the <pre> only when open removes the hidden-but-
+              sized element entirely. */}
+          <div className="rounded-lg border border-border">
+            <button
+              type="button"
+              onClick={() => setYamlPreviewOpen((v) => !v)}
+              aria-expanded={yamlPreviewOpen}
+              className="flex w-full cursor-pointer items-center justify-between gap-2 px-4 py-3 text-sm font-medium hover:bg-muted/40"
+            >
               <div className="flex items-center gap-2">
-                <ChevronRight className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-90" />
+                <ChevronRight
+                  className={cn(
+                    "h-4 w-4 text-muted-foreground transition-transform",
+                    yamlPreviewOpen && "rotate-90",
+                  )}
+                />
                 <FileCode2 className="h-4 w-4 text-muted-foreground" />
                 YAML preview
                 <Badge variant="secondary" className="text-[10px]">
@@ -1474,11 +1542,13 @@ export function BenchmarkForm({
                 </Badge>
               </div>
               <Info className="h-3.5 w-3.5 text-muted-foreground" />
-            </summary>
-            <pre className="overflow-x-auto rounded-b-lg border-t border-border bg-muted/40 px-4 py-3 font-mono text-xs leading-relaxed text-foreground">
-              {formYaml}
-            </pre>
-          </details>
+            </button>
+            {yamlPreviewOpen && (
+              <pre className="max-h-80 overflow-auto rounded-b-lg border-t border-border bg-muted/40 px-4 py-3 font-mono text-xs leading-relaxed text-foreground">
+                {formYaml}
+              </pre>
+            )}
+          </div>
         </TabsContent>
 
         <TabsContent value="yaml" className="mt-4 !flex-none">

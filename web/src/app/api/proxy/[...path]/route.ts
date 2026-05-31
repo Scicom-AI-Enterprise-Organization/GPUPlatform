@@ -14,6 +14,9 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
 export async function POST(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   return forward(req, ctx);
 }
+export async function PUT(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
+  return forward(req, ctx);
+}
 export async function DELETE(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   return forward(req, ctx);
 }
@@ -31,6 +34,9 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
   };
   const token = req.cookies.get(TOKEN_COOKIE)?.value;
   if (token) headers["Authorization"] = `Bearer ${token}`;
+  // Forward Range so media elements can request byte ranges (audio seeking).
+  const range = req.headers.get("range");
+  if (range) headers["Range"] = range;
 
   const init: RequestInit = { method: req.method, headers };
   if (req.method !== "GET" && req.method !== "HEAD") {
@@ -51,6 +57,23 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
           "X-Accel-Buffering": "no",
         },
       });
+    }
+    // Binary (audio/image/video/octet-stream/etc.): pipe the body through as-is.
+    // `res.text()` would UTF-8-decode and corrupt binary payloads — which is why
+    // proxied audio failed to play. Forward media-relevant headers too.
+    const isText =
+      ct.startsWith("text/") ||
+      ct.includes("application/json") ||
+      ct.includes("application/javascript") ||
+      ct.includes("+json") ||
+      ct.includes("application/xml");
+    if (!isText) {
+      const out = new Headers({ "Content-Type": ct });
+      for (const h of ["content-length", "accept-ranges", "content-range", "cache-control", "content-disposition"]) {
+        const v = res.headers.get(h);
+        if (v) out.set(h, v);
+      }
+      return new NextResponse(res.body, { status: res.status, headers: out });
     }
     const body = await res.text();
     return new NextResponse(body, {

@@ -30,7 +30,7 @@ export default async function NewBenchmarkPage({
   }
 
   return (
-    <>
+    <div className="flex h-full flex-col">
       <ConsoleTopbar
         crumbs={[
           { label: "Benchmark", href: "/benchmark" },
@@ -38,7 +38,14 @@ export default async function NewBenchmarkPage({
         ]}
         username={username}
       />
-      <div className="px-6 py-6 lg:px-10 lg:py-8">
+      {/* Inner scroller with symmetric vertical padding (mirrors
+          /serverless/new) so the action bar keeps bottom breathing room.
+          `relative` makes this the containing block for any out-of-flow
+          descendant — notably Radix <Switch>'s hidden form-bubble <input>
+          (position:absolute, no positioned ancestor of its own). Without it
+          that bubble anchors to <html> and escapes this scroller's clip,
+          stretching the document so it scrolls past the action bar. */}
+      <div className="relative flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         {noAccess ? (
           <NoAccessAlert />
         ) : (
@@ -49,6 +56,6 @@ export default async function NewBenchmarkPage({
           />
         )}
       </div>
-    </>
+    </div>
   );
 }

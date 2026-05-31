@@ -135,7 +135,8 @@ export function fmt(v: number | null, digits: number): string {
  * the aggregate doesn't exist yet (run still in flight). All fetches go through
  * the gateway content proxy (same-origin) — presigned S3 URLs are CORS-blocked.
  * Throws only if the file listing itself fails; individual bad files are
- * skipped. */
+ * skipped. (Warm-up requests use vLLM's native --num-warmups and never produce
+ * a result file, so there's nothing to filter here.) */
 export async function fetchBenchRows(benchId: string): Promise<Row[]> {
   try {
     const aggR = await fetch(gateway.benchmarkFileContentUrl(benchId, "result.json"));

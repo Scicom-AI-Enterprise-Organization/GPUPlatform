@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
-from sqlalchemy import JSON, Boolean, ForeignKey, String, DateTime, Integer, select, text
+from sqlalchemy import BigInteger, JSON, Boolean, ForeignKey, String, DateTime, Integer, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -198,6 +198,45 @@ class Provider(Base):
     )
 
 
+class GlobalEnv(Base):
+    """Org-wide environment variables / secrets, set by admins in the UI and
+    merged into every workload's environment (benchmark pods + serverless VM/
+    RunPod workers). A per-resource var of the same name overrides the global one.
+
+    `value_enc` is always Fernet-encrypted at rest. `is_secret` controls whether
+    the API ever returns the plaintext (secrets are masked; non-secrets are shown
+    so admins can read back e.g. a default region)."""
+    __tablename__ = "global_env"
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value_enc: Mapped[str] = mapped_column(String(8192), nullable=False)
+    is_secret: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    updated_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class TrackingCredential(Base):
+    """A named experiment-tracker credential (Weights & Biases / MLflow), shown
+    as a card on the Secrets page and selectable per Autotrain run. Org-wide +
+    admin-managed, like GlobalEnv. `config_enc` is Fernet-encrypted JSON whose
+    shape depends on `kind`:
+        wandb : {"api_key": str}
+        mlflow: {"uri": str, "username": str, "password": str}
+    The Autotrain runner decrypts the referenced credential and injects the
+    canonical env (WANDB_API_KEY / MLFLOW_TRACKING_URI/USERNAME/PASSWORD)."""
+    __tablename__ = "tracking_credentials"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # track-<hex8>
+    name: Mapped[str] = mapped_column(String(128))
+    kind: Mapped[str] = mapped_column(String(16), index=True)  # "wandb" | "mlflow"
+    config_enc: Mapped[str] = mapped_column(String(8192), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class Storage(Base):
     """A storage backend the platform writes to — where AutoTrain datasets,
     benchmark logs, serverless inference logs, etc. get persisted. NOT a single
@@ -226,6 +265,78 @@ class Storage(Base):
     config: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class Dataset(Base):
+    """An Autotrain dataset — a named pointer to a metadata file of
+    {audio, transcription} rows living in a `Storage` backend (S3) or on a
+    HuggingFace repo. Mirrors the Benchmark/Storage ownership model: owned by a
+    user, references a Storage by id.
+
+    `kind` discriminates the source:
+    - `upload` — a CSV/JSON/JSONL metadata file uploaded through the UI and
+      written to the dataset's S3 storage under `datasets/{id}/{filename}`.
+    - `s3`     — references a metadata file already living in S3 (`s3_metadata_uri`).
+    - `hf`     — references an existing HuggingFace dataset repo (`hf_repo`).
+
+    The audio referenced by each row resolves against the storage prefix +
+    `audio_prefix`. `audio_field`/`transcription_field` are the column names the
+    parser detected (defaults `audio`/`transcription`). `hf_*` track a push of
+    the metadata file to a HuggingFace repo.
+    """
+    __tablename__ = "datasets"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # ds-<hex8>
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    kind: Mapped[str] = mapped_column(String(16), default="upload", server_default="upload", nullable=False)
+    # Storage row (kind=s3 for upload/s3, kind=huggingface for hf). Plain string
+    # ref (not a hard FK) so deleting a storage doesn't cascade-delete datasets.
+    storage_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    audio_prefix: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    s3_metadata_uri: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    metadata_filename: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    format: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # csv|json|jsonl
+    num_rows: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    audio_field: Mapped[str] = mapped_column(String(128), default="audio", server_default="audio", nullable=False)
+    transcription_field: Mapped[str] = mapped_column(String(128), default="transcription", server_default="transcription", nullable=False)
+    # Per-split transcription column overrides for HF sources whose splits use
+    # different column names (e.g. {"train": "text", "test": "after"}). Empty/None
+    # → use `transcription_field` for every split. The audio column is assumed
+    # consistent across splits (`audio_field`).
+    split_fields: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # When this (zip-backed HF) dataset has been materialised to S3, the id of
+    # the resulting audio dataset. Lets the source page resolve + play audio by
+    # joining each row's audio basename against the materialised S3 audio.
+    audio_dataset_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    hf_repo: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    hf_revision: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    hf_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Audio-zip → audio-column transform job: "" (idle) | running | done | failed.
+    # `transform_log` holds a short tail of progress lines for the UI to poll.
+    transform_status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    transform_log: Mapped[Optional[str]] = mapped_column(String(8192), nullable=True)
+    # Labeling-platform source (kind=label): a live reference to a Label project.
+    # We store the base URL + project id and the Fernet-encrypted access token;
+    # preview/import fetch the project's export.v1.jsonl (audio_url + transcription)
+    # on demand with `Authorization: Bearer <lpat token>`.
+    label_base_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    label_project_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    label_token_enc: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    # Which review status to import from the project: approved | rejected |
+    # not_reviewed | all (the export endpoint's `status` filter). Default approved.
+    label_status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # Alternatively the lpat token can come from a named global secret instead of
+    # being stored per-dataset; resolved via load_global_env() at use time.
+    label_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
     )
 
 
@@ -277,10 +388,11 @@ def get_database_url() -> str:
 
 async def init_db() -> None:
     global _engine, _sessionmaker
-    # Import side-effect: registers Benchmark / BenchmarkJob / ComputePod
-    # tables on Base before create_all runs.
+    # Import side-effect: registers Benchmark / BenchmarkJob / ComputePod /
+    # TrainingRun tables on Base before create_all runs.
     from . import bench  # noqa: F401
     from . import compute  # noqa: F401
+    from . import training_api  # noqa: F401
     _engine = create_async_engine(get_database_url(), pool_pre_ping=True)
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     async with _engine.begin() as conn:
@@ -464,6 +576,37 @@ async def init_db() -> None:
         # it in place for any DB that created `storage` without it.
         await conn.execute(text(
             "ALTER TABLE storage ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        # Dataset audio-zip → audio-column transform job tracking.
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS transform_status VARCHAR(16)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS transform_log VARCHAR(8192)"
+        ))
+        # Per-split transcription column overrides (HF splits with differing schemas).
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS split_fields JSON"
+        ))
+        # Link a zip-backed source dataset to its materialised S3 audio dataset.
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS audio_dataset_id VARCHAR(64)"
+        ))
+        # Labeling-platform source (kind=label): base URL + project id + encrypted token.
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_base_url VARCHAR(512)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_project_id VARCHAR(128)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_token_enc VARCHAR(2048)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_status VARCHAR(16)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_token_secret VARCHAR(128)"
         ))
 
 

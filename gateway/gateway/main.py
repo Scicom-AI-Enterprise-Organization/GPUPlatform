@@ -42,6 +42,10 @@ from . import bench as bench_module
 from . import compute as compute_module
 from . import providers_api as providers_module
 from . import storage_api as storage_module
+from . import datasets_api as datasets_module
+from . import global_env_api as global_env_module
+from . import training_api as training_module
+from . import tracking_creds_api as tracking_creds_module
 
 logger = logging.getLogger("gateway")
 
@@ -413,6 +417,18 @@ async def lifespan(app: FastAPI):
                 "Check RunPod dashboard for any pod still billing.", orphaned,
             )
         logger.info("compute enabled")
+    # Autotrain: mark any training runs left 'running'/'queued' by a previous
+    # gateway process as failed (their pods, if any, dangle on RunPod). Runs even
+    # without the env bucket since runs can target a per-storage S3 backend.
+    try:
+        t_orphaned = await training_module.cleanup_orphaned_running(app.state.redis)
+        if t_orphaned:
+            logger.warning(
+                "autotrain: marked %d previously-running training run(s) as failed "
+                "(gateway restart). Check RunPod for any pods left billing.", t_orphaned,
+            )
+    except Exception:
+        logger.exception("autotrain: orphan cleanup failed")
     if os.environ.get("AUTOSCALER", "0") == "1":
         from .provider import build_provider
         from .autoscaler import autoscaler_loop
@@ -488,6 +504,10 @@ app.include_router(bench_module.router)
 app.include_router(compute_module.router)
 app.include_router(providers_module.router)
 app.include_router(storage_module.router)
+app.include_router(datasets_module.router)
+app.include_router(global_env_module.router)
+app.include_router(training_module.router)
+app.include_router(tracking_creds_module.router)
 
 
 @app.middleware("http")
@@ -1369,8 +1389,11 @@ async def create_app(
         elif visible_devices_norm:
             # Single-model VM GPU pin (multi sets it per model from gpu_indices).
             env["CUDA_VISIBLE_DEVICES"] = visible_devices_norm
-        if record.env_vars:
-            env["WORKER_ENV_JSON"] = json.dumps(record.env_vars)
+        # Global env/secrets + this app's env vars (app overrides global).
+        from .global_env_api import load_global_env
+        _worker_env = {**(await load_global_env(session)), **(record.env_vars or {})}
+        if _worker_env:
+            env["WORKER_ENV_JSON"] = json.dumps(_worker_env)
         try:
             result = await provider.provision(
                 app_id=req.name,

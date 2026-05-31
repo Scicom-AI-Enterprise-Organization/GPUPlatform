@@ -276,6 +276,16 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
             except (TypeError, ValueError):
                 pass
         n_to_add = desired - current
+        # Admin global env / secrets, merged into every worker's env (an app env
+        # var of the same name overrides). Loaded once per scale-up, not per tick.
+        global_env: dict[str, str] = {}
+        try:
+            from .db import session_factory
+            from .global_env_api import load_global_env
+            async with session_factory()() as _ges:
+                global_env = await load_global_env(_ges)
+        except Exception:
+            logger.exception("autoscaler: failed to load global env for app=%s", app_id)
         for _ in range(n_to_add):
             token = secrets.token_urlsafe(24)
             env: dict[str, str] = {"REGISTRATION_TOKEN": token}
@@ -294,9 +304,11 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
                 # Single-model VM GPU pin. Multi sets this per model from
                 # gpu_indices, so only apply the global var outside multi.
                 env["CUDA_VISIBLE_DEVICES"] = app.visible_devices.strip()
-            # User-supplied env applied to every vLLM process (cache/home dirs, …).
-            if getattr(app, "env_vars", None):
-                env["WORKER_ENV_JSON"] = json.dumps(app.env_vars)
+            # Global env/secrets + this app's env vars (app overrides global),
+            # applied to every vLLM process on the worker.
+            _worker_env = {**global_env, **(getattr(app, "env_vars", None) or {})}
+            if _worker_env:
+                env["WORKER_ENV_JSON"] = json.dumps(_worker_env)
             try:
                 result = await provider.provision(
                     app_id=app_id,

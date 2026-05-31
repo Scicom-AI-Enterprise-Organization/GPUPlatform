@@ -9,6 +9,7 @@ const SECTION_LABEL: Record<SectionKey, string> = {
   inference: "Inference",
   benchmark: "Benchmark",
   compute: "Compute",
+  datasets: "Datasets",
 };
 
 function fmtDate(iso: string) {

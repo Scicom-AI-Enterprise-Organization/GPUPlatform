@@ -104,6 +104,8 @@ const GROUPS: Group[] = [
   { id: "serverless", title: "Serverless endpoints", blurb: <>Create and manage autoscaling vLLM endpoints. Each endpoint scales to zero when idle.</> },
   { id: "inference", title: "Inference", blurb: <>Send requests to a deployed endpoint — OpenAI-compatible, or the native sync / streaming routes.</> },
   { id: "benchmarks", title: "Benchmarks", blurb: <>Run llm-benchmaq throughput/latency sweeps on a RunPod pod or a registered VM. Logs + results land in a storage backend.</> },
+  { id: "datasets", title: "Datasets", blurb: <>Audio + transcription datasets — backed by an uploaded metadata file, an S3 metadata file, or a HuggingFace repo. Browse rows, set the audio/transcription columns (per-split for HF repos with differing schemas), and transform a zip-of-audio repo into one with a real <code>audio</code> column (pushed to HF or materialised to S3).</> },
+  { id: "autotrain", title: "Autotrain", blurb: <>Fine-tune Whisper models on your datasets — SSH-orchestrated on a RunPod pod or a registered VM. Logs stream live; checkpoints + metrics land in a storage backend.</> },
   { id: "compute", title: "Compute pods", blurb: <>Raw RunPod pods with SSH + JupyterLab. Creation may require admin approval.</> },
   { id: "storage", title: "Storage", blurb: <>S3 / HuggingFace backends the platform writes to (dataset files, benchmark logs, inference logs). Writes are admin-only.</> },
   { id: "providers", title: "GPU providers", blurb: <>Registered VMs / RunPod / Prime Intellect accounts that endpoints, benchmarks, and compute can target. Writes are admin-only.</> },
@@ -567,6 +569,382 @@ vllm:gpu_cache_usage_perc{app_id="my-endpoint",model="…"} 0.41`,
     parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Benchmark id." }],
     request: { sample: `curl -s -X POST "$SGPU/benchmarks/bench-1a2b3c4d/terminate" -H "Authorization: Bearer $SGPU_API_KEY"` },
     responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "id": "bench-1a2b3c4d", "status": "cancelled" }` }],
+  },
+
+  // ───── Datasets ─────
+  {
+    id: "list-datasets",
+    group: "datasets",
+    method: "GET",
+    path: "/v1/datasets",
+    title: "List datasets",
+    description: <>Your datasets, newest first. <code>scope=all</code> (admin) returns everyone&apos;s.</>,
+    parameters: [{ name: "scope", in: "query", type: '"mine" | "all"', doc: "Default mine." }],
+    request: { sample: `curl -s "$SGPU/v1/datasets?scope=mine" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [
+      {
+        code: 200,
+        codeLabel: "OK",
+        sample: `[
+  {
+    "id": "ds-1a2b3c4d",
+    "name": "emgs-recording",
+    "kind": "hf",
+    "storage_id": "store-1a2b3c4d", "storage_name": "hf-token",
+    "hf_repo": "Scicom-intl/emgs-recording-2025-10-13",
+    "audio_field": "audio_filename", "transcription_field": "text",
+    "split_fields": {"train": "text", "test": "after"},
+    "audio_dataset_id": "ds-07b26489",
+    "num_rows": 3058,
+    "transform_status": "done",
+    "created_by": "admin", "created_at": "2026-05-29T03:21:08+00:00"
+  }
+]`,
+      },
+    ],
+  },
+  {
+    id: "create-dataset",
+    group: "datasets",
+    method: "POST",
+    path: "/v1/datasets",
+    title: "Create a dataset",
+    description: (
+      <>
+        <p>Registers a dataset pointer. <code>kind</code> selects the source: <code>upload</code> (then POST a metadata file to <code>/upload</code>), <code>s3</code> (point at an existing <code>s3_metadata_uri</code>), or <code>hf</code> (an existing HuggingFace repo).</p>
+        <p className="mt-2 text-xs text-muted-foreground"><code>storage_id</code> references a Storage row — <code>kind=s3</code> for upload/s3 datasets, <code>kind=huggingface</code> for hf (used to resolve the HF token).</p>
+      </>
+    ),
+    parameters: [
+      { name: "name", in: "body", type: "string", required: true, doc: "Dataset name." },
+      { name: "kind", in: "body", type: '"upload" | "s3" | "hf"', doc: "Source type. Default upload." },
+      { name: "storage_id", in: "body", type: "string", doc: "Storage row id (s3 backend, or hf token holder)." },
+      { name: "s3_metadata_uri", in: "body", type: "string", doc: "kind=s3: s3://bucket/key of the metadata file." },
+      { name: "hf_repo", in: "body", type: "string", doc: "kind=hf: owner/name of the source repo." },
+      { name: "audio_prefix", in: "body", type: "string", doc: "Optional key prefix audio paths resolve against." },
+      { name: "description", in: "body", type: "string", doc: "Optional." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/v1/datasets" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"name": "emgs-recording", "kind": "hf",
+       "hf_repo": "Scicom-intl/emgs-recording-2025-10-13",
+       "storage_id": "store-1a2b3c4d"}'`,
+    },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "id": "ds-1a2b3c4d", "name": "emgs-recording", "kind": "hf", "...": "DatasetRecord" }` },
+      { code: 400, codeLabel: "Bad Request", doc: "Missing/invalid field — e.g. hf_repo required for kind=hf, or storage_id (an S3 storage) required for upload/s3.", sample: `{ "detail": "hf_repo (owner/name) is required for kind=hf" }` },
+    ],
+  },
+  {
+    id: "get-dataset",
+    group: "datasets",
+    method: "GET",
+    path: "/v1/datasets/:id",
+    title: "Get a dataset",
+    description: <>Full record — source, column mapping, row count, and transform status.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Dataset id (ds-…)." }],
+    request: { sample: `curl -s "$SGPU/v1/datasets/ds-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "id": "ds-1a2b3c4d", "kind": "hf", "audio_field": "audio_filename", "transcription_field": "text", "...": "DatasetRecord" }` },
+      { code: 403, codeLabel: "Forbidden", doc: "Not yours (and you're not admin).", sample: `{ "detail": "forbidden" }` },
+    ],
+  },
+  {
+    id: "update-dataset",
+    group: "datasets",
+    method: "PATCH",
+    path: "/v1/datasets/:id",
+    title: "Update columns / metadata",
+    description: (
+      <>
+        <p>Patch the audio / transcription column mapping (and name, description, audio_prefix). For an HF source whose splits have different schemas, set <code>split_fields</code> to map each split&apos;s transcription column — pass <code>{`{}`}</code> to clear.</p>
+      </>
+    ),
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Dataset id." },
+      { name: "audio_field", in: "body", type: "string", doc: "Column holding the audio path/ref." },
+      { name: "transcription_field", in: "body", type: "string", doc: "Default/output transcription column." },
+      { name: "split_fields", in: "body", type: "object", doc: 'Per-split transcription columns, e.g. {"train":"text","test":"after"}.' },
+      { name: "name / description / audio_prefix", in: "body", type: "string", doc: "Optional metadata edits." },
+    ],
+    request: {
+      sample: `curl -s -X PATCH "$SGPU/v1/datasets/ds-1a2b3c4d" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"audio_field": "audio_filename", "transcription_field": "text",
+       "split_fields": {"train": "text", "test": "after"}}'`,
+    },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "ds-1a2b3c4d", "split_fields": {"train": "text", "test": "after"}, "...": "DatasetRecord" }` }],
+  },
+  {
+    id: "dataset-preview",
+    group: "datasets",
+    method: "GET",
+    path: "/v1/datasets/:id/preview",
+    title: "Browse rows (paginated)",
+    description: (
+      <>
+        <p>A page of rows with each audio reference resolved to a playable URL and the transcription resolved per the (per-split) column mapping. Returns the full <code>total</code> for pagination.</p>
+        <p className="mt-2 text-xs text-muted-foreground">For HF sources, <code>split</code> selects which split to read; <code>splits</code> lists the available ones. Audio URLs point at the gateway proxy (<code>/v1/datasets/:id/audio</code>) so they stream same-origin.</p>
+      </>
+    ),
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Dataset id." },
+      { name: "offset", in: "query", type: "integer", doc: "Row offset. Default 0." },
+      { name: "limit", in: "query", type: "integer", doc: "Rows per page (1–200). Default 20." },
+      { name: "split", in: "query", type: "string", doc: "HF only: which split to read. Default the first." },
+    ],
+    request: { sample: `curl -s "$SGPU/v1/datasets/ds-1a2b3c4d/preview?offset=0&limit=20&split=train" \\
+  -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [
+      {
+        code: 200,
+        codeLabel: "OK",
+        sample: `{
+  "audio_field": "audio_filename",
+  "transcription_field": "text",
+  "offset": 0, "limit": 20, "total": 3000,
+  "split": "train", "splits": ["test", "train"],
+  "rows": [
+    {
+      "audio_url": "/v1/datasets/ds-1a2b3c4d/audio?src=https%3A%2F%2F…",
+      "transcription": "welcome to the contact centre…",
+      "audio_filename": "clip-0001.mp3", "text": "welcome to the contact centre…"
+    }
+  ]
+}`,
+      },
+    ],
+  },
+  {
+    id: "dataset-splits",
+    group: "datasets",
+    method: "GET",
+    path: "/v1/datasets/:id/splits",
+    title: "List splits + columns (HF)",
+    description: <>Per-split column names for an HF source (read from each split&apos;s parquet footer), so you can map a transcription column per split. Empty for non-HF datasets.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Dataset id." }],
+    request: { sample: `curl -s "$SGPU/v1/datasets/ds-1a2b3c4d/splits" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [
+      {
+        code: 200,
+        codeLabel: "OK",
+        sample: `{
+  "splits": [
+    {"split": "test",  "columns": ["after", "audio_filename", "before", "metadata"], "num_rows": 58},
+    {"split": "train", "columns": ["audio_filename", "metadata", "text"], "num_rows": 3000}
+  ]
+}`,
+      },
+    ],
+  },
+  {
+    id: "transform-dataset",
+    group: "datasets",
+    method: "POST",
+    path: "/v1/datasets/:id/transform",
+    title: "Transform → audio-column dataset",
+    description: (
+      <>
+        <p>For an HF source that stores audio inside zip/tar archives (no playable <code>audio</code> column): unzips it, joins each metadata row&apos;s audio to its file (honouring the per-split mapping), and builds a <b>new</b> dataset with a real <code>audio</code> column — pushed to HuggingFace (<code>target=hf</code>) or materialised to S3 (<code>target=s3</code>). Non-destructive; runs as a background job (poll <code>GET /:id</code> for <code>transform_status</code> / <code>transform_log</code>).</p>
+      </>
+    ),
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Source dataset id (must be HF)." },
+      { name: "target", in: "body", type: '"hf" | "s3"', required: true, doc: "Output destination." },
+      { name: "hf_repo", in: "body", type: "string", doc: "target=hf: owner/name to push to." },
+      { name: "storage_id", in: "body", type: "string", doc: "target=s3: a kind=s3 storage." },
+      { name: "s3_folder", in: "body", type: "string", doc: "target=s3: folder within the storage prefix. Default datasets/{id}/transformed." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/v1/datasets/ds-1a2b3c4d/transform" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"target": "s3", "storage_id": "store-1a2b3c4d", "s3_folder": "datasets/emgs-audio"}'`,
+    },
+    responses: [
+      { code: 200, codeLabel: "OK", doc: "Job queued; the returned record's transform_status flips to running.", sample: `{ "id": "ds-1a2b3c4d", "transform_status": "running", "transform_log": "[03:04:25] transform queued (target=s3)", "...": "DatasetRecord" }` },
+      { code: 400, codeLabel: "Bad Request", doc: "Source has no HF repo, target invalid, or storage_id isn't a kind=s3 storage.", sample: `{ "detail": "transform needs a source HuggingFace repo (owner/name) on the dataset" }` },
+      { code: 409, codeLabel: "Conflict", doc: "A transform is already running for this dataset.", sample: `{ "detail": "a transform is already running for this dataset" }` },
+    ],
+  },
+  {
+    id: "delete-dataset",
+    group: "datasets",
+    method: "DELETE",
+    path: "/v1/datasets/:id",
+    title: "Delete a dataset",
+    description: <>Removes the dataset record. Files already written to storage (uploaded metadata, materialised audio) are not deleted.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Dataset id." }],
+    request: { sample: `curl -s -X DELETE "$SGPU/v1/datasets/ds-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "id": "ds-1a2b3c4d" }` }],
+  },
+
+  // ───── Autotrain ─────
+  {
+    id: "create-training-run",
+    group: "autotrain",
+    method: "POST",
+    path: "/v1/training-runs",
+    title: "Create a training run",
+    description: (
+      <>
+        <p>Queues a Whisper finetune against a dataset. The gateway SSHes to the target (a RunPod pod it spawns, or a registered VM via <code>provider_id</code>), runs the trainer, streams logs, and writes checkpoints + metrics under the run&apos;s storage prefix.</p>
+        <p className="mt-2 text-xs text-muted-foreground">All hyperparameters are optional — the trainer has sensible defaults. Experiment-tracking creds (W&amp;B / MLflow) come from the global Secrets page, not the body.</p>
+      </>
+    ),
+    parameters: [
+      { name: "name", in: "body", type: "string", required: true, doc: "Run label (also the W&B/MLflow run name)." },
+      { name: "dataset_id", in: "body", type: "string", required: true, doc: "Dataset to train on (must be yours, or admin)." },
+      { name: "base_model", in: "body", type: "string", required: true, doc: 'HF Whisper repo, e.g. "openai/whisper-small".' },
+      { name: "test_dataset_id", in: "body", type: "string", doc: "Held-out eval dataset. Omit to split from train (eval_split_pct)." },
+      { name: "eval_metric", in: "body", type: '"wer" | "cer"', doc: "Default wer." },
+      { name: "max_epochs / patience", in: "body", type: "number", doc: "Epoch cap; patience=0 disables early stop." },
+      { name: "batch_size / grad_accum / learning_rate / warmup_steps / weight_decay", in: "body", type: "number", doc: "Optimizer knobs. Defaults: 8 / 1 / 1e-5 / 0 / 0." },
+      { name: "precision", in: "body", type: '"fp16" | "bf16"', doc: "Default fp16." },
+      { name: "language / task", in: "body", type: "string", doc: 'e.g. "ms" / "transcribe".' },
+      { name: "provider_id", in: "body", type: "string", doc: "vm provider → bare metal; omit (or a runpod provider) → cloud pod." },
+      { name: "gpu_type / gpu_count / secure_cloud / disk_gb / volume_gb", in: "body", type: "mixed", doc: "Cloud-pod hardware. Defaults: L40S / 1 / true / 60 / 80." },
+      { name: "visible_devices", in: "body", type: "string", doc: 'VM-only GPU pin, e.g. "0,1".' },
+      { name: "storage_id", in: "body", type: "string", doc: "Enabled S3 backend for logs + artifacts. Omit for the gateway default." },
+      { name: "hf_push_repo", in: "body", type: "string", doc: "Push the finished model to this HF repo (uses storage / env HF_TOKEN)." },
+      { name: "report_to", in: "body", type: '("mlflow" | "wandb")[]', doc: "Experiment trackers to log to. Default none." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/v1/training-runs" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "whisper-ms-v1",
+    "dataset_id": "ds-1a2b3c4d",
+    "base_model": "openai/whisper-small",
+    "language": "ms", "max_epochs": 3, "precision": "bf16",
+    "gpu_type": "NVIDIA L40S", "gpu_count": 1,
+    "storage_id": "store-1a2b3c4d"
+  }'`,
+    },
+    responses: [
+      {
+        code: 200,
+        codeLabel: "OK",
+        sample: `{
+  "id": "train-1a2b3c4d",
+  "name": "whisper-ms-v1",
+  "status": "queued",
+  "dataset_id": "ds-1a2b3c4d",
+  "test_dataset_id": null,
+  "base_model": "openai/whisper-small",
+  "s3_prefix": "training-runs/train-1a2b3c4d/",
+  "config_json": { "eval_metric": "wer", "max_epochs": 3, "precision": "bf16", "...": "…" },
+  "exit_code": null, "error_text": null, "result_json": null,
+  "created_by": "admin",
+  "created_at": "2026-05-29T03:21:08+00:00",
+  "started_at": null, "ended_at": null,
+  "provider_id": null, "storage_id": "store-1a2b3c4d",
+  "gpu_type": "NVIDIA L40S", "gpu_count": 1, "visible_devices": null
+}`,
+      },
+      { code: 400, codeLabel: "Bad Request", doc: "Unknown dataset_id / test_dataset_id / provider_id, or storage_id isn't an enabled S3 backend.", sample: `{ "detail": "unknown dataset_id" }` },
+    ],
+  },
+  {
+    id: "list-training-runs",
+    group: "autotrain",
+    method: "GET",
+    path: "/v1/training-runs",
+    title: "List training runs",
+    description: <>Your runs, newest first. <code>scope=all</code> (admin) returns everyone&apos;s.</>,
+    parameters: [{ name: "scope", in: "query", type: '"mine" | "all"', doc: "Default mine." }],
+    request: { sample: `curl -s "$SGPU/v1/training-runs?scope=mine" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `[ { "id": "train-1a2b3c4d", "name": "whisper-ms-v1", "status": "done", "exit_code": 0, "result_json": { "wer": 0.142 }, "...": "TrainingRunRecord" } ]` }],
+  },
+  {
+    id: "get-training-run",
+    group: "autotrain",
+    method: "GET",
+    path: "/v1/training-runs/:id",
+    title: "Get a training run",
+    description: <>Full record for one run — status, hyperparameters (<code>config_json</code>), and final metrics (<code>result_json</code>) once it finishes.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Run id (train-…)." }],
+    request: { sample: `curl -s "$SGPU/v1/training-runs/train-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "id": "train-1a2b3c4d", "status": "running", "...": "TrainingRunRecord" }` },
+      { code: 403, codeLabel: "Forbidden", doc: "The run isn't yours (and you're not admin).", sample: `{ "detail": "not yours" }` },
+    ],
+  },
+  {
+    id: "training-logs",
+    group: "autotrain",
+    method: "GET",
+    path: "/v1/training-runs/:id/logs",
+    title: "Fetch logs (tail)",
+    description: <>Last <code>tail</code> log lines plus the live <code>status</code> and any <code>error_text</code>. Falls back to the on-disk log if Redis has rotated.</>,
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Run id." },
+      { name: "tail", in: "query", type: "number", doc: "Lines from the end. Default 400." },
+    ],
+    request: { sample: `curl -s "$SGPU/v1/training-runs/train-1a2b3c4d/logs?tail=200" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{
+  "status": "running",
+  "error_text": null,
+  "lines": [
+    "[gateway] starting autotrain run train-1a2b3c4d",
+    "epoch 1/3 | step 50 | loss 0.81",
+    "eval | wer 0.182"
+  ]
+}` }],
+  },
+  {
+    id: "training-logs-stream",
+    group: "autotrain",
+    method: "GET",
+    path: "/v1/training-runs/:id/logs/stream",
+    title: "Stream logs (SSE)",
+    description: <>Server-sent-events tail of the run&apos;s log. Emits each new line as <code>data:</code> and closes with an <code>end</code> event when the run reaches a terminal state.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Run id." }],
+    request: { sample: `curl -N "$SGPU/v1/training-runs/train-1a2b3c4d/logs/stream" \\
+  -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK · text/event-stream", sample: `data: epoch 1/3 | step 50 | loss 0.81
+data: eval | wer 0.182
+event: end
+data: end` }],
+  },
+  {
+    id: "training-files",
+    group: "autotrain",
+    method: "GET",
+    path: "/v1/training-runs/:id/files",
+    title: "List artifacts",
+    description: <>Every file under the run&apos;s storage prefix (checkpoints, metrics, the merged model) with a presigned download URL.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Run id." }],
+    request: { sample: `curl -s "$SGPU/v1/training-runs/train-1a2b3c4d/files" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `[
+  { "name": "metrics.json", "size": 412, "modified": "2026-05-29T04:48:31+00:00", "download_url": "https://…" },
+  { "name": "model/model.safetensors", "size": 967482112, "modified": "2026-05-29T04:50:02+00:00", "download_url": "https://…" }
+]` }],
+  },
+  {
+    id: "terminate-training-run",
+    group: "autotrain",
+    method: "POST",
+    path: "/v1/training-runs/:id/terminate",
+    title: "Terminate a running run",
+    description: <>Cancels the run, kills the trainer, and tears down the RunPod pod (cloud runs). No-op-safe only while active.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Run id." }],
+    request: { sample: `curl -s -X POST "$SGPU/v1/training-runs/train-1a2b3c4d/terminate" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "id": "train-1a2b3c4d", "status": "cancelled", "...": "TrainingRunRecord" }` },
+      { code: 409, codeLabel: "Conflict", doc: "The run already finished (done / failed / cancelled).", sample: `{ "detail": "already done" }` },
+    ],
+  },
+  {
+    id: "delete-training-run",
+    group: "autotrain",
+    method: "DELETE",
+    path: "/v1/training-runs/:id",
+    title: "Delete a training run",
+    description: <>Cancels it if still running (tearing down the pod), then removes the record. Artifacts already written to storage are not deleted.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Run id." }],
+    request: { sample: `curl -s -X DELETE "$SGPU/v1/training-runs/train-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "id": "train-1a2b3c4d" }` }],
   },
 
   // ───── Compute pods ─────

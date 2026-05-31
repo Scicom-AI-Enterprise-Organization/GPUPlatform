@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, KeyRound, Lock, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
+import { BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, KeyRound, Library, Lock, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -13,16 +13,17 @@ type Item = {
   icon: React.ElementType;
   locked?: boolean;
   // If set, only render when sections[section] is true.
-  section?: "inference" | "benchmark" | "compute";
+  section?: "inference" | "benchmark" | "compute" | "datasets";
 };
 
 const RESOURCES: Item[] = [
   { label: "Serverless Inference", href: "/serverless", icon: Boxes, section: "inference" },
   { label: "Benchmark", href: "/benchmark", icon: FlaskConical, section: "benchmark" },
+  { label: "Storage", href: "/storage", icon: Database },
+  { label: "Datasets", href: "/datasets", icon: Library, section: "datasets" },
+  { label: "Autotrain", href: "/autotrain", icon: Sparkles },
   { label: "Compute", href: "/compute", icon: Box, section: "compute" },
   { label: "GPU Providers", href: "/providers", icon: Cloud },
-  { label: "Storage", href: "/storage", icon: Database },
-  { label: "Autotrain", href: "#", icon: Sparkles, locked: true },
 ];
 const ACCOUNT: Item[] = [
   { label: "API tokens", href: "/api-keys", icon: KeyRound },
@@ -32,6 +33,7 @@ const ACCOUNT: Item[] = [
 const ADMIN: Item[] = [
   { label: "Organization", href: "/organization", icon: Users },
   { label: "Roles", href: "/admin/roles", icon: Shield },
+  { label: "Secrets", href: "/admin/secrets", icon: Lock },
   { label: "Audit log", href: "/admin/audit", icon: ScrollText },
 ];
 const MANAGE: Item[] = [
@@ -39,12 +41,12 @@ const MANAGE: Item[] = [
   { label: "Provisioned", href: "/admin/provisioned", icon: Server },
 ];
 
-type Sections = { inference: boolean; benchmark: boolean; compute: boolean };
+type Sections = { inference: boolean; benchmark: boolean; compute: boolean; datasets: boolean };
 type Counts = { pendingApprovals: number; provisioned: number };
 
 export function ConsoleSidebar({
   isAdmin = false,
-  sections = { inference: true, benchmark: true, compute: true },
+  sections = { inference: true, benchmark: true, compute: true, datasets: true },
   counts = { pendingApprovals: 0, provisioned: 0 },
 }: {
   isAdmin?: boolean;
@@ -76,6 +78,12 @@ export function ConsoleSidebar({
     }
     if (href === "/storage") {
       return pathname === "/storage" || pathname.startsWith("/storage/");
+    }
+    if (href === "/datasets") {
+      return pathname === "/datasets" || pathname.startsWith("/datasets/");
+    }
+    if (href === "/autotrain") {
+      return pathname === "/autotrain" || pathname.startsWith("/autotrain/");
     }
     return pathname === href;
   };

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -38,12 +38,31 @@ export function StorageForm() {
   const [accessKeyId, setAccessKeyId] = useState("");
   const [secretAccessKey, setSecretAccessKey] = useState("");
 
-  // huggingface
+  // huggingface — token comes from a global secret (default) or a pasted token.
+  const [hfSource, setHfSource] = useState<"secret" | "paste">("secret");
   const [hfToken, setHfToken] = useState("");
+  const [hfTokenSecret, setHfTokenSecret] = useState("");
+  const [secretKeys, setSecretKeys] = useState<string[]>([]);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [test, setTest] = useState<TestState>({ status: "idle" });
+
+  // Global secrets (admin Secrets) the HF token can reference — keys only.
+  useEffect(() => {
+    let cancel = false;
+    fetch("/api/proxy/v1/global-env", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: { key: string }[]) => {
+        if (!cancel && Array.isArray(rows)) setSecretKeys(rows.map((r) => r.key));
+      })
+      .catch(() => {
+        /* admins only; non-admins just won't see the picker */
+      });
+    return () => {
+      cancel = true;
+    };
+  }, []);
 
   // Editing a tested field invalidates a prior pass, so Create re-disables
   // until the user re-tests. No-op when already idle to avoid render churn.
@@ -82,7 +101,9 @@ export function StorageForm() {
               access_key_id: accessKeyId.trim() || null,
               secret_access_key: secretAccessKey.trim() || null,
             }
-          : { kind, hf_token: hfToken.trim() || null },
+          : hfSource === "secret"
+            ? { kind, hf_token_secret: hfTokenSecret || null }
+            : { kind, hf_token: hfToken.trim() || null },
       );
       setTest(r.ok ? { status: "ok", message: r.message } : { status: "fail", message: r.message });
     } catch (e) {
@@ -113,9 +134,9 @@ export function StorageForm() {
               access_key_id: accessKeyId.trim() || null,
               secret_access_key: secretAccessKey.trim() || null,
             }
-          : {
-              hf_token: hfToken.trim() || null,
-            }),
+          : hfSource === "secret"
+            ? { hf_token_secret: hfTokenSecret || null }
+            : { hf_token: hfToken.trim() || null }),
       });
       router.push("/storage");
       router.refresh();
@@ -274,32 +295,88 @@ export function StorageForm() {
         <section className="rounded-lg border border-border bg-card p-5">
           <div className="mb-1 text-sm font-medium">HuggingFace API token</div>
           <p className="mb-3 text-xs text-muted-foreground">
-            Optional — leave blank to fall back to{" "}
-            <span className="font-mono">HF_TOKEN</span> on the gateway. Stored
-            encrypted at rest with Fernet. Generate one at{" "}
-            <a
-              href="https://huggingface.co/settings/tokens"
-              target="_blank"
-              rel="noreferrer"
-              className="underline"
-            >
-              huggingface.co/settings/tokens
-            </a>
-            .
+            Use a global secret (managed once under{" "}
+            <a href="/admin/secrets" className="underline">Secrets</a>, shared, rotate without touching this storage)
+            or paste a token (stored encrypted here). Leave blank to fall back to{" "}
+            <span className="font-mono">HF_TOKEN</span> on the gateway.
           </p>
-          <Label htmlFor="hf-token">Token</Label>
-          <Input
-            id="hf-token"
-            type="password"
-            autoComplete="off"
-            value={hfToken}
-            onChange={(e) => {
-              setHfToken(e.target.value);
-              invalidateTest();
-            }}
-            placeholder="hf_..."
-            className="mt-1.5 font-mono text-xs"
-          />
+
+          <div className="mb-3 inline-flex rounded-md border border-border p-0.5 text-xs">
+            {(["secret", "paste"] as const).map((src) => (
+              <button
+                key={src}
+                type="button"
+                onClick={() => {
+                  setHfSource(src);
+                  invalidateTest();
+                }}
+                className={
+                  "rounded px-2.5 py-1 transition-colors " +
+                  (hfSource === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                }
+              >
+                {src === "secret" ? "Global secret" : "Paste a token"}
+              </button>
+            ))}
+          </div>
+
+          {hfSource === "secret" ? (
+            secretKeys.length > 0 ? (
+              <>
+                <Label htmlFor="hf-secret">Global secret</Label>
+                <Select
+                  value={hfTokenSecret}
+                  onValueChange={(v) => {
+                    setHfTokenSecret(v);
+                    invalidateTest();
+                  }}
+                >
+                  <SelectTrigger id="hf-secret" className="mt-1.5">
+                    <SelectValue placeholder="Select a secret (e.g. HF_TOKEN)" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {secretKeys.map((k) => (
+                      <SelectItem key={k} value={k} className="font-mono text-xs">
+                        {k}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  Resolved from Secrets at use-time — rotate it there and this storage picks it up automatically.
+                </p>
+              </>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                No global secrets yet. Add one under{" "}
+                <a href="/admin/secrets" className="underline">Secrets</a> (e.g. <span className="font-mono">HF_TOKEN</span>),
+                then pick it here — or switch to <span className="font-medium">Paste a token</span>.
+              </p>
+            )
+          ) : (
+            <>
+              <Label htmlFor="hf-token">Token</Label>
+              <Input
+                id="hf-token"
+                type="password"
+                autoComplete="off"
+                value={hfToken}
+                onChange={(e) => {
+                  setHfToken(e.target.value);
+                  invalidateTest();
+                }}
+                placeholder="hf_..."
+                className="mt-1.5 font-mono text-xs"
+              />
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                Stored encrypted at rest with Fernet. Generate one at{" "}
+                <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noreferrer" className="underline">
+                  huggingface.co/settings/tokens
+                </a>
+                .
+              </p>
+            </>
+          )}
         </section>
       )}
 
@@ -315,14 +392,14 @@ export function StorageForm() {
       </section>
 
       <div className="flex items-center gap-3">
-        {test.status === "ok" && (
-          <span className="text-sm text-emerald-600 dark:text-emerald-400">✓ {test.message}</span>
-        )}
-        {test.status === "fail" && (
-          <span className="text-sm text-destructive">✕ {test.message}</span>
-        )}
         {error && <span className="text-sm text-destructive">{error}</span>}
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-3">
+          {test.status === "ok" && (
+            <span className="text-sm text-emerald-600 dark:text-emerald-400">✓ {test.message}</span>
+          )}
+          {test.status === "fail" && (
+            <span className="text-right text-sm text-destructive">✕ {test.message}</span>
+          )}
           <Button
             type="button"
             variant="outline"

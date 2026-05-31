@@ -27,6 +27,7 @@ const SECTION_LABEL: Record<SectionKey, string> = {
   inference: "Inference",
   benchmark: "Benchmark",
   compute: "Compute",
+  datasets: "Datasets",
 };
 
 const NO_ROLE = "__none__";

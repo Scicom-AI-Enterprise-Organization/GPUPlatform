@@ -361,9 +361,16 @@ def install() -> None:
                 # hf download to abort on these VMs; plain HTTP is slower but
                 # reliable.
                 "export HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0\n"
+                # User env (HOME, caches, CUDA_VISIBLE_DEVICES) MUST be exported
+                # before the PATH/activate lines below. With a HOME override the
+                # `~`/`$HOME` in `uv venv ~/.bench-venv` (install step) expand to
+                # the overridden home, so the venv lives there; if we activate
+                # before re-exporting HOME here, `~`/`$HOME` fall back to the SSH
+                # user's default home (/root) and miss that venv — the install and
+                # benchmark steps must resolve the venv path identically.
+                + env_prefix +
                 'export PATH="$HOME/.local/bin:$PATH"\n'
                 f"source {venv_path}/bin/activate\n"
-                + env_prefix +
                 f"benchmaq bench {remote_config_path}\n"
             )
             print()

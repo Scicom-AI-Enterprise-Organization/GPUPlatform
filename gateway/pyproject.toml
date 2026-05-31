@@ -22,6 +22,11 @@ dependencies = [
     "pyyaml>=6.0",
     "cryptography>=42",
     "paramiko>=3.4",
+    # Dataset audio-zip → audio-column transform job: download/unzip a HF repo,
+    # build a datasets.Dataset with an Audio() feature, push to HF / upload to S3.
+    "huggingface_hub>=0.24",
+    "datasets>=2.20",
+    "soundfile>=0.12",
     # llm-benchmaq is the CLI we shell out to for benchmark runs. Public repo;
     # pulls in paramiko/scp/etc.
     "benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@75d1353",
@@ -33,3 +38,8 @@ gateway = "gateway.main:run"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gateway*"]
+
+[tool.pytest.ini_options]
+# Async tests run without a per-test marker; async fixtures are auto-detected.
+asyncio_mode = "auto"
+testpaths = ["tests"]

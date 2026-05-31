@@ -279,9 +279,23 @@ def _ssh_key_path() -> str:
     return os.path.expanduser(p)
 
 
-def _merge_run_env(env_vars: Optional[dict], visible_devices: Optional[str]) -> dict:
-    """User env + CUDA_VISIBLE_DEVICES pin into one dict for the run."""
-    env = {str(k): str(v) for k, v in (env_vars or {}).items()}
+def _merge_run_env(
+    env_vars: Optional[dict],
+    visible_devices: Optional[str],
+    global_env: Optional[dict] = None,
+) -> dict:
+    """Build the run env. Precedence (low → high): legacy gateway HF_TOKEN env <
+    admin global env/secrets < per-benchmark env vars. benchmaq forwards this into
+    the pod (runpod.env) / VM remote env, where `hf download` reads HF_TOKEN — so
+    gated models work without pasting a token per benchmark."""
+    env: dict[str, str] = {}
+    gw_tok = os.environ.get("HF_TOKEN", "").strip()  # legacy; superseded by the global-env UI
+    if gw_tok:
+        env["HF_TOKEN"] = gw_tok
+    for k, v in (global_env or {}).items():
+        env[str(k)] = str(v)
+    for k, v in (env_vars or {}).items():
+        env[str(k)] = str(v)
     vd = (visible_devices or "").strip()
     if vd:
         env["CUDA_VISIBLE_DEVICES"] = vd
@@ -294,6 +308,8 @@ def _resolve_config(
     env_vars: Optional[dict] = None,
     visible_devices: Optional[str] = None,
     runpod_key_path: Optional[str] = None,
+    bench_id: Optional[str] = None,
+    global_env: Optional[dict] = None,
 ) -> str:
     """Inject runtime values (SSH key path, RunPod API key) into the user's YAML.
 
@@ -310,7 +326,7 @@ def _resolve_config(
     if not isinstance(cfg, dict):
         return raw_yaml
 
-    run_env = _merge_run_env(env_vars, visible_devices)
+    run_env = _merge_run_env(env_vars, visible_devices, global_env)
 
     if vm_target is None:
         # Prefer the per-run ephemeral key (minted in run_benchmark); fall back to
@@ -383,10 +399,21 @@ def _resolve_config(
                     if ld.startswith("/workspace/"):
                         model["local_dir"] = "~/" + ld[len("/workspace/"):]
                 results = item.get("results")
-                if isinstance(results, dict):
-                    rd = str(results.get("result_dir") or "")
-                    if rd.startswith("/workspace/"):
-                        results["result_dir"] = "~/" + rd[len("/workspace/"):]
+                if not isinstance(results, dict):
+                    results = {}
+                    item["results"] = results
+                rd = str(results.get("result_dir") or "")
+                if rd.startswith("/workspace/"):
+                    results["result_dir"] = "~/" + rd[len("/workspace/"):]
+                # Isolate this run's output in a per-bench dir. benchmaq's default
+                # is the *relative* `./benchmark_results`, which on a shared VM
+                # resolves under the SSH user's home alongside every prior run's
+                # files — `_download_results` then `ls`es them all back, polluting
+                # the aggregate and (since the gateway keeps the first .json it
+                # finds) storing some unrelated run's metrics on this row. Only
+                # inject when the user didn't pin a dir themselves.
+                if bench_id and not results.get("result_dir"):
+                    results["result_dir"] = f"/tmp/sgpu-bench-results/{bench_id}"
 
     return yaml.safe_dump(cfg, sort_keys=False)
 
@@ -721,6 +748,56 @@ async def _drain(stream: asyncio.StreamReader, prefix: str, redis, bench_id: str
                 asyncio.create_task(_capture_runpod_cost(bench_id, m.group(1), provider_id=provider_id))
 
 
+# Recognised model-download (hf) failure signatures → a clean one-liner. When a
+# benchmaq run dies at the download step it prints a generic "Model download
+# failed with exit code N" and then the pod-cleanup epilogue, which buries the
+# real `hf` error — so we dig it out of the log and name the likely cause.
+_DL_FAILURE_SIGNATURES: list[tuple[str, str]] = [
+    (r"gated repo|GatedRepo|awaiting a review of your request|access to model.*restricted|must agree|accept the conditions",
+     "the model is gated — accept access on HuggingFace and pass a token that can see it"),
+    (r"401 Client Error|Invalid (user )?token|Unauthorized|authentication.*fail",
+     "HuggingFace auth failed (401) — set a valid HF token with access to this repo"),
+    (r"404 Client Error|RepositoryNotFound|Repository Not Found|does not (exist|appear)|could not be found",
+     "the repo wasn't found (404) — check the model id (and that the token can see it)"),
+    (r"hf_transfer",
+     "hf_transfer is enabled (HF_HUB_ENABLE_HF_TRANSFER=1) but not installed in the pod"),
+    (r"No space left on device|Disk quota exceeded|\[Errno 28\]",
+     "the pod ran out of disk while downloading — use a larger container/volume disk"),
+    (r"Connection (error|reset|timed out)|Max retries exceeded|Temporary failure in name resolution|Read timed out|Failed to establish a new connection",
+     "a network error reaching HuggingFace (transient) — retry"),
+]
+
+
+def _download_failure_reason(text: str) -> Optional[str]:
+    """If a run failed at the model-download step, return a clean one-line reason
+    (a recognised hf error, or the tail of the hf output) instead of the generic
+    'exit code N' + pod-cleanup noise. None when it wasn't a download failure."""
+    if "Model download failed" not in text and "DOWNLOADING MODEL" not in text:
+        return None
+    m = re.search(r"DOWNLOADING MODEL:\s*(\S+)", text)
+    head = f"Model download failed{f' for {m.group(1)}' if m else ''}"
+    for rx, msg in _DL_FAILURE_SIGNATURES:
+        if re.search(rx, text, re.IGNORECASE):
+            return f"{head}: {msg}."
+    # Unrecognised — surface the hf output between the download banner and the
+    # failure line (the real error), dropping progress bars + boilerplate.
+    di, fi = text.rfind("DOWNLOADING MODEL"), text.find("Model download failed")
+    seg = text[di:fi] if (di >= 0 and fi > di) else text
+    lines = [
+        ln.strip() for ln in seg.splitlines()
+        if ln.strip()
+        and not re.search(r"\d+%\|", ln)          # tqdm progress bars
+        and "DOWNLOADING MODEL" not in ln
+        and "Model download failed" not in ln     # the generic line we're replacing
+        and not re.match(r"(?i)^(error|warning):?\s*$", ln.strip())
+        and not ln.startswith(("Running:", "Destination:", "="))
+    ]
+    tail = "\n".join(lines[-12:]).strip()
+    return f"{head}:\n{tail}" if tail else (
+        f"{head} — hf produced no error output (often a bad model id, or a missing/wrong HF token)."
+    )
+
+
 async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     """End-to-end runner for one benchmark. Owns the subprocess from spawn → S3 sync."""
     work = _work_dir(bench_id)
@@ -739,6 +816,10 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         cleanup_model = bool(getattr(b, "cleanup_model", True))
         run_env_vars = getattr(b, "env_vars", None) or None
         run_visible_devices = getattr(b, "visible_devices", None) or None
+        # Admin global env / secrets (e.g. HF_TOKEN) merged into the run; a
+        # per-benchmark env var of the same name overrides it.
+        from .global_env_api import load_global_env
+        global_env = await load_global_env(s)
         await s.commit()
 
     # Disambiguate provider kind. A runpod-kind provider_id picks WHICH
@@ -835,7 +916,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     cfg_path.write_text(_resolve_config(
         raw_yaml, vm_target=vm_target,
         env_vars=run_env_vars, visible_devices=run_visible_devices,
-        runpod_key_path=runpod_key_path,
+        runpod_key_path=runpod_key_path, bench_id=bench_id, global_env=global_env,
     ))
 
     if vm_target:
@@ -947,7 +1028,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     prefix = s3_prefix
     s3_put_text(
         f"{prefix}config.yaml",
-        _resolve_config(raw_yaml, vm_target=vm_target, env_vars=run_env_vars, visible_devices=run_visible_devices, runpod_key_path=runpod_key_path),
+        _resolve_config(raw_yaml, vm_target=vm_target, env_vars=run_env_vars, visible_devices=run_visible_devices, runpod_key_path=runpod_key_path, bench_id=bench_id, global_env=global_env),
         target=target,
     )
     result_json: Optional[dict] = None
@@ -1027,8 +1108,8 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         try:
             if full_log.exists():
                 with full_log.open("r", encoding="utf-8", errors="replace") as f:
-                    tail_lines = f.readlines()[-50:]
-                error_excerpt = "".join(tail_lines)[-4000:]
+                    all_lines = f.readlines()
+                error_excerpt = "".join(all_lines[-50:])[-4000:]
                 # Surface a clean one-liner for known failure patterns so the
                 # list page doesn't show a raw log wall.
                 _cuda_m = re.search(
@@ -1036,6 +1117,13 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 )
                 if _cuda_m:
                     error_excerpt = _cuda_m.group(0).strip()
+                else:
+                    # Model-download failures: the real hf error sits ABOVE the
+                    # pod-cleanup epilogue, so the last-50-lines tail misses it.
+                    # Scan a wider window and lead with the actual cause.
+                    _dl = _download_failure_reason("".join(all_lines[-2000:]))
+                    if _dl:
+                        error_excerpt = (_dl + "\n\n— log tail —\n" + (error_excerpt or ""))[:4000]
         except Exception:
             error_excerpt = None
         if all_requests_failed:

@@ -44,6 +44,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     inference: true,
     benchmark: true,
     compute: true,
+    datasets: true,
   };
 
   let counts = { pendingApprovals: 0, provisioned: 0 };

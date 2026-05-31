@@ -63,6 +63,9 @@ class CreateStorageRequest(BaseModel):
     secret_access_key: Optional[str] = None
     # huggingface credentials — blank → fall back to HF_TOKEN env var
     hf_token: Optional[str] = None
+    # Reference a global secret (admin Secrets) by key instead of pasting a token;
+    # resolved at use-time. Takes precedence over `hf_token` when set.
+    hf_token_secret: Optional[str] = None
     notes: Optional[str] = None
     enabled: bool = True
 
@@ -78,6 +81,7 @@ class UpdateStorageRequest(BaseModel):
     access_key_id: Optional[str] = None
     secret_access_key: Optional[str] = None
     hf_token: Optional[str] = None
+    hf_token_secret: Optional[str] = None
     notes: Optional[str] = None
     enabled: Optional[bool] = None
 
@@ -93,6 +97,7 @@ class TestStorageRequest(BaseModel):
     access_key_id: Optional[str] = None
     secret_access_key: Optional[str] = None
     hf_token: Optional[str] = None
+    hf_token_secret: Optional[str] = None
 
 
 class TestStorageResponse(BaseModel):
@@ -110,6 +115,8 @@ class StorageRecord(BaseModel):
     region: Optional[str] = None
     endpoint: Optional[str] = None
     has_credentials: bool = False
+    # For huggingface: the global-secret key its token is resolved from (if any).
+    hf_token_secret: Optional[str] = None
     enabled: bool = True
     notes: Optional[str] = None
     created_at: str
@@ -129,7 +136,8 @@ def _to_record(s: Storage, owner_username: str) -> StorageRecord:
         prefix=cfg.get("prefix"),
         region=cfg.get("region"),
         endpoint=cfg.get("endpoint"),
-        has_credentials=bool(cfg.get("credentials_enc")),
+        has_credentials=bool(cfg.get("credentials_enc")) or bool(cfg.get("hf_token_secret")),
+        hf_token_secret=cfg.get("hf_token_secret"),
         enabled=bool(s.enabled),
         notes=s.description,
         created_at=s.created_at.isoformat() if s.created_at else "",
@@ -269,6 +277,7 @@ async def list_storage(
 async def test_storage(
     req: TestStorageRequest,
     user: User = Depends(require_admin),  # noqa: ARG001 — admin-only create flow
+    session: AsyncSession = Depends(get_session),
 ):
     if req.kind not in SUPPORTED_KINDS:
         raise HTTPException(status_code=400, detail=f"unsupported kind: {req.kind}")
@@ -289,7 +298,15 @@ async def test_storage(
         except Exception as e:  # botocore ClientError / endpoint / network
             return TestStorageResponse(ok=False, message=_s3_error_message(e))
         return TestStorageResponse(ok=True, message=f"reached bucket {bucket}")
-    ok, msg = await _test_hf(req.hf_token)
+    # huggingface — resolve a global-secret reference to its value before testing.
+    token = req.hf_token
+    ref = (req.hf_token_secret or "").strip()
+    if ref:
+        from .global_env_api import load_global_env
+        token = (await load_global_env(session)).get(ref)
+        if not token:
+            return TestStorageResponse(ok=False, message=f"global secret '{ref}' is not set")
+    ok, msg = await _test_hf(token)
     return TestStorageResponse(ok=ok, message=msg)
 
 
@@ -323,9 +340,13 @@ async def create_storage(
             config["credentials_enc"] = enc
     else:  # huggingface
         config = {}
-        enc = _encrypt_hf_token(req.hf_token)
-        if enc:
-            config["credentials_enc"] = enc
+        ref = (req.hf_token_secret or "").strip()
+        if ref:
+            config["hf_token_secret"] = ref  # resolve from global secrets at use-time
+        else:
+            enc = _encrypt_hf_token(req.hf_token)
+            if enc:
+                config["credentials_enc"] = enc
 
     sid = f"store-{secrets.token_hex(4)}"
     row = Storage(
@@ -393,9 +414,19 @@ async def update_storage(
         if enc:  # only replace when new creds supplied; omit keeps existing
             cfg["credentials_enc"] = enc
     else:  # huggingface
+        # Switching to a global-secret reference clears any stored token, and
+        # vice-versa. Omitting both keeps whatever's there.
+        if req.hf_token_secret is not None:
+            ref = req.hf_token_secret.strip()
+            if ref:
+                cfg["hf_token_secret"] = ref
+                cfg.pop("credentials_enc", None)
+            else:
+                cfg.pop("hf_token_secret", None)
         enc = _encrypt_hf_token(req.hf_token)
         if enc:
             cfg["credentials_enc"] = enc
+            cfg.pop("hf_token_secret", None)
 
     row.config = cfg
     flag_modified(row, "config")
