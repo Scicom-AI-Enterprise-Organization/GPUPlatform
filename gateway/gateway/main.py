@@ -323,6 +323,7 @@ class AuditLogRecord(BaseModel):
     id: int
     actor_id: Optional[int] = None
     actor_username: str
+    actor_email: Optional[str] = None  # current email of the actor (if still a user)
     action: str
     resource_type: str
     resource_id: Optional[str] = None
@@ -1044,12 +1045,20 @@ async def list_audit_logs(
         stmt = stmt.where(AuditLog.resource_type == resource_type)
     if action:
         stmt = stmt.where(AuditLog.action == action)
-    rows = await session.execute(stmt)
+    rows = list((await session.execute(stmt)).scalars().all())
+    # The audit row only snapshots the username; resolve each actor's current
+    # email from the users table (NULL for since-deleted users).
+    actor_ids = {r.actor_id for r in rows if r.actor_id is not None}
+    emails: dict[int, Optional[str]] = {}
+    if actor_ids:
+        ures = await session.execute(select(User.id, User.email).where(User.id.in_(actor_ids)))
+        emails = {uid: email for uid, email in ures.all()}
     return [
         AuditLogRecord(
             id=r.id,
             actor_id=r.actor_id,
             actor_username=r.actor_username,
+            actor_email=emails.get(r.actor_id) if r.actor_id is not None else None,
             action=r.action,
             resource_type=r.resource_type,
             resource_id=r.resource_id,
@@ -1057,7 +1066,7 @@ async def list_audit_logs(
             details=r.details,
             created_at=r.created_at.isoformat() if r.created_at else "",
         )
-        for r in rows.scalars().all()
+        for r in rows
     ]
 
 

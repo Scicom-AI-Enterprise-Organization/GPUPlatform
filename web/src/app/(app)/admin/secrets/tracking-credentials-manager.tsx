@@ -99,7 +99,7 @@ export function TrackingCredentialsManager({ initial }: { initial: TrackingCrede
           <Plus className="h-4 w-4" /> Add credential
         </Button>
       </div>
-      <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
+      <p className="mb-3 text-xs text-muted-foreground">
         Named Weights &amp; Biases / MLflow credentials. Autotrain runs pick one per run; the
         runner injects <span className="font-mono">WANDB_API_KEY</span> or{" "}
         <span className="font-mono">MLFLOW_TRACKING_URI/USERNAME/PASSWORD</span>. Encrypted at rest, never shown again.

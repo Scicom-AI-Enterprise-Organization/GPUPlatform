@@ -1238,7 +1238,7 @@ export function ApiDocs() {
               </Link>
             </Button>
           </div>
-          <p className="max-w-2xl text-sm text-muted-foreground">
+          <p className="text-sm text-muted-foreground">
             Every action in the console is an HTTP call against the gateway. Authenticate with an API
             key as a <code>Bearer</code> token; a key acts as you and can only do what your role +
             section access allows.

@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { DollarSign, Search } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import { Pagination } from "@/components/ui/pagination";
 import { formatCostUSD } from "@/lib/cost";
 import {
   Select,
@@ -41,6 +42,8 @@ export function AuditList({ initial }: { initial: AuditLogRecord[] }) {
   const [query, setQuery] = useState("");
   const [resourceType, setResourceType] = useState<string>(ANY);
   const [actor, setActor] = useState<string>(ANY);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(24);
 
   const resourceTypes = useMemo(() => {
     const s = new Set<string>();
@@ -74,6 +77,12 @@ export function AuditList({ initial }: { initial: AuditLogRecord[] }) {
     });
   }, [initial, query, resourceType, actor]);
 
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  // Clamp in render so a shrinking result set never strands an empty page;
+  // changing any filter resets to page 1 via the handlers below.
+  const currentPage = Math.min(page, pageCount);
+  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -81,12 +90,15 @@ export function AuditList({ initial }: { initial: AuditLogRecord[] }) {
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setPage(1);
+            }}
             placeholder="Search action, resource, actor…"
             className="pl-9"
           />
         </div>
-        <Select value={actor} onValueChange={setActor}>
+        <Select value={actor} onValueChange={(v) => { setActor(v); setPage(1); }}>
           <SelectTrigger className="w-44">
             <SelectValue placeholder="Any actor" />
           </SelectTrigger>
@@ -97,7 +109,7 @@ export function AuditList({ initial }: { initial: AuditLogRecord[] }) {
             ))}
           </SelectContent>
         </Select>
-        <Select value={resourceType} onValueChange={setResourceType}>
+        <Select value={resourceType} onValueChange={(v) => { setResourceType(v); setPage(1); }}>
           <SelectTrigger className="w-44">
             <SelectValue placeholder="Any resource" />
           </SelectTrigger>
@@ -125,7 +137,7 @@ export function AuditList({ initial }: { initial: AuditLogRecord[] }) {
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
-            {filtered.map((e) => (
+            {paged.map((e) => (
               <tr key={e.id} className="hover:bg-muted/20">
                 <td className="px-4 py-2 align-top">
                   <div className="text-xs">{fmtTs(e.created_at)}</div>
@@ -133,7 +145,12 @@ export function AuditList({ initial }: { initial: AuditLogRecord[] }) {
                     {relativeTime(e.created_at)}
                   </div>
                 </td>
-                <td className="px-4 py-2 align-top font-medium">{e.actor_username}</td>
+                <td className="px-4 py-2 align-top">
+                  <div className="font-medium">{e.actor_username}</div>
+                  {e.actor_email && (
+                    <div className="text-[11px] text-muted-foreground">{e.actor_email}</div>
+                  )}
+                </td>
                 <td className="px-4 py-2 align-top">
                   <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
                     {e.action}
@@ -179,6 +196,21 @@ export function AuditList({ initial }: { initial: AuditLogRecord[] }) {
           </tbody>
         </table>
       </div>
+
+      {filtered.length > 0 && (
+        <Pagination
+          page={currentPage}
+          pageCount={pageCount}
+          total={filtered.length}
+          pageSize={pageSize}
+          onPageChange={setPage}
+          onPageSizeChange={(n) => {
+            setPageSize(n);
+            setPage(1);
+          }}
+          itemLabel="events"
+        />
+      )}
     </div>
   );
 }
