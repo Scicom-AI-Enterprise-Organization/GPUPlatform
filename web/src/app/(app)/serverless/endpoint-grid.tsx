@@ -31,6 +31,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Pagination } from "@/components/ui/pagination";
 import type { AppRecord } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
@@ -50,8 +51,12 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [view, setView] = useState<"rows" | "grid">("rows");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(12);
   useEffect(() => {
     const v = window.localStorage.getItem("sgpu_serverless_view");
+    // Reading client-only localStorage post-mount avoids an SSR/CSR mismatch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "rows" || v === "grid") setView(v);
   }, []);
   const setViewPersist = (v: "rows" | "grid") => {
@@ -82,6 +87,12 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
       return tokens.every((t) => text.includes(t));
     });
   }, [apps, q]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  // Clamp in render so a shrinking result set never strands an empty page; the
+  // search handlers reset to page 1 directly.
+  const currentPage = Math.min(page, pageCount);
+  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   const onDeleteSelected = async () => {
     if (selected.size === 0) return;
@@ -123,13 +134,19 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
             type="search"
             placeholder="Search by name, id, model, GPU, owner…"
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={(e) => {
+              setQ(e.target.value);
+              setPage(1);
+            }}
             className="h-10 w-full rounded-md border border-input bg-background pl-9 pr-9 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
           />
           {q && (
             <button
               type="button"
-              onClick={() => setQ("")}
+              onClick={() => {
+                setQ("");
+                setPage(1);
+              }}
               className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
               title="Clear"
             >
@@ -194,7 +211,7 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
                 {" "}
                 <button
                   type="button"
-                  onClick={() => setSelected(new Set(filtered.map((a) => a.app_id)))}
+                  onClick={() => setSelected(new Set(paged.map((a) => a.app_id)))}
                   className="ml-2 underline underline-offset-2 hover:text-foreground"
                 >
                   Select all visible
@@ -239,25 +256,39 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
           <p className="text-sm text-muted-foreground">No endpoints match your search.</p>
         </div>
       ) : (
-        <div
-          className={cn(
-            "gap-3",
-            view === "rows"
-              ? "flex flex-col"
-              : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
-          )}
-        >
-          {filtered.map((app) => (
-            <EndpointCard
-              key={app.app_id}
-              app={app}
-              selectMode={selectMode}
-              selected={selected.has(app.app_id)}
-              onToggle={toggle}
-              onDelete={() => setSingle(app)}
-            />
-          ))}
-        </div>
+        <>
+          <div
+            className={cn(
+              "gap-3",
+              view === "rows"
+                ? "flex flex-col"
+                : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
+            )}
+          >
+            {paged.map((app) => (
+              <EndpointCard
+                key={app.app_id}
+                app={app}
+                selectMode={selectMode}
+                selected={selected.has(app.app_id)}
+                onToggle={toggle}
+                onDelete={() => setSingle(app)}
+              />
+            ))}
+          </div>
+          <Pagination
+            page={currentPage}
+            pageCount={pageCount}
+            total={filtered.length}
+            pageSize={pageSize}
+            onPageChange={setPage}
+            onPageSizeChange={(n) => {
+              setPageSize(n);
+              setPage(1);
+            }}
+            itemLabel="endpoints"
+          />
+        </>
       )}
 
       <SingleDeleteDialog target={single} onClose={() => setSingle(null)} />

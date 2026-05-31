@@ -46,7 +46,7 @@ export default async function BenchmarkPage({
         <div className="mb-6 flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Benchmark</h1>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            <p className="mt-1 text-sm text-muted-foreground">
               Run <span className="font-mono text-xs">llm-benchmaq</span> sweeps on real GPUs.
               Results land in S3; metrics and files surface in the detail view.
             </p>

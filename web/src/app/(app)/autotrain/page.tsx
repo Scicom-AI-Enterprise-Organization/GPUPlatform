@@ -43,7 +43,7 @@ export default async function AutotrainPage({
         <div className="mb-6 flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Autotrain</h1>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            <p className="mt-1 text-sm text-muted-foreground">
               Finetune a Whisper model on a dataset. WER + CER are evaluated every
               epoch; training stops at the max-epoch cap or early on patience.
             </p>

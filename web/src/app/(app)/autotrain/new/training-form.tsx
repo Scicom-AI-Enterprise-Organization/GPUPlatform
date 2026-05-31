@@ -394,7 +394,7 @@ export function TrainingForm() {
     <form onSubmit={onSubmit} className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">New training run</h1>
-        <p className="mt-1 max-w-xl text-sm text-muted-foreground">
+        <p className="mt-1 text-sm text-muted-foreground">
           {isTts
             ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM (loss-only; metrics to W&B/MLflow)."
             : "Finetune a Whisper model on a dataset. WER + CER are evaluated each epoch; training stops at the max-epoch cap or early on patience."}

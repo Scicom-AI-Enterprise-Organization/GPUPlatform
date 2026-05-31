@@ -37,7 +37,7 @@ export default async function RolesPage() {
         <div className="">
         <header className="mb-8">
           <h1 className="text-2xl font-semibold tracking-tight">Roles</h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+          <p className="mt-1 text-sm text-muted-foreground">
             Each role bundles a set of section permissions. Attach roles to
             users in <span className="font-medium">Organization</span>. System
             roles can be edited but not deleted.

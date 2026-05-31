@@ -18,7 +18,7 @@ export default async function NewStoragePage() {
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         <div className="mb-6">
           <h1 className="text-2xl font-semibold tracking-tight">New storage</h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+          <p className="mt-1 text-sm text-muted-foreground">
             Add a storage backend. Pick an S3 (or S3-compatible) bucket or a
             HuggingFace token holder. Credentials are encrypted at rest; leave
             them blank to fall back to the gateway&apos;s env.

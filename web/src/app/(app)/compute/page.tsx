@@ -48,7 +48,7 @@ export default async function ComputePage({
         <div className="mb-6 flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Compute</h1>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            <p className="mt-1 text-sm text-muted-foreground">
               Provision a raw GPU pod with SSH and JupyterLab. Pods bill per-second
               until you terminate them — pick a template, click create, you get back
               an SSH command and a JupyterLab URL.

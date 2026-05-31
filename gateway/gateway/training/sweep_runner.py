@@ -98,6 +98,15 @@ def run(cfg: dict) -> None:
                 for k in ("sweep", "sweep_gpus", "sweep_metric", "gpus_per_trial", "_config_path"):
                     tcfg.pop(k, None)
                 tcfg.update(params)  # override the swept hyperparameters
+                # The `augment` sweep dimension is a scalar flag (on/off) for a
+                # clean leaderboard label; translate it into the trainer's real
+                # knob: "on" reuses the base augment_techniques, "off" clears
+                # them. (params keeps `augment` so @@TRIAL still reports it.)
+                if "augment" in tcfg:
+                    on = str(tcfg.pop("augment")).lower() in ("on", "true", "1", "yes")
+                    tcfg["augment_techniques"] = (
+                        list(cfg.get("augment_techniques") or []) if on else []
+                    )
                 tcfg["work_dir"] = os.path.join(work, f"trial{i}")
                 tcfg["run_name"] = f"{cfg.get('run_name', 'run')}-t{i}"
                 if base_prefix and tcfg.get("artifacts"):

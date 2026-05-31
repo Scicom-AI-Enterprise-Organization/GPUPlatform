@@ -410,6 +410,13 @@ def split_pairs(pairs: list[dict], cfg: dict) -> tuple[list[dict], list[dict]]:
         ev = [p for p in pairs if (p.get("split") or "").lower() in EVAL_SPLITS]
         log(f"[split] using dataset split column: {len(train)} train / {len(ev)} eval")
         return train, ev
+    # The user explicitly chose this dataset as its own test set, but it carries
+    # no test/validation split column — fall back to a seeded hold-out and say so
+    # loudly (rather than silently evaluating on rows it also trained on).
+    if cfg.get("test_from_split"):
+        log("[split] WARNING: test==training dataset but no `split` column found "
+            f"(values seen: {sorted({(p.get('split') or '').lower() for p in pairs}) or 'none'}); "
+            "falling back to a seeded hold-out.")
     import random
 
     pct = float(cfg.get("eval_split_pct", 10)) / 100.0

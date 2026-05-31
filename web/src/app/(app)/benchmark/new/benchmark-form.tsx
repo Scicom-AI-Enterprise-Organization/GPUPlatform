@@ -832,7 +832,7 @@ export function BenchmarkForm({
       {/* Header — plain, no gradient. */}
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Create benchmark</h1>
-        <p className="mt-1 max-w-xl text-sm text-muted-foreground">
+        <p className="mt-1 text-sm text-muted-foreground">
           Spin up a RunPod GPU, run <span className="font-mono text-xs">benchmaq</span>{" "}
           against vLLM, and stream the logs back here. Save as a template if
           you&apos;ll re-run it.

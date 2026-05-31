@@ -44,7 +44,7 @@ export default async function DatasetsPage({
         <div className="mb-6 flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Datasets</h1>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            <p className="mt-1 text-sm text-muted-foreground">
               Register <span className="font-mono text-xs">{`{audio, transcription}`}</span>{" "}
               datasets for Autotrain. Upload a CSV / JSON / JSONL metadata file to
               a storage backend, preview the rows with inline audio, and push to a

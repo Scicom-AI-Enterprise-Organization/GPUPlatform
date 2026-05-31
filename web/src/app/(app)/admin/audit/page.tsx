@@ -10,7 +10,7 @@ const GATEWAY = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
 async function loadAudit(token: string): Promise<AuditLogRecord[]> {
   try {
-    const r = await fetch(`${GATEWAY}/admin/audit-logs?limit=200`, {
+    const r = await fetch(`${GATEWAY}/admin/audit-logs?limit=1000`, {
       headers: { Authorization: `Bearer ${token}` },
       cache: "no-store",
     });
@@ -37,9 +37,9 @@ export default async function AuditPage() {
         <div className="">
         <header className="mb-6">
           <h1 className="text-2xl font-semibold tracking-tight">Audit log</h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+          <p className="mt-1 text-sm text-muted-foreground">
             Every state-changing action across the platform — who, what, when.
-            Most recent first; up to 200 events shown.
+            Most recent first; up to 1000 events shown.
           </p>
         </header>
 

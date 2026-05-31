@@ -16,6 +16,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Pagination } from "@/components/ui/pagination";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { BenchmarkRow } from "./benchmark-row";
 
 /** Pre-compute a flat searchable string per benchmark. Includes name, id,
@@ -68,8 +76,12 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const [renaming, setRenaming] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
   const [view, setView] = useState<"rows" | "grid">("rows");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(12);
   useEffect(() => {
     const v = window.localStorage.getItem("sgpu_bench_view");
+    // Reading client-only localStorage post-mount avoids an SSR/CSR mismatch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "rows" || v === "grid") setView(v);
   }, []);
   const setViewPersist = (v: "rows" | "grid") => {
@@ -169,6 +181,12 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
 
   const hasFilter = q.trim().length > 0 || status !== "all";
 
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  // Clamp in render so a shrinking result set never strands an empty page; the
+  // search/filter handlers reset to page 1 directly.
+  const currentPage = Math.min(page, pageCount);
+  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
   return (
     <div>
       <div className="mb-4 flex gap-2">
@@ -178,13 +196,19 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
             type="search"
             placeholder="Search by name, id, model, GPU, owner, status…"
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={(e) => {
+              setQ(e.target.value);
+              setPage(1);
+            }}
             className="h-10 w-full rounded-md border border-input bg-background pl-9 pr-9 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
           />
           {q && (
             <button
               type="button"
-              onClick={() => setQ("")}
+              onClick={() => {
+                setQ("");
+                setPage(1);
+              }}
               className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
               title="Clear"
             >
@@ -192,18 +216,24 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
             </button>
           )}
         </div>
-        <select
+        <Select
           value={status}
-          onChange={(e) => setStatus(e.target.value as StatusFilter)}
-          className="h-10 rounded-md border border-input bg-background px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
-          title="Filter by status"
+          onValueChange={(v) => {
+            setStatus(v as StatusFilter);
+            setPage(1);
+          }}
         >
-          {STATUS_OPTIONS.map((s) => (
-            <option key={s} value={s}>
-              {s === "all" ? "All statuses" : s.charAt(0).toUpperCase() + s.slice(1)}
-            </option>
-          ))}
-        </select>
+          <SelectTrigger className="h-10! w-[150px]" title="Filter by status">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {STATUS_OPTIONS.map((s) => (
+              <SelectItem key={s} value={s}>
+                {s === "all" ? "All statuses" : s.charAt(0).toUpperCase() + s.slice(1)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
           <button
             type="button"
@@ -261,7 +291,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
                 {" "}
                 <button
                   type="button"
-                  onClick={() => setSelected(new Set(filtered.map((b) => b.id)))}
+                  onClick={() => setSelected(new Set(paged.map((b) => b.id)))}
                   className="ml-2 underline underline-offset-2 hover:text-foreground"
                 >
                   Select all visible
@@ -327,30 +357,44 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
           <p className="text-sm text-muted-foreground">No benchmarks match your filters.</p>
         </div>
       ) : (
-        <div
-          className={cn(
-            "gap-3",
-            view === "rows"
-              ? "flex flex-col"
-              : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
-          )}
-        >
-          {filtered.map((b) => (
-            <BenchmarkRow
-              key={b.id}
-              bench={b}
-              selectMode={selectMode}
-              selected={selected.has(b.id)}
-              onToggle={toggle}
-              onDelete={(bench) => setSingle(bench)}
-              onRename={(bench) => {
-                setRenameTarget(bench);
-                setRenameDraft(bench.name);
-                setRenameError(null);
-              }}
-            />
-          ))}
-        </div>
+        <>
+          <div
+            className={cn(
+              "gap-3",
+              view === "rows"
+                ? "flex flex-col"
+                : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
+            )}
+          >
+            {paged.map((b) => (
+              <BenchmarkRow
+                key={b.id}
+                bench={b}
+                selectMode={selectMode}
+                selected={selected.has(b.id)}
+                onToggle={toggle}
+                onDelete={(bench) => setSingle(bench)}
+                onRename={(bench) => {
+                  setRenameTarget(bench);
+                  setRenameDraft(bench.name);
+                  setRenameError(null);
+                }}
+              />
+            ))}
+          </div>
+          <Pagination
+            page={currentPage}
+            pageCount={pageCount}
+            total={filtered.length}
+            pageSize={pageSize}
+            onPageChange={setPage}
+            onPageSizeChange={(n) => {
+              setPageSize(n);
+              setPage(1);
+            }}
+            itemLabel="runs"
+          />
+        </>
       )}
 
       <Dialog

@@ -14,7 +14,7 @@ export default async function ApiKeysPage() {
         <div className="mb-6 flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">API tokens</h1>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            <p className="mt-1 text-sm text-muted-foreground">
               Personal tokens for the gateway API — submit and list jobs, deploy endpoints,
               run benchmarks, and manage compute from scripts or CI. Pass a token as a{" "}
               <code className="font-mono">Bearer</code> credential. Treat tokens like passwords.

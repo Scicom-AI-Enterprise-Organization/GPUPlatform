@@ -40,7 +40,7 @@ export default async function SecretsPage() {
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         <header className="mb-8">
           <h1 className="text-2xl font-semibold tracking-tight">Global env &amp; secrets</h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+          <p className="mt-1 text-sm text-muted-foreground">
             Org-wide environment variables (e.g. <span className="font-mono">HF_TOKEN</span>) injected into every
             benchmark run and serverless worker. A per-benchmark / per-endpoint variable of the same name overrides
             the global one. Secret values are encrypted at rest and never shown again after you save them.

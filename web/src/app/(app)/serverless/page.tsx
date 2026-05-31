@@ -44,7 +44,7 @@ export default async function ServerlessPage({
         <div className="mb-6 flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Serverless Inference</h1>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            <p className="mt-1 text-sm text-muted-foreground">
               Deploy and scale GPU-powered inference endpoints. Pay per second of compute.
             </p>
           </div>
