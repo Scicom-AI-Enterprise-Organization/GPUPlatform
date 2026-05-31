@@ -126,9 +126,11 @@ async def _run(
     storage_id: Optional[str],
     s3_folder: Optional[str] = None,
 ) -> None:
+    import tempfile
+
     from fastapi.concurrency import run_in_threadpool
     from sqlalchemy import select
-    from .datasets_api import _hf_token, _s3_target_and_prefix
+    from .datasets_api import _hf_token, _label_token, _s3_target_and_prefix
 
     work: Optional[str] = None
     try:
@@ -137,6 +139,7 @@ async def _run(
             d = await s.get(Dataset, dataset_id)
             if d is None:
                 return
+            kind = d.kind
             src_repo = d.hf_repo
             audio_field, transcription_field = d.audio_field, d.transcription_field
             split_fields = dict(d.split_fields or {})  # {split: transcription_column}
@@ -146,8 +149,17 @@ async def _run(
             token = await _hf_token(hf_store, s)
             out_storage = await s.get(Storage, storage_id) if (target == "s3" and storage_id) else None
             s3_target, s3_prefix = (_s3_target_and_prefix(out_storage) if out_storage else (None, ""))
+            # Labeling-platform source (kind="label"): base URL + project + token.
+            label_base_url = d.label_base_url
+            label_project_id = d.label_project_id
+            label_status = d.label_status or "approved"
+            label_token = await _label_token(d, s) if kind == "label" else None
 
-        if not src_repo:
+        if kind == "label":
+            if not (label_base_url and label_project_id and label_token):
+                await _finish(dataset_id, "failed", "labeling-platform source not fully configured (base URL, project, token)")
+                return
+        elif not src_repo:
             await _finish(dataset_id, "failed", "dataset has no hf_repo to transform")
             return
         if target == "hf" and not (hf_repo and "/" in hf_repo):
@@ -157,19 +169,31 @@ async def _run(
             await _finish(dataset_id, "failed", "pick an S3 storage for the S3 target")
             return
 
-        await _log(dataset_id, f"downloading {src_repo} …")
-        work = await run_in_threadpool(_download, src_repo, token)
+        if kind == "label":
+            # Stream the project export + download each task's audio. No archive
+            # extraction — the export already pairs audio with its transcription.
+            work = tempfile.mkdtemp(prefix="sgpu-transform-")
+            await _log(dataset_id, f"exporting label project {label_project_id} (status={label_status}) …")
+            pairs = await run_in_threadpool(
+                _label_pairs, label_base_url, label_project_id, label_token, label_status, work,
+            )
+            if not pairs:
+                await _finish(dataset_id, "failed", "no tasks with downloadable audio in the label export (check the status filter / token)")
+                return
+        else:
+            await _log(dataset_id, f"downloading {src_repo} …")
+            work = await run_in_threadpool(_download, src_repo, token)
 
-        await _log(dataset_id, "extracting audio archives …")
-        n_audio = await run_in_threadpool(_extract_archives, work)
-        await _log(dataset_id, f"~{n_audio} audio files on disk; reading metadata …")
+            await _log(dataset_id, "extracting audio archives …")
+            n_audio = await run_in_threadpool(_extract_archives, work)
+            await _log(dataset_id, f"~{n_audio} audio files on disk; reading metadata …")
 
-        if split_fields:
-            await _log(dataset_id, f"per-split transcription columns: {split_fields}")
-        pairs = await run_in_threadpool(_build_pairs, work, audio_field, transcription_field, split_fields)
-        if not pairs:
-            await _finish(dataset_id, "failed", "no metadata rows matched an extracted audio file — check the audio column")
-            return
+            if split_fields:
+                await _log(dataset_id, f"per-split transcription columns: {split_fields}")
+            pairs = await run_in_threadpool(_build_pairs, work, audio_field, transcription_field, split_fields)
+            if not pairs:
+                await _finish(dataset_id, "failed", "no metadata rows matched an extracted audio file — check the audio column")
+                return
         await _log(dataset_id, f"matched {len(pairs)} rows to audio; building output …")
 
         # Non-destructive: build the output, then create a NEW "-audio" dataset
@@ -217,6 +241,81 @@ def _download(repo: str, token: Optional[str]) -> str:
     work = tempfile.mkdtemp(prefix="sgpu-transform-")
     snapshot_download(repo_id=repo, repo_type="dataset", local_dir=work, token=token)
     return work
+
+
+# Content-type → extension, for label-platform audio that arrives without a
+# usable filename (e.g. proxied task-audio endpoints).
+_CT_EXT = {
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/flac": ".flac", "audio/x-flac": ".flac",
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/ogg": ".ogg", "audio/opus": ".opus",
+    "audio/mp4": ".m4a", "audio/aac": ".aac", "audio/x-m4a": ".m4a",
+}
+
+
+def _label_pairs(
+    base_url: str,
+    project_id: str,
+    token: str,
+    status: str,
+    work: str,
+) -> list[tuple[str, str, str]]:
+    """Stream a labeling-platform project export (export.v1.jsonl) and download
+    each task's audio into `work/audio`. Returns [(split, abs_audio_path,
+    transcription)] — the same shape `_build_pairs` produces for HF sources, so
+    the HF/S3 target writers are reused unchanged.
+
+    Audio resolution mirrors the gateway's label-audio proxy: tasks whose
+    `audio_url` lives under the platform (or that only expose a task id) are
+    fetched from `/api/projects/{pid}/tasks/{tid}/audio` with the bearer token;
+    presigned-S3 `audio_url`s are downloaded directly (no auth header — the
+    signature lives in the query string)."""
+    import os as _os
+    from urllib.parse import unquote, urlparse
+
+    import httpx
+
+    from .datasets_api import _label_export_rows
+
+    base = (base_url or "").rstrip("/")
+    # limit=huge → read every line; offset=0. _label_export_rows stops only when
+    # it has `total` rows, so a limit past the end safely yields all of them.
+    rows, _total = _label_export_rows(base_url, project_id, token, status, 10**9, 0)
+
+    audio_dir = Path(work) / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    pairs: list[tuple[str, str, str]] = []
+    with httpx.Client(timeout=120.0, follow_redirects=True) as cli:
+        for i, r in enumerate(rows):
+            u = str(r.get("audio_url") or "").strip()
+            tid = r.get("id")
+            # Decide download URL + whether to attach the platform token.
+            if (not u or u.startswith(base)) and tid is not None:
+                dl_url = f"{base}/api/projects/{project_id}/tasks/{tid}/audio"
+                headers = {"Authorization": f"Bearer {token}"}
+            elif u:
+                dl_url, headers = u, {}
+            else:
+                continue
+            try:
+                resp = cli.get(dl_url, headers=headers)
+                resp.raise_for_status()
+            except Exception:  # noqa: BLE001 — skip the task, keep going
+                logger.warning("label audio download failed (task=%s)", tid)
+                continue
+            # Pick an extension: URL basename, else the response content-type.
+            ext = _os.path.splitext(unquote(_os.path.basename(urlparse(u).path)))[1].lower()
+            if ext not in _AUDIO_EXTS:
+                ext = _CT_EXT.get((resp.headers.get("content-type") or "").split(";")[0].strip().lower(), ".wav")
+            name = f"task-{tid}{ext}" if tid is not None else f"row-{i}{ext}"
+            dest = audio_dir / name
+            dest.write_bytes(resp.content)
+            text = r.get("transcription")
+            text = "" if text is None else str(text)
+            split = str(r.get("split") or "train")
+            pairs.append((split, str(dest), text))
+    return pairs
 
 
 def _extract_archives(work: str) -> int:

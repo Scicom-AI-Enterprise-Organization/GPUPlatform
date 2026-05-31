@@ -1125,7 +1125,11 @@ async def transform_dataset(
     """Kick off the audio-zip → audio-column transform as a gateway background
     job. Poll GET /{id} (transform_status / transform_log) for progress."""
     d = await _require_dataset(session, dataset_id, user)
-    if not (d.hf_repo and "/" in d.hf_repo):
+    if d.kind == "label":
+        tok = await _label_token(d, session)
+        if not (d.label_base_url and d.label_project_id and tok):
+            raise HTTPException(status_code=400, detail="label dataset needs a base URL, project, and stored token to transform")
+    elif not (d.hf_repo and "/" in d.hf_repo):
         raise HTTPException(status_code=400, detail="transform needs a source HuggingFace repo (owner/name) on the dataset")
     if d.transform_status == "running":
         raise HTTPException(status_code=409, detail="a transform is already running for this dataset")

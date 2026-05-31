@@ -76,9 +76,11 @@ export default async function DatasetDetailPage({
     }
   }
 
-  // S3 storages to offer as a transform target (HF audio-zip → audio column).
+  // S3 storages to offer as a transform target (HF audio-zip / label platform →
+  // audio column).
+  const canTransform = dataset?.kind === "hf" || dataset?.kind === "label";
   let s3Storages: StorageRecord[] = [];
-  if (dataset?.kind === "hf") {
+  if (canTransform) {
     try {
       s3Storages = (await gateway.listStorage()).filter((s) => s.kind === "s3" && s.enabled);
     } catch {
@@ -162,9 +164,10 @@ export default async function DatasetDetailPage({
               splitFields={dataset.split_fields}
             />
 
-            {dataset.kind === "hf" && (
+            {canTransform && (
               <TransformCard
                 datasetId={dataset.id}
+                kind={dataset.kind}
                 hfRepo={dataset.hf_repo ?? null}
                 s3Storages={s3Storages}
                 initialStatus={dataset.transform_status ?? null}

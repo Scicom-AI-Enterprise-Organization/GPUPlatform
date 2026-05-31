@@ -15,7 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { DatasetRecord, StorageRecord } from "@/lib/types";
+import type { DatasetKind, DatasetRecord, StorageRecord } from "@/lib/types";
 
 function errText(body: unknown, fallback: string): string {
   if (typeof body === "string") return body || fallback;
@@ -31,17 +31,20 @@ function errText(body: unknown, fallback: string): string {
 
 export function TransformCard({
   datasetId,
+  kind,
   hfRepo,
   s3Storages,
   initialStatus,
   initialLog,
 }: {
   datasetId: string;
+  kind: DatasetKind;
   hfRepo: string | null;
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
 }) {
+  const isLabel = kind === "label";
   const router = useRouter();
   const [target, setTarget] = useState<"hf" | "s3">("hf");
   const [outRepo, setOutRepo] = useState(hfRepo ? `${hfRepo}-audio` : "");
@@ -129,11 +132,23 @@ export function TransformCard({
   return (
     <Card>
       <CardHeader className="flex flex-col gap-0.5">
-        <CardTitle className="text-base">Transform — extract audio column</CardTitle>
+        <CardTitle className="text-base">
+          {isLabel ? "Transform — export labels to a dataset" : "Transform — extract audio column"}
+        </CardTitle>
         <span className="text-xs text-muted-foreground">
-          This repo stores audio in archives, so there&apos;s no audio column to preview. Unzip it and rebuild a
-          dataset with a real audio column (joined on the <span className="font-mono">audio</span> column you set
-          above). Runs on the gateway; watch progress below.
+          {isLabel ? (
+            <>
+              Export this labeling-platform project&apos;s reviewed tasks (per the dataset&apos;s status filter),
+              download each clip, and build a dataset with a real <span className="font-mono">audio</span> column +
+              its <span className="font-mono">transcription</span>. Runs on the gateway; watch progress below.
+            </>
+          ) : (
+            <>
+              This repo stores audio in archives, so there&apos;s no audio column to preview. Unzip it and rebuild a
+              dataset with a real audio column (joined on the <span className="font-mono">audio</span> column you set
+              above). Runs on the gateway; watch progress below.
+            </>
+          )}
         </span>
       </CardHeader>
       <CardContent className="space-y-3">
