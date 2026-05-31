@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Check, Download, Loader2, Pencil, RotateCcw, Trash2, X, XCircle } from "lucide-react";
-import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,6 +13,14 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui/tabs";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   CartesianGrid,
   Line,
@@ -75,6 +82,16 @@ export function RunKindBadge({ sweep, trials }: { sweep: boolean; trials?: numbe
 function fmt(v: number | null | undefined, digits = 2): string {
   return v == null ? "—" : v.toFixed(digits);
 }
+
+// Drives the shared confirmation dialog (replaces window.confirm).
+type ConfirmOpts = {
+  title: string;
+  description: string;
+  confirmLabel: string;
+  busyLabel: string;
+  destructive?: boolean;
+  run: () => Promise<void>;
+};
 
 export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const router = useRouter();
@@ -172,57 +189,79 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     return a.metric - b.metric;
   });
 
-  async function onTerminate() {
-    if (!confirm("Terminate this run? The pod (if any) is torn down.")) return;
+  // A single confirmation dialog drives terminate/delete/restart (no native
+  // window.confirm). Each action sets `confirmOpts`; the dialog runs `.run()`.
+  const [confirmOpts, setConfirmOpts] = useState<ConfirmOpts | null>(null);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
+  async function runConfirm() {
+    if (!confirmOpts) return;
     setBusy(true);
+    setConfirmError(null);
     try {
-      setRun(await gateway.terminateTrainingRun(run.id));
-      toast.success("Terminated", { duration: 3000 });
+      await confirmOpts.run();
+      setConfirmOpts(null);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
+      setConfirmError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   }
 
-  async function onDelete() {
-    if (!confirm("Delete this run? This removes its record.")) return;
-    setBusy(true);
-    try {
-      await gateway.deleteTrainingRun(run.id);
-      toast.success("Deleted", { duration: 3000 });
-      router.push("/autotrain");
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
-      setBusy(false);
-    }
+  function onTerminate() {
+    setConfirmError(null);
+    setConfirmOpts({
+      title: "Terminate this run?",
+      description: "Stops training now and tears down the pod (if any). Metrics collected so far are kept.",
+      confirmLabel: "Terminate",
+      busyLabel: "Terminating…",
+      destructive: true,
+      run: async () => {
+        setRun(await gateway.terminateTrainingRun(run.id));
+      },
+    });
+  }
+
+  function onDelete() {
+    setConfirmError(null);
+    setConfirmOpts({
+      title: `Delete ${run.name}?`,
+      description: "Removes the training-run record. S3 artifacts are kept. If a pod is still alive, terminate it first.",
+      confirmLabel: "Delete",
+      busyLabel: "Deleting…",
+      destructive: true,
+      run: async () => {
+        await gateway.deleteTrainingRun(run.id);
+        router.push("/autotrain");
+      },
+    });
   }
 
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(run.name);
+  const [renameError, setRenameError] = useState<string | null>(null);
   async function onRename() {
     const n = nameDraft.trim();
-    if (!n || n === run.name) { setEditingName(false); return; }
+    if (!n || n === run.name) { setEditingName(false); setRenameError(null); return; }
+    setRenameError(null);
     try {
       setRun(await gateway.renameTrainingRun(run.id, n));
       setEditingName(false);
-      toast.success("Renamed", { duration: 2000 });
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
+      setRenameError(e instanceof Error ? e.message : String(e));
     }
   }
 
-  async function onRestart() {
-    if (!confirm("Restart? Launches a fresh run with this run's exact config.")) return;
-    setBusy(true);
-    try {
-      const created = await gateway.restartTrainingRun(run.id);
-      toast.success(`Restarted → ${created.id}`, { duration: 3000 });
-      router.push(`/autotrain/${encodeURIComponent(created.id)}`);
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e), { duration: 5000 });
-      setBusy(false);
-    }
+  function onRestart() {
+    setConfirmOpts({
+      title: "Restart this run?",
+      description: "Launches a fresh run with this run's exact config (same dataset, model, GPUs and hyperparameters).",
+      confirmLabel: "Restart",
+      busyLabel: "Restarting…",
+      run: async () => {
+        const created = await gateway.restartTrainingRun(run.id);
+        router.push(`/autotrain/${encodeURIComponent(created.id)}`);
+      },
+    });
   }
 
   return (
@@ -231,23 +270,26 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             {editingName ? (
-              <span className="flex items-center gap-1">
-                <Input
-                  value={nameDraft}
-                  onChange={(e) => setNameDraft(e.target.value)}
-                  autoFocus
-                  className="h-8 w-72 text-lg font-semibold"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") onRename();
-                    if (e.key === "Escape") setEditingName(false);
-                  }}
-                />
-                <Button size="icon" variant="ghost" className="h-7 w-7" onClick={onRename} title="Save">
-                  <Check className="h-4 w-4" />
-                </Button>
-                <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => setEditingName(false)} title="Cancel">
-                  <X className="h-4 w-4" />
-                </Button>
+              <span className="flex flex-col gap-1">
+                <span className="flex items-center gap-1">
+                  <Input
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    autoFocus
+                    className="h-8 w-72 text-lg font-semibold"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") onRename();
+                      if (e.key === "Escape") { setEditingName(false); setRenameError(null); }
+                    }}
+                  />
+                  <Button size="icon" variant="ghost" className="h-7 w-7" onClick={onRename} title="Save">
+                    <Check className="h-4 w-4" />
+                  </Button>
+                  <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => { setEditingName(false); setRenameError(null); }} title="Cancel">
+                    <X className="h-4 w-4" />
+                  </Button>
+                </span>
+                {renameError && <span className="text-xs text-destructive">{renameError}</span>}
               </span>
             ) : (
               <>
@@ -447,6 +489,36 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           <JsonView value={run.config_json} />
         </TabsContent>
       </Tabs>
+
+      <Dialog
+        open={!!confirmOpts}
+        onOpenChange={(o) => {
+          if (!busy && !o) {
+            setConfirmOpts(null);
+            setConfirmError(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{confirmOpts?.title}</DialogTitle>
+            <DialogDescription>{confirmOpts?.description}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {confirmError && <p className="mr-auto text-sm text-destructive">{confirmError}</p>}
+            <Button variant="outline" onClick={() => setConfirmOpts(null)} disabled={busy}>
+              Cancel
+            </Button>
+            <Button
+              variant={confirmOpts?.destructive ? "destructive" : "default"}
+              onClick={runConfirm}
+              disabled={busy}
+            >
+              {busy ? confirmOpts?.busyLabel : confirmOpts?.confirmLabel}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
