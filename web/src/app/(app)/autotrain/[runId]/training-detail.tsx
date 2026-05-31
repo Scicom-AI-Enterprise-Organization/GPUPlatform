@@ -2,11 +2,17 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Check, Download, Loader2, Pencil, RotateCcw, Trash2, X, XCircle } from "lucide-react";
+import { AudioLines, Check, ChevronDown, Copy, Download, Loader2, Pencil, RotateCcw, Trash2, X, XCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Tabs,
   TabsContent,
@@ -47,6 +53,11 @@ function trialLabel(i: number, trials: TrainingTrial[]): string {
     : k === "batch_size" ? `bs ${v}`
     : k === "grad_accum" ? `ga ${v}`
     : k === "max_epochs" ? `ep ${v}`
+    : k === "weight_decay" ? `wd ${v}`
+    : k === "lora_r" ? `r ${v}`
+    : k === "lora_alpha" ? `α ${v}`
+    : k === "freeze_encoder" ? (String(v) === "on" ? "frozen" : "full")
+    : k === "augment" ? `aug ${v}`
     : `${k}=${v}`,
   );
   return `t${i}: ${parts.join(" · ")}`;
@@ -180,6 +191,12 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const artifact = run.result_json?.artifact;
   const trials = run.result_json?.trials ?? [];
   const isSweep = isSweepConfig(run.config_json) || trials.length > 0;
+  // Try-it playground: finished ASR run on a VM (inference runs on that VM).
+  const canTryIt =
+    run.status === "done" &&
+    (run.task_type ?? "asr") === "asr" &&
+    run.provider_kind === "vm" &&
+    !!run.result_json?.artifact?.s3_uri;
   const metricLabel = run.task_type === "tts"
     ? "loss"
     : String((run.config_json?.eval_metric as string) || "wer").toUpperCase();
@@ -251,17 +268,22 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     }
   }
 
-  function onRestart() {
+  function onDuplicateRun() {
     setConfirmOpts({
-      title: "Restart this run?",
-      description: "Launches a fresh run with this run's exact config (same dataset, model, GPUs and hyperparameters).",
-      confirmLabel: "Restart",
-      busyLabel: "Restarting…",
+      title: "Duplicate & run now?",
+      description: "Launches a new run with this run's exact config (same dataset, model, GPUs and hyperparameters). The original is untouched.",
+      confirmLabel: "Duplicate & run",
+      busyLabel: "Launching…",
       run: async () => {
         const created = await gateway.restartTrainingRun(run.id);
         router.push(`/autotrain/${encodeURIComponent(created.id)}`);
       },
     });
+  }
+
+  // Open the create form pre-filled from this run's config, without launching.
+  function onEditAsNew() {
+    router.push(`/autotrain/new?from=${encodeURIComponent(run.id)}`);
   }
 
   return (
@@ -313,14 +335,26 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm" disabled={busy}>
+                <Copy className="h-4 w-4" /> Duplicate <ChevronDown className="h-3.5 w-3.5 opacity-60" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={(e) => { e.preventDefault(); onDuplicateRun(); }}>
+                <RotateCcw className="h-4 w-4" /> Duplicate &amp; run now
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={(e) => { e.preventDefault(); onEditAsNew(); }}>
+                <Pencil className="h-4 w-4" /> Edit as new…
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           {!terminal && (
             <Button variant="outline" size="sm" onClick={onTerminate} disabled={busy} className="text-destructive">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <XCircle className="h-4 w-4" />} Terminate
             </Button>
           )}
-          <Button variant="outline" size="sm" onClick={onRestart} disabled={busy}>
-            <RotateCcw className="h-4 w-4" /> Restart
-          </Button>
           <Button variant="outline" size="sm" onClick={onDelete} disabled={busy}>
             <Trash2 className="h-4 w-4" /> Delete
           </Button>
@@ -400,6 +434,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           <TabsTrigger value="logs">Logs</TabsTrigger>
           <TabsTrigger value="files">Files</TabsTrigger>
           <TabsTrigger value="config">Config</TabsTrigger>
+          {canTryIt && <TabsTrigger value="tryit">Try it</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="metrics" className="mt-4 !flex-none space-y-4">
@@ -488,6 +523,12 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           </Card>
           <JsonView value={run.config_json} />
         </TabsContent>
+
+        {canTryIt && (
+          <TabsContent value="tryit" className="mt-4 !flex-none">
+            <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
+          </TabsContent>
+        )}
       </Tabs>
 
       <Dialog
@@ -890,6 +931,83 @@ function EvalCurve({ epochs, sweep, trials }: { epochs: TrainingEpoch[]; sweep: 
         <p className="mt-1 text-[10px] text-muted-foreground">
           <span className="text-red-500">■</span> WER · <span className="text-violet-500">■</span> CER
         </p>
+      </CardContent>
+    </Card>
+  );
+}
+
+// Try-it playground — upload a clip, pick a GPU the run used (or CPU), and
+// transcribe it with the finetuned model on the run's VM (over SSH).
+function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevices: string | null }) {
+  const gpuIds = (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const [file, setFile] = useState<File | null>(null);
+  const [gpu, setGpu] = useState<string>(gpuIds[0] ?? "auto");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ text: string; device?: string } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function onTranscribe() {
+    if (!file) return;
+    setBusy(true);
+    setErr(null);
+    setResult(null);
+    try {
+      setResult(await gateway.transcribeTrainingRun(runId, file, gpu));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — transcribe a clip</CardTitle></CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-xs text-muted-foreground">
+          Runs the finetuned model on this run&apos;s VM. Pick a GPU the run used (or CPU), upload a short
+          audio clip (≤ 25 MB), and transcribe. The first request downloads the model onto the VM, so it
+          can take a little longer.
+        </p>
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1.5">
+            <label className="block text-xs font-medium">Audio clip</label>
+            <input
+              type="file"
+              accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.webm"
+              onChange={(e) => { setFile(e.target.files?.[0] ?? null); setResult(null); }}
+              className="block text-xs file:mr-3 file:rounded-md file:border-0 file:bg-muted file:px-2.5 file:py-1.5 file:text-foreground hover:file:bg-muted/70"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="block text-xs font-medium">Run on</label>
+            <select
+              value={gpu}
+              onChange={(e) => setGpu(e.target.value)}
+              className="h-9 rounded-md border border-border bg-background px-2 text-sm"
+            >
+              {gpuIds.map((g) => <option key={g} value={g}>GPU {g}</option>)}
+              <option value="auto">Auto (most-free GPU)</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </div>
+          <Button type="button" onClick={onTranscribe} disabled={busy || !file}>
+            {busy
+              ? <><Loader2 className="h-4 w-4 animate-spin" /> Transcribing…</>
+              : <><AudioLines className="h-4 w-4" /> Transcribe</>}
+          </Button>
+        </div>
+        {err && <p className="text-sm text-destructive">{err}</p>}
+        {result && (
+          <div className="space-y-1.5">
+            <div className="text-xs text-muted-foreground">
+              Transcription{result.device ? ` · ran on ${result.device}` : ""}
+            </div>
+            <div className="whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-3 text-sm">
+              {result.text || <span className="text-muted-foreground">(empty — the model returned nothing)</span>}
+            </div>
+          </div>
+        )}
       </CardContent>
     </Card>
   );

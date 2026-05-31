@@ -316,6 +316,8 @@ export type CreateTrainingRunRequest = {
   eval_metric?: "wer" | "cer";
   max_epochs?: number;
   patience?: number;
+  // Normalize text (case/punctuation) before WER/CER (Whisper-style). Off = raw.
+  normalize_text?: boolean;
   eval_split_pct?: number;
   split_seed?: number;
   batch_size?: number;
@@ -323,6 +325,15 @@ export type CreateTrainingRunRequest = {
   learning_rate?: number;
   warmup_steps?: number;
   weight_decay?: number;
+  // LoRA / PEFT — adapters merged into the base at save time (drop-in checkpoint).
+  use_lora?: boolean;
+  lora_r?: number;
+  lora_alpha?: number;
+  lora_dropout?: number;
+  // Freeze the encoder; train the decoder only.
+  freeze_encoder?: boolean;
+  // Multi-GPU single run: DDP via torchrun (default) vs DataParallel.
+  use_ddp?: boolean;
   // "<load>-<amp>": weight load dtype + mixed-precision (AMP) train dtype.
   precision?: "fp32-bf16" | "bf16-bf16" | "fp32-fp16" | "fp16-fp16";
   language?: string | null;

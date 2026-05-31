@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import (
@@ -332,6 +332,31 @@ def _ssh_put(cli, local: str, remote: str) -> None:
     chan = cli.get_transport().open_session()
     chan.set_combine_stderr(True)
     chan.exec_command(f"bash -c {_shlex.quote(write_cmd)}")
+    out = b""
+    while not chan.exit_status_ready() or chan.recv_ready():
+        if chan.recv_ready():
+            out += chan.recv(8192)
+        else:
+            time.sleep(0.05)
+    rc = chan.recv_exit_status()
+    if rc != 0:
+        raise RuntimeError(
+            f"remote write of {remote} failed (rc={rc}): {out.decode('utf-8', 'replace').strip()}"
+        )
+
+
+def _ssh_put_bytes(cli, data: bytes, remote: str) -> None:
+    """Stream raw bytes to a remote file over an exec channel's stdin (no SFTP,
+    no argv-length limit) — for payloads too big for _ssh_put's base64 argv
+    (capped ~128 KB by MAX_ARG_STRLEN), e.g. an uploaded audio clip."""
+    import shlex as _shlex
+
+    write_cmd = f"mkdir -p \"$(dirname {_shlex.quote(remote)})\" && cat > {_shlex.quote(remote)}"
+    chan = cli.get_transport().open_session()
+    chan.set_combine_stderr(True)
+    chan.exec_command(f"bash -c {_shlex.quote(write_cmd)}")
+    chan.sendall(data)
+    chan.shutdown_write()
     out = b""
     while not chan.exit_status_ready() or chan.recv_ready():
         if chan.recv_ready():
@@ -807,10 +832,24 @@ async def run_training(redis, run_id: str) -> None:
                 await asyncio.to_thread(_ssh_put, cli, str(base / "sweep_runner.py"), "/tmp/sweep_runner.py")
                 remote_script = "/tmp/sweep_runner.py"
                 env_prefix = ""  # the orchestrator pins each trial itself
+                launch = "python -u"
             else:
                 remote_script = worker_remote
                 env_prefix = f"CUDA_VISIBLE_DEVICES={visible_devices} " if visible_devices else ""
-            cmd = f"{user_env}{env_prefix}python -u {remote_script} --config {remote_cfg}"
+                # Multi-GPU single run → DistributedDataParallel via torch's
+                # launcher (one process per GPU), unless disabled — falls back to
+                # plain `python` (HF's implicit DataParallel). torch.distributed.run
+                # is used over the `torchrun` console script so it doesn't depend
+                # on PATH. The trainer rank-guards its log/upload (see _IS_MAIN).
+                n_gpus = (len([x for x in visible_devices.split(",") if x.strip()])
+                          if visible_devices else int(gpu_count or 1))
+                if cfg.get("use_ddp", True) and n_gpus > 1 and task_type == "asr":
+                    port = 29500 + (sum(ord(c) for c in run_id) % 2000)
+                    launch = f"python -m torch.distributed.run --nproc_per_node={n_gpus} --master_port={port}"
+                    await _push_log(redis, run_id, f"[gateway] DDP via torch.distributed.run · {n_gpus} GPUs")
+                else:
+                    launch = "python -u"
+            cmd = f"{user_env}{env_prefix}{launch} {remote_script} --config {remote_cfg}"
             await _push_log(redis, run_id, f"[gateway] $ {cmd}")
             rc = await asyncio.to_thread(_ssh_run_stream, cli, cmd, on_line)
         finally:
@@ -914,6 +953,9 @@ class CreateTrainingRunRequest(BaseModel):
     gpus_per_trial: int = 1
     # Hyperparams + split + eval settings (all optional; trainer has defaults).
     eval_metric: str = "wer"           # "wer" | "cer" (ASR only)
+    # Normalize text (case/punctuation/numbers) before WER/CER, Whisper-style.
+    # Off = score raw text (much higher, but exact-match strict).
+    normalize_text: bool = True
     max_epochs: int = 3
     patience: int = 0                  # 0 = no early stop
     eval_split_pct: float = 10.0
@@ -923,6 +965,19 @@ class CreateTrainingRunRequest(BaseModel):
     learning_rate: float = 1e-5
     warmup_steps: int = 0
     weight_decay: float = 0.0
+    # LoRA / PEFT — train low-rank adapters on the attention projections instead
+    # of the full model (less VRAM, faster). Merged into the base at save time
+    # so the artifact is a drop-in Whisper checkpoint (no peft to load/serve).
+    use_lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    # Freeze the encoder; train the decoder only (faster, less overfit on small data).
+    freeze_encoder: bool = False
+    # Multi-GPU strategy for a single (non-sweep) run: DDP via torchrun (one
+    # process/GPU, default) vs HF's implicit DataParallel. Ignored on 1 GPU and
+    # for sweeps (those pin gpus_per_trial per trial).
+    use_ddp: bool = True
     # Emit a training-loss point every N optimizer steps (@@STEP) for the live
     # loss curve. Smaller N = smoother graph, more log lines.
     logging_steps: int = 10
@@ -1064,7 +1119,14 @@ def _validate_sweep(sweep: dict) -> None:
             raise HTTPException(status_code=400, detail=f"sweep learning_rate: {v!r} is not a number like 1e-4")
         if not math.isfinite(f) or f <= 0:
             raise HTTPException(status_code=400, detail=f"sweep learning_rate: {v!r} must be a positive number like 1e-4")
-    for key in ("batch_size", "grad_accum", "max_epochs", "block_size"):
+    for v in (sweep.get("weight_decay") or []):  # 0 is valid for weight decay
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"sweep weight_decay: {v!r} is not a number")
+        if not math.isfinite(f) or f < 0:
+            raise HTTPException(status_code=400, detail=f"sweep weight_decay: {v!r} must be a non-negative number")
+    for key in ("batch_size", "grad_accum", "max_epochs", "block_size", "lora_r", "lora_alpha"):
         for v in (sweep.get(key) or []):
             try:
                 n = int(v)
@@ -1072,6 +1134,9 @@ def _validate_sweep(sweep: dict) -> None:
                 raise HTTPException(status_code=400, detail=f"sweep {key}: {v!r} must be a positive integer")
             if n <= 0:
                 raise HTTPException(status_code=400, detail=f"sweep {key}: {v!r} must be a positive integer")
+    for v in (sweep.get("freeze_encoder") or []):
+        if str(v).lower() not in ("on", "off", "true", "false", "1", "0", "yes", "no"):
+            raise HTTPException(status_code=400, detail=f"sweep freeze_encoder: {v!r} must be on/off")
 
 
 @router.post("", response_model=TrainingRunRecord)
@@ -1151,11 +1216,15 @@ async def create_training_run(
         "pack_sequence_length": body.pack_sequence_length,
         "default_speaker": body.default_speaker, "speaker_field": body.speaker_field,
         "sweep": body.sweep or {}, "gpus_per_trial": body.gpus_per_trial,
-        "eval_metric": body.eval_metric, "max_epochs": body.max_epochs,
+        "eval_metric": body.eval_metric, "normalize_text": body.normalize_text,
+        "max_epochs": body.max_epochs,
         "patience": body.patience, "eval_split_pct": body.eval_split_pct,
         "split_seed": body.split_seed, "batch_size": body.batch_size,
         "grad_accum": body.grad_accum, "learning_rate": body.learning_rate,
         "warmup_steps": body.warmup_steps, "weight_decay": body.weight_decay,
+        "use_lora": body.use_lora, "lora_r": body.lora_r,
+        "lora_alpha": body.lora_alpha, "lora_dropout": body.lora_dropout,
+        "freeze_encoder": body.freeze_encoder, "use_ddp": body.use_ddp,
         "logging_steps": body.logging_steps,
         "augment_techniques": [t for t in (body.augment_techniques or []) if t in _AUG_TECHNIQUES],
         "augment_prob": body.augment_prob,
@@ -1502,6 +1571,74 @@ async def _resolve_run_ssh(row: TrainingRun) -> Optional[tuple[str, int, str, st
     return ip, int(port), "root", key
 
 
+def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
+                        run_id: str, model_s3: str, creds: dict, audio: bytes,
+                        filename: str, cfg: dict, gpu: Optional[str] = None) -> tuple[str, Optional[str]]:
+    """SSH to the run's VM, ship the transcribe script + the audio clip, run it
+    against the finetuned model (downloaded from S3 there), and return the text.
+    Blocking — call via to_thread."""
+    import tempfile
+
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        _ssh_put(cli, str(base / "transcribe.py"), "/tmp/sgpu_transcribe.py")
+        ext = os.path.splitext(filename)[1] or ".wav"
+        remote_audio = f"/tmp/sgpu_tryit_audio{ext}"
+        _ssh_put_bytes(cli, audio, remote_audio)
+        work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
+        tconf = {
+            "model_s3": model_s3,
+            "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+            "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+            "audio_path": remote_audio,
+            "model_dir": f"{work_dir}/sgpu-tryit/{run_id}",
+            "language": cfg.get("language") or None,
+            "task": cfg.get("task") or "transcribe",
+            "gpu": gpu or "auto",
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(tconf))
+            local_cfg = f.name
+        try:
+            _ssh_put(cli, local_cfg, "/tmp/sgpu_transcribe.json")
+        finally:
+            try:
+                os.unlink(local_cfg)
+            except OSError:
+                pass
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        out: dict = {"text": None, "device": None, "error": None, "lines": []}
+
+        def on_line(line: str) -> None:
+            out["lines"].append(line)
+            j = line.find("@@TEXT ")
+            if j >= 0:
+                try:
+                    obj = json.loads(line[j + len("@@TEXT "):])
+                except Exception:  # noqa: BLE001
+                    return
+                if obj.get("error"):
+                    out["error"] = obj["error"]
+                else:
+                    out["text"] = obj.get("text", "")
+                    out["device"] = obj.get("device")
+
+        cmd = f"{user_env}python -u /tmp/sgpu_transcribe.py --config /tmp/sgpu_transcribe.json"
+        rc = _ssh_run_stream(cli, cmd, on_line)
+        if out["error"]:
+            raise RuntimeError(out["error"])
+        if out["text"] is None:
+            tail = "\n".join(out["lines"][-15:])
+            raise RuntimeError(f"transcription produced no output (rc={rc}):\n{tail}")
+        return out["text"], out.get("device")
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _gpu_query_sync(run_id: str, host: str, port: int, user: str,
                     key_filename: str, gpu_csv: Optional[str]) -> list[dict]:
     """`nvidia-smi` over a cached SSH connection → per-GPU util + memory. Only
@@ -1572,3 +1709,67 @@ async def training_gpu(
     except Exception as e:  # noqa: BLE001
         return {"status": row.status, "gpus": [], "error": str(e)[:200]}
     return {"status": row.status, "gpus": gpus}
+
+
+class TranscribeResponse(BaseModel):
+    text: str
+    device: Optional[str] = None
+
+
+@router.post("/{run_id}/transcribe", response_model=TranscribeResponse)
+async def transcribe_with_run(
+    run_id: str,
+    request: Request,
+    filename: str = Query("audio.wav", description="original file name (for the audio extension)"),
+    gpu: Optional[str] = Query(None, description="GPU index to run on (e.g. '6'), 'cpu', or 'auto'"),
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Try-it playground: transcribe one uploaded clip with this run's finetuned
+    model. Runs on the run's VM over SSH (the control plane has no GPU/ML deps),
+    so it needs a finished ASR run on a kind=vm provider — cloud-pod runs are
+    gone after training. The raw audio bytes are the request body."""
+    row = await _owned(run_id, user, session)
+    if (row.task_type or "asr") != "asr":
+        raise HTTPException(status_code=400, detail="try-it is for ASR (Whisper) runs")
+    if row.status != "done":
+        raise HTTPException(status_code=400, detail="the run must finish training first")
+    model_s3 = ((row.result_json or {}).get("artifact") or {}).get("s3_uri")
+    if not model_s3:
+        raise HTTPException(status_code=400, detail="no trained model artifact for this run")
+    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+    if prov is None or prov.kind != "vm":
+        raise HTTPException(
+            status_code=400,
+            detail=("try-it runs on a VM provider; this run used a cloud pod "
+                    "(gone after training). Push to HF and try there, or re-run on a VM."),
+        )
+    # Validate the GPU choice against the run's pinned GPUs (if any).
+    sel = (gpu or "").strip().lower()
+    if sel and sel not in ("cpu", "auto"):
+        if not sel.isdigit():
+            raise HTTPException(status_code=400, detail="gpu must be a GPU index, 'cpu', or 'auto'")
+        allowed = [x.strip() for x in (row.visible_devices or "").split(",") if x.strip()]
+        if allowed and sel not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"GPU {sel} not in this run's GPUs ({', '.join(allowed)})",
+            )
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(status_code=400, detail="empty audio upload")
+    if len(audio) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="audio too large (max 25 MB) — try-it is for short clips")
+    storage = await session.get(Storage, row.storage_id) if row.storage_id else None
+    creds = _s3_creds_from_storage(storage)
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
+    try:
+        text, device = await asyncio.to_thread(
+            _run_transcribe_ssh, *ssh, run_id, model_s3, creds, audio,
+            filename or "audio.wav", dict(row.config_json or {}), sel or "auto",
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"transcription failed: {e}")
+    return TranscribeResponse(text=text, device=device)

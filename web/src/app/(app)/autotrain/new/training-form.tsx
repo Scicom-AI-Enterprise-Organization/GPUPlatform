@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   Activity,
   AlertCircle,
@@ -132,14 +132,16 @@ function parseCsvNums(s: string, asInt: boolean): number[] {
 
 // Comma/space-separated tokens that AREN'T a positive number (kind="int" also
 // requires an integer). Used to reject bad sweep cells instead of dropping them.
-function invalidNumTokens(s: string, kind: "num" | "int"): string[] {
+function invalidNumTokens(s: string, kind: "num" | "int" | "nonneg"): string[] {
   return s
     .split(/[,\s]+/)
     .map((t) => t.trim())
     .filter(Boolean)
     .filter((t) => {
       const n = Number(t);
-      if (!Number.isFinite(n) || n <= 0) return true;
+      if (!Number.isFinite(n)) return true;
+      if (kind === "nonneg") return n < 0;       // weight decay: 0 is valid
+      if (n <= 0) return true;
       return kind === "int" && !Number.isInteger(n);
     });
 }
@@ -175,6 +177,10 @@ type VmAvailState =
 
 export function TrainingForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  // ?from=<runId> → prefill the form with that run's config ("Edit as new").
+  const fromId = searchParams.get("from");
+  const [prefilling, setPrefilling] = useState(!!fromId);
   const [datasets, setDatasets] = useState<DatasetRecord[]>([]);
   const [storages, setStorages] = useState<StorageRecord[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -197,6 +203,7 @@ export function TrainingForm() {
   const [gradAccum, setGradAccum] = useState(4);
   // training
   const [evalMetric, setEvalMetric] = useState<"wer" | "cer">("wer");
+  const [normalizeText, setNormalizeText] = useState(true);
   const [maxEpochs, setMaxEpochs] = useState(3);
   const [patience, setPatience] = useState(1);
   const [batchSize, setBatchSize] = useState(8);
@@ -204,6 +211,15 @@ export function TrainingForm() {
   const [learningRate, setLearningRate] = useState("1e-5");
   const [precision, setPrecision] = useState<string>("fp32-bf16");
   const [language, setLanguage] = useState("");
+  const [weightDecay, setWeightDecay] = useState(0.0);
+  // LoRA / PEFT (merged into base at save → drop-in checkpoint)
+  const [useLora, setUseLora] = useState(false);
+  const [loraR, setLoraR] = useState(16);
+  const [loraAlpha, setLoraAlpha] = useState(32);
+  const [loraDropout, setLoraDropout] = useState(0.05);
+  const [freezeEncoder, setFreezeEncoder] = useState(false);
+  // Multi-GPU single run: DDP (torchrun) vs DataParallel.
+  const [useDdp, setUseDdp] = useState(true);
   // hyperparameter sweep
   const [sweepOn, setSweepOn] = useState(false);
   const [gpusPerTrial, setGpusPerTrial] = useState(1);
@@ -212,10 +228,15 @@ export function TrainingForm() {
   const [sweepGradAccum, setSweepGradAccum] = useState("");
   const [sweepEpochs, setSweepEpochs] = useState("");
   const [sweepBlock, setSweepBlock] = useState("");
+  const [sweepWeightDecay, setSweepWeightDecay] = useState("");
+  const [sweepLoraR, setSweepLoraR] = useState("");
+  const [sweepLoraAlpha, setSweepLoraAlpha] = useState("");
   const [sweepPrecisions, setSweepPrecisions] = useState<string[]>([]);
   // compare augmentation on/off as a sweep dimension (the "on" arm uses the
   // selected techniques + probability below; the "off" arm trains clean audio).
   const [sweepAugment, setSweepAugment] = useState(false);
+  // compare freeze-encoder on/off as a sweep dimension.
+  const [sweepFreeze, setSweepFreeze] = useState(false);
   // run on (pod card — mirrors benchmark/new)
   const [target, setTarget] = useState<"cloud" | "vm">("cloud");
   const [providerId, setProviderId] = useState(""); // vm provider
@@ -279,6 +300,108 @@ export function TrainingForm() {
       .catch(() => {});
   }, []);
 
+  // "Edit as new": fetch the source run and replay its config_json + record into
+  // form state. All sets happen inside the async callback (post-mount), so they
+  // override the useState defaults without fighting the initial render.
+  useEffect(() => {
+    if (!fromId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await gateway.getTrainingRun(fromId);
+        if (cancelled) return;
+        const c = (r.config_json ?? {}) as Record<string, unknown>;
+        const num = (v: unknown, d: number) => (typeof v === "number" && Number.isFinite(v) ? v : d);
+        const str = (v: unknown) => (v == null ? "" : String(v));
+        const arr = (v: unknown) => (Array.isArray(v) ? (v as unknown[]) : []);
+        const csv = (v: unknown) => arr(v).join(", ");
+
+        const tt: "asr" | "tts" = (r.task_type ?? c.task_type) === "tts" ? "tts" : "asr";
+        setTaskType(tt);
+        const models = tt === "tts" ? TTS_BASE_MODELS : WHISPER_MODELS;
+        if (r.base_model && models.includes(r.base_model)) setModelChoice(r.base_model);
+        else if (r.base_model) { setModelChoice(CUSTOM); setCustomModel(r.base_model); }
+        setName(r.name || (tt === "tts" ? "tts-finetune" : "whisper-finetune"));
+        setDatasetId(r.dataset_id || "");
+        setTestDatasetId(r.test_dataset_id || AUTO_SPLIT);
+        if (c.eval_split_pct != null) setEvalSplitPct(num(c.eval_split_pct, 10));
+        // TTS knobs
+        if (c.tokenizer) setTtsTokenizer(str(c.tokenizer));
+        if (c.block_size != null) setBlockSize(num(c.block_size, 10240));
+        if (c.pack_sequence_length != null) setPackSeq(num(c.pack_sequence_length, 4096));
+        if (c.default_speaker) setDefaultSpeaker(str(c.default_speaker));
+        // training
+        if (c.grad_accum != null) setGradAccum(num(c.grad_accum, 4));
+        if (c.eval_metric === "wer" || c.eval_metric === "cer") setEvalMetric(c.eval_metric);
+        if (c.normalize_text != null) setNormalizeText(!!c.normalize_text);
+        if (c.max_epochs != null) setMaxEpochs(num(c.max_epochs, 3));
+        if (c.patience != null) setPatience(num(c.patience, 1));
+        if (c.batch_size != null) setBatchSize(num(c.batch_size, 8));
+        if (c.logging_steps != null) setLoggingSteps(num(c.logging_steps, 10));
+        if (c.learning_rate != null) setLearningRate(str(c.learning_rate));
+        if (c.weight_decay != null) setWeightDecay(num(c.weight_decay, 0));
+        if (c.use_lora != null) setUseLora(!!c.use_lora);
+        if (c.lora_r != null) setLoraR(num(c.lora_r, 16));
+        if (c.lora_alpha != null) setLoraAlpha(num(c.lora_alpha, 32));
+        if (c.lora_dropout != null) setLoraDropout(num(c.lora_dropout, 0.05));
+        if (c.freeze_encoder != null) setFreezeEncoder(!!c.freeze_encoder);
+        if (c.use_ddp != null) setUseDdp(!!c.use_ddp);
+        if (c.precision) setPrecision(str(c.precision));
+        if (c.language != null) setLanguage(str(c.language));
+        // sweep
+        const sweep = (c.sweep ?? {}) as Record<string, unknown>;
+        if (Object.values(sweep).some((v) => Array.isArray(v) && v.length)) {
+          setSweepOn(true);
+          if (c.gpus_per_trial != null) setGpusPerTrial(num(c.gpus_per_trial, 1));
+          setSweepLr(csv(sweep.learning_rate));
+          setSweepBatch(csv(sweep.batch_size));
+          setSweepGradAccum(csv(sweep.grad_accum));
+          setSweepEpochs(csv(sweep.max_epochs));
+          setSweepBlock(csv(sweep.block_size));
+          setSweepWeightDecay(csv(sweep.weight_decay));
+          setSweepLoraR(csv(sweep.lora_r));
+          setSweepLoraAlpha(csv(sweep.lora_alpha));
+          setSweepPrecisions(arr(sweep.precision).map(String));
+          setSweepAugment(arr(sweep.augment).length > 0);
+          setSweepFreeze(arr(sweep.freeze_encoder).length > 0);
+        }
+        // augmentation
+        if (Array.isArray(c.augment_techniques)) setAugmentTechniques(arr(c.augment_techniques).map(String));
+        if (c.augment_prob != null) setAugmentProb(num(c.augment_prob, 0.5));
+        // run on
+        if (r.provider_kind === "vm") { setTarget("vm"); setProviderId(r.provider_id || ""); }
+        else if (r.provider_id) { setTarget("cloud"); setRunpodProviderId(r.provider_id); }
+        if (r.gpu_type) setGpuType(r.gpu_type);
+        if (r.gpu_count != null) setGpuCount(r.gpu_count);
+        if (c.secure_cloud != null) setSecureCloud(!!c.secure_cloud);
+        if (c.disk_gb != null) setDiskGb(num(c.disk_gb, 60));
+        if (c.volume_gb != null) setVolumeGb(num(c.volume_gb, 80));
+        setVisibleDevices(r.visible_devices || "");
+        // env vars dict → KEY=value lines
+        const ev = (c.env_vars ?? {}) as Record<string, unknown>;
+        const evText = Object.entries(ev).map(([k, v]) => `${k}=${v}`).join("\n");
+        if (evText) setEnvText(evText);
+        // artifacts
+        setStorageId(r.storage_id || "");
+        if (c.hf_push_repo) setHfPushRepo(str(c.hf_push_repo));
+        if (c.work_dir) setWorkDir(str(c.work_dir));
+        if (c.cleanup_checkpoints != null) setCleanupCheckpoints(!!c.cleanup_checkpoints);
+        // experiment tracking
+        if (c.wandb_credential_id) setWandbCredId(str(c.wandb_credential_id));
+        if (c.mlflow_credential_id) setMlflowCredId(str(c.mlflow_credential_id));
+        if (c.wandb_project) setWandbProject(str(c.wandb_project));
+        if (c.wandb_entity) setWandbEntity(str(c.wandb_entity));
+        if (c.mlflow_tracking_uri) setMlflowUri(str(c.mlflow_tracking_uri));
+        if (c.mlflow_experiment) setMlflowExperiment(str(c.mlflow_experiment));
+      } catch (e) {
+        toast.error(`Couldn't load ${fromId}: ${e instanceof Error ? e.message : String(e)}`, { duration: 6000 });
+      } finally {
+        if (!cancelled) setPrefilling(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [fromId]);
+
   useEffect(() => {
     if (target === "vm" && providerId) refreshVmAvail(providerId);
     else setVmAvail({ status: "idle" });
@@ -339,9 +462,17 @@ export function TrainingForm() {
     const ep = parseCsvNums(sweepEpochs, true);
     if (ep.length) s.max_epochs = ep;
     if (sweepPrecisions.length) s.precision = sweepPrecisions;
+    const wd = parseCsvNums(sweepWeightDecay, false);
+    if (wd.length) s.weight_decay = wd;
+    const lr_ = parseCsvNums(sweepLoraR, true);
+    if (lr_.length) s.lora_r = lr_;
+    const la = parseCsvNums(sweepLoraAlpha, true);
+    if (la.length) s.lora_alpha = la;
     // Augment vs. no-augment. The "on" arm reuses augmentTechniques/augmentProb;
     // only meaningful when at least one technique is selected.
     if (sweepAugment && augmentTechniques.length) s.augment = ["on", "off"];
+    // Freeze-encoder vs full as a sweep dimension (ASR only).
+    if (sweepFreeze && !isTts) s.freeze_encoder = ["on", "off"];
     if (isTts) {
       const bs = parseCsvNums(sweepBlock, true);
       if (bs.length) s.block_size = bs;
@@ -397,16 +528,20 @@ export function TrainingForm() {
       if (sweepLr.trim() && badLr.length) {
         return setError(`Learning rates (sweep): ${badLr.map((b) => `"${b}"`).join(", ")} — use positive numbers like 1e-4.`);
       }
-      const intFields = [
-        { label: "Batch sizes", val: sweepBatch },
-        { label: "Grad-accum steps", val: sweepGradAccum },
-        { label: "Max epochs", val: sweepEpochs },
-        ...(isTts ? [{ label: "Block sizes", val: sweepBlock }] : []),
+      const numFields: { label: string; val: string; kind: "int" | "nonneg" }[] = [
+        { label: "Batch sizes", val: sweepBatch, kind: "int" },
+        { label: "Grad-accum steps", val: sweepGradAccum, kind: "int" },
+        { label: "Max epochs", val: sweepEpochs, kind: "int" },
+        { label: "LoRA r", val: sweepLoraR, kind: "int" },
+        { label: "LoRA alpha", val: sweepLoraAlpha, kind: "int" },
+        { label: "Weight decay", val: sweepWeightDecay, kind: "nonneg" },
+        ...(isTts ? [{ label: "Block sizes", val: sweepBlock, kind: "int" as const }] : []),
       ];
-      for (const f of intFields) {
-        const bad = invalidNumTokens(f.val, "int");
+      for (const f of numFields) {
+        const bad = invalidNumTokens(f.val, f.kind);
         if (f.val.trim() && bad.length) {
-          return setError(`${f.label} (sweep): ${bad.map((b) => `"${b}"`).join(", ")} — use positive integers.`);
+          const want = f.kind === "nonneg" ? "non-negative numbers" : "positive integers";
+          return setError(`${f.label} (sweep): ${bad.map((b) => `"${b}"`).join(", ")} — use ${want}.`);
         }
       }
       // GPUs per trial can't exceed the GPUs available to the sweep
@@ -426,12 +561,20 @@ export function TrainingForm() {
       task_type: taskType,
       test_dataset_id: isTts ? null : (testDatasetId === AUTO_SPLIT ? null : testDatasetId),
       eval_metric: evalMetric,
+      normalize_text: normalizeText,
       max_epochs: maxEpochs,
       patience: isTts ? 0 : patience,
       eval_split_pct: evalSplitPct,
       batch_size: batchSize,
       grad_accum: gradAccum,
       learning_rate: Number(learningRate) || (isTts ? 2e-5 : 1e-5),
+      weight_decay: weightDecay,
+      use_lora: useLora || (sweepOn && (sweepLoraR.trim() !== "" || sweepLoraAlpha.trim() !== "")),
+      lora_r: loraR,
+      lora_alpha: loraAlpha,
+      lora_dropout: loraDropout,
+      freeze_encoder: freezeEncoder,
+      use_ddp: useDdp,
       logging_steps: loggingSteps,
       precision: precision as CreateTrainingRunRequest["precision"],
       language: isTts ? null : (language.trim() || null),
@@ -491,6 +634,14 @@ export function TrainingForm() {
             ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM (loss-only; metrics to W&B/MLflow)."
             : "Finetune a Whisper model on a dataset. WER + CER are evaluated each epoch; training stops at the max-epoch cap or early on patience."}
         </p>
+        {fromId && (
+          <p className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground">
+            {prefilling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            {prefilling
+              ? `Loading config from ${fromId}…`
+              : <>Pre-filled from <span className="font-mono">{fromId}</span> — review and tweak before creating.</>}
+          </p>
+        )}
       </div>
 
       {/* Training type */}
@@ -609,6 +760,15 @@ export function TrainingForm() {
           <FieldWrap label="Log loss every N steps" hint="Streams a training-loss point every N steps (@@STEP) for the live loss curve. Smaller = smoother, more log lines.">
             <NumberField min={1} value={loggingSteps} onChange={setLoggingSteps} />
           </FieldWrap>
+          {!isTts && (
+            <FieldWrap label="WER / CER text" hint="Normalize (Whisper-style: lowercase, strip punctuation, spell out numbers) before scoring, or score raw text.">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={normalizeText} onChange={(e) => setNormalizeText(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span>Normalize before WER/CER</span>
+              </label>
+            </FieldWrap>
+          )}
         </div>
 
         <div className="mb-5 flex items-center gap-3">
@@ -688,6 +848,16 @@ export function TrainingForm() {
           ) : isTts ? (
             <FieldWrap label="Grad accumulation"><NumberField min={1} value={gradAccum} onChange={setGradAccum} /></FieldWrap>
           ) : null}
+          {sweepOn ? (
+            <FieldWrap label="Weight decay" hint="AdamW L2 — e.g. 0, 0.01, 0.1">
+              <Input className="font-mono" placeholder="0, 0.01, 0.1" value={sweepWeightDecay} onChange={(e) => setSweepWeightDecay(e.target.value)} />
+            </FieldWrap>
+          ) : (
+            <FieldWrap label="Weight decay (AdamW)" hint="L2 regularization. 0 = off.">
+              <Input className="font-mono" type="number" min={0} step={0.01} value={weightDecay}
+                onChange={(e) => setWeightDecay(Math.max(0, Number(e.target.value) || 0))} />
+            </FieldWrap>
+          )}
 
           {/* TTS knobs */}
           {isTts && (sweepOn ? (
@@ -719,6 +889,57 @@ export function TrainingForm() {
             </FieldWrap>
           )}
         </Grid>
+
+        {/* LoRA + freeze-encoder (ASR / Whisper) */}
+        {!isTts && (
+          <div className="mt-4 space-y-3 border-t border-border pt-4">
+            <div className="flex flex-wrap items-center gap-x-8 gap-y-2">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={useLora} onChange={(e) => setUseLora(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span className="font-medium">Use LoRA</span>
+                <span className="text-xs text-muted-foreground">adapters on q/v attention, merged into the base at save</span>
+              </label>
+              {sweepOn ? (
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input type="checkbox" checked={sweepFreeze} onChange={(e) => setSweepFreeze(e.target.checked)}
+                    className="h-4 w-4 accent-primary" />
+                  <span className="font-medium">Sweep freeze-encoder</span>
+                  <span className="text-xs text-muted-foreground">compare frozen vs full (×2 trials)</span>
+                </label>
+              ) : (
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input type="checkbox" checked={freezeEncoder} onChange={(e) => setFreezeEncoder(e.target.checked)}
+                    className="h-4 w-4 accent-primary" />
+                  <span className="font-medium">Freeze encoder</span>
+                  <span className="text-xs text-muted-foreground">train the decoder only</span>
+                </label>
+              )}
+            </div>
+            {useLora && (
+              <div className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-3">
+                {sweepOn ? (
+                  <FieldWrap label="LoRA r" hint="e.g. 8, 16, 32">
+                    <Input className="font-mono" placeholder="8, 16, 32" value={sweepLoraR} onChange={(e) => setSweepLoraR(e.target.value)} />
+                  </FieldWrap>
+                ) : (
+                  <FieldWrap label="LoRA r" hint="Adapter rank."><NumberField min={1} value={loraR} onChange={setLoraR} /></FieldWrap>
+                )}
+                {sweepOn ? (
+                  <FieldWrap label="LoRA alpha" hint="e.g. 16, 32, 64">
+                    <Input className="font-mono" placeholder="16, 32, 64" value={sweepLoraAlpha} onChange={(e) => setSweepLoraAlpha(e.target.value)} />
+                  </FieldWrap>
+                ) : (
+                  <FieldWrap label="LoRA alpha" hint="Scaling (≈2×r)."><NumberField min={1} value={loraAlpha} onChange={setLoraAlpha} /></FieldWrap>
+                )}
+                <FieldWrap label="LoRA dropout" hint="0–1, on the adapters.">
+                  <Input className="font-mono" type="number" min={0} max={1} step={0.01} value={loraDropout}
+                    onChange={(e) => setLoraDropout(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />
+                </FieldWrap>
+              </div>
+            )}
+          </div>
+        )}
 
         {sweepOn && (
           <p className="mt-4 text-[11px] leading-snug text-muted-foreground">
@@ -959,6 +1180,27 @@ export function TrainingForm() {
             </p>
           )}
         </div>
+
+        {/* DDP — only meaningful for a multi-GPU single run (sweeps pin 1/trial) */}
+        {!sweepOn && !isTts && (() => {
+          const n = visibleDevices.trim()
+            ? visibleDevices.split(",").filter((x) => x.trim()).length
+            : gpuBound;
+          if (n <= 1) return null;
+          return (
+            <label className="mt-4 flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-sm hover:bg-muted/50">
+              <input type="checkbox" checked={useDdp} onChange={(e) => setUseDdp(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary" />
+              <span className="min-w-0">
+                <span className="font-medium">Distributed training (DDP)</span>
+                <span className="block text-xs text-muted-foreground">
+                  One process per GPU via <span className="font-mono">torchrun</span> ({n} GPUs) — faster + balanced than
+                  single-process DataParallel. Uncheck to use DataParallel.
+                </span>
+              </span>
+            </label>
+          );
+        })()}
 
         <div className="mt-4 space-y-1.5">
           <Label htmlFor="train-workdir" className="text-xs">Checkpoint / temp directory</Label>

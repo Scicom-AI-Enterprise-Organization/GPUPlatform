@@ -26,13 +26,23 @@ import tempfile
 import traceback
 
 
+# Under torchrun (DDP) every GPU runs this script as a separate rank; only rank 0
+# may write to the gateway's SSH stream, else every log line + @@STEP/@@METRIC is
+# duplicated WORLD_SIZE times (and the gateway parses garbage). torchrun sets RANK
+# before the script runs; plain `python` (single GPU / DataParallel) leaves it
+# unset → rank 0.
+_IS_MAIN = os.environ.get("RANK", "0") == "0"
+
+
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    if _IS_MAIN:
+        print(msg, flush=True)
 
 
 def emit(tag: str, obj: dict) -> None:
-    """Structured line the gateway parses out of the stream."""
-    print(f"@@{tag} {json.dumps(obj)}", flush=True)
+    """Structured line the gateway parses out of the stream (rank-0 only)."""
+    if _IS_MAIN:
+        print(f"@@{tag} {json.dumps(obj)}", flush=True)
 
 
 # Set by run() to the run's work dir; rm'd by main() when cleanup_checkpoints is on.
@@ -124,6 +134,17 @@ def ensure_tracker_deps(report_to: list[str]) -> None:
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *want]
         )
+
+
+def ensure_lora_deps() -> None:
+    """Install peft on demand (only when a run requests LoRA)."""
+    try:
+        import peft  # noqa: F401
+        return
+    except Exception:
+        pass
+    log("[deps] installing peft (LoRA) …")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "peft>=0.11"])
 
 
 # --------------------------------------------------------------------------
@@ -402,24 +423,33 @@ class _LazyAsrDataset:
         return len(self.items)
 
     def __getitem__(self, idx: int) -> dict:
-        it = self.items[idx]
-        if it.get("src") == "hf":
-            a = it["hf_split"][it["hf_idx"]][it["audio_field"]]
-            array, sr = a["array"], a["sampling_rate"]
-        else:
-            import librosa
-            os.makedirs(self.audio_dir, exist_ok=True)
-            path = _download_audio_s3(it["s3_spec"], it["s3_ref"], self.audio_dir)
-            if path is None:
-                raise RuntimeError(f"audio fetch failed for {it.get('s3_ref')!r}")
-            array, sr = librosa.load(path, sr=16000)  # decode + resample to 16k
-        if self.augment_techniques and random.random() < self.augment_prob:
-            array = _augment_audio(array, sr, self.augment_techniques)
-        feat = self.processor.feature_extractor(
-            array, sampling_rate=sr
-        ).input_features[0]
-        labels = self.processor.tokenizer(it["text"]).input_ids
-        return {"input_features": feat, "labels": labels}
+        # A single unreachable/corrupt clip must not kill the whole trial — skip
+        # to the next item (wrapping) so the batch stays full. Only raise if a
+        # whole window is unloadable (a genuinely broken dataset).
+        n = len(self.items)
+        last_err = None
+        for off in range(min(16, n)):
+            it = self.items[(idx + off) % n]
+            try:
+                if it.get("src") == "hf":
+                    a = it["hf_split"][it["hf_idx"]][it["audio_field"]]
+                    array, sr = a["array"], a["sampling_rate"]
+                else:
+                    import librosa
+                    os.makedirs(self.audio_dir, exist_ok=True)
+                    path = _download_audio_s3(it["s3_spec"], it["s3_ref"], self.audio_dir)
+                    if path is None:
+                        raise RuntimeError(f"audio fetch failed for {it.get('s3_ref')!r}")
+                    array, sr = librosa.load(path, sr=16000)  # decode + resample to 16k
+                if self.augment_techniques and random.random() < self.augment_prob:
+                    array = _augment_audio(array, sr, self.augment_techniques)
+                feat = self.processor.feature_extractor(array, sampling_rate=sr).input_features[0]
+                labels = self.processor.tokenizer(it["text"]).input_ids
+                return {"input_features": feat, "labels": labels}
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        raise RuntimeError(f"no loadable audio near index {idx}: {last_err}")
 
 
 # --------------------------------------------------------------------------
@@ -518,6 +548,35 @@ def run(cfg: dict) -> None:
     model.config.forced_decoder_ids = None
     model.config.suppress_tokens = []
 
+    # Freeze the encoder (train decoder only) — faster + less overfitting on
+    # small corpora. Independent of LoRA.
+    if cfg.get("freeze_encoder"):
+        model.freeze_encoder()
+        log("[train] encoder frozen — training the decoder only")
+
+    # LoRA / PEFT — train low-rank adapters on the attention projections instead
+    # of the full model (far less VRAM + faster). The adapters are merged back
+    # into the base weights at save time, so the artifact is a drop-in Whisper
+    # checkpoint (no peft needed to load/serve it).
+    use_lora = bool(cfg.get("use_lora"))
+    if use_lora:
+        ensure_lora_deps()
+        from peft import LoraConfig, get_peft_model
+
+        lconf = LoraConfig(
+            r=int(cfg.get("lora_r", 16)),
+            lora_alpha=int(cfg.get("lora_alpha", 32)),
+            lora_dropout=float(cfg.get("lora_dropout", 0.05)),
+            target_modules=["q_proj", "v_proj"],
+            bias="none",
+        )
+        model = get_peft_model(model, lconf)
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_all = sum(p.numel() for p in model.parameters())
+        log(f"[train] LoRA enabled (r={lconf.r}, alpha={lconf.lora_alpha}, "
+            f"dropout={lconf.lora_dropout}) — {n_train:,}/{n_all:,} params trainable "
+            f"({100 * n_train / max(1, n_all):.2f}%)")
+
     # Lazy datasets: no upfront decode / Arrow build. Feature extraction happens
     # in __getitem__, parallelized by the DataLoader's workers and overlapped
     # with GPU compute — so training starts immediately.
@@ -557,14 +616,43 @@ def run(cfg: dict) -> None:
     wer_metric = hf_evaluate.load("wer")
     cer_metric = hf_evaluate.load("cer")
 
+    # Whisper's standard eval normalizes text (lowercase, strip punctuation,
+    # spell-out numbers, …) BEFORE scoring — otherwise WER/CER are inflated by
+    # casing/punctuation and aren't comparable to any published number. Use the
+    # tokenizer's English normalizer for en, the multilingual basic normalizer
+    # otherwise; fall back to lowercasing if the helper isn't available. Opt out
+    # via normalize_text=false to score raw (cased + punctuated) text.
+    _tok = processor.tokenizer
+    _is_en = (language or "").lower() in ("en", "english")
+    _do_norm = bool(cfg.get("normalize_text", True))
+    log(f"[train] WER/CER on {'normalized' if _do_norm else 'raw'} text")
+
+    def _normalize(s: str) -> str:
+        s = s or ""
+        if not _do_norm:
+            return s.strip()
+        try:
+            return _tok.normalize(s) if _is_en else _tok.basic_normalize(s)
+        except Exception:
+            return s.lower().strip()
+
     def compute_metrics(pred):
         pred_ids = pred.predictions
         label_ids = pred.label_ids
-        label_ids = np.where(label_ids != -100, label_ids, processor.tokenizer.pad_token_id)
-        pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-        label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-        wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
-        cer = 100 * cer_metric.compute(predictions=pred_str, references=label_str)
+        label_ids = np.where(label_ids != -100, label_ids, _tok.pad_token_id)
+        pred_str = _tok.batch_decode(pred_ids, skip_special_tokens=True)
+        label_str = _tok.batch_decode(label_ids, skip_special_tokens=True)
+        # jiwer errors on an empty reference — drop pairs whose normalized
+        # reference is blank (e.g. punctuation-only labels).
+        pairs = [(p, r) for p, r in (
+            (_normalize(ps), _normalize(ls)) for ps, ls in zip(pred_str, label_str)
+        ) if r.strip()]
+        if not pairs:
+            return {"wer": 0.0, "cer": 0.0}
+        preds = [p for p, _ in pairs]
+        refs = [r for _, r in pairs]
+        wer = 100 * wer_metric.compute(predictions=preds, references=refs)
+        cer = 100 * cer_metric.compute(predictions=preds, references=refs)
         return {"wer": wer, "cer": cer}
 
     # ---- experiment tracking (W&B / MLflow via HF Trainer's report_to) ----
@@ -659,9 +747,8 @@ def run(cfg: dict) -> None:
     epochs_ran = int(round(result.metrics.get("epoch", 0)))
     stopped_early = epochs_ran < int(cfg["max_epochs"])
 
-    best_dir = os.path.join(work, "best-model")
-    trainer.save_model(best_dir)
-    processor.save_pretrained(best_dir)
+    # evaluate() is a collective op under DDP — EVERY rank must call it or the
+    # ranks deadlock. Save + upload + push happen on rank 0 only (below).
     final = trainer.evaluate()
     best = {
         "epoch": epochs_ran,
@@ -669,6 +756,22 @@ def run(cfg: dict) -> None:
         "cer": final.get("eval_cer"),
         "eval_loss": final.get("eval_loss"),
     }
+    if not _IS_MAIN:
+        return  # non-main DDP ranks: nothing more to do; rank 0 saves/uploads.
+
+    best_dir = os.path.join(work, "best-model")
+    # Unwrap any DDP/DataParallel wrapper; fold LoRA adapters into the base so the
+    # saved checkpoint is a plain Whisper model (loads + serves without peft).
+    save_model = trainer.model
+    try:
+        save_model = trainer.accelerator.unwrap_model(save_model)
+    except Exception:  # noqa: BLE001
+        pass
+    if use_lora and hasattr(save_model, "merge_and_unload"):
+        save_model = save_model.merge_and_unload()
+        log("[train] merged LoRA adapters into the base weights")
+    save_model.save_pretrained(best_dir)
+    processor.save_pretrained(best_dir)
 
     # ---- upload artifacts to S3 (best model + metrics) ----
     art = cfg.get("artifacts") or {}
@@ -689,11 +792,11 @@ def run(cfg: dict) -> None:
         s3_uri = f"s3://{art['bucket']}/{base_key}/"
         log(f"[upload] best model → {s3_uri}")
 
-    # ---- optional HF push ----
+    # ---- optional HF push (the merged model, so it's a drop-in checkpoint) ----
     hf_repo = None
     if cfg.get("hf_push_repo") and cfg.get("hf_token"):
         try:
-            model.push_to_hub(cfg["hf_push_repo"], token=cfg["hf_token"])
+            save_model.push_to_hub(cfg["hf_push_repo"], token=cfg["hf_token"])
             processor.push_to_hub(cfg["hf_push_repo"], token=cfg["hf_token"])
             hf_repo = cfg["hf_push_repo"]
             log(f"[upload] pushed best model → https://huggingface.co/{hf_repo}")
@@ -722,8 +825,10 @@ def _redirect_tmp(base: str) -> None:
 
 
 def _cleanup_workdir(enabled: bool) -> None:
-    """rm the run's checkpoints + work dir (the best model is already on S3)."""
-    if not enabled or not _RUN_WORKDIR:
+    """rm the run's checkpoints + work dir (the best model is already on S3).
+    Rank-0 only: under DDP all ranks share the dir, and a non-main rank must not
+    delete it while rank 0 is still uploading."""
+    if not enabled or not _RUN_WORKDIR or not _IS_MAIN:
         return
     import shutil
     shutil.rmtree(_RUN_WORKDIR, ignore_errors=True)
@@ -743,6 +848,13 @@ def main() -> int:
     try:
         ensure_deps()
         ensure_tracker_deps((cfg.get("tracking") or {}).get("report_to") or [])
+        # Install peft up front (in the sweep's one-shot deps prep) when LoRA is
+        # used anywhere, so concurrent trials don't race a pip install into the
+        # shared venv (which corrupted the first wave's imports).
+        if cfg.get("use_lora") or any(
+            k in (cfg.get("sweep") or {}) for k in ("lora_r", "lora_alpha")
+        ):
+            ensure_lora_deps()
         if a.deps_only:
             log("[deps] ready (deps-only)")
             return 0

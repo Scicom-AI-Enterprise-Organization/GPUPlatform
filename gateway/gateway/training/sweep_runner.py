@@ -107,6 +107,13 @@ def run(cfg: dict) -> None:
                     tcfg["augment_techniques"] = (
                         list(cfg.get("augment_techniques") or []) if on else []
                     )
+                # freeze_encoder may arrive as an on/off sweep value — coerce to a
+                # real bool, else the string "off" is truthy and freezes anyway.
+                if "freeze_encoder" in tcfg:
+                    tcfg["freeze_encoder"] = str(tcfg["freeze_encoder"]).lower() in ("on", "true", "1", "yes")
+                # Sweeping a LoRA knob (r/alpha) implies LoRA is on for those trials.
+                if ("lora_r" in tcfg or "lora_alpha" in tcfg) and not tcfg.get("use_lora"):
+                    tcfg["use_lora"] = True
                 tcfg["work_dir"] = os.path.join(work, f"trial{i}")
                 tcfg["run_name"] = f"{cfg.get('run_name', 'run')}-t{i}"
                 if base_prefix and tcfg.get("artifacts"):
@@ -121,9 +128,20 @@ def run(cfg: dict) -> None:
                 pin = env.get("CUDA_VISIBLE_DEVICES", "(all)")
                 emit_line(f"[sweep] trial {i} START params={json.dumps(params)} gpus={pin}\n")
 
+                # Multi-GPU trial → DDP via torch's launcher (one process per GPU
+                # in the slice); the worker rank-guards its @@ output. Single-GPU
+                # trials run plain `python`. Per-trial master_port avoids clashes
+                # between concurrent trials.
+                slice_n = len(gpu_slice) if gpu_slice else 1
+                if slice_n > 1 and (tcfg.get("use_ddp", True)):
+                    port = 29500 + (i % 4000)
+                    cmd = [sys.executable, "-m", "torch.distributed.run",
+                           f"--nproc_per_node={slice_n}", f"--master_port={port}",
+                           worker, "--config", tpath]
+                else:
+                    cmd = [sys.executable, "-u", worker, "--config", tpath]
                 proc = subprocess.Popen(
-                    [sys.executable, "-u", worker, "--config", tpath],
-                    env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1,
                 )
                 best = None

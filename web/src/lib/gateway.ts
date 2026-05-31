@@ -271,6 +271,17 @@ export const gateway = {
     request<TrainingGpuResponse>(`/v1/training-runs/${encodeURIComponent(id)}/gpu`),
   trainingLogsStreamUrl: (id: string) =>
     `/api/proxy/v1/training-runs/${encodeURIComponent(id)}/logs/stream`,
+  /** Try-it playground: transcribe a clip with the run's finetuned model (runs
+   * on the run's VM over SSH). `gpu` is a GPU index, "cpu", or "auto". */
+  transcribeTrainingRun: async (id: string, file: File, gpu?: string) => {
+    const buf = await file.arrayBuffer();
+    const q = new URLSearchParams({ filename: file.name || "audio.wav" });
+    if (gpu) q.set("gpu", gpu);
+    return request<{ text: string; device?: string }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/transcribe?${q.toString()}`,
+      { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: buf },
+    );
+  },
 
   // ---- Experiment-tracker credentials (Secrets page card) ----
   listTrackingCredentials: (kind?: "wandb" | "mlflow") =>

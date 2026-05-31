@@ -40,7 +40,17 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
 
   const init: RequestInit = { method: req.method, headers };
   if (req.method !== "GET" && req.method !== "HEAD") {
-    init.body = await req.text();
+    // Text bodies (JSON/form/etc.) forward as text; binary bodies (e.g. an
+    // uploaded audio clip) MUST forward as raw bytes — `req.text()` UTF-8-decodes
+    // and corrupts them.
+    const reqCt = (req.headers.get("content-type") ?? "").toLowerCase();
+    const reqIsText =
+      reqCt === "" ||
+      reqCt.startsWith("text/") ||
+      reqCt.includes("json") ||
+      reqCt.includes("xml") ||
+      reqCt.includes("x-www-form-urlencoded");
+    init.body = reqIsText ? await req.text() : await req.arrayBuffer();
   }
 
   try {
