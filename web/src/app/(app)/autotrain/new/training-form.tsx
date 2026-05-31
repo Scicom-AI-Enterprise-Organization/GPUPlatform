@@ -79,6 +79,19 @@ const AUTO_SPLIT = "__auto__";
 
 const GPU_COUNT_CHOICES = [1, 2, 4, 8] as const;
 
+// Training-audio augmentation techniques (mirror whisper_finetune._AUG_FUNCS).
+// One enabled technique is applied at random per augmented sample.
+const AUG_OPTIONS: { id: string; label: string; desc: string }[] = [
+  { id: "telephone", label: "Telephone", desc: "Phone-line degradation: band-pass + downsample + clip + dropout" },
+  { id: "noise", label: "Noise", desc: "Additive Gaussian noise at random SNR (10–40 dB)" },
+  { id: "dropout", label: "Dropout", desc: "Zero random ~25 ms chunks (packet loss)" },
+  { id: "gain", label: "Gain", desc: "Random volume change (−20 … +6 dB)" },
+  { id: "pitch", label: "Pitch shift", desc: "±3 semitones (duration preserved)" },
+  { id: "speed", label: "Speed", desc: "Time-stretch 0.9–1.1× (speaking rate)" },
+  { id: "reverb", label: "Reverb", desc: "Light room reverb" },
+  { id: "bandpass", label: "Band-pass", desc: "Telephone 300–3400 Hz band only" },
+];
+
 // precision = "<weight load dtype>-<mixed-precision (AMP) train dtype>".
 const PRECISIONS: { value: string; label: string }[] = [
   { value: "fp32-bf16", label: "fp32 load · bf16 mixed (recommended)" },
@@ -203,6 +216,8 @@ export function TrainingForm() {
   const [hfPushRepo, setHfPushRepo] = useState("");
   const [workDir, setWorkDir] = useState("/share");
   const [cleanupCheckpoints, setCleanupCheckpoints] = useState(true);
+  const [augmentTechniques, setAugmentTechniques] = useState<string[]>([]);
+  const [augmentProb, setAugmentProb] = useState(0.5);
   // experiment tracking — named credentials from the Secrets page (picked per run)
   const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
   const [wandbCredId, setWandbCredId] = useState("");
@@ -343,6 +358,8 @@ export function TrainingForm() {
       hf_push_repo: hfPushRepo.trim() || null,
       work_dir: workDir.trim() || "/share",
       cleanup_checkpoints: cleanupCheckpoints,
+      augment_techniques: augmentTechniques,
+      augment_prob: augmentProb,
       report_to: [
         ...(wandbOn ? (["wandb"] as const) : []),
         ...(mlflowOn ? (["mlflow"] as const) : []),
@@ -774,6 +791,51 @@ export function TrainingForm() {
             </span>
           </span>
         </label>
+
+        <div className="mt-4 space-y-1.5">
+          <Label className="text-xs">Audio augmentation (training only)</Label>
+          <p className="text-xs text-muted-foreground">
+            Select techniques to harden the model against noisy / phone audio. One enabled
+            technique is applied at random to each augmented training clip; eval is never augmented.
+          </p>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {AUG_OPTIONS.map((o) => {
+              const on = augmentTechniques.includes(o.id);
+              return (
+                <button
+                  key={o.id}
+                  type="button"
+                  title={o.desc}
+                  onClick={() =>
+                    setAugmentTechniques((prev) =>
+                      prev.includes(o.id) ? prev.filter((x) => x !== o.id) : [...prev, o.id],
+                    )
+                  }
+                  className={cn(
+                    "rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors",
+                    on ? "border-primary/60 bg-primary/10 text-foreground"
+                       : "border-border text-muted-foreground hover:border-primary/40 hover:bg-muted/40",
+                  )}
+                >
+                  <span className="block font-medium">{o.label}</span>
+                  <span className="block truncate text-[10px] opacity-70">{o.desc}</span>
+                </button>
+              );
+            })}
+          </div>
+          {augmentTechniques.length > 0 && (
+            <div className="flex items-center gap-2 pt-1">
+              <Label htmlFor="aug-prob" className="text-xs">Augment probability</Label>
+              <Input id="aug-prob" type="number" min={0} max={1} step={0.05}
+                className="h-8 w-24 font-mono text-xs"
+                value={augmentProb}
+                onChange={(e) => setAugmentProb(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />
+              <span className="text-[11px] text-muted-foreground">
+                fraction of training clips augmented ({augmentTechniques.length} technique{augmentTechniques.length === 1 ? "" : "s"})
+              </span>
+            </div>
+          )}
+        </div>
 
         <div className="mt-4 space-y-1.5">
           <Label htmlFor="train-env" className="text-xs">Environment variables</Label>

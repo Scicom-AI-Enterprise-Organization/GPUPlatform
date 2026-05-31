@@ -346,6 +346,9 @@ export type CreateTrainingRunRequest = {
   work_dir?: string;
   // rm the checkpoint/work dir after the run (best model is on S3). Default true.
   cleanup_checkpoints?: boolean;
+  // Training-audio augmentation: multi-select technique names. Empty = off.
+  augment_techniques?: string[];
+  augment_prob?: number;
 };
 
 export type TrainingFile = {

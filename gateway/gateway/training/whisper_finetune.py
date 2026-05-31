@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -241,6 +242,122 @@ def load_pairs(ds: dict, work: str) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Audio augmentation (TRAINING audio only). Each technique is a numpy/scipy/
+# librosa transform on a float waveform at sr. The user multi-selects which to
+# enable; one is picked at random per augmented sample. Hardens the model
+# against phone / noisy conditions. `telephone` is ported from the Scicom STT
+# whisper augmentation; the rest are standard ASR augmentations.
+# ---------------------------------------------------------------------------
+def _aug_telephone(x, sr):
+    """Phone-line degradation: attenuate → 300–3400 Hz band-pass → downsample to
+    5/6/8 kHz → additive noise → hard clip → random chunk dropout → upsample."""
+    import numpy as np
+    from scipy.signal import butter, lfilter, resample
+    x = x * (10 ** (-15 / 20.0))
+    nyq = 0.5 * sr
+    b, a = butter(4, [300 / nyq, 3400 / nyq], btype="band")
+    x = lfilter(b, a, x)
+    down_sr = random.choice([5000, 6000, 8000])
+    x = resample(x, max(1, int(len(x) * down_sr / sr)))
+    rms = float(np.sqrt(np.mean(x ** 2))) or 1e-9
+    x = x + np.random.normal(0, rms / (10 ** (random.randint(20, 50) / 20)), size=x.shape)
+    x = np.clip(x, -0.25, 0.25)
+    for i in range(0, len(x), 400):
+        if np.random.rand() < 0.03:
+            x[i:i + 400] = 0.0
+    return resample(x, max(1, int(len(x) * sr / down_sr)))
+
+
+def _aug_noise(x, sr):
+    """Additive Gaussian noise at a random SNR (10–40 dB)."""
+    import numpy as np
+    rms = float(np.sqrt(np.mean(x ** 2))) or 1e-9
+    return x + np.random.normal(0, rms / (10 ** (random.randint(10, 40) / 20)), size=x.shape)
+
+
+def _aug_dropout(x, sr):
+    """Zero out random ~25 ms chunks (packet-loss / clipping)."""
+    import numpy as np
+    out = x.copy()
+    chunk = max(1, int(0.025 * sr))
+    for i in range(0, len(out), chunk):
+        if np.random.rand() < 0.05:
+            out[i:i + chunk] = 0.0
+    return out
+
+
+def _aug_gain(x, sr):
+    """Random volume change (−20 … +6 dB)."""
+    return x * (10 ** (random.uniform(-20, 6) / 20.0))
+
+
+def _aug_pitch(x, sr):
+    """Pitch shift ±3 semitones (preserves duration)."""
+    import librosa
+    import numpy as np
+    return librosa.effects.pitch_shift(x.astype(np.float32), sr=sr, n_steps=random.uniform(-3, 3))
+
+
+def _aug_speed(x, sr):
+    """Time-stretch 0.9–1.1× (speaking-rate change; alters duration)."""
+    import librosa
+    import numpy as np
+    return librosa.effects.time_stretch(x.astype(np.float32), rate=random.uniform(0.9, 1.1))
+
+
+def _aug_reverb(x, sr):
+    """Light room reverb via convolution with a short decaying-noise impulse."""
+    import numpy as np
+    from scipy.signal import fftconvolve
+    n = max(1, int(0.05 * sr))
+    ir = np.exp(-6.0 * np.arange(n) / n) * np.random.normal(0, 1, n)
+    ir[0] = 1.0
+    y = fftconvolve(x, ir)[: len(x)]
+    peak = float(np.max(np.abs(y))) or 1.0
+    return y / peak * (float(np.max(np.abs(x))) or 1.0)
+
+
+def _aug_bandpass(x, sr):
+    """Telephone 300–3400 Hz band-pass only (no resample/noise)."""
+    from scipy.signal import butter, lfilter
+    nyq = 0.5 * sr
+    b, a = butter(4, [300 / nyq, 3400 / nyq], btype="band")
+    return lfilter(b, a, x)
+
+
+_AUG_FUNCS = {
+    "telephone": _aug_telephone,
+    "noise": _aug_noise,
+    "dropout": _aug_dropout,
+    "gain": _aug_gain,
+    "pitch": _aug_pitch,
+    "speed": _aug_speed,
+    "reverb": _aug_reverb,
+    "bandpass": _aug_bandpass,
+}
+# Stable list the API/form validate against.
+AUG_TECHNIQUES = list(_AUG_FUNCS.keys())
+
+
+def _augment_audio(data, sr: int, techniques):
+    """Apply ONE randomly-chosen enabled technique to the waveform. Falls back to
+    the untouched audio if the technique list is empty or a transform errors."""
+    import numpy as np
+    techs = [t for t in (techniques or []) if t in _AUG_FUNCS]
+    if not techs:
+        return np.asarray(data, dtype=np.float32)
+    x = np.asarray(data, dtype=np.float64)
+    if x.size == 0:
+        return x.astype(np.float32)
+    try:
+        x = _AUG_FUNCS[random.choice(techs)](x, sr)
+    except Exception as e:  # noqa: BLE001
+        log(f"[augment] skipped ({e})")
+        return np.asarray(data, dtype=np.float32)
+    return np.asarray(x, dtype=np.float32)
+
+
 class _LazyAsrDataset:
     """Map-style dataset for HF Seq2SeqTrainer / torch DataLoader. Holds only the
     metadata items; __getitem__ fetches + decodes the audio for one index from
@@ -248,10 +365,13 @@ class _LazyAsrDataset:
     class (not a torch subclass) so it stays picklable for DataLoader workers,
     which run __getitem__ in parallel and overlap audio I/O with GPU compute."""
 
-    def __init__(self, items: list[dict], processor, work: str):
+    def __init__(self, items: list[dict], processor, work: str,
+                 augment_techniques=None, augment_prob: float = 0.5):
         self.items = items
         self.processor = processor
         self.audio_dir = os.path.join(work, "audio")
+        self.augment_techniques = [t for t in (augment_techniques or []) if t in _AUG_FUNCS]
+        self.augment_prob = augment_prob
 
     def __len__(self) -> int:
         return len(self.items)
@@ -268,6 +388,8 @@ class _LazyAsrDataset:
             if path is None:
                 raise RuntimeError(f"audio fetch failed for {it.get('s3_ref')!r}")
             array, sr = librosa.load(path, sr=16000)  # decode + resample to 16k
+        if self.augment_techniques and random.random() < self.augment_prob:
+            array = _augment_audio(array, sr, self.augment_techniques)
         feat = self.processor.feature_extractor(
             array, sampling_rate=sr
         ).input_features[0]
@@ -367,10 +489,14 @@ def run(cfg: dict) -> None:
     # Lazy datasets: no upfront decode / Arrow build. Feature extraction happens
     # in __getitem__, parallelized by the DataLoader's workers and overlapped
     # with GPU compute — so training starts immediately.
-    train_ds = _LazyAsrDataset(train_pairs, processor, work)
-    eval_ds = _LazyAsrDataset(eval_pairs, processor, work)
+    aug_techs = [t for t in (cfg.get("augment_techniques") or []) if t in _AUG_FUNCS]
+    aug_prob = float(cfg.get("augment_prob", 0.5))
+    train_ds = _LazyAsrDataset(train_pairs, processor, work,
+                               augment_techniques=aug_techs, augment_prob=aug_prob)
+    eval_ds = _LazyAsrDataset(eval_pairs, processor, work)  # never augment eval
     log(f"[trainer] {len(train_ds)} train / {len(eval_ds)} eval examples "
-        f"— audio fetched + decoded lazily per item during training")
+        f"— audio fetched + decoded lazily per item during training"
+        + (f"; augment p={aug_prob}: {', '.join(aug_techs)}" if aug_techs else ""))
 
     class Collator:
         def __call__(self, features):

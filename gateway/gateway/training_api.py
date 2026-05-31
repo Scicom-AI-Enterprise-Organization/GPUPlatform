@@ -60,6 +60,8 @@ LOG_LIST_TTL_S = 12_960_000  # ~5 months
 POLL_INTERVAL_S = 5.0
 POLL_TIMEOUT_S = 900.0
 DEFAULT_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+# Valid training-audio augmentation techniques (mirror whisper_finetune._AUG_FUNCS).
+_AUG_TECHNIQUES = {"telephone", "noise", "dropout", "gain", "pitch", "speed", "reverb", "bandpass"}
 
 # Strong refs to in-flight runner tasks (else asyncio may GC them) + per-run
 # teardown state (RunPod id + api key) so terminate can delete the pod.
@@ -838,6 +840,11 @@ class CreateTrainingRunRequest(BaseModel):
     # Emit a training-loss point every N optimizer steps (@@STEP) for the live
     # loss curve. Smaller N = smoother graph, more log lines.
     logging_steps: int = 10
+    # Audio augmentation on TRAINING audio only — names from AUG_TECHNIQUES
+    # (telephone/noise/dropout/gain/pitch/speed/reverb/bandpass). Empty = off.
+    # One enabled technique is picked at random per augmented sample.
+    augment_techniques: list[str] = []
+    augment_prob: float = 0.5
     precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
@@ -971,6 +978,8 @@ async def create_training_run(
         "grad_accum": body.grad_accum, "learning_rate": body.learning_rate,
         "warmup_steps": body.warmup_steps, "weight_decay": body.weight_decay,
         "logging_steps": body.logging_steps,
+        "augment_techniques": [t for t in (body.augment_techniques or []) if t in _AUG_TECHNIQUES],
+        "augment_prob": body.augment_prob,
         "precision": body.precision, "language": body.language, "task": body.task,
         "base_model": body.base_model, "secure_cloud": body.secure_cloud,
         "disk_gb": body.disk_gb, "volume_gb": body.volume_gb,
