@@ -83,6 +83,98 @@ function RowItem({ index, row }: { index: number; row: DatasetPreviewRow }) {
   );
 }
 
+type PackedDecode = {
+  tokenizer: string;
+  num_tokens: number;
+  num_utterances: number;
+  utterances: { tokens: number; text: string }[];
+  full_text: string;
+};
+
+/**
+ * One multipacked block (tts_packed). The header shows token / utterance counts;
+ * opening the collapse decodes the block to text via the run's Qwen3 tokenizer
+ * (fetched lazily, server-side) so you can inspect what got packed together.
+ */
+function PackedRowItem({
+  datasetId,
+  index,
+  row,
+}: {
+  datasetId: string;
+  index: number;
+  row: DatasetPreviewRow;
+}) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState<PackedDecode | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const tokens = typeof row.tokens === "number" ? row.tokens : undefined;
+  const utts = typeof row.utterances === "number" ? row.utterances : undefined;
+
+  async function toggle() {
+    const next = !open;
+    setOpen(next);
+    if (next && !data && !loading) {
+      setLoading(true);
+      setErr(null);
+      try {
+        const r = await fetch(
+          `/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/packed-row?index=${index}`,
+          { cache: "no-store" },
+        );
+        const j = await r.json();
+        if (!r.ok) setErr((j && (j.detail || j.error)) || `decode failed (${r.status})`);
+        else setData(j as PackedDecode);
+      } catch (e) {
+        setErr(e instanceof Error ? e.message : String(e));
+      } finally {
+        setLoading(false);
+      }
+    }
+  }
+
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      <button type="button" onClick={toggle} className="flex w-full items-center gap-2 p-3 text-left transition-colors hover:bg-muted/40">
+        <ChevronRight className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")} />
+        <span className="w-9 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">#{index + 1}</span>
+        <span className="flex-1 text-sm">
+          Packed block · <span className="font-mono">{tokens ?? "?"}</span> tokens ·{" "}
+          <span className="font-mono">{utts ?? "?"}</span> utterance{utts === 1 ? "" : "s"}
+        </span>
+        <span className="shrink-0 text-xs text-muted-foreground">{open ? "hide" : "decode"}</span>
+      </button>
+      {open && (
+        <div className="space-y-2 border-t border-border p-3 text-xs">
+          {loading && (
+            <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> decoding with the TTS tokenizer…
+            </span>
+          )}
+          {err && <span className="text-destructive">{err}</span>}
+          {data && (
+            <>
+              <div className="text-[11px] text-muted-foreground">
+                {data.num_utterances} utterance{data.num_utterances === 1 ? "" : "s"} multipacked into{" "}
+                {data.num_tokens} tokens · decoded with <span className="font-mono">{data.tokenizer}</span>
+              </div>
+              <ol className="space-y-1.5">
+                {data.utterances.map((u, j) => (
+                  <li key={j} className="rounded border border-border/60 bg-muted/30 p-2">
+                    <div className="mb-0.5 font-mono text-[10px] text-muted-foreground">utt {j + 1} · {u.tokens} tokens</div>
+                    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed scrollbar-thin">{u.text}</pre>
+                  </li>
+                ))}
+              </ol>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
  * Paginated browser over *all* rows of a dataset — inspect one by one with a
  * waveform player. Seeds from the server-rendered first page, then fetches each
@@ -218,9 +310,13 @@ export function RowBrowser({
                 <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
               </div>
             )}
-            {rows.map((r, i) => (
-              <RowItem key={offset + i} index={offset + i} row={r} />
-            ))}
+            {rows.map((r, i) =>
+              r.packed === true ? (
+                <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} />
+              ) : (
+                <RowItem key={offset + i} index={offset + i} row={r} />
+              ),
+            )}
           </div>
         )}
 

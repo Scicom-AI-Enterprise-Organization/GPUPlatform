@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Loader2, Wand2 } from "lucide-react";
+import { ArrowRight, Loader2, Wand2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -15,7 +15,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { DatasetKind, DatasetRecord, StorageRecord } from "@/lib/types";
+import { gateway, GatewayError } from "@/lib/gateway";
+import type { DatasetKind, StorageRecord } from "@/lib/types";
 
 function errText(body: unknown, fallback: string): string {
   if (typeof body === "string") return body || fallback;
@@ -56,7 +57,9 @@ export function TransformCard({
   const [log, setLog] = useState<string | null>(initialLog);
   const [err, setErr] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const poll = useRef<ReturnType<typeof setInterval> | null>(null);
+  const logRef = useRef<HTMLPreElement | null>(null);
 
   const running = status === "running";
   // The job log ends with "… created dataset ds-xxxxxxxx (N rows)" — surface a
@@ -75,9 +78,7 @@ export function TransformCard({
     }
     const id = setInterval(async () => {
       try {
-        const r = await fetch(`/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}`, { cache: "no-store" });
-        if (!r.ok) return;
-        const d = (await r.json()) as DatasetRecord;
+        const d = await gateway.getDataset(datasetId);
         setStatus(d.transform_status ?? null);
         setLog(d.transform_log ?? null);
         if (d.transform_status !== "running") router.refresh();
@@ -101,35 +102,48 @@ export function TransformCard({
     }
     setStarting(true);
     try {
-      const r = await fetch(`/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/transform`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(
-          target === "hf"
-            ? { target: "hf", hf_repo: outRepo.trim() }
-            : { target: "s3", storage_id: storageId, s3_folder: s3Folder.trim() || null },
-        ),
-      });
-      const text = await r.text();
-      let parsed: unknown = text;
-      try {
-        parsed = text ? JSON.parse(text) : null;
-      } catch {
-        /* keep raw */
-      }
-      if (!r.ok) {
-        setErr(errText(parsed, r.statusText));
-        return;
-      }
-      const d = parsed as DatasetRecord;
+      const d = await gateway.transformDataset(
+        datasetId,
+        target === "hf"
+          ? { target: "hf", hf_repo: outRepo.trim() }
+          : { target: "s3", storage_id: storageId, s3_folder: s3Folder.trim() || null },
+      );
       setStatus(d.transform_status ?? "running");
       setLog(d.transform_log ?? null);
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(
+        e instanceof GatewayError
+          ? errText(e.parsed, e.message)
+          : e instanceof Error ? e.message : String(e),
+      );
     } finally {
       setStarting(false);
     }
   }
+
+  async function cancel() {
+    setErr(null);
+    setCancelling(true);
+    try {
+      const d = await gateway.cancelDatasetTransform(datasetId);
+      setStatus(d.transform_status ?? null);
+      setLog(d.transform_log ?? null);
+      router.refresh();
+    } catch (e) {
+      setErr(
+        e instanceof GatewayError
+          ? errText(e.parsed, e.message)
+          : e instanceof Error ? e.message : String(e),
+      );
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  // Auto-scroll the live log to the newest line while running.
+  useEffect(() => {
+    if (running && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [log, running]);
 
   const desc = (
     <span className="text-xs text-muted-foreground">
@@ -219,6 +233,12 @@ export function TransformCard({
             {running || starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
             {running ? "Transforming…" : "Run transform"}
           </Button>
+          {running && (
+            <Button variant="outline" onClick={cancel} disabled={cancelling} className="text-destructive">
+              {cancelling ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+              {cancelling ? "Cancelling…" : "Cancel"}
+            </Button>
+          )}
           {status && status !== "running" && (
             <span className={status === "done" ? "text-sm text-emerald-600 dark:text-emerald-400" : "text-sm text-destructive"}>
               {status === "done" ? "✓ done" : `✕ ${status}`}
@@ -236,9 +256,15 @@ export function TransformCard({
         </div>
 
         {log && (
-          <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin">
-            {log}
-          </pre>
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              {running && <Loader2 className="h-3 w-3 animate-spin" />}
+              <span>{running ? "Live log" : "Log"}</span>
+            </div>
+            <pre ref={logRef} className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin">
+              {log}
+            </pre>
+          </div>
         )}
     </div>
   );

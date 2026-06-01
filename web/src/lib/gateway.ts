@@ -31,6 +31,8 @@ import type {
   CreateStorageRequest,
   CreateDatasetRequest,
   UpdateDatasetRequest,
+  TransformDatasetRequest,
+  TtsPackRequest,
   DatasetRecord,
   DatasetPreview,
   SyncDatasetRequest,
@@ -449,6 +451,25 @@ export const gateway = {
     request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/sync`, {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+  // Extract a real audio column (hf archive / label export → audio) → HF or S3.
+  // Background job; poll getDataset(id).transform_status / transform_log.
+  transformDataset: (id: string, body: TransformDatasetRequest) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/transform`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // NeuCodec-encode + multipack for TTS → a new packed dataset. Background job;
+  // poll getDataset(id).transform_status / transform_log.
+  packTtsDataset: (id: string, body: TtsPackRequest) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/pack-tts`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // Cancel a running transform (audio extraction or TTS pack) for a dataset.
+  cancelDatasetTransform: (id: string) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/cancel-transform`, {
+      method: "POST",
     }),
 
   // ---- Global secrets (admin-managed; values masked) ----

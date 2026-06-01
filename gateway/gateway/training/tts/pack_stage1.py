@@ -12,7 +12,6 @@ import os
 import sys
 import copy
 import json
-import string
 import argparse
 
 # Vendored ChiniDataset lives next to this script (shipped with the tts dir) —
@@ -46,14 +45,12 @@ def new_path(f: str) -> str:
 
 
 def filter_rows(rows):
-    digits = set(string.digits)
+    # Pack every row that has a NeuCodec token file — no content filtering.
+    # (Previously dropped any transcription containing a digit or 'http'; the
+    # user wants all utterances kept, digits included.)
     out, missing = [], []
     for c in rows:
         c = copy.copy(c)
-        if set(c['text']) & digits:
-            continue
-        if 'http' in c['text'].lower():
-            continue
         token_filename = new_path(c['filename_audio'])
         if not os.path.exists(token_filename):
             missing.append(c['filename_audio'])

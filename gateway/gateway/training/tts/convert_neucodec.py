@@ -111,22 +111,24 @@ def loop(indices_device_pair):
     model.eval().cuda()
 
     for f in files:
+        # Exactly one progress bump per file, in `finally` (the old explicit
+        # bumps in the skip branches double-counted → 122/61 = 200%).
         try:
             filename = new_path(f)
             if os.path.exists(filename):
                 try:
                     with open(filename) as fopen:
                         json.load(fopen)
-                    _bump()
                     continue
                 except Exception:
                     pass
 
             try:
                 y, sr = librosa.load(f, sr=16000)
-                if len(y) / sr > 20:
-                    _bump()
-                    continue
+                # No duration cap — encode the whole clip. (The old 20s cap
+                # silently skipped every long-form clip, writing zero tokens, so
+                # pack_stage1 had nothing to pack.) Over-long utterances are still
+                # bounded later by pack_stage1's --sequence_length filter.
                 wav_tensor = torch.from_numpy(y).float().unsqueeze(0)
                 fsq_codes = model.encode_code(wav_tensor.unsqueeze(1))
                 tokens = fsq_codes[0, 0].tolist()

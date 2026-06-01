@@ -531,6 +531,15 @@ async def metrics_mw(request: Request, call_next):
 GATEWAY_VERSION = os.environ.get("APP_VERSION", "dev")
 
 
+@app.get("/")
+async def root():
+    """Service identity at the bare URL. Workers reach the gateway via their
+    `GATEWAY_URL` (on a VM, the reverse-tunnelled loopback) and ping the root as a
+    reachability check — without this they'd get a 404 that spams the access log.
+    A plain 200 confirms reachability; real probes use /health, /ready, /version."""
+    return {"service": "serverless-gpu-gateway", "version": GATEWAY_VERSION, "ok": True}
+
+
 @app.get("/health")
 async def health():
     return {"ok": True, "version": GATEWAY_VERSION}

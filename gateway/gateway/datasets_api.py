@@ -95,13 +95,24 @@ class TransformRequest(BaseModel):
 
 class TtsPackRequest(BaseModel):
     """NeuCodec-encode + multipack a {audio, transcription} dataset into a
-    ChiniDataset, on a GPU provider over SSH, → a new packed dataset."""
-    provider_id: str                       # GPU box (vm/runpod) — NeuCodec needs a GPU
+    ChiniDataset, on a GPU provider over SSH, → a new packed dataset. Provisioning
+    mirrors Autotrain (pack runs through the training runner): a VM provider_id
+    SSHes onto that box; otherwise a fresh RunPod pod is spawned (provider_id =
+    a RunPod account, or null for the gateway default key) with gpu_type/tier."""
+    provider_id: Optional[str] = None      # kind=vm → bare metal; runpod acct / null → spawn a pod
     storage_id: str                        # s3 storage for the packed shards
     tokenizer: Optional[str] = None        # speech-token tokenizer (pack_stage1)
     sequence_length: int = 4096            # multipack block length
     gpu_count: int = 1
     visible_devices: Optional[str] = None
+    # Isolated uv venv for the NeuCodec/TTS deps (mirrors Autotrain). Reused +
+    # cached across packs/runs. None → /share/neucodec-tts (dedicated NeuCodec venv).
+    venv_path: Optional[str] = None
+    # RunPod pod knobs (ignored for a VM provider).
+    gpu_type: str = "NVIDIA L40S"
+    secure_cloud: bool = True
+    disk_gb: int = 60
+    volume_gb: int = 80
 
 
 class DatasetRecord(BaseModel):
@@ -119,7 +130,10 @@ class DatasetRecord(BaseModel):
     num_rows: Optional[int] = None
     audio_field: str = "audio"
     transcription_field: str = "transcription"
-    split_fields: Optional[dict[str, str]] = None
+    # Usually {split: transcription_column} (str→str), but a packed (tts_packed)
+    # dataset stashes a nested {"_tts_pack": {...}} metadata blob here — so the
+    # response type tolerates non-string values (don't tighten back to str).
+    split_fields: Optional[dict[str, Any]] = None
     audio_dataset_id: Optional[str] = None  # materialised S3 audio dataset (if any)
     hf_repo: Optional[str] = None
     hf_revision: Optional[str] = None
@@ -853,6 +867,74 @@ def _label_export_rows(
     return rows, total
 
 
+# ---- packed (tts_packed) inspection: read ChiniDataset parquet + decode ----
+_PACKED_CACHE: dict[str, list[dict]] = {}        # dataset_id → [{input_ids, attention_mask}]
+_TTS_TOKENIZER_CACHE: dict[str, Any] = {}        # repo_id → tokenizers.Tokenizer
+_DEFAULT_TTS_TOKENIZER = "Scicom-intl/Multilingual-Expressive-TTS-1.7B"
+
+
+def _read_packed_parquet(target: "S3Target", s3_uri: str, cap: int = 5000) -> list[dict]:
+    """Read the ChiniDataset parquet shards under the `s3_uri` prefix (multipacked
+    NeuCodec records) → [{input_ids, attention_mask}], capped. attention_mask is
+    the list of per-utterance lengths the packer stored, so the UI can split a
+    block back into its constituent utterances."""
+    import io as _io
+    import pyarrow.parquet as pq
+
+    u = urlparse(s3_uri)
+    t = dataclasses.replace(target, bucket=u.netloc) if u.scheme == "s3" else target
+    prefix = (u.path.lstrip("/") if u.scheme == "s3" else s3_uri).rstrip("/") + "/"
+    shards = sorted(o["key"] for o in bench.s3_list(prefix, t) if o["key"].endswith(".parquet"))
+    cli = bench._s3_client(t)
+    out: list[dict] = []
+    for key in shards:
+        body = cli.get_object(Bucket=t.bucket, Key=key)["Body"].read()
+        tbl = pq.read_table(_io.BytesIO(body), columns=["input_ids", "attention_mask"])
+        ids_col = tbl.column("input_ids").to_pylist()
+        mask_col = tbl.column("attention_mask").to_pylist()
+        for ids, mask in zip(ids_col, mask_col):
+            out.append({"input_ids": list(ids or []), "attention_mask": list(mask or [])})
+            if len(out) >= cap:
+                return out
+    return out
+
+
+def _decode_packed_record(repo_id: str, hf_token: Optional[str], rec: dict) -> dict:
+    """Decode one packed record's token ids to text with the run's Qwen3 tokenizer
+    (cached). Splits by attention_mask so each multipacked utterance shows on its
+    own; speech tokens render as `<|s_N|>`, control tokens kept (not stripped)."""
+    from tokenizers import Tokenizer
+
+    tok = _TTS_TOKENIZER_CACHE.get(repo_id)
+    if tok is None:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(repo_id, "tokenizer.json", token=hf_token or None)
+        tok = Tokenizer.from_file(path)
+        _TTS_TOKENIZER_CACHE[repo_id] = tok
+
+    ids = rec.get("input_ids") or []
+    mask = rec.get("attention_mask") or []
+    utts, pos = [], 0
+    for length in mask:
+        seg = ids[pos:pos + length]
+        pos += length
+        utts.append({"tokens": len(seg), "text": tok.decode(seg, skip_special_tokens=False)})
+    return {
+        "num_tokens": len(ids),
+        "num_utterances": len(utts),
+        "utterances": utts,
+        "full_text": tok.decode(ids, skip_special_tokens=False),
+    }
+
+
+async def _packed_records_cached(dataset_id: str, target: "S3Target", s3_uri: str) -> list[dict]:
+    recs = _PACKED_CACHE.get(dataset_id)
+    if recs is None:
+        recs = await _run_sync(_read_packed_parquet, target, s3_uri)
+        _PACKED_CACHE[dataset_id] = recs
+    return recs
+
+
 @router.get("/{dataset_id}/preview", response_model=PreviewResponse)
 async def preview_dataset(
     dataset_id: str,
@@ -873,9 +955,26 @@ async def preview_dataset(
         return PreviewResponse(audio_field=af, transcription_field=tf, offset=offset, limit=limit, **kw)
 
     if d.kind == "tts_packed":
-        # Packed = tokenized NeuCodec multipacks (no audio/text rows to show).
-        return _resp(rows=[], total=d.num_rows or 0,
-                     error=f"Packed TTS dataset ({d.num_rows or '?'} records) — tokenized multipacks, not row-previewable.")
+        # Packed = multipacked NeuCodec blocks. Show one row per block with its
+        # token/utterance counts; the UI decodes a block to text on expand
+        # (GET /{id}/packed-row?index=N).
+        if not (d.storage_id and d.s3_metadata_uri):
+            return _resp(rows=[], total=d.num_rows or 0, error="packed dataset has no storage / shards")
+        try:
+            storage = await _load_storage(session, d.storage_id)
+            target, _base = _s3_target_and_prefix(storage)
+            recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("packed preview failed for %s: %s", dataset_id, e)
+            return _resp(rows=[], total=d.num_rows or 0, error=f"could not read packed shards: {e}")
+        total = len(recs)
+        page = recs[offset:offset + limit]
+        rows = [
+            {"packed": True, "index": offset + i,
+             "tokens": len(r["input_ids"]), "utterances": len(r["attention_mask"])}
+            for i, r in enumerate(page)
+        ]
+        return _resp(rows=rows, total=total)
 
     try:
         if d.kind == "label":
@@ -981,6 +1080,37 @@ async def preview_dataset(
     except Exception as e:  # noqa: BLE001 — surface as an inline error, not a 500
         logger.warning("preview failed for %s: %s", dataset_id, e)
         return _resp(rows=[], error=str(e))
+
+
+@router.get("/{dataset_id}/packed-row")
+async def packed_row(
+    dataset_id: str,
+    index: int = Query(..., ge=0, description="packed record index"),
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Decode one multipacked record to text with the run's Qwen3 tokenizer — for
+    inspecting what got packed together. Returns per-utterance + full decoded text.
+    The datasets UI calls this when a packed row's collapse is opened."""
+    d = await _require_dataset(session, dataset_id, user)
+    if d.kind != "tts_packed":
+        raise HTTPException(status_code=400, detail="not a packed (tts_packed) dataset")
+    if not (d.storage_id and d.s3_metadata_uri):
+        raise HTTPException(status_code=400, detail="packed dataset has no storage / shards")
+    storage = await _load_storage(session, d.storage_id)
+    target, _base = _s3_target_and_prefix(storage)
+    recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri)
+    if index >= len(recs):
+        raise HTTPException(status_code=404, detail=f"index {index} out of range (have {len(recs)})")
+
+    repo_id = ((d.split_fields or {}).get("_tts_pack") or {}).get("tokenizer") or _DEFAULT_TTS_TOKENIZER
+    from .global_env_api import load_global_env
+    hf_token = (await load_global_env(session)).get("HF_TOKEN") or os.environ.get("HF_TOKEN")
+    try:
+        decoded = await _run_sync(_decode_packed_record, repo_id, hf_token, recs[index])
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"decode failed (tokenizer {repo_id}): {e}")
+    return {"index": index, "tokenizer": repo_id, **decoded}
 
 
 @router.get("/{dataset_id}/audio")
@@ -1202,7 +1332,10 @@ async def pack_tts_dataset(
         base_model="Qwen/Qwen3-1.7B-Base",  # unused in pack-only (no training)
         task_type="tts",
         provider_id=req.provider_id, storage_id=req.storage_id,
-        gpu_count=req.gpu_count, visible_devices=req.visible_devices,
+        gpu_type=req.gpu_type, gpu_count=req.gpu_count,
+        secure_cloud=req.secure_cloud, disk_gb=req.disk_gb, volume_gb=req.volume_gb,
+        visible_devices=req.visible_devices,
+        venv_path=(req.venv_path or "").strip() or "/share/neucodec-tts",
         tokenizer=req.tokenizer or None,
         pack_sequence_length=req.sequence_length,
         pack_only=True, pack_source_dataset_id=dataset_id,
@@ -1210,12 +1343,44 @@ async def pack_tts_dataset(
     )
     run = await create_training_run(body, request, user, session)
     d.transform_status = "running"
-    d.transform_log = f"TTS pack queued (run {run.id}) · seq_len {req.sequence_length} · provider {req.provider_id}"
+    _where = req.provider_id or f"RunPod {req.gpu_type} ×{req.gpu_count}"
+    d.transform_log = f"TTS pack queued (run {run.id}) · seq_len {req.sequence_length} · {_where}"
     await session.commit()
     await audit_module.record(user, "dataset.pack-tts", "dataset", dataset_id, d.name,
                               details={"run": run.id, "sequence_length": req.sequence_length})
     await session.refresh(d)
     return _to_record(d, user.username, None)
+
+
+@router.post("/{dataset_id}/cancel-transform", response_model=DatasetRecord)
+async def cancel_dataset_transform(
+    dataset_id: str,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Cancel a running transform for this dataset — whether it's an in-process
+    audio-extraction job (hf/label → audio) or a TTS pack (a training run)."""
+    d = await _require_dataset(session, dataset_id, user)
+    if d.transform_status != "running":
+        owner = await session.get(User, d.owner_id)
+        return _to_record(d, owner.username if owner else "", None)
+
+    from . import dataset_transform
+    from .training_api import cancel_pack_run_for_dataset
+
+    cancelled = await dataset_transform.cancel_transform(dataset_id)
+    cancelled = (await cancel_pack_run_for_dataset(dataset_id)) or cancelled
+    # Stamp cancelled if nothing else already moved it off "running".
+    await session.refresh(d)
+    if d.transform_status == "running":
+        d.transform_status = "cancelled"
+        prev = d.transform_log or ""
+        d.transform_log = (prev + ("\n" if prev else "") + "transform cancelled by user")[-8000:]
+        await session.commit()
+        await session.refresh(d)
+    await audit_module.record(user, "dataset.cancel-transform", "dataset", dataset_id, d.name)
+    owner = await session.get(User, d.owner_id)
+    return _to_record(d, owner.username if owner else "", None)
 
 
 def _hf_upload(repo: str, path_in_repo: str, body: bytes, token: str, private: bool) -> Optional[str]:

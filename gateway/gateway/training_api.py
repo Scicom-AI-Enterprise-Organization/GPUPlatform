@@ -62,6 +62,18 @@ LOG_LIST_TTL_S = 12_960_000  # ~5 months
 POLL_INTERVAL_S = 5.0
 POLL_TIMEOUT_S = 900.0
 DEFAULT_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+# Ensure `uv` exists + is on PATH before the trainer's --deps-only runs, so its
+# venv is built with `uv venv` / `uv pip install` (fast, hash-constraint-free)
+# rather than the slow `python -m venv` + pip fallback. Mirrors the benchmark VM
+# bootstrap (pyremote_shim). Prepended AFTER the user env so $HOME is set first;
+# non-fatal (|| true) → if curl/network is unavailable the trainer still falls
+# back to venv+pip. Applies to ASR, TTS train, and NeuCodec (pack-only) runs.
+_UV_BOOTSTRAP = (
+    'export PATH="$HOME/.local/bin:$PATH"\n'
+    'if ! command -v uv >/dev/null 2>&1; then '
+    'curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || true; fi\n'
+    'export PATH="$HOME/.local/bin:$PATH"\n'
+)
 # Valid training-audio augmentation techniques (mirror whisper_finetune._AUG_FUNCS).
 _AUG_TECHNIQUES = {"telephone", "noise", "dropout", "gain", "pitch", "speed", "reverb", "bandpass"}
 
@@ -628,6 +640,63 @@ async def _set_dataset_transform(dataset_id: Optional[str], status: str, log_lin
         await s.commit()
 
 
+async def _mirror_pack_log(redis, run_id: str, dataset_id: Optional[str]) -> None:
+    """Mirror a pack run's live log tail into the source dataset's transform_log
+    (replace, not append) every few seconds, so the datasets UI shows the real
+    deps/NeuCodec/pack progress instead of a static 'queued' line. Permission-safe
+    (the datasets card already reads transform_log; no autotrain-section needed).
+    Only mirrors while the dataset is still 'running' — never clobbers the final
+    done/failed summary."""
+    if not dataset_id:
+        return
+    while True:
+        await asyncio.sleep(3)
+        try:
+            raw = await redis.lrange(f"train:logs:{run_id}", -150, -1)
+            txt = "\n".join(
+                (b.decode("utf-8", "replace") if isinstance(b, bytes) else str(b)) for b in raw
+            )
+            async with session_factory()() as s:
+                d = await s.get(Dataset, dataset_id)
+                if d is None or d.transform_status != "running":
+                    return
+                d.transform_log = txt[-8000:]
+                await s.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+
+async def cancel_pack_run_for_dataset(dataset_id: str) -> bool:
+    """Terminate an active pack-only training run sourced from this dataset (used
+    by the datasets 'Cancel' button). Returns True if one was found + cancelled."""
+    async with session_factory()() as s:
+        rows = (
+            await s.execute(
+                select(TrainingRun).where(TrainingRun.status.in_(("queued", "running")))
+            )
+        ).scalars().all()
+        target = next(
+            (r for r in rows
+             if (r.config_json or {}).get("pack_only")
+             and (r.config_json or {}).get("pack_source_dataset_id") == dataset_id),
+            None,
+        )
+        if target is None:
+            return False
+        t = _active_runners.get(target.id)
+        if t:
+            t.cancel()
+        st = _RUN_STATE.pop(target.id, None)
+        if st:
+            await _terminate_pod(st.get("api_key"), st.get("runpod_id"))
+        target.status = "cancelled"
+        target.ended_at = datetime.now(timezone.utc)
+        await s.commit()
+        return True
+
+
 async def run_training(redis, run_id: str) -> None:
     work = _work_dir(run_id)
     async with session_factory()() as s:
@@ -892,6 +961,10 @@ async def run_training(redis, run_id: str) -> None:
                 pass
 
     flush_task = asyncio.create_task(result_flusher())
+    # Pack-only runs: mirror the live log tail into the source dataset so the
+    # datasets "Transformation" card shows real progress (not just "queued").
+    _pack_src = cfg.get("pack_source_dataset_id") if cfg.get("pack_only") else None
+    mirror_task = asyncio.create_task(_mirror_pack_log(redis, run_id, _pack_src))
     rc = 1
     try:
         cfg["gpu_count"] = gpu_count
@@ -948,7 +1021,9 @@ async def run_training(redis, run_id: str) -> None:
             # stays per-branch (the sweep orchestrator pins each trial itself).
             user_env = _render_env_exports(cfg.get("env_vars") or {})
             # --- deps phase: create/reuse the isolated uv venv (system python) ---
-            deps_cmd = f"{user_env}python -u {worker_remote} --deps-only --config {remote_cfg}"
+            # uv bootstrap goes AFTER user_env (needs $HOME) so the child python's
+            # shutil.which("uv") finds it and the trainer uses uv, not pip.
+            deps_cmd = f"{user_env}{_UV_BOOTSTRAP}python -u {worker_remote} --deps-only --config {remote_cfg}"
             await _push_log(redis, run_id, f"[gateway] $ {deps_cmd}")
             drc = await asyncio.to_thread(_ssh_run_stream, cli, deps_cmd, on_line)
             if drc != 0:
@@ -1001,6 +1076,11 @@ async def run_training(redis, run_id: str) -> None:
         pump_task.cancel()
         try:
             await pump_task
+        except BaseException:
+            pass
+        mirror_task.cancel()
+        try:
+            await mirror_task
         except BaseException:
             pass
         # final flush of any lines the pump didn't reach before cancellation

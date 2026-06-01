@@ -44,6 +44,11 @@ def _append_log(existing: Optional[str], line: str, max_chars: int = 8000) -> st
 # ---------------- async orchestration ----------------
 
 
+# In-flight transform tasks, keyed by dataset_id, so the datasets "Cancel"
+# button can abort an audio-extraction job (hf/label → audio) mid-run.
+_active: dict[str, asyncio.Task] = {}
+
+
 async def start_transform(
     dataset_id: str,
     target: str,
@@ -59,7 +64,21 @@ async def start_transform(
         d.transform_status = "running"
         d.transform_log = _append_log(None, f"transform queued (target={target})")
         await s.commit()
-    asyncio.create_task(_run(dataset_id, target, hf_repo, storage_id, s3_folder))
+    task = asyncio.create_task(_run(dataset_id, target, hf_repo, storage_id, s3_folder))
+    _active[dataset_id] = task
+    task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
+
+
+async def cancel_transform(dataset_id: str) -> bool:
+    """Abort an in-flight audio-extraction transform for this dataset. Returns
+    True if one was running. (Pack-only TTS runs are training runs — cancelled
+    separately via training_api.cancel_pack_run_for_dataset.)"""
+    t = _active.get(dataset_id)
+    if t is None or t.done():
+        return False
+    t.cancel()
+    await _finish(dataset_id, "cancelled", "transform cancelled by user")
+    return True
 
 
 async def _log(dataset_id: str, line: str) -> None:

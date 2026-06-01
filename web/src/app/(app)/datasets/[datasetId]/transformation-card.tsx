@@ -29,7 +29,24 @@ export function TransformationCard({
 }) {
   const canTransform = kind === "hf" || kind === "label";
   const audioLabel = kind === "label" ? "Export labels → audio" : "Extract audio column";
-  const [tab, setTab] = useState(canTransform ? "audio" : "pack");
+
+  // Reflect the active tab in the URL (?tab=audio|pack) so it's deep-linkable.
+  // We update the URL via history.replaceState rather than the router so toggling
+  // tabs doesn't re-run this page's server fetch (dataset + preview). The initial
+  // tab is seeded from the URL on mount.
+  const searchParams = useSearchParams();
+  const [tab, setTab] = useState(() => {
+    const t = searchParams.get("tab");
+    if (canTransform && (t === "audio" || t === "pack")) return t;
+    return canTransform ? "audio" : "pack";
+  });
+  const onTab = (v: string) => {
+    setTab(v);
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    params.set("tab", v);
+    window.history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
+  };
 
   const packTab = (
     <TtsPackCard
@@ -51,7 +68,7 @@ export function TransformationCard({
       </CardHeader>
       <CardContent>
         {canTransform ? (
-          <Tabs value={tab} onValueChange={setTab}>
+          <Tabs value={tab} onValueChange={onTab}>
             <TabsList className="mb-3">
               <TabsTrigger value="audio">{audioLabel}</TabsTrigger>
               <TabsTrigger value="pack">Pack for TTS (NeuCodec)</TabsTrigger>

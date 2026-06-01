@@ -54,7 +54,13 @@ export function ColumnsCard({
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const hasSplitOverrides = !!splitFields && Object.keys(splitFields).length > 0;
+  // Only string-valued entries are real per-split transcription columns. A
+  // packed (tts_packed) dataset stashes a nested `_tts_pack` metadata object in
+  // split_fields — exclude it so we never try to render an object as a child.
+  const stringSplitFields: Record<string, string> = Object.fromEntries(
+    Object.entries(splitFields ?? {}).filter(([, v]) => typeof v === "string"),
+  ) as Record<string, string>;
+  const hasSplitOverrides = Object.keys(stringSplitFields).length > 0;
 
   // Seed per-split picks from current overrides, falling back to the global
   // transcription column when a split has it, else its first non-audio column.
@@ -192,7 +198,7 @@ export function ColumnsCard({
               <span className="font-mono text-xs">{audioField}</span>
             </div>
             {hasSplitOverrides ? (
-              Object.entries(splitFields as Record<string, string>).map(([split, col]) => (
+              Object.entries(stringSplitFields).map(([split, col]) => (
                 <div key={split} className="flex items-baseline justify-between gap-4 py-1.5">
                   <span className="text-xs text-muted-foreground">
                     Transcription · <span className="font-mono">{split}</span>

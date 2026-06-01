@@ -660,6 +660,34 @@ export type DatasetPreview = {
 
 export type SyncDatasetRequest = { hf_repo: string; private: boolean };
 
+// Turn a source dataset (hf archive / label-platform export) into one with a
+// real audio column — pushed to HF or materialised to S3. Mirrors the gateway
+// TransformRequest. Runs as a gateway background job (poll transform_status).
+export type TransformDatasetRequest = {
+  target: "hf" | "s3";
+  hf_repo?: string | null; // required for target=hf (owner/name)
+  storage_id?: string | null; // required for target=s3 (a kind=s3 storage)
+  s3_folder?: string | null; // target=s3 dest folder; blank → datasets/{id}/transformed
+};
+
+// NeuCodec-encode + multipack a {audio, transcription} dataset into a packed
+// (tts_packed) dataset on a GPU. Mirrors the gateway TtsPackRequest. provider_id
+// = a VM (SSH) or RunPod account; null → spawn a pod with the gpu_type/tier below.
+export type TtsPackRequest = {
+  provider_id?: string | null;
+  storage_id: string;
+  tokenizer?: string | null;
+  sequence_length?: number;
+  gpu_count?: number;
+  visible_devices?: string | null;
+  venv_path?: string | null; // isolated uv venv for the NeuCodec/TTS deps
+  // RunPod pod knobs (ignored for a VM provider)
+  gpu_type?: string;
+  secure_cloud?: boolean;
+  disk_gb?: number;
+  volume_gb?: number;
+};
+
 // Org-wide env var / secret (admin-managed). Mirrors gateway GlobalEnvRecord.
 // `value` is plaintext for non-secrets, null for secrets; `value_preview` is a
 // masked hint for secrets.
