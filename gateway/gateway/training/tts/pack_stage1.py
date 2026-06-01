@@ -15,32 +15,26 @@ import json
 import string
 import argparse
 
+# Vendored ChiniDataset lives next to this script (shipped with the tts dir) —
+# put it on sys.path so `import chinidataset` works on the GPU box without a pip
+# install (the repo is private + the box has no GitHub creds).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from streaming import MDSWriter, LocalDataset
-from streaming.base.format.mds.encodings import Encoding, _encodings
+from chinidataset import ParquetWriter, StreamingDataset
 from datasets import load_dataset
 
-
-class UInt32(Encoding):
-    def encode(self, obj) -> bytes:
-        return obj.tobytes()
-
-    def decode(self, data: bytes):
-        return np.frombuffer(data, np.uint32)
-
-
-_encodings['uint32'] = UInt32
-
+# ChiniDataset is Parquet-native — array columns are typed `<dtype>[]` (no custom
+# MDS encoding needed; uint32 arrays are stored natively).
 COLUMNS = {
-    'input_ids': 'uint32',
-    'position_ids': 'uint32',
-    'attention_mask': 'uint32',
+    'input_ids': 'uint32[]',
+    'position_ids': 'uint32[]',
+    'attention_mask': 'uint32[]',
     'audio': 'str',
     'text': 'str',
 }
-HASHES = ('sha1', 'xxh64')
 
 
 def new_path(f: str) -> str:
@@ -96,7 +90,7 @@ def loop(rows, folder, tokenizer, sequence_length=4096, progress_every=100):
         f'[AUTOTRAIN_PROGRESS] step=pack_stage1 processed=0 total={total} percent=0.0',
         flush=True,
     )
-    with MDSWriter(out=folder, columns=COLUMNS, compression=None, hashes=HASHES) as out:
+    with ParquetWriter(out=folder, columns=COLUMNS) as out:
         for i, row in enumerate(tqdm(rows)):
             try:
                 with open(row['token_filename']) as fopen:
@@ -179,7 +173,7 @@ def main():
 
     loop(processed, args.output_dir, tokenizer, sequence_length=args.sequence_length)
 
-    dataset = LocalDataset(args.output_dir)
+    dataset = StreamingDataset(local=args.output_dir)
     print(f'[pack_stage1] wrote {len(dataset)} packed records to {args.output_dir}', flush=True)
 
 

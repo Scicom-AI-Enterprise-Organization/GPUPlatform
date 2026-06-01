@@ -24,7 +24,7 @@ export function parseGpuIds(raw: string, tp: number, label: string): number[] | 
   }
   const ids = parts.map(Number);
   if (ids.length !== tp) {
-    throw new Error(`${label}: ${ids.length} GPU id(s) but TP=${tp} — they must match`);
+    throw new Error(`${label}: ${ids.length} GPU id(s) but ${tp} expected (tp×pp) — they must match`);
   }
   if (new Set(ids).size !== ids.length) {
     throw new Error(`${label}: duplicate GPU id in ${raw}`);

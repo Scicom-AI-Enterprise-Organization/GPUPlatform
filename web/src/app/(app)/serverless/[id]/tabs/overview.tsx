@@ -128,7 +128,7 @@ function VmServingCard({ app }: { app: AppRecord }) {
 // tensor-parallel size + extra args. Editable inline — click "Edit" to add /
 // remove models, change TP, or rewrite args, then "Save" re-provisions the
 // worker (in-flight requests drain first) via PATCH /apps/{id}/models.
-type ModelRow = { model: string; tp: number; extra_args: string; gpus: string };
+type ModelRow = { model: string; tp: number; pp: number; extra_args: string; gpus: string };
 
 const TP_CHOICES = [1, 2, 4, 8];
 
@@ -136,6 +136,7 @@ function toRows(models: AppRecord["models"]): ModelRow[] {
   return (models ?? []).map((m) => ({
     model: m.model,
     tp: m.tp ?? 1,
+    pp: m.pp ?? 1,
     extra_args: m.extra_args ?? "",
     gpus: (m.gpu_indices ?? []).join(","),
   }));
@@ -169,7 +170,8 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
   const models = app.models ?? [];
   const physIds = parsePhys(visibleDevices);
   const gpuCount = physIds.length;
-  const suggestions = suggestPacking(rows.map((r) => r.tp), physIds);
+  // Each member occupies tp × pp consecutive GPUs.
+  const suggestions = suggestPacking(rows.map((r) => r.tp * (r.pp || 1)), physIds);
 
   function startEdit() {
     setRows(toRows(app.models));
@@ -185,22 +187,24 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
   }
   const update = (i: number, patch: Partial<ModelRow>) =>
     setRows((rs) => rs.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
-  const addRow = () => setRows((rs) => [...rs, { model: "", tp: 1, extra_args: "", gpus: "" }]);
+  const addRow = () => setRows((rs) => [...rs, { model: "", tp: 1, pp: 1, extra_args: "", gpus: "" }]);
   const removeRow = (i: number) => setRows((rs) => rs.filter((_, idx) => idx !== i));
 
   async function save() {
     setSaving(true);
     setErr(null);
     setMsg(null);
-    let payload: Array<{ model: string; tp: number; extra_args: string; gpu_indices?: number[] }>;
+    let payload: Array<{ model: string; tp: number; pp: number; extra_args: string; gpu_indices?: number[] }>;
     try {
       payload = rows
         .filter((r) => r.model.trim())
         .map((r) => {
-          const gpu_indices = parseGpuIds(r.gpus, r.tp, r.model.trim() || "model");
+          const pp = r.pp || 1;
+          const gpu_indices = parseGpuIds(r.gpus, r.tp * pp, r.model.trim() || "model");
           return {
             model: r.model.trim(),
             tp: r.tp,
+            pp,
             extra_args: r.extra_args.trim(),
             ...(gpu_indices ? { gpu_indices } : {}),
           };
@@ -253,7 +257,7 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
           <CardTitle className="text-sm font-medium">vLLM engine args — per model</CardTitle>
           <span className="text-xs text-muted-foreground">
             {editing
-              ? "Add or remove models, change tensor-parallel size, or edit args. Saving re-provisions the worker — in-flight requests drain first."
+              ? "Add or remove models, change tensor- / pipeline-parallel size (a model uses TP×PP GPUs), or edit args. Saving re-provisions the worker — in-flight requests drain first."
               : "Each model launches its own "}
             {!editing && <code className="font-mono">vllm serve</code>}
             {!editing && " with these args."}
@@ -285,6 +289,11 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
                     <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
                       TP={m.tp}
                     </span>
+                    {(m.pp ?? 1) > 1 && (
+                      <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                        PP={m.pp}
+                      </span>
+                    )}
                   </div>
                 </div>
                 <pre className="overflow-x-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
@@ -299,6 +308,9 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
           <>
             {rows.map((r, i) => {
               const tpOpts = Array.from(new Set([...TP_CHOICES, r.tp])).sort((a, b) => a - b);
+              // PP need not be a power of two (e.g. TP=2 × PP=3 = 6 GPUs).
+              const ppMax = Math.max(gpuCount || 8, r.pp);
+              const ppOpts = Array.from({ length: ppMax }, (_, k) => k + 1);
               return (
                 <div key={i} className="rounded-md border border-border">
                   <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/30 px-3 py-2">
@@ -324,7 +336,30 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
                             <SelectItem
                               key={n}
                               value={String(n)}
-                              disabled={gpuCount > 0 && n > gpuCount}
+                              disabled={gpuCount > 0 && n * (r.pp || 1) > gpuCount}
+                            >
+                              {n}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">PP</span>
+                      <Select
+                        value={String(r.pp || 1)}
+                        onValueChange={(v) => update(i, { pp: Number(v) })}
+                        disabled={saving}
+                      >
+                        <SelectTrigger className="h-8 w-[68px] font-mono text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {ppOpts.map((n) => (
+                            <SelectItem
+                              key={n}
+                              value={String(n)}
+                              disabled={gpuCount > 0 && r.tp * n > gpuCount}
                             >
                               {n}
                             </SelectItem>

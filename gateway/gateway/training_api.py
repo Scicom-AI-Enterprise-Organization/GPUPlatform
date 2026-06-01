@@ -199,11 +199,40 @@ async def _resolve_global_env() -> dict:
 
 async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str] = None) -> dict:
     """Turn a Dataset row into the trainer's dataset spec, with creds inlined."""
+    label_token = None
     async with session_factory()() as s:
         ds = await s.get(Dataset, dataset_id)
         if ds is None:
             raise RuntimeError(f"dataset {dataset_id} not found")
         storage = await s.get(Storage, ds.storage_id) if ds.storage_id else None
+        if ds.kind == "label":
+            from .datasets_api import _label_token
+            label_token = await _label_token(ds, s)
+
+    if ds.kind == "label":
+        # Resolve the labeling-platform export server-side (the gateway has the
+        # API helpers) into {audio_url, id, text, split} rows the trainer
+        # downloads. The token + base URL are inlined so the GPU box can fetch
+        # platform-hosted clips (those need the bearer token); presigned audio_urls
+        # download directly.
+        from .datasets_api import _label_export_rows
+        rows, _total = await asyncio.to_thread(
+            _label_export_rows, ds.label_base_url, ds.label_project_id, label_token,
+            ds.label_status or "approved", 10**9, 0,
+        )
+        tf = ds.transcription_field or "transcription"
+        spec_rows = [
+            {"audio_url": str(r.get("audio_url") or ""), "id": r.get("id"),
+             "text": "" if r.get(tf) is None else str(r.get(tf)), "split": str(r.get("split") or "train")}
+            for r in rows
+        ]
+        return {
+            "kind": "label",
+            "label_base_url": (ds.label_base_url or "").rstrip("/"),
+            "label_project_id": ds.label_project_id,
+            "label_token": label_token,
+            "rows": spec_rows,
+        }
 
     if ds.kind == "hf":
         hf_token = None
@@ -222,6 +251,15 @@ async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str
         }
 
     creds = _s3_creds_from_storage(storage)
+    if ds.kind == "tts_packed":
+        # Pre-packed (NeuCodec + multipack) ChiniDataset: s3_metadata_uri is the
+        # s3:// prefix of the shards. The TTS trainer streams it (skips convert+pack).
+        return {
+            "kind": "tts_packed",
+            "packed_uri": ds.s3_metadata_uri,
+            "region": creds["region"], "endpoint": creds["endpoint"],
+            "access_key": creds["access_key"], "secret_key": creds["secret_key"],
+        }
     if ds.kind == "s3" and ds.s3_metadata_uri:
         # s3_metadata_uri is either a full "s3://bucket/key" URI or a key
         # relative to the storage's bucket (used as-is). Mirror datasets_api's
@@ -368,6 +406,33 @@ def _ssh_put_bytes(cli, data: bytes, remote: str) -> None:
         raise RuntimeError(
             f"remote write of {remote} failed (rc={rc}): {out.decode('utf-8', 'replace').strip()}"
         )
+
+
+def _ssh_put_dir_tar(cli, local_dir: str, remote_dir: str) -> None:
+    """Tar a local directory, stream it over SSH, and untar it on the remote —
+    ships a whole package tree (e.g. the vendored chinidataset) in one shot,
+    skipping __pycache__. No SFTP / no per-file round-trips."""
+    import io
+    import shlex as _shlex
+    import tarfile
+
+    def _filter(ti: "tarfile.TarInfo"):
+        base = os.path.basename(ti.name)
+        if base == "__pycache__" or base.endswith((".pyc", ".pyo")):
+            return None
+        return ti
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(local_dir, arcname=".", filter=_filter)
+    _ssh_put_bytes(cli, buf.getvalue(), "/tmp/_sgpu_ship.tar.gz")
+    rc = _ssh_exec(
+        cli,
+        f"mkdir -p {_shlex.quote(remote_dir)} && "
+        f"tar -xzf /tmp/_sgpu_ship.tar.gz -C {_shlex.quote(remote_dir)} && rm -f /tmp/_sgpu_ship.tar.gz",
+    )
+    if rc != 0:
+        raise RuntimeError(f"failed to ship/untar {local_dir} → {remote_dir} (rc={rc})")
 
 
 def _render_env_exports(env: dict) -> str:
@@ -517,6 +582,49 @@ async def _finalize(run_id: str, status: str, exit_code: Optional[int],
         if result_json is not None:
             row.result_json = result_json
         row.ended_at = datetime.now(timezone.utc)
+        await s.commit()
+
+
+async def _finish_tts_pack(run_id: str, cfg: dict, packed: dict) -> str:
+    """Create the packed (NeuCodec + multipack) dataset row from a finished
+    pack-only run; returns the new dataset id. kind='tts_packed', s3_metadata_uri
+    points at the ChiniDataset shards prefix the TTS trainer streams from."""
+    src_id = cfg.get("pack_source_dataset_id")
+    new_id = "ds-" + os.urandom(4).hex()
+    async with session_factory()() as s:
+        src = await s.get(Dataset, src_id) if src_id else None
+        run = await s.get(TrainingRun, run_id)
+        name = (f"{src.name}-tts-packed" if src else f"{run_id}-packed")[:255]
+        ds = Dataset(
+            id=new_id,
+            owner_id=(src.owner_id if src else run.owner_id),
+            name=name,
+            description=(f"NeuCodec + multipack (seq_len {packed.get('sequence_length')}, "
+                         f"tokenizer {packed.get('tokenizer')}) of {src.name if src else src_id}")[:2048],
+            kind="tts_packed",
+            storage_id=(run.storage_id if run else (src.storage_id if src else None)),
+            s3_metadata_uri=packed["s3_uri"],
+            num_rows=packed.get("samples"),
+            audio_field="audio", transcription_field="text",
+            split_fields={"_tts_pack": {"tokenizer": packed.get("tokenizer"),
+                                        "sequence_length": packed.get("sequence_length")}},
+        )
+        s.add(ds)
+        await s.commit()
+    return new_id
+
+
+async def _set_dataset_transform(dataset_id: Optional[str], status: str, log_line: str) -> None:
+    """Stamp a dataset's transform_status/transform_log (polled by the datasets UI)."""
+    if not dataset_id:
+        return
+    async with session_factory()() as s:
+        d = await s.get(Dataset, dataset_id)
+        if d is None:
+            return
+        d.transform_status = status
+        prev = d.transform_log or ""
+        d.transform_log = (prev + ("\n" if prev else "") + log_line)[-8000:]
         await s.commit()
 
 
@@ -689,7 +797,7 @@ async def run_training(redis, run_id: str) -> None:
         for tag, key in (("@@METRIC ", "metric"), ("@@STEP ", "step"),
                          ("@@DONE ", "done"),
                          ("@@ARTIFACT ", "artifact"), ("@@ERROR ", "error"),
-                         ("@@TRIAL ", "trial")):
+                         ("@@TRIAL ", "trial"), ("@@PACKED ", "packed")):
             # The tag can be prefixed by a tqdm progress bar (\r, no newline) on
             # the same captured line, so find it anywhere — not just at the start.
             ti = line.find(tag)
@@ -726,6 +834,8 @@ async def run_training(redis, run_id: str) -> None:
                     result.setdefault("trials", []).append(obj)
             elif key == "artifact":
                 result["artifact"] = obj
+            elif key == "packed":  # TTS pack-only transform → packed dataset spec
+                result["packed"] = obj
             elif key == "error":
                 result["error"] = obj.get("message")
             break
@@ -815,10 +925,11 @@ async def run_training(redis, run_id: str) -> None:
             base = _trainer_script_path().parent  # gateway/gateway/training/
             # Ship the worker for the task type …
             if task_type == "tts":
-                await asyncio.to_thread(_ssh_exec, cli, "mkdir -p /tmp/tts")
                 await asyncio.to_thread(_ssh_put, cli, str(base / "tts_finetune.py"), "/tmp/tts_finetune.py")
-                for fn in ("convert_neucodec.py", "pack_stage1.py", "qwen3_tts_flash.py"):
-                    await asyncio.to_thread(_ssh_put, cli, str(base / "tts" / fn), f"/tmp/tts/{fn}")
+                # Ship the whole tts/ dir as a tarball — it now carries the
+                # vendored chinidataset package (Parquet streaming) alongside the
+                # convert/pack/train scripts.
+                await asyncio.to_thread(_ssh_put_dir_tar, cli, str(base / "tts"), "/tmp/tts")
                 worker_remote = "/tmp/tts_finetune.py"
             else:
                 await asyncio.to_thread(_ssh_put, cli, str(_trainer_script_path()), "/tmp/whisper_finetune.py")
@@ -897,6 +1008,23 @@ async def run_training(redis, run_id: str) -> None:
     await _finalize(run_id, status, rc, err, result_json=result)
     await _push_log(redis, run_id, f"[gateway] run {status} (rc={rc})")
 
+    # "Pack for TTS" transform: on success create a packed dataset row + stamp
+    # the source dataset's transform_status (the datasets UI polls it).
+    if cfg.get("pack_only"):
+        src_id = cfg.get("pack_source_dataset_id")
+        packed = result.get("packed") or {}
+        if status == "done" and packed.get("s3_uri"):
+            try:
+                new_ds_id = await _finish_tts_pack(run_id, cfg, packed)
+                await _set_dataset_transform(
+                    src_id, "done",
+                    f"packed → {packed['s3_uri']} ({packed.get('samples')} records); "
+                    f"created dataset {new_ds_id}")
+            except Exception as e:  # noqa: BLE001
+                await _set_dataset_transform(src_id, "failed", f"pack ok but dataset create failed: {e}")
+        else:
+            await _set_dataset_transform(src_id, "failed", err or f"pack failed (rc={rc})")
+
     if runpod_id and api_key:
         await _terminate_pod(api_key, runpod_id)
         await _push_log(redis, run_id, f"[gateway] pod {runpod_id} torn down")
@@ -946,6 +1074,11 @@ class CreateTrainingRunRequest(BaseModel):
     pack_sequence_length: int = 4096   # per-utterance pack length
     default_speaker: Optional[str] = None
     speaker_field: Optional[str] = None
+    # Pack-only TTS dataset transform: run convert_neucodec + pack_stage1 and
+    # upload the ChiniDataset shards (no training) — the gateway then creates a
+    # packed dataset. Set internally by the datasets "Pack for TTS" endpoint.
+    pack_only: bool = False
+    pack_source_dataset_id: Optional[str] = None
     # ---- hyperparameter sweep ----
     # {param: [values]} → cross-product = trials, run in a GPU-pinned pool on one
     # box (concurrency = #gpus / gpus_per_trial). Empty = single run.
@@ -1219,6 +1352,7 @@ async def create_training_run(
         "tokenizer": body.tokenizer, "block_size": body.block_size,
         "pack_sequence_length": body.pack_sequence_length,
         "default_speaker": body.default_speaker, "speaker_field": body.speaker_field,
+        "pack_only": body.pack_only, "pack_source_dataset_id": body.pack_source_dataset_id,
         "sweep": body.sweep or {}, "gpus_per_trial": body.gpus_per_trial,
         "eval_metric": body.eval_metric, "normalize_text": body.normalize_text,
         "max_epochs": body.max_epochs,

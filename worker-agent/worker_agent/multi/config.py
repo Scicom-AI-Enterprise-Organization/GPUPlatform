@@ -27,11 +27,12 @@ from dataclasses import dataclass, field
 class MemberModel:
     model: str                      # HF id / path → vLLM --model
     served_name: str                # what clients send as payload["model"]
-    tp: int                         # tensor-parallel size = GPUs needed
+    tp: int                         # tensor-parallel size
     port: int                       # localhost port for this model's vLLM
-    gpu_indices: tuple[int, ...]    # CUDA_VISIBLE_DEVICES (len == tp)
+    gpu_indices: tuple[int, ...]    # CUDA_VISIBLE_DEVICES (len == tp * pp)
     extra_args: list[str] = field(default_factory=list)
     sleep_level: int = 1
+    pp: int = 1                     # pipeline-parallel size; GPUs needed = tp * pp
 
     @property
     def base_url(self) -> str:
@@ -72,15 +73,17 @@ def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiMo
             raise ValueError(f"member {i} has no model")
         served = (m.get("served_name") or model).strip()
         tp = int(m.get("tp") or 1)
+        pp = max(1, int(m.get("pp") or 1))
+        width = tp * pp  # GPUs this member occupies (tensor × pipeline parallel)
         port = int(m.get("port") or (8001 + i))
         explicit_idxs = bool(m.get("gpu_indices"))
         idxs = tuple(int(x) for x in (m.get("gpu_indices") or []))
         if not idxs:
-            # Auto-assign: pack tp consecutive GPUs round-robin (deterministic).
-            start = (i * tp) % max(1, total) if total else 0
-            idxs = tuple((start + j) % max(1, total) for j in range(tp)) if total else tuple(range(tp))
-        if len(idxs) != tp:
-            raise ValueError(f"{model}: gpu_indices {idxs} length != tp {tp}")
+            # Auto-assign: pack `width` consecutive GPUs round-robin (deterministic).
+            start = (i * width) % max(1, total) if total else 0
+            idxs = tuple((start + j) % max(1, total) for j in range(width)) if total else tuple(range(width))
+        if len(idxs) != width:
+            raise ValueError(f"{model}: gpu_indices {idxs} length != tp*pp {width} (tp={tp}, pp={pp})")
         if any(g < 0 for g in idxs):
             raise ValueError(f"{model}: negative gpu index in {idxs}")
         # Only range-check AUTO-assigned indices against the device count. Explicit
@@ -101,6 +104,7 @@ def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiMo
             model=model,
             served_name=served,
             tp=tp,
+            pp=pp,
             port=port,
             gpu_indices=idxs,
             extra_args=extra_list,

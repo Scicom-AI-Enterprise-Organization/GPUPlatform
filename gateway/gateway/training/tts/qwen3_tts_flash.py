@@ -58,8 +58,9 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers import Qwen3ForCausalLM
 import json
 import numpy as np
-from streaming import LocalDataset
-from streaming.base.format.mds.encodings import Encoding, _encodings
+# Vendored ChiniDataset (shipped next to this script) — no pip/git on the box.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from chinidataset import StreamingDataset
 from cut_cross_entropy import linear_cross_entropy
 from liger_kernel.transformers import apply_liger_kernel_to_qwen3, LigerFusedLinearCrossEntropyLoss
 
@@ -267,24 +268,20 @@ def main():
     min_dtype = torch.finfo(torch_dtype).min
     sequence_length = data_args.block_size
 
-    class UInt32(Encoding):
-        def encode(self, obj) -> bytes:
-            return obj.tobytes()
-
-        def decode(self, data: bytes):
-            return np.frombuffer(data, np.uint32)
-
-    _encodings['uint32'] = UInt32
-
     class DatasetFixed(torch.utils.data.Dataset):
         def __init__(self, local):
-            self.dataset = LocalDataset(local=local)
+            self.dataset = StreamingDataset(local=local)
 
         def __getitem__(self, idx):
-            data = self.dataset[idx]
+            data = dict(self.dataset[idx])
             data.pop('audio', None)
             data.pop('text', None)
             data.pop('token_type_ids', None)
+
+            # ChiniDataset returns array columns as numpy already, but be robust
+            # to list-typed values.
+            for k in list(data.keys()):
+                data[k] = np.asarray(data[k])
 
             if data['attention_mask'].max() > sequence_length:
                 print(data)
@@ -292,7 +289,7 @@ def main():
 
             for k in data.keys():
                 data[k] = data[k].astype(np.int64)
-        
+
             return data
 
         def __len__(self):

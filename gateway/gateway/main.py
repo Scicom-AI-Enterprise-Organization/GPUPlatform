@@ -70,12 +70,13 @@ class MultiModelMember(BaseModel):
     # A model served by a multi-model endpoint. `model` is the HuggingFace id;
     # it doubles as the served-model-name clients send in payload["model"].
     model: str
-    tp: int = 1                 # tensor-parallel size = GPUs this model needs
+    tp: int = 1                 # tensor-parallel size
+    pp: int = 1                 # pipeline-parallel size; GPUs this model needs = tp * pp
     extra_args: str = ""        # per-model vLLM CLI args
     # Optional explicit GPU pin: the physical ids (within `visible_devices`) this
-    # model runs on, e.g. [0,1,2,3]. len must == tp. None/empty = auto-pack into
-    # the next free tp-wide slot. Models with disjoint pins load concurrently;
-    # overlapping pins time-share those GPUs via vLLM sleep/wake.
+    # model runs on, e.g. [0,1,2,3]. len must == tp * pp. None/empty = auto-pack
+    # into the next free (tp*pp)-wide slot. Models with disjoint pins load
+    # concurrently; overlapping pins time-share those GPUs via vLLM sleep/wake.
     gpu_indices: Optional[list[int]] = None
 
 
@@ -1127,7 +1128,7 @@ async def get_gpu_availability(
 # them in their args makes vLLM see a duplicate argument and refuse to start, so
 # we reject them at create time rather than letting the worker fail to provision.
 _VLLM_RESERVED_SINGLE = {"--model", "--served-model-name", "--port"}
-_VLLM_RESERVED_MULTI = _VLLM_RESERVED_SINGLE | {"--tensor-parallel-size", "-tp", "--enable-sleep-mode"}
+_VLLM_RESERVED_MULTI = _VLLM_RESERVED_SINGLE | {"--tensor-parallel-size", "-tp", "--pipeline-parallel-size", "-pp", "--enable-sleep-mode"}
 
 
 def _validate_vllm_args(args: Optional[str], *, label: str, reserved: set[str]) -> None:
@@ -1174,8 +1175,12 @@ def _normalize_member_gpu_indices(m, *, vd_ids, usable_gpus: int, label: str):
         raise ValueError(f"{label}: gpu_indices must be >= 0")
     if len(set(idxs)) != len(idxs):
         raise ValueError(f"{label}: gpu_indices has duplicate ids {idxs}")
-    if len(idxs) != int(m.tp):
-        raise ValueError(f"{label}: gpu_indices {idxs} must have exactly tp={m.tp} id(s)")
+    width = int(m.tp) * max(1, int(getattr(m, "pp", 1) or 1))
+    if len(idxs) != width:
+        raise ValueError(
+            f"{label}: gpu_indices {idxs} must have exactly tp*pp={width} id(s) "
+            f"(tp={m.tp}, pp={getattr(m, 'pp', 1)})"
+        )
     if vd_ids:
         bad = [g for g in idxs if g not in set(vd_ids)]
         if bad:
@@ -1265,17 +1270,23 @@ async def create_app(
                 detail="VM provider has no probed GPUs — run Test on the provider first",
             )
         # Usable GPU universe: a visible_devices pin narrows it to that subset.
-        # Each model needs tp GPUs (tp <= usable); the fleet packs each onto a
-        # tp-wide slot via build_multi_model_config, which handles tp NOT dividing
-        # the total (e.g. tp=4 on 6 GPUs → [0,1,2,3], leaving [4,5] for tp=2
-        # members). So we only require tp <= usable, not tp | usable.
+        # Each model needs tp*pp GPUs (must be <= usable); the fleet packs each
+        # onto a (tp*pp)-wide slot via build_multi_model_config, which handles the
+        # width NOT dividing the total (e.g. width=4 on 6 GPUs → [0,1,2,3],
+        # leaving [4,5]). So we only require tp*pp <= usable, not exact division.
         usable_gpus = len(vd_ids) if vd_ids else total_gpus
         seen: set[str] = set()
         for m in members:
             if m.tp < 1:
                 raise HTTPException(status_code=400, detail=f"model {m.model}: tp must be >= 1")
-            if m.tp > usable_gpus:
-                raise HTTPException(status_code=400, detail=f"model {m.model}: tp={m.tp} exceeds the {usable_gpus} selected GPUs")
+            if getattr(m, "pp", 1) < 1:
+                raise HTTPException(status_code=400, detail=f"model {m.model}: pp must be >= 1")
+            width = m.tp * max(1, int(getattr(m, "pp", 1) or 1))
+            if width > usable_gpus:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"model {m.model}: tp×pp={width} (tp={m.tp}, pp={getattr(m, 'pp', 1)}) exceeds the {usable_gpus} selected GPUs",
+                )
             if m.model in seen:
                 raise HTTPException(status_code=400, detail=f"duplicate model in members: {m.model}")
             seen.add(m.model)
@@ -1835,8 +1846,11 @@ async def update_app_models(
     for m in req.models:
         if m.tp < 1:
             raise HTTPException(status_code=400, detail={"error": f"model {m.model}: tp must be >= 1"})
-        if usable_gpus and m.tp > usable_gpus:
-            raise HTTPException(status_code=400, detail={"error": f"model {m.model}: tp={m.tp} exceeds the {usable_gpus} GPUs"})
+        if getattr(m, "pp", 1) < 1:
+            raise HTTPException(status_code=400, detail={"error": f"model {m.model}: pp must be >= 1"})
+        width = m.tp * max(1, int(getattr(m, "pp", 1) or 1))
+        if usable_gpus and width > usable_gpus:
+            raise HTTPException(status_code=400, detail={"error": f"model {m.model}: tp×pp={width} (tp={m.tp}, pp={getattr(m, 'pp', 1)}) exceeds the {usable_gpus} GPUs"})
         if m.model in seen:
             raise HTTPException(status_code=400, detail={"error": f"duplicate model in members: {m.model}"})
         seen.add(m.model)

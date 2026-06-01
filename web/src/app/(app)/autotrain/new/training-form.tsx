@@ -611,7 +611,6 @@ export function TrainingForm() {
     setSubmitting(true);
     try {
       const created = await gateway.createTrainingRun(body);
-      toast.success(`Created ${created.id}`, { duration: 4000 });
       router.push(`/autotrain/${encodeURIComponent(created.id)}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

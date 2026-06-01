@@ -78,22 +78,25 @@ def build_multi_model_config(app) -> dict:
     for m in members:
         model = m["model"]
         tp = max(1, int(m.get("tp", 1) or 1))
+        pp = max(1, int(m.get("pp", 1) or 1))
+        width = tp * pp  # GPUs this model occupies = tensor × pipeline parallel
         # Explicit pin wins: the user chose exactly which physical GPUs this model
         # runs on (validated at create/update time). Otherwise auto-pack into the
-        # next free tp-wide slot, round-robin per tp size.
+        # next free (tp*pp)-wide slot, round-robin per slot width.
         pinned = [int(x) for x in (m.get("gpu_indices") or [])]
         if pinned:
             gpu_indices = pinned
         else:
-            n_slots = max(1, universe // tp) if universe else 1
-            si = slot_cursor.get(tp, 0) % n_slots
-            slot_cursor[tp] = si + 1
-            start = si * tp
-            gpu_indices = phys[start:start + tp] if phys else list(range(start, start + tp))
+            n_slots = max(1, universe // width) if universe else 1
+            si = slot_cursor.get(width, 0) % n_slots
+            slot_cursor[width] = si + 1
+            start = si * width
+            gpu_indices = phys[start:start + width] if phys else list(range(start, start + width))
         out.append({
             "model": model,
             "served_name": model,
             "tp": tp,
+            "pp": pp,
             "port": port,
             "gpu_indices": gpu_indices,
             "extra_args": (m.get("extra_args", "") or ""),

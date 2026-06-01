@@ -93,6 +93,17 @@ class TransformRequest(BaseModel):
     s3_folder: Optional[str] = None
 
 
+class TtsPackRequest(BaseModel):
+    """NeuCodec-encode + multipack a {audio, transcription} dataset into a
+    ChiniDataset, on a GPU provider over SSH, → a new packed dataset."""
+    provider_id: str                       # GPU box (vm/runpod) — NeuCodec needs a GPU
+    storage_id: str                        # s3 storage for the packed shards
+    tokenizer: Optional[str] = None        # speech-token tokenizer (pack_stage1)
+    sequence_length: int = 4096            # multipack block length
+    gpu_count: int = 1
+    visible_devices: Optional[str] = None
+
+
 class DatasetRecord(BaseModel):
     id: str
     name: str
@@ -861,6 +872,11 @@ async def preview_dataset(
     def _resp(**kw):
         return PreviewResponse(audio_field=af, transcription_field=tf, offset=offset, limit=limit, **kw)
 
+    if d.kind == "tts_packed":
+        # Packed = tokenized NeuCodec multipacks (no audio/text rows to show).
+        return _resp(rows=[], total=d.num_rows or 0,
+                     error=f"Packed TTS dataset ({d.num_rows or '?'} records) — tokenized multipacks, not row-previewable.")
+
     try:
         if d.kind == "label":
             tok = await _label_token(d, session)
@@ -1150,6 +1166,54 @@ async def transform_dataset(
         s3_folder=(req.s3_folder or "").strip() or None,
     )
     await audit_module.record(user, "dataset.transform", "dataset", dataset_id, d.name, details={"target": req.target})
+    await session.refresh(d)
+    return _to_record(d, user.username, None)
+
+
+@router.post("/{dataset_id}/pack-tts", response_model=DatasetRecord)
+async def pack_tts_dataset(
+    dataset_id: str,
+    req: TtsPackRequest,
+    request: Request,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """NeuCodec-encode + multipack this {audio, transcription} dataset into a
+    ChiniDataset on a GPU provider over SSH, then create a new packed dataset.
+    Implemented as a pack-only TTS training job (reuses the training runner); the
+    source dataset's transform_status/transform_log track it for the UI."""
+    d = await _require_dataset(session, dataset_id, user)
+    if d.kind == "tts_packed":
+        raise HTTPException(status_code=400, detail="this dataset is already packed")
+    if d.kind == "label":
+        tok = await _label_token(d, session)
+        if not (d.label_base_url and d.label_project_id and tok):
+            raise HTTPException(status_code=400, detail="label dataset needs a base URL, project, and stored token to pack")
+    if d.transform_status == "running":
+        raise HTTPException(status_code=409, detail="a transform is already running for this dataset")
+    st = await session.get(Storage, req.storage_id)
+    if st is None or st.kind != "s3":
+        raise HTTPException(status_code=400, detail="storage_id must reference a kind=s3 storage")
+
+    from .training_api import CreateTrainingRunRequest, create_training_run
+    body = CreateTrainingRunRequest(
+        name=f"pack-{d.name}"[:128],
+        dataset_id=dataset_id,
+        base_model="Qwen/Qwen3-1.7B-Base",  # unused in pack-only (no training)
+        task_type="tts",
+        provider_id=req.provider_id, storage_id=req.storage_id,
+        gpu_count=req.gpu_count, visible_devices=req.visible_devices,
+        tokenizer=req.tokenizer or None,
+        pack_sequence_length=req.sequence_length,
+        pack_only=True, pack_source_dataset_id=dataset_id,
+        max_epochs=1,
+    )
+    run = await create_training_run(body, request, user, session)
+    d.transform_status = "running"
+    d.transform_log = f"TTS pack queued (run {run.id}) · seq_len {req.sequence_length} · provider {req.provider_id}"
+    await session.commit()
+    await audit_module.record(user, "dataset.pack-tts", "dataset", dataset_id, d.name,
+                              details={"run": run.id, "sequence_length": req.sequence_length})
     await session.refresh(d)
     return _to_record(d, user.username, None)
 

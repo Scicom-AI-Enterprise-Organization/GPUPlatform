@@ -79,15 +79,17 @@ def _run_loss(cmd: list[str], cwd: str, env: dict) -> float | None:
 # we pin the stack the trainer needs).
 DEPS = [
     "torch==2.9.1", "transformers==4.57.3", "accelerate",
-    "mosaicml-streaming", "librosa", "soundfile", "datasets", "wandb",
+    "librosa", "soundfile", "datasets", "wandb",
     "neucodec", "pandas", "pyarrow", "multiprocess", "liger-kernel",
     "git+https://github.com/apple/ml-cross-entropy",
 ]
+# ChiniDataset (Parquet streaming) replaces mosaicml-streaming — it's vendored
+# next to the tts scripts and shipped with them (private repo, no git on the box).
 
 
 def ensure_deps(report_to: list[str]) -> None:
     try:
-        import transformers, datasets, streaming, neucodec  # noqa: F401
+        import transformers, datasets, pyarrow, neucodec  # noqa: F401
         log("[deps] core TTS stack present")
     except Exception:
         log("[deps] installing TTS stack (torch/transformers/neucodec/streaming/…)")
@@ -112,6 +114,37 @@ def _s3_client(ds: dict):
         aws_secret_access_key=ds.get("secret_key") or None,
         config=BotoConfig(signature_version="s3v4"),
     )
+
+
+def _upload_s3_dir(art: dict, local_dir: str, key_prefix: str) -> str:
+    """Upload every file under local_dir to s3://{bucket}/{key_prefix}/… and
+    return the s3:// URI of the prefix."""
+    cli = _s3_client(art)
+    base_key = key_prefix.rstrip("/")
+    for root, _dirs, files in os.walk(local_dir):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, local_dir)
+            cli.upload_file(fp, art["bucket"], f"{base_key}/{rel}")
+    return f"s3://{art['bucket']}/{base_key}/"
+
+
+def _download_s3_prefix(spec: dict, s3_uri: str, dest_dir: str) -> None:
+    """Download every object under an s3://bucket/prefix into dest_dir (used to
+    pull a pre-packed ChiniDataset before training)."""
+    assert s3_uri.startswith("s3://"), s3_uri
+    bucket, _, prefix = s3_uri[len("s3://"):].partition("/")
+    prefix = prefix.rstrip("/") + "/"
+    cli = _s3_client(spec)
+    os.makedirs(dest_dir, exist_ok=True)
+    for page in cli.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            rel = obj["Key"][len(prefix):]
+            if not rel:
+                continue
+            fp = os.path.join(dest_dir, rel)
+            os.makedirs(os.path.dirname(fp) or dest_dir, exist_ok=True)
+            cli.download_file(bucket, obj["Key"], fp)
 
 
 def _read_metadata_rows(ds: dict) -> list[dict]:
@@ -161,6 +194,40 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
                     "speaker": str(r.get(speaker_field) or default_speaker),
                 })
                 idx += 1
+    elif ds.get("kind") == "label":
+        # Labeling-platform rows resolved by the gateway. Platform-hosted clips
+        # (empty/under-base audio_url) are fetched from the task audio endpoint
+        # with the bearer token; presigned audio_urls download directly.
+        import urllib.request
+        base = (ds.get("label_base_url") or "").rstrip("/")
+        pid = ds.get("label_project_id")
+        token = ds.get("label_token")
+        _exts = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm")
+        for i, r in enumerate(ds.get("rows") or []):
+            u = (r.get("audio_url") or "").strip()
+            tid = r.get("id")
+            txt = r.get("text")
+            if txt is None:
+                continue
+            if (not u or u.startswith(base)) and tid is not None:
+                req = urllib.request.Request(f"{base}/api/projects/{pid}/tasks/{tid}/audio",
+                                             headers={"Authorization": f"Bearer {token}"})
+            elif u:
+                req = urllib.request.Request(u)
+            else:
+                continue
+            ext = os.path.splitext(os.path.basename(u.split("?")[0]))[1].lower()
+            if ext not in _exts:
+                ext = ".wav"
+            rel = f"audio/task-{tid if tid is not None else i}{ext}"
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    with open(os.path.join(work, rel), "wb") as f:
+                        f.write(resp.read())
+            except Exception as e:  # noqa: BLE001
+                log(f"[data] skip label task {tid}: {e}")
+                continue
+            rows.append({"filename_audio": rel, "text": str(txt), "speaker": str(default_speaker)})
     else:
         cli = _s3_client(ds)
         prefix = (ds.get("audio_prefix") or "").strip("/")
@@ -226,7 +293,6 @@ def run(cfg: dict) -> None:
     load_dt, amp = parse_precision(cfg.get("precision"))
     gpus = max(1, int(cfg.get("gpu_count", 1)))
 
-    audio_paths, meta = build_dataset(cfg, work)
     packed = os.path.join(work, "packed")
     out_dir = os.path.join(work, "out")
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
@@ -237,13 +303,40 @@ def run(cfg: dict) -> None:
         log(f"[gateway] $ {' '.join(cmd)}")
         subprocess.check_call(cmd, cwd=cwd, env=env)
 
-    # 1. NeuCodec tokenization
-    step([sys.executable, "-u", os.path.join(TTS_DIR, "convert_neucodec.py"),
-          "--file", audio_paths], cwd=work)
-    # 2. pack into MDS
-    step([sys.executable, "-u", os.path.join(TTS_DIR, "pack_stage1.py"),
-          "--dataset", meta, "--output_dir", packed,
-          "--tokenizer", tokenizer, "--sequence_length", str(seq_len)], cwd=work)
+    ds = cfg.get("dataset") or {}
+    if ds.get("packed_uri"):
+        # Dataset was already NeuCodec-encoded + multipacked (a "Pack for TTS"
+        # transform) → pull the ChiniDataset shards and skip convert/pack.
+        log(f"[pack] reusing pre-packed ChiniDataset from {ds['packed_uri']}")
+        _download_s3_prefix(ds, ds["packed_uri"], packed)
+    else:
+        audio_paths, meta = build_dataset(cfg, work)
+        # 1. NeuCodec tokenization
+        step([sys.executable, "-u", os.path.join(TTS_DIR, "convert_neucodec.py"),
+              "--file", audio_paths], cwd=work)
+        # 2. pack into a ChiniDataset (Parquet streaming)
+        step([sys.executable, "-u", os.path.join(TTS_DIR, "pack_stage1.py"),
+              "--dataset", meta, "--output_dir", packed,
+              "--tokenizer", tokenizer, "--sequence_length", str(seq_len)], cwd=work)
+
+    # Pack-only (dataset transform): upload the packed ChiniDataset shards to S3
+    # and stop — no training. The gateway turns @@PACKED into a new packed dataset.
+    if cfg.get("pack_only"):
+        art = cfg.get("artifacts") or {}
+        s3_uri = samples = None
+        if art.get("bucket"):
+            s3_uri = _upload_s3_dir(art, packed, art["prefix"].rstrip("/") + "/packed")
+            try:
+                sys.path.insert(0, TTS_DIR)
+                from chinidataset import StreamingDataset
+                samples = len(StreamingDataset(local=packed))
+            except Exception as e:  # noqa: BLE001
+                log(f"[pack] could not count packed records: {e}")
+            log(f"[pack] uploaded packed dataset → {s3_uri} ({samples} records)")
+        emit("PACKED", {"s3_uri": s3_uri, "samples": samples,
+                        "sequence_length": seq_len, "tokenizer": tokenizer})
+        return
+
     # 3. finetune via torchrun
     log(f"[train] precision: load={load_dt} amp={amp or 'none'}")
     dtype_args = ["--torch_dtype", load_dt]

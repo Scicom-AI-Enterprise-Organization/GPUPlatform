@@ -117,6 +117,9 @@ async def launch_member(
         "--served-model-name", member.served_name,
         "--port", str(member.port),
         "--tensor-parallel-size", str(member.tp),
+        # Pipeline parallel: split the model's layers across pp GPU groups. Total
+        # GPUs used = tp * pp (the member's gpu_indices). Omitted when pp == 1.
+        *(["--pipeline-parallel-size", str(member.pp)] if member.pp > 1 else []),
         "--enable-sleep-mode",
         *member.extra_args,
     ]
@@ -126,8 +129,8 @@ async def launch_member(
     # abort instantly. The log shipper detects the size reset and re-tails from 0.
     logf = open(log_path, "wb", buffering=0)
     logger.info(
-        "launching vllm: model=%s gpus=%s tp=%d port=%d → %s",
-        member.model, env["CUDA_VISIBLE_DEVICES"], member.tp, member.port, log_path,
+        "launching vllm: model=%s gpus=%s tp=%d pp=%d port=%d → %s",
+        member.model, env["CUDA_VISIBLE_DEVICES"], member.tp, member.pp, member.port, log_path,
     )
     # start_new_session=True puts the engine + its tp worker children in their
     # own process group so terminate() can SIGKILL the whole group (no orphans).

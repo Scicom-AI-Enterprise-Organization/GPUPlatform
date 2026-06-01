@@ -10,10 +10,11 @@ export type AutoscalerSpec = {
 // doubles as the served-model-name clients send in the OpenAI `model` field.
 export type MultiModelMember = {
   model: string;
-  tp: number;          // tensor-parallel size = GPUs this model needs
+  tp: number;          // tensor-parallel size
+  pp?: number;         // pipeline-parallel size; GPUs this model needs = tp * pp
   extra_args: string;  // per-model vLLM CLI args
-  // Optional explicit GPU pin (physical ids within visible_devices, len == tp).
-  // null/omitted = auto-pack into the next free tp-wide slot.
+  // Optional explicit GPU pin (physical ids within visible_devices, len == tp*pp).
+  // null/omitted = auto-pack into the next free (tp*pp)-wide slot.
   gpu_indices?: number[] | null;
 };
 
@@ -569,7 +570,7 @@ export type StorageRecord = {
 
 // ---- Datasets (Autotrain) ----
 
-export type DatasetKind = "upload" | "s3" | "hf" | "label";
+export type DatasetKind = "upload" | "s3" | "hf" | "label" | "tts_packed";
 
 export type DatasetRecord = {
   id: string;

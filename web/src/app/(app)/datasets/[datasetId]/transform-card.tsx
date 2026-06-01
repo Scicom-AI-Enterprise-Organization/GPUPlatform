@@ -36,6 +36,7 @@ export function TransformCard({
   s3Storages,
   initialStatus,
   initialLog,
+  bare = false,
 }: {
   datasetId: string;
   kind: DatasetKind;
@@ -43,6 +44,7 @@ export function TransformCard({
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
+  bare?: boolean;
 }) {
   const isLabel = kind === "label";
   const router = useRouter();
@@ -129,29 +131,25 @@ export function TransformCard({
     }
   }
 
-  return (
-    <Card>
-      <CardHeader className="flex flex-col gap-0.5">
-        <CardTitle className="text-base">
-          {isLabel ? "Transform — export labels to a dataset" : "Transform — extract audio column"}
-        </CardTitle>
-        <span className="text-xs text-muted-foreground">
-          {isLabel ? (
-            <>
-              Export this labeling-platform project&apos;s reviewed tasks (per the dataset&apos;s status filter),
-              download each clip, and build a dataset with a real <span className="font-mono">audio</span> column +
-              its <span className="font-mono">transcription</span>. Runs on the gateway; watch progress below.
-            </>
-          ) : (
-            <>
-              This repo stores audio in archives, so there&apos;s no audio column to preview. Unzip it and rebuild a
-              dataset with a real audio column (joined on the <span className="font-mono">audio</span> column you set
-              above). Runs on the gateway; watch progress below.
-            </>
-          )}
-        </span>
-      </CardHeader>
-      <CardContent className="space-y-3">
+  const desc = (
+    <span className="text-xs text-muted-foreground">
+      {isLabel ? (
+        <>
+          Export this labeling-platform project&apos;s reviewed tasks (per the dataset&apos;s status filter),
+          download each clip, and build a dataset with a real <span className="font-mono">audio</span> column +
+          its <span className="font-mono">transcription</span>. Runs on the gateway; watch progress below.
+        </>
+      ) : (
+        <>
+          This repo stores audio in archives, so there&apos;s no audio column to preview. Unzip it and rebuild a
+          dataset with a real audio column (joined on the <span className="font-mono">audio</span> column you set
+          above). Runs on the gateway; watch progress below.
+        </>
+      )}
+    </span>
+  );
+  const body = (
+    <div className="space-y-3">
         <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
           {(["hf", "s3"] as const).map((t) => (
             <button
@@ -242,7 +240,19 @@ export function TransformCard({
             {log}
           </pre>
         )}
-      </CardContent>
+    </div>
+  );
+
+  if (bare) return <div className="space-y-3">{desc}{body}</div>;
+  return (
+    <Card>
+      <CardHeader className="flex flex-col gap-0.5">
+        <CardTitle className="text-base">
+          {isLabel ? "Transform — export labels to a dataset" : "Transform — extract audio column"}
+        </CardTitle>
+        {desc}
+      </CardHeader>
+      <CardContent>{body}</CardContent>
     </Card>
   );
 }

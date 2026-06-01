@@ -10,7 +10,7 @@ import { SyncCard } from "./sync-card";
 import { DeleteButton } from "./delete-button";
 import { DatasetTitle } from "./dataset-title";
 import { ColumnsCard } from "./columns-card";
-import { TransformCard } from "./transform-card";
+import { TransformationCard } from "./transformation-card";
 import { RowBrowser } from "./row-browser";
 
 function fmtBytes(n?: number | null): string {
@@ -79,8 +79,13 @@ export default async function DatasetDetailPage({
   // S3 storages to offer as a transform target (HF audio-zip / label platform →
   // audio column).
   const canTransform = dataset?.kind === "hf" || dataset?.kind === "label";
+  // Pack {audio, transcription} → NeuCodec + multipack ChiniDataset (TTS). Not
+  // for label (transform to audio first) or an already-packed dataset.
+  const canPack =
+    dataset?.kind === "s3" || dataset?.kind === "upload" ||
+    dataset?.kind === "hf" || dataset?.kind === "label";
   let s3Storages: StorageRecord[] = [];
-  if (canTransform) {
+  if (canTransform || canPack) {
     try {
       s3Storages = (await gateway.listStorage()).filter((s) => s.kind === "s3" && s.enabled);
     } catch {
@@ -164,8 +169,8 @@ export default async function DatasetDetailPage({
               splitFields={dataset.split_fields}
             />
 
-            {canTransform && (
-              <TransformCard
+            {(canPack || canTransform) && (
+              <TransformationCard
                 datasetId={dataset.id}
                 kind={dataset.kind}
                 hfRepo={dataset.hf_repo ?? null}

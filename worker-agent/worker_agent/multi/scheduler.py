@@ -485,6 +485,7 @@ class MultiModelScheduler:
                 "inflight": rt.inflight,
                 "gpus": list(rt.member.gpu_indices),
                 "tp": rt.member.tp,
+                "pp": rt.member.pp,
                 "last_used_ts": rt.last_used or None,
                 "reason": rt.reason,
                 "port": rt.member.port,

@@ -29,6 +29,7 @@ export const KIND_LABEL: Record<DatasetKind, string> = {
   s3: "s3",
   hf: "huggingface",
   label: "labeling",
+  tts_packed: "tts-packed",
 };
 
 export function KindIcon({ kind, className }: { kind: DatasetKind; className?: string }) {
