@@ -552,7 +552,9 @@ def run(cfg: dict) -> None:
             r=_r,
             lora_alpha=_alpha,
             lora_dropout=float(cfg.get("lora_dropout", 0.05)),
-            target_modules=["q_proj", "v_proj"],
+            # All linear layers (attn q/k/v/out_proj + MLP fc1/fc2 across encoder
+            # & decoder); peft's "all-linear" auto-excludes the tied output proj.
+            target_modules="all-linear",
             bias="none",
         )
         model = get_peft_model(model, lconf)

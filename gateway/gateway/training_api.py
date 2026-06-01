@@ -76,6 +76,10 @@ _UV_BOOTSTRAP = (
 )
 # Valid training-audio augmentation techniques (mirror whisper_finetune._AUG_FUNCS).
 _AUG_TECHNIQUES = {"telephone", "noise", "dropout", "gain", "pitch", "speed", "reverb", "bandpass"}
+# TTS audio-eval methods (run on the test set): char-error-rate, UTMOSv2 MOS,
+# TitaNet speaker similarity. The eval runner is a follow-up; the selection +
+# config plumbing land here so runs record what to evaluate.
+_TTS_EVAL_METHODS = {"cer", "mos", "similarity"}
 
 # Strong refs to in-flight runner tasks (else asyncio may GC them) + per-run
 # teardown state (RunPod id + api key) so terminate can delete the pod.
@@ -882,6 +886,9 @@ async def run_training(redis, run_id: str) -> None:
             except Exception:
                 break
             if key == "metric":
+                if "tts_eval" in obj:  # post-training TTS audio eval (CER/MOS/similarity)
+                    result["tts_eval"] = obj["tts_eval"]
+                    break
                 if trial_idx is not None:
                     obj["trial"] = trial_idx
                 result["epochs"].append(obj)
@@ -1218,6 +1225,8 @@ class CreateTrainingRunRequest(BaseModel):
     # One enabled technique is picked at random per augmented sample.
     augment_techniques: list[str] = []
     augment_prob: float = 0.5
+    # TTS-only: audio eval methods to run on the test set (cer | mos | similarity).
+    eval_methods: list[str] = []
     precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
@@ -1385,10 +1394,29 @@ async def create_training_run(
     ds = await session.get(Dataset, body.dataset_id)
     if ds is None or (ds.owner_id != user.id and not user.is_admin):
         raise HTTPException(status_code=400, detail="unknown dataset_id")
+    tds = None
     if body.test_dataset_id:
         tds = await session.get(Dataset, body.test_dataset_id)
         if tds is None or (tds.owner_id != user.id and not user.is_admin):
             raise HTTPException(status_code=400, detail="unknown test_dataset_id")
+    # TTS trains directly on pre-packed (tts_packed) ChiniDataset shards — convert
+    # + multipack already happened on the Datasets page. Block size + tokenizer
+    # are derived from the packed dataset / base model, not asked in the form.
+    if body.task_type == "tts":
+        if ds.kind != "tts_packed":
+            raise HTTPException(
+                status_code=400,
+                detail="TTS training needs a packed dataset (kind=tts_packed) — pack it first via 'Pack for TTS'",
+            )
+        if tds is not None and tds.kind != "tts_packed":
+            raise HTTPException(status_code=400, detail="TTS test dataset must also be packed (kind=tts_packed)")
+        # block size follows the packed dataset's sequence_length.
+        _pack_meta = (ds.split_fields or {}).get("_tts_pack") or {}
+        _seq = _pack_meta.get("sequence_length")
+        if _seq:
+            body.block_size = int(_seq)
+        # the trainer tokenizes with the base model's tokenizer; record it.
+        body.tokenizer = body.base_model
     if body.storage_id:
         st = await session.get(Storage, body.storage_id)
         if st is None or st.kind != "s3" or not st.enabled:
@@ -1466,6 +1494,7 @@ async def create_training_run(
         "logging_steps": body.logging_steps,
         "augment_techniques": [t for t in (body.augment_techniques or []) if t in _AUG_TECHNIQUES],
         "augment_prob": body.augment_prob,
+        "eval_methods": [m for m in (body.eval_methods or []) if m in _TTS_EVAL_METHODS],
         "precision": body.precision, "language": body.language, "task": body.task,
         "base_model": body.base_model,
         # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab

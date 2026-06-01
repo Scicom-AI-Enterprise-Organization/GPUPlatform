@@ -382,6 +382,21 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </Card>
       )}
 
+      {run.result_json?.tts_eval && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">
+              TTS evaluation{run.result_json.tts_eval.samples != null ? ` · ${run.result_json.tts_eval.samples} samples` : ""}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-wrap gap-x-8 gap-y-2 text-sm">
+            {run.result_json.tts_eval.cer != null && <Stat label="CER ↓" value={fmt(run.result_json.tts_eval.cer, 4)} />}
+            {run.result_json.tts_eval.mos != null && <Stat label="MOS ↑ (UTMOSv2)" value={fmt(run.result_json.tts_eval.mos, 3)} />}
+            {run.result_json.tts_eval.similarity != null && <Stat label="Speaker sim ↑ (TitaNet)" value={fmt(run.result_json.tts_eval.similarity, 4)} />}
+          </CardContent>
+        </Card>
+      )}
+
       {isSweep && (
         <Card>
           <CardHeader className="pb-2">

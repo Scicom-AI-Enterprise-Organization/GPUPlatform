@@ -30,23 +30,31 @@ function errText(body: unknown, fallback: string): string {
   return fallback;
 }
 
+// Radix <Select> forbids an empty-string item value, so represent "no speaker
+// column" with a sentinel that maps back to "" on save.
+const NO_SPEAKER = "__none__";
+
 export function ColumnsCard({
   datasetId,
   kind,
   audioField,
   transcriptionField,
+  speakerField,
   splitFields,
 }: {
   datasetId: string;
   kind: string;
   audioField: string;
   transcriptionField: string;
+  speakerField?: string | null;
   splitFields?: Record<string, string> | null;
 }) {
   const router = useRouter();
   const [editing, setEditing] = useState(false);
   const [audio, setAudio] = useState(audioField);
   const [transcription, setTranscription] = useState(transcriptionField);
+  // TTS-only speaker column (one global column, like audio). "" → one voice.
+  const [speaker, setSpeaker] = useState(speakerField ?? "");
   // Per-split transcription column choices (only when the HF source exposes splits).
   const [perSplit, setPerSplit] = useState<Record<string, string>>({});
   const [splits, setSplits] = useState<SplitInfo[] | null>(null);
@@ -104,6 +112,7 @@ export function ColumnsCard({
   function startEdit() {
     setAudio(audioField);
     setTranscription(transcriptionField);
+    setSpeaker(speakerField ?? "");
     setErr(null);
     setEditing(true);
     // Lazily fetch the split columns for the per-split pickers (HF only); the
@@ -113,6 +122,11 @@ export function ColumnsCard({
   }
 
   const multiSplit = (splits?.length ?? 0) > 1;
+  // Union of all known split columns (HF only), minus the audio column → the
+  // options for the speaker dropdown. Empty for non-HF sources (free-text input).
+  const columnOptions = Array.from(new Set((splits ?? []).flatMap((s) => s.columns))).filter(
+    (c) => c !== audio,
+  );
 
   async function save() {
     setErr(null);
@@ -132,6 +146,7 @@ export function ColumnsCard({
       body = {
         audio_field: audio.trim(),
         transcription_field: primary,
+        speaker_field: speaker.trim(),
         split_fields: perSplit,
       };
     } else {
@@ -142,6 +157,7 @@ export function ColumnsCard({
       body = {
         audio_field: audio.trim(),
         transcription_field: transcription.trim(),
+        speaker_field: speaker.trim(),
         split_fields: {}, // clear any stale per-split overrides
       };
     }
@@ -210,6 +226,12 @@ export function ColumnsCard({
               <div className="flex items-baseline justify-between gap-4 py-1.5">
                 <span className="text-xs text-muted-foreground">Transcription column</span>
                 <span className="font-mono text-xs">{transcriptionField}</span>
+              </div>
+            )}
+            {speakerField && (
+              <div className="flex items-baseline justify-between gap-4 py-1.5">
+                <span className="text-xs text-muted-foreground">Speaker column</span>
+                <span className="font-mono text-xs">{speakerField}</span>
               </div>
             )}
           </div>
@@ -281,6 +303,49 @@ export function ColumnsCard({
                   disabled={saving}
                   className="font-mono text-xs"
                 />
+              </div>
+            )}
+
+            {!loadingSplits && (
+              <div className="space-y-1 sm:max-w-xs">
+                <Label htmlFor="ds-speaker" className="text-xs">
+                  Speaker column <span className="text-muted-foreground">(optional · TTS)</span>
+                </Label>
+                {columnOptions.length > 0 ? (
+                  <Select
+                    value={speaker || NO_SPEAKER}
+                    onValueChange={(v) => setSpeaker(v === NO_SPEAKER ? "" : v)}
+                    disabled={saving}
+                  >
+                    <SelectTrigger className="text-xs">
+                      <SelectValue placeholder="No speaker column" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={NO_SPEAKER} className="text-xs">
+                        — none (one voice) —
+                      </SelectItem>
+                      {Array.from(new Set([...(speaker ? [speaker] : []), ...columnOptions])).map(
+                        (c) => (
+                          <SelectItem key={c} value={c} className="font-mono text-xs">
+                            {c}
+                          </SelectItem>
+                        ),
+                      )}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input
+                    id="ds-speaker"
+                    value={speaker}
+                    onChange={(e) => setSpeaker(e.target.value)}
+                    placeholder="speaker"
+                    disabled={saving}
+                    className="font-mono text-xs"
+                  />
+                )}
+                <p className="text-xs text-muted-foreground">
+                  Prepended to each line when packing for TTS. Leave empty to train a single voice.
+                </p>
               </div>
             )}
 

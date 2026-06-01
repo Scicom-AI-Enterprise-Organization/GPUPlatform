@@ -302,6 +302,10 @@ class Dataset(Base):
     num_rows: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     audio_field: Mapped[str] = mapped_column(String(128), default="audio", server_default="audio", nullable=False)
     transcription_field: Mapped[str] = mapped_column(String(128), default="transcription", server_default="transcription", nullable=False)
+    # TTS-only: which column holds the speaker label/name. The TTS pack step
+    # (pack_stage1) prepends "<speaker>: " to each transcript. None → the packer
+    # falls back to a constant speaker (one voice).
+    speaker_field: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # Per-split transcription column overrides for HF sources whose splits use
     # different column names (e.g. {"train": "text", "test": "after"}). Empty/None
     # → use `transcription_field` for every split. The audio column is assumed
@@ -587,6 +591,10 @@ async def init_db() -> None:
         # Per-split transcription column overrides (HF splits with differing schemas).
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS split_fields JSON"
+        ))
+        # TTS-only speaker column mapping (consumed by the pack step).
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS speaker_field VARCHAR(128)"
         ))
         # Link a zip-backed source dataset to its materialised S3 audio dataset.
         await conn.execute(text(

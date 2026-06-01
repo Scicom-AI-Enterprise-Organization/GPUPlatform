@@ -251,6 +251,13 @@ export type TrainingResult = {
   artifact?: { s3_uri?: string | null; hf_repo?: string | null } | null;
   stopped_early?: boolean;
   trials?: TrainingTrial[];
+  // TTS audio eval (post-training): CER / MOS (UTMOSv2) / speaker similarity (TitaNet).
+  tts_eval?: {
+    samples?: number;
+    cer?: number | null;
+    mos?: number | null;
+    similarity?: number | null;
+  } | null;
   progress?: { step?: string; percent?: number } | null;
   error?: string;
 };
@@ -374,6 +381,8 @@ export type CreateTrainingRunRequest = {
   // Training-audio augmentation: multi-select technique names. Empty = off.
   augment_techniques?: string[];
   augment_prob?: number;
+  // TTS-only: audio eval methods to run on the test set (cer | mos | similarity).
+  eval_methods?: string[];
 };
 
 export type TrainingFile = {
@@ -590,6 +599,7 @@ export type DatasetRecord = {
   num_rows?: number | null;
   audio_field: string;
   transcription_field: string;
+  speaker_field?: string | null; // TTS-only speaker column (null → one voice)
   split_fields?: Record<string, string> | null; // per-split transcription overrides
   audio_dataset_id?: string | null; // materialised S3 audio dataset (source → output link)
   hf_repo?: string | null;

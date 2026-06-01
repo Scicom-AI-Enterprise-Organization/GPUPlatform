@@ -68,12 +68,12 @@ const WHISPER_MODELS = [
 ];
 const DEFAULT_WHISPER = "openai/whisper-large-v3-turbo";
 const TTS_BASE_MODELS = [
-  "Scicom-intl/Multilingual-Expressive-TTS-1.7B",
-  "Scicom-intl/Multilingual-Expressive-TTS-0.6B",
   "Scicom-intl/Multilingual-TTS-1.7B-Base",
   "Scicom-intl/Multilingual-TTS-0.6B-Base",
+  "Scicom-intl/Multilingual-Expressive-TTS-1.7B",
+  "Scicom-intl/Multilingual-Expressive-TTS-0.6B",
 ];
-const DEFAULT_TTS_TOKENIZER = "Scicom-intl/Multilingual-Expressive-TTS-1.7B";
+const DEFAULT_TTS_BASE = "Scicom-intl/Multilingual-TTS-1.7B-Base";
 const CUSTOM = "__custom__";
 const AUTO_SPLIT = "__auto__";
 
@@ -90,6 +90,14 @@ const AUG_OPTIONS: { id: string; label: string; desc: string }[] = [
   { id: "speed", label: "Speed", desc: "Time-stretch 0.9–1.1× (speaking rate)" },
   { id: "reverb", label: "Reverb", desc: "Light room reverb" },
   { id: "bandpass", label: "Band-pass", desc: "Telephone 300–3400 Hz band only" },
+];
+
+// TTS evaluation methods — each generates audio from the eval set, then scores
+// it. Multi-select (pick any combo), styled like the augmentation boxes.
+const TTS_EVAL_METHODS: { id: string; label: string; desc: string }[] = [
+  { id: "cer", label: "CER", desc: "ASR the generated audio, char error rate vs. the reference text" },
+  { id: "mos", label: "MOS (UTMOSv2)", desc: "Predicted naturalness MOS via faster-UTMOSv2" },
+  { id: "similarity", label: "Speaker similarity", desc: "TitaNet speaker-embedding cosine vs. the reference voice" },
 ];
 
 // precision = "<weight load dtype>-<mixed-precision (AMP) train dtype>".
@@ -181,6 +189,9 @@ export function TrainingForm() {
   // ?from=<runId> → prefill the form with that run's config ("Edit as new").
   const fromId = searchParams.get("from");
   const [prefilling, setPrefilling] = useState(!!fromId);
+  // ?task=asr|tts decides the initial task (and its defaults) on first render, so
+  // the model dropdown isn't briefly empty while an effect flips asr→tts.
+  const initialTask: "asr" | "tts" = searchParams.get("task") === "tts" ? "tts" : "asr";
   const [datasets, setDatasets] = useState<DatasetRecord[]>([]);
   const [storages, setStorages] = useState<StorageRecord[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -188,18 +199,15 @@ export function TrainingForm() {
   const [error, setError] = useState<string | null>(null);
 
   // task + model + data
-  const [taskType, setTaskType] = useState<"asr" | "tts">("asr");
-  const [name, setName] = useState("whisper-finetune");
-  const [modelChoice, setModelChoice] = useState(DEFAULT_WHISPER);
+  const [taskType, setTaskType] = useState<"asr" | "tts">(initialTask);
+  const [name, setName] = useState(initialTask === "tts" ? "tts-finetune" : "whisper-finetune");
+  const [modelChoice, setModelChoice] = useState(initialTask === "tts" ? DEFAULT_TTS_BASE : DEFAULT_WHISPER);
   const [customModel, setCustomModel] = useState("");
   const [datasetId, setDatasetId] = useState("");
   const [testDatasetId, setTestDatasetId] = useState(AUTO_SPLIT);
   const [evalSplitPct, setEvalSplitPct] = useState(10);
-  // TTS-only (Qwen3 + NeuCodec)
-  const [ttsTokenizer, setTtsTokenizer] = useState(DEFAULT_TTS_TOKENIZER);
-  const [blockSize, setBlockSize] = useState(10240);
-  const [packSeq, setPackSeq] = useState(4096);
-  const [defaultSpeaker, setDefaultSpeaker] = useState("speaker");
+  // TTS trains on a pre-packed dataset: block size follows the dataset's
+  // sequence_length and the tokenizer is the base model's — neither is asked here.
   const [gradAccum, setGradAccum] = useState(4);
   // training
   const [evalMetric, setEvalMetric] = useState<"wer" | "cer">("wer");
@@ -227,7 +235,6 @@ export function TrainingForm() {
   const [sweepBatch, setSweepBatch] = useState("");
   const [sweepGradAccum, setSweepGradAccum] = useState("");
   const [sweepEpochs, setSweepEpochs] = useState("");
-  const [sweepBlock, setSweepBlock] = useState("");
   const [sweepWeightDecay, setSweepWeightDecay] = useState("");
   const [sweepLoraR, setSweepLoraR] = useState("");
   const [sweepPrecisions, setSweepPrecisions] = useState<string[]>([]);
@@ -253,10 +260,12 @@ export function TrainingForm() {
   const [hfPushRepo, setHfPushRepo] = useState("");
   const [workDir, setWorkDir] = useState("/share");
   // Isolated uv venv for the trainer deps (mirrors serverless's vLLM venv_path).
-  const [venvPath, setVenvPath] = useState("/share/autotrain-whisper");
+  const [venvPath, setVenvPath] = useState(initialTask === "tts" ? "/share/autotrain-tts" : "/share/autotrain-whisper");
   const [cleanupCheckpoints, setCleanupCheckpoints] = useState(true);
   const [augmentTechniques, setAugmentTechniques] = useState<string[]>([]);
   const [augmentProb, setAugmentProb] = useState(0.5);
+  // TTS eval methods to run on the test set (CER / MOS / similarity).
+  const [evalMethods, setEvalMethods] = useState<string[]>(["cer"]);
   // experiment tracking — named credentials from the Secrets page (picked per run)
   const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
   const [wandbCredId, setWandbCredId] = useState("");
@@ -326,11 +335,6 @@ export function TrainingForm() {
         setDatasetId(r.dataset_id || "");
         setTestDatasetId(r.test_dataset_id || AUTO_SPLIT);
         if (c.eval_split_pct != null) setEvalSplitPct(num(c.eval_split_pct, 10));
-        // TTS knobs
-        if (c.tokenizer) setTtsTokenizer(str(c.tokenizer));
-        if (c.block_size != null) setBlockSize(num(c.block_size, 10240));
-        if (c.pack_sequence_length != null) setPackSeq(num(c.pack_sequence_length, 4096));
-        if (c.default_speaker) setDefaultSpeaker(str(c.default_speaker));
         // training
         if (c.grad_accum != null) setGradAccum(num(c.grad_accum, 4));
         if (c.eval_metric === "wer" || c.eval_metric === "cer") setEvalMetric(c.eval_metric);
@@ -358,7 +362,6 @@ export function TrainingForm() {
           setSweepBatch(csv(sweep.batch_size));
           setSweepGradAccum(csv(sweep.grad_accum));
           setSweepEpochs(csv(sweep.max_epochs));
-          setSweepBlock(csv(sweep.block_size));
           setSweepWeightDecay(csv(sweep.weight_decay));
           setSweepLoraR(csv(sweep.lora_r));
           setSweepPrecisions(arr(sweep.precision).map(String));
@@ -368,6 +371,7 @@ export function TrainingForm() {
         // augmentation
         if (Array.isArray(c.augment_techniques)) setAugmentTechniques(arr(c.augment_techniques).map(String));
         if (c.augment_prob != null) setAugmentProb(num(c.augment_prob, 0.5));
+        if (Array.isArray(c.eval_methods)) setEvalMethods(arr(c.eval_methods).map(String));
         // run on
         if (r.provider_kind === "vm") { setTarget("vm"); setProviderId(r.provider_id || ""); }
         else if (r.provider_id) { setTarget("cloud"); setRunpodProviderId(r.provider_id); }
@@ -440,10 +444,12 @@ export function TrainingForm() {
   const hasStorage = s3Storages.length > 0;
   const isTts = taskType === "tts";
   const MODELS = isTts ? TTS_BASE_MODELS : WHISPER_MODELS;
+  // TTS trains directly on a pre-packed (tts_packed) dataset; ASR uses any source.
+  const pickDatasets = isTts ? datasets.filter((d) => d.kind === "tts_packed") : datasets;
 
   function pickTask(t: "asr" | "tts") {
     setTaskType(t);
-    setModelChoice(t === "tts" ? TTS_BASE_MODELS[0] : DEFAULT_WHISPER);
+    setModelChoice(t === "tts" ? DEFAULT_TTS_BASE : DEFAULT_WHISPER);
     // Swap the default uv venv path when the user hasn't customized it.
     setVenvPath((v) =>
       t === "tts"
@@ -451,12 +457,18 @@ export function TrainingForm() {
         : (v === "/share/autotrain-tts" ? "/share/autotrain-whisper" : v),
     );
     if (t === "tts") {
-      setPrecision("bf16");
       setName((n) => (n === "whisper-finetune" ? "tts-finetune" : n));
     } else {
       setName((n) => (n === "tts-finetune" ? "whisper-finetune" : n));
     }
+    // Reflect the ASR/TTS choice in the URL (?task=) so it's deep-linkable.
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      params.set("task", t);
+      window.history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
+    }
   }
+
 
   function buildSweep(): Record<string, (number | string)[]> {
     const s: Record<string, (number | string)[]> = {};
@@ -478,10 +490,6 @@ export function TrainingForm() {
     if (sweepAugment && augmentTechniques.length) s.augment = ["on", "off"];
     // Freeze-encoder vs full as a sweep dimension (ASR only).
     if (sweepFreeze && !isTts) s.freeze_encoder = ["on", "off"];
-    if (isTts) {
-      const bs = parseCsvNums(sweepBlock, true);
-      if (bs.length) s.block_size = bs;
-    }
     return s;
   }
   const sweepGrid = sweepOn ? buildSweep() : {};
@@ -539,7 +547,6 @@ export function TrainingForm() {
         { label: "Max epochs", val: sweepEpochs, kind: "int" },
         { label: "LoRA r", val: sweepLoraR, kind: "int" },
         { label: "Weight decay", val: sweepWeightDecay, kind: "nonneg" },
-        ...(isTts ? [{ label: "Block sizes", val: sweepBlock, kind: "int" as const }] : []),
       ];
       for (const f of numFields) {
         const bad = invalidNumTokens(f.val, f.kind);
@@ -563,11 +570,11 @@ export function TrainingForm() {
       dataset_id: datasetId,
       base_model: baseModel,
       task_type: taskType,
-      test_dataset_id: isTts ? null : (testDatasetId === AUTO_SPLIT ? null : testDatasetId),
+      test_dataset_id: testDatasetId === AUTO_SPLIT ? null : testDatasetId,
       eval_metric: evalMetric,
       normalize_text: normalizeText,
       max_epochs: maxEpochs,
-      patience: isTts ? 0 : patience,
+      patience: patience,
       eval_split_pct: evalSplitPct,
       batch_size: batchSize,
       grad_accum: gradAccum,
@@ -582,12 +589,10 @@ export function TrainingForm() {
       logging_steps: loggingSteps,
       precision: precision as CreateTrainingRunRequest["precision"],
       language: isTts ? null : (language.trim() || null),
-      ...(isTts ? {
-        tokenizer: ttsTokenizer.trim() || DEFAULT_TTS_TOKENIZER,
-        block_size: blockSize,
-        pack_sequence_length: packSeq,
-        default_speaker: defaultSpeaker.trim() || "speaker",
-      } : {}),
+      // TTS: block size + tokenizer are derived server-side from the packed
+      // dataset + base model, so they're not sent from the form. The chosen
+      // audio-eval methods (CER / MOS / similarity) run on the test set.
+      ...(isTts ? { eval_methods: evalMethods } : {}),
       ...(sweepOn && Object.keys(sweepGrid).length
         ? { sweep: sweepGrid, gpus_per_trial: gpusPerTrial }
         : {}),
@@ -695,50 +700,64 @@ export function TrainingForm() {
           <FieldWrap label="Run name">
             <Input className="font-mono" value={name} onChange={(e) => setName(e.target.value)} />
           </FieldWrap>
-          <FieldWrap label="Training dataset" hint="From the Datasets page.">
+          <FieldWrap label="Training dataset"
+            hint={isTts ? "A NeuCodec-packed dataset (kind=tts_packed) from the Datasets page." : "From the Datasets page."}>
             <Select value={datasetId} onValueChange={setDatasetId}>
-              <SelectTrigger><SelectValue placeholder={datasets.length ? "Pick a dataset…" : "No datasets yet"} /></SelectTrigger>
+              <SelectTrigger>
+                <SelectValue placeholder={
+                  pickDatasets.length ? "Pick a dataset…" : (isTts ? "No packed datasets — pack one first" : "No datasets yet")
+                } />
+              </SelectTrigger>
               <SelectContent>
-                {datasets.map((d) => (
+                {pickDatasets.map((d) => (
                   <SelectItem key={d.id} value={d.id}>
                     {d.name}{d.num_rows != null ? ` · ${d.num_rows} rows` : ""} · {d.kind}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            {isTts && pickDatasets.length === 0 && (
+              <p className="mt-1.5 text-[11px] text-muted-foreground">
+                TTS trains on a packed dataset. Create one with{" "}
+                <span className="font-mono">Pack for TTS</span> on a dataset&apos;s Transformation tab.
+              </p>
+            )}
           </FieldWrap>
-          {!isTts && (
-            <FieldWrap label="Test dataset" hint="Held out for per-epoch WER/CER. Auto-split if none.">
-              <Select value={testDatasetId} onValueChange={setTestDatasetId}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={AUTO_SPLIT}>— Auto-split from training set —</SelectItem>
-                  {datasets.map((d) => (
-                    <SelectItem key={d.id} value={d.id}>
-                      {d.name} · {d.kind}
-                      {d.id === datasetId ? " — its own test split" : ""}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {testDatasetId === AUTO_SPLIT && (
-                <div className="mt-2 flex items-center gap-2">
-                  <Label className="text-xs text-muted-foreground">Hold-out %</Label>
-                  <Input type="number" min={1} max={50} className="w-24"
-                    value={evalSplitPct} onChange={(e) => setEvalSplitPct(Number(e.target.value))} />
-                  <span className="text-[11px] text-muted-foreground">uses a `split` column if present</span>
-                </div>
-              )}
-              {testDatasetId === datasetId && datasetId !== "" && (
-                <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
-                  Same as training — evaluation uses this dataset&apos;s{" "}
-                  <span className="font-mono">test</span>/<span className="font-mono">validation</span>{" "}
-                  rows (its <span className="font-mono">split</span> column). Falls back to a seeded
-                  hold-out if it has none.
-                </p>
-              )}
-            </FieldWrap>
-          )}
+          <FieldWrap label="Test dataset"
+            hint={isTts
+              ? "Auto-split a fraction of the packed records for eval loss, or pick another packed dataset."
+              : "Held out for per-epoch WER/CER. Auto-split if none."}>
+            <Select value={testDatasetId} onValueChange={setTestDatasetId}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value={AUTO_SPLIT}>— Auto-split from training set —</SelectItem>
+                {pickDatasets.filter((d) => !isTts || d.id !== datasetId).map((d) => (
+                  <SelectItem key={d.id} value={d.id}>
+                    {d.name}{d.num_rows != null ? ` · ${d.num_rows} rows` : ""} · {d.kind}
+                    {!isTts && d.id === datasetId ? " — its own test split" : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {testDatasetId === AUTO_SPLIT && (
+              <div className="mt-2 flex items-center gap-2">
+                <Label className="text-xs text-muted-foreground">Hold-out %</Label>
+                <Input type="number" min={1} max={50} className="w-24"
+                  value={evalSplitPct} onChange={(e) => setEvalSplitPct(Number(e.target.value))} />
+                <span className="text-[11px] text-muted-foreground">
+                  {isTts ? "held out from the packed records for eval loss" : "uses a `split` column if present"}
+                </span>
+              </div>
+            )}
+            {!isTts && testDatasetId === datasetId && datasetId !== "" && (
+              <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+                Same as training — evaluation uses this dataset&apos;s{" "}
+                <span className="font-mono">test</span>/<span className="font-mono">validation</span>{" "}
+                rows (its <span className="font-mono">split</span> column). Falls back to a seeded
+                hold-out if it has none.
+              </p>
+            )}
+          </FieldWrap>
         </Grid>
       </Section>
 
@@ -812,11 +831,12 @@ export function TrainingForm() {
               </Select>
             </FieldWrap>
           )}
-          {!isTts && (
-            <FieldWrap label="Early-stop patience" hint="Epochs without eval improvement before stopping. 0 = off.">
-              <NumberField min={0} value={patience} onChange={setPatience} />
-            </FieldWrap>
-          )}
+          <FieldWrap label="Early-stop patience"
+            hint={isTts
+              ? "Evals without eval-loss improvement before stopping. 0 = off (needs a test set)."
+              : "Epochs without eval improvement before stopping. 0 = off."}>
+            <NumberField min={0} value={patience} onChange={setPatience} />
+          </FieldWrap>
           {!isTts && (
             <FieldWrap label="Language" hint="ISO code (e.g. en, ms). Empty = multilingual / model default.">
               <Input className="font-mono" placeholder="en" value={language} onChange={(e) => setLanguage(e.target.value)} />
@@ -863,29 +883,9 @@ export function TrainingForm() {
             </FieldWrap>
           )}
 
-          {/* TTS knobs */}
-          {isTts && (sweepOn ? (
-            <FieldWrap label="Block sizes" hint="e.g. 8192, 10240">
-              <Input className="font-mono" placeholder="8192, 10240" value={sweepBlock} onChange={(e) => setSweepBlock(e.target.value)} />
-            </FieldWrap>
-          ) : (
-            <FieldWrap label="Block size (training ctx)" hint="qwen3_tts_flash --block_size">
-              <NumberField min={512} value={blockSize} onChange={setBlockSize} />
-            </FieldWrap>
-          ))}
-          {isTts && (
-            <>
-              <FieldWrap label="Pack sequence length" hint="Per-utterance pack length (pack_stage1).">
-                <NumberField min={256} value={packSeq} onChange={setPackSeq} />
-              </FieldWrap>
-              <FieldWrap label="Pack tokenizer" hint="Tokenizer carrying the NeuCodec speech tokens.">
-                <Input className="font-mono" value={ttsTokenizer} onChange={(e) => setTtsTokenizer(e.target.value)} />
-              </FieldWrap>
-              <FieldWrap label="Default speaker" hint="Used when a row has no speaker column.">
-                <Input className="font-mono" value={defaultSpeaker} onChange={(e) => setDefaultSpeaker(e.target.value)} />
-              </FieldWrap>
-            </>
-          )}
+          {/* TTS: block size + tokenizer aren't asked here — block size follows the
+              packed dataset's sequence_length, and the tokenizer is the base TTS
+              model's. (Packing already happened on the Datasets page.) */}
 
           {sweepOn && (
             <FieldWrap label="GPUs per trial" hint="Trials run concurrently = #GPUs / this.">
@@ -894,57 +894,55 @@ export function TrainingForm() {
           )}
         </Grid>
 
-        {/* LoRA + freeze-encoder (ASR / Whisper) */}
-        {!isTts && (
-          <div className="mt-4 space-y-3 border-t border-border pt-4">
-            <div className="flex flex-wrap items-center gap-x-8 gap-y-2">
+        {/* LoRA (ASR + TTS) + freeze-encoder (ASR / Whisper only) */}
+        <div className="mt-4 space-y-3 border-t border-border pt-4">
+          <div className="flex flex-wrap items-center gap-x-8 gap-y-2">
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input type="checkbox" checked={useLora} onChange={(e) => setUseLora(e.target.checked)}
+                className="h-4 w-4 accent-primary" />
+              <span className="font-medium">Use LoRA</span>
+              <span className="text-xs text-muted-foreground">adapters on all linear layers, merged into the base at save</span>
+            </label>
+            {!isTts && (sweepOn ? (
               <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input type="checkbox" checked={useLora} onChange={(e) => setUseLora(e.target.checked)}
+                <input type="checkbox" checked={sweepFreeze} onChange={(e) => setSweepFreeze(e.target.checked)}
                   className="h-4 w-4 accent-primary" />
-                <span className="font-medium">Use LoRA</span>
-                <span className="text-xs text-muted-foreground">adapters on q/v attention, merged into the base at save</span>
+                <span className="font-medium">Sweep freeze-encoder</span>
+                <span className="text-xs text-muted-foreground">compare frozen vs full (×2 trials)</span>
               </label>
-              {sweepOn ? (
-                <label className="flex cursor-pointer items-center gap-2 text-sm">
-                  <input type="checkbox" checked={sweepFreeze} onChange={(e) => setSweepFreeze(e.target.checked)}
-                    className="h-4 w-4 accent-primary" />
-                  <span className="font-medium">Sweep freeze-encoder</span>
-                  <span className="text-xs text-muted-foreground">compare frozen vs full (×2 trials)</span>
-                </label>
-              ) : (
-                <label className="flex cursor-pointer items-center gap-2 text-sm">
-                  <input type="checkbox" checked={freezeEncoder} onChange={(e) => setFreezeEncoder(e.target.checked)}
-                    className="h-4 w-4 accent-primary" />
-                  <span className="font-medium">Freeze encoder</span>
-                  <span className="text-xs text-muted-foreground">train the decoder only</span>
-                </label>
-              )}
-            </div>
-            {useLora && (
-              <div className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-3">
-                {sweepOn ? (
-                  <FieldWrap label="LoRA r" hint="e.g. 8, 16, 32">
-                    <Input className="font-mono" placeholder="8, 16, 32" value={sweepLoraR} onChange={(e) => setSweepLoraR(e.target.value)} />
-                  </FieldWrap>
-                ) : (
-                  <FieldWrap label="LoRA r" hint="Adapter rank."><NumberField min={1} value={loraR} onChange={setLoraR} /></FieldWrap>
-                )}
-                <FieldWrap
-                  label="LoRA alpha ratio"
-                  hint={sweepOn
-                    ? `alpha = round(r × ${loraAlphaRatio}) per trial (e.g. r 32 → ${Math.round(32 * loraAlphaRatio)})`
-                    : `alpha = ${Math.round(loraR * loraAlphaRatio)} (r ${loraR} × ${loraAlphaRatio}). 2× is typical.`}>
-                  <Input className="font-mono" type="number" min={0} step={0.5} value={loraAlphaRatio}
-                    onChange={(e) => setLoraAlphaRatio(Math.max(0, Number(e.target.value) || 0))} />
-                </FieldWrap>
-                <FieldWrap label="LoRA dropout" hint="0–1, on the adapters.">
-                  <Input className="font-mono" type="number" min={0} max={1} step={0.01} value={loraDropout}
-                    onChange={(e) => setLoraDropout(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />
-                </FieldWrap>
-              </div>
-            )}
+            ) : (
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={freezeEncoder} onChange={(e) => setFreezeEncoder(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span className="font-medium">Freeze encoder</span>
+                <span className="text-xs text-muted-foreground">train the decoder only</span>
+              </label>
+            ))}
           </div>
-        )}
+          {useLora && (
+            <div className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-3">
+              {sweepOn ? (
+                <FieldWrap label="LoRA r" hint="e.g. 8, 16, 32">
+                  <Input className="font-mono" placeholder="8, 16, 32" value={sweepLoraR} onChange={(e) => setSweepLoraR(e.target.value)} />
+                </FieldWrap>
+              ) : (
+                <FieldWrap label="LoRA r" hint="Adapter rank."><NumberField min={1} value={loraR} onChange={setLoraR} /></FieldWrap>
+              )}
+              <FieldWrap
+                label="LoRA alpha ratio"
+                hint={sweepOn
+                  ? `alpha = round(r × ${loraAlphaRatio}) per trial (e.g. r 32 → ${Math.round(32 * loraAlphaRatio)})`
+                  : `alpha = ${Math.round(loraR * loraAlphaRatio)} (r ${loraR} × ${loraAlphaRatio}). 2× is typical.`}>
+                <Input className="font-mono" type="number" min={0} step={0.5} value={loraAlphaRatio}
+                  onChange={(e) => setLoraAlphaRatio(Math.max(0, Number(e.target.value) || 0))} />
+              </FieldWrap>
+              <FieldWrap label="LoRA dropout" hint="0–1, on the adapters.">
+                <Input className="font-mono" type="number" min={0} max={1} step={0.01} value={loraDropout}
+                  onChange={(e) => setLoraDropout(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />
+              </FieldWrap>
+            </div>
+          )}
+        </div>
 
         {sweepOn && (
           <p className="mt-4 text-[11px] leading-snug text-muted-foreground">
@@ -955,6 +953,41 @@ export function TrainingForm() {
             <span className="font-mono">…/trials/&lt;i&gt;/</span>.
           </p>
         )}
+        {isTts && (
+          <div className="mt-5 space-y-1.5 border-t border-border pt-4">
+            <Label className="text-xs">Evaluation methods</Label>
+            <p className="text-xs text-muted-foreground">
+              Synthesize the test set and score it (per eval, drives patience early-stop + best-model).
+              Pick any combination — each runs independently. No test set = skipped.
+            </p>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              {TTS_EVAL_METHODS.map((m) => {
+                const on = evalMethods.includes(m.id);
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    title={m.desc}
+                    onClick={() =>
+                      setEvalMethods((prev) =>
+                        prev.includes(m.id) ? prev.filter((x) => x !== m.id) : [...prev, m.id],
+                      )
+                    }
+                    className={cn(
+                      "rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors",
+                      on ? "border-primary/60 bg-primary/10 text-foreground"
+                         : "border-border text-muted-foreground hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <span className="block font-medium">{m.label}</span>
+                    <span className="block text-[10px] opacity-70">{m.desc}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        {!isTts && (
         <div className="mt-5 space-y-1.5 border-t border-border pt-4">
           <Label className="text-xs">Audio augmentation (training only)</Label>
           <p className="text-xs text-muted-foreground">
@@ -1027,6 +1060,7 @@ export function TrainingForm() {
             </label>
           )}
         </div>
+        )}
       </Section>
 
       {/* Run on — pod card (mirrors benchmark/new) */}

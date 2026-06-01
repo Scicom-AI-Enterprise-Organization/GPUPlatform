@@ -166,6 +166,7 @@ export default async function DatasetDetailPage({
               kind={dataset.kind}
               audioField={dataset.audio_field}
               transcriptionField={dataset.transcription_field}
+              speakerField={dataset.speaker_field}
               splitFields={dataset.split_fields}
             />
 

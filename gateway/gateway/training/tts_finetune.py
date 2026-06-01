@@ -85,6 +85,7 @@ DEPS = [
     "librosa", "soundfile", "datasets", "wandb", "boto3",
     "neucodec", "pandas", "pyarrow", "multiprocess", "liger-kernel",
     "git+https://github.com/apple/ml-cross-entropy",
+    "peft>=0.11",  # LoRA (all-linear adapters, merged into base at save)
 ]
 
 
@@ -134,6 +135,31 @@ def _ensure_venv(cfg: dict) -> str:
         subprocess.check_call([py, "-m", "pip", "install", "-q", *pkgs], env=env)
     log(f"[deps] TTS venv ready: {py}")
     return py
+
+
+# Eval-only extras, installed on demand (per the selected methods) so non-eval
+# runs keep a lean venv. The MOS/similarity models come from the Scicom repos.
+_EVAL_DEPS = {
+    "cer": ["jiwer"],  # transformers/whisper already in the TTS stack
+    "mos": ["git+https://github.com/Scicom-AI-Enterprise-Organization/faster-UTMOSv2"],
+    "similarity": ["scikit-learn", "git+https://github.com/Scicom-AI-Enterprise-Organization/titanet-vectors-fp16"],
+}
+
+
+def _ensure_eval_deps(py: str, methods: list, env: dict) -> None:
+    import shutil
+
+    pkgs: list[str] = []
+    for m in methods:
+        pkgs += _EVAL_DEPS.get(m, [])
+    pkgs = sorted(set(pkgs))
+    if not pkgs:
+        return
+    log(f"[eval][deps] installing: {', '.join(pkgs)}")
+    if shutil.which("uv"):
+        subprocess.check_call(["uv", "pip", "install", "--python", py, *pkgs], env=env)
+    else:
+        subprocess.check_call([py, "-m", "pip", "install", "-q", *pkgs], env=env)
 
 
 # --------------------------------------------------------------------------
@@ -382,6 +408,24 @@ def run(cfg: dict) -> None:
     elif amp == "fp16":
         dtype_args += ["--fp16"]
     report_flag = ",".join(report_to) if report_to else "none"
+    # LoRA on all linear layers (embeddings + lm_head stay frozen). alpha follows
+    # r via lora_alpha_ratio when set (mirrors the Whisper path) so a sweep over r
+    # carries alpha with it; the adapters are merged into a plain checkpoint at
+    # save (see qwen3_tts_flash.py) so eval/serving need no peft.
+    lora_args: list[str] = []
+    if cfg.get("use_lora"):
+        _r = int(cfg.get("lora_r", 16))
+        _ratio = cfg.get("lora_alpha_ratio")
+        _alpha = int(round(_r * float(_ratio))) if _ratio is not None else int(cfg.get("lora_alpha", 32))
+        _tgt = str(cfg.get("lora_target_modules") or "all-linear")
+        lora_args = [
+            "--use_lora", "true",
+            "--lora_r", str(_r),
+            "--lora_alpha", str(_alpha),
+            "--lora_dropout", str(float(cfg.get("lora_dropout", 0.05))),
+            "--lora_target_modules", _tgt,
+        ]
+        log(f"[train] LoRA enabled (r={_r}, alpha={_alpha}, dropout={cfg.get('lora_dropout', 0.05)}, target={_tgt})")
     last_loss = _run_loss([
         # venv python's torch.distributed.run (sys.executable is the venv python
         # in the run phase) — not a system `torchrun` that'd miss the venv torch.
@@ -406,7 +450,36 @@ def run(cfg: dict) -> None:
         "--remove_unused_columns", "false",
         "--report_to", report_flag,
         *dtype_args,
+        *lora_args,
     ], work, env)
+
+    # ---- evaluation (CER / MOS / similarity) on the test set ----
+    eval_methods = [m for m in (cfg.get("eval_methods") or []) if m in ("cer", "mos", "similarity")]
+    if eval_methods and os.path.isdir(out_dir):
+        # eval set: a separate packed test dataset if given, else the training
+        # packed dir (auto-split — sampled; the trainer doesn't carve a held-out
+        # shard set, so this scores generation quality on the packed records).
+        test_ds = cfg.get("test_dataset") or {}
+        eval_dir = packed
+        if isinstance(test_ds, dict) and test_ds.get("packed_uri"):
+            eval_dir = os.path.join(work, "eval_packed")
+            _download_s3_prefix(test_ds, test_ds["packed_uri"], eval_dir)
+        try:
+            _ensure_eval_deps(sys.executable, eval_methods, env)
+            eval_cmd = [
+                sys.executable, "-u", os.path.join(TTS_DIR, "tts_eval.py"),
+                "--model_dir", out_dir, "--eval_dir", eval_dir,
+                "--out_dir", os.path.join(work, "eval_audio"),
+                "--methods", ",".join(eval_methods),
+                "--max_samples", str(int(cfg.get("eval_max_samples", 64))),
+            ]
+            if cfg.get("language"):
+                eval_cmd += ["--language", str(cfg["language"])]
+            if cfg.get("eval_asr_model"):
+                eval_cmd += ["--asr_model", str(cfg["eval_asr_model"])]
+            step(eval_cmd, work)  # @@METRIC {tts_eval:{…}} is parsed by the gateway
+        except Exception as e:  # noqa: BLE001 — eval is best-effort; training already succeeded
+            log(f"[eval] TTS evaluation failed (training is unaffected): {e}")
 
     # ---- upload checkpoint to S3 + optional HF ----
     art = cfg.get("artifacts") or {}

@@ -73,6 +73,8 @@ class UpdateDatasetRequest(BaseModel):
     audio_prefix: Optional[str] = None
     audio_field: Optional[str] = None
     transcription_field: Optional[str] = None
+    # TTS-only speaker column. Pass "" to clear (one-voice packing).
+    speaker_field: Optional[str] = None
     # Per-split transcription column overrides, e.g. {"train": "text", "test": "after"}.
     # Pass {} to clear. Splits not listed fall back to transcription_field.
     split_fields: Optional[dict[str, str]] = None
@@ -130,6 +132,7 @@ class DatasetRecord(BaseModel):
     num_rows: Optional[int] = None
     audio_field: str = "audio"
     transcription_field: str = "transcription"
+    speaker_field: Optional[str] = None  # TTS-only speaker column (None → one voice)
     # Usually {split: transcription_column} (str→str), but a packed (tts_packed)
     # dataset stashes a nested {"_tts_pack": {...}} metadata blob here — so the
     # response type tolerates non-string values (don't tighten back to str).
@@ -209,6 +212,7 @@ def _to_record(d: Dataset, owner_username: str, storage_name: Optional[str]) -> 
         num_rows=d.num_rows,
         audio_field=d.audio_field,
         transcription_field=d.transcription_field,
+        speaker_field=getattr(d, "speaker_field", None) or None,
         split_fields=getattr(d, "split_fields", None) or None,
         audio_dataset_id=getattr(d, "audio_dataset_id", None) or None,
         hf_repo=d.hf_repo,
@@ -477,6 +481,9 @@ async def update_dataset(
         d.audio_field = req.audio_field.strip()
     if req.transcription_field is not None and req.transcription_field.strip():
         d.transcription_field = req.transcription_field.strip()
+    if req.speaker_field is not None:
+        # Blank clears it → the packer falls back to a single constant speaker.
+        d.speaker_field = req.speaker_field.strip() or None
     if req.split_fields is not None:
         # {} clears the overrides; otherwise keep only non-blank split→column pairs.
         cleaned = {
@@ -727,6 +734,24 @@ async def _source_audio_resolver(session: AsyncSession, d: Dataset):
     return resolve
 
 
+def _hf_split_ident(splits: list[dict[str, Any]]):
+    """Return a function that names each datasets-server split entry by whichever
+    of config/split is the distinct one, so the row preview, the /splits picker
+    and the per-split column map all agree on labels. A multi-config dataset
+    (configs "test"/"train", each with a single split "train") is labelled by
+    config; a normal single-config dataset ("default") is labelled by its split
+    (train/test/validation). Reading the parquet directory names directly is
+    unreliable — it surfaces the top-level dir (e.g. "data"/"default") rather than
+    the actual split."""
+    configs = [s["config"] for s in splits]
+    snames = [s["split"] for s in splits]
+    if splits and len(set(configs)) == len(splits):
+        return lambda s: s["config"]  # noqa: E731
+    if splits and len(set(snames)) == len(splits):
+        return lambda s: s["split"]  # noqa: E731
+    return lambda s: f'{s["config"]}/{s["split"]}'  # noqa: E731
+
+
 def _hf_preview_rows(
     hf_repo: str, token: Optional[str], limit: int, offset: int = 0, split: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], Optional[int], Optional[str], list[str]]:
@@ -743,18 +768,7 @@ def _hf_preview_rows(
         splits = sp.json().get("splits", [])
         if not splits:
             return [], 0, None, []
-        # Identify each entry by whichever of config/split is distinct, so the
-        # label matches the parquet-dir names used by /splits + the per-split
-        # mapping. This dataset uses configs "test"/"train" (each split "train");
-        # a normal dataset uses one config "default" with distinct splits.
-        configs = [s["config"] for s in splits]
-        snames = [s["split"] for s in splits]
-        if len(set(configs)) == len(splits):
-            ident = lambda s: s["config"]  # noqa: E731
-        elif len(set(snames)) == len(splits):
-            ident = lambda s: s["split"]  # noqa: E731
-        else:
-            ident = lambda s: f'{s["config"]}/{s["split"]}'  # noqa: E731
+        ident = _hf_split_ident(splits)
         names = [ident(s) for s in splits]
         chosen = next((s for s in splits if ident(s) == split), splits[0])
         rows = cli.get(
@@ -772,37 +786,37 @@ def _hf_preview_rows(
 
 
 def _hf_split_columns(hf_repo: str, token: Optional[str]) -> list[dict[str, Any]]:
-    """Per-split column names for an HF dataset by reading each split's parquet
-    footer (cheap — only the metadata/footer is fetched, not the data). Splits
-    can have *different* schemas; the UI uses this to offer a transcription-column
-    picker per split. Returns [{split, columns, num_rows}]."""
-    from huggingface_hub import HfApi, HfFileSystem
-    import pyarrow.parquet as pq
-
-    api = HfApi(token=token)
-    files = [f for f in api.list_repo_files(hf_repo, repo_type="dataset") if f.endswith(".parquet")]
-    if not files:
-        return []
-    fs = HfFileSystem(token=token)
-    agg: dict[str, dict[str, Any]] = {}
-    for f in files:
-        # HF parquet layout is "<split>/<shard>.parquet"; bare files → "default".
-        split = f.split("/")[0] if "/" in f else "default"
-        try:
-            with fs.open(f"datasets/{hf_repo}/{f}") as fh:
-                pf = pq.ParquetFile(fh)
-                cols = list(pf.schema_arrow.names)
-                nrows = pf.metadata.num_rows
-        except Exception:
-            logger.warning("split-columns read failed for %s/%s", hf_repo, f)
-            continue
-        a = agg.setdefault(split, {"columns": set(), "num_rows": 0})
-        a["columns"].update(cols)
-        a["num_rows"] += nrows
-    return [
-        {"split": k, "columns": sorted(v["columns"]), "num_rows": v["num_rows"]}
-        for k, v in sorted(agg.items())
-    ]
+    """Per-split column names + row counts for an HF dataset, from the HF
+    datasets-server: `/splits` for the authoritative config/split list and
+    `/info` for each config's feature columns and per-split row counts. The UI
+    uses this to offer a transcription/speaker column picker per split, so the
+    labels MUST match `_hf_preview_rows` (train/test, …) — not the parquet
+    directory names. Returns [{split, columns, num_rows}]."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    with httpx.Client(timeout=20.0) as cli:
+        sp = cli.get(
+            "https://datasets-server.huggingface.co/splits",
+            params={"dataset": hf_repo}, headers=headers,
+        )
+        sp.raise_for_status()
+        splits = sp.json().get("splits", [])
+        if not splits:
+            return []
+        ident = _hf_split_ident(splits)
+        info = cli.get(
+            "https://datasets-server.huggingface.co/info",
+            params={"dataset": hf_repo}, headers=headers,
+        )
+        info.raise_for_status()
+        # dataset_info maps config → {features: {col: …}, splits: {split: {num_examples}}}.
+        di = info.json().get("dataset_info", {}) or {}
+    out = []
+    for s in splits:
+        cfg = di.get(s["config"], {}) or {}
+        cols = sorted((cfg.get("features") or {}).keys())
+        nrows = ((cfg.get("splits") or {}).get(s["split"]) or {}).get("num_examples")
+        out.append({"split": ident(s), "columns": cols, "num_rows": nrows})
+    return out
 
 
 # ---------- labeling-platform source (kind=label) ----------------------
@@ -1338,6 +1352,9 @@ async def pack_tts_dataset(
         venv_path=(req.venv_path or "").strip() or "/share/neucodec-tts",
         tokenizer=req.tokenizer or None,
         pack_sequence_length=req.sequence_length,
+        # The speaker column is set on the dataset's column mapping; pack_stage1
+        # prepends it to each transcript. None → a single constant speaker.
+        speaker_field=d.speaker_field or None,
         pack_only=True, pack_source_dataset_id=dataset_id,
         max_epochs=1,
     )

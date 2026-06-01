@@ -164,6 +164,15 @@ class ModelArguments:
             )
         },
     )
+    # ---- LoRA (peft) ----------------------------------------------------
+    use_lora: bool = field(
+        default=False, metadata={"help": "Wrap the model in LoRA adapters (peft) instead of full finetuning."})
+    lora_r: int = field(default=16, metadata={"help": "LoRA rank."})
+    lora_alpha: int = field(default=32, metadata={"help": "LoRA alpha (absolute)."})
+    lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout on the adapters."})
+    lora_target_modules: str = field(
+        default="all-linear",
+        metadata={"help": "Comma-separated module names, or 'all-linear' for every nn.Linear (excl. the output proj)."})
 
     def __post_init__(self):
         if self.config_overrides is not None and (
@@ -197,12 +206,33 @@ class Model(Qwen3ForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         self.loss = LigerFusedLinearCrossEntropyLoss(reduction="sum")
-        
+
+    def _lm_head_weight(self):
+        """The lm_head weight to project hidden states with in the fused loss.
+        Normally a plain nn.Linear (frozen under LoRA — we don't adapt the head).
+        Defensive: if the head is ever kept trainable via peft's modules_to_save
+        (ModulesToSaveWrapper), return the active copy; otherwise the base weight."""
+        head = self.lm_head
+        msd = getattr(head, "modules_to_save", None)
+        if msd is not None:
+            active = getattr(head, "active_adapter", None)
+            if isinstance(active, (list, tuple)):
+                active = active[0] if active else None
+            if active is not None and active in msd:
+                return msd[active].weight
+        return head.weight
+
     def forward(self, input_ids, attention_mask=None, position_ids=None, labels=None, num_items_in_batch=None, **kwargs):
+        # peft's PeftModelForCausalLM.forward injects output_hidden_states /
+        # output_attentions / return_dict / inputs_embeds into kwargs; drop them
+        # so they don't collide with the explicit output_hidden_states=True (and
+        # so a None inputs_embeds doesn't fight the real input_ids).
+        for _k in ("output_hidden_states", "output_attentions", "return_dict", "inputs_embeds"):
+            kwargs.pop(_k, None)
         super_out = self.model.forward(
-            input_ids = input_ids, 
-            position_ids = position_ids, 
-            attention_mask = attention_mask, 
+            input_ids = input_ids,
+            position_ids = position_ids,
+            attention_mask = attention_mask,
             output_hidden_states = True,
             **kwargs,
         )
@@ -211,7 +241,7 @@ class Model(Qwen3ForCausalLM):
             embeddings = embeddings[:,:-1].reshape(-1, embeddings.shape[-1])
             labels = labels[..., 1:].contiguous()
             labels = labels.reshape(-1)
-            loss = self.loss(self.lm_head.weight, embeddings, labels)
+            loss = self.loss(self._lm_head_weight(), embeddings, labels)
             num_items_in_batch = num_items_in_batch.to(loss.device)
             loss = loss / num_items_in_batch
             return {'loss': loss}
@@ -303,6 +333,32 @@ def main():
     model.resize_token_embeddings(len(tokenizer), mean_resizing=False, pad_to_multiple_of=8)
     print(model)
 
+    if model_args.use_lora:
+        from peft import LoraConfig, get_peft_model
+
+        tgt = (model_args.lora_target_modules or "all-linear").strip()
+        target_modules = (
+            "all-linear" if tgt in ("", "all-linear", "all")
+            else [t.strip() for t in tgt.split(",") if t.strip()]
+        )
+        peft_config = LoraConfig(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            # Adapt all linear layers only. peft's "all-linear" auto-excludes the
+            # output proj (lm_head); embed_tokens is an nn.Embedding so it's never
+            # a target — embeddings + lm_head stay frozen at their base weights.
+            target_modules=target_modules,
+        )
+        model = get_peft_model(model, peft_config)
+        # Gradient checkpointing + (mostly) frozen base needs the embedding output
+        # to require grad so the checkpointed graph stays connected.
+        if getattr(training_args, "gradient_checkpointing", False):
+            model.enable_input_require_grads()
+        model.print_trainable_parameters()
+
     dataset = DatasetFixed(data_args.train_file)
     print('dataset', len(dataset), dataset[0]['attention_mask'].shape)
 
@@ -349,7 +405,18 @@ def main():
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
         trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()
+        if model_args.use_lora:
+            # Merge LoRA adapters back into the base → a plain Qwen3 checkpoint
+            # that downstream eval and serving load with no peft (embed/lm_head
+            # are unchanged — they were frozen). merge_and_unload runs per-rank
+            # (local op); only the main process writes the artifact.
+            to_save = trainer.accelerator.unwrap_model(trainer.model)
+            to_save = to_save.merge_and_unload()
+            if training_args.should_save:
+                to_save.save_pretrained(training_args.output_dir, safe_serialization=True)
+                tokenizer.save_pretrained(training_args.output_dir)
+        else:
+            trainer.save_model()
         trainer.save_state()
 
 
