@@ -602,6 +602,11 @@ export type DatasetRecord = {
   speaker_field?: string | null; // TTS-only speaker column (null → one voice)
   split_fields?: Record<string, string> | null; // per-split transcription overrides
   audio_dataset_id?: string | null; // materialised S3 audio dataset (source → output link)
+  // Lineage for a transformed dataset: the dataset it was derived from + that
+  // source's original HF repo (computed server-side).
+  source_dataset_id?: string | null;
+  source_name?: string | null;
+  source_hf_repo?: string | null;
   hf_repo?: string | null;
   hf_revision?: string | null;
   hf_synced_at?: string | null;
@@ -667,6 +672,8 @@ export type DatasetPreview = {
   total?: number | null;
   split?: string | null; // which HF split these rows came from
   splits?: string[] | null; // available HF splits (for a picker)
+  speakers?: string[] | null; // distinct speaker values (for a filter dropdown)
+  speaker?: string | null; // the selected speaker filter, echoed back
   excluded_count?: number; // rows manually un-ticked (excluded from training)
   error?: string | null;
 };

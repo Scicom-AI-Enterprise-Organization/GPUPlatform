@@ -449,9 +449,16 @@ export const gateway = {
       `/v1/datasets/${encodeURIComponent(id)}`,
       { method: "DELETE" },
     ),
-  getDatasetPreview: (id: string, limit = 20, offset = 0, split?: string | null) => {
+  getDatasetPreview: (
+    id: string,
+    limit = 20,
+    offset = 0,
+    split?: string | null,
+    speaker?: string | null,
+  ) => {
     const q = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     if (split) q.set("split", split);
+    if (speaker) q.set("speaker", speaker);
     return request<DatasetPreview>(
       `/v1/datasets/${encodeURIComponent(id)}/preview?${q.toString()}`,
     );

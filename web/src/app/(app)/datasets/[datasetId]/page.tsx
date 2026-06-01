@@ -9,7 +9,7 @@ export default async function DatasetDetailPage({
   searchParams,
 }: {
   params: Promise<{ datasetId: string }>;
-  searchParams: Promise<{ offset?: string; limit?: string; split?: string }>;
+  searchParams: Promise<{ offset?: string; limit?: string; split?: string; speaker?: string }>;
 }) {
   const { datasetId } = await params;
   const sp = await searchParams;
@@ -19,6 +19,7 @@ export default async function DatasetDetailPage({
   const offset = Math.max(0, Number.parseInt(sp.offset ?? "", 10) || 0);
   const limit = Math.min(200, Math.max(1, Number.parseInt(sp.limit ?? "", 10) || 20));
   const split = sp.split || undefined;
+  const speaker = sp.speaker || undefined;
 
   let dataset: DatasetRecord | null = null;
   let loadError: string | null = null;
@@ -39,7 +40,7 @@ export default async function DatasetDetailPage({
   let preview: DatasetPreview | null = null;
   if (dataset && hasMetadata) {
     try {
-      preview = await gateway.getDatasetPreview(dataset.id, limit, offset, split);
+      preview = await gateway.getDatasetPreview(dataset.id, limit, offset, split, speaker);
     } catch (e) {
       preview = { audio_field: dataset.audio_field, transcription_field: dataset.transcription_field, rows: [], error: e instanceof Error ? e.message : String(e) };
     }
@@ -48,11 +49,10 @@ export default async function DatasetDetailPage({
   // S3 storages to offer as a transform target (HF audio-zip / label platform →
   // audio column).
   const canTransform = dataset?.kind === "hf" || dataset?.kind === "label";
-  // Pack {audio, transcription} → NeuCodec + multipack ChiniDataset (TTS). Not
-  // for label (transform to audio first) or an already-packed dataset.
-  const canPack =
-    dataset?.kind === "s3" || dataset?.kind === "upload" ||
-    dataset?.kind === "hf" || dataset?.kind === "label";
+  // Pack {audio, transcription} → NeuCodec + multipack ChiniDataset (TTS). Only
+  // for datasets that already have a real audio column (s3 / upload). hf / label
+  // sources must extract an audio column first, then pack the resulting dataset.
+  const canPack = dataset?.kind === "s3" || dataset?.kind === "upload";
   let s3Storages: StorageRecord[] = [];
   if (canTransform || canPack) {
     try {

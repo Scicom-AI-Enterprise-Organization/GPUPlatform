@@ -226,8 +226,15 @@ def _read_metadata_rows(ds: dict) -> list[dict]:
 
 
 def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
-    """Materialise audio under work/audio/, write audio_paths.json + meta.jsonl.
-    Returns (audio_paths_json, meta_jsonl)."""
+    """Resolve audio sources + write audio_sources.json + meta.jsonl.
+
+    S3 rows are NOT bulk-downloaded: their (presigned) URL is passed through so
+    convert_neucodec streams + prefetches them during encoding (overlapping the
+    download with GPU work). HF/label rows are materialised locally (their audio
+    is an in-memory array / token-gated endpoint, not a plain fetchable URL).
+    audio_sources.json is a list of {key, src}: `key` is the token-file key (==
+    meta's filename_audio) and `src` is a local path or an S3 URL.
+    Returns (audio_sources_json, meta_jsonl)."""
     import soundfile as sf
 
     ds = cfg["dataset"]
@@ -239,6 +246,7 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
     audio_dir = os.path.join(work, "audio")
     os.makedirs(audio_dir, exist_ok=True)
     rows: list[dict] = []
+    sources: list[dict] = []  # [{key, src}] for convert_neucodec (src = path or URL)
 
     if ds.get("kind") == "hf":
         from datasets import load_dataset
@@ -254,6 +262,7 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
                     "filename_audio": rel, "text": str(r.get(tf, "")),
                     "speaker": str(r.get(speaker_field) or default_speaker),
                 })
+                sources.append({"key": rel, "src": rel})  # local (HF array → wav)
                 idx += 1
     elif ds.get("kind") == "label":
         # Labeling-platform rows resolved by the gateway. Platform-hosted clips
@@ -289,11 +298,13 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
                 log(f"[data] skip label task {tid}: {e}")
                 continue
             rows.append({"filename_audio": rel, "text": str(txt), "speaker": str(default_speaker)})
+            sources.append({"key": rel, "src": rel})  # local (downloaded above)
     else:
         cli = _s3_client(ds)
         prefix = (ds.get("audio_prefix") or "").strip("/")
         # Rows manually un-ticked in the row browser → excluded from training.
         excluded = {int(x) for x in (ds.get("excluded_rows") or [])}
+        streamed = downloaded = 0
         for i, r in enumerate(_read_metadata_rows(ds)):
             if i in excluded:
                 continue
@@ -301,36 +312,43 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
             txt = r.get(text_field)
             if not ref or txt is None:
                 continue
-            base = os.path.basename(str(ref).split("?")[0]) or "a.wav"
+            ref = str(ref)
+            base = os.path.basename(ref.split("?")[0]) or "a.wav"
             rel = f"audio/{base}"
-            dest = os.path.join(work, rel)
-            try:
-                if str(ref).startswith(("http://", "https://")):
-                    import urllib.request
-                    urllib.request.urlretrieve(str(ref), dest)
-                else:
-                    key = "/".join(p for p in [prefix, str(ref).lstrip("/")] if p)
+            if ref.startswith(("http://", "https://")):
+                # Stream from S3 during encoding — no bulk download to disk.
+                src = ref
+                streamed += 1
+            else:
+                # Bare key (no presigned URL to stream) → fetch once via boto3.
+                dest = os.path.join(work, rel)
+                key = "/".join(p for p in [prefix, ref.lstrip("/")] if p)
+                try:
                     cli.download_file(ds["bucket"], key, dest)
-            except Exception as e:  # noqa: BLE001
-                log(f"[data] skip {ref!r}: {e}")
-                continue
+                except Exception as e:  # noqa: BLE001
+                    log(f"[data] skip {ref!r}: {e}")
+                    continue
+                src = rel
+                downloaded += 1
             rows.append({
                 "filename_audio": rel, "text": str(txt),
                 "speaker": str(r.get(speaker_field) or default_speaker),
             })
+            sources.append({"key": rel, "src": src})
+        log(f"[data] s3 sources: {streamed} streamed from URLs, {downloaded} pre-downloaded")
 
     if not rows:
         raise RuntimeError("no usable {audio, transcription} rows resolved from the dataset")
 
-    audio_paths = os.path.join(work, "audio_paths.json")
-    with open(audio_paths, "w") as f:
-        json.dump([r["filename_audio"] for r in rows], f)
+    sources_path = os.path.join(work, "audio_sources.json")
+    with open(sources_path, "w") as f:
+        json.dump(sources, f)
     meta = os.path.join(work, "meta.jsonl")
     with open(meta, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
-    log(f"[data] {len(rows)} rows · audio under {audio_dir}")
-    return audio_paths, meta
+    log(f"[data] {len(rows)} rows resolved ({len(sources)} audio sources)")
+    return sources_path, meta
 
 
 # --------------------------------------------------------------------------
@@ -377,10 +395,11 @@ def run(cfg: dict) -> None:
         log(f"[pack] reusing pre-packed ChiniDataset from {ds['packed_uri']}")
         _download_s3_prefix(ds, ds["packed_uri"], packed)
     else:
-        audio_paths, meta = build_dataset(cfg, work)
-        # 1. NeuCodec tokenization
+        sources, meta = build_dataset(cfg, work)
+        # 1. NeuCodec tokenization — streams + prefetches audio from S3, overlapping
+        # download (comm) with GPU encode (comp); no bulk download to disk.
         step([sys.executable, "-u", os.path.join(TTS_DIR, "convert_neucodec.py"),
-              "--file", audio_paths], cwd=work)
+              "--file", sources], cwd=work)
         # 2. pack into a ChiniDataset (Parquet streaming)
         step([sys.executable, "-u", os.path.join(TTS_DIR, "pack_stage1.py"),
               "--dataset", meta, "--output_dir", packed,

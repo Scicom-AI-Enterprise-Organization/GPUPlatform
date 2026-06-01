@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -94,7 +95,10 @@ export function DatasetDetail({
     window.history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
   };
 
-  const hfValue = dataset.hf_synced_at ? "Synced" : dataset.hf_repo ? "Linked" : "—";
+  // The HF repo this dataset lives at, or — for a transformed dataset — the
+  // original HF dataset it was derived from.
+  const hfRepo = dataset.hf_repo || dataset.source_hf_repo || null;
+  const hfValue = hfRepo ? <span title={hfRepo}>{hfRepo}</span> : "—";
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -146,7 +150,7 @@ export function DatasetDetail({
         <Tabs value={tab} onValueChange={setTab} className="!block">
           {showRows && preview && (
             <TabsContent value="rows" className="!flex-none">
-              <RowBrowser datasetId={dataset.id} initial={preview} />
+              <RowBrowser datasetId={dataset.id} initial={preview} speakerField={dataset.speaker_field} />
             </TabsContent>
           )}
 
@@ -201,6 +205,19 @@ export function DatasetDetail({
                   <Row label="Audio prefix" value={<span className="font-mono text-xs">{dataset.audio_prefix}</span>} />
                 )}
                 <Row label="Size" value={fmtBytes(dataset.size_bytes)} />
+                {dataset.source_dataset_id && (
+                  <Row
+                    label="Transformed from"
+                    value={
+                      <Link href={`/datasets/${dataset.source_dataset_id}`} className="text-sm text-primary hover:underline">
+                        {dataset.source_name ?? dataset.source_dataset_id}
+                        {dataset.source_hf_repo && (
+                          <span className="ml-1 font-mono text-xs text-muted-foreground">· {dataset.source_hf_repo}</span>
+                        )}
+                      </Link>
+                    }
+                  />
+                )}
                 <Row
                   label="HuggingFace"
                   value={
@@ -208,7 +225,9 @@ export function DatasetDetail({
                       ? `synced → ${dataset.hf_repo} (${new Date(dataset.hf_synced_at).toLocaleString()})`
                       : dataset.hf_repo
                         ? dataset.hf_repo
-                        : "not synced"
+                        : dataset.source_hf_repo
+                          ? `from ${dataset.source_hf_repo}`
+                          : "not synced"
                   }
                 />
               </CardContent>

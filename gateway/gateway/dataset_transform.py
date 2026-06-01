@@ -455,6 +455,50 @@ def _split_of(meta: Path, root: Path) -> str:
     return rel.parts[0] if len(rel.parts) > 1 else meta.stem
 
 
+def _declared_splits(work: str) -> Optional[list[tuple[str, str]]]:
+    """Parse the repo README's `configs:` front-matter → [(split_label, path_glob)],
+    so a metadata file maps to the dataset's DECLARED split (the same train/test
+    HF shows) instead of being guessed from its filename. Files matching no
+    declared pattern aren't part of the dataset and are dropped by the caller.
+    Returns None when no configs are declared (caller falls back to filename
+    inference). Labels mirror the row preview's config-vs-split naming."""
+    import re
+
+    import yaml
+
+    readme = Path(work) / "README.md"
+    if not readme.is_file():
+        return None
+    try:
+        text = readme.read_text(errors="replace")
+        m = re.match(r"^﻿?---\s*\n(.*?)\n---", text, re.S)
+        meta = yaml.safe_load(m.group(1)) if m else None
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    triples: list[tuple[str, str, str]] = []  # (config, split, glob)
+    for c in (meta.get("configs") or []):
+        cfg = str((c or {}).get("config_name") or "default")
+        for df in ((c or {}).get("data_files") or []):
+            sp, path = (df or {}).get("split"), (df or {}).get("path")
+            if not sp or not path:
+                continue
+            for p in ([path] if isinstance(path, str) else path):
+                triples.append((cfg, str(sp), str(p)))
+    if not triples:
+        return None
+    # Label by whichever of config/split is distinct (matches _hf_split_ident).
+    pairs = sorted({(c, s) for c, s, _ in triples})
+    if len({c for c, _ in pairs}) == len(pairs):
+        ident = lambda c, s: c  # noqa: E731
+    elif len({s for _, s in pairs}) == len(pairs):
+        ident = lambda c, s: s  # noqa: E731
+    else:
+        ident = lambda c, s: f"{c}/{s}"  # noqa: E731
+    return [(ident(c, s), g) for c, s, g in triples]
+
+
 def _scalar(v) -> Optional[str]:
     """Stringify a metadata value if it's a simple scalar (str/number/bool);
     return None for nulls/NaN or complex values (audio structs, byte blobs,
@@ -497,8 +541,15 @@ def _read_metadata(
     if not candidates:
         raise RuntimeError("no metadata table (csv/parquet/jsonl) found in the repo")
 
+    import fnmatch
+
+    # Prefer the source's DECLARED splits (README configs) so the output follows
+    # the original train/test rather than parquet directory/file names; falls
+    # back to filename inference for plain repos with no configs.
+    declared = _declared_splits(work)
     frames = []
     seen_cols: set[str] = set()
+    skipped_undeclared = 0
     for meta in candidates:
         try:
             df = _load_table(meta)
@@ -507,7 +558,18 @@ def _read_metadata(
         seen_cols.update(map(str, df.columns))
         if audio_field not in df.columns:
             continue
-        split = _split_of(meta, root)
+        if declared is not None:
+            try:
+                rel = str(meta.relative_to(root)).replace(os.sep, "/")
+            except ValueError:
+                rel = meta.name
+            split = next((lbl for lbl, glob in declared if fnmatch.fnmatch(rel, glob)), None)
+            if split is None:
+                # Not referenced by any declared config → not part of the dataset.
+                skipped_undeclared += 1
+                continue
+        else:
+            split = _split_of(meta, root)
         tcol = split_fields.get(split) or transcription_field
         out = df.copy()  # keep every column (speaker, etc.); audio col is replaced later
         # Missing column for this split → blank, not a hard failure (the split may
@@ -515,6 +577,11 @@ def _read_metadata(
         out["__text__"] = df[tcol] if tcol in df.columns else ""
         out["__split__"] = split  # carried through so the output keeps its splits
         frames.append(out)
+    if declared is not None and skipped_undeclared:
+        logger.info(
+            "transform: kept %d declared-split tables, dropped %d not referenced by the "
+            "source's configs (e.g. loose root parquets)", len(frames), skipped_undeclared,
+        )
     if not frames:
         raise RuntimeError(
             f"no metadata table has the audio column '{audio_field}'. "

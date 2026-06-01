@@ -147,6 +147,11 @@ class DatasetRecord(BaseModel):
     # response type tolerates non-string values (don't tighten back to str).
     split_fields: Optional[dict[str, Any]] = None
     audio_dataset_id: Optional[str] = None  # materialised S3 audio dataset (if any)
+    # Lineage: a transformed dataset (hf/label → audio) records the dataset it was
+    # derived from + that source's original HF repo (computed, not stored).
+    source_dataset_id: Optional[str] = None
+    source_name: Optional[str] = None
+    source_hf_repo: Optional[str] = None
     hf_repo: Optional[str] = None
     hf_revision: Optional[str] = None
     hf_synced_at: Optional[str] = None
@@ -180,6 +185,8 @@ class PreviewResponse(BaseModel):
     total: Optional[int] = None  # full row count when known (for pagination)
     split: Optional[str] = None  # which HF split these rows came from
     splits: Optional[list[str]] = None  # available HF splits (for a picker)
+    speakers: Optional[list[str]] = None  # distinct speaker values (for a filter dropdown)
+    speaker: Optional[str] = None  # the selected speaker filter, echoed back
     excluded_count: int = 0  # rows manually un-ticked (excluded from training)
     error: Optional[str] = None
 
@@ -206,7 +213,15 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
-def _to_record(d: Dataset, owner_username: str, storage_name: Optional[str]) -> DatasetRecord:
+def _to_record(
+    d: Dataset,
+    owner_username: str,
+    storage_name: Optional[str],
+    *,
+    source_dataset_id: Optional[str] = None,
+    source_name: Optional[str] = None,
+    source_hf_repo: Optional[str] = None,
+) -> DatasetRecord:
     return DatasetRecord(
         id=d.id,
         name=d.name,
@@ -225,6 +240,9 @@ def _to_record(d: Dataset, owner_username: str, storage_name: Optional[str]) -> 
         speaker_field=getattr(d, "speaker_field", None) or None,
         split_fields=getattr(d, "split_fields", None) or None,
         audio_dataset_id=getattr(d, "audio_dataset_id", None) or None,
+        source_dataset_id=source_dataset_id,
+        source_name=source_name,
+        source_hf_repo=source_hf_repo,
         hf_repo=d.hf_repo,
         hf_revision=d.hf_revision,
         hf_synced_at=_iso(d.hf_synced_at),
@@ -238,6 +256,25 @@ def _to_record(d: Dataset, owner_username: str, storage_name: Optional[str]) -> 
         updated_at=_iso(d.updated_at) or "",
         created_by=owner_username,
     )
+
+
+async def _s3_folder_size(storage: Storage, s3_metadata_uri: str) -> Optional[int]:
+    """Total bytes under a materialised dataset's S3 folder (the directory holding
+    its metadata file + audio/). Best-effort: returns None on any S3 error."""
+    try:
+        target, _ = _s3_target_and_prefix(storage)
+        u = urlparse(s3_metadata_uri)
+        if u.scheme == "s3":
+            target = dataclasses.replace(target, bucket=u.netloc)
+            key = u.path.lstrip("/")
+        else:
+            key = s3_metadata_uri
+        folder = (key.rsplit("/", 1)[0] + "/") if "/" in key else ""
+        objs = await _run_sync(bench.s3_list, folder, target)
+        return sum(int(o.get("size") or 0) for o in objs)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("folder-size compute failed for %s: %s", s3_metadata_uri, e)
+        return None
 
 
 async def _owner_map(session: AsyncSession, rows: list[Dataset]) -> dict[int, str]:
@@ -467,7 +504,31 @@ async def get_dataset(
     d = await _require_dataset(session, dataset_id, user)
     owner = await session.get(User, d.owner_id)
     storage = await session.get(Storage, d.storage_id) if d.storage_id else None
-    return _to_record(d, owner.username if owner else "", storage.name if storage else None)
+
+    # Transformed datasets are created without a size — compute it once from the
+    # materialised S3 folder (metadata + audio/) and cache it on the row.
+    if (
+        d.kind == "s3" and d.size_bytes is None and d.s3_metadata_uri
+        and storage and d.transform_status != "running"
+    ):
+        size = await _s3_folder_size(storage, d.s3_metadata_uri)
+        if size:
+            d.size_bytes = size
+            await session.commit()
+            await session.refresh(d)
+
+    # Lineage: the transform sets the SOURCE dataset's audio_dataset_id → this one,
+    # so surface the original dataset (+ its HF repo) this was derived from.
+    src = (
+        await session.execute(select(Dataset).where(Dataset.audio_dataset_id == d.id))
+    ).scalars().first()
+
+    return _to_record(
+        d, owner.username if owner else "", storage.name if storage else None,
+        source_dataset_id=src.id if src else None,
+        source_name=src.name if src else None,
+        source_hf_repo=(src.hf_repo if src else None),
+    )
 
 
 @router.patch("/{dataset_id}", response_model=DatasetRecord)
@@ -965,6 +1026,7 @@ async def preview_dataset(
     limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
     split: Optional[str] = Query(None, description="HF split to read (default: first)"),
+    speaker: Optional[str] = Query(None, description="filter rows to one speaker (S3/upload)"),
     user: User = Depends(require_section("datasets")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -1089,6 +1151,18 @@ async def preview_dataset(
             used_split = split if (split and split in splits_list) else (splits_list[0] if splits_list else None)
             if used_split is not None:
                 indexed = [(gi, r) for gi, r in indexed if str(r.get("split")) == used_split]
+        # Speaker filter: materialised datasets carry a speaker column. Expose the
+        # distinct speakers (within the current split) for a dropdown, and page
+        # within the chosen one. Computed before applying the filter so the
+        # dropdown always lists every speaker, not just the selected one.
+        spk_col = getattr(d, "speaker_field", None) or "speaker"
+        speakers_list: Optional[list[str]] = None
+        used_speaker: Optional[str] = None
+        if all_rows and spk_col in all_rows[0]:
+            speakers_list = sorted({str(r.get(spk_col)) for _gi, r in indexed if str(r.get(spk_col) or "").strip()})
+            if speaker and speaker in speakers_list:
+                used_speaker = speaker
+                indexed = [(gi, r) for gi, r in indexed if str(r.get(spk_col)) == used_speaker]
         total = len(indexed)
         page = indexed[offset:offset + limit]
         rows = [
@@ -1106,7 +1180,7 @@ async def preview_dataset(
             for gi, r in page
         ]
         return _resp(rows=rows, total=total, split=used_split, splits=splits_list,
-                     excluded_count=len(excluded))
+                     speakers=speakers_list, speaker=used_speaker, excluded_count=len(excluded))
     except dataset_metadata.DatasetParseError as e:
         return _resp(rows=[], error=str(e))
     except Exception as e:  # noqa: BLE001 — surface as an inline error, not a 500

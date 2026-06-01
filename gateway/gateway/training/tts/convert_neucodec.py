@@ -1,93 +1,108 @@
-"""Convert raw audio files to NeuCodec speech tokens.
+"""Convert audio to NeuCodec speech tokens — streaming + prefetching from S3.
 
-Each audio file at `*.mp3` / `*.wav` is encoded with `neuphonic/neucodec` and
-written as a JSON list of token IDs to a sibling `<folder>_neucodec/...json`.
+Instead of bulk-downloading the whole dataset to disk first, each GPU worker runs
+a producer/consumer pipeline: a pool of downloader threads (comm) fetch + decode
+audio (from an S3/HTTP URL, in memory) into a bounded queue while the GPU drains
+it (comp). Download and encode therefore overlap, and disk use stays ~constant.
 
-Progress reporting:
-  Workers share a `multiprocessing.Value` counter that's incremented per file
-  processed. A poller in the main process prints
-  `[AUTOTRAIN_PROGRESS] step=convert_neucodec percent=NN.N`
-  every ~2 s so the AutoTrain worker can update the job step's progress bar.
+Input (`--file`): a JSON list of items, each either
+  - a string  → a local audio path (key == path), or
+  - {"key": <token-key>, "src": <local-path-or-URL>}
+`key` is the token-file key (matches pack_stage1's `filename_audio`); `src` is
+where the audio comes from. Tokens are written to `<key-folder>_neucodec/...json`.
+
+Progress / logs:
+  - `[AUTOTRAIN_PROGRESS] step=convert_neucodec processed=N total=M percent=P`
+    (overall bar, emitted from the main process every ~2 s)
+  - per-GPU granular lines every ~5 s: encoded/queued counts, queue depth, and
+    encode vs download throughput (files/s, MB/s).
 """
 import os
 
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 
+import io
 import json
-import time
+import queue as _queue
 import threading
-from glob import glob
-from functools import partial
-import itertools
+import time
+import urllib.request
 
 import click
 import librosa
-import numpy as np
-import soundfile as sf
 from multiprocess import Pool, Value
-from tqdm import tqdm
+
+# Per-GPU downloader threads + how far to prefetch ahead (bounded → ~constant mem).
+_DL_THREADS = int(os.environ.get('NEUCODEC_DL_THREADS', '8') or '8')
+_PREFETCH = int(os.environ.get('NEUCODEC_PREFETCH', '48') or '48')
+_SR = 16000
 
 
-def old_chunks(l, n):
-    for i in range(0, len(l), n):
-        yield (l[i: i + n], i // n)
-
-
-def chunks(l, devices):
-    chunk_size = len(l) // len(devices)
-    remainder = len(l) % len(devices)
-    start = 0
-    for i in range(len(devices)):
-        extra = 1 if i < remainder else 0
-        end = start + chunk_size + extra
-        yield (l[start:end], devices[i])
-        start = end
-
-
-def new_path(f):
-    splitted = f.split('/')
-    folder = f.split('/')[0]
-    folder = folder + '_neucodec'
+def new_path(key):
+    """Token-file path for an audio key — must match pack_stage1.new_path:
+    `<first-segment>_neucodec/<rest>.json`."""
+    splitted = key.split('/')
+    folder = splitted[0] + '_neucodec'
     new_f = os.path.join(folder, '/'.join(splitted[1:]))
-    new_f = new_f.replace('.mp3', '.json').replace('.wav', '.json')
-    return new_f
+    return new_f.replace('.mp3', '.json').replace('.wav', '.json')
 
 
-def multiprocessing(strings, function, cores=6, returned=True):
-    df_split = old_chunks(strings, len(strings) // cores)
-    pool = Pool(cores)
-    pooled = pool.map(function, df_split)
-    pool.close()
-    pool.join()
-
-    if returned:
-        return list(itertools.chain(*pooled))
+def _norm(item):
+    """(key, src) for an input item — a bare string is a local path (key==src)."""
+    if isinstance(item, str):
+        return item, item
+    return item['key'], (item.get('src') or item['key'])
 
 
-def check(files):
-    files, _ = files
-    filtered = []
-    for file in tqdm(files):
-        filename_done = new_path(file)
+def _token_done(key):
+    """True if this clip's token file already exists + is valid JSON (resume)."""
+    p = new_path(key)
+    if not os.path.exists(p):
+        return False
+    try:
+        with open(p) as f:
+            json.load(f)
+        return True
+    except Exception:
+        return False
 
-        if os.path.exists(filename_done):
+
+def _fetch_decode(src):
+    """Return (waveform float32 mono @ _SR, bytes_moved). Streams from S3/HTTP into
+    memory when `src` is a URL (no file written), else decodes the local file."""
+    if src.startswith(('http://', 'https://')):
+        with urllib.request.urlopen(urllib.request.Request(src), timeout=120) as r:
+            raw = r.read()
+        try:
+            y, _ = librosa.load(io.BytesIO(raw), sr=_SR)
+        except Exception:
+            # Some audio backends can't decode (e.g.) mp3 from memory — fall back
+            # to a single transient temp file (still streaming: one small file at
+            # a time, deleted immediately; never the whole dataset on disk).
+            import tempfile
+            suffix = os.path.splitext(src.split('?')[0])[1] or '.mp3'
+            tmp = None
             try:
-                with open(filename_done) as fopen:
-                    json.load(fopen)
-                    continue
-            except Exception:
-                pass
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+                    tf.write(raw)
+                    tmp = tf.name
+                y, _ = librosa.load(tmp, sr=_SR)
+            finally:
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+        return y, len(raw)
+    y, _ = librosa.load(src, sr=_SR)
+    try:
+        return y, os.path.getsize(src)
+    except OSError:
+        return y, 0
 
-        filtered.append(file)
-    return filtered
 
-
-# ---- worker (per device) ---------------------------------------------------
-
-# `_counter` and `_total` are set by `_init_worker` so each forked process
-# inherits a reference to the shared counter without us having to thread it
-# through the Pool.map argument tuple.
+# ---- shared progress counter (set per worker via the Pool initializer) -----
 _counter = None
 _total = 0
 
@@ -98,62 +113,120 @@ def _init_worker(counter, total):
     _total = total
 
 
-def loop(indices_device_pair):
-    files, device = indices_device_pair
+def _bump(n=1):
+    if _counter is None:
+        return
+    try:
+        with _counter.get_lock():
+            _counter.value += n
+    except Exception:
+        pass
+
+
+def loop(items_device):
+    """One GPU worker: prefetch+decode audio on threads, encode on the GPU."""
+    items, device = items_device
     os.environ['CUDA_VISIBLE_DEVICES'] = str(device)
 
     from neucodec import NeuCodec
     import torch
 
     torch.autograd.set_grad_enabled(False)
-
     model = NeuCodec.from_pretrained("neuphonic/neucodec")
     model.eval().cuda()
 
-    for f in files:
-        # Exactly one progress bump per file, in `finally` (the old explicit
-        # bumps in the skip branches double-counted → 122/61 = 200%).
-        try:
-            filename = new_path(f)
-            if os.path.exists(filename):
-                try:
-                    with open(filename) as fopen:
-                        json.load(fopen)
-                    continue
-                except Exception:
-                    pass
-
-            try:
-                y, sr = librosa.load(f, sr=16000)
-                # No duration cap — encode the whole clip. (The old 20s cap
-                # silently skipped every long-form clip, writing zero tokens, so
-                # pack_stage1 had nothing to pack.) Over-long utterances are still
-                # bounded later by pack_stage1's --sequence_length filter.
-                wav_tensor = torch.from_numpy(y).float().unsqueeze(0)
-                fsq_codes = model.encode_code(wav_tensor.unsqueeze(1))
-                tokens = fsq_codes[0, 0].tolist()
-
-                os.makedirs(os.path.split(filename)[0], exist_ok=True)
-                with open(filename, 'w') as fopen:
-                    json.dump(tokens, fopen)
-            except Exception as e:
-                print(f'[convert_neucodec] error processing {f!r}: {e}', flush=True)
-        finally:
-            _bump()
-
-
-def _bump():
-    """Bump the shared counter by one. Best-effort — never crash the worker."""
-    if _counter is None:
+    # Resume: skip clips whose tokens already exist (count them as done up front).
+    todo, already = [], 0
+    for it in items:
+        key, src = _norm(it)
+        if _token_done(key):
+            already += 1
+        else:
+            todo.append((key, src))
+    if already:
+        _bump(already)
+    if not todo:
+        print(f'[convert_neucodec] dev{device}: all {already} clips already encoded', flush=True)
         return
-    try:
-        with _counter.get_lock():
-            _counter.value += 1
-    except Exception:
-        pass
+
+    q: _queue.Queue = _queue.Queue(maxsize=_PREFETCH)
+    stats = {'dl': 0, 'bytes': 0, 'fail': 0}
+    slock = threading.Lock()
+
+    def producer(sub):
+        for key, src in sub:
+            try:
+                y, nbytes = _fetch_decode(src)
+                q.put((key, y))
+                with slock:
+                    stats['dl'] += 1
+                    stats['bytes'] += nbytes
+            except Exception as e:  # noqa: BLE001 — skip the clip, keep streaming
+                q.put((key, None))
+                with slock:
+                    stats['fail'] += 1
+                print(f'[convert_neucodec] dev{device} fetch failed {src!r}: {e}', flush=True)
+
+    n_threads = max(1, min(_DL_THREADS, len(todo)))
+    # Round-robin split so every downloader thread stays busy regardless of order.
+    subs = [todo[i::n_threads] for i in range(n_threads)]
+    threads = [threading.Thread(target=producer, args=(s,), daemon=True) for s in subs]
+    for t in threads:
+        t.start()
+    print(f'[convert_neucodec] dev{device}: streaming {len(todo)} clips '
+          f'({already} cached) · {n_threads} dl-threads · prefetch {_PREFETCH}', flush=True)
+
+    enc = 0
+    t0 = time.time()
+    last_log = t0
+    while enc < len(todo):
+        try:
+            key, y = q.get(timeout=300)
+        except _queue.Empty:
+            if not any(t.is_alive() for t in threads):
+                print(f'[convert_neucodec] dev{device}: producers ended early at '
+                      f'{enc}/{len(todo)}', flush=True)
+                break
+            continue
+        enc += 1
+        if y is not None and len(y) > 0:
+            try:
+                wav = torch.from_numpy(y).float().unsqueeze(0)
+                codes = model.encode_code(wav.unsqueeze(1))
+                tokens = codes[0, 0].tolist()
+                out = new_path(key)
+                os.makedirs(os.path.split(out)[0], exist_ok=True)
+                with open(out, 'w') as f:
+                    json.dump(tokens, f)
+            except Exception as e:  # noqa: BLE001
+                print(f'[convert_neucodec] dev{device} encode failed {key!r}: {e}', flush=True)
+        _bump()
+        now = time.time()
+        if now - last_log >= 5.0:
+            with slock:
+                dl, mb, fail = stats['dl'], stats['bytes'] / 1e6, stats['fail']
+            dt = max(1e-6, now - t0)
+            print(f'[convert_neucodec] dev{device} enc={enc}/{len(todo)} dl={dl} '
+                  f'q={q.qsize()} fail={fail} · enc {enc / dt:.1f}/s · '
+                  f'dl {mb:.0f}MB ({mb / dt:.1f}MB/s)', flush=True)
+            last_log = now
+    for t in threads:
+        t.join(timeout=2.0)
+    dt = max(1e-6, time.time() - t0)
+    print(f'[convert_neucodec] dev{device} done: {enc} encoded in {dt:.0f}s '
+          f'({enc / dt:.1f}/s), {stats["fail"]} failed', flush=True)
 
 
-# ---- progress poller -------------------------------------------------------
+def chunks(items, devices):
+    """Split items across devices (one GPU worker per device), as evenly as possible."""
+    chunk_size = len(items) // len(devices)
+    remainder = len(items) % len(devices)
+    start = 0
+    for i in range(len(devices)):
+        end = start + chunk_size + (1 if i < remainder else 0)
+        yield (items[start:end], devices[i])
+        start = end
+
 
 def _start_progress_poller(counter, total, interval=2.0):
     stop = threading.Event()
@@ -178,7 +251,8 @@ def _start_progress_poller(counter, total, interval=2.0):
 
 
 @click.command()
-@click.option('--file', required=True, help='JSON file containing a list of audio paths.')
+@click.option('--file', required=True,
+              help='JSON list of items: local paths, or {"key","src"} (src may be an S3 URL).')
 @click.option('--replication', default=1)
 def main(file, replication):
     devices = os.environ.get('CUDA_VISIBLE_DEVICES')
@@ -186,37 +260,26 @@ def main(file, replication):
         import torch
         devices = list(range(torch.cuda.device_count()))
     else:
-        devices = [d.strip() for d in devices.split(',')]
-
+        devices = [d.strip() for d in devices.split(',') if d.strip()]
     devices = replication * devices
     print(f'[convert_neucodec] devices: {devices}', flush=True)
 
     with open(file) as fopen:
-        files = json.load(fopen)
+        items = json.load(fopen)
+    total = len(items)
     print(
-        f'[AUTOTRAIN_PROGRESS] step=convert_neucodec processed=0 total={len(files)} percent=0.0',
+        f'[AUTOTRAIN_PROGRESS] step=convert_neucodec processed=0 total={total} percent=0.0',
         flush=True,
     )
+    print(f'[convert_neucodec] {total} clips · streaming + prefetch '
+          f'({_DL_THREADS} dl-threads/GPU, prefetch {_PREFETCH}) over {len(devices)} GPU(s)',
+          flush=True)
 
-    filtered = multiprocessing(files, check, 30)
-    already_done = len(files) - len(filtered)
-    total = len(files)
-    print(
-        f'[convert_neucodec] {already_done}/{total} already converted, {len(filtered)} to do',
-        flush=True,
-    )
-
-    counter = Value('i', already_done)
+    counter = Value('i', 0)
     stop, poller = _start_progress_poller(counter, total)
-
-    df_split = list(chunks(filtered, devices))
-
+    df_split = list(chunks(items, devices))
     try:
-        with Pool(
-            len(devices),
-            initializer=_init_worker,
-            initargs=(counter, total),
-        ) as pool:
+        with Pool(len(devices), initializer=_init_worker, initargs=(counter, total)) as pool:
             pool.map(loop, df_split)
     finally:
         stop.set()
@@ -228,6 +291,7 @@ def main(file, replication):
             f'processed={v} total={total} percent={pct:.1f}',
             flush=True,
         )
+        print(f'[convert_neucodec] complete: {v}/{total} clips encoded', flush=True)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Volume2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Mic, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -18,6 +18,8 @@ import { cn } from "@/lib/utils";
 import type { DatasetPreview, DatasetPreviewRow } from "@/lib/types";
 
 const PAGE_SIZES = [10, 20, 50];
+// Radix <Select> forbids an empty value, so "all speakers" uses a sentinel.
+const ALL_SPEAKERS = "__all__";
 
 function audioOf(r: DatasetPreviewRow): string | null {
   const u = r.audio_url;
@@ -36,6 +38,14 @@ function textOf(r: DatasetPreviewRow): string {
   return typeof t === "string" ? t : JSON.stringify(t);
 }
 
+/** The row's speaker value (from the dataset's speaker column, default "speaker"). */
+function speakerOf(r: DatasetPreviewRow, speakerField?: string | null): string | null {
+  const v = r[speakerField || "speaker"];
+  if (v == null || typeof v === "object") return null;
+  const s = String(v).trim();
+  return s || null;
+}
+
 /**
  * One collapsible row. The waveform player only mounts when expanded, so audio
  * + server-side peaks are fetched lazily (per click) instead of for every row
@@ -46,14 +56,17 @@ function RowItem({
   index,
   row,
   onToggle,
+  speakerField,
 }: {
   index: number;
   row: DatasetPreviewRow;
   onToggle?: (rowIndex: number, included: boolean) => void;
+  speakerField?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const audio = audioOf(row);
   const text = textOf(row);
+  const speaker = speakerOf(row, speakerField);
   const rowIndex = typeof row.row_index === "number" ? row.row_index : null;
   const included = row.included !== false; // default: included
   return (
@@ -95,6 +108,15 @@ function RowItem({
           <span className="mt-0.5 w-9 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
             #{index + 1}
           </span>
+          {speaker && (
+            <span
+              className="mt-0.5 inline-flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+              title={`speaker: ${speaker}`}
+            >
+              <Mic className="h-3 w-3" />
+              {speaker}
+            </span>
+          )}
           <span className={cn("flex-1 whitespace-pre-wrap break-words text-sm", !open && "line-clamp-2")}>
             {text || <span className="text-muted-foreground">(empty)</span>}
           </span>
@@ -214,14 +236,20 @@ function PackedRowItem({
 export function RowBrowser({
   datasetId,
   initial,
+  speakerField,
 }: {
   datasetId: string;
   initial: DatasetPreview;
+  speakerField?: string | null;
 }) {
   const [limit, setLimit] = useState(initial.limit && initial.limit > 0 ? initial.limit : 20);
   const [offset, setOffset] = useState(initial.offset ?? 0);
   const [split, setSplit] = useState<string | null>(initial.split ?? null);
   const [splits] = useState<string[]>(initial.splits ?? []);
+  // Speaker filter (S3/upload datasets with a speaker column). The list is
+  // per-split, so it's refreshed from each fetch.
+  const [speaker, setSpeaker] = useState<string | null>(initial.speaker ?? null);
+  const [speakers, setSpeakers] = useState<string[]>(initial.speakers ?? []);
   const [rows, setRows] = useState<DatasetPreviewRow[]>(initial.rows ?? []);
   const [total, setTotal] = useState<number | null>(initial.total ?? null);
   const [loading, setLoading] = useState(false);
@@ -263,12 +291,13 @@ export function RowBrowser({
   }, [datasetId]);
 
   const fetchPage = useCallback(
-    async (off: number, lim: number, spl: string | null) => {
+    async (off: number, lim: number, spl: string | null, spk: string | null) => {
       setLoading(true);
       setError(null);
       try {
         const q = new URLSearchParams({ offset: String(off), limit: String(lim) });
         if (spl) q.set("split", spl);
+        if (spk) q.set("speaker", spk);
         const r = await fetch(
           `/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/preview?${q.toString()}`,
           { cache: "no-store" },
@@ -280,6 +309,7 @@ export function RowBrowser({
         }
         setRows(data.rows ?? []);
         if (typeof data.total === "number") setTotal(data.total);
+        if (Array.isArray(data.speakers)) setSpeakers(data.speakers);
         if (typeof data.excluded_count === "number") setExcludedCount(data.excluded_count);
         setError(data.error ?? null);
       } catch (e) {
@@ -305,10 +335,12 @@ export function RowBrowser({
       q.set("limit", String(limit));
       if (split) q.set("split", split);
       else q.delete("split");
+      if (speaker) q.set("speaker", speaker);
+      else q.delete("speaker");
       window.history.replaceState(null, "", `${window.location.pathname}?${q.toString()}`);
     }
-    void fetchPage(offset, limit, split);
-  }, [offset, limit, split, fetchPage]);
+    void fetchPage(offset, limit, split, speaker);
+  }, [offset, limit, split, speaker, fetchPage]);
 
   const from = total === 0 ? 0 : offset + 1;
   const to = offset + rows.length;
@@ -340,6 +372,7 @@ export function RowBrowser({
               value={split ?? splits[0]}
               onValueChange={(v) => {
                 setOffset(0);
+                setSpeaker(null); // speaker lists are per-split; reset on split change
                 setSplit(v);
               }}
             >
@@ -350,6 +383,29 @@ export function RowBrowser({
                 {splits.map((s) => (
                   <SelectItem key={s} value={s} className="text-xs">
                     split: {s}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          {speakers.length > 1 && (
+            <Select
+              value={speaker ?? ALL_SPEAKERS}
+              onValueChange={(v) => {
+                setOffset(0);
+                setSpeaker(v === ALL_SPEAKERS ? null : v);
+              }}
+            >
+              <SelectTrigger className="h-8 w-[150px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_SPEAKERS} className="text-xs">
+                  all speakers
+                </SelectItem>
+                {speakers.map((sp) => (
+                  <SelectItem key={sp} value={sp} className="font-mono text-xs">
+                    🎤 {sp}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -391,7 +447,7 @@ export function RowBrowser({
               r.packed === true ? (
                 <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} />
               ) : (
-                <RowItem key={offset + i} index={offset + i} row={r} onToggle={setIncluded} />
+                <RowItem key={offset + i} index={offset + i} row={r} onToggle={setIncluded} speakerField={speakerField} />
               ),
             )}
           </div>
