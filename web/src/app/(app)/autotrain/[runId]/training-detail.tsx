@@ -205,6 +205,14 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const metricLabel = run.task_type === "tts"
     ? "loss"
     : String((run.config_json?.eval_metric as string) || "wer").toUpperCase();
+  // TTS has no WER/CER (ASR-only metrics). Its eval signal is the held-out loss
+  // on the test split; CER / MOS / speaker-similarity only exist when those eval
+  // methods were selected (shown separately in the TTS evaluation card).
+  const isTts = run.task_type === "tts";
+  const evalLosses = epochs
+    .map((e) => e.eval_loss)
+    .filter((n): n is number => typeof n === "number");
+  const bestEvalLoss = evalLosses.length ? Math.min(...evalLosses) : (best?.eval_loss ?? null);
   const sortedTrials = [...trials].sort((a, b) => {
     if (a.metric == null) return 1;
     if (b.metric == null) return -1;
@@ -374,8 +382,8 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           />
           <CostKpi run={run} />
           <Kpi
-            label={run.task_type === "tts" ? "Best CER" : `Best ${metricLabel}`}
-            value={run.task_type === "tts" ? fmt(run.result_json?.tts_eval?.cer ?? null, 4) : fmt(best?.wer ?? null)}
+            label={isTts ? "Best eval loss" : `Best ${metricLabel}`}
+            value={isTts ? fmt(bestEvalLoss, 4) : fmt(best?.wer ?? null)}
           />
           {isSweep && <Kpi label="Trials" value={String(trials.length)} />}
         </div>
@@ -404,8 +412,8 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           <CardHeader className="pb-2"><CardTitle className="text-sm">Best checkpoint</CardTitle></CardHeader>
           <CardContent className="flex flex-wrap gap-x-8 gap-y-2 text-sm">
             <Stat label="Best epoch" value={String(best.epoch ?? "—")} />
-            <Stat label="WER" value={fmt(best.wer)} />
-            <Stat label="CER" value={fmt(best.cer)} />
+            {!isTts && <Stat label="WER" value={fmt(best.wer)} />}
+            {!isTts && <Stat label="CER" value={fmt(best.cer)} />}
             <Stat label="Eval loss" value={fmt(best.eval_loss, 4)} />
             {run.result_json?.stopped_early && <Stat label="Stopped early" value="yes (patience)" />}
             {artifact?.s3_uri && <Stat label="Artifact" value={artifact.s3_uri} mono />}
@@ -494,8 +502,8 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
                   <tr>
                     {isSweep && <th className="px-3 py-2 text-left">Trial</th>}
                     <th className="px-3 py-2 text-left">Epoch</th>
-                    <th className="px-3 py-2 text-right">WER</th>
-                    <th className="px-3 py-2 text-right">CER</th>
+                    {!isTts && <th className="px-3 py-2 text-right">WER</th>}
+                    {!isTts && <th className="px-3 py-2 text-right">CER</th>}
                     <th className="px-3 py-2 text-right">Eval loss</th>
                     <th className="px-3 py-2 text-right">Train loss</th>
                   </tr>
@@ -519,8 +527,8 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
                           </td>
                         )}
                         <td className="px-3 py-2 font-mono">{e.epoch}</td>
-                        <td className="px-3 py-2 text-right font-mono">{fmt(e.wer)}</td>
-                        <td className="px-3 py-2 text-right font-mono">{fmt(e.cer)}</td>
+                        {!isTts && <td className="px-3 py-2 text-right font-mono">{fmt(e.wer)}</td>}
+                        {!isTts && <td className="px-3 py-2 text-right font-mono">{fmt(e.cer)}</td>}
                         <td className="px-3 py-2 text-right font-mono">{fmt(e.eval_loss, 4)}</td>
                         <td className="px-3 py-2 text-right font-mono">{fmt(e.train_loss, 4)}</td>
                       </tr>
@@ -1091,33 +1099,62 @@ function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevice
 
 function LogsTab({ lines, status }: { lines: string[]; status: string }) {
   const endRef = useRef<HTMLDivElement>(null);
+  const [autoScroll, setAutoScroll] = useState(true);
   const terminal = ["done", "failed", "cancelled"].includes(status);
 
+  // Only stick to the bottom when auto-scroll is on — so you can scroll up to
+  // read without being yanked back down as new lines stream in.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [lines]);
+    if (autoScroll) endRef.current?.scrollIntoView({ block: "end" });
+  }, [lines, autoScroll]);
 
   return (
-    <div className="terminal-block h-[55vh] overflow-y-auto rounded-md border border-border bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-200">
-      {lines.length === 0 ? (
-        <div className="text-zinc-500">
-          {status === "queued" ? "Queued — waiting for the runner…" : "Waiting for output…"}
-        </div>
-      ) : (
-        lines.map((l, i) => (
-          <div key={i} className={
-            l.startsWith("@@") ? "text-sky-300"
-              : l.startsWith("[gateway]") ? "text-emerald-300"
-              : "text-zinc-200"
-          }>{l}</div>
-        ))
-      )}
-      <div ref={endRef} />
-      {terminal && lines.length === 0 && (
-        <div className="text-zinc-500">No logs (run {status}).</div>
-      )}
+    <div className="space-y-2">
+      <label className="flex w-fit cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground">
+        <input
+          type="checkbox"
+          checked={autoScroll}
+          onChange={(e) => setAutoScroll(e.target.checked)}
+          className="h-3.5 w-3.5 accent-primary"
+        />
+        Auto-scroll to latest{!autoScroll && lines.length > 0 ? " (paused)" : ""}
+      </label>
+      <div className="terminal-block h-[55vh] overflow-y-auto rounded-md border border-border bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-200">
+        {lines.length === 0 ? (
+          <div className="text-zinc-500">
+            {status === "queued" ? "Queued — waiting for the runner…" : "Waiting for output…"}
+          </div>
+        ) : (
+          lines.map((l, i) => (
+            <div key={i} className={
+              l.startsWith("@@") ? "text-sky-300"
+                : l.startsWith("[gateway]") ? "text-emerald-300"
+                : "text-zinc-200"
+            }>{l}</div>
+          ))
+        )}
+        <div ref={endRef} />
+        {terminal && lines.length === 0 && (
+          <div className="text-zinc-500">No logs (run {status}).</div>
+        )}
+      </div>
     </div>
   );
+}
+
+// Human-readable byte size (B/KB/MB/GB/TB) — files range from <1 KB configs to
+// multi-GB safetensors, so a fixed KB unit is unreadable.
+function fmtBytes(n?: number | null): string {
+  if (n == null) return "—";
+  if (n < 1024) return `${n} B`;
+  const u = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < u.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
 }
 
 function FilesTab({ run }: { run: TrainingRunRecord }) {
@@ -1145,7 +1182,7 @@ function FilesTab({ run }: { run: TrainingRunRecord }) {
           <span className="truncate font-mono text-xs">{f.name}</span>
           <a href={f.download_url} target="_blank" rel="noreferrer"
             className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-            <Download className="h-3.5 w-3.5" /> {(f.size / 1024).toFixed(0)} KB
+            <Download className="h-3.5 w-3.5" /> {fmtBytes(f.size)}
           </a>
         </li>
       ))}

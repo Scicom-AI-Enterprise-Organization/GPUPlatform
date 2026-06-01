@@ -1,8 +1,8 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
-import { Cloud, Database, KeyRound, MoreHorizontal, Power, Trash2, User } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Cloud, Database, Inbox, KeyRound, LayoutGrid, List, MoreHorizontal, Power, Search, Trash2, User, X } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -20,12 +20,19 @@ import {
 } from "@/components/ui/dialog";
 import { gateway } from "@/lib/gateway";
 import { avatarFor } from "@/lib/avatar";
+import { cn } from "@/lib/utils";
 import type { StorageKind, StorageRecord } from "@/lib/types";
 
 const KIND_LABEL: Record<StorageKind, string> = {
   s3: "s3",
   huggingface: "huggingface",
 };
+
+function searchableText(s: StorageRecord): string {
+  return [s.name, s.id, s.kind, s.bucket ?? "", s.prefix ?? "", s.region ?? "", s.endpoint ?? "", s.notes ?? "", s.created_by ?? ""]
+    .join(" ")
+    .toLowerCase();
+}
 
 function KindIcon({ kind }: { kind: StorageKind }) {
   return kind === "huggingface" ? <Database className="h-3 w-3" /> : <Cloud className="h-3 w-3" />;
@@ -52,6 +59,27 @@ export function StorageList({
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [q, setQ] = useState("");
+  const [view, setView] = useState<"rows" | "grid">("grid");
+  useEffect(() => {
+    const v = window.localStorage.getItem("sgpu_storage_view");
+    // Reading client-only localStorage post-mount avoids an SSR/CSR mismatch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (v === "rows" || v === "grid") setView(v);
+  }, []);
+  const setViewPersist = (v: "rows" | "grid") => {
+    setView(v);
+    window.localStorage.setItem("sgpu_storage_view", v);
+  };
+
+  const filtered = useMemo(() => {
+    const tokens = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!tokens.length) return items;
+    return items.filter((s) => {
+      const text = searchableText(s);
+      return tokens.every((t) => text.includes(t));
+    });
+  }, [items, q]);
 
   const onDelete = async () => {
     if (!target) return;
@@ -82,8 +110,72 @@ export function StorageList({
 
   return (
     <div>
-      <ul className="flex flex-col gap-3">
-        {items.map((s) => {
+      <div className="mb-4 flex gap-2">
+        <div className="relative flex-1">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <input
+            type="search"
+            placeholder="Search by name, id, bucket, region…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            className="h-10 w-full rounded-md border border-input bg-background pl-9 pr-9 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
+          />
+          {q && (
+            <button
+              type="button"
+              onClick={() => setQ("")}
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+              title="Clear"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+        <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
+          <button
+            type="button"
+            onClick={() => setViewPersist("rows")}
+            className={cn(
+              "inline-flex items-center justify-center px-2.5 text-sm",
+              view === "rows" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50",
+            )}
+            title="List view"
+            aria-label="List view"
+            aria-pressed={view === "rows"}
+          >
+            <List className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewPersist("grid")}
+            className={cn(
+              "inline-flex items-center justify-center border-l border-input px-2.5 text-sm",
+              view === "grid" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50",
+            )}
+            title="Grid view"
+            aria-label="Grid view"
+            aria-pressed={view === "grid"}
+          >
+            <LayoutGrid className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      {q && (
+        <div className="mb-3 text-xs text-muted-foreground">
+          {filtered.length} of {items.length} match for{" "}
+          <span className="font-mono text-foreground">&quot;{q}&quot;</span>
+        </div>
+      )}
+
+      {filtered.length === 0 ? (
+        <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
+          <Inbox className="h-6 w-6 text-muted-foreground/60" />
+          <p className="text-sm text-muted-foreground">No storage matches your search.</p>
+        </div>
+      ) : (
+      <ul className={cn("gap-3", view === "rows" ? "flex flex-col" : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3")}>
+        {filtered.map((s) => {
           const scope = scopeOf(s);
           return (
             <li
@@ -186,6 +278,7 @@ export function StorageList({
           );
         })}
       </ul>
+      )}
 
       <Dialog
         open={!!target}

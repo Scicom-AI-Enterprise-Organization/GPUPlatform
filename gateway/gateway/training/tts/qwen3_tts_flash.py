@@ -47,6 +47,7 @@ from transformers import (
     AddedToken,
     HfArgumentParser,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     default_data_collator,
     DataCollatorWithPadding,
@@ -422,6 +423,26 @@ def main():
             'max_length_k': max_seqlen_q
         }
 
+    # Emit @@STEP (per-log train loss) + @@METRIC (per-epoch eval loss on the test
+    # split) so the gateway's live loss curve has points — HF's default
+    # `{'loss': …}` console log isn't parsed by the gateway.
+    class _ProgressEmitter(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kw):
+            if not logs or not state.is_world_process_zero:
+                return
+            if "loss" in logs:
+                print("@@STEP " + json.dumps({
+                    "step": int(state.global_step),
+                    "loss": float(logs["loss"]),
+                    "lr": float(logs.get("learning_rate") or 0.0),
+                    "epoch": float(logs.get("epoch") or 0.0),
+                }), flush=True)
+            if "eval_loss" in logs:
+                print("@@METRIC " + json.dumps({
+                    "epoch": float(logs.get("epoch") or 0.0),
+                    "eval_loss": float(logs["eval_loss"]),
+                }), flush=True)
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -431,6 +452,7 @@ def main():
         data_collator=collator,
         compute_metrics=None,
         preprocess_logits_for_metrics=None,
+        callbacks=[_ProgressEmitter()],
     )
 
     if training_args.do_train:
