@@ -66,85 +66,65 @@ def parse_precision(p):
 
 
 # --------------------------------------------------------------------------
-# Dependency bootstrap — runs before the heavy imports so a fresh pod works.
+# Dependency bootstrap — an isolated uv venv (created by --deps-only), so the
+# Whisper stack never clobbers the box's system python or the TTS stack.
 # --------------------------------------------------------------------------
-def ensure_deps() -> None:
-    # datasets>=4.0 decodes the Audio feature via torchcodec (needs ffmpeg + a
-    # torch-matched wheel) and dies with "please install 'torchcodec'" on a box
-    # without it. Pin to the 3.x line so the soundfile/librosa decoder is used —
-    # that's what we install below and it yields the {array,sampling_rate} dicts
-    # the trainer expects. This must run BEFORE any `import datasets`: a pip
-    # downgrade can't swap a module that's already imported in this process, so
-    # we detect the installed version via metadata (no import) and downgrade.
-    import importlib.metadata as _md
-    try:
-        _ds = _md.version("datasets")
-        if int(_ds.split(".")[0]) >= 4:
-            log(f"[deps] datasets {_ds} requires torchcodec for audio; pinning <4.0 …")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "-q", "datasets>=2.20,<4.0"]
-            )
-    except Exception:
-        pass
+DEFAULT_VENV = "/share/autotrain-whisper"
 
-    try:
-        import transformers  # noqa: F401
-        import datasets  # noqa: F401
-        import evaluate  # noqa: F401
-        import jiwer  # noqa: F401
-        import soundfile  # noqa: F401
-        import boto3  # noqa: F401
-        log("[deps] already present")
-        return
-    except Exception:
-        pass
-    log("[deps] installing transformers/datasets/evaluate/jiwer/audio/boto3 …")
+
+def _ensure_venv(cfg: dict) -> str:
+    """Create/reuse an isolated uv venv with the Whisper stack; return its python.
+    datasets is pinned <4.0 (4.x needs torchcodec for the Audio feature; we use
+    the soundfile/librosa decoder). Idempotent — fast when the venv is ready."""
+    import shutil
+
+    venv = (cfg.get("venv_path") or DEFAULT_VENV).rstrip("/")
+    py = os.path.join(venv, "bin", "python")
+    env = {**os.environ, "PIP_CONSTRAINT": "", "PIP_REQUIRE_HASHES": "0"}
+    # peft is always installed so the same venv serves LoRA + non-LoRA runs (and
+    # _present checks it, so a venv first built for a non-LoRA run still gets it).
     pkgs = [
-        "transformers>=4.44",
-        "datasets>=2.20,<4.0",
-        "evaluate",
-        "jiwer",
-        "accelerate>=0.30",
-        "soundfile",
-        "librosa",
-        "boto3",
-        "huggingface_hub",
+        "torch", "transformers>=4.44", "datasets>=2.20,<4.0", "evaluate", "jiwer",
+        "accelerate>=0.30", "soundfile", "librosa", "boto3", "huggingface_hub", "peft>=0.11",
     ]
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *pkgs]
-    )
-    log("[deps] done")
-
-
-def ensure_tracker_deps(report_to: list[str]) -> None:
-    """Install experiment-tracker clients on demand (only what's enabled)."""
-    want: list[str] = []
+    check_mods = ["torch", "transformers", "datasets", "evaluate", "jiwer", "soundfile", "boto3", "peft"]
+    report_to = (cfg.get("tracking") or {}).get("report_to") or cfg.get("report_to") or []
     if "wandb" in report_to:
-        try:
-            import wandb  # noqa: F401
-        except Exception:
-            want.append("wandb")
+        pkgs.append("wandb"); check_mods.append("wandb")
     if "mlflow" in report_to:
+        pkgs.append("mlflow"); check_mods.append("mlflow")
+
+    def _present() -> bool:
         try:
-            import mlflow  # noqa: F401
+            subprocess.check_call(
+                [py, "-c", "import " + ", ".join(check_mods)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return True
         except Exception:
-            want.append("mlflow")
-    if want:
-        log(f"[deps] installing trackers: {', '.join(want)}")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *want]
-        )
+            return False
 
-
-def ensure_lora_deps() -> None:
-    """Install peft on demand (only when a run requests LoRA)."""
-    try:
-        import peft  # noqa: F401
-        return
-    except Exception:
-        pass
-    log("[deps] installing peft (LoRA) …")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "peft>=0.11"])
+    if os.path.exists(py) and _present():
+        log(f"[deps] Whisper venv ready: {py}")
+        return py
+    have_uv = shutil.which("uv") is not None
+    # Create the venv only if absent (`uv venv` errors on a non-empty dir); then
+    # ALWAYS install — idempotent, and adds any missing pkg (e.g. peft) to a venv
+    # first built for a different run.
+    if not os.path.exists(py):
+        log(f"[deps] creating venv {venv} …")
+        if have_uv:
+            subprocess.check_call(["uv", "venv", venv, "--python", "3.12"], env=env)
+        else:
+            subprocess.check_call([sys.executable, "-m", "venv", venv], env=env)
+            subprocess.check_call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"], env=env)
+    log(f"[deps] installing Whisper stack into {venv} …")
+    if have_uv:
+        subprocess.check_call(["uv", "pip", "install", "--python", py, *pkgs], env=env)
+    else:
+        subprocess.check_call([py, "-m", "pip", "install", "-q", *pkgs], env=env)
+    log(f"[deps] Whisper venv ready: {py}")
+    return py
 
 
 # --------------------------------------------------------------------------
@@ -560,8 +540,7 @@ def run(cfg: dict) -> None:
     # checkpoint (no peft needed to load/serve it).
     use_lora = bool(cfg.get("use_lora"))
     if use_lora:
-        ensure_lora_deps()
-        from peft import LoraConfig, get_peft_model
+        from peft import LoraConfig, get_peft_model  # in the venv (installed by _ensure_venv)
 
         _r = int(cfg.get("lora_r", 16))
         # alpha is conventionally a ratio of r (e.g. 2×). When lora_alpha_ratio is
@@ -677,6 +656,18 @@ def run(cfg: dict) -> None:
         log(f"[track] reporting metrics to: {', '.join(report_to)}")
 
     out_dir = os.path.join(work, "out")
+    # Cap logging_steps to the real step count so SHORT runs still emit a loss
+    # curve. HF only logs "loss" every logging_steps; a 1-epoch / tiny-dataset
+    # run can have fewer total steps than the default (10), producing an empty
+    # loss chart. Aim for ~20 points across the whole run, min 1.
+    _bs = max(1, int(cfg.get("batch_size", 8)))
+    _ga = max(1, int(cfg.get("grad_accum", 1)))
+    _world = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    _spe = max(1, (len(train_ds) + (_bs * _ga * _world) - 1) // (_bs * _ga * _world))
+    _epochs = max(1, int(cfg["max_epochs"]) or 1)
+    _total_steps = max(1, _spe * _epochs)
+    eff_logging_steps = max(1, min(int(cfg.get("logging_steps", 10)), _total_steps // 20 or 1))
+    log(f"[trainer] ~{_total_steps} optimizer steps (world={_world}) → logging_steps={eff_logging_steps}")
     args = Seq2SeqTrainingArguments(
         output_dir=out_dir,
         per_device_train_batch_size=int(cfg.get("batch_size", 8)),
@@ -696,7 +687,7 @@ def run(cfg: dict) -> None:
         metric_for_best_model=metric_name,
         greater_is_better=False,
         save_total_limit=1,
-        logging_steps=max(1, int(cfg.get("logging_steps", 10))),
+        logging_steps=eff_logging_steps,
         # Parallel lazy audio fetch/decode in __getitem__, overlapped with GPU.
         dataloader_num_workers=max(0, int(cfg.get("dataloader_num_workers", 4))),
         report_to=report_to,
@@ -852,15 +843,10 @@ def main() -> int:
     _redirect_tmp(cfg.get("work_dir") or "/share")
     cleanup = bool(cfg.get("cleanup_checkpoints", True))
     try:
-        ensure_deps()
-        ensure_tracker_deps((cfg.get("tracking") or {}).get("report_to") or [])
-        # Install peft up front (in the sweep's one-shot deps prep) when LoRA is
-        # used anywhere, so concurrent trials don't race a pip install into the
-        # shared venv (which corrupted the first wave's imports).
-        if cfg.get("use_lora") or any(
-            k in (cfg.get("sweep") or {}) for k in ("lora_r", "lora_alpha")
-        ):
-            ensure_lora_deps()
+        # --deps-only (deps phase, system python): build the isolated uv venv.
+        # Run phase: the gateway launches us with {venv}/bin/python, so the venv
+        # is already present (this is a fast no-op) and run()'s imports resolve.
+        _ensure_venv(cfg)
         if a.deps_only:
             log("[deps] ready (deps-only)")
             return 0

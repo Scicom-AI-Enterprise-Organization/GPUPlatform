@@ -252,6 +252,8 @@ export function TrainingForm() {
   const [storageId, setStorageId] = useState("");
   const [hfPushRepo, setHfPushRepo] = useState("");
   const [workDir, setWorkDir] = useState("/share");
+  // Isolated uv venv for the trainer deps (mirrors serverless's vLLM venv_path).
+  const [venvPath, setVenvPath] = useState("/share/autotrain-whisper");
   const [cleanupCheckpoints, setCleanupCheckpoints] = useState(true);
   const [augmentTechniques, setAugmentTechniques] = useState<string[]>([]);
   const [augmentProb, setAugmentProb] = useState(0.5);
@@ -383,6 +385,7 @@ export function TrainingForm() {
         setStorageId(r.storage_id || "");
         if (c.hf_push_repo) setHfPushRepo(str(c.hf_push_repo));
         if (c.work_dir) setWorkDir(str(c.work_dir));
+        if (c.venv_path) setVenvPath(str(c.venv_path));
         if (c.cleanup_checkpoints != null) setCleanupCheckpoints(!!c.cleanup_checkpoints);
         // experiment tracking
         if (c.wandb_credential_id) setWandbCredId(str(c.wandb_credential_id));
@@ -441,6 +444,12 @@ export function TrainingForm() {
   function pickTask(t: "asr" | "tts") {
     setTaskType(t);
     setModelChoice(t === "tts" ? TTS_BASE_MODELS[0] : DEFAULT_WHISPER);
+    // Swap the default uv venv path when the user hasn't customized it.
+    setVenvPath((v) =>
+      t === "tts"
+        ? (v === "/share/autotrain-whisper" ? "/share/autotrain-tts" : v)
+        : (v === "/share/autotrain-tts" ? "/share/autotrain-whisper" : v),
+    );
     if (t === "tts") {
       setPrecision("bf16");
       setName((n) => (n === "whisper-finetune" ? "tts-finetune" : n));
@@ -593,6 +602,7 @@ export function TrainingForm() {
       storage_id: storageId,
       hf_push_repo: hfPushRepo.trim() || null,
       work_dir: workDir.trim() || "/share",
+      venv_path: venvPath.trim() || null,
       cleanup_checkpoints: cleanupCheckpoints,
       augment_techniques: augmentTechniques,
       augment_prob: augmentProb,
@@ -1205,6 +1215,17 @@ export function TrainingForm() {
             Roomy dir on the VM for checkpoints + temp (<span className="font-mono">TMPDIR</span>). Default{" "}
             <span className="font-mono">/share</span> — avoid <span className="font-mono">/tmp</span> (small disk).
             The best model is uploaded to S3 regardless.
+          </p>
+        </div>
+
+        <div className="mt-4 space-y-1.5">
+          <Label htmlFor="train-venv" className="text-xs">uv venv path</Label>
+          <Input id="train-venv" className="font-mono text-xs" placeholder="/share/autotrain-whisper"
+            value={venvPath} onChange={(e) => setVenvPath(e.target.value)} />
+          <p className="text-xs text-muted-foreground">
+            Isolated <span className="font-mono">uv</span> venv for the trainer&apos;s deps (like serverless&apos;s vLLM venv) —
+            keeps the stack off the box&apos;s system Python so {isTts ? "TTS" : "Whisper"} can&apos;t clobber another task&apos;s
+            torch. Default <span className="font-mono">{isTts ? "/share/autotrain-tts" : "/share/autotrain-whisper"}</span>; reused + cached across runs.
           </p>
         </div>
 

@@ -364,6 +364,9 @@ export type CreateTrainingRunRequest = {
   logging_steps?: number;
   // OS env vars exported on the remote before the trainer (HOME, cache dirs, …).
   env_vars?: Record<string, string>;
+  // Isolated uv venv for the trainer deps (like serverless's vLLM venv_path);
+  // default /share/autotrain-whisper (asr) or /share/autotrain-tts (tts).
+  venv_path?: string | null;
   // Roomy dir on the remote for checkpoints + temp (default /share; /tmp is small).
   work_dir?: string;
   // rm the checkpoint/work dir after the run (best model is on S3). Default true.

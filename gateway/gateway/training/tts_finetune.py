@@ -75,30 +75,65 @@ def _run_loss(cmd: list[str], cwd: str, env: dict) -> float | None:
     return last
 
 
-# install.sh from the reference, pip form (the pod image already has CUDA torch;
-# we pin the stack the trainer needs).
+# The TTS stack the trainer pins. torchaudio MUST match torch (neucodec imports
+# it); a mismatched torchaudio gives "undefined symbol: torch_library_impl" on
+# `import neucodec`. ChiniDataset (Parquet streaming) is vendored alongside the
+# tts scripts (private repo, no git on the box) — not a pip dep.
+DEFAULT_VENV = "/share/autotrain-tts"
 DEPS = [
-    "torch==2.9.1", "transformers==4.57.3", "accelerate",
-    "librosa", "soundfile", "datasets", "wandb",
+    "torch==2.9.1", "torchaudio==2.9.1", "transformers==4.57.3", "accelerate",
+    "librosa", "soundfile", "datasets", "wandb", "boto3",
     "neucodec", "pandas", "pyarrow", "multiprocess", "liger-kernel",
     "git+https://github.com/apple/ml-cross-entropy",
 ]
-# ChiniDataset (Parquet streaming) replaces mosaicml-streaming — it's vendored
-# next to the tts scripts and shipped with them (private repo, no git on the box).
 
 
-def ensure_deps(report_to: list[str]) -> None:
-    try:
-        import transformers, datasets, pyarrow, neucodec  # noqa: F401
-        log("[deps] core TTS stack present")
-    except Exception:
-        log("[deps] installing TTS stack (torch/transformers/neucodec/streaming/…)")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *DEPS])
-    if "mlflow" in report_to:
+def _ensure_venv(cfg: dict) -> str:
+    """Create/reuse an isolated uv venv with the TTS stack and return its python.
+    Isolation keeps torch 2.9.1 + neucodec off the box's system python (and away
+    from the Whisper stack — they need different torch). Idempotent."""
+    import shutil
+
+    venv = (cfg.get("venv_path") or DEFAULT_VENV).rstrip("/")
+    py = os.path.join(venv, "bin", "python")
+    # Bypass the pod image's hashed pip constraint (PIP_CONSTRAINT): it pins the
+    # base wheels and rejects torch 2.9.1's nvidia-nccl dep ("do not match the
+    # hashes from the requirements file"). A fresh venv has no such constraint.
+    env = {**os.environ, "PIP_CONSTRAINT": "", "PIP_REQUIRE_HASHES": "0"}
+    pkgs = list(DEPS)
+    if "mlflow" in ((cfg.get("tracking") or {}).get("report_to") or []):
+        pkgs.append("mlflow")
+
+    def _present() -> bool:
         try:
-            import mlflow  # noqa: F401
+            subprocess.check_call(
+                [py, "-c", "import torch, torchaudio, transformers, neucodec, pyarrow, boto3"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return True
         except Exception:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "mlflow"])
+            return False
+
+    if os.path.exists(py) and _present():
+        log(f"[deps] TTS venv ready: {py}")
+        return py
+    have_uv = shutil.which("uv") is not None
+    # Create the venv only if absent (`uv venv` errors on a non-empty dir); then
+    # ALWAYS install (idempotent — adds any missing pkg).
+    if not os.path.exists(py):
+        log(f"[deps] creating venv {venv} …")
+        if have_uv:
+            subprocess.check_call(["uv", "venv", venv, "--python", "3.12"], env=env)
+        else:
+            subprocess.check_call([sys.executable, "-m", "venv", venv], env=env)
+            subprocess.check_call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"], env=env)
+    log(f"[deps] installing TTS stack into {venv} (torch/torchaudio/neucodec/…) …")
+    if have_uv:
+        subprocess.check_call(["uv", "pip", "install", "--python", py, *pkgs], env=env)
+    else:
+        subprocess.check_call([py, "-m", "pip", "install", "-q", *pkgs], env=env)
+    log(f"[deps] TTS venv ready: {py}")
+    return py
 
 
 # --------------------------------------------------------------------------
@@ -280,7 +315,9 @@ def run(cfg: dict) -> None:
             os.environ[k] = str(v)
     report_to = list(tracking.get("report_to") or [])
 
-    ensure_deps(report_to)
+    # Deps live in the isolated uv venv (built by --deps-only); the gateway runs
+    # us with that venv's python, so this is a fast no-op verifying it's present.
+    _ensure_venv(cfg)
 
     model = cfg.get("base_model") or "Qwen/Qwen3-1.7B-Base"
     tokenizer = cfg.get("tokenizer") or "Scicom-intl/Multilingual-Expressive-TTS-1.7B"
@@ -346,7 +383,10 @@ def run(cfg: dict) -> None:
         dtype_args += ["--fp16"]
     report_flag = ",".join(report_to) if report_to else "none"
     last_loss = _run_loss([
-        "torchrun", f"--nproc_per_node={gpus}", os.path.join(TTS_DIR, "qwen3_tts_flash.py"),
+        # venv python's torch.distributed.run (sys.executable is the venv python
+        # in the run phase) — not a system `torchrun` that'd miss the venv torch.
+        sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={gpus}",
+        os.path.join(TTS_DIR, "qwen3_tts_flash.py"),
         "--model_name_or_path", model,
         "--train_file", packed,
         "--output_dir", out_dir,
@@ -409,8 +449,8 @@ def main() -> int:
     with open(a.config) as f:
         cfg = json.load(f)
     try:
+        _ensure_venv(cfg)  # deps phase builds the uv venv; run phase verifies it
         if a.deps_only:
-            ensure_deps((cfg.get("tracking") or {}).get("report_to") or [])
             log("[deps] ready (deps-only)")
             return 0
         run(cfg)

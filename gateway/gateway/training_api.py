@@ -896,6 +896,14 @@ async def run_training(redis, run_id: str) -> None:
     try:
         cfg["gpu_count"] = gpu_count
         task_type = (cfg.get("task_type") or "asr").lower()
+        # Isolated uv venv per task (mirrors serverless's vLLM venv_path) so the
+        # heavy stack never clobbers the box's system python or another task's
+        # deps. The trainer's --deps-only creates/installs it; the run phase
+        # launches from {venv}/bin/python.
+        venv_path = (cfg.get("venv_path")
+                     or ("/share/autotrain-tts" if task_type == "tts" else "/share/autotrain-whisper")).rstrip("/")
+        cfg["venv_path"] = venv_path
+        venv_py = shlex.quote(f"{venv_path}/bin/python")
         # Sweep mode: a sweep orchestrator schedules GPU-pinned trials. Resolve
         # the GPU id list to schedule across + the rank metric, baked into cfg.
         sweep_on = any(isinstance(v, list) and v for v in (cfg.get("sweep") or {}).values())
@@ -939,11 +947,18 @@ async def run_training(redis, run_id: str) -> None:
             # both sweep and single runs — absolute values mkdir'd. GPU pinning
             # stays per-branch (the sweep orchestrator pins each trial itself).
             user_env = _render_env_exports(cfg.get("env_vars") or {})
+            # --- deps phase: create/reuse the isolated uv venv (system python) ---
+            deps_cmd = f"{user_env}python -u {worker_remote} --deps-only --config {remote_cfg}"
+            await _push_log(redis, run_id, f"[gateway] $ {deps_cmd}")
+            drc = await asyncio.to_thread(_ssh_run_stream, cli, deps_cmd, on_line)
+            if drc != 0:
+                raise RuntimeError(f"dependency setup (uv venv {venv_path}) failed (rc={drc})")
+            # --- run phase: launch the trainer from the venv python ---
             if sweep_on:
                 await asyncio.to_thread(_ssh_put, cli, str(base / "sweep_runner.py"), "/tmp/sweep_runner.py")
                 remote_script = "/tmp/sweep_runner.py"
                 env_prefix = ""  # the orchestrator pins each trial itself
-                launch = "python -u"
+                launch = f"{venv_py} -u"
             else:
                 remote_script = worker_remote
                 env_prefix = f"CUDA_VISIBLE_DEVICES={visible_devices} " if visible_devices else ""
@@ -956,10 +971,10 @@ async def run_training(redis, run_id: str) -> None:
                           if visible_devices else int(gpu_count or 1))
                 if cfg.get("use_ddp", True) and n_gpus > 1 and task_type == "asr":
                     port = 29500 + (sum(ord(c) for c in run_id) % 2000)
-                    launch = f"python -m torch.distributed.run --nproc_per_node={n_gpus} --master_port={port}"
+                    launch = f"{venv_py} -m torch.distributed.run --nproc_per_node={n_gpus} --master_port={port}"
                     await _push_log(redis, run_id, f"[gateway] DDP via torch.distributed.run · {n_gpus} GPUs")
                 else:
-                    launch = "python -u"
+                    launch = f"{venv_py} -u"
             cmd = f"{user_env}{env_prefix}{launch} {remote_script} --config {remote_cfg}"
             await _push_log(redis, run_id, f"[gateway] $ {cmd}")
             rc = await asyncio.to_thread(_ssh_run_stream, cli, cmd, on_line)
@@ -1140,6 +1155,10 @@ class CreateTrainingRunRequest(BaseModel):
     # /share (the VM's big volume); /tmp is a small disk that overflows on big
     # models. The best model is uploaded to S3 regardless.
     work_dir: str = "/share"
+    # Isolated uv venv for the trainer's deps (like serverless's vLLM venv_path) —
+    # keeps the heavy stack off the box's system python. Default per task:
+    # /share/autotrain-whisper (asr) or /share/autotrain-tts (tts).
+    venv_path: Optional[str] = None
     # rm the run's checkpoint/work dir on the remote once the run ends (the best
     # model is already on S3). Keeps the volume from filling across runs.
     cleanup_checkpoints: bool = True
@@ -1377,6 +1396,7 @@ async def create_training_run(
         }),
         "hf_push_repo": body.hf_push_repo,
         "work_dir": (body.work_dir or "/share").strip() or "/share",
+        "venv_path": (body.venv_path or "").strip() or None,
         "cleanup_checkpoints": body.cleanup_checkpoints,
         # experiment tracking — non-secret knobs + the chosen credential ids.
         "report_to": [t for t in body.report_to if t in ("mlflow", "wandb")],

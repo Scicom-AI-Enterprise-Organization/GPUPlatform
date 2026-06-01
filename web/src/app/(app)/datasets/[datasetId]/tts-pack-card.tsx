@@ -28,8 +28,6 @@ function errText(body: unknown, fallback: string): string {
   return fallback;
 }
 
-const DEFAULT_TOKENIZER = "Scicom-intl/Multilingual-Expressive-TTS-1.7B";
-
 // NeuCodec-encode + multipack a {audio, transcription} dataset into a ChiniDataset
 // (Parquet streaming) on a GPU provider over SSH → a new packed dataset that TTS
 // training streams directly (skips convert+pack per run).
@@ -50,7 +48,6 @@ export function TtsPackCard({
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [providerId, setProviderId] = useState("");
   const [storageId, setStorageId] = useState(s3Storages[0]?.id ?? "");
-  const [tokenizer, setTokenizer] = useState(DEFAULT_TOKENIZER);
   const [seqLen, setSeqLen] = useState(4096);
   const [visibleDevices, setVisibleDevices] = useState("");
   const [status, setStatus] = useState<string | null>(initialStatus);
@@ -110,7 +107,6 @@ export function TtsPackCard({
         body: JSON.stringify({
           provider_id: providerId,
           storage_id: storageId,
-          tokenizer: tokenizer.trim() || null,
           sequence_length: seqLen,
           visible_devices: visibleDevices.trim() || null,
         }),
@@ -184,11 +180,9 @@ export function TtsPackCard({
               value={visibleDevices} onChange={(e) => setVisibleDevices(e.target.value)} disabled={running} />
           </div>
         </div>
-        <div className="space-y-1">
-          <Label className="text-xs">Speech-token tokenizer</Label>
-          <Input className="font-mono text-xs" value={tokenizer}
-            onChange={(e) => setTokenizer(e.target.value)} disabled={running} />
-        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Speech tokenizer is fixed — all Scicom TTS models share the NeuCodec speech-token vocab.
+        </p>
 
         {err && <p className="text-sm text-destructive">{err}</p>}
 
