@@ -306,6 +306,10 @@ class Dataset(Base):
     # (pack_stage1) prepends "<speaker>: " to each transcript. None → the packer
     # falls back to a constant speaker (one voice).
     speaker_field: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Rows manually un-ticked in the row browser so they're EXCLUDED from training
+    # (a JSON list of metadata-file row indices). Default/empty → every row is
+    # included. Applied by the S3/upload dataset readers in the trainers.
+    excluded_rows: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     # Per-split transcription column overrides for HF sources whose splits use
     # different column names (e.g. {"train": "text", "test": "after"}). Empty/None
     # → use `transcription_field` for every split. The audio column is assumed
@@ -595,6 +599,10 @@ async def init_db() -> None:
         # TTS-only speaker column mapping (consumed by the pack step).
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS speaker_field VARCHAR(128)"
+        ))
+        # Manually-excluded row indices (un-ticked in the row browser).
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS excluded_rows JSON"
         ))
         # Link a zip-backed source dataset to its materialised S3 audio dataset.
         await conn.execute(text(

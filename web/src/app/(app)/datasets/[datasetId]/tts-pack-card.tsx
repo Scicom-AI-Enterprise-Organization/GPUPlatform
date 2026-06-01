@@ -29,6 +29,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { ProgressEta } from "@/components/progress-eta";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { cn } from "@/lib/utils";
 import { gateway, GatewayError } from "@/lib/gateway";
@@ -422,56 +423,82 @@ export function TtsPackCard({
       <p className="text-[11px] text-muted-foreground">
         Speech tokenizer is fixed — all Scicom TTS models share the NeuCodec speech-token vocab.
       </p>
-
-      {err && <p className="text-sm text-destructive">{err}</p>}
-
-      <div className="flex items-center gap-3">
-        <Button onClick={run} disabled={running || starting}>
-          {running || starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Boxes className="h-4 w-4" />}
-          {running ? "Packing…" : "Pack for TTS"}
-        </Button>
-        {running && (
-          <Button variant="outline" onClick={cancel} disabled={cancelling} className="text-destructive">
-            {cancelling ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
-            {cancelling ? "Cancelling…" : "Cancel"}
-          </Button>
-        )}
-        {status && status !== "running" && (
-          <span className={status === "done" ? "text-sm text-emerald-600 dark:text-emerald-400" : "text-sm text-destructive"}>
-            {status === "done" ? "✓ done" : `✕ ${status}`}
-          </span>
-        )}
-        {newDatasetId && (
-          <Link href={`/datasets/${newDatasetId}`} className="inline-flex items-center gap-1 text-sm text-primary hover:underline">
-            Open packed dataset <span className="font-mono text-xs">{newDatasetId}</span>
-            <ArrowRight className="h-3.5 w-3.5" />
-          </Link>
-        )}
-      </div>
-
-      {log && (
-        <div className="space-y-1">
-          <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-            {running && <Loader2 className="h-3 w-3 animate-spin" />}
-            <span>{running ? "Live log (NeuCodec encode + multipack on the GPU box)" : "Log"}</span>
-          </div>
-          <pre ref={logRef} className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin">
-            {log}
-          </pre>
-        </div>
-      )}
     </div>
   );
 
-  if (bare) return <div className="space-y-3">{desc}{body}</div>;
-  return (
-    <Card>
-      <CardHeader className="flex flex-col gap-0.5">
-        <CardTitle className="text-base">Pack for TTS — NeuCodec + multipack</CardTitle>
+  const logBlock = log ? (
+    <div className="space-y-1">
+      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+        {running && <Loader2 className="h-3 w-3 animate-spin" />}
+        <span>{running ? "Live log (NeuCodec encode + multipack on the GPU box)" : "Log"}</span>
+        <ProgressEta log={log} running={running} />
+      </div>
+      <pre ref={logRef} className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin">
+        {log}
+      </pre>
+    </div>
+  ) : null;
+
+  // The primary action lives in its own footer row (outside the form card when
+  // standalone): status / result link on the left, Pack + Cancel on the right.
+  const actions = (
+    <div className="space-y-3">
+      {err && <p className="text-sm text-destructive">{err}</p>}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          {status && status !== "running" && (
+            <span className={status === "done" ? "text-sm text-emerald-600 dark:text-emerald-400" : "text-sm text-destructive"}>
+              {status === "done" ? "✓ done" : `✕ ${status}`}
+            </span>
+          )}
+          {newDatasetId && (
+            <Link href={`/datasets/${newDatasetId}`} className="inline-flex items-center gap-1 text-sm text-primary hover:underline">
+              Open packed dataset <span className="font-mono text-xs">{newDatasetId}</span>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </Link>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          {running && (
+            <Button variant="outline" onClick={cancel} disabled={cancelling} className="text-destructive">
+              {cancelling ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+              {cancelling ? "Cancelling…" : "Cancel"}
+            </Button>
+          )}
+          <Button onClick={run} disabled={running || starting}>
+            {running || starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Boxes className="h-4 w-4" />}
+            {running ? "Packing…" : "Pack for TTS"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // Embedded in the hf/label transform tabs: no card, action row inline.
+  if (bare)
+    return (
+      <div className="space-y-3">
         {desc}
-      </CardHeader>
-      <CardContent>{body}</CardContent>
-    </Card>
+        {body}
+        {actions}
+        {logBlock}
+      </div>
+    );
+  // s3 / upload: settings + log inside the card, with the Pack button below it.
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader className="flex flex-col gap-0.5">
+          <CardTitle className="text-base">Pack for TTS — NeuCodec + multipack</CardTitle>
+          {desc}
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {body}
+          {logBlock}
+        </CardContent>
+      </Card>
+      {actions}
+    </div>
   );
 }
 

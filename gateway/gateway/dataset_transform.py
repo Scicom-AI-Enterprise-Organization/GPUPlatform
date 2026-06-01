@@ -20,7 +20,7 @@ import tarfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .db import Dataset, Storage, session_factory
 
@@ -90,6 +90,21 @@ async def _log(dataset_id: str, line: str) -> None:
     logger.info("transform %s: %s", dataset_id, line)
 
 
+def _make_progress(dataset_id: str, loop: asyncio.AbstractEventLoop) -> Callable[[str, int, int], None]:
+    """A thread-safe progress callback for the blocking ETL steps (which run in a
+    threadpool). Appends an `[AUTOTRAIN_PROGRESS]` marker to transform_log so the
+    UI can show a percentage + ETA — the same marker format the TTS pack emits."""
+    def progress(step: str, processed: int, total: int) -> None:
+        pct = (processed / total * 100.0) if total else 0.0
+        line = f"[AUTOTRAIN_PROGRESS] step={step} processed={processed} total={total} percent={pct:.1f}"
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_log(dataset_id, line), loop)
+            fut.add_done_callback(lambda f: f.cancelled() or f.exception())  # retrieve → no "never awaited" warning
+        except Exception:  # noqa: BLE001 — progress is best-effort
+            pass
+    return progress
+
+
 async def _finish(dataset_id: str, status: str, line: str, **updates) -> None:
     async with session_factory()() as s:
         d = await s.get(Dataset, dataset_id)
@@ -145,14 +160,18 @@ async def _run(
     storage_id: Optional[str],
     s3_folder: Optional[str] = None,
 ) -> None:
-    import tempfile
-
     from fastapi.concurrency import run_in_threadpool
     from sqlalchemy import select
     from .datasets_api import _hf_token, _label_token, _s3_target_and_prefix
 
-    work: Optional[str] = None
+    # Stable per-dataset scratch dir: a re-run reuses an earlier download +
+    # extraction (no re-fetch of a huge repo over a slow link). Kept on
+    # failure/cancel for resume; only removed after a fully successful run.
+    work = _work_dir(dataset_id)
+    success = False
+    progress = _make_progress(dataset_id, asyncio.get_running_loop())
     try:
+        os.makedirs(work, exist_ok=True)
         # Resolve source repo + columns + tokens + output storage.
         async with session_factory()() as s:
             d = await s.get(Dataset, dataset_id)
@@ -191,7 +210,6 @@ async def _run(
         if kind == "label":
             # Stream the project export + download each task's audio. No archive
             # extraction — the export already pairs audio with its transcription.
-            work = tempfile.mkdtemp(prefix="sgpu-transform-")
             await _log(dataset_id, f"exporting label project {label_project_id} (status={label_status}) …")
             pairs = await run_in_threadpool(
                 _label_pairs, label_base_url, label_project_id, label_token, label_status, work,
@@ -200,8 +218,8 @@ async def _run(
                 await _finish(dataset_id, "failed", "no tasks with downloadable audio in the label export (check the status filter / token)")
                 return
         else:
-            await _log(dataset_id, f"downloading {src_repo} …")
-            work = await run_in_threadpool(_download, src_repo, token)
+            await _log(dataset_id, f"downloading {src_repo} … (reuses cached files on re-run)")
+            await run_in_threadpool(_download, src_repo, token, work, progress)
 
             await _log(dataset_id, "extracting audio archives …")
             n_audio = await run_in_threadpool(_extract_archives, work)
@@ -224,9 +242,10 @@ async def _run(
                 hf_repo=hf_repo,
             )
             await _finish(dataset_id, "done", f"pushed → {hf_repo}; created dataset {new_id} ({len(pairs)} rows)")
+            success = True
         else:
             uri = await run_in_threadpool(
-                _materialise_s3, pairs, transcription_field, s3_target, s3_prefix, dataset_id, s3_folder,
+                _materialise_s3, pairs, transcription_field, s3_target, s3_prefix, dataset_id, s3_folder, progress,
             )
             new_id = await _create_output(
                 dataset_id, kind="s3", transcription_field=transcription_field, num_rows=len(pairs),
@@ -239,27 +258,79 @@ async def _run(
                 f"materialised → {uri}; created dataset {new_id} ({len(pairs)} rows)",
                 audio_dataset_id=new_id,
             )
+            success = True
     except ModuleNotFoundError as e:
         await _finish(dataset_id, "failed", f"missing dependency: {e}. Install datasets + soundfile in the gateway.")
     except Exception as e:  # noqa: BLE001
         await _finish(dataset_id, "failed", f"transform failed: {e}")
         logger.exception("transform %s failed", dataset_id)
     finally:
-        if work:
+        # Keep the scratch dir on failure/cancel so a re-run resumes from the
+        # already-downloaded + extracted files; only clean up after success.
+        if work and success:
             shutil.rmtree(work, ignore_errors=True)
 
 
 # ---------------- blocking ETL steps (run in threadpool) ----------------
 
 
-def _download(repo: str, token: Optional[str]) -> str:
-    """snapshot_download the dataset repo into a fresh temp dir; return its path."""
+def _work_dir(dataset_id: str) -> str:
+    """Stable per-dataset scratch dir under the system temp root. Reused across
+    runs so a re-run doesn't re-download/re-extract a big repo."""
     import tempfile
-    from huggingface_hub import snapshot_download
+    return os.path.join(tempfile.gettempdir(), "sgpu-transform", dataset_id)
 
-    work = tempfile.mkdtemp(prefix="sgpu-transform-")
-    snapshot_download(repo_id=repo, repo_type="dataset", local_dir=work, token=token)
-    return work
+
+def _download(
+    repo: str,
+    token: Optional[str],
+    dest: str,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+) -> str:
+    """snapshot_download the dataset repo into the STABLE `dest` — re-runs skip
+    files already present (no network re-fetch). Emits a byte-based `download`
+    progress marker (snapshot_download itself is opaque, so the UI otherwise
+    shows no %) by polling the on-disk size against the repo's total size."""
+    import threading
+    from huggingface_hub import HfApi, snapshot_download
+
+    os.makedirs(dest, exist_ok=True)
+    total_bytes = 0
+    try:
+        info = HfApi(token=token).repo_info(repo, repo_type="dataset", files_metadata=True)
+        total_bytes = sum(int(getattr(s, "size", 0) or 0) for s in (info.siblings or []))
+    except Exception:  # noqa: BLE001 — size lookup is best-effort (just disables %)
+        logger.warning("repo_info size lookup failed for %s; download %% unavailable", repo)
+
+    mb = 1024 * 1024
+
+    def _dir_bytes() -> int:
+        tot = 0
+        for root, _dirs, files in os.walk(dest):
+            for f in files:
+                try:
+                    tot += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        return tot
+
+    stop = threading.Event()
+
+    def _poll() -> None:
+        while not stop.wait(2.0):
+            if progress and total_bytes:
+                progress("download", min(_dir_bytes(), total_bytes) // mb, total_bytes // mb)
+
+    poller = threading.Thread(target=_poll, daemon=True)
+    poller.start()
+    try:
+        snapshot_download(repo_id=repo, repo_type="dataset", local_dir=dest, token=token)
+    finally:
+        stop.set()
+        poller.join(timeout=3.0)
+    if progress and total_bytes:
+        progress("download", total_bytes // mb, total_bytes // mb)
+    return dest
 
 
 # Content-type → extension, for label-platform audio that arrives without a
@@ -279,11 +350,11 @@ def _label_pairs(
     token: str,
     status: str,
     work: str,
-) -> list[tuple[str, str, str]]:
+) -> list[tuple[str, str, str, dict]]:
     """Stream a labeling-platform project export (export.v1.jsonl) and download
     each task's audio into `work/audio`. Returns [(split, abs_audio_path,
-    transcription)] — the same shape `_build_pairs` produces for HF sources, so
-    the HF/S3 target writers are reused unchanged.
+    transcription, extra)] — the same shape `_build_pairs` produces for HF
+    sources (extra is empty here), so the HF/S3 target writers are reused.
 
     Audio resolution mirrors the gateway's label-audio proxy: tasks whose
     `audio_url` lives under the platform (or that only expose a task id) are
@@ -304,7 +375,7 @@ def _label_pairs(
 
     audio_dir = Path(work) / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
-    pairs: list[tuple[str, str, str]] = []
+    pairs: list[tuple[str, str, str, dict]] = []
     with httpx.Client(timeout=120.0, follow_redirects=True) as cli:
         for i, r in enumerate(rows):
             u = str(r.get("audio_url") or "").strip()
@@ -333,24 +404,31 @@ def _label_pairs(
             text = r.get("transcription")
             text = "" if text is None else str(text)
             split = str(r.get("split") or "train")
-            pairs.append((split, str(dest), text))
+            pairs.append((split, str(dest), text, {}))
     return pairs
 
 
 def _extract_archives(work: str) -> int:
-    """Unzip/untar every archive under `work` in place. Returns a rough count of
+    """Unzip/untar every archive under `work` in place. Idempotent: an archive
+    already expanded on a previous run (a sibling `.extracted` marker exists) is
+    skipped, so a resumed transform doesn't re-extract. Returns a rough count of
     audio files present afterwards."""
     root = Path(work)
     for p in list(root.rglob("*")):
-        if not p.is_file():
+        if not p.is_file() or p.suffix == ".extracted":
+            continue
+        marker = p.with_name(p.name + ".extracted")
+        if marker.exists():
             continue
         try:
             if p.suffix.lower() == ".zip" and zipfile.is_zipfile(p):
                 with zipfile.ZipFile(p) as zf:
                     zf.extractall(p.parent)
+                marker.write_text("")
             elif tarfile.is_tarfile(p):
                 with tarfile.open(p) as tf:
                     tf.extractall(p.parent)  # noqa: S202 — trusted org dataset
+                marker.write_text("")
         except Exception:
             logger.exception("extract failed for %s", p)
     return sum(1 for f in root.rglob("*") if f.suffix.lower() in _AUDIO_EXTS)
@@ -377,6 +455,25 @@ def _split_of(meta: Path, root: Path) -> str:
     return rel.parts[0] if len(rel.parts) > 1 else meta.stem
 
 
+def _scalar(v) -> Optional[str]:
+    """Stringify a metadata value if it's a simple scalar (str/number/bool);
+    return None for nulls/NaN or complex values (audio structs, byte blobs,
+    arrays) that can't live in a metadata CSV — so carried-through columns like
+    `speaker` survive but the audio feature itself is skipped."""
+    import numpy as _np
+
+    if v is None or isinstance(v, (dict, list, tuple, set, bytes, bytearray, _np.ndarray)):
+        return None
+    try:
+        import pandas as _pd
+        if _pd.isna(v):  # NaN / NaT / pd.NA (scalars only — complex types excluded above)
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(v)
+    return s if s.strip() != "" else None
+
+
 def _read_metadata(
     work: str,
     audio_field: str,
@@ -387,8 +484,9 @@ def _read_metadata(
     the audio column — so train/test split parquets are all included. Each split
     can name its transcription column differently (`split_fields`, e.g.
     {"train": "text", "test": "after"}); the chosen column is normalised into a
-    single `__text__` column so the output is unified. Raises with the columns it
-    *did* find when nothing matches (the usual cause: wrong column mapping)."""
+    single `__text__` column so the output is unified. All other columns (e.g.
+    `speaker`) are preserved so the output dataset keeps them. Raises with the
+    columns it *did* find when nothing matches (usually a wrong column mapping)."""
     import pandas as pd
 
     split_fields = split_fields or {}
@@ -411,7 +509,7 @@ def _read_metadata(
             continue
         split = _split_of(meta, root)
         tcol = split_fields.get(split) or transcription_field
-        out = pd.DataFrame({audio_field: df[audio_field]})
+        out = df.copy()  # keep every column (speaker, etc.); audio col is replaced later
         # Missing column for this split → blank, not a hard failure (the split may
         # genuinely lack a transcription, or the mapping only covers some splits).
         out["__text__"] = df[tcol] if tcol in df.columns else ""
@@ -430,16 +528,20 @@ def _build_pairs(
     audio_field: str,
     transcription_field: str,
     split_fields: Optional[dict] = None,
-) -> list[tuple[str, str, str]]:
+) -> list[tuple[str, str, str, dict]]:
     """Join each metadata row's audio reference to an extracted file on disk.
-    Returns [(split, abs_audio_path, transcription)] so the output keeps splits."""
+    Returns [(split, abs_audio_path, transcription, extra)] so the output keeps
+    splits; `extra` carries the row's other simple columns (e.g. speaker)."""
     root = Path(work)
     by_name: dict[str, str] = {}
     for f in root.rglob("*"):
         if f.suffix.lower() in _AUDIO_EXTS:
             by_name.setdefault(f.name, str(f))  # basename → path
     rows = _read_metadata(work, audio_field, transcription_field, split_fields)
-    pairs: list[tuple[str, str, str]] = []
+    # Don't carry the audio col (it's replaced by the URL), the chosen
+    # transcription col (it becomes `transcription_field`), or the markers.
+    skip = {audio_field, transcription_field, "__text__", "__split__"}
+    pairs: list[tuple[str, str, str, dict]] = []
     for r in rows:
         ref = r.get(audio_field)
         if not isinstance(ref, str) or not ref:
@@ -454,18 +556,25 @@ def _build_pairs(
         if text is None or (isinstance(text, float) and text != text):
             text = ""
         split = r.get("__split__") or "train"
-        pairs.append((str(split), path, str(text)))
+        extra = {str(k): s for k, v in r.items() if k not in skip and (s := _scalar(v)) is not None}
+        pairs.append((str(split), path, str(text), extra))
     return pairs
 
 
-def _push_hf(pairs: list[tuple[str, str, str]], transcription_field: str, out_repo: str, token: Optional[str]) -> None:
+def _push_hf(pairs: list[tuple[str, str, str, dict]], transcription_field: str, out_repo: str, token: Optional[str]) -> None:
     from datasets import Audio, Dataset as HFDataset, DatasetDict
 
+    # Union of carried-through columns (e.g. speaker) so every row has every key.
+    extra_cols = sorted({k for *_rest, extra in pairs for k in extra})
     by_split: dict[str, dict[str, list]] = {}
-    for split, path, text in pairs:
-        d = by_split.setdefault(split, {"audio": [], transcription_field: []})
+    for split, path, text, extra in pairs:
+        d = by_split.setdefault(
+            split, {"audio": [], transcription_field: [], **{c: [] for c in extra_cols}}
+        )
         d["audio"].append(path)
         d[transcription_field].append(text)
+        for c in extra_cols:
+            d[c].append(extra.get(c, ""))
     dd = DatasetDict({
         split: HFDataset.from_dict(d).cast_column("audio", Audio())
         for split, d in by_split.items()
@@ -474,18 +583,19 @@ def _push_hf(pairs: list[tuple[str, str, str]], transcription_field: str, out_re
 
 
 def _materialise_s3(
-    pairs: list[tuple[str, str, str]],
+    pairs: list[tuple[str, str, str, dict]],
     transcription_field: str,
     s3_target,
     s3_prefix: str,
     dataset_id: str,
     s3_folder: Optional[str] = None,
+    progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> str:
     """Upload each audio file to S3 and write a metadata CSV with columns
-    [audio (presigned URL), <transcription>, split] — keeping the source's
-    splits. Writes under the storage's prefix + `s3_folder` (default
-    datasets/{id}/transformed). Re-runs skip audio already in the bucket.
-    Returns the s3:// URI of the metadata."""
+    [audio (presigned URL), <transcription>, split, <carried-through cols…>] —
+    keeping the source's splits and extra columns (e.g. speaker). Writes under
+    the storage's prefix + `s3_folder` (default datasets/{id}/transformed).
+    Re-runs skip audio already in the bucket. Returns the s3:// URI."""
     import csv
     import io as _io
 
@@ -501,19 +611,33 @@ def _materialise_s3(
                 existing.add(obj["key"])
     except Exception:  # noqa: BLE001 — best-effort; fall back to always uploading
         pass
+    expires = 7 * 24 * 3600
+    # Unique source files (the same clip can repeat across splits) → S3 key.
+    key_of: dict[str, str] = {}
+    for _split, path, _text, _extra in pairs:
+        key_of.setdefault(path, f"{base}/audio/{os.path.basename(path)}")
+
+    # Upload concurrently, reusing one client; re-runs skip clips already present.
+    to_upload = [(key, path) for path, key in key_of.items() if key not in existing]
+    total_up = len(to_upload)
+    if total_up:
+        every = max(1, total_up // 50)  # ~50 progress markers over the upload
+
+        def _on_done(done: int) -> None:
+            if progress and (done % every == 0 or done == total_up):
+                progress("upload_s3", done, total_up)
+
+        bench.s3_put_files(to_upload, s3_target, max_workers=16, on_done=_on_done)
+
+    # Presign every unique key (local signing, one client), then write the CSV
+    # with the carried-through columns (e.g. speaker) after audio/text/split.
+    urls = bench.s3_presign_many(list(key_of.values()), expires, s3_target)
+    extra_cols = sorted({k for *_rest, extra in pairs for k in extra})
     buf = _io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["audio", transcription_field, "split"])
-    uploaded: dict[str, str] = {}  # src path → presigned URL (dedupe repeats across splits)
-    for split, path, text in pairs:
-        url = uploaded.get(path)
-        if url is None:
-            key = f"{base}/audio/{os.path.basename(path)}"
-            if key not in existing:
-                bench.s3_put_file(key, path, s3_target)
-            url = bench.s3_presign_get(key, 7 * 24 * 3600, s3_target)
-            uploaded[path] = url
-        writer.writerow([url, text, split])
+    writer.writerow(["audio", transcription_field, "split"] + extra_cols)
+    for split, path, text, extra in pairs:
+        writer.writerow([urls[key_of[path]], text, split] + [extra.get(c, "") for c in extra_cols])
     meta_key = f"{base}/metadata.csv"
     bench.s3_put_text(meta_key, buf.getvalue(), s3_target)
     bucket = getattr(s3_target, "bucket", "")

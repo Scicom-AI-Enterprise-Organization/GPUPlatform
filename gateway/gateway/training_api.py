@@ -306,6 +306,8 @@ async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str
         "format": ds.format,
         "audio_field": ds.audio_field,
         "transcription_field": ds.transcription_field,
+        # Rows manually un-ticked in the row browser → skipped by the reader.
+        "excluded_rows": sorted(int(x) for x in (ds.excluded_rows or [])),
     }
 
 
@@ -1402,7 +1404,10 @@ async def create_training_run(
     # TTS trains directly on pre-packed (tts_packed) ChiniDataset shards — convert
     # + multipack already happened on the Datasets page. Block size + tokenizer
     # are derived from the packed dataset / base model, not asked in the form.
-    if body.task_type == "tts":
+    # A pack-only run is the EXCEPTION: it consumes a non-packed {audio,
+    # transcription, speaker} source to PRODUCE the packed dataset, so it must
+    # not require kind=tts_packed (that would make 'Pack for TTS' reject itself).
+    if body.task_type == "tts" and not body.pack_only:
         if ds.kind != "tts_packed":
             raise HTTPException(
                 status_code=400,

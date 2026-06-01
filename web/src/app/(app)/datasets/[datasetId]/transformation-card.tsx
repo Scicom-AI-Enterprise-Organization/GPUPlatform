@@ -48,15 +48,19 @@ export function TransformationCard({
     window.history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
   };
 
-  const packTab = (
-    <TtsPackCard
-      datasetId={datasetId}
-      s3Storages={s3Storages}
-      initialStatus={initialStatus}
-      initialLog={initialLog}
-      bare
-    />
-  );
+  // s3 / upload already have audio — there's only the TTS pack step (no
+  // extract-audio tab to switch between). Render it standalone so it owns its
+  // own card with the Pack button as a footer outside the card.
+  if (!canTransform) {
+    return (
+      <TtsPackCard
+        datasetId={datasetId}
+        s3Storages={s3Storages}
+        initialStatus={initialStatus}
+        initialLog={initialLog}
+      />
+    );
+  }
 
   return (
     <Card>
@@ -67,28 +71,32 @@ export function TransformationCard({
         </span>
       </CardHeader>
       <CardContent>
-        {canTransform ? (
-          <Tabs value={tab} onValueChange={onTab}>
-            <TabsList className="mb-3">
-              <TabsTrigger value="audio">{audioLabel}</TabsTrigger>
-              <TabsTrigger value="pack">Pack for TTS (NeuCodec)</TabsTrigger>
-            </TabsList>
-            <TabsContent value="audio">
-              <TransformCard
-                datasetId={datasetId}
-                kind={kind}
-                hfRepo={hfRepo}
-                s3Storages={s3Storages}
-                initialStatus={initialStatus}
-                initialLog={initialLog}
-                bare
-              />
-            </TabsContent>
-            <TabsContent value="pack">{packTab}</TabsContent>
-          </Tabs>
-        ) : (
-          packTab
-        )}
+        <Tabs value={tab} onValueChange={onTab}>
+          <TabsList className="mb-3">
+            <TabsTrigger value="audio">{audioLabel}</TabsTrigger>
+            <TabsTrigger value="pack">Pack for TTS (NeuCodec)</TabsTrigger>
+          </TabsList>
+          <TabsContent value="audio">
+            <TransformCard
+              datasetId={datasetId}
+              kind={kind}
+              hfRepo={hfRepo}
+              s3Storages={s3Storages}
+              initialStatus={initialStatus}
+              initialLog={initialLog}
+              bare
+            />
+          </TabsContent>
+          <TabsContent value="pack">
+            <TtsPackCard
+              datasetId={datasetId}
+              s3Storages={s3Storages}
+              initialStatus={initialStatus}
+              initialLog={initialLog}
+              bare
+            />
+          </TabsContent>
+        </Tabs>
       </CardContent>
     </Card>
   );

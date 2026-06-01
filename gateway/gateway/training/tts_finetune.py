@@ -292,7 +292,11 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
     else:
         cli = _s3_client(ds)
         prefix = (ds.get("audio_prefix") or "").strip("/")
-        for r in _read_metadata_rows(ds):
+        # Rows manually un-ticked in the row browser → excluded from training.
+        excluded = {int(x) for x in (ds.get("excluded_rows") or [])}
+        for i, r in enumerate(_read_metadata_rows(ds)):
+            if i in excluded:
+                continue
             ref = r.get(audio_field)
             txt = r.get(text_field)
             if not ref or txt is None:

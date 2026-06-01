@@ -37,6 +37,8 @@ import {
   YAxis,
 } from "recharts";
 import { gateway } from "@/lib/gateway";
+import { formatCostUSD, formatRateUSD, useLiveCost } from "@/lib/cost";
+import { BurnFlame } from "@/components/burn-flame";
 import { JsonView } from "@/components/json-view";
 import { cn } from "@/lib/utils";
 import type { TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
@@ -191,6 +193,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const artifact = run.result_json?.artifact;
   const trials = run.result_json?.trials ?? [];
   const isSweep = isSweepConfig(run.config_json) || trials.length > 0;
+  // A pack-only run (NeuCodec encode + multipack, no training) has no loss curve
+  // or per-epoch eval — hide those empty panels for it.
+  const packOnly = run.config_json?.pack_only === true;
   // Try-it playground: finished ASR run on a VM (inference runs on that VM).
   const canTryIt =
     run.status === "done" &&
@@ -287,7 +292,8 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-1 flex-col overflow-hidden">
+      <div className="border-b border-border bg-sidebar/40 px-6 pt-4 lg:px-10">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -331,7 +337,6 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           </div>
           <p className="mt-1 font-mono text-xs text-muted-foreground">
             {run.base_model} · {run.id}
-            {run.cost_per_hr != null ? ` · $${run.cost_per_hr}/hr` : ""}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -361,12 +366,39 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </div>
       </div>
 
+        <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-5">
+          <Kpi label="Status" value={run.status} />
+          <Kpi
+            label="GPU"
+            value={run.gpu_type ? `${run.gpu_type}${run.gpu_count > 1 ? ` ×${run.gpu_count}` : ""}` : "—"}
+          />
+          <CostKpi run={run} />
+          <Kpi
+            label={run.task_type === "tts" ? "Best CER" : `Best ${metricLabel}`}
+            value={run.task_type === "tts" ? fmt(run.result_json?.tts_eval?.cer ?? null, 4) : fmt(best?.wer ?? null)}
+          />
+          {isSweep && <Kpi label="Trials" value={String(trials.length)} />}
+        </div>
+
+        <Tabs value={tab} onValueChange={onTab} className="mt-4">
+          <TabsList variant="line" className="bg-transparent">
+            <TabsTrigger value="metrics">Metrics</TabsTrigger>
+            <TabsTrigger value="logs">Logs</TabsTrigger>
+            <TabsTrigger value="files">Files</TabsTrigger>
+            <TabsTrigger value="config">Config</TabsTrigger>
+            {canTryIt && <TabsTrigger value="tryit">Try it</TabsTrigger>}
+          </TabsList>
+        </Tabs>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
       {run.error_text && run.status === "failed" && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           <pre className="whitespace-pre-wrap break-words font-mono text-xs">{run.error_text}</pre>
         </div>
       )}
 
+      {tab === "metrics" && (<>
       {best && !isSweep && (
         <Card>
           <CardHeader className="pb-2"><CardTitle className="text-sm">Best checkpoint</CardTitle></CardHeader>
@@ -442,24 +474,19 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           </CardContent>
         </Card>
       )}
+      </>)}
 
       <Tabs value={tab} onValueChange={onTab} className="!block">
-        <TabsList>
-          <TabsTrigger value="metrics">Metrics</TabsTrigger>
-          <TabsTrigger value="logs">Logs</TabsTrigger>
-          <TabsTrigger value="files">Files</TabsTrigger>
-          <TabsTrigger value="config">Config</TabsTrigger>
-          {canTryIt && <TabsTrigger value="tryit">Try it</TabsTrigger>}
-        </TabsList>
-
-        <TabsContent value="metrics" className="mt-4 !flex-none space-y-4">
-          <LossCurve steps={steps} epochs={epochs} live={!terminal} sweep={isSweep} trials={trials} />
+        <TabsContent value="metrics" className="!flex-none space-y-4">
+          {!packOnly && <LossCurve steps={steps} epochs={epochs} live={!terminal} sweep={isSweep} trials={trials} />}
           <EvalCurve epochs={epochs} sweep={isSweep} trials={trials} />
           <GpuCard gpus={gpus} samples={run.result_json?.gpu_samples ?? []} running={!terminal} />
           {epochs.length === 0 ? (
+            packOnly ? null : (
             <p className="text-sm text-muted-foreground">
               No per-epoch metrics yet. They appear here as each epoch finishes evaluating.
             </p>
+            )
           ) : (
             <div className="overflow-x-auto rounded-md border border-border">
               <table className="w-full text-sm">
@@ -505,15 +532,15 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           )}
         </TabsContent>
 
-        <TabsContent value="logs" className="mt-4 !flex-none">
+        <TabsContent value="logs" className="!flex-none">
           <LogsTab lines={lines} status={run.status} />
         </TabsContent>
 
-        <TabsContent value="files" className="mt-4 !flex-none">
+        <TabsContent value="files" className="!flex-none">
           <FilesTab run={run} />
         </TabsContent>
 
-        <TabsContent value="config" className="mt-4 !flex-none space-y-4">
+        <TabsContent value="config" className="!flex-none space-y-4">
           <Card>
             <CardHeader className="pb-2"><CardTitle className="text-sm">Compute</CardTitle></CardHeader>
             <CardContent className="flex flex-wrap gap-x-8 gap-y-3 text-sm">
@@ -540,11 +567,12 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </TabsContent>
 
         {canTryIt && (
-          <TabsContent value="tryit" className="mt-4 !flex-none">
+          <TabsContent value="tryit" className="!flex-none">
             <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
           </TabsContent>
         )}
       </Tabs>
+      </div>
 
       <Dialog
         open={!!confirmOpts}
@@ -584,6 +612,39 @@ function Stat({ label, value, mono }: { label: string; value: string; mono?: boo
     <div>
       <div className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</div>
       <div className={`text-sm ${mono ? "font-mono break-all" : "font-medium"}`}>{value}</div>
+    </div>
+  );
+}
+
+// Header-band KPI cell (matches the benchmark / serverless detail headers).
+function Kpi({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="mt-0.5 truncate text-lg font-semibold tabular-nums">{value}</div>
+    </div>
+  );
+}
+
+// Live-ticking spend while running; final total once the run ends.
+function CostKpi({ run }: { run: TrainingRunRecord }) {
+  const live = useLiveCost(run.started_at, run.ended_at, run.cost_per_hr);
+  const isBurning = run.status === "running" && run.cost_per_hr != null && run.ended_at == null;
+  return (
+    <div>
+      <div className="text-xs text-muted-foreground">Cost {isBurning ? "(live)" : ""}</div>
+      <div
+        className={cn(
+          "mt-0.5 flex items-center gap-1.5 text-lg font-semibold tabular-nums",
+          isBurning && "text-amber-600 dark:text-amber-400",
+        )}
+      >
+        {isBurning && <BurnFlame size="h-4 w-4" />}
+        {formatCostUSD(live)}
+      </div>
+      <div className="text-[10px] text-muted-foreground">
+        {run.cost_per_hr != null ? `at ${formatRateUSD(run.cost_per_hr)}` : "—"}
+      </div>
     </div>
   );
 }

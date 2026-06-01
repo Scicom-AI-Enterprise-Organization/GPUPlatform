@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
   SelectContent,
@@ -12,6 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { WaveformPlayer } from "@/components/waveform-player";
+import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 import type { DatasetPreview, DatasetPreviewRow } from "@/lib/types";
 
@@ -40,40 +42,69 @@ function textOf(r: DatasetPreviewRow): string {
  * on the page — decoding N clips up front is expensive. Keyed by row index, so
  * it remounts collapsed on page change.
  */
-function RowItem({ index, row }: { index: number; row: DatasetPreviewRow }) {
+function RowItem({
+  index,
+  row,
+  onToggle,
+}: {
+  index: number;
+  row: DatasetPreviewRow;
+  onToggle?: (rowIndex: number, included: boolean) => void;
+}) {
   const [open, setOpen] = useState(false);
   const audio = audioOf(row);
   const text = textOf(row);
+  const rowIndex = typeof row.row_index === "number" ? row.row_index : null;
+  const included = row.included !== false; // default: included
   return (
-    <div className="overflow-hidden rounded-md border border-border">
-      <button
-        type="button"
-        onClick={() => audio && setOpen((o) => !o)}
-        disabled={!audio}
-        className={cn(
-          "flex w-full items-start gap-2 p-3 text-left transition-colors",
-          audio ? "hover:bg-muted/40" : "cursor-default",
+    <div
+      className={cn(
+        "overflow-hidden rounded-md border border-border",
+        !included && "border-dashed opacity-55",
+      )}
+    >
+      <div className="flex items-stretch">
+        {rowIndex !== null && onToggle && (
+          <label
+            className="flex shrink-0 cursor-pointer items-center border-r border-border px-2.5 hover:bg-muted/40"
+            title={included ? "Included in training — untick to exclude" : "Excluded from training"}
+          >
+            <Checkbox
+              checked={included}
+              onCheckedChange={(v) => onToggle(rowIndex, v === true)}
+              aria-label="include in training"
+            />
+          </label>
         )}
-      >
-        <ChevronRight
+        <button
+          type="button"
+          onClick={() => audio && setOpen((o) => !o)}
+          disabled={!audio}
           className={cn(
-            "mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-transform",
-            open && "rotate-90",
-            !audio && "opacity-0",
+            "flex w-full items-start gap-2 p-3 text-left transition-colors",
+            audio ? "hover:bg-muted/40" : "cursor-default",
           )}
-        />
-        <span className="mt-0.5 w-9 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
-          #{index + 1}
-        </span>
-        <span className={cn("flex-1 whitespace-pre-wrap break-words text-sm", !open && "line-clamp-2")}>
-          {text || <span className="text-muted-foreground">(empty)</span>}
-        </span>
-        {audio ? (
-          <Volume2 className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-        ) : (
-          <span className="mt-0.5 shrink-0 text-xs text-muted-foreground">no audio</span>
-        )}
-      </button>
+        >
+          <ChevronRight
+            className={cn(
+              "mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+              open && "rotate-90",
+              !audio && "opacity-0",
+            )}
+          />
+          <span className="mt-0.5 w-9 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
+            #{index + 1}
+          </span>
+          <span className={cn("flex-1 whitespace-pre-wrap break-words text-sm", !open && "line-clamp-2")}>
+            {text || <span className="text-muted-foreground">(empty)</span>}
+          </span>
+          {audio ? (
+            <Volume2 className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+          ) : (
+            <span className="mt-0.5 shrink-0 text-xs text-muted-foreground">no audio</span>
+          )}
+        </button>
+      </div>
       {open && audio && (
         <div className="border-t border-border p-3">
           <WaveformPlayer src={audio} />
@@ -195,8 +226,41 @@ export function RowBrowser({
   const [total, setTotal] = useState<number | null>(initial.total ?? null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(initial.error ?? null);
+  // Manual training-inclusion curation: count of rows un-ticked (excluded).
+  const [excludedCount, setExcludedCount] = useState(initial.excluded_count ?? 0);
+  const [toggleErr, setToggleErr] = useState<string | null>(null);
   // Skip the very first fetch — we already have the server-rendered page.
   const seeded = useRef(true);
+
+  // Tick/un-tick a row → include/exclude it from training. Optimistic; reverts
+  // on failure. The server is the source of truth for the excluded count.
+  const setIncluded = useCallback(
+    async (rowIndex: number, included: boolean) => {
+      setToggleErr(null);
+      setRows((prev) => prev.map((r) => (r.row_index === rowIndex ? { ...r, included } : r)));
+      try {
+        const res = await gateway.setRowInclusion(datasetId, { indices: [rowIndex], included });
+        setExcludedCount(res.excluded_count);
+      } catch (e) {
+        setRows((prev) =>
+          prev.map((r) => (r.row_index === rowIndex ? { ...r, included: !included } : r)),
+        );
+        setToggleErr(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [datasetId],
+  );
+
+  const includeAll = useCallback(async () => {
+    setToggleErr(null);
+    try {
+      const res = await gateway.setRowInclusion(datasetId, { clear: true });
+      setExcludedCount(res.excluded_count);
+      setRows((prev) => prev.map((r) => ({ ...r, included: true })));
+    } catch (e) {
+      setToggleErr(e instanceof Error ? e.message : String(e));
+    }
+  }, [datasetId]);
 
   const fetchPage = useCallback(
     async (off: number, lim: number, spl: string | null) => {
@@ -216,6 +280,7 @@ export function RowBrowser({
         }
         setRows(data.rows ?? []);
         if (typeof data.total === "number") setTotal(data.total);
+        if (typeof data.excluded_count === "number") setExcludedCount(data.excluded_count);
         setError(data.error ?? null);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -254,9 +319,21 @@ export function RowBrowser({
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">
-        <CardTitle className="text-base">
-          Rows{total != null ? ` · ${total.toLocaleString()}` : ""}
-        </CardTitle>
+        <div className="flex flex-col gap-0.5">
+          <CardTitle className="text-base">
+            Rows{total != null ? ` · ${total.toLocaleString()}` : ""}
+          </CardTitle>
+          {excludedCount > 0 ? (
+            <span className="text-xs text-muted-foreground">
+              {excludedCount.toLocaleString()} excluded from training ·{" "}
+              <button type="button" onClick={includeAll} className="underline underline-offset-2 hover:text-foreground">
+                include all
+              </button>
+            </span>
+          ) : (
+            <span className="text-xs text-muted-foreground">Untick a row to exclude it from training.</span>
+          )}
+        </div>
         <div className="flex items-center gap-2">
           {splits.length > 1 && (
             <Select
@@ -314,11 +391,13 @@ export function RowBrowser({
               r.packed === true ? (
                 <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} />
               ) : (
-                <RowItem key={offset + i} index={offset + i} row={r} />
+                <RowItem key={offset + i} index={offset + i} row={r} onToggle={setIncluded} />
               ),
             )}
           </div>
         )}
+
+        {toggleErr && <p className="text-xs text-destructive">Couldn’t save selection: {toggleErr}</p>}
 
         {!error && (rows.length > 0 || offset > 0) && (
           <div className="flex items-center justify-between gap-3 pt-1">

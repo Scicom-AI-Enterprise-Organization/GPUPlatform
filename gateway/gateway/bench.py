@@ -178,11 +178,19 @@ async def _bench_s3_target(storage_id: Optional[str]) -> S3Target:
     return _target_from_storage_row(row)
 
 
-def _s3_client(target: S3Target):
+def _s3_client(target: S3Target, max_pool_connections: Optional[int] = None):
     if not target.bucket:
         raise RuntimeError(
             "no S3 bucket configured — set BENCHMARK_S3_BUCKET or select a storage"
         )
+    cfg_kwargs: dict = {
+        "signature_version": "s3v4",
+        "s3": {"addressing_style": "path" if target.endpoint else "virtual"},
+    }
+    # Bump the connection pool for concurrent uploaders (botocore defaults to 10,
+    # which would serialise a wider thread pool and spam pool-full warnings).
+    if max_pool_connections:
+        cfg_kwargs["max_pool_connections"] = max_pool_connections
     kwargs: dict = {
         "region_name": target.region,
         # Pin to the regional endpoint. Default `s3.amazonaws.com` redirects to
@@ -190,10 +198,7 @@ def _s3_client(target: S3Target):
         # region get a 400 on the global host before the redirect can happen.
         # A custom endpoint (R2 / MinIO) overrides this and wants path-style.
         "endpoint_url": target.endpoint or f"https://s3.{target.region}.amazonaws.com",
-        "config": BotoConfig(
-            signature_version="s3v4",
-            s3={"addressing_style": "path" if target.endpoint else "virtual"},
-        ),
+        "config": BotoConfig(**cfg_kwargs),
     }
     if target.access_key and target.secret_key:
         kwargs["aws_access_key_id"] = target.access_key
@@ -210,6 +215,62 @@ def s3_put_file(key: str, path: str, target: Optional[S3Target] = None) -> None:
     t = target or _env_s3_target()
     with open(path, "rb") as f:
         _s3_client(t).put_object(Bucket=t.bucket, Key=key, Body=f.read())
+
+
+def s3_put_files(
+    items: list[tuple[str, str]],
+    target: Optional[S3Target] = None,
+    *,
+    max_workers: int = 16,
+    on_done: Optional["Callable[[int], None]"] = None,
+) -> None:
+    """Upload many (key, local_path) files to S3 concurrently, reusing ONE client.
+    The sequential path paid a fresh-client build + a serial round-trip per file,
+    which crawls on 10k+ clips. Calls on_done(n_completed) as each finishes;
+    raises the first upload error (parity with the per-file path)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not items:
+        return
+    t = target or _env_s3_target()
+    workers = max(1, min(max_workers, len(items)))
+    cli = _s3_client(t, max_pool_connections=workers)
+
+    def _put(key_path: tuple[str, str]) -> None:
+        key, path = key_path
+        with open(path, "rb") as f:
+            cli.put_object(Bucket=t.bucket, Key=key, Body=f.read())
+
+    err: Optional[BaseException] = None
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for fut in as_completed([ex.submit(_put, it) for it in items]):
+            done += 1
+            exc = fut.exception()
+            if exc is not None and err is None:
+                err = exc
+            if on_done is not None:
+                try:
+                    on_done(done)
+                except Exception:  # noqa: BLE001 — progress is best-effort
+                    pass
+    if err is not None:
+        raise err
+
+
+def s3_presign_many(
+    keys: list[str], expires: int = 3600, target: Optional[S3Target] = None
+) -> dict[str, str]:
+    """Presign GET URLs for many keys reusing one client (avoids a per-key client
+    build — presigning itself is local, no network). Returns {key: url}."""
+    t = target or _env_s3_target()
+    cli = _s3_client(t)
+    return {
+        k: cli.generate_presigned_url(
+            "get_object", Params={"Bucket": t.bucket, "Key": k}, ExpiresIn=expires
+        )
+        for k in dict.fromkeys(keys)  # dedupe, keep order
+    }
 
 
 def s3_get_text(key: str, target: Optional[S3Target] = None) -> Optional[str]:

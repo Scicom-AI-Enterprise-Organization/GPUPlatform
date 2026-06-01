@@ -15,6 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { ProgressEta } from "@/components/progress-eta";
 import { gateway, GatewayError } from "@/lib/gateway";
 import type { DatasetKind, StorageRecord } from "@/lib/types";
 
@@ -260,6 +261,7 @@ export function TransformCard({
             <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
               {running && <Loader2 className="h-3 w-3 animate-spin" />}
               <span>{running ? "Live log" : "Log"}</span>
+              <ProgressEta log={log} running={running} />
             </div>
             <pre ref={logRef} className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin">
               {log}

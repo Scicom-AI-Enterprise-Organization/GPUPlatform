@@ -28,15 +28,15 @@ export default async function TrainingRunPage({
         ]}
         username={username}
       />
-      <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
-        {error || !run ? (
+      {error || !run ? (
+        <div className="flex-1 px-6 py-8 lg:px-10">
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error ?? "Run not found."}
           </div>
-        ) : (
-          <TrainingDetail initial={run} />
-        )}
-      </div>
+        </div>
+      ) : (
+        <TrainingDetail initial={run} />
+      )}
     </div>
   );
 }

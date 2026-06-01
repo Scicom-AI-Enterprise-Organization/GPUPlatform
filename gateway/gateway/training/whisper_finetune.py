@@ -253,10 +253,16 @@ def load_pairs(ds: dict, work: str) -> list[dict]:
 
     # S3 / upload metadata — keep only the per-row ref + text; download on access.
     rows = _read_metadata_rows(ds)
+    # Rows manually un-ticked in the row browser (excluded from training). Indices
+    # are positions in this metadata file — the same order the preview shows.
+    excluded = {int(x) for x in (ds.get("excluded_rows") or [])}
     log(f"[data] {len(rows)} metadata rows from s3://{ds['bucket']}/{ds['metadata_key']} "
-        f"(audio fetched lazily per item)")
+        f"(audio fetched lazily per item)"
+        + (f"; {len(excluded)} manually excluded" if excluded else ""))
     out = []
-    for r in rows:
+    for i, r in enumerate(rows):
+        if i in excluded:
+            continue
         ref = r.get(audio_field)
         text = r.get(text_field)
         if not ref or text is None:

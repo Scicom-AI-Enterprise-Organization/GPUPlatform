@@ -80,6 +80,15 @@ class UpdateDatasetRequest(BaseModel):
     split_fields: Optional[dict[str, str]] = None
 
 
+class RowInclusionRequest(BaseModel):
+    """Tick / un-tick rows in the row browser. included=False excludes the given
+    metadata-file row indices from training; included=True re-includes them.
+    clear=True re-includes ALL rows (ignores indices)."""
+    indices: list[int] = []
+    included: bool = True
+    clear: bool = False
+
+
 class SyncRequest(BaseModel):
     hf_repo: str
     private: bool = True
@@ -171,6 +180,7 @@ class PreviewResponse(BaseModel):
     total: Optional[int] = None  # full row count when known (for pagination)
     split: Optional[str] = None  # which HF split these rows came from
     splits: Optional[list[str]] = None  # available HF splits (for a picker)
+    excluded_count: int = 0  # rows manually un-ticked (excluded from training)
     error: Optional[str] = None
 
 
@@ -1065,6 +1075,11 @@ async def preview_dataset(
         # Metadata tables are small (text + URLs) → parse all to get the true row
         # count, then slice the requested page.
         all_rows = dataset_metadata.parse_rows(mdname, text.encode("utf-8"), 10**9)
+        excluded = {int(x) for x in (d.excluded_rows or [])}
+        # Pair each row with its stable GLOBAL index (file order) before any split
+        # filtering — that's the identity the trainers use (they read the same
+        # file in the same order), so an un-ticked row maps 1:1 to a skipped row.
+        indexed = list(enumerate(all_rows))
         # A `split` column (from a split-preserving transform) → expose the splits
         # and page within the chosen one, mirroring the HF split picker.
         used_split: Optional[str] = None
@@ -1073,9 +1088,9 @@ async def preview_dataset(
             splits_list = sorted({str(r["split"]) for r in all_rows if r.get("split")})
             used_split = split if (split and split in splits_list) else (splits_list[0] if splits_list else None)
             if used_split is not None:
-                all_rows = [r for r in all_rows if str(r.get("split")) == used_split]
-        total = len(all_rows)
-        page = all_rows[offset:offset + limit]
+                indexed = [(gi, r) for gi, r in indexed if str(r.get("split")) == used_split]
+        total = len(indexed)
+        page = indexed[offset:offset + limit]
         rows = [
             {
                 # Proxy the presigned URL through the gateway (avoids S3 CORS in
@@ -1084,16 +1099,43 @@ async def preview_dataset(
                     dataset_id, _audio_str(_resolve_audio_url(target, base, d.audio_prefix, r.get(af)))
                 ),
                 "transcription": r.get(tf),
+                "row_index": gi,
+                "included": gi not in excluded,
                 **r,
             }
-            for r in page
+            for gi, r in page
         ]
-        return _resp(rows=rows, total=total, split=used_split, splits=splits_list)
+        return _resp(rows=rows, total=total, split=used_split, splits=splits_list,
+                     excluded_count=len(excluded))
     except dataset_metadata.DatasetParseError as e:
         return _resp(rows=[], error=str(e))
     except Exception as e:  # noqa: BLE001 — surface as an inline error, not a 500
         logger.warning("preview failed for %s: %s", dataset_id, e)
         return _resp(rows=[], error=str(e))
+
+
+@router.post("/{dataset_id}/row-inclusion")
+async def set_row_inclusion(
+    dataset_id: str,
+    req: RowInclusionRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Manually curate which rows train. Stores the excluded metadata-row indices
+    on the dataset (default: none → all rows train); the S3/upload trainers skip
+    these. Returns the new excluded count."""
+    d = await _require_dataset(session, dataset_id, user)
+    cur = {int(x) for x in (d.excluded_rows or [])}
+    if req.clear:
+        cur = set()
+    else:
+        idx = {int(i) for i in req.indices if int(i) >= 0}
+        cur = (cur - idx) if req.included else (cur | idx)
+    d.excluded_rows = sorted(cur) or None
+    await session.commit()
+    await audit_module.record(user, "dataset.row-inclusion", "dataset", d.id, d.name,
+                              details={"excluded_count": len(cur)})
+    return {"excluded_count": len(cur)}
 
 
 @router.get("/{dataset_id}/packed-row")

@@ -653,6 +653,8 @@ export type DatasetUploadResult = {
 export type DatasetPreviewRow = {
   audio_url?: string | null;
   transcription?: unknown;
+  row_index?: number; // stable metadata-file index (for include/exclude)
+  included?: boolean; // false → manually excluded from training
   [k: string]: unknown;
 };
 
@@ -665,6 +667,7 @@ export type DatasetPreview = {
   total?: number | null;
   split?: string | null; // which HF split these rows came from
   splits?: string[] | null; // available HF splits (for a picker)
+  excluded_count?: number; // rows manually un-ticked (excluded from training)
   error?: string | null;
 };
 

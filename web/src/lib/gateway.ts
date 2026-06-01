@@ -435,6 +435,15 @@ export const gateway = {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
+  // Include/exclude rows from training (manual curation in the row browser).
+  setRowInclusion: (
+    id: string,
+    body: { indices?: number[]; included?: boolean; clear?: boolean },
+  ) =>
+    request<{ excluded_count: number }>(
+      `/v1/datasets/${encodeURIComponent(id)}/row-inclusion`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   deleteDataset: (id: string) =>
     request<{ ok: boolean; id: string }>(
       `/v1/datasets/${encodeURIComponent(id)}`,
