@@ -75,7 +75,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const [renameDraft, setRenameDraft] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
-  const [view, setView] = useState<"rows" | "grid">("rows");
+  const [view, setView] = useState<"rows" | "grid">("grid");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
   useEffect(() => {

@@ -86,6 +86,7 @@ DEPS = [
     "neucodec", "pandas", "pyarrow", "multiprocess", "liger-kernel",
     "git+https://github.com/apple/ml-cross-entropy",
     "peft>=0.11",  # LoRA (all-linear adapters, merged into base at save)
+    "kernels",  # HF kernel-hub loader for the flash-attn-3 attn impl (fresh venvs)
 ]
 
 
@@ -261,6 +262,7 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
                 rows.append({
                     "filename_audio": rel, "text": str(r.get(tf, "")),
                     "speaker": str(r.get(speaker_field) or default_speaker),
+                    "split": split_name,  # preserve the source split → packed per split
                 })
                 sources.append({"key": rel, "src": rel})  # local (HF array → wav)
                 idx += 1
@@ -297,7 +299,8 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
             except Exception as e:  # noqa: BLE001
                 log(f"[data] skip label task {tid}: {e}")
                 continue
-            rows.append({"filename_audio": rel, "text": str(txt), "speaker": str(default_speaker)})
+            rows.append({"filename_audio": rel, "text": str(txt), "speaker": str(default_speaker),
+                         "split": str(r.get("split") or "train")})
             sources.append({"key": rel, "src": rel})  # local (downloaded above)
     else:
         cli = _s3_client(ds)
@@ -333,6 +336,7 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
             rows.append({
                 "filename_audio": rel, "text": str(txt),
                 "speaker": str(r.get(speaker_field) or default_speaker),
+                "split": str(r.get("split") or "train"),  # preserve source split
             })
             sources.append({"key": rel, "src": src})
         log(f"[data] s3 sources: {streamed} streamed from URLs, {downloaded} pre-downloaded")
@@ -349,6 +353,21 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
             f.write(json.dumps(r) + "\n")
     log(f"[data] {len(rows)} rows resolved ({len(sources)} audio sources)")
     return sources_path, meta
+
+
+def _splits_in(meta_jsonl: str) -> list[str]:
+    """Distinct splits in meta.jsonl, first-seen order (e.g. train then test).
+    Falls back to ['train'] when rows carry no split."""
+    seen: list[str] = []
+    with open(meta_jsonl) as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            sp = json.loads(ln).get("split") or "train"
+            if sp not in seen:
+                seen.append(sp)
+    return seen or ["train"]
 
 
 # --------------------------------------------------------------------------
@@ -400,28 +419,39 @@ def run(cfg: dict) -> None:
         # download (comm) with GPU encode (comp); no bulk download to disk.
         step([sys.executable, "-u", os.path.join(TTS_DIR, "convert_neucodec.py"),
               "--file", sources], cwd=work)
-        # 2. pack into a ChiniDataset (Parquet streaming)
+        # 2. pack into ONE split-aware ChiniDataset: each SOURCE SPLIT becomes a
+        # `packed/<split>/` subdir (its own index.json + shards) so train/test
+        # never mix, but the whole `packed/` prefix is ONE dataset (the trainer
+        # reads StreamingDataset(local, split=...); the UI shows a split picker).
+        if cfg.get("pack_only"):
+            art = cfg.get("artifacts") or {}
+            splits = _splits_in(meta)
+            sys.path.insert(0, TTS_DIR)
+            from chinidataset import StreamingDataset
+            per_split = {}
+            for sp in splits:
+                outdir = os.path.join(packed, sp)
+                step([sys.executable, "-u", os.path.join(TTS_DIR, "pack_stage1.py"),
+                      "--dataset", meta, "--split", sp, "--output_dir", outdir,
+                      "--tokenizer", tokenizer, "--sequence_length", str(seq_len)], cwd=work)
+                try:
+                    per_split[sp] = len(StreamingDataset(local=outdir))
+                except Exception as e:  # noqa: BLE001
+                    log(f"[pack] could not count packed records for split {sp}: {e}")
+                    per_split[sp] = None
+                log(f"[pack] split={sp}: {per_split[sp]} records")
+            s3_uri = None
+            if art.get("bucket"):
+                # Upload the whole packed/ tree once → one prefix with train/+test/.
+                s3_uri = _upload_s3_dir(art, packed, art["prefix"].rstrip("/") + "/packed")
+            total = sum(v for v in per_split.values() if isinstance(v, int))
+            log(f"[pack] uploaded split-aware dataset → {s3_uri} · {per_split}")
+            emit("PACKED", {"s3_uri": s3_uri, "samples": total, "splits": per_split,
+                            "sequence_length": seq_len, "tokenizer": tokenizer})
+            return
         step([sys.executable, "-u", os.path.join(TTS_DIR, "pack_stage1.py"),
               "--dataset", meta, "--output_dir", packed,
               "--tokenizer", tokenizer, "--sequence_length", str(seq_len)], cwd=work)
-
-    # Pack-only (dataset transform): upload the packed ChiniDataset shards to S3
-    # and stop — no training. The gateway turns @@PACKED into a new packed dataset.
-    if cfg.get("pack_only"):
-        art = cfg.get("artifacts") or {}
-        s3_uri = samples = None
-        if art.get("bucket"):
-            s3_uri = _upload_s3_dir(art, packed, art["prefix"].rstrip("/") + "/packed")
-            try:
-                sys.path.insert(0, TTS_DIR)
-                from chinidataset import StreamingDataset
-                samples = len(StreamingDataset(local=packed))
-            except Exception as e:  # noqa: BLE001
-                log(f"[pack] could not count packed records: {e}")
-            log(f"[pack] uploaded packed dataset → {s3_uri} ({samples} records)")
-        emit("PACKED", {"s3_uri": s3_uri, "samples": samples,
-                        "sequence_length": seq_len, "tokenizer": tokenizer})
-        return
 
     # 3. finetune via torchrun
     log(f"[train] precision: load={load_dt} amp={amp or 'none'}")

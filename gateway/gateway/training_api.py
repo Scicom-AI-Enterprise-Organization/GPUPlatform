@@ -605,27 +605,32 @@ async def _finalize(run_id: str, status: str, exit_code: Optional[int],
 
 async def _finish_tts_pack(run_id: str, cfg: dict, packed: dict) -> str:
     """Create the packed (NeuCodec + multipack) dataset row from a finished
-    pack-only run; returns the new dataset id. kind='tts_packed', s3_metadata_uri
-    points at the ChiniDataset shards prefix the TTS trainer streams from."""
+    pack-only run — ONE split-aware tts_packed dataset whose s3_metadata_uri
+    prefix holds train/ + test/ subdirs. `_tts_pack.splits` records the per-split
+    record counts so the UI shows a split picker and the trainer can hold out
+    the test split. Returns the new dataset id."""
     src_id = cfg.get("pack_source_dataset_id")
     new_id = "ds-" + os.urandom(4).hex()
+    splits = packed.get("splits") or {}  # {split: record_count}
     async with session_factory()() as s:
         src = await s.get(Dataset, src_id) if src_id else None
         run = await s.get(TrainingRun, run_id)
-        name = (f"{src.name}-tts-packed" if src else f"{run_id}-packed")[:255]
+        base = (src.name if src else (run_id if run else src_id)) or run_id
         ds = Dataset(
             id=new_id,
             owner_id=(src.owner_id if src else run.owner_id),
-            name=name,
+            name=(f"{base}-tts-packed")[:255],
             description=(f"NeuCodec + multipack (seq_len {packed.get('sequence_length')}, "
-                         f"tokenizer {packed.get('tokenizer')}) of {src.name if src else src_id}")[:2048],
+                         f"tokenizer {packed.get('tokenizer')}, splits {list(splits) or ['(flat)']}) "
+                         f"of {base}")[:2048],
             kind="tts_packed",
             storage_id=(run.storage_id if run else (src.storage_id if src else None)),
-            s3_metadata_uri=packed["s3_uri"],
+            s3_metadata_uri=packed.get("s3_uri"),
             num_rows=packed.get("samples"),
             audio_field="audio", transcription_field="text",
             split_fields={"_tts_pack": {"tokenizer": packed.get("tokenizer"),
-                                        "sequence_length": packed.get("sequence_length")}},
+                                        "sequence_length": packed.get("sequence_length"),
+                                        "splits": splits}},
         )
         s.add(ds)
         await s.commit()
@@ -1122,7 +1127,7 @@ async def run_training(redis, run_id: str) -> None:
                 new_ds_id = await _finish_tts_pack(run_id, cfg, packed)
                 await _set_dataset_transform(
                     src_id, "done",
-                    f"packed → {packed['s3_uri']} ({packed.get('samples')} records); "
+                    f"packed → {packed['s3_uri']} (splits {packed.get('splits') or {}}); "
                     f"created dataset {new_ds_id}")
             except Exception as e:  # noqa: BLE001
                 await _set_dataset_transform(src_id, "failed", f"pack ok but dataset create failed: {e}")

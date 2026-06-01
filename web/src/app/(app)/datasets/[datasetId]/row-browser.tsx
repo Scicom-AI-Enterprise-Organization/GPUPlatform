@@ -153,10 +153,12 @@ function PackedRowItem({
   datasetId,
   index,
   row,
+  split,
 }: {
   datasetId: string;
   index: number;
   row: DatasetPreviewRow;
+  split?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const [data, setData] = useState<PackedDecode | null>(null);
@@ -173,7 +175,8 @@ function PackedRowItem({
       setErr(null);
       try {
         const r = await fetch(
-          `/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/packed-row?index=${index}`,
+          `/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/packed-row?index=${index}` +
+            (split ? `&split=${encodeURIComponent(split)}` : ""),
           { cache: "no-store" },
         );
         const j = await r.json();
@@ -445,7 +448,7 @@ export function RowBrowser({
             )}
             {rows.map((r, i) =>
               r.packed === true ? (
-                <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} />
+                <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} split={split} />
               ) : (
                 <RowItem key={offset + i} index={offset + i} row={r} onToggle={setIncluded} speakerField={speakerField} />
               ),

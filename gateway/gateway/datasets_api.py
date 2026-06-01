@@ -1012,11 +1012,16 @@ def _decode_packed_record(repo_id: str, hf_token: Optional[str], rec: dict) -> d
     }
 
 
-async def _packed_records_cached(dataset_id: str, target: "S3Target", s3_uri: str) -> list[dict]:
-    recs = _PACKED_CACHE.get(dataset_id)
+async def _packed_records_cached(
+    dataset_id: str, target: "S3Target", s3_uri: str, split: Optional[str] = None,
+) -> list[dict]:
+    # Split-aware packed datasets keep shards under <prefix>/<split>/; cache per split.
+    ckey = f"{dataset_id}::{split}" if split else dataset_id
+    recs = _PACKED_CACHE.get(ckey)
     if recs is None:
-        recs = await _run_sync(_read_packed_parquet, target, s3_uri)
-        _PACKED_CACHE[dataset_id] = recs
+        uri = (s3_uri.rstrip("/") + "/" + split) if split else s3_uri
+        recs = await _run_sync(_read_packed_parquet, target, uri)
+        _PACKED_CACHE[ckey] = recs
     return recs
 
 
@@ -1046,21 +1051,26 @@ async def preview_dataset(
         # (GET /{id}/packed-row?index=N).
         if not (d.storage_id and d.s3_metadata_uri):
             return _resp(rows=[], total=d.num_rows or 0, error="packed dataset has no storage / shards")
+        # Split-aware: `_tts_pack.splits` = {split: count}; shards live under
+        # <prefix>/<split>/. Offer a split picker + page within the chosen split.
+        tp = (d.split_fields or {}).get("_tts_pack") or {}
+        pack_splits = list((tp.get("splits") or {}).keys())
+        used_split = (split if (split and split in pack_splits) else (pack_splits[0] if pack_splits else None))
         try:
             storage = await _load_storage(session, d.storage_id)
             target, _base = _s3_target_and_prefix(storage)
-            recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri)
+            recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
         except Exception as e:  # noqa: BLE001
             logger.warning("packed preview failed for %s: %s", dataset_id, e)
             return _resp(rows=[], total=d.num_rows or 0, error=f"could not read packed shards: {e}")
         total = len(recs)
         page = recs[offset:offset + limit]
         rows = [
-            {"packed": True, "index": offset + i,
+            {"packed": True, "index": offset + i, "split": used_split,
              "tokens": len(r["input_ids"]), "utterances": len(r["attention_mask"])}
             for i, r in enumerate(page)
         ]
-        return _resp(rows=rows, total=total)
+        return _resp(rows=rows, total=total, split=used_split, splits=(pack_splits or None))
 
     try:
         if d.kind == "label":
@@ -1215,7 +1225,8 @@ async def set_row_inclusion(
 @router.get("/{dataset_id}/packed-row")
 async def packed_row(
     dataset_id: str,
-    index: int = Query(..., ge=0, description="packed record index"),
+    index: int = Query(..., ge=0, description="packed record index (within the split)"),
+    split: Optional[str] = Query(None, description="which packed split to decode from"),
     user: User = Depends(require_section("datasets")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -1229,7 +1240,9 @@ async def packed_row(
         raise HTTPException(status_code=400, detail="packed dataset has no storage / shards")
     storage = await _load_storage(session, d.storage_id)
     target, _base = _s3_target_and_prefix(storage)
-    recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri)
+    pack_splits = list((((d.split_fields or {}).get("_tts_pack") or {}).get("splits") or {}).keys())
+    used_split = (split if (split and split in pack_splits) else (pack_splits[0] if pack_splits else None))
+    recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
     if index >= len(recs):
         raise HTTPException(status_code=404, detail=f"index {index} out of range (have {len(recs)})")
 

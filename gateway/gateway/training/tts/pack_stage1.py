@@ -151,14 +151,21 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
     print(f'[pack_stage1] loading dataset {args.dataset!r} (split={args.split!r})', flush=True)
-    # AutoTrain orchestrator passes a local json/jsonl metadata file; everything
-    # else is treated as a HF dataset id / loadable path.
+    # AutoTrain orchestrator passes a local json/jsonl metadata file (a flat list
+    # whose rows carry a per-row `split` field); everything else is a HF dataset id.
     if args.dataset.endswith(('.json', '.jsonl')):
         ds = load_dataset('json', data_files=args.dataset)
+        rows = ds[list(ds.keys())[0]].to_list()
     else:
         ds = load_dataset(args.dataset)
-    split = args.split if args.split in ds else list(ds.keys())[0]
-    rows = ds[split].to_list()
+        split = args.split if args.split in ds else list(ds.keys())[0]
+        rows = ds[split].to_list()
+    # If rows carry a per-row `split` (our meta.jsonl), pack ONLY this split so
+    # train/test never mix into the same ChiniDataset.
+    if rows and any(isinstance(r, dict) and 'split' in r for r in rows):
+        before = len(rows)
+        rows = [r for r in rows if str(r.get('split')) == args.split]
+        print(f'[pack_stage1] split={args.split!r}: {len(rows)}/{before} rows', flush=True)
 
     print(f'[pack_stage1] filtering / pairing tokens for {len(rows)} rows', flush=True)
     processed, missing = filter_rows(rows)

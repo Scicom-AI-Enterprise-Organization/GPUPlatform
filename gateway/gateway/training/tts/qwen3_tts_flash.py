@@ -299,8 +299,8 @@ def main():
     sequence_length = data_args.block_size
 
     class DatasetFixed(torch.utils.data.Dataset):
-        def __init__(self, local):
-            self.dataset = StreamingDataset(local=local)
+        def __init__(self, local, split=None):
+            self.dataset = StreamingDataset(local=local, split=split)
 
         def __getitem__(self, idx):
             data = dict(self.dataset[idx])
@@ -325,11 +325,30 @@ def main():
         def __len__(self):
             return len(self.dataset)
 
-    model = Model.from_pretrained(
-        model_args.model_name_or_path,
-        attn_implementation = 'kernels-community/vllm-flash-attn3',
-        torch_dtype = model_args.torch_dtype,
-    )
+    # This model packs multiple utterances per block and relies on flash-attn
+    # VARLEN attention (the collator passes cu_seq_lens_q/k) to keep them from
+    # attending across pack boundaries. Only flash-attn backends honour that —
+    # sdpa/eager would silently mis-attend across the packed sequence — so we use
+    # the FA3 Hopper hub kernel (H20 is sm_90), fall back only to FA2, and fail
+    # loudly otherwise rather than degrade to a backend that breaks packing.
+    model = None
+    for _ai in ('kernels-community/vllm-flash-attn3', 'flash_attention_2'):
+        try:
+            model = Model.from_pretrained(
+                model_args.model_name_or_path,
+                attn_implementation=_ai,
+                torch_dtype=model_args.torch_dtype,
+            )
+            print(f'[qwen3_tts] attn_implementation={_ai}', flush=True)
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f'[qwen3_tts] attn {_ai!r} unavailable: {e}', flush=True)
+    if model is None:
+        raise RuntimeError(
+            'no flash-attn backend available (need the `kernels` package for FA3, or '
+            '`flash_attn` for FA2). This model packs utterances and requires flash-attn '
+            'varlen attention — sdpa/eager would mis-attend across pack boundaries.'
+        )
     model.resize_token_embeddings(len(tokenizer), mean_resizing=False, pad_to_multiple_of=8)
     print(model)
 
@@ -359,8 +378,24 @@ def main():
             model.enable_input_require_grads()
         model.print_trainable_parameters()
 
-    dataset = DatasetFixed(data_args.train_file)
-    print('dataset', len(dataset), dataset[0]['attention_mask'].shape)
+    # Split-aware packed dataset keeps train/ + test/ subdirs (StreamingDataset
+    # reads local/<split>/); a flat packed dir (legacy / single split) has shards
+    # at the root. Train on `train`, evaluate on `test` when present.
+    _tf = data_args.train_file
+    _has_train = os.path.isdir(os.path.join(_tf, 'train'))
+    _has_test = os.path.isdir(os.path.join(_tf, 'test'))
+    dataset = DatasetFixed(_tf, split='train' if _has_train else None)
+    eval_dataset = DatasetFixed(_tf, split='test') if _has_test else None
+    print('dataset', len(dataset), dataset[0]['attention_mask'].shape,
+          '| eval', (len(eval_dataset) if eval_dataset is not None else 0))
+    if eval_dataset is not None:
+        # Turn on per-epoch eval loss on the held-out test split (overrides the
+        # --do_eval false the orchestrator passes for flat datasets).
+        training_args.do_eval = True
+        try:
+            training_args.eval_strategy = 'epoch'
+        except Exception:
+            training_args.evaluation_strategy = 'epoch'
 
     def collator(batch):
         batch = [b for b in batch if b is not None]
@@ -391,7 +426,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=dataset,
-        eval_dataset=None,
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=collator,
         compute_metrics=None,

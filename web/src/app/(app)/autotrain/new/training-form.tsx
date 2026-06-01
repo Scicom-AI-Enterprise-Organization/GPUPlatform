@@ -77,6 +77,15 @@ const DEFAULT_TTS_BASE = "Scicom-intl/Multilingual-TTS-1.7B-Base";
 const CUSTOM = "__custom__";
 const AUTO_SPLIT = "__auto__";
 
+// A split-aware tts_packed dataset stores its splits at `split_fields._tts_pack.splits`
+// (e.g. {train, test}); such a dataset can serve as its OWN test set (the trainer
+// evaluates on its `test` subdir), so we let it be picked as the test dataset.
+function packTestSplit(d?: { split_fields?: unknown } | null): boolean {
+  const sp = (d?.split_fields as Record<string, unknown> | null | undefined)?.["_tts_pack"];
+  const splits = (sp as Record<string, unknown> | null | undefined)?.["splits"];
+  return !!splits && typeof splits === "object" && "test" in (splits as object);
+}
+
 const GPU_COUNT_CHOICES = [1, 2, 4, 8] as const;
 
 // Training-audio augmentation techniques (mirror whisper_finetune._AUG_FUNCS).
@@ -725,18 +734,22 @@ export function TrainingForm() {
           </FieldWrap>
           <FieldWrap label="Test dataset"
             hint={isTts
-              ? "Auto-split a fraction of the packed records for eval loss, or pick another packed dataset."
+              ? "Use this dataset's own test split (if it was packed with one), pick another packed dataset, or auto-split a hold-out for eval loss."
               : "Held out for per-epoch WER/CER. Auto-split if none."}>
             <Select value={testDatasetId} onValueChange={setTestDatasetId}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value={AUTO_SPLIT}>— Auto-split from training set —</SelectItem>
-                {pickDatasets.filter((d) => !isTts || d.id !== datasetId).map((d) => (
-                  <SelectItem key={d.id} value={d.id}>
-                    {d.name}{d.num_rows != null ? ` · ${d.num_rows} rows` : ""} · {d.kind}
-                    {!isTts && d.id === datasetId ? " — its own test split" : ""}
-                  </SelectItem>
-                ))}
+                {/* TTS: a split-aware packed dataset can be its own test set (its
+                    `test` subdir); other packed datasets are also selectable. */}
+                {pickDatasets
+                  .filter((d) => !isTts || d.id !== datasetId || packTestSplit(d))
+                  .map((d) => (
+                    <SelectItem key={d.id} value={d.id}>
+                      {d.name}{d.num_rows != null ? ` · ${d.num_rows} rows` : ""} · {d.kind}
+                      {d.id === datasetId ? " — its own test split" : ""}
+                    </SelectItem>
+                  ))}
               </SelectContent>
             </Select>
             {testDatasetId === AUTO_SPLIT && (
@@ -749,12 +762,19 @@ export function TrainingForm() {
                 </span>
               </div>
             )}
-            {!isTts && testDatasetId === datasetId && datasetId !== "" && (
+            {testDatasetId === datasetId && datasetId !== "" && (
               <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
-                Same as training — evaluation uses this dataset&apos;s{" "}
-                <span className="font-mono">test</span>/<span className="font-mono">validation</span>{" "}
-                rows (its <span className="font-mono">split</span> column). Falls back to a seeded
-                hold-out if it has none.
+                {isTts ? (
+                  <>Same as training — evaluation uses this packed dataset&apos;s held-out{" "}
+                    <span className="font-mono">test</span> split (its{" "}
+                    <span className="font-mono">test/</span> shards), kept separate from{" "}
+                    <span className="font-mono">train</span>.</>
+                ) : (
+                  <>Same as training — evaluation uses this dataset&apos;s{" "}
+                    <span className="font-mono">test</span>/<span className="font-mono">validation</span>{" "}
+                    rows (its <span className="font-mono">split</span> column). Falls back to a seeded
+                    hold-out if it has none.</>
+                )}
               </p>
             )}
           </FieldWrap>
