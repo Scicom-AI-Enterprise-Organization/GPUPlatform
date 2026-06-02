@@ -196,10 +196,10 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   // A pack-only run (NeuCodec encode + multipack, no training) has no loss curve
   // or per-epoch eval — hide those empty panels for it.
   const packOnly = run.config_json?.pack_only === true;
-  // Try-it playground: finished ASR run on a VM (inference runs on that VM).
+  // Try-it playground: a finished run on a VM (inference runs on that VM) — ASR
+  // transcribes an uploaded clip; TTS synthesizes speech from text.
   const canTryIt =
     run.status === "done" &&
-    (run.task_type ?? "asr") === "asr" &&
     run.provider_kind === "vm" &&
     !!run.result_json?.artifact?.s3_uri;
   const metricLabel = run.task_type === "tts"
@@ -576,7 +576,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
 
         {canTryIt && (
           <TabsContent value="tryit" className="!flex-none">
-            <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
+            {(run.task_type ?? "asr") === "tts"
+              ? <TtsPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
+              : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />}
           </TabsContent>
         )}
       </Tabs>
@@ -914,6 +916,16 @@ function LossCurve({ steps, epochs, live, sweep, trials }: { steps: TrainingStep
   );
 }
 
+// Explicit, de-duplicated x-axis ticks. recharts' auto-tick generator (esp. with
+// allowDecimals=false) can emit duplicate ticks when points sit at ~the same value
+// (a degenerate domain — common with step-based eval, where all points share a near
+// epoch), tripping React's "two children with the same key" warning. Cap at ~8.
+function uniqTicks(values: number[]): number[] {
+  const xs = [...new Set(values)].sort((a, b) => a - b);
+  if (xs.length <= 8) return xs;
+  return [...new Set(Array.from({ length: 8 }, (_, i) => xs[Math.round((i * (xs.length - 1)) / 7)]))];
+}
+
 // One per-trial metric chart (WER or CER): a line per trial, legended by params.
 function PerTrialEvalChart({ epochs, metric, idxs, trials }: {
   epochs: TrainingEpoch[]; metric: "wer" | "cer"; idxs: number[]; trials: TrainingTrial[];
@@ -936,6 +948,7 @@ function PerTrialEvalChart({ epochs, metric, idxs, trials }: {
           <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
             <XAxis dataKey="epoch" type="number" domain={["dataMin", "dataMax"]} allowDecimals={false}
+              ticks={uniqTicks(data.map((d) => d.epoch))}
               tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
               label={{ value: "epoch", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
             <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
@@ -1000,6 +1013,7 @@ function EvalCurve({ epochs, sweep, trials }: { epochs: TrainingEpoch[]; sweep: 
             <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
               <XAxis dataKey="epoch" type="number" domain={["dataMin", "dataMax"]} allowDecimals={false}
+                ticks={uniqTicks(data.map((d) => d.epoch))}
                 tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
                 label={{ value: "epoch", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
               <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
@@ -1027,7 +1041,7 @@ function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevice
   const [file, setFile] = useState<File | null>(null);
   const [gpu, setGpu] = useState<string>(gpuIds[0] ?? "auto");
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ text: string; device?: string } | null>(null);
+  const [result, setResult] = useState<{ text: string; device?: string; logs?: string[] } | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   async function onTranscribe() {
@@ -1053,6 +1067,7 @@ function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevice
           audio clip (≤ 25 MB), and transcribe. The first request downloads the model onto the VM, so it
           can take a little longer.
         </p>
+        <PersistentControls runId={runId} gpu={gpu} />
         <div className="flex flex-wrap items-end gap-3">
           <div className="space-y-1.5">
             <label className="block text-xs font-medium">Audio clip</label>
@@ -1092,6 +1107,201 @@ function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevice
             </div>
           </div>
         )}
+        {result && <TryItLogs lines={result.logs ?? []} />}
+      </CardContent>
+    </Card>
+  );
+}
+
+// Collapsible VM-side log block for the playground (model download / inference).
+function TryItLogs({ lines }: { lines: string[] }) {
+  if (!lines || lines.length === 0) return null;
+  return (
+    <details className="rounded-md border border-border">
+      <summary className="cursor-pointer select-none px-3 py-1.5 text-xs text-muted-foreground">
+        Logs ({lines.length} lines)
+      </summary>
+      <div className="terminal-block max-h-64 overflow-y-auto border-t border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200">
+        {lines.map((l, i) => (
+          <div key={i} className={
+            l.includes("[tryit]") ? "text-emerald-300"
+              : l.startsWith("@@") ? "text-sky-300"
+              : "text-zinc-300"
+          }>{l}</div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+// Persistent worker controls — load the model once on the VM (resident on the GPU)
+// so try-it requests skip the per-call model load, with Load / Restart / Unload.
+function PersistentControls({ runId, gpu }: { runId: string; gpu: string }) {
+  const [st, setSt] = useState<{ running: boolean; ready: boolean; device?: string; logs?: string[] } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const poll = useCallback(async () => {
+    try { setSt(await gateway.playgroundStatus(runId)); } catch { /* transient */ }
+  }, [runId]);
+  useEffect(() => { poll(); }, [poll]);
+  // While loading, poll until ready (the model load takes ~10-15s).
+  useEffect(() => {
+    if (!st?.running || st.ready) return;
+    const t = setInterval(poll, 3000);
+    return () => clearInterval(t);
+  }, [st, poll]);
+
+  async function act(fn: () => Promise<unknown>) {
+    setBusy(true); setErr(null);
+    try { await fn(); await poll(); }
+    catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  }
+  const label = !st?.running ? "not loaded" : st.ready ? `ready${st.device ? ` · ${st.device}` : ""}` : "loading…";
+  const dot = !st?.running ? "bg-muted-foreground/50" : st.ready ? "bg-emerald-500" : "bg-amber-500 animate-pulse";
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+      <span className="font-medium">Persistent model</span>
+      <span className={cn("inline-block h-2 w-2 rounded-full", dot)} />
+      <span className="text-muted-foreground">{label}</span>
+      <span className="hidden text-[11px] text-muted-foreground sm:inline">— keep it resident so requests skip the load</span>
+      <div className="ml-auto flex items-center gap-2">
+        {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+        {!st?.running ? (
+          <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
+            onClick={() => act(() => gateway.playgroundStart(runId, gpu))}>Load model</Button>
+        ) : (
+          <>
+            <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
+              onClick={() => act(async () => { await gateway.playgroundStop(runId); await gateway.playgroundStart(runId, gpu); })}>Restart</Button>
+            <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
+              onClick={() => act(() => gateway.playgroundStop(runId))}>Unload</Button>
+          </>
+        )}
+      </div>
+      {err && <span className="w-full text-destructive">{err}</span>}
+      {st?.running && (st.logs?.length ?? 0) > 0 && (
+        <div className="terminal-block max-h-32 w-full overflow-y-auto rounded-md border border-border bg-zinc-950 p-2 font-mono text-[10px] leading-snug text-zinc-300">
+          {st.logs!.map((l, i) => (
+            <div key={i} className={l.includes("[server]") ? "text-emerald-300" : "text-zinc-400"}>{l}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Try-it playground (TTS) — type text, pick a GPU the run used (or CPU), and
+// synthesize speech with the finetuned model on the run's VM (over SSH), then play it.
+function TtsPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevices: string | null }) {
+  const gpuIds = (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const [text, setText] = useState("");
+  const [speaker, setSpeaker] = useState("");
+  const [gpu, setGpu] = useState<string>(gpuIds[0] ?? "auto");
+  const [busy, setBusy] = useState(false);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [device, setDevice] = useState<string | undefined>();
+  const [logs, setLogs] = useState<string[]>([]);
+  const [prompt, setPrompt] = useState<string | null>(null);
+  const [genText, setGenText] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function onSynthesize() {
+    if (!text.trim()) return;
+    setBusy(true);
+    setErr(null);
+    setLogs([]);
+    setPrompt(null);
+    setGenText(null);
+    if (audioUrl) { URL.revokeObjectURL(audioUrl); setAudioUrl(null); }
+    try {
+      const r = await gateway.synthesizeTrainingRun(runId, text.trim(), {
+        speaker: speaker.trim() || undefined, gpu,
+      });
+      setAudioUrl(r.url);
+      setDevice(r.device);
+      setLogs(r.logs ?? []);
+      setPrompt(r.prompt ?? null);
+      setGenText(r.genText ?? null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — synthesize speech</CardTitle></CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-xs text-muted-foreground">
+          Runs the finetuned TTS model on this run&apos;s VM. Type text, optionally a speaker name (as the
+          data was packed), pick a GPU the run used (or CPU), and synthesize. The first request downloads the
+          model onto the VM, so it can take a little longer.
+        </p>
+        <PersistentControls runId={runId} gpu={gpu} />
+        <div className="space-y-1.5">
+          <label className="block text-xs font-medium">Text</label>
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={3}
+            placeholder="Type something to speak…"
+            className="block w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          />
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1.5">
+            <label className="block text-xs font-medium">Speaker (optional)</label>
+            <input
+              value={speaker}
+              onChange={(e) => setSpeaker(e.target.value)}
+              placeholder="(default)"
+              className="h-9 rounded-md border border-border bg-background px-2 text-sm"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="block text-xs font-medium">Run on</label>
+            <select
+              value={gpu}
+              onChange={(e) => setGpu(e.target.value)}
+              className="h-9 rounded-md border border-border bg-background px-2 text-sm"
+            >
+              {gpuIds.map((g) => <option key={g} value={g}>GPU {g}</option>)}
+              <option value="auto">Auto (most-free GPU)</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </div>
+          <Button type="button" onClick={onSynthesize} disabled={busy || !text.trim()}>
+            {busy
+              ? <><Loader2 className="h-4 w-4 animate-spin" /> Synthesizing…</>
+              : <><AudioLines className="h-4 w-4" /> Synthesize</>}
+          </Button>
+        </div>
+        {err && <p className="text-sm text-destructive">{err}</p>}
+        {audioUrl && (
+          <div className="space-y-1.5">
+            <div className="text-xs text-muted-foreground">Generated audio{device ? ` · ran on ${device}` : ""}</div>
+            {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+            <audio controls src={audioUrl} className="w-full" />
+          </div>
+        )}
+        {prompt && (
+          <div className="space-y-1">
+            <div className="text-xs font-medium text-muted-foreground">Prompt (fed to the model)</div>
+            <pre className="max-h-24 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border bg-muted/30 p-2 font-mono text-[11px]">{prompt}</pre>
+          </div>
+        )}
+        {genText && (
+          <details className="rounded-md border border-border">
+            <summary className="cursor-pointer select-none px-3 py-1.5 text-xs text-muted-foreground">
+              Generated tokens (before NeuCodec)
+            </summary>
+            <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all border-t border-border bg-muted/30 p-2 font-mono text-[11px]">{genText}</pre>
+          </details>
+        )}
+        <TryItLogs lines={logs} />
       </CardContent>
     </Card>
   );

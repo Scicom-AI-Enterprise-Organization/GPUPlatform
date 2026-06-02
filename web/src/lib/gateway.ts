@@ -279,11 +279,44 @@ export const gateway = {
     const buf = await file.arrayBuffer();
     const q = new URLSearchParams({ filename: file.name || "audio.wav" });
     if (gpu) q.set("gpu", gpu);
-    return request<{ text: string; device?: string }>(
+    return request<{ text: string; device?: string; logs?: string[] }>(
       `/v1/training-runs/${encodeURIComponent(id)}/transcribe?${q.toString()}`,
       { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: buf },
     );
   },
+  /** Try-it playground (TTS): synthesize speech for `text` with the run's finetuned
+   * model (runs on the run's VM over SSH). Returns a playable object-URL for the WAV. */
+  synthesizeTrainingRun: async (id: string, text: string, opts?: { speaker?: string; gpu?: string }) => {
+    const q = new URLSearchParams({ text });
+    if (opts?.speaker) q.set("speaker", opts.speaker);
+    if (opts?.gpu) q.set("gpu", opts.gpu);
+    const res = await request<{ audio_b64: string; sample_rate: number; device?: string; logs?: string[]; prompt?: string; gen_text?: string }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/synthesize?${q.toString()}`,
+      { method: "POST" },
+    );
+    const bin = atob(res.audio_b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+    return { url, sampleRate: res.sample_rate, device: res.device, logs: res.logs ?? [],
+             prompt: res.prompt, genText: res.gen_text };
+  },
+  /** Persistent try-it worker: load the model once on the VM and keep it resident
+   * (subsequent transcribe/synthesize skip the per-request model load). */
+  playgroundStart: (id: string, gpu?: string) =>
+    request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/playground/start${gpu ? `?gpu=${encodeURIComponent(gpu)}` : ""}`,
+      { method: "POST" },
+    ),
+  playgroundStatus: (id: string) =>
+    request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/playground/status`,
+    ),
+  playgroundStop: (id: string) =>
+    request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/playground/stop`,
+      { method: "POST" },
+    ),
 
   // ---- Experiment-tracker credentials (Secrets page card) ----
   listTrackingCredentials: (kind?: "wandb" | "mlflow") =>

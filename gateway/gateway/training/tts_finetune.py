@@ -392,7 +392,7 @@ def run(cfg: dict) -> None:
     # Per-run work dir under <work_dir>/sgpu-train (mirrors Whisper) so cleanup at
     # the end rm's ONLY this run's dir — never the shared /share root, which holds
     # the venv. Also means each run starts on a fresh dir (no stale checkpoints).
-    _root = os.path.join((cfg.get("work_dir") or "/share").rstrip("/"), "sgpu-train")
+    _root = os.path.join((cfg.get("work_dir") or "/share").rstrip("/"), "checkpoint-tts")
     try:
         os.makedirs(_root, exist_ok=True)
         work = tempfile.mkdtemp(prefix="autotrain-tts-", dir=_root)
@@ -576,6 +576,7 @@ def run(cfg: dict) -> None:
         "--gradient_accumulation_steps", str(grad_accum),
         "--learning_rate", str(lr),
         "--warmup_steps", str(int(cfg.get("warmup_steps", 0))),
+        "--lr_scheduler_type", str(cfg.get("lr_scheduler_type") or "linear"),
         "--block_size", str(block_size),
         "--save_total_limit", "3",
         *cadence_args,

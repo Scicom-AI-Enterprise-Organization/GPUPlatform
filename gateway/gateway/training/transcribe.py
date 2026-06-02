@@ -18,10 +18,15 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 
 def emit(obj: dict) -> None:
     print("@@TEXT " + json.dumps(obj), flush=True)
+
+
+def log(m: str) -> None:
+    print(f"[tryit] {m}", flush=True)
 
 
 def _pick_gpu() -> str | None:
@@ -65,6 +70,7 @@ def _download_model(cfg: dict) -> str:
     )
     dest = cfg.get("model_dir") or "/tmp/sgpu-tryit-model"
     os.makedirs(dest, exist_ok=True)
+    log(f"downloading model from {s3} → {dest} (cached after the first call) …")
     n = 0
     for page in cli.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -112,6 +118,10 @@ def main() -> int:
     use_cuda = want_cuda and torch.cuda.is_available()
     device = "cuda" if use_cuda else "cpu"
     dtype = torch.float16 if use_cuda else torch.float32
+    gpu_name = torch.cuda.get_device_name(0) if use_cuda else None
+    log(f"device: {device}" + (f" ({gpu_name})" if gpu_name else ""))
+    log("loading ASR model …")
+    _t = time.time()
     asr = pipeline(
         "automatic-speech-recognition",
         model=model_dir,
@@ -119,6 +129,7 @@ def main() -> int:
         torch_dtype=dtype,
         chunk_length_s=30,  # transcribe arbitrarily long clips by chunking
     )
+    log(f"loaded ASR model in {time.time() - _t:.1f}s")
     gen_kwargs = {"task": cfg.get("task") or "transcribe"}
     if cfg.get("language"):
         gen_kwargs["language"] = cfg["language"]
@@ -126,9 +137,12 @@ def main() -> int:
     # array — passing a file path makes the pipeline shell out to ffmpeg, which the
     # VM doesn't have. librosa (soundfile/audioread) already handles these clips.
     audio, sr = librosa.load(cfg["audio_path"], sr=16000, mono=True)
+    log(f"transcribing {len(audio) / sr:.1f}s of audio (language={cfg.get('language') or 'auto'}) …")
+    _t = time.time()
     out = asr({"raw": audio, "sampling_rate": sr}, generate_kwargs=gen_kwargs, return_timestamps=False)
-    text = out["text"] if isinstance(out, dict) else str(out)
-    emit({"text": (text or "").strip(), "device": device})
+    text = (out["text"] if isinstance(out, dict) else str(out)) or ""
+    log(f"done in {time.time() - _t:.1f}s → {len(text.split())} words on {device}")
+    emit({"text": text.strip(), "device": device})
     return 0
 
 

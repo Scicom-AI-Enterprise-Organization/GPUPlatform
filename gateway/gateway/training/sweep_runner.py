@@ -32,6 +32,12 @@ import threading
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKERS = {"asr": "whisper_finetune.py", "tts": "tts_finetune.py"}
+# Tasks whose worker is an ORCHESTRATOR — it launches its own torch.distributed.run
+# (TTS: tts_finetune spawns torchrun for qwen3). Such a worker must be run DIRECTLY
+# (never under an outer torchrun, which would nest launchers); it reads the GPU
+# slice from CUDA_VISIBLE_DEVICES and picks its own nproc. ASR's worker IS the
+# trainer, so it's run as N ranks under torchrun for a multi-GPU trial.
+ORCHESTRATOR_TASKS = {"tts"}
 
 
 def log(m: str) -> None:
@@ -133,12 +139,16 @@ def run(cfg: dict) -> None:
                 # trials run plain `python`. Per-trial master_port avoids clashes
                 # between concurrent trials.
                 slice_n = len(gpu_slice) if gpu_slice else 1
-                if slice_n > 1 and (tcfg.get("use_ddp", True)):
+                if slice_n > 1 and tcfg.get("use_ddp", True) and task not in ORCHESTRATOR_TASKS:
+                    # ASR multi-GPU trial: run the trainer as N ranks under torchrun
+                    # (per-trial master_port avoids clashes between concurrent trials).
                     port = 29500 + (i % 4000)
                     cmd = [sys.executable, "-m", "torch.distributed.run",
                            f"--nproc_per_node={slice_n}", f"--master_port={port}",
                            worker, "--config", tpath]
                 else:
+                    # Single-GPU trial, OR an orchestrator worker (TTS) that launches
+                    # its own torchrun from the pinned CUDA_VISIBLE_DEVICES slice.
                     cmd = [sys.executable, "-u", worker, "--config", tpath]
                 proc = subprocess.Popen(
                     cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

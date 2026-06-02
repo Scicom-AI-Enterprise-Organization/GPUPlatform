@@ -419,18 +419,20 @@ async def lifespan(app: FastAPI):
                 "Check RunPod dashboard for any pod still billing.", orphaned,
             )
         logger.info("compute enabled")
-    # Autotrain: mark any training runs left 'running'/'queued' by a previous
-    # gateway process as failed (their pods, if any, dangle on RunPod). Runs even
-    # without the env bucket since runs can target a per-storage S3 backend.
+    # Autotrain: reconcile training runs left 'running'/'queued' by a previous
+    # gateway process. Trainers run detached on the VM/pod, so a restart no longer
+    # kills them — cleanup SSH-checks each (alive → kept running; exited → finalized
+    # from its log; unreachable → failed), and the janitor finalizes survivors when
+    # they later exit. Runs without the env bucket (runs can target per-storage S3).
     try:
         t_orphaned = await training_module.cleanup_orphaned_running(app.state.redis)
         if t_orphaned:
-            logger.warning(
-                "autotrain: marked %d previously-running training run(s) as failed "
-                "(gateway restart). Check RunPod for any pods left billing.", t_orphaned,
-            )
+            logger.warning("autotrain: finalized %d orphaned training run(s) after gateway restart", t_orphaned)
+        app.state.training_janitor_task = asyncio.create_task(
+            training_module.training_janitor_loop(app.state.redis)
+        )
     except Exception:
-        logger.exception("autotrain: orphan cleanup failed")
+        logger.exception("autotrain: orphan reconcile failed")
     if os.environ.get("AUTOSCALER", "0") == "1":
         from .provider import build_provider
         from .autoscaler import autoscaler_loop

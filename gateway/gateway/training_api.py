@@ -1059,14 +1059,51 @@ async def run_training(redis, run_id: str) -> None:
                 n_gpus = (len([x for x in visible_devices.split(",") if x.strip()])
                           if visible_devices else int(gpu_count or 1))
                 if cfg.get("use_ddp", True) and n_gpus > 1 and task_type == "asr":
-                    port = 29500 + (sum(ord(c) for c in run_id) % 2000)
-                    launch = f"{venv_py} -m torch.distributed.run --nproc_per_node={n_gpus} --master_port={port}"
-                    await _push_log(redis, run_id, f"[gateway] DDP via torch.distributed.run · {n_gpus} GPUs")
+                    # Pick a FREE port on the VM at launch (the old deterministic
+                    # 29500+hash collided with a prior run's TIME_WAIT / concurrent
+                    # runs → EADDRINUSE). MP is set first; the CVD pin stays in the
+                    # `VAR=val python` export position so torchrun still sees the GPUs.
+                    _fp = (venv_py + " -c \"import socket,sys; s=socket.socket(); s.bind(('',0)); "
+                           "sys.stdout.write(str(s.getsockname()[1])); s.close()\"")
+                    env_prefix = (f"MP=$({_fp}); "
+                                  + (f"CUDA_VISIBLE_DEVICES={visible_devices} " if visible_devices else ""))
+                    launch = f"{venv_py} -m torch.distributed.run --nproc_per_node={n_gpus} --master_port=$MP"
+                    await _push_log(redis, run_id, f"[gateway] DDP via torch.distributed.run · {n_gpus} GPUs (free port)")
                 else:
                     launch = f"{venv_py} -u"
             cmd = f"{user_env}{env_prefix}{launch} {remote_script} --config {remote_cfg}"
             await _push_log(redis, run_id, f"[gateway] $ {cmd}")
-            rc = await asyncio.to_thread(_ssh_run_stream, cli, cmd, on_line)
+            # Detach the trainer into its own session with output → a log file, so a
+            # gateway restart / SSH drop can't SIGHUP-kill it. Stream by tailing that
+            # log behind a watcher that stops once the training pid exits; the
+            # trainer's exit code rides back on an `@@RC:` line. cleanup_orphaned_running
+            # + the janitor finalize a surviving run from the same log + pidfile.
+            rlog, rpid, rsh = _remote_run_paths(run_id)
+            # The runscript records ITS OWN pid ($$ — the bash that also writes the
+            # trailing @@RC), so a dead pidfile always implies @@RC is already in the
+            # log. (Recording $! of `setsid` raced: setsid can exit before @@RC, so a
+            # liveness check would see "dead" mid-run and mis-finalize the run.)
+            run_sh = f"#!/bin/bash\necho $$ > {rpid}\n{cmd}\necho \"@@RC:$?\"\n"
+            await asyncio.to_thread(_ssh_put_bytes, cli, run_sh.encode(), rsh)
+            await asyncio.to_thread(
+                _ssh_exec, cli,
+                f"rm -f {rlog} {rpid}; setsid bash {rsh} > {rlog} 2>&1 </dev/null &")
+            await _push_log(redis, run_id, "[gateway] trainer detached (survives gateway restart) — tailing log")
+            _rc_box = {"rc": None}
+
+            def _cap(l: str) -> None:
+                _m = re.match(r"\s*@@RC:(-?\d+)", l)
+                if _m:
+                    _rc_box["rc"] = int(_m.group(1))
+                    return  # internal marker — don't surface in the run log
+                on_line(l)
+
+            _stream = (f"tail -n +1 -F {rlog} & T=$!; "
+                       f'while :; do P=$(cat {rpid} 2>/dev/null); '
+                       f'if [ -n "$P" ] && ! kill -0 "$P" 2>/dev/null; then break; fi; sleep 2; done; '
+                       f"sleep 2; kill $T 2>/dev/null")
+            await asyncio.to_thread(_ssh_run_stream, cli, _stream, _cap)
+            rc = _rc_box["rc"] if _rc_box["rc"] is not None else 1
         finally:
             try:
                 cli.close()
@@ -1110,7 +1147,10 @@ async def run_training(redis, run_id: str) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning("training %s: logs upload failed: %s", run_id, e)
 
-    status = "done" if (rc == 0 and not result.get("error")) else "failed"
+    # @@DONE (best) or @@ARTIFACT means the trainer finished + uploaded → treat as
+    # done even if the exit code wasn't captured (e.g. a tail race on a detached run).
+    _ok = (rc == 0) or (result.get("best") is not None) or bool(result.get("artifact"))
+    status = "done" if (_ok and not result.get("error")) else "failed"
     err = result.get("error") if status == "failed" else None
     if status == "failed" and not err:
         err = f"trainer exited with code {rc}"
@@ -1147,25 +1187,144 @@ async def run_training(redis, run_id: str) -> None:
 # ---------- lifecycle hooks (mirror bench) ------------------------------
 
 
+def _remote_run_paths(run_id: str) -> tuple[str, str, str]:
+    """(log, pidfile, runscript) on the VM/pod for a detached training run."""
+    return (f"/tmp/sgpu_train_{run_id}.log", f"/tmp/sgpu_train_{run_id}.pid", f"/tmp/sgpu_train_{run_id}.sh")
+
+
+def _parse_remote_log(text: str) -> tuple[Optional[int], dict]:
+    """Reconstruct (rc, result_json) from a detached run's log file — used to
+    finalize a run the gateway stopped streaming (after a restart). Mirrors the
+    subset of on_line marker handling that matters for the final record."""
+    result: dict = {"epochs": [], "steps": [], "trials": [], "gpu_samples": []}
+    rc: Optional[int] = None
+    for line in text.splitlines():
+        m = re.match(r"\s*@@RC:(-?\d+)", line)
+        if m:
+            rc = int(m.group(1)); continue
+        for tag, key in (("@@METRIC ", "metric"), ("@@STEP ", "step"), ("@@DONE ", "done"),
+                         ("@@ARTIFACT ", "artifact"), ("@@ERROR ", "error"),
+                         ("@@TRIAL ", "trial"), ("@@PACKED ", "packed")):
+            ti = line.find(tag)
+            if ti < 0:
+                continue
+            try:
+                obj = json.loads(line[ti + len(tag):])
+            except Exception:  # noqa: BLE001
+                break
+            if key == "metric":
+                (result.__setitem__("tts_eval", obj["tts_eval"]) if "tts_eval" in obj
+                 else result["epochs"].append(obj))
+            elif key == "step":
+                result["steps"].append(obj)
+            elif key == "done":
+                result["best"] = obj.get("best"); result["stopped_early"] = bool(obj.get("stopped_early"))
+                if obj.get("trials") is not None:
+                    result["trials"] = obj["trials"]
+            elif key == "trial":
+                t = obj.get("trial")
+                if isinstance(t, int) and 0 <= t < len(result["trials"]):
+                    result["trials"][t].update(obj)
+                else:
+                    result["trials"].append(obj)
+            elif key == "artifact":
+                result["artifact"] = obj
+            elif key == "packed":
+                result["packed"] = obj
+            elif key == "error":
+                result["error"] = obj.get("message")
+            break
+    return rc, result
+
+
+async def _reconcile_orphan(row, redis) -> str:
+    """Reconcile one orphaned (gateway-untracked) training run over SSH: the
+    detached trainer survives a gateway restart, so check its pid — still alive →
+    leave it running (finalized later when it exits); exited → finalize from its
+    log; VM unreachable / no log → mark failed. Returns the resulting state."""
+    rlog, rpid, _sh = _remote_run_paths(row.id)
+    try:
+        ssh = await _resolve_run_ssh(row)
+    except Exception:  # noqa: BLE001
+        ssh = None
+    if ssh is None:
+        await _finalize(row.id, "failed", None, "orphaned by gateway restart (box unreachable)")
+        return "failed"
+    host, port, user, key = ssh
+
+    def _probe() -> tuple[bool, str]:
+        cli = _ssh_connect(host, int(port), user, key)
+        try:
+            alive = "@@A" in _ssh_capture(cli, f'kill -0 "$(cat {rpid} 2>/dev/null)" 2>/dev/null && echo @@A || echo @@D')
+            return alive, _ssh_capture(cli, f"cat {rlog} 2>/dev/null")
+        finally:
+            try:
+                cli.close()
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        alive, log = await asyncio.to_thread(_probe)
+    except Exception as e:  # noqa: BLE001
+        await _finalize(row.id, "failed", None, f"orphaned (probe failed: {e})")
+        return "failed"
+    if alive:
+        return "running"  # detached trainer survived; finalize when it exits
+    if not (log or "").strip():
+        await _finalize(row.id, "failed", None, "orphaned by gateway restart (process gone, no log)")
+        return "failed"
+    rc, result = _parse_remote_log(log)
+    # @@DONE (best) or @@ARTIFACT means the trainer finished + uploaded → treat as
+    # done even if the exit code wasn't captured (e.g. a tail race on a detached run).
+    _ok = (rc == 0) or (result.get("best") is not None) or bool(result.get("artifact"))
+    status = "done" if (_ok and not result.get("error")) else "failed"
+    err = result.get("error") if status == "failed" else None
+    if status == "failed" and not err:
+        err = f"trainer exited with code {rc}" if rc is not None else "trainer process gone (no exit code captured)"
+    await _finalize(row.id, status, rc, err, result_json=result)
+    await _push_log(redis, row.id, f"[gateway] finalized from log after restart: {status} (rc={rc})")
+    return status
+
+
 async def cleanup_orphaned_running(redis) -> int:
-    """On startup, mark running/queued rows failed — the gateway restarted and
-    their pods (if any) are dangling on RunPod."""
-    n = 0
+    """On startup, reconcile running/queued rows. Detached trainers survive a
+    gateway restart, so each is SSH-probed: alive → kept running (the janitor
+    finalizes it when it exits); exited → finalized from its log; unreachable →
+    failed. Returns the count moved to a terminal state."""
     async with session_factory()() as s:
         rows = (await s.execute(
             select(TrainingRun).where(TrainingRun.status.in_(["running", "queued"]))
         )).scalars().all()
-        for row in rows:
-            row.status = "failed"
-            row.error_text = (
-                "orphaned by gateway restart — pod (if any) is still on RunPod, "
-                "terminate it manually"
-            )
-            row.ended_at = datetime.now(timezone.utc)
+    n = 0
+    for row in rows:
+        # queued rows never launched a detached process → just fail them.
+        if row.status == "queued":
+            await _finalize(row.id, "failed", None, "orphaned by gateway restart (never started)")
             n += 1
-        if n:
-            await s.commit()
+            continue
+        if (await _reconcile_orphan(row, redis)) != "running":
+            n += 1
     return n
+
+
+async def training_janitor_loop(redis, interval: int = 90) -> None:
+    """Finalize runs that survived a gateway restart (left 'running' by cleanup)
+    once their detached trainer exits. Skips runs this gateway is actively
+    managing (they finalize themselves)."""
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            async with session_factory()() as s:
+                rows = (await s.execute(
+                    select(TrainingRun).where(TrainingRun.status == "running")
+                )).scalars().all()
+            for row in rows:
+                if row.id in _RUN_STATE:
+                    continue  # actively streamed by this gateway → it finalizes itself
+                await _reconcile_orphan(row, redis)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("training janitor: %s", e)
 
 
 # ---------- schemas ------------------------------------------------------
@@ -1216,6 +1375,9 @@ class CreateTrainingRunRequest(BaseModel):
     grad_accum: int = 1
     learning_rate: float = 1e-5
     warmup_steps: int = 0
+    # HF LR schedule: linear (warmup→linear decay, the default), cosine,
+    # constant_with_warmup (warmup→hold), or constant (no warmup/decay).
+    lr_scheduler_type: str = "linear"
     weight_decay: float = 0.0
     # LoRA / PEFT — train low-rank adapters on the attention projections instead
     # of the full model (less VRAM, faster). Merged into the base at save time
@@ -1512,7 +1674,8 @@ async def create_training_run(
         "patience": body.patience, "eval_split_pct": body.eval_split_pct,
         "split_seed": body.split_seed, "batch_size": body.batch_size,
         "grad_accum": body.grad_accum, "learning_rate": body.learning_rate,
-        "warmup_steps": body.warmup_steps, "weight_decay": body.weight_decay,
+        "warmup_steps": body.warmup_steps, "lr_scheduler_type": body.lr_scheduler_type,
+        "weight_decay": body.weight_decay,
         "use_lora": body.use_lora, "lora_r": body.lora_r,
         "lora_alpha_ratio": body.lora_alpha_ratio,
         "lora_alpha": body.lora_alpha, "lora_dropout": body.lora_dropout,
@@ -1866,6 +2029,159 @@ async def _resolve_run_ssh(row: TrainingRun) -> Optional[tuple[str, int, str, st
     return ip, int(port), "root", key
 
 
+# ---------- persistent "Try it" worker (loaded model, served over a Unix socket,
+# lifecycle managed over SSH — the small sibling of the serverless worker) --------
+
+
+def _playground_paths(cfg: dict, run_id: str, kind: str) -> dict:
+    """VM-side paths for a run's persistent Try-it server. model_dir matches the
+    one-shot cache dir so the persistent + one-shot paths share the weights."""
+    work = (cfg.get("work_dir") or "/share").rstrip("/")
+    md = f"{work}/sgpu-tts-tryit/{run_id}" if kind == "tts" else f"{work}/sgpu-tryit/{run_id}"
+    return {
+        "sock": f"/tmp/sgpu_tryit_{run_id}.sock",
+        "ready": f"/tmp/sgpu_tryit_{run_id}.sock.ready",
+        "pid": f"/tmp/sgpu_tryit_{run_id}.pid",
+        "log": f"/tmp/sgpu_tryit_{run_id}.server.log",
+        "cfg": f"/tmp/sgpu_tryit_{run_id}.server.json",
+        "model_dir": md,
+    }
+
+
+def _ssh_capture(cli, command: str) -> str:
+    """Run a command over SSH, return its combined stdout+stderr as one string.
+    _ssh_run_stream hands us newline-stripped lines, so rejoin WITH newlines — else
+    multi-line output (e.g. a run log) collapses and line-anchored parsing breaks."""
+    chunks: list[str] = []
+    _ssh_run_stream(cli, command, lambda l: chunks.append(l))
+    return "\n".join(chunks)
+
+
+def _persistent_status(cli, paths: dict) -> dict:
+    """{running, ready, device?, kind?, logs[]} in one SSH probe — the log tail lets
+    the UI show the worker's load progress (download / shard load) while polling."""
+    cmd = (f'P="$(cat {paths["pid"]} 2>/dev/null)"; '
+           f'if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then '
+           f'if [ -f {paths["ready"]} ]; then echo "READY $(cat {paths["ready"]})"; '
+           f'else echo LOADING; fi; else echo DOWN; fi; '
+           f'echo "@@STATUSLOG@@"; tail -n 14 {paths["log"]} 2>/dev/null')
+    head, _, logpart = _ssh_capture(cli, cmd).partition("@@STATUSLOG@@")
+    line = next((x for x in head.strip().splitlines() if x.startswith(("READY", "LOADING", "DOWN"))), "DOWN")
+    logs = [x for x in logpart.splitlines() if x.strip()][-14:]
+    base = {"logs": logs}
+    if line.startswith("READY"):
+        try:
+            meta = json.loads(line[len("READY "):])
+        except Exception:  # noqa: BLE001
+            meta = {}
+        return {**base, "running": True, "ready": True, "device": meta.get("device"), "kind": meta.get("kind")}
+    return {**base, "running": line.startswith("LOADING"), "ready": False}
+
+
+def _persistent_request(cli, paths: dict, req: dict) -> tuple[dict, list[str]]:
+    """Forward one request to the loaded server over its socket; return (resp, log_tail)."""
+    import shlex
+    _ssh_put_bytes(cli, json.dumps(req).encode(), "/tmp/sgpu_tryit_req.json")
+    sock = shlex.quote(paths["sock"])
+    cmd = (f'PY="$(command -v python3 || command -v python)"; '
+           f'"$PY" /tmp/sgpu_tryit_client.py --sock {sock} --req /tmp/sgpu_tryit_req.json')
+    got: dict = {"resp": None}
+
+    def on_line(l: str) -> None:
+        s = l.strip()
+        if s.startswith("{") and got["resp"] is None:
+            try:
+                got["resp"] = json.loads(s)
+            except Exception:  # noqa: BLE001
+                pass
+    _ssh_run_stream(cli, cmd, on_line)
+    tail = [x for x in _ssh_capture(cli, f"tail -n 6 {paths['log']} 2>/dev/null").splitlines() if x.strip()]
+    if got["resp"] is None:
+        raise RuntimeError("persistent worker did not respond (it may have crashed — check Restart)")
+    return got["resp"], tail
+
+
+def _playground_start_ssh(host, port, user, key_filename, run_id, kind, model_s3, creds, cfg, gpu=None,
+                          idle_timeout=300):
+    """Launch the persistent server on the VM (nohup, own session) and record its
+    pid. Returns the status after launch (loading). idle_timeout=0 disables the
+    server's idle auto-unload."""
+    import shlex
+    import tempfile
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        paths = _playground_paths(cfg, run_id, kind)
+        # already up? just report.
+        st = _persistent_status(cli, paths)
+        if st["running"]:
+            return st
+        base = _trainer_script_path().parent
+        _ssh_put(cli, str(base / "tryit_server.py"), "/tmp/sgpu_tryit_server.py")
+        _ssh_put(cli, str(base / "tryit_client.py"), "/tmp/sgpu_tryit_client.py")
+        sconf = {
+            "kind": kind, "model_s3": model_s3,
+            "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+            "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+            "model_dir": paths["model_dir"], "sock": paths["sock"], "gpu": gpu or "auto",
+            "language": cfg.get("language") or None, "task": cfg.get("task") or "transcribe",
+            "idle_timeout": idle_timeout, "pid": paths["pid"],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(sconf)); local_cfg = f.name
+        try:
+            _ssh_put(cli, local_cfg, paths["cfg"])
+        finally:
+            try:
+                os.unlink(local_cfg)
+            except OSError:
+                pass
+        venv = (cfg.get("venv_path")
+                or ("/share/autotrain-tts" if kind == "tts" else "/share/autotrain-whisper")).rstrip("/")
+        py = f"{venv}/bin/python"
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        # setsid → its own session/pgid so stop can kill the whole group cleanly.
+        cmd = (f'{user_env}rm -f {paths["ready"]}; PY="{py}"; [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"; '
+               f'setsid nohup "$PY" -u /tmp/sgpu_tryit_server.py --config {shlex.quote(paths["cfg"])} '
+               f'> {paths["log"]} 2>&1 & echo $! > {paths["pid"]}; sleep 0.3; cat {paths["pid"]}')
+        _ssh_capture(cli, cmd)
+        return _persistent_status(cli, paths)
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _playground_stop_ssh(host, port, user, key_filename, run_id, cfg, kind):
+    """Stop the run's persistent server — SIGTERM its process group (own session),
+    then clean up the socket/pid/ready files. Precise: only the recorded pid."""
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        paths = _playground_paths(cfg, run_id, kind)
+        cmd = (f'P="$(cat {paths["pid"]} 2>/dev/null)"; '
+               f'if [ -n "$P" ]; then kill -TERM -"$P" 2>/dev/null || kill -TERM "$P" 2>/dev/null; sleep 1; '
+               f'kill -KILL -"$P" 2>/dev/null || true; fi; '
+               f'rm -f {paths["sock"]} {paths["ready"]} {paths["pid"]}; echo stopped')
+        _ssh_capture(cli, cmd)
+        return {"running": False, "ready": False}
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _playground_status_ssh(host, port, user, key_filename, run_id, cfg, kind):
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        return _persistent_status(cli, _playground_paths(cfg, run_id, kind))
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
                         run_id: str, model_s3: str, creds: dict, audio: bytes,
                         filename: str, cfg: dict, gpu: Optional[str] = None) -> tuple[str, Optional[str]]:
@@ -1876,11 +2192,18 @@ def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
 
     cli = _ssh_connect(host, int(port), user, key_filename)
     try:
-        base = _trainer_script_path().parent  # gateway/gateway/training/
-        _ssh_put(cli, str(base / "transcribe.py"), "/tmp/sgpu_transcribe.py")
         ext = os.path.splitext(filename)[1] or ".wav"
         remote_audio = f"/tmp/sgpu_tryit_audio{ext}"
         _ssh_put_bytes(cli, audio, remote_audio)
+        # Persistent server loaded? route to it (no per-request model load).
+        _paths = _playground_paths(cfg, run_id, "asr")
+        if _persistent_status(cli, _paths).get("ready"):
+            resp, tail = _persistent_request(cli, _paths, {"audio_path": remote_audio})
+            if resp.get("error"):
+                raise RuntimeError(resp["error"])
+            return resp.get("text", ""), resp.get("device"), (tail or ["served by the persistent worker"])
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        _ssh_put(cli, str(base / "transcribe.py"), "/tmp/sgpu_transcribe.py")
         work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
         tconf = {
             "model_s3": model_s3,
@@ -1932,7 +2255,7 @@ def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
         if out["text"] is None:
             tail = "\n".join(out["lines"][-15:])
             raise RuntimeError(f"transcription produced no output (rc={rc}):\n{tail}")
-        return out["text"], out.get("device")
+        return out["text"], out.get("device"), out["lines"][-120:]
     finally:
         try:
             cli.close()
@@ -2015,6 +2338,7 @@ async def training_gpu(
 class TranscribeResponse(BaseModel):
     text: str
     device: Optional[str] = None
+    logs: list[str] = []          # VM-side progress (model download, inference) for the playground
 
 
 @router.post("/{run_id}/transcribe", response_model=TranscribeResponse)
@@ -2067,10 +2391,237 @@ async def transcribe_with_run(
     if ssh is None:
         raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
     try:
-        text, device = await asyncio.to_thread(
+        text, device, logs = await asyncio.to_thread(
             _run_transcribe_ssh, *ssh, run_id, model_s3, creds, audio,
             filename or "audio.wav", dict(row.config_json or {}), sel or "auto",
         )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"transcription failed: {e}")
-    return TranscribeResponse(text=text, device=device)
+    return TranscribeResponse(text=text, device=device, logs=logs)
+
+
+def _run_synthesize_ssh(host: str, port: int, user: str, key_filename: str,
+                        run_id: str, model_s3: str, creds: dict, text: str,
+                        speaker: str, cfg: dict, gpu: Optional[str] = None) -> tuple[bytes, int, Optional[str]]:
+    """SSH to the run's VM, ship tts_infer.py, synthesize `text` with the finetuned
+    TTS model (downloaded from S3 there), and return (wav_bytes, sample_rate,
+    device). The TTS twin of _run_transcribe_ssh. Blocking — call via to_thread."""
+    import tempfile
+
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        # Persistent server loaded? route to it (no per-request model load).
+        _paths = _playground_paths(cfg, run_id, "tts")
+        if _persistent_status(cli, _paths).get("ready"):
+            req = {"text": text, "speaker": speaker or ""}
+            resp, tail = _persistent_request(cli, _paths, req)
+            if resp.get("error"):
+                raise RuntimeError(resp["error"])
+            if not resp.get("wav_b64"):
+                raise RuntimeError("persistent worker returned no audio")
+            return (resp["wav_b64"], int(resp.get("sample_rate") or 24000), resp.get("device"),
+                    (tail or ["served by the persistent worker"]), resp.get("prompt"), resp.get("gen_text"))
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        _ssh_put(cli, str(base / "tts" / "tts_infer.py"), "/tmp/sgpu_tts_infer.py")
+        work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
+        tconf = {
+            "model_s3": model_s3,
+            "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+            "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+            "model_dir": f"{work_dir}/sgpu-tts-tryit/{run_id}",
+            "text": text, "speaker": speaker or "", "gpu": gpu or "auto",
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(tconf))
+            local_cfg = f.name
+        try:
+            _ssh_put(cli, local_cfg, "/tmp/sgpu_tts_infer.json")
+        finally:
+            try:
+                os.unlink(local_cfg)
+            except OSError:
+                pass
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        # TTS trainer venv (torch/transformers/neucodec/soundfile/boto3).
+        venv = (cfg.get("venv_path") or "/share/autotrain-tts").rstrip("/")
+        py = f"{venv}/bin/python"
+        out: dict = {"wav": None, "sr": None, "device": None, "error": None, "lines": [],
+                     "prompt": None, "gen_text": None}
+
+        def on_line(line: str) -> None:
+            j = line.find("@@AUDIO ")
+            if j < 0:
+                if len(out["lines"]) < 400:  # keep a tail for errors; skip the huge b64 line
+                    out["lines"].append(line)
+                return
+            try:
+                obj = json.loads(line[j + len("@@AUDIO "):])
+            except Exception:  # noqa: BLE001
+                return
+            out["prompt"] = obj.get("prompt"); out["gen_text"] = obj.get("gen_text")
+            if obj.get("error"):
+                out["error"] = obj["error"]
+            else:
+                out["wav"] = obj.get("wav_b64"); out["sr"] = obj.get("sample_rate"); out["device"] = obj.get("device")
+
+        cmd = (f'{user_env}PY="{py}"; [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"; '
+               f'"$PY" -u /tmp/sgpu_tts_infer.py --config /tmp/sgpu_tts_infer.json')
+        rc = _ssh_run_stream(cli, cmd, on_line)
+        if out["error"]:
+            raise RuntimeError(out["error"])
+        if not out["wav"]:
+            tail = "\n".join(out["lines"][-15:])
+            raise RuntimeError(f"synthesis produced no audio (rc={rc}):\n{tail}")
+        return (out["wav"], int(out["sr"] or 24000), out.get("device"), out["lines"][-120:],
+                out.get("prompt"), out.get("gen_text"))  # wav is base64
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class SynthesizeResponse(BaseModel):
+    audio_b64: str          # base64-encoded WAV (PCM_16) the browser can play
+    sample_rate: int
+    device: Optional[str] = None
+    logs: list[str] = []    # VM-side progress (model download, generation) for the playground
+    prompt: Optional[str] = None    # the exact prompt fed to the model
+    gen_text: Optional[str] = None  # the model's raw generation (speech tokens) before NeuCodec
+
+
+@router.post("/{run_id}/synthesize", response_model=SynthesizeResponse)
+async def synthesize_with_run(
+    run_id: str,
+    text: str = Query(..., description="text to synthesize"),
+    speaker: str = Query("", description="optional speaker name (matches how the data was packed)"),
+    gpu: Optional[str] = Query(None, description="GPU index (e.g. '6'), 'cpu', or 'auto'"),
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Try-it playground (TTS): synthesize speech for `text` with this run's
+    finetuned TTS model. Runs on the run's VM over SSH (the control plane has no
+    GPU/ML deps) → needs a finished TTS run on a kind=vm provider. Returns a WAV."""
+    row = await _owned(run_id, user, session)
+    if (row.task_type or "asr") != "tts":
+        raise HTTPException(status_code=400, detail="synthesize is for TTS runs")
+    if row.status != "done":
+        raise HTTPException(status_code=400, detail="the run must finish training first")
+    model_s3 = ((row.result_json or {}).get("artifact") or {}).get("s3_uri")
+    if not model_s3:
+        raise HTTPException(status_code=400, detail="no trained model artifact for this run")
+    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+    if prov is None or prov.kind != "vm":
+        raise HTTPException(status_code=400, detail=("try-it runs on a VM provider; this run used a "
+                            "cloud pod (gone after training). Push to HF and try there, or re-run on a VM."))
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty text")
+    if len(text) > 2000:
+        raise HTTPException(status_code=400, detail="text too long (max 2000 chars) — try-it is for short clips")
+    sel = (gpu or "").strip().lower()
+    if sel and sel not in ("cpu", "auto"):
+        if not sel.isdigit():
+            raise HTTPException(status_code=400, detail="gpu must be a GPU index, 'cpu', or 'auto'")
+        allowed = [x.strip() for x in (row.visible_devices or "").split(",") if x.strip()]
+        if allowed and sel not in allowed:
+            raise HTTPException(status_code=400, detail=f"GPU {sel} not in this run's GPUs ({', '.join(allowed)})")
+    storage = await session.get(Storage, row.storage_id) if row.storage_id else None
+    creds = _s3_creds_from_storage(storage)
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
+    try:
+        wav_b64, sr, device, logs, prompt, gen_text = await asyncio.to_thread(
+            _run_synthesize_ssh, *ssh, run_id, model_s3, creds, text, speaker,
+            dict(row.config_json or {}), sel or "auto",
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"synthesis failed: {e}")
+    return SynthesizeResponse(audio_b64=wav_b64, sample_rate=sr, device=device, logs=logs,
+                              prompt=prompt, gen_text=gen_text)
+
+
+class PlaygroundStatus(BaseModel):
+    running: bool = False
+    ready: bool = False
+    device: Optional[str] = None
+    kind: Optional[str] = None
+    logs: list[str] = []    # tail of the worker's load/serve log (for live load progress)
+
+
+async def _playground_ctx(run_id: str, user: User, session: AsyncSession):
+    """Validate + resolve everything the playground lifecycle needs: the run must
+    be a finished ASR/TTS run on a VM with a model artifact. Returns
+    (row, kind, model_s3, creds, ssh, cfg)."""
+    row = await _owned(run_id, user, session)
+    kind = (row.task_type or "asr").lower()
+    if kind not in ("asr", "tts"):
+        raise HTTPException(status_code=400, detail="try-it is for ASR/TTS runs")
+    if row.status != "done":
+        raise HTTPException(status_code=400, detail="the run must finish training first")
+    model_s3 = ((row.result_json or {}).get("artifact") or {}).get("s3_uri")
+    if not model_s3:
+        raise HTTPException(status_code=400, detail="no trained model artifact for this run")
+    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+    if prov is None or prov.kind != "vm":
+        raise HTTPException(status_code=400, detail="persistent try-it needs a VM provider")
+    storage = await session.get(Storage, row.storage_id) if row.storage_id else None
+    creds = _s3_creds_from_storage(storage)
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
+    return row, kind, model_s3, creds, ssh, dict(row.config_json or {})
+
+
+@router.post("/{run_id}/playground/start", response_model=PlaygroundStatus)
+async def playground_start(
+    run_id: str,
+    gpu: Optional[str] = Query(None, description="GPU index, 'cpu', or 'auto'"),
+    idle_minutes: float = Query(5, ge=0, le=120,
+                                description="auto-unload after this many idle minutes (0 = never)"),
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Load the run's model into a persistent worker on its VM (served over a Unix
+    socket) so try-it requests skip the per-call model load. Returns immediately;
+    poll …/playground/status until ready. Auto-unloads after idle_minutes idle."""
+    row, kind, model_s3, creds, ssh, cfg = await _playground_ctx(run_id, user, session)
+    sel = (gpu or "").strip().lower()
+    if sel and sel not in ("cpu", "auto") and not sel.isdigit():
+        raise HTTPException(status_code=400, detail="gpu must be a GPU index, 'cpu', or 'auto'")
+    try:
+        st = await asyncio.to_thread(_playground_start_ssh, *ssh, run_id, kind, model_s3, creds, cfg,
+                                     sel or "auto", int(idle_minutes * 60))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"could not start the worker: {e}")
+    return PlaygroundStatus(**st)
+
+
+@router.get("/{run_id}/playground/status", response_model=PlaygroundStatus)
+async def playground_status(
+    run_id: str,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    row, kind, _m, _c, ssh, cfg = await _playground_ctx(run_id, user, session)
+    try:
+        st = await asyncio.to_thread(_playground_status_ssh, *ssh, run_id, cfg, kind)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"status check failed: {e}")
+    return PlaygroundStatus(**st)
+
+
+@router.post("/{run_id}/playground/stop", response_model=PlaygroundStatus)
+async def playground_stop(
+    run_id: str,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Unload the persistent worker and free the GPU (SIGTERM its process group)."""
+    row, kind, _m, _c, ssh, cfg = await _playground_ctx(run_id, user, session)
+    try:
+        st = await asyncio.to_thread(_playground_stop_ssh, *ssh, run_id, cfg, kind)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"stop failed: {e}")
+    return PlaygroundStatus(**st)

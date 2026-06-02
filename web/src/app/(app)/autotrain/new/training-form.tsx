@@ -236,6 +236,10 @@ export function TrainingForm() {
   const [precision, setPrecision] = useState<string>("fp32-bf16");
   const [language, setLanguage] = useState("");
   const [weightDecay, setWeightDecay] = useState(0.0);
+  // LR schedule: warmup steps + HF scheduler type (linear = warmup→linear decay).
+  const [warmupSteps, setWarmupSteps] = useState(0);
+  const [lrScheduler, setLrScheduler] =
+    useState<"linear" | "cosine" | "constant_with_warmup" | "constant">("linear");
   // LoRA / PEFT (merged into base at save → drop-in checkpoint)
   const [useLora, setUseLora] = useState(false);
   const [loraR, setLoraR] = useState(16);
@@ -370,6 +374,9 @@ export function TrainingForm() {
         if (c.logging_steps != null) setLoggingSteps(num(c.logging_steps, 10));
         if (c.learning_rate != null) setLearningRate(str(c.learning_rate));
         if (c.weight_decay != null) setWeightDecay(num(c.weight_decay, 0));
+        if (c.warmup_steps != null) setWarmupSteps(num(c.warmup_steps, 0));
+        if (["linear", "cosine", "constant_with_warmup", "constant"].includes(String(c.lr_scheduler_type)))
+          setLrScheduler(c.lr_scheduler_type as "linear" | "cosine" | "constant_with_warmup" | "constant");
         if (c.use_lora != null) setUseLora(!!c.use_lora);
         if (c.lora_r != null) setLoraR(num(c.lora_r, 16));
         if (c.lora_alpha_ratio != null) setLoraAlphaRatio(num(c.lora_alpha_ratio, 2));
@@ -472,8 +479,11 @@ export function TrainingForm() {
   const hasStorage = s3Storages.length > 0;
   const isTts = taskType === "tts";
   const MODELS = isTts ? TTS_BASE_MODELS : WHISPER_MODELS;
-  // TTS trains directly on a pre-packed (tts_packed) dataset; ASR uses any source.
-  const pickDatasets = isTts ? datasets.filter((d) => d.kind === "tts_packed") : datasets;
+  // TTS trains directly on a pre-packed (tts_packed) dataset; ASR uses raw audio
+  // sources — never a tts_packed dataset (those hold NeuCodec tokens, not audio).
+  const pickDatasets = isTts
+    ? datasets.filter((d) => d.kind === "tts_packed")
+    : datasets.filter((d) => d.kind !== "tts_packed");
 
   function pickTask(t: "asr" | "tts") {
     setTaskType(t);
@@ -624,6 +634,8 @@ export function TrainingForm() {
       grad_accum: gradAccum,
       learning_rate: Number(learningRate) || (isTts ? 2e-5 : 1e-5),
       weight_decay: weightDecay,
+      warmup_steps: warmupSteps,
+      lr_scheduler_type: lrScheduler,
       use_lora: useLora || (sweepOn && sweepLoraR.trim() !== ""),
       lora_r: loraR,
       lora_alpha_ratio: loraAlphaRatio,
@@ -953,6 +965,23 @@ export function TrainingForm() {
                 onChange={(e) => setWeightDecay(Math.max(0, Number(e.target.value) || 0))} />
             </FieldWrap>
           )}
+          <FieldWrap label="LR schedule" hint="How the learning rate moves over training (HF lr_scheduler_type).">
+            <Select value={lrScheduler} onValueChange={(v) => setLrScheduler(v as typeof lrScheduler)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="linear">linear (warmup → linear decay)</SelectItem>
+                <SelectItem value="cosine">cosine (warmup → cosine decay)</SelectItem>
+                <SelectItem value="constant_with_warmup">constant w/ warmup</SelectItem>
+                <SelectItem value="constant">constant (no warmup/decay)</SelectItem>
+              </SelectContent>
+            </Select>
+          </FieldWrap>
+          <FieldWrap label="Warmup steps"
+            hint={lrScheduler === "constant"
+              ? "Ignored by the constant schedule."
+              : "Optimizer steps to ramp LR 0 → peak before decay. 0 = no warmup."}>
+            <NumberField min={0} value={warmupSteps} onChange={setWarmupSteps} />
+          </FieldWrap>
 
           {/* TTS: block size + tokenizer aren't asked here — block size follows the
               packed dataset's sequence_length, and the tokenizer is the base TTS

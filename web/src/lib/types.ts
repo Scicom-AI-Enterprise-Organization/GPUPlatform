@@ -337,6 +337,7 @@ export type CreateTrainingRunRequest = {
   grad_accum?: number;
   learning_rate?: number;
   warmup_steps?: number;
+  lr_scheduler_type?: "linear" | "cosine" | "constant_with_warmup" | "constant";
   weight_decay?: number;
   // LoRA / PEFT — adapters merged into the base at save time (drop-in checkpoint).
   use_lora?: boolean;

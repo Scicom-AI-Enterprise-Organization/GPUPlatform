@@ -496,7 +496,7 @@ def run(cfg: dict) -> None:
     # main() rm's this dir afterwards when cleanup_checkpoints is set (the best
     # model is uploaded to S3 first).
     global _RUN_WORKDIR
-    _train_root = os.path.join((cfg.get("work_dir") or "/share").rstrip("/"), "sgpu-train")
+    _train_root = os.path.join((cfg.get("work_dir") or "/share").rstrip("/"), "checkpoint-whisper")
     try:
         os.makedirs(_train_root, exist_ok=True)
         work = tempfile.mkdtemp(prefix="autotrain-", dir=_train_root)
@@ -696,6 +696,7 @@ def run(cfg: dict) -> None:
         gradient_accumulation_steps=int(cfg.get("grad_accum", 1)),
         learning_rate=float(cfg.get("learning_rate", 1e-5)),
         warmup_steps=int(cfg.get("warmup_steps", 0)),
+        lr_scheduler_type=str(cfg.get("lr_scheduler_type") or "linear"),
         weight_decay=float(cfg.get("weight_decay", 0.0)),
         num_train_epochs=float(cfg["max_epochs"]),
         max_steps=(_max_steps if _max_steps > 0 else -1),
