@@ -673,9 +673,22 @@ def run(cfg: dict) -> None:
     _world = max(1, int(os.environ.get("WORLD_SIZE", "1")))
     _spe = max(1, (len(train_ds) + (_bs * _ga * _world) - 1) // (_bs * _ga * _world))
     _epochs = max(1, int(cfg["max_epochs"]) or 1)
+    _max_steps = int(cfg.get("max_steps", 0) or 0)
     _total_steps = max(1, _spe * _epochs)
+    if _max_steps > 0:
+        _total_steps = min(_total_steps, _max_steps)
+    # Eval + checkpoint cadence (epoch | steps). load_best_model_at_end requires
+    # save_strategy == eval_strategy (and save_steps a multiple of eval_steps), so
+    # keep them in lockstep. Under a short max_steps cap, shrink eval_steps so at
+    # least one eval fires (else there's no "best" checkpoint to load).
+    _eval_strat = str(cfg.get("eval_strategy") or "epoch").lower()
+    _eval_steps = max(1, int(cfg.get("eval_steps", 500) or 500))
+    if _max_steps > 0 and _eval_strat == "steps":
+        _eval_steps = min(_eval_steps, _max_steps)
     eff_logging_steps = max(1, min(int(cfg.get("logging_steps", 10)), _total_steps // 20 or 1))
-    log(f"[trainer] ~{_total_steps} optimizer steps (world={_world}) → logging_steps={eff_logging_steps}")
+    log(f"[trainer] ~{_total_steps} optimizer steps (world={_world}) → logging_steps={eff_logging_steps}"
+        + (f", max_steps={_max_steps}" if _max_steps > 0 else "")
+        + (f", eval every {_eval_steps} steps" if _eval_strat == "steps" else ", eval per epoch"))
     args = Seq2SeqTrainingArguments(
         output_dir=out_dir,
         per_device_train_batch_size=int(cfg.get("batch_size", 8)),
@@ -685,8 +698,11 @@ def run(cfg: dict) -> None:
         warmup_steps=int(cfg.get("warmup_steps", 0)),
         weight_decay=float(cfg.get("weight_decay", 0.0)),
         num_train_epochs=float(cfg["max_epochs"]),
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        max_steps=(_max_steps if _max_steps > 0 else -1),
+        eval_strategy=_eval_strat,
+        save_strategy=_eval_strat,
+        eval_steps=_eval_steps,
+        save_steps=_eval_steps,
         predict_with_generate=True,
         generation_max_length=int(cfg.get("generation_max_length", 225)),
         fp16=(amp == "fp16"),

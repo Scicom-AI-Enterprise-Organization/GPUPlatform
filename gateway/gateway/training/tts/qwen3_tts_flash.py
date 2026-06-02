@@ -389,14 +389,26 @@ def main():
     eval_dataset = DatasetFixed(_tf, split='test') if _has_test else None
     print('dataset', len(dataset), dataset[0]['attention_mask'].shape,
           '| eval', (len(eval_dataset) if eval_dataset is not None else 0))
+    def _evs_name(a):
+        return str(getattr(a, "eval_strategy", None) or getattr(a, "evaluation_strategy", "") or "").split(".")[-1].lower()
     if eval_dataset is not None:
-        # Turn on per-epoch eval loss on the held-out test split (overrides the
-        # --do_eval false the orchestrator passes for flat datasets).
+        # Per-epoch/step eval loss on the held-out test split. Respect the cadence
+        # the orchestrator passed (--eval_strategy / --eval_steps); only default to
+        # 'epoch' when it wasn't set (HF's default is 'no').
         training_args.do_eval = True
+        if _evs_name(training_args) in ("", "no"):
+            try:
+                training_args.eval_strategy = 'epoch'
+            except Exception:
+                training_args.evaluation_strategy = 'epoch'
+    else:
+        # No test split → don't evaluate (a passed --eval_strategy steps would
+        # otherwise crash the Trainer with no eval_dataset).
+        training_args.do_eval = False
         try:
-            training_args.eval_strategy = 'epoch'
+            training_args.eval_strategy = 'no'
         except Exception:
-            training_args.evaluation_strategy = 'epoch'
+            training_args.evaluation_strategy = 'no'
 
     def collator(batch):
         batch = [b for b in batch if b is not None]

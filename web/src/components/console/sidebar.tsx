@@ -12,7 +12,8 @@ type Item = {
   href: string;
   icon: React.ElementType;
   locked?: boolean;
-  // If set, only render when sections[section] is true.
+  // If set, this item is dropped from the nav when the section is turned off
+  // platform-wide via DISABLED_SECTIONS.
   section?: "inference" | "benchmark" | "compute" | "datasets";
 };
 
@@ -41,18 +42,20 @@ const MANAGE: Item[] = [
   { label: "Provisioned", href: "/admin/provisioned", icon: Server },
 ];
 
-type Sections = { inference: boolean; benchmark: boolean; compute: boolean; datasets: boolean };
 type Counts = { pendingApprovals: number; provisioned: number };
 
 export function ConsoleSidebar({
   isAdmin = false,
-  sections = { inference: true, benchmark: true, compute: true, datasets: true },
+  disabled = [],
   counts = { pendingApprovals: 0, provisioned: 0 },
 }: {
   isAdmin?: boolean;
-  sections?: Sections;
+  // Surfaces turned off platform-wide (DISABLED_SECTIONS) — dropped from the nav.
+  disabled?: string[];
   counts?: Counts;
 } = {}) {
+  const disabledSet = new Set(disabled);
+  const resources = RESOURCES.filter((item) => !(item.section && disabledSet.has(item.section)));
   // Map of href → numeric badge to show next to the item label. Always
   // present (default 0) so admins know the rail is wired up even when
   // nothing's pending.
@@ -93,7 +96,7 @@ export function ConsoleSidebar({
   const groups = (
     <>
       <SidebarGroup label="Resources" collapsed={collapsed}>
-        {RESOURCES.map((item) => (
+        {resources.map((item) => (
           <SidebarItem
             key={item.label}
             item={item}

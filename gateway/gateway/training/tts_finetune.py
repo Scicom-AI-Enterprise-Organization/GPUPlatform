@@ -453,6 +453,32 @@ def run(cfg: dict) -> None:
               "--dataset", meta, "--output_dir", packed,
               "--tokenizer", tokenizer, "--sequence_length", str(seq_len)], cwd=work)
 
+    # A pre-packed dataset may be split-aware: packed/train + packed/test subdirs
+    # (each its own index.json), vs a flat dataset with index.json at the packed/
+    # root. Train on the train split; "use its own test split" then evals on the
+    # held-out packed/test (not a sample of the training shards).
+    def _has_index(d):
+        return os.path.exists(os.path.join(d, "index.json"))
+    # Prefer the explicit split subdirs (train/ + held-out test/) whenever a
+    # train/ subdir exists. A split-aware pack may ALSO carry a flat combined
+    # index.json at the packed/ root (train+test mixed) — training on that would
+    # leak the test records, so the train/ split takes priority over the root.
+    train_dir = os.path.join(packed, "train") if _has_index(os.path.join(packed, "train")) else packed
+    split_test_dir = None
+    for _sp in ("test", "validation", "valid", "dev"):
+        if _has_index(os.path.join(packed, _sp)):
+            split_test_dir = os.path.join(packed, _sp)
+            break
+    log(f"[train] train_dir={train_dir}" + (f"  held-out split={split_test_dir}" if split_test_dir else ""))
+
+    # Fresh output dir. /share/out is reused across runs on a VM, and a leftover
+    # checkpoint-N from a prior/aborted run makes HF Trainer try to RESUME from it
+    # and die ("Can't find a checkpoint index"). Start each run clean.
+    import shutil as _shutil
+    if os.path.isdir(out_dir):
+        _shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+
     # 3. finetune via torchrun
     log(f"[train] precision: load={load_dt} amp={amp or 'none'}")
     dtype_args = ["--torch_dtype", load_dt]
@@ -479,24 +505,45 @@ def run(cfg: dict) -> None:
             "--lora_target_modules", _tgt,
         ]
         log(f"[train] LoRA enabled (r={_r}, alpha={_alpha}, dropout={cfg.get('lora_dropout', 0.05)}, target={_tgt})")
+    # Eval + checkpoint cadence (epoch | steps) + optional hard step cap — all
+    # native HF TrainingArguments. eval_steps == save_steps so a Whisper-style
+    # load_best_model_at_end stays valid; qwen3 only turns eval ON when the packed
+    # dataset has a test split (else it forces eval_strategy=no).
+    _evs = str(cfg.get("eval_strategy") or "epoch").lower()
+    _svs = str(cfg.get("save_strategy") or _evs).lower()
+    cadence_args = [
+        "--eval_strategy", _evs,
+        "--save_strategy", _svs,
+        "--logging_steps", str(max(1, int(cfg.get("logging_steps", 10) or 10))),
+    ]
+    if _evs == "steps":
+        cadence_args += ["--eval_steps", str(int(cfg.get("eval_steps", 500) or 500))]
+    if _svs == "steps":
+        cadence_args += ["--save_steps", str(int(cfg.get("save_steps", cfg.get("eval_steps", 500)) or 500))]
+    _max_steps = int(cfg.get("max_steps", 0) or 0)
+    if _max_steps > 0:
+        cadence_args += ["--max_steps", str(_max_steps)]
+        log(f"[train] step cap: max_steps={_max_steps} (overrides epochs)")
+    log(f"[train] cadence: eval={_evs} save={_svs}" + (f" every {cfg.get('eval_steps')} steps" if _evs == 'steps' else ""))
     last_loss = _run_loss([
         # venv python's torch.distributed.run (sys.executable is the venv python
         # in the run phase) — not a system `torchrun` that'd miss the venv torch.
         sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={gpus}",
         os.path.join(TTS_DIR, "qwen3_tts_flash.py"),
         "--model_name_or_path", model,
+        # Parent packed dir — qwen3 reads train/ for training and test/ for the
+        # per-epoch/step eval loss; a flat dir trains on the root.
         "--train_file", packed,
         "--output_dir", out_dir,
-        "--do_train", "--do_eval", "false",
+        "--do_train",
         "--num_train_epochs", str(epochs),
         "--per_device_train_batch_size", str(batch),
         "--gradient_accumulation_steps", str(grad_accum),
         "--learning_rate", str(lr),
         "--warmup_steps", str(int(cfg.get("warmup_steps", 0))),
         "--block_size", str(block_size),
-        "--logging_steps", "1",
-        "--save_strategy", "epoch",
         "--save_total_limit", "3",
+        *cadence_args,
         "--gradient_checkpointing", "true",
         "--ddp_find_unused_parameters", "false",
         "--dataloader_num_workers", "5",
@@ -509,14 +556,22 @@ def run(cfg: dict) -> None:
     # ---- evaluation (CER / MOS / similarity) on the test set ----
     eval_methods = [m for m in (cfg.get("eval_methods") or []) if m in ("cer", "mos", "similarity")]
     if eval_methods and os.path.isdir(out_dir):
-        # eval set: a separate packed test dataset if given, else the training
-        # packed dir (auto-split — sampled; the trainer doesn't carve a held-out
-        # shard set, so this scores generation quality on the packed records).
+        # eval set, in priority order: (1) a separate packed test dataset, (2) the
+        # dataset's own held-out test split (test_from_split), (3) else the train
+        # dir (sampled — no held-out set, scores generation on the train shards).
         test_ds = cfg.get("test_dataset") or {}
-        eval_dir = packed
+        eval_dir = train_dir
         if isinstance(test_ds, dict) and test_ds.get("packed_uri"):
             eval_dir = os.path.join(work, "eval_packed")
             _download_s3_prefix(test_ds, test_ds["packed_uri"], eval_dir)
+            # a split-aware separate test dataset → prefer its held-out split
+            if not _has_index(eval_dir):
+                for _sp in ("test", "validation", "valid", "dev"):
+                    if _has_index(os.path.join(eval_dir, _sp)):
+                        eval_dir = os.path.join(eval_dir, _sp)
+                        break
+        elif cfg.get("test_from_split") and split_test_dir:
+            eval_dir = split_test_dir
         try:
             _ensure_eval_deps(sys.executable, eval_methods, env)
             eval_cmd = [
@@ -540,7 +595,11 @@ def run(cfg: dict) -> None:
     if art.get("bucket") and os.path.isdir(out_dir):
         cli = _s3_client(art)
         base_key = art["prefix"].rstrip("/") + "/model"
-        for root, _dirs, files in os.walk(out_dir):
+        for root, dirs, files in os.walk(out_dir):
+            # Only ship the final model at the out_dir root — skip intermediate
+            # `checkpoint-N/` dirs (HF keeps save_total_limit of them, several GB
+            # each; uploading them all dwarfs a short run's training time).
+            dirs[:] = [d for d in dirs if not d.startswith("checkpoint-")]
             for fn in files:
                 fp = os.path.join(root, fn)
                 rel = os.path.relpath(fp, out_dir)

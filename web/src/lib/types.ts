@@ -323,6 +323,11 @@ export type CreateTrainingRunRequest = {
   gpus_per_trial?: number;
   eval_metric?: "wer" | "cer";
   max_epochs?: number;
+  max_steps?: number;
+  eval_strategy?: "epoch" | "steps";
+  eval_steps?: number;
+  save_strategy?: "epoch" | "steps";
+  save_steps?: number;
   patience?: number;
   // Normalize text (case/punctuation) before WER/CER (Whisper-style). Off = raw.
   normalize_text?: boolean;
@@ -383,6 +388,7 @@ export type CreateTrainingRunRequest = {
   augment_prob?: number;
   // TTS-only: audio eval methods to run on the test set (cer | mos | similarity).
   eval_methods?: string[];
+  eval_max_samples?: number;
 };
 
 export type TrainingFile = {

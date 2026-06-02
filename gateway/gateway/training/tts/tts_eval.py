@@ -53,11 +53,15 @@ def _read_packed(local_dir):
     for i in range(len(ds)):
         rec = dict(ds[i])
         ids = rec.get("input_ids")
-        mask = rec.get("attention_mask")  # per-utterance lengths
+        mask = rec.get("attention_mask")  # per-utterance lengths (numpy array)
         if ids is None:
             continue
         ids = [int(x) for x in list(ids)]
-        mask = [int(x) for x in list(mask or [len(ids)])]
+        # mask is a numpy array → test for emptiness explicitly (a bare
+        # `mask or …` raises "truth value of an array is ambiguous").
+        if mask is None or len(mask) == 0:
+            mask = [len(ids)]
+        mask = [int(x) for x in list(mask)]
         pos = 0
         for length in mask:
             yield ids[pos:pos + length]
@@ -103,16 +107,17 @@ def generate_pairs(model_dir, packed_dir, out_dir, max_samples, max_new_tokens=2
     import numpy as np  # noqa: F401
     import soundfile as sf
     import torch
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from neucodec import NeuCodec
-
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from qwen3_tts_flash import Model  # the trainer's Qwen3 wrapper
 
     os.makedirs(out_dir, exist_ok=True)
     log(f"[eval] loading model {model_dir} + tokenizer + NeuCodec …")
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = Model.from_pretrained(model_dir, torch_dtype=torch.bfloat16).cuda().eval()
+    # Load as a plain causal LM for generation. The trainer's custom `Model`
+    # subclass overrides forward for a fused-linear training loss and returns no
+    # logits when labels is None — so it can't `.generate()`. The saved weights
+    # are standard Qwen3ForCausalLM, which generates correctly.
+    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.bfloat16).cuda().eval()
     neucodec = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
     neucodec = neucodec.cuda() if torch.cuda.is_available() else neucodec
     im_end_id = tokenizer.convert_tokens_to_ids(_IM_END)
@@ -155,6 +160,7 @@ def generate_pairs(model_dir, packed_dir, out_dir, max_samples, max_new_tokens=2
 # Scorers (verbatim APIs from the Scicom eval repos)
 # ---------------------------------------------------------------------------
 def score_cer(pairs, asr_model, language):
+    import librosa
     import torch
     from jiwer import cer
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
@@ -164,14 +170,25 @@ def score_cer(pairs, asr_model, language):
     proc = AutoProcessor.from_pretrained(asr_model)
     pipe = pipeline("automatic-speech-recognition", model=m, tokenizer=proc.tokenizer,
                     feature_extractor=proc.feature_extractor, torch_dtype=torch.float16, device="cuda")
+    # language=None → Whisper auto-detects (the data is mixed English/Malay).
+    gen_kw = {"language": language, "task": "transcribe"} if language else {}
     scores = []
     for p in pairs:
         if not (p.get("text") or "").strip():
             continue
         try:
-            kw = {"language": language} if language else {}
-            txt = pipe(p["gen"], **kw)["text"]
-            s = min(1.0, float(cer(p["text"].strip(), txt.strip())))
+            # Decode the wav ourselves (soundfile/librosa) → 16 kHz mono array and
+            # hand the pipeline a raw array, so it never shells out to ffmpeg
+            # (absent on most pods/VMs — passing a path makes Whisper need it).
+            audio, _ = librosa.load(p["gen"], sr=16000)
+            # return_timestamps=True lets Whisper handle clips >30s (long-form);
+            # harmless on short ones. Generated TTS can run long when the model
+            # doesn't emit <|im_end|> early.
+            call_kw = {"return_timestamps": True}
+            if gen_kw:
+                call_kw["generate_kwargs"] = gen_kw
+            out = pipe({"raw": audio, "sampling_rate": 16000}, **call_kw)
+            s = min(1.0, float(cer(p["text"].strip(), out["text"].strip())))
             scores.append(s)
         except Exception as e:  # noqa: BLE001
             log(f"[eval] CER skip {p['gen']}: {e}")

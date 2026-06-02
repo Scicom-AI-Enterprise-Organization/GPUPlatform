@@ -222,6 +222,13 @@ export function TrainingForm() {
   const [evalMetric, setEvalMetric] = useState<"wer" | "cer">("wer");
   const [normalizeText, setNormalizeText] = useState(true);
   const [maxEpochs, setMaxEpochs] = useState(3);
+  // Train for a fixed number of epochs or a fixed number of optimizer steps
+  // (steps overrides epochs in HF — good for quick debug runs), plus the
+  // eval/checkpoint cadence (per epoch | every N steps) for intermediate feedback.
+  const [durationMode, setDurationMode] = useState<"epochs" | "steps">("epochs");
+  const [maxSteps, setMaxSteps] = useState(500);
+  const [evalStrategy, setEvalStrategy] = useState<"epoch" | "steps">("epoch");
+  const [evalSteps, setEvalSteps] = useState(500);
   const [patience, setPatience] = useState(1);
   const [batchSize, setBatchSize] = useState(8);
   const [loggingSteps, setLoggingSteps] = useState(10);
@@ -244,6 +251,7 @@ export function TrainingForm() {
   const [sweepBatch, setSweepBatch] = useState("");
   const [sweepGradAccum, setSweepGradAccum] = useState("");
   const [sweepEpochs, setSweepEpochs] = useState("");
+  const [sweepSteps, setSweepSteps] = useState("");
   const [sweepWeightDecay, setSweepWeightDecay] = useState("");
   const [sweepLoraR, setSweepLoraR] = useState("");
   const [sweepPrecisions, setSweepPrecisions] = useState<string[]>([]);
@@ -275,6 +283,10 @@ export function TrainingForm() {
   const [augmentProb, setAugmentProb] = useState(0.5);
   // TTS eval methods to run on the test set (CER / MOS / similarity).
   const [evalMethods, setEvalMethods] = useState<string[]>(["cer"]);
+  // How many generated clips the heavy eval scores (per method). Lower = faster
+  // eval — the gen + NeuCodec decode + Whisper/UTMOSv2/TitaNet pass dominates a
+  // short run, so a small count (e.g. 8) keeps debug runs snappy.
+  const [evalMaxSamples, setEvalMaxSamples] = useState(64);
   // experiment tracking — named credentials from the Secrets page (picked per run)
   const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
   const [wandbCredId, setWandbCredId] = useState("");
@@ -349,6 +361,10 @@ export function TrainingForm() {
         if (c.eval_metric === "wer" || c.eval_metric === "cer") setEvalMetric(c.eval_metric);
         if (c.normalize_text != null) setNormalizeText(!!c.normalize_text);
         if (c.max_epochs != null) setMaxEpochs(num(c.max_epochs, 3));
+        const _ms = num(c.max_steps, 0);
+        if (_ms > 0) { setDurationMode("steps"); setMaxSteps(_ms); } else setDurationMode("epochs");
+        if (c.eval_strategy === "steps" || c.eval_strategy === "epoch") setEvalStrategy(c.eval_strategy);
+        if (c.eval_steps != null) setEvalSteps(num(c.eval_steps, 500));
         if (c.patience != null) setPatience(num(c.patience, 1));
         if (c.batch_size != null) setBatchSize(num(c.batch_size, 8));
         if (c.logging_steps != null) setLoggingSteps(num(c.logging_steps, 10));
@@ -371,6 +387,8 @@ export function TrainingForm() {
           setSweepBatch(csv(sweep.batch_size));
           setSweepGradAccum(csv(sweep.grad_accum));
           setSweepEpochs(csv(sweep.max_epochs));
+          setSweepSteps(csv(sweep.max_steps));
+          if (arr(sweep.max_steps).length) setDurationMode("steps");
           setSweepWeightDecay(csv(sweep.weight_decay));
           setSweepLoraR(csv(sweep.lora_r));
           setSweepPrecisions(arr(sweep.precision).map(String));
@@ -381,6 +399,7 @@ export function TrainingForm() {
         if (Array.isArray(c.augment_techniques)) setAugmentTechniques(arr(c.augment_techniques).map(String));
         if (c.augment_prob != null) setAugmentProb(num(c.augment_prob, 0.5));
         if (Array.isArray(c.eval_methods)) setEvalMethods(arr(c.eval_methods).map(String));
+        if (c.eval_max_samples != null) setEvalMaxSamples(num(c.eval_max_samples, 64));
         // run on
         if (r.provider_kind === "vm") { setTarget("vm"); setProviderId(r.provider_id || ""); }
         else if (r.provider_id) { setTarget("cloud"); setRunpodProviderId(r.provider_id); }
@@ -487,8 +506,14 @@ export function TrainingForm() {
     if (b.length) s.batch_size = b;
     const ga = parseCsvNums(sweepGradAccum, true);
     if (ga.length) s.grad_accum = ga;
-    const ep = parseCsvNums(sweepEpochs, true);
-    if (ep.length) s.max_epochs = ep;
+    // Sweep the training-duration dimension that matches the Epochs/Steps toggle.
+    if (durationMode === "steps") {
+      const st = parseCsvNums(sweepSteps, true);
+      if (st.length) s.max_steps = st;
+    } else {
+      const ep = parseCsvNums(sweepEpochs, true);
+      if (ep.length) s.max_epochs = ep;
+    }
     if (sweepPrecisions.length) s.precision = sweepPrecisions;
     const wd = parseCsvNums(sweepWeightDecay, false);
     if (wd.length) s.weight_decay = wd;
@@ -553,7 +578,9 @@ export function TrainingForm() {
       const numFields: { label: string; val: string; kind: "int" | "nonneg" }[] = [
         { label: "Batch sizes", val: sweepBatch, kind: "int" },
         { label: "Grad-accum steps", val: sweepGradAccum, kind: "int" },
-        { label: "Max epochs", val: sweepEpochs, kind: "int" },
+        durationMode === "steps"
+          ? { label: "Max steps", val: sweepSteps, kind: "int" }
+          : { label: "Max epochs", val: sweepEpochs, kind: "int" },
         { label: "LoRA r", val: sweepLoraR, kind: "int" },
         { label: "Weight decay", val: sweepWeightDecay, kind: "nonneg" },
       ];
@@ -583,6 +610,14 @@ export function TrainingForm() {
       eval_metric: evalMetric,
       normalize_text: normalizeText,
       max_epochs: maxEpochs,
+      // Step-capped training only in single-run "Steps" mode; sweeps stay epoch-based.
+      max_steps: (durationMode === "steps" && !sweepOn) ? maxSteps : 0,
+      eval_strategy: evalStrategy,
+      eval_steps: evalSteps,
+      // save in lockstep with eval so Whisper's load_best_model_at_end holds
+      // (save_strategy must equal eval_strategy; save_steps a multiple of eval_steps).
+      save_strategy: evalStrategy,
+      save_steps: evalSteps,
       patience: patience,
       eval_split_pct: evalSplitPct,
       batch_size: batchSize,
@@ -601,7 +636,7 @@ export function TrainingForm() {
       // TTS: block size + tokenizer are derived server-side from the packed
       // dataset + base model, so they're not sent from the form. The chosen
       // audio-eval methods (CER / MOS / similarity) run on the test set.
-      ...(isTts ? { eval_methods: evalMethods } : {}),
+      ...(isTts ? { eval_methods: evalMethods, eval_max_samples: evalMaxSamples } : {}),
       ...(sweepOn && Object.keys(sweepGrid).length
         ? { sweep: sweepGrid, gpus_per_trial: gpusPerTrial }
         : {}),
@@ -649,8 +684,8 @@ export function TrainingForm() {
         <h1 className="text-2xl font-semibold tracking-tight">New training run</h1>
         <p className="mt-1 text-sm text-muted-foreground">
           {isTts
-            ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM (loss-only; metrics to W&B/MLflow)."
-            : "Finetune a Whisper model on a dataset. WER + CER are evaluated each epoch; training stops at the max-epoch cap or early on patience."}
+            ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM. Eval loss runs on the held-out test split per epoch or every N steps; CER / MOS / speaker-similarity score generated audio at the end."
+            : "Finetune a Whisper model on a dataset. WER + CER are evaluated on a held-out split — per epoch or every N steps — and training stops at the epoch / max-step cap or early on patience."}
         </p>
         {fromId && (
           <p className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground">
@@ -851,12 +886,6 @@ export function TrainingForm() {
               </Select>
             </FieldWrap>
           )}
-          <FieldWrap label="Early-stop patience"
-            hint={isTts
-              ? "Evals without eval-loss improvement before stopping. 0 = off (needs a test set)."
-              : "Epochs without eval improvement before stopping. 0 = off."}>
-            <NumberField min={0} value={patience} onChange={setPatience} />
-          </FieldWrap>
           {!isTts && (
             <FieldWrap label="Language" hint="ISO code (e.g. en, ms). Empty = multilingual / model default.">
               <Input className="font-mono" placeholder="en" value={language} onChange={(e) => setLanguage(e.target.value)} />
@@ -864,13 +893,35 @@ export function TrainingForm() {
           )}
 
           {/* sweepable knobs — single value, or comma-separated list in sweep mode */}
-          {sweepOn ? (
-            <FieldWrap label="Max epochs" hint="e.g. 3, 5">
-              <Input className="font-mono" placeholder="3, 5" value={sweepEpochs} onChange={(e) => setSweepEpochs(e.target.value)} />
-            </FieldWrap>
-          ) : (
-            <FieldWrap label="Max epochs"><NumberField min={1} value={maxEpochs} onChange={setMaxEpochs} /></FieldWrap>
-          )}
+          {/* Train for a number of epochs OR optimizer steps (toggle). In sweep
+              mode the right field is a CSV of caps to try — one trial each. */}
+          <FieldWrap label="Train for"
+            hint={durationMode === "steps"
+              ? (sweepOn ? "Step caps to try — one trial each (e.g. 200, 500)."
+                         : "Stop after this many optimizer steps (overrides epochs — handy for quick debug runs).")
+              : (sweepOn ? "Epoch counts to try — one trial each (e.g. 3, 5)."
+                         : "Stop after this many epochs (or earlier on patience).")}>
+            <div className="flex gap-2">
+              <Select value={durationMode} onValueChange={(v) => setDurationMode(v as "epochs" | "steps")}>
+                <SelectTrigger className="w-[108px] shrink-0"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="epochs">Epochs</SelectItem>
+                  <SelectItem value="steps">Steps</SelectItem>
+                </SelectContent>
+              </Select>
+              <div className="flex-1">
+                {sweepOn ? (
+                  durationMode === "steps"
+                    ? <Input className="font-mono" placeholder="200, 500" value={sweepSteps} onChange={(e) => setSweepSteps(e.target.value)} />
+                    : <Input className="font-mono" placeholder="3, 5" value={sweepEpochs} onChange={(e) => setSweepEpochs(e.target.value)} />
+                ) : (
+                  durationMode === "epochs"
+                    ? <NumberField min={1} value={maxEpochs} onChange={setMaxEpochs} />
+                    : <NumberField min={1} value={maxSteps} onChange={setMaxSteps} />
+                )}
+              </div>
+            </div>
+          </FieldWrap>
           {sweepOn ? (
             <FieldWrap label="Batch sizes" hint="e.g. 8, 16">
               <Input className="font-mono" placeholder="8, 16" value={sweepBatch} onChange={(e) => setSweepBatch(e.target.value)} />
@@ -913,6 +964,35 @@ export function TrainingForm() {
             </FieldWrap>
           )}
         </Grid>
+
+        {/* Evaluation, checkpointing & early stop — grouped together since they
+            share a cadence. "Every N steps" gives intermediate eval/checkpoints
+            during a long run; per epoch is the default. Applies to ASR + TTS. */}
+        <div className="mt-4 space-y-3 border-t border-border pt-4">
+          <div className="text-sm font-medium">Evaluation &amp; checkpoints</div>
+          <div className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-3">
+            <FieldWrap label="Cadence" hint="When to evaluate the held-out test set + save a checkpoint.">
+              <Select value={evalStrategy} onValueChange={(v) => setEvalStrategy(v as "epoch" | "steps")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="epoch">Per epoch</SelectItem>
+                  <SelectItem value="steps">Every N steps</SelectItem>
+                </SelectContent>
+              </Select>
+            </FieldWrap>
+            {evalStrategy === "steps" && (
+              <FieldWrap label="Every N steps" hint="Evaluate + checkpoint every this many optimizer steps.">
+                <NumberField min={1} value={evalSteps} onChange={setEvalSteps} />
+              </FieldWrap>
+            )}
+            <FieldWrap label="Early-stop patience"
+              hint={isTts
+                ? "Evals without eval-loss improvement before stopping. 0 = off (needs a test set)."
+                : "Evals without eval improvement before stopping. 0 = off."}>
+              <NumberField min={0} value={patience} onChange={setPatience} />
+            </FieldWrap>
+          </div>
+        </div>
 
         {/* LoRA (ASR + TTS) + freeze-encoder (ASR / Whisper only) */}
         <div className="mt-4 space-y-3 border-t border-border pt-4">
@@ -1004,6 +1084,11 @@ export function TrainingForm() {
                   </button>
                 );
               })}
+            </div>
+            <div className="pt-1 sm:max-w-[16rem]">
+              <FieldWrap label="Eval sample count" hint="Generated clips to score (per method). Lower = faster eval — e.g. 8 for quick debug runs.">
+                <NumberField min={1} value={evalMaxSamples} onChange={setEvalMaxSamples} />
+              </FieldWrap>
             </div>
           </div>
         )}

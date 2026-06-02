@@ -1199,6 +1199,16 @@ class CreateTrainingRunRequest(BaseModel):
     # Off = score raw text (much higher, but exact-match strict).
     normalize_text: bool = True
     max_epochs: int = 3
+    # Hard cap on optimizer steps; >0 overrides max_epochs (HF `max_steps`). 0 =
+    # run the full epochs. Handy for quick debug runs (e.g. max_steps=50).
+    max_steps: int = 0
+    # Eval + checkpoint cadence: "epoch" (default) or "steps". In "steps" mode,
+    # evaluate + checkpoint every eval_steps / save_steps optimizer steps. Kept
+    # equal by the form so HF's load_best_model_at_end constraint (Whisper) holds.
+    eval_strategy: str = "epoch"
+    eval_steps: int = 500
+    save_strategy: str = "epoch"
+    save_steps: int = 500
     patience: int = 0                  # 0 = no early stop
     eval_split_pct: float = 10.0
     split_seed: int = 42
@@ -1234,6 +1244,10 @@ class CreateTrainingRunRequest(BaseModel):
     augment_prob: float = 0.5
     # TTS-only: audio eval methods to run on the test set (cer | mos | similarity).
     eval_methods: list[str] = []
+    # TTS-only: how many generated clips the heavy eval scores (per method). The
+    # gen + NeuCodec-decode + scorer pass dominates a short run, so a small count
+    # keeps debug runs fast. Default 64.
+    eval_max_samples: int = 64
     precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
@@ -1378,7 +1392,7 @@ def _validate_sweep(sweep: dict) -> None:
             raise HTTPException(status_code=400, detail=f"sweep weight_decay: {v!r} is not a number")
         if not math.isfinite(f) or f < 0:
             raise HTTPException(status_code=400, detail=f"sweep weight_decay: {v!r} must be a non-negative number")
-    for key in ("batch_size", "grad_accum", "max_epochs", "block_size", "lora_r", "lora_alpha"):
+    for key in ("batch_size", "grad_accum", "max_epochs", "max_steps", "block_size", "lora_r", "lora_alpha"):
         for v in (sweep.get(key) or []):
             try:
                 n = int(v)
@@ -1492,7 +1506,9 @@ async def create_training_run(
         "pack_only": body.pack_only, "pack_source_dataset_id": body.pack_source_dataset_id,
         "sweep": body.sweep or {}, "gpus_per_trial": body.gpus_per_trial,
         "eval_metric": body.eval_metric, "normalize_text": body.normalize_text,
-        "max_epochs": body.max_epochs,
+        "max_epochs": body.max_epochs, "max_steps": body.max_steps,
+        "eval_strategy": body.eval_strategy, "eval_steps": body.eval_steps,
+        "save_strategy": body.save_strategy, "save_steps": body.save_steps,
         "patience": body.patience, "eval_split_pct": body.eval_split_pct,
         "split_seed": body.split_seed, "batch_size": body.batch_size,
         "grad_accum": body.grad_accum, "learning_rate": body.learning_rate,
@@ -1505,6 +1521,7 @@ async def create_training_run(
         "augment_techniques": [t for t in (body.augment_techniques or []) if t in _AUG_TECHNIQUES],
         "augment_prob": body.augment_prob,
         "eval_methods": [m for m in (body.eval_methods or []) if m in _TTS_EVAL_METHODS],
+        "eval_max_samples": body.eval_max_samples,
         "precision": body.precision, "language": body.language, "task": body.task,
         "base_model": body.base_model,
         # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab

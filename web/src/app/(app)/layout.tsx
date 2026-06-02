@@ -4,6 +4,7 @@ import { SidebarStateProvider } from "@/components/console/sidebar-state";
 import { TerminalThemeInit } from "@/components/terminal-theme-init";
 import { TOKEN_COOKIE } from "@/lib/auth-cookie";
 import { getMe } from "@/lib/me";
+import { disabledSections } from "@/lib/sections";
 
 const GATEWAY = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
@@ -40,12 +41,9 @@ async function loadAdminCounts(token: string): Promise<{
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
   const me = await getMe();
   const isAdmin = me?.role === "admin";
-  const sections = me?.sections ?? {
-    inference: true,
-    benchmark: true,
-    compute: true,
-    datasets: true,
-  };
+  // Surfaces turned off platform-wide via DISABLED_SECTIONS — hidden from the
+  // nav entirely (vs per-user denial, where the item shows + the page alerts).
+  const disabled = [...disabledSections()];
 
   let counts = { pendingApprovals: 0, provisioned: 0 };
   if (isAdmin) {
@@ -61,7 +59,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
         <div className="flex min-h-0 flex-1">
           <ConsoleSidebar
             isAdmin={isAdmin}
-            sections={sections}
+            disabled={disabled}
             counts={counts}
           />
           <main className="min-w-0 flex-1 overflow-y-auto scrollbar-thin">
