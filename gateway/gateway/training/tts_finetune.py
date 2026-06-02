@@ -33,6 +33,19 @@ _LOSS_RE = re.compile(r"'loss':\s*([0-9.eE+-]+)")
 _RUN_WORKDIR = None
 
 
+def _free_port() -> int:
+    """An OS-assigned free TCP port for torch.distributed's rendezvous. The
+    default 29500 collides when concurrent sweep trials each launch their own
+    torchrun on the same box (EADDRINUSE) — a unique port per launch avoids it."""
+    import socket
+    s = socket.socket()
+    try:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
 def log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -408,7 +421,15 @@ def run(cfg: dict) -> None:
     grad_accum = int(cfg.get("grad_accum", 4))
     lr = float(cfg.get("learning_rate", 2e-5))
     load_dt, amp = parse_precision(cfg.get("precision"))
-    gpus = max(1, int(cfg.get("gpu_count", 1)))
+    # nproc_per_node = the GPUs actually visible to THIS process. A sweep trial is
+    # pinned by the sweep runner to gpus_per_trial GPUs via CUDA_VISIBLE_DEVICES;
+    # honoring that (over the run-wide gpu_count) avoids launching N ranks onto a
+    # 1-GPU pin. For a single run the gateway sets CVD to the pin = gpu_count, so
+    # this is unchanged there.
+    _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    gpus = (len([x for x in _cvd.split(",") if x.strip()]) if _cvd
+            else max(1, int(cfg.get("gpu_count", 1))))
+    gpus = max(1, gpus)
 
     packed = os.path.join(work, "packed")
     out_dir = os.path.join(work, "out")
@@ -542,6 +563,7 @@ def run(cfg: dict) -> None:
         # venv python's torch.distributed.run (sys.executable is the venv python
         # in the run phase) — not a system `torchrun` that'd miss the venv torch.
         sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={gpus}",
+        f"--master_port={_free_port()}",  # unique per launch — concurrent sweep trials else clash on 29500
         os.path.join(TTS_DIR, "qwen3_tts_flash.py"),
         "--model_name_or_path", model,
         # Parent packed dir — qwen3 reads train/ for training and test/ for the
