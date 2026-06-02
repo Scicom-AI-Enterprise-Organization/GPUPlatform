@@ -559,15 +559,19 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
                     ? `${run.provider_name}${run.provider_kind ? ` (${run.provider_kind})` : ""}`
                     : run.provider_id || "—"
                 }
+                href={run.provider_id ? "/providers" : undefined}
               />
               <Stat
                 label="GPU"
                 value={run.gpu_type ? `${run.gpu_type}${run.gpu_count > 1 ? ` × ${run.gpu_count}` : ""}` : "—"}
               />
               {run.visible_devices && <Stat label="GPU ids" value={run.visible_devices} mono />}
-              <Stat label="Storage" value={run.storage_name || run.storage_id || "—"} />
-              <Stat label="Dataset" value={run.dataset_id} mono />
-              {run.test_dataset_id && <Stat label="Test dataset" value={run.test_dataset_id} mono />}
+              <Stat label="Storage" value={run.storage_name || run.storage_id || "—"}
+                href={run.storage_id ? "/storage" : undefined} />
+              <Stat label="Dataset" value={run.dataset_id} mono
+                href={run.dataset_id ? `/datasets/${run.dataset_id}` : undefined} />
+              {run.test_dataset_id && <Stat label="Test dataset" value={run.test_dataset_id} mono
+                href={`/datasets/${run.test_dataset_id}`} />}
               <Stat label="Base model" value={run.base_model} mono />
             </CardContent>
           </Card>
@@ -617,11 +621,16 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   );
 }
 
-function Stat({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function Stat({ label, value, mono, href }: { label: string; value: string; mono?: boolean; href?: string }) {
+  const cls = `text-sm ${mono ? "font-mono break-all" : "font-medium"}`;
   return (
     <div>
       <div className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className={`text-sm ${mono ? "font-mono break-all" : "font-medium"}`}>{value}</div>
+      {href ? (
+        <a href={href} target="_blank" rel="noreferrer" className={`${cls} text-primary hover:underline`}>{value}</a>
+      ) : (
+        <div className={cls}>{value}</div>
+      )}
     </div>
   );
 }

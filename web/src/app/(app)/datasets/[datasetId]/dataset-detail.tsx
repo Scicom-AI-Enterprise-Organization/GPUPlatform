@@ -98,7 +98,12 @@ export function DatasetDetail({
   // The HF repo this dataset lives at, or — for a transformed dataset — the
   // original HF dataset it was derived from.
   const hfRepo = dataset.hf_repo || dataset.source_hf_repo || null;
-  const hfValue = hfRepo ? <span title={hfRepo}>{hfRepo}</span> : "—";
+  const hfUrl = hfRepo ? `https://huggingface.co/datasets/${hfRepo}` : null;
+  const hfValue = hfRepo ? (
+    <a href={hfUrl!} target="_blank" rel="noreferrer" title={hfRepo} className="text-primary hover:underline">
+      {hfRepo}
+    </a>
+  ) : "—";
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -119,7 +124,9 @@ export function DatasetDetail({
               {dataset.storage_name && (
                 <>
                   <span>·</span>
-                  <span>{dataset.storage_name}</span>
+                  <a href="/storage" target="_blank" rel="noreferrer" className="text-primary hover:underline">
+                    {dataset.storage_name}
+                  </a>
                 </>
               )}
             </div>
@@ -185,7 +192,18 @@ export function DatasetDetail({
               </CardHeader>
               <CardContent className="divide-y divide-border/60">
                 <Row label="Source" value={dataset.kind} />
-                <Row label="Storage" value={dataset.storage_name ?? "—"} />
+                <Row
+                  label="Storage"
+                  value={
+                    dataset.storage_name ? (
+                      <a href="/storage" target="_blank" rel="noreferrer" className="text-sm text-primary hover:underline">
+                        {dataset.storage_name}
+                      </a>
+                    ) : (
+                      "—"
+                    )
+                  }
+                />
                 {dataset.kind === "s3" && (
                   <Row label="S3 metadata URI" value={<span className="font-mono text-xs">{dataset.s3_metadata_uri ?? "—"}</span>} />
                 )}
@@ -221,13 +239,17 @@ export function DatasetDetail({
                 <Row
                   label="HuggingFace"
                   value={
-                    dataset.hf_synced_at
-                      ? `synced → ${dataset.hf_repo} (${new Date(dataset.hf_synced_at).toLocaleString()})`
-                      : dataset.hf_repo
-                        ? dataset.hf_repo
-                        : dataset.source_hf_repo
-                          ? `from ${dataset.source_hf_repo}`
-                          : "not synced"
+                    hfRepo ? (
+                      <a href={hfUrl!} target="_blank" rel="noreferrer" className="text-sm text-primary hover:underline">
+                        {dataset.hf_synced_at && dataset.hf_repo
+                          ? `synced → ${dataset.hf_repo} (${new Date(dataset.hf_synced_at).toLocaleString()})`
+                          : dataset.hf_repo
+                            ? dataset.hf_repo
+                            : `from ${dataset.source_hf_repo}`}
+                      </a>
+                    ) : (
+                      "not synced"
+                    )
                   }
                 />
               </CardContent>

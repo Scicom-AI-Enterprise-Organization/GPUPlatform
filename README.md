@@ -191,13 +191,14 @@ Stand one up and drive it entirely with `curl`: [docs/MULTI_MODEL_FLEET.md](docs
 
 Finetune a speech model on your own [dataset](#datasets) — orchestrated over SSH on a `vm` provider (bare-metal) or a RunPod pod the gateway spawns, with the trained model pushed to S3 (and optionally Hugging Face). Create a run in the form at `/autotrain/new` or via `POST /v1/training-runs`.
 
-- **Two task types** — **ASR** (Whisper: `whisper-large-v3`, `-v3-turbo`, …) and **TTS** (Qwen3 + NeuCodec). ASR is evaluated on **WER / CER**; training stops at the max-epoch cap or early on patience.
+- **Two task types** — **ASR** (Whisper: `whisper-large-v3`, `-v3-turbo`, …), evaluated per-epoch on **WER / CER** with early-stopping on patience; and **TTS** (Qwen3 + NeuCodec), trained on a `tts_packed` [dataset](#datasets) and evaluated post-training on **CER** (Whisper-transcribe), **MOS** (UTMOSv2), and **speaker similarity** (TitaNet).
 - **Hyperparameter sweep** — pass a `sweep` grid (e.g. `{"learning_rate":[1e-4,1e-5],"precision":["fp32-bf16","bf16-bf16"]}`) and the gateway runs the cross-product of trials, packing `gpus_per_trial` onto the GPUs you pinned with `visible_devices`. The detail page lists every trial (pending / running / done / failed) and splits the loss + WER/CER curves **per trial**, legended by params.
 - **Audio augmentation** — apply any of 8 techniques (`telephone`, `noise`, `dropout`, `gain`, `pitch`, `speed`, `reverb`, `bandpass`) at a chosen probability to the training split only (eval is never augmented).
 - **Live + persisted metrics** — per-step training loss, per-epoch eval (WER/CER/eval-loss), and a **GPU telemetry** graph (util / memory / temperature per GPU). All are persisted, so a finished run still renders its charts. Pull everything programmatically from `GET /v1/training-runs/{id}/metrics`.
 - **Lazy data loading** — the trainer indexes **metadata only** up front and fetches each clip's audio from S3 / HF inside the DataLoader (`__getitem__`), so a multi-GB corpus costs ~nothing to start and doesn't stall on a slow shared mount.
 - **Experiment tracking** — point a run at a [tracking credential](#secrets-global-env--tracking) to log to **Weights & Biases** or **MLflow**.
-- **Operate it** — live log SSE, a Config tab (the VM/provider, GPU type + ids, storage, dataset, base model), per-run **Rename / Restart / Terminate / Delete** (a clean confirmation dialog, no native alert), and `work_dir` + `cleanup_checkpoints` to control scratch/checkpoint disk. Arbitrary OS `env_vars` (e.g. `HF_HOME`, cache dirs) are exported around the trainer.
+- **Operate it** — tabbed detail (**Metrics / Logs / Files / Config / Try it**), live log SSE, a Config tab (the VM/provider, GPU type + ids, storage, dataset, base model), per-run **Rename / Restart / Terminate / Delete** (a clean confirmation dialog, no native alert), and `work_dir` + `cleanup_checkpoints` to control scratch/checkpoint disk. Arbitrary OS `env_vars` (e.g. `HF_HOME`, cache dirs) are exported around the trainer.
+- **Try it** — once a run finishes, **transcribe a clip** (ASR) or **synthesize speech** (TTS) with the finetuned model directly on the run's VM, from the **Try it** tab. A persistent mode keeps the model resident between calls so you don't pay the load cost on every request.
 
 ```bash
 curl -s -X POST "$GATEWAY/v1/training-runs" -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
@@ -216,7 +217,7 @@ curl -s -H "Authorization: Bearer $KEY" "$GATEWAY/v1/training-runs/<id>/metrics"
 
 ## Datasets
 
-A dataset is a named pointer to a metadata table of `{audio, transcription}` rows that Autotrain consumes. Manage them at `/datasets` or `POST /v1/datasets`. Four source kinds:
+A dataset is a named pointer to a metadata table of `{audio, transcription}` (optionally `speaker`) rows that Autotrain consumes. Manage them at `/datasets` or `POST /v1/datasets`. Five kinds:
 
 | Kind | Source |
 |---|---|
@@ -224,8 +225,14 @@ A dataset is a named pointer to a metadata table of `{audio, transcription}` row
 | `s3` | a metadata file already in S3 — a full `s3://bucket/key` URI **or** a key relative to the storage bucket |
 | `hf` | a Hugging Face audio dataset (read lazily, per-split, with a token from a HF storage backend) |
 | `label` | a live project on a labeling platform |
+| `tts_packed` | the output of a **Pack for TTS** step — NeuCodec speech tokens multipacked into a ChiniDataset that TTS training streams directly |
 
-The detail page (`/datasets/{id}`) previews rows with inline **audio playback + waveform**, lets you map the `audio` / `transcription` columns (and per-split overrides), lists HF **splits**, and can **transform** a zip/tar-of-audio HF dataset into one with a real audio column (materialized to S3 or pushed to HF) or **sync** uploaded metadata to a HF repo.
+The detail page (`/datasets/{id}`) is tab-organized — **Rows / Columns / Transform / Details**:
+
+- **Rows** — paginate the whole corpus with inline **audio playback + waveform**, and **curate the training split in place**: untick a row to exclude it (`POST …/row-inclusion`) and the trainers skip it. A packed dataset instead shows one row per multipacked block, decoded back to text on demand.
+- **Columns** — map the `audio` / `transcription` / `speaker` columns (with per-split transcription overrides); lists the HF **splits**.
+- **Transform** — one operation per source kind. An `hf`/`label` dataset stores audio in archives / behind a label export, so it can only **extract a real audio column** (→ materialized to S3 or pushed to HF). An `s3`/`upload` dataset already has audio, so it can **Pack for TTS** — NeuCodec-encode + multipack into a `tts_packed` dataset on a GPU (a RunPod pod or your VM), with live log + progress. Uploaded metadata can also be **synced** to a HF repo.
+- **Details** — source/storage metadata, the S3 folder **size** (computed on demand), and — for a transformed dataset — a **Transformed from** link back to the source dataset + its original HF repo.
 
 ## Benchmark
 
@@ -280,8 +287,8 @@ Mint a long-lived bearer token on the **API tokens** page (or `POST /api-keys`).
 | Area | Key endpoints |
 |---|---|
 | Serverless | `POST /apps` · `GET /apps` · `GET /apps/{id}/status` · `POST /v1/chat/completions` · `GET /v1/models` · `POST /run/{app}` · `GET /result/{id}` |
-| Autotrain | `POST /v1/training-runs` · `GET /v1/training-runs` · `GET /v1/training-runs/{id}` · `GET /v1/training-runs/{id}/metrics` · `GET /v1/training-runs/{id}/logs/stream` · `POST /v1/training-runs/{id}/restart` · `POST /v1/training-runs/{id}/terminate` |
-| Datasets | `GET /v1/datasets` · `POST /v1/datasets` · `POST /v1/datasets/{id}/upload` · `GET /v1/datasets/{id}/preview` · `POST /v1/datasets/{id}/transform` |
+| Autotrain | `POST /v1/training-runs` · `GET /v1/training-runs` · `GET /v1/training-runs/{id}` · `GET /v1/training-runs/{id}/metrics` · `GET /v1/training-runs/{id}/files` · `GET /v1/training-runs/{id}/logs/stream` · `POST /v1/training-runs/{id}/restart` · `POST /v1/training-runs/{id}/terminate` · `POST /v1/training-runs/{id}/transcribe` · `POST /v1/training-runs/{id}/synthesize` |
+| Datasets | `GET /v1/datasets` · `POST /v1/datasets` · `POST /v1/datasets/{id}/upload` · `GET /v1/datasets/{id}/preview` · `POST /v1/datasets/{id}/row-inclusion` · `POST /v1/datasets/{id}/transform` · `POST /v1/datasets/{id}/pack-tts` · `POST /v1/datasets/{id}/sync` |
 | Benchmark | `POST /benchmarks` · `GET /benchmarks/{id}` · `GET /benchmarks/{id}/logs?tail=` · `POST /benchmarks/{id}/duplicate` · `PATCH /benchmarks/{id}` (rename) · `POST /benchmarks/{id}/terminate` |
 | Compute | `POST /compute` · `GET /compute` · `GET /compute/{id}/ssh` |
 | Providers / storage / secrets | `GET /v1/providers` · `GET /v1/storage` · `GET /v1/global-env` · `GET /v1/tracking-credentials` |
@@ -368,11 +375,12 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 - **Compute approvals** at `/admin/compute-approvals` — pods land in `pending` until an admin clears them (toggle off per role).
 - **Provisioned** at `/admin/provisioned` — live view of every pod + serverless app across users, with cost tracking.
 - **Secrets** at `/admin/secrets` — org-wide global env vars + W&B / MLflow [tracking credentials](#secrets-global-env--tracking).
+- **Disable a surface** — set `DISABLED_SECTIONS` (comma-separated: `inference,benchmark,compute,datasets`) on the gateway **and** web; the section drops out of the sidebar, its pages 404, and the gateway 403s its routes.
 
 ## Repo layout
 
 - **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/training-runs`, `/v1/datasets`, `/v1/providers`, `/v1/storage`, `/v1/global-env`, `/v1/tracking-credentials`, `/api-keys`, `/auth`, `/admin/*`, `/metrics`
-- **Trainers** (`gateway/gateway/training/`) — standalone runner scripts shipped over SSH per run: `whisper_finetune.py` (ASR), `tts_finetune.py` (Qwen3 + NeuCodec TTS), and `sweep_runner.py` (GPU-pinned multi-trial orchestrator)
+- **Trainers** (`gateway/gateway/training/`) — standalone runner scripts shipped over SSH per run: `whisper_finetune.py` (ASR), `tts_finetune.py` (the TTS pipeline — NeuCodec-encode → multipack into a ChiniDataset → Qwen3 causal-LM train → CER/MOS/similarity eval, with a **pack-only** mode that powers the dataset Pack-for-TTS step), and `sweep_runner.py` (GPU-pinned multi-trial orchestrator)
 - **Worker agent** (`worker-agent/`) — `BRPOP`s jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub; also drives the **multi-model VM fleet** — wave-loads each vLLM, sleeps/wakes them per request, runs operator commands (sleep/restart/kill), and ships per-model + scheduler logs to the gateway
 - **SDK + CLI** (`sdk/serverlessgpu/`) — `@endpoint` decorator, `QueueDepthAutoscaler`, and the `serverlessgpu` CLI
 - **Web** (`web/`) — Next.js UI: Serverless, Autotrain, Datasets, Benchmark, Compute, Providers, Storage, API tokens, Admin (users / roles / audit / approvals / provisioned / secrets)
