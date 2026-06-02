@@ -1919,7 +1919,13 @@ def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
                     out["text"] = obj.get("text", "")
                     out["device"] = obj.get("device")
 
-        cmd = f"{user_env}python -u /tmp/sgpu_transcribe.py --config /tmp/sgpu_transcribe.json"
+        # Run with the ASR trainer venv (torch/transformers/librosa/boto3); the
+        # box's bare `python` lacks them → "Could not import module 'pipeline'".
+        # Fall back to system python3/python if the venv is somehow absent.
+        venv = (cfg.get("venv_path") or "/share/autotrain-whisper").rstrip("/")
+        py = f"{venv}/bin/python"
+        cmd = (f'{user_env}PY="{py}"; [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"; '
+               f'"$PY" -u /tmp/sgpu_transcribe.py --config /tmp/sgpu_transcribe.json')
         rc = _ssh_run_stream(cli, cmd, on_line)
         if out["error"]:
             raise RuntimeError(out["error"])

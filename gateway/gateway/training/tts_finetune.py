@@ -29,6 +29,8 @@ import traceback
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 TTS_DIR = os.path.join(THIS_DIR, "tts")
 _LOSS_RE = re.compile(r"'loss':\s*([0-9.eE+-]+)")
+# Per-run work dir (set in run()); main() rm's it when cleanup_checkpoints is on.
+_RUN_WORKDIR = None
 
 
 def log(msg: str) -> None:
@@ -372,8 +374,19 @@ def _splits_in(meta_jsonl: str) -> list[str]:
 
 # --------------------------------------------------------------------------
 def run(cfg: dict) -> None:
-    work = os.path.abspath(cfg.get("work_dir") or "/workspace/autotrain-tts")
-    os.makedirs(work, exist_ok=True)
+    import tempfile
+    global _RUN_WORKDIR
+    # Per-run work dir under <work_dir>/sgpu-train (mirrors Whisper) so cleanup at
+    # the end rm's ONLY this run's dir — never the shared /share root, which holds
+    # the venv. Also means each run starts on a fresh dir (no stale checkpoints).
+    _root = os.path.join((cfg.get("work_dir") or "/share").rstrip("/"), "sgpu-train")
+    try:
+        os.makedirs(_root, exist_ok=True)
+        work = tempfile.mkdtemp(prefix="autotrain-tts-", dir=_root)
+    except OSError:
+        work = tempfile.mkdtemp(prefix="autotrain-tts-")
+    _RUN_WORKDIR = work
+    log(f"[trainer] work dir: {work}")
 
     # tracking env (gateway injected the resolved secrets in cfg["tracking"]["env"])
     tracking = cfg.get("tracking") or {}
@@ -625,6 +638,17 @@ def run(cfg: dict) -> None:
                   "epochs": epochs, "stopped_early": False})
 
 
+def _cleanup_workdir(cfg: dict) -> None:
+    """Remove this run's per-run work dir once artifacts are in S3 (mirrors the
+    Whisper trainer). Best model lives in S3; the local checkpoints/packed/audio
+    are disposable. Skipped when cleanup_checkpoints is off."""
+    import shutil
+    if not cfg.get("cleanup_checkpoints", True) or not _RUN_WORKDIR:
+        return
+    shutil.rmtree(_RUN_WORKDIR, ignore_errors=True)
+    log(f"[trainer] cleaned work dir: {_RUN_WORKDIR}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -644,6 +668,8 @@ def main() -> int:
         emit("ERROR", {"message": str(e)})
         log(traceback.format_exc())
         return 1
+    finally:
+        _cleanup_workdir(cfg)
 
 
 if __name__ == "__main__":
