@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import paramiko
 
@@ -189,3 +189,153 @@ def _availability_sync(host: str, port: int, user: str, private_key: str) -> VmA
 
 async def availability_vm(host: str, port: int, user: str, private_key: str) -> VmAvailabilityResult:
     return await asyncio.to_thread(_availability_sync, host, port, user, private_key)
+
+
+# --------------------------------------------------------------------------
+# Live host metrics (CPU% + memory + per-GPU util/mem/temp) for the provider
+# metrics page. One SSH round-trip; not persisted (the UI polls + graphs live).
+# --------------------------------------------------------------------------
+@dataclass
+class GpuMetric:
+    index: int
+    name: str
+    util_pct: int
+    mem_used_mib: int
+    mem_total_mib: int
+    temp_c: int
+
+
+@dataclass
+class VmMetricsResult:
+    ok: bool
+    message: str
+    cpu_pct: float          # overall busy %, -1 when unavailable
+    mem_used_mib: int
+    mem_total_mib: int
+    gpus: list[GpuMetric]
+    checked_at: float
+    cpu_cores: list[float] = field(default_factory=list)  # per-core busy % (htop-style)
+
+
+# Two /proc/stat samples (CPU%), /proc/meminfo (RAM), nvidia-smi (GPUs) — one shot.
+# Two /proc/stat samples include the aggregate `cpu` line AND every per-core
+# `cpuN` line, so we can report overall + per-core busy % (htop-style).
+_METRICS_CMD = (
+    "echo @@CPU1; grep '^cpu' /proc/stat; sleep 0.4; echo @@CPU2; grep '^cpu' /proc/stat; "
+    "echo @@MEM; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; echo @@GPU; "
+    "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu "
+    "--format=csv,noheader,nounits 2>/dev/null"
+)
+
+
+def _cpu_busy_total(line: str):
+    """(busy, total) jiffies from a `/proc/stat` `cpu …` line; None if unparseable.
+    busy excludes idle + iowait."""
+    nums = [int(x) for x in line.split()[1:] if x.lstrip("-").isdigit()]
+    if len(nums) < 4:
+        return None
+    idle = nums[3] + (nums[4] if len(nums) > 4 else 0)  # idle + iowait
+    total = sum(nums)
+    return total - idle, total
+
+
+def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetricsResult:
+    import time as _time
+    try:
+        pkey = _load_pkey(private_key)
+    except Exception as e:
+        return VmMetricsResult(False, f"key parse failed: {e}", -1.0, 0, 0, [], _time.time())
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host, port=port, username=user, pkey=pkey,
+            timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
+            auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False,
+        )
+    except paramiko.AuthenticationException:
+        return VmMetricsResult(False, "authentication failed", -1.0, 0, 0, [], _time.time())
+    except Exception as e:
+        return VmMetricsResult(False, f"SSH connect failed: {e}", -1.0, 0, 0, [], _time.time())
+
+    try:
+        _, stdout, _ = client.exec_command(_METRICS_CMD, timeout=COMMAND_TIMEOUT_S)
+        stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="replace")
+        sec: dict[str, list[str]] = {}
+        cur = None
+        for ln in out.splitlines():
+            s = ln.strip()
+            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU"):
+                cur = s
+                sec[cur] = []
+            elif cur:
+                sec[cur].append(ln)
+
+        # Aggregate + per-core CPU% from the two samples (delta busy / delta total).
+        cpu_pct = -1.0
+        cpu_cores: list[float] = []
+
+        def _sample(lines):
+            d = {}
+            for ln in lines:
+                name = ln.split(" ", 1)[0] if ln else ""
+                if name.startswith("cpu"):
+                    bt = _cpu_busy_total(ln)
+                    if bt:
+                        d[name] = bt
+            return d
+
+        def _pct(a, b):
+            if a and b and (b[1] - a[1]) > 0:
+                return round(100.0 * (b[0] - a[0]) / (b[1] - a[1]), 1)
+            return None
+
+        try:
+            s1, s2 = _sample(sec.get("@@CPU1", [])), _sample(sec.get("@@CPU2", []))
+            agg = _pct(s1.get("cpu"), s2.get("cpu"))
+            if agg is not None:
+                cpu_pct = agg
+            cores = sorted((n for n in s2 if n != "cpu" and n[3:].isdigit()), key=lambda n: int(n[3:]))
+            cpu_cores = [(_pct(s1.get(n), s2.get(n)) or 0.0) for n in cores]
+        except Exception:  # noqa: BLE001
+            pass
+
+        mem_total_mib = mem_used_mib = 0
+        try:
+            kv = {}
+            for ln in sec.get("@@MEM", []):
+                k, _, v = ln.partition(":")
+                kv[k.strip()] = int(v.strip().split()[0])  # kB
+            if "MemTotal" in kv and "MemAvailable" in kv:
+                mem_total_mib = kv["MemTotal"] // 1024
+                mem_used_mib = (kv["MemTotal"] - kv["MemAvailable"]) // 1024
+        except Exception:  # noqa: BLE001
+            pass
+
+        gpus: list[GpuMetric] = []
+        for ln in sec.get("@@GPU", []):
+            parts = [p.strip() for p in ln.split(",")]
+            if len(parts) < 6:
+                continue
+            try:
+                gpus.append(GpuMetric(int(parts[0]), parts[1], int(parts[2]),
+                                      int(parts[3]), int(parts[4]), int(parts[5])))
+            except ValueError:
+                continue
+
+        ok = mem_total_mib > 0 or bool(gpus) or cpu_pct >= 0
+        return VmMetricsResult(
+            ok, "ok" if ok else "no metrics parsed (is this a Linux host with nvidia-smi?)",
+            cpu_pct, mem_used_mib, mem_total_mib, gpus, _time.time(), cpu_cores=cpu_cores,
+        )
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+async def metrics_vm(host: str, port: int, user: str, private_key: str) -> VmMetricsResult:
+    return await asyncio.to_thread(_metrics_sync, host, port, user, private_key)

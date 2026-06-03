@@ -26,7 +26,7 @@ from . import audit as audit_module
 from . import crypto
 from .auth import current_user, require_admin
 from .db import Provider, User, get_session
-from .vm_probe import availability_vm, probe_vm
+from .vm_probe import availability_vm, metrics_vm, probe_vm
 
 logger = logging.getLogger("gateway.providers")
 
@@ -110,6 +110,27 @@ class AvailabilityResponse(BaseModel):
     ok: bool
     message: str
     gpus: list[GpuLiveInfo] = []
+    checked_at: float
+
+
+class GpuMetricInfo(BaseModel):
+    index: int
+    name: str
+    util_pct: int
+    mem_used_mib: int
+    mem_total_mib: int
+    temp_c: int
+
+
+class ProviderMetricsResponse(BaseModel):
+    """Live VM host metrics for the provider metrics page (polled, not stored)."""
+    ok: bool
+    message: str
+    cpu_pct: float = -1.0          # overall CPU busy %, -1 if unavailable
+    cpu_cores: list[float] = []    # per-core busy % (htop-style)
+    mem_used_mib: int = 0
+    mem_total_mib: int = 0
+    gpus: list[GpuMetricInfo] = []
     checked_at: float
 
 
@@ -482,6 +503,44 @@ async def provider_availability(
             index=g.index, name=g.name,
             mem_free_mib=g.mem_free_mib, mem_total_mib=g.mem_total_mib,
             util_pct=g.util_pct,
+        ) for g in result.gpus],
+        checked_at=result.checked_at,
+    )
+
+
+@router.get("/{provider_id}/metrics", response_model=ProviderMetricsResponse)
+async def provider_metrics(
+    provider_id: str,
+    user: User = Depends(current_user),  # noqa: ARG001 — auth-only
+    session: AsyncSession = Depends(get_session),
+):
+    """Live host metrics (CPU% + memory + per-GPU util/mem/temp) for a VM provider,
+    over SSH. Not stored — the metrics page polls this and graphs it client-side."""
+    row = await session.get(Provider, provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+    if row.kind != "vm":
+        raise HTTPException(status_code=400, detail="metrics are only available for VM providers")
+    cfg = row.config or {}
+    enc = cfg.get("private_key_enc")
+    if not enc:
+        raise HTTPException(status_code=500, detail="provider missing stored key")
+    result = await metrics_vm(
+        host=cfg.get("host", ""),
+        port=int(cfg.get("port") or VM_DEFAULT_PORT),
+        user=cfg.get("user", "root"),
+        private_key=crypto.decrypt(enc),
+    )
+    return ProviderMetricsResponse(
+        ok=result.ok,
+        message=result.message,
+        cpu_pct=result.cpu_pct,
+        cpu_cores=result.cpu_cores,
+        mem_used_mib=result.mem_used_mib,
+        mem_total_mib=result.mem_total_mib,
+        gpus=[GpuMetricInfo(
+            index=g.index, name=g.name, util_pct=g.util_pct,
+            mem_used_mib=g.mem_used_mib, mem_total_mib=g.mem_total_mib, temp_c=g.temp_c,
         ) for g in result.gpus],
         checked_at=result.checked_at,
     )

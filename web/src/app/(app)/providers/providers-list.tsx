@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { Cloud, Copy, Cpu, Inbox, KeyRound, LayoutGrid, List, MoreHorizontal, Search, Server, Trash2, User, X } from "lucide-react";
+import { Activity, Cloud, Copy, Cpu, Inbox, KeyRound, LayoutGrid, List, MoreHorizontal, Search, Server, Trash2, User, X } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -207,6 +207,17 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
+                  {p.kind === "vm" && (
+                    <DropdownMenuItem
+                      onSelect={(e) => {
+                        e.preventDefault();
+                        router.push(`/providers/${encodeURIComponent(p.id)}/metrics`);
+                      }}
+                    >
+                      <Activity className="h-4 w-4" />
+                      Metrics
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem
                     onSelect={(e) => {
                       e.preventDefault();

@@ -38,6 +38,24 @@ def log(m: str) -> None:
     print(f"[server] {m}", flush=True)
 
 
+# --- granular load progress: each step() closes out the previous step with its
+# elapsed time, so the UI shows "→ loading X …" then "✓ loading X (1.2s)". ---
+_step = {"t": 0.0, "label": ""}
+
+
+def step(m: str) -> None:
+    if _step["label"]:
+        log(f"  ✓ {_step['label']} ({time.time() - _step['t']:.1f}s)")
+    _step["t"] = time.time(); _step["label"] = m
+    log(f"→ {m} …")
+
+
+def step_done() -> None:
+    if _step["label"]:
+        log(f"  ✓ {_step['label']} ({time.time() - _step['t']:.1f}s)")
+        _step["label"] = ""
+
+
 def _pick_gpu() -> str | None:
     try:
         out = subprocess.check_output(
@@ -91,6 +109,7 @@ def _download_model(cfg: dict) -> str:
 
 class TTSEngine:
     def __init__(self, cfg: dict, use_cuda: bool):
+        step("importing torch + transformers + neucodec")
         import soundfile
         import torch
         from neucodec import NeuCodec
@@ -99,11 +118,27 @@ class TTSEngine:
         self.torch = torch; self.sf = soundfile
         self.use_cuda = use_cuda; self.device = "cuda" if use_cuda else "cpu"
         dtype = torch.bfloat16 if use_cuda else torch.float32
+
+        step("fetching model files from storage")
         md = _download_model(cfg)
+
+        step("loading tokenizer")
         self.tok = AutoTokenizer.from_pretrained(md)
+
+        step(f"loading language-model weights ({str(dtype).replace('torch.', '')})")
         m = AutoModelForCausalLM.from_pretrained(md, torch_dtype=dtype)
+        try:
+            nparams = sum(p.numel() for p in m.parameters())
+            log(f"  · language model: {nparams / 1e9:.2f}B params")
+        except Exception:
+            pass
+
+        step(f"moving language model to {self.device}")
         self.model = (m.cuda() if use_cuda else m).eval()
+
+        step("loading NeuCodec audio decoder (neuphonic/neucodec)")
         neu = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
+        step(f"moving NeuCodec to {self.device}")
         self.neu = neu.cuda() if use_cuda else neu
         self.im_end = self.tok.convert_tokens_to_ids("<|im_end|>")
 
@@ -145,15 +180,21 @@ class TTSEngine:
 
 class ASREngine:
     def __init__(self, cfg: dict, use_cuda: bool):
+        step("importing torch + transformers + librosa")
         import librosa
         import torch
         from transformers import pipeline
 
         self.librosa = librosa
         self.use_cuda = use_cuda; self.device = "cuda" if use_cuda else "cpu"
+        dtype = torch.float16 if use_cuda else torch.float32
+
+        step("fetching model files from storage")
         md = _download_model(cfg)
+
+        step(f"loading whisper weights ({str(dtype).replace('torch.', '')}) + building ASR pipeline on {self.device}")
         self.asr = pipeline("automatic-speech-recognition", model=md, device=0 if use_cuda else -1,
-                            torch_dtype=torch.float16 if use_cuda else torch.float32, chunk_length_s=30)
+                            torch_dtype=dtype, chunk_length_s=30)
         self.gen_kwargs = {"task": cfg.get("task") or "transcribe"}
         if cfg.get("language"):
             self.gen_kwargs["language"] = cfg["language"]
@@ -164,7 +205,11 @@ class ASREngine:
             return {"error": "audio file not found on the VM"}
         audio, sr = self.librosa.load(ap, sr=16000, mono=True)
         t = time.time()
-        out = self.asr({"raw": audio, "sampling_rate": sr}, generate_kwargs=self.gen_kwargs, return_timestamps=True)
+        # return_timestamps=False on purpose: with transformers 5.x the timestamp
+        # logits processor slices with the model's eos_token_id, which isn't a plain
+        # int on a merged-LoRA Whisper → "slice indices must be integers". We only
+        # need text here; chunk_length_s still handles long clips via token-overlap.
+        out = self.asr({"raw": audio, "sampling_rate": sr}, generate_kwargs=self.gen_kwargs, return_timestamps=False)
         text = (out["text"] if isinstance(out, dict) else str(out)) or ""
         log(f"asr: {len(audio) / sr:.1f}s in {time.time() - t:.1f}s → {len(text.split())} words")
         return {"text": text.strip(), "device": self.device}
@@ -190,6 +235,7 @@ def main() -> int:
     log(f"loading {kind} model on {'cuda' if use_cuda else 'cpu'} …")
     t0 = time.time()
     engine = TTSEngine(cfg, use_cuda) if kind == "tts" else ASREngine(cfg, use_cuda)
+    step_done()
     log(f"loaded {kind} model in {time.time() - t0:.1f}s — ready on {engine.device}")
 
     sock = cfg["sock"]

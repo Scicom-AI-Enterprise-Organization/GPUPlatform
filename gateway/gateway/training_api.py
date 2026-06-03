@@ -480,24 +480,26 @@ def _ssh_exec(cli, command: str) -> int:
 
 def _ssh_run_stream(cli, command: str, on_line) -> int:
     """Run `command`, calling on_line(str) per stdout/stderr line. Blocking —
-    call via asyncio.to_thread. Returns the remote exit status."""
+    call via asyncio.to_thread. Returns the remote exit status.
+
+    Drains the channel with a blocking recv() until EOF. The earlier
+    recv_ready()/exit_status_ready() poll could break *before* a large buffered
+    reply was fully drained — a race that truncated big single-line responses
+    (e.g. a TTS wav_b64 ~160 KB), leaving the caller a partial, unparseable line
+    while small replies (ASR text) slipped through in one recv. recv() returns
+    b"" on channel EOF, so the whole reply is delivered before we stop."""
     chan = cli.get_transport().open_session()
     chan.set_combine_stderr(True)
     chan.exec_command(command)
     buf = b""
     while True:
-        if chan.recv_ready():
-            data = chan.recv(8192)
-            if not data:
-                break
-            buf += data
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                on_line(line.decode("utf-8", "replace"))
-        elif chan.exit_status_ready() and not chan.recv_ready():
+        data = chan.recv(65536)
+        if not data:
             break
-        else:
-            time.sleep(0.2)
+        buf += data
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            on_line(line.decode("utf-8", "replace"))
     if buf:
         on_line(buf.decode("utf-8", "replace"))
     return chan.recv_exit_status()
@@ -2038,6 +2040,10 @@ def _playground_paths(cfg: dict, run_id: str, kind: str) -> dict:
     one-shot cache dir so the persistent + one-shot paths share the weights."""
     work = (cfg.get("work_dir") or "/share").rstrip("/")
     md = f"{work}/sgpu-tts-tryit/{run_id}" if kind == "tts" else f"{work}/sgpu-tryit/{run_id}"
+    # Reuse the run's training uv venv (persisted in config_json by run_training);
+    # fall back to the per-task default the trainer also uses. Never machine python.
+    venv = (cfg.get("venv_path")
+            or ("/share/autotrain-tts" if kind == "tts" else "/share/autotrain-whisper")).rstrip("/")
     return {
         "sock": f"/tmp/sgpu_tryit_{run_id}.sock",
         "ready": f"/tmp/sgpu_tryit_{run_id}.sock.ready",
@@ -2045,6 +2051,8 @@ def _playground_paths(cfg: dict, run_id: str, kind: str) -> dict:
         "log": f"/tmp/sgpu_tryit_{run_id}.server.log",
         "cfg": f"/tmp/sgpu_tryit_{run_id}.server.json",
         "model_dir": md,
+        "venv": venv,
+        "py": f"{venv}/bin/python",
     }
 
 
@@ -2083,8 +2091,8 @@ def _persistent_request(cli, paths: dict, req: dict) -> tuple[dict, list[str]]:
     import shlex
     _ssh_put_bytes(cli, json.dumps(req).encode(), "/tmp/sgpu_tryit_req.json")
     sock = shlex.quote(paths["sock"])
-    cmd = (f'PY="$(command -v python3 || command -v python)"; '
-           f'"$PY" /tmp/sgpu_tryit_client.py --sock {sock} --req /tmp/sgpu_tryit_req.json')
+    # Same uv venv as the run (the client is stdlib-only, but stay off machine python).
+    cmd = f'{shlex.quote(paths["py"])} /tmp/sgpu_tryit_client.py --sock {sock} --req /tmp/sgpu_tryit_req.json'
     got: dict = {"resp": None}
 
     def on_line(l: str) -> None:
@@ -2135,12 +2143,11 @@ def _playground_start_ssh(host, port, user, key_filename, run_id, kind, model_s3
                 os.unlink(local_cfg)
             except OSError:
                 pass
-        venv = (cfg.get("venv_path")
-                or ("/share/autotrain-tts" if kind == "tts" else "/share/autotrain-whisper")).rstrip("/")
-        py = f"{venv}/bin/python"
+        py = paths["py"]  # the run's training uv venv (asr→whisper, tts→tts); never machine python
         user_env = _render_env_exports(cfg.get("env_vars") or {})
         # setsid → its own session/pgid so stop can kill the whole group cleanly.
-        cmd = (f'{user_env}rm -f {paths["ready"]}; PY="{py}"; [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"; '
+        cmd = (f'{user_env}rm -f {paths["ready"]}; PY="{py}"; '
+               f'if [ ! -x "$PY" ]; then echo "venv python not found at $PY — train this run first (it creates the uv venv)" > {paths["log"]}; exit 1; fi; '
                f'setsid nohup "$PY" -u /tmp/sgpu_tryit_server.py --config {shlex.quote(paths["cfg"])} '
                f'> {paths["log"]} 2>&1 & echo $! > {paths["pid"]}; sleep 0.3; cat {paths["pid"]}')
         _ssh_capture(cli, cmd)
@@ -2245,9 +2252,11 @@ def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
         # Run with the ASR trainer venv (torch/transformers/librosa/boto3); the
         # box's bare `python` lacks them → "Could not import module 'pipeline'".
         # Fall back to system python3/python if the venv is somehow absent.
+        # Reuse the STT run's training uv venv (config_json); never machine python.
         venv = (cfg.get("venv_path") or "/share/autotrain-whisper").rstrip("/")
         py = f"{venv}/bin/python"
-        cmd = (f'{user_env}PY="{py}"; [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"; '
+        cmd = (f'{user_env}PY="{py}"; '
+               f'if [ ! -x "$PY" ]; then echo "venv python not found at $PY — train this run first (it creates the uv venv)"; exit 1; fi; '
                f'"$PY" -u /tmp/sgpu_transcribe.py --config /tmp/sgpu_transcribe.json')
         rc = _ssh_run_stream(cli, cmd, on_line)
         if out["error"]:
@@ -2442,7 +2451,8 @@ def _run_synthesize_ssh(host: str, port: int, user: str, key_filename: str,
             except OSError:
                 pass
         user_env = _render_env_exports(cfg.get("env_vars") or {})
-        # TTS trainer venv (torch/transformers/neucodec/soundfile/boto3).
+        # Reuse the TTS run's training uv venv (config_json; torch/transformers/
+        # neucodec/soundfile/boto3); never machine python.
         venv = (cfg.get("venv_path") or "/share/autotrain-tts").rstrip("/")
         py = f"{venv}/bin/python"
         out: dict = {"wav": None, "sr": None, "device": None, "error": None, "lines": [],
@@ -2464,7 +2474,8 @@ def _run_synthesize_ssh(host: str, port: int, user: str, key_filename: str,
             else:
                 out["wav"] = obj.get("wav_b64"); out["sr"] = obj.get("sample_rate"); out["device"] = obj.get("device")
 
-        cmd = (f'{user_env}PY="{py}"; [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"; '
+        cmd = (f'{user_env}PY="{py}"; '
+               f'if [ ! -x "$PY" ]; then echo "venv python not found at $PY — train this run first (it creates the uv venv)"; exit 1; fi; '
                f'"$PY" -u /tmp/sgpu_tts_infer.py --config /tmp/sgpu_tts_infer.json')
         rc = _ssh_run_stream(cli, cmd, on_line)
         if out["error"]:

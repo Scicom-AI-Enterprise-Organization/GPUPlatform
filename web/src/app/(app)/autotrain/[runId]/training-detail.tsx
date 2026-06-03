@@ -6,6 +6,8 @@ import { AudioLines, Check, ChevronDown, Copy, Download, Loader2, Pencil, Rotate
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   DropdownMenu,
@@ -1077,29 +1079,30 @@ function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevice
           can take a little longer.
         </p>
         <PersistentControls runId={runId} gpu={gpu} />
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="space-y-1.5">
-            <label className="block text-xs font-medium">Audio clip</label>
+        <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">audio clip</span>
             <input
               type="file"
               accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.webm"
               onChange={(e) => { setFile(e.target.files?.[0] ?? null); setResult(null); }}
-              className="block text-xs file:mr-3 file:rounded-md file:border-0 file:bg-muted file:px-2.5 file:py-1.5 file:text-foreground hover:file:bg-muted/70"
+              className="flex h-8 items-center rounded-md border border-input bg-transparent text-xs shadow-xs file:mr-3 file:h-8 file:border-0 file:border-r file:border-input file:bg-muted file:px-2.5 file:text-foreground hover:file:bg-muted/70"
             />
           </div>
-          <div className="space-y-1.5">
-            <label className="block text-xs font-medium">Run on</label>
-            <select
-              value={gpu}
-              onChange={(e) => setGpu(e.target.value)}
-              className="h-9 rounded-md border border-border bg-background px-2 text-sm"
-            >
-              {gpuIds.map((g) => <option key={g} value={g}>GPU {g}</option>)}
-              <option value="auto">Auto (most-free GPU)</option>
-              <option value="cpu">CPU</option>
-            </select>
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">run on</span>
+            <Select value={gpu} onValueChange={setGpu}>
+              <SelectTrigger className="h-8 w-[180px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {gpuIds.map((g) => <SelectItem key={g} value={g} className="text-xs">GPU {g}</SelectItem>)}
+                <SelectItem value="auto" className="text-xs">Auto (most-free GPU)</SelectItem>
+                <SelectItem value="cpu" className="text-xs">CPU</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
-          <Button type="button" onClick={onTranscribe} disabled={busy || !file}>
+          <Button type="button" onClick={onTranscribe} disabled={busy || !file} className="ml-auto">
             {busy
               ? <><Loader2 className="h-4 w-4 animate-spin" /> Transcribing…</>
               : <><AudioLines className="h-4 w-4" /> Transcribe</>}
@@ -1250,39 +1253,40 @@ function TtsPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
           model onto the VM, so it can take a little longer.
         </p>
         <PersistentControls runId={runId} gpu={gpu} />
-        <div className="space-y-1.5">
-          <label className="block text-xs font-medium">Text</label>
-          <textarea
+        <div className="flex flex-col gap-1">
+          <span className="text-xs text-muted-foreground">text</span>
+          <Textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
             rows={3}
             placeholder="Type something to speak…"
-            className="block w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+            className="text-sm"
           />
         </div>
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="space-y-1.5">
-            <label className="block text-xs font-medium">Speaker (optional)</label>
-            <input
+        <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">speaker (optional)</span>
+            <Input
               value={speaker}
               onChange={(e) => setSpeaker(e.target.value)}
               placeholder="(default)"
-              className="h-9 rounded-md border border-border bg-background px-2 text-sm"
+              className="h-8 w-[200px] text-sm"
             />
           </div>
-          <div className="space-y-1.5">
-            <label className="block text-xs font-medium">Run on</label>
-            <select
-              value={gpu}
-              onChange={(e) => setGpu(e.target.value)}
-              className="h-9 rounded-md border border-border bg-background px-2 text-sm"
-            >
-              {gpuIds.map((g) => <option key={g} value={g}>GPU {g}</option>)}
-              <option value="auto">Auto (most-free GPU)</option>
-              <option value="cpu">CPU</option>
-            </select>
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">run on</span>
+            <Select value={gpu} onValueChange={setGpu}>
+              <SelectTrigger className="h-8 w-[180px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {gpuIds.map((g) => <SelectItem key={g} value={g} className="text-xs">GPU {g}</SelectItem>)}
+                <SelectItem value="auto" className="text-xs">Auto (most-free GPU)</SelectItem>
+                <SelectItem value="cpu" className="text-xs">CPU</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
-          <Button type="button" onClick={onSynthesize} disabled={busy || !text.trim()}>
+          <Button type="button" onClick={onSynthesize} disabled={busy || !text.trim()} className="ml-auto">
             {busy
               ? <><Loader2 className="h-4 w-4 animate-spin" /> Synthesizing…</>
               : <><AudioLines className="h-4 w-4" /> Synthesize</>}

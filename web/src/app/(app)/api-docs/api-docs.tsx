@@ -946,6 +946,98 @@ data: end` }],
     request: { sample: `curl -s -X DELETE "$SGPU/v1/training-runs/train-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
     responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "id": "train-1a2b3c4d" }` }],
   },
+  {
+    id: "transcribe-run",
+    group: "autotrain",
+    method: "POST",
+    path: "/v1/training-runs/:id/transcribe",
+    title: "Try-it: transcribe a clip (ASR)",
+    description: <>Run the finetuned <strong>Whisper</strong> model on a short audio clip. The run must be <code>done</code> and on a <strong>VM</strong> provider (cloud pods are gone once training ends). The clip is the raw request body (≤ 25 MB). If a persistent worker is loaded (see <em>load a persistent worker</em> below) the call reuses it; otherwise the model is loaded on the VM just for this request.</>,
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Run id (a finished ASR run)." },
+      { name: "filename", in: "query", type: "string", doc: "Original file name — only its extension is used to decode. Default audio.wav." },
+      { name: "gpu", in: "query", type: "string", doc: 'GPU index (e.g. "6"), "cpu", or "auto" (most-free GPU). Must be one of the run’s GPUs if it pinned any.' },
+      { name: "(body)", in: "body", type: "binary", required: true, doc: "Raw audio bytes (wav/mp3/m4a/flac/ogg/webm), ≤ 25 MB." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/v1/training-runs/train-1a2b3c4d/transcribe?filename=clip.mp3&gpu=auto" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/octet-stream" \\
+  --data-binary @clip.mp3`,
+    },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "text": "hello world", "device": "cuda", "logs": ["[server] asr: 3.0s in 0.4s → 2 words"] }` },
+      { code: 400, codeLabel: "Bad Request", doc: "Run not finished, not a VM provider, empty / too-large upload, or invalid gpu.", sample: `{ "detail": "the run must finish training first" }` },
+      { code: 502, codeLabel: "Bad Gateway", doc: "Transcription failed on the VM.", sample: `{ "detail": "transcription failed: …" }` },
+    ],
+  },
+  {
+    id: "synthesize-run",
+    group: "autotrain",
+    method: "POST",
+    path: "/v1/training-runs/:id/synthesize",
+    title: "Try-it: synthesize speech (TTS)",
+    description: <>Run the finetuned <strong>TTS</strong> model (Qwen3 + NeuCodec) to speak <code>text</code>. The run must be <code>done</code>, of <code>task_type: &quot;tts&quot;</code>, and on a <strong>VM</strong> provider. Returns a base64 WAV. A loaded persistent worker is reused when present.</>,
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Run id (a finished TTS run)." },
+      { name: "text", in: "query", type: "string", required: true, doc: "Text to synthesize." },
+      { name: "speaker", in: "query", type: "string", doc: "Optional speaker name, matching how the data was packed." },
+      { name: "gpu", in: "query", type: "string", doc: 'GPU index, "cpu", or "auto". Must be one of the run’s GPUs if it pinned any.' },
+    ],
+    request: {
+      sample: `curl -s -G -X POST "$SGPU/v1/training-runs/train-1a2b3c4d/synthesize" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" \\
+  --data-urlencode "text=Hello, this is a test." --data-urlencode "gpu=auto"`,
+    },
+    responses: [
+      { code: 200, codeLabel: "OK", doc: <>Decode <code>audio_b64</code> to a <code>.wav</code> (PCM16 at <code>sample_rate</code>, typically 24 kHz). <code>gen_text</code> is the raw speech-token generation before NeuCodec.</>, sample: `{
+  "audio_b64": "UklGR…",
+  "sample_rate": 24000,
+  "device": "cuda",
+  "prompt": "<|im_start|>Hello, this is a test.<|speech_start|>",
+  "gen_text": "<|s_123|><|s_456|>…<|im_end|>",
+  "logs": ["[server] synth: 200 speech codes in 4.0s"]
+}` },
+      { code: 400, codeLabel: "Bad Request", doc: "Not a TTS run, not finished, not a VM provider, or invalid gpu.", sample: `{ "detail": "synthesize is for TTS runs" }` },
+      { code: 502, codeLabel: "Bad Gateway", doc: "Synthesis failed on the VM.", sample: `{ "detail": "synthesis failed: …" }` },
+    ],
+  },
+  {
+    id: "playground-start",
+    group: "autotrain",
+    method: "POST",
+    path: "/v1/training-runs/:id/playground/start",
+    title: "Try-it: load a persistent worker",
+    description: <>Load the run&apos;s model into a long-lived worker on its VM (served over a Unix socket) so subsequent <code>transcribe</code> / <code>synthesize</code> calls skip the per-request model load. Returns immediately — poll <code>…/playground/status</code> until <code>ready</code>. Auto-unloads after <code>idle_minutes</code> with no requests.</>,
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Run id." },
+      { name: "gpu", in: "query", type: "string", doc: 'GPU index, "cpu", or "auto".' },
+      { name: "idle_minutes", in: "query", type: "number", doc: "Auto-unload after this many idle minutes (0 = never). Default 5, max 120." },
+    ],
+    request: { sample: `curl -s -X POST "$SGPU/v1/training-runs/train-1a2b3c4d/playground/start?gpu=auto&idle_minutes=10" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", doc: "Loading started — poll status until ready:true.", sample: `{ "running": true, "ready": false, "device": null, "kind": null, "logs": ["[server] loading asr model on cuda …"] }` }],
+  },
+  {
+    id: "playground-status",
+    group: "autotrain",
+    method: "GET",
+    path: "/v1/training-runs/:id/playground/status",
+    title: "Try-it: worker status",
+    description: <>Whether the persistent worker is running and <code>ready</code>, with <code>kind</code> (asr / tts) and a tail of its load/serve log (granular load progress).</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Run id." }],
+    request: { sample: `curl -s "$SGPU/v1/training-runs/train-1a2b3c4d/playground/status" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "running": true, "ready": true, "device": "cuda", "kind": "tts", "logs": ["[server] loaded tts model in 16.8s — ready on cuda"] }` }],
+  },
+  {
+    id: "playground-stop",
+    group: "autotrain",
+    method: "POST",
+    path: "/v1/training-runs/:id/playground/stop",
+    title: "Try-it: unload the worker",
+    description: <>Stop the persistent worker and free its GPU (SIGTERM its process group).</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Run id." }],
+    request: { sample: `curl -s -X POST "$SGPU/v1/training-runs/train-1a2b3c4d/playground/stop" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "running": false, "ready": false, "device": null, "kind": null, "logs": [] }` }],
+  },
 
   // ───── Compute pods ─────
   {

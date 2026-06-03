@@ -809,6 +809,27 @@ export type VmAvailability = {
   checked_at: number;
 };
 
+// Live VM host metrics (CPU / memory / per-GPU), polled + graphed (not persisted).
+export type ProviderGpuMetric = {
+  index: number;
+  name: string;
+  util_pct: number;
+  mem_used_mib: number;
+  mem_total_mib: number;
+  temp_c: number;
+};
+
+export type ProviderMetrics = {
+  ok: boolean;
+  message: string;
+  cpu_pct: number; // overall CPU busy %, -1 if unavailable
+  cpu_cores: number[]; // per-core busy % (htop-style)
+  mem_used_mib: number;
+  mem_total_mib: number;
+  gpus: ProviderGpuMetric[];
+  checked_at: number;
+};
+
 // ---- Admin: roles + audit ----
 
 export type SectionKey = "inference" | "benchmark" | "compute" | "datasets";
