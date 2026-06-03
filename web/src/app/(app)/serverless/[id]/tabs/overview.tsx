@@ -128,7 +128,7 @@ function VmServingCard({ app }: { app: AppRecord }) {
 // tensor-parallel size + extra args. Editable inline — click "Edit" to add /
 // remove models, change TP, or rewrite args, then "Save" re-provisions the
 // worker (in-flight requests drain first) via PATCH /apps/{id}/models.
-type ModelRow = { model: string; tp: number; pp: number; extra_args: string; gpus: string };
+type ModelRow = { model: string; tp: number; pp: number; extra_args: string; gpus: string; audio: boolean };
 
 const TP_CHOICES = [1, 2, 4, 8];
 
@@ -139,6 +139,7 @@ function toRows(models: AppRecord["models"]): ModelRow[] {
     pp: m.pp ?? 1,
     extra_args: m.extra_args ?? "",
     gpus: (m.gpu_indices ?? []).join(","),
+    audio: m.task === "transcription",
   }));
 }
 
@@ -187,14 +188,14 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
   }
   const update = (i: number, patch: Partial<ModelRow>) =>
     setRows((rs) => rs.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
-  const addRow = () => setRows((rs) => [...rs, { model: "", tp: 1, pp: 1, extra_args: "", gpus: "" }]);
+  const addRow = () => setRows((rs) => [...rs, { model: "", tp: 1, pp: 1, extra_args: "", gpus: "", audio: false }]);
   const removeRow = (i: number) => setRows((rs) => rs.filter((_, idx) => idx !== i));
 
   async function save() {
     setSaving(true);
     setErr(null);
     setMsg(null);
-    let payload: Array<{ model: string; tp: number; pp: number; extra_args: string; gpu_indices?: number[] }>;
+    let payload: Array<{ model: string; tp: number; pp: number; extra_args: string; gpu_indices?: number[]; task?: string }>;
     try {
       payload = rows
         .filter((r) => r.model.trim())
@@ -207,6 +208,7 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
             pp,
             extra_args: r.extra_args.trim(),
             ...(gpu_indices ? { gpu_indices } : {}),
+            ...(r.audio ? { task: "transcription" } : {}),
           };
         });
     } catch (e) {
@@ -399,7 +401,7 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
                       <Trash2 className="h-3.5 w-3.5" />
                     </Button>
                   </div>
-                  <div className="px-3 py-2">
+                  <div className="space-y-2 px-3 py-2">
                     <Textarea
                       value={r.extra_args}
                       onChange={(e) => update(i, { extra_args: cleanVllmArgs(e.target.value) })}
@@ -408,6 +410,19 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
                       rows={2}
                       className="font-mono text-[11px] leading-relaxed"
                     />
+                    <label
+                      className="flex w-fit cursor-pointer select-none items-center gap-1.5 text-[11px] text-muted-foreground"
+                      title="Marks this as an audio/ASR (Whisper) model so the worker installs audio-decode deps. Set it for ASR finetunes whose name doesn't say 'whisper'."
+                    >
+                      <input
+                        type="checkbox"
+                        checked={r.audio}
+                        onChange={(e) => update(i, { audio: e.target.checked })}
+                        disabled={saving}
+                        className="h-3.5 w-3.5 accent-primary"
+                      />
+                      Audio / ASR model (Whisper) — enables transcription
+                    </label>
                   </div>
                 </div>
               );

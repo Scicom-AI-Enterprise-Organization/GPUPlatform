@@ -168,6 +168,57 @@ async def ensure_vllm(venv_path: str | None, vllm_version: str | None) -> None:
         logger.exception("vllm ensure failed (continuing — launch will validate)")
 
 
+# Heuristic for "this member is a Whisper/ASR transcription model" — used to pull
+# in vLLM's audio-decode deps. Errs toward matching (a false positive just means a
+# harmless extra install).
+_AUDIO_MODEL_RE = re.compile(r"whisper|asr|transcrib|speech[-_]?to[-_]?text", re.I)
+
+
+def is_audio_model(member) -> bool:
+    """A member is audio/ASR if it's explicitly tagged `task="transcription"` (the
+    reliable signal — works for any model name, incl. custom finetunes) OR its id
+    matches the Whisper-family name heuristic (convenience for the common case)."""
+    if getattr(member, "task", None) == "transcription":
+        return True
+    model = getattr(member, "model", None)
+    return bool(model and _AUDIO_MODEL_RE.search(model))
+
+
+async def ensure_audio_deps(venv_path: str | None, members) -> None:
+    """If any member is a transcription/ASR model (Whisper), make sure vLLM's
+    audio-decode deps are in the venv. Without them vLLM rejects every clip with
+    'Invalid or unsupported audio file', even valid WAVs. Best-effort + idempotent,
+    like ensure_vllm.
+
+    `soundfile` (bundled libsndfile ≥1.1) covers wav/flac/ogg/mp3; `resampy` is
+    what vLLM's loader uses to resample to the model's 16 kHz (without it, any
+    non-16 kHz clip fails — only same-rate WAVs slip through); `av` (PyAV, which
+    bundles ffmpeg libraries) is vLLM's fallback decoder for m4a/aac/webm/video.
+    vLLM uses PyAV — NOT the system `ffmpeg` binary — so this is fully
+    pip-installable into the uv venv. This is the `vllm[audio]` extra set."""
+    if not venv_path or not any(is_audio_model(m) for m in members):
+        return
+    py = f"{venv_path}/bin/python"
+    if not os.path.exists(py):
+        logger.warning("venv_path %s has no bin/python — skipping audio-deps ensure", venv_path)
+        return
+    cmd = ["uv", "pip", "install", "--python", py, "librosa", "soundfile", "resampy", "av"]
+    logger.info("ensuring audio deps (librosa, soundfile) in %s for a transcription model", venv_path)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning("audio deps ensure rc=%s: %s", proc.returncode, (out or b"").decode("utf-8", "replace")[-500:])
+        else:
+            logger.info("audio deps present in %s", venv_path)
+    except FileNotFoundError:
+        logger.warning("`uv` not found on PATH — cannot ensure audio deps; whisper members will reject audio")
+    except Exception:
+        logger.exception("audio deps ensure failed (continuing — launch will validate)")
+
+
 # Definitive "this launch is doomed" markers. Seeing any of these in the log
 # means the engine won't recover, so we abort the health wait immediately rather
 # than block the whole startup for the full 900s timeout (which is what happens

@@ -33,6 +33,7 @@ class MemberModel:
     extra_args: list[str] = field(default_factory=list)
     sleep_level: int = 1
     pp: int = 1                     # pipeline-parallel size; GPUs needed = tp * pp
+    task: str | None = None         # "transcription" → audio/ASR model (drives audio-dep install)
 
     @property
     def base_url(self) -> str:
@@ -109,6 +110,7 @@ def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiMo
             gpu_indices=idxs,
             extra_args=extra_list,
             sleep_level=int(m.get("sleep_level") or default_level),
+            task=((m.get("task") or "").strip().lower() or None),
         ))
     return MultiModelConfig(
         total_gpus=total,

@@ -48,6 +48,42 @@ The user has been told this multiple times and may push back. Per
 `feedback_just_do_it.md`: don't re-litigate. State the constraint once, do what
 they ask, move on.
 
+### Serving Whisper / audio (ASR) on the serverless fleet
+
+The fleet serves **Whisper** via the OpenAI-compatible **`/v1/audio/transcriptions`** and
+**`/v1/audio/translations`** (global + scoped `/{app_id}/v1/audio/...`). The job queue is
+JSON-only, so the gateway base64s the uploaded clip into the payload and the **worker rebuilds
+the multipart** request for vLLM (`worker-agent/worker_agent/main.py` `handle()`). Use it from an
+endpoint's **Playground → mode: Audio transcription** (a Chat/Audio toggle on the Playground tab —
+not a separate tab; its model dropdown lists *every* member so any name works, and it keeps its own
+per-browser transcription history alongside the chat history), or:
+`curl -F file=@clip.mp3 -F model=<model> -H "Authorization: Bearer sgpu_…" $GW/<app_id>/v1/audio/transcriptions`
+
+Three things silently break audio if missing — check these first when transcription fails:
+- **Gateway venv needs `python-multipart`** (now in `gateway/pyproject.toml`). Without it FastAPI
+  refuses to boot once the `Form`/`File` routes exist — the gateway crashes on start.
+- **vLLM venv needs `librosa soundfile resampy av`** (the `vllm[audio]` set — all pip, **NO system
+  ffmpeg**; vLLM decodes via soundfile + PyAV). `resampy` is the sneaky one: without it any
+  non-16 kHz clip fails as `"Invalid or unsupported audio file"` while a 16 kHz WAV slips through
+  (looks like an mp3/codec bug — it isn't). `launcher.ensure_audio_deps()` auto-installs these for
+  any audio member on (re)provision.
+- **Tag ASR models** with the per-member **"Audio / ASR (Whisper)" checkbox** (create form +
+  Overview → Models → Edit) → stores `task: "transcription"`. Required for ASR finetunes whose name
+  doesn't contain "whisper" (a name heuristic auto-covers `whisper-*`); the worker installs audio
+  deps when `task=="transcription"` OR the name matches.
+
+To add Whisper to an existing fleet: **Overview → Models → Edit → add the member (TP=1), check
+Audio, Save** — that re-provisions and re-ships the worker-agent + ensures the audio deps. (A
+member needs a GPU slot; small fleets time-share via sleep/wake. Sleep-mode works fine with Whisper.)
+
+### Testing the gateway locally (current `.env` reality)
+
+`gateway/.env` is currently `AUTH_DISABLED=0` + `GATEWAY_RELOAD=0` (despite older notes saying
+auth-disabled): backend edits need a **manual gateway restart**, and API calls need **real auth**.
+For testing, send an **API key** as `Authorization: Bearer sgpu_…` — do **not** write Redis
+`session:<token>` keys to forge a session (that's exactly the prod-Redis-exposure risk; the user
+flagged it). No active training run? a gateway restart is safe — runs detach and finalize from log.
+
 ### What NOT to do
 
 - Don't suggest `docker compose up gateway` to test backend changes — the compose

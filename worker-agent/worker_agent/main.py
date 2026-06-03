@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -32,6 +33,11 @@ async def register(gateway_url: str, machine_id: str, app_id: str, token: str) -
     raise RuntimeError("gateway never accepted registration after 30 attempts")
 
 
+# OpenAI-compatible audio endpoints take a multipart file upload, so the worker
+# rebuilds multipart from the base64'd clip the gateway put in the JSON payload.
+AUDIO_PATHS = ("/v1/audio/transcriptions", "/v1/audio/translations")
+
+
 async def handle(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/completions", base_url: str | None = None) -> Any:
     """Run a unary (non-streaming) request.
 
@@ -55,7 +61,16 @@ async def handle(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/c
         url = base_url or os.environ.get("VLLM_URL", "http://localhost:8000")
         async with httpx.AsyncClient(timeout=300.0) as client:
             try:
-                r = await client.post(f"{url}{endpoint}", json=payload)
+                if endpoint in AUDIO_PATHS:
+                    # Audio endpoints (Whisper) take multipart/form-data, not JSON.
+                    # The gateway base64'd the clip into the payload (the queue is
+                    # JSON-only); rebuild the multipart upload vLLM expects.
+                    audio = base64.b64decode(payload["_audio_b64"])
+                    files = {"file": (payload.get("_filename") or "audio.wav", audio)}
+                    data = {"model": payload["model"], **(payload.get("_form") or {})}
+                    r = await client.post(f"{url}{endpoint}", files=files, data=data)
+                else:
+                    r = await client.post(f"{url}{endpoint}", json=payload)
                 r.raise_for_status()
                 return r.json()
             except httpx.HTTPError as e:

@@ -228,6 +228,9 @@ class MultiModelScheduler:
         # Ensure the requested vLLM version is present in the venv before any
         # model launches (no-op when venv_path/vllm_version aren't set).
         await launcher.ensure_vllm(self.cfg.venv_path, self.cfg.vllm_version)
+        # Whisper/ASR members need vLLM's audio-decode deps (librosa, soundfile) or
+        # every clip is rejected as "Invalid or unsupported audio file".
+        await launcher.ensure_audio_deps(self.cfg.venv_path, self.cfg.members)
         # Load in WAVES: each wave is a set of mutually NON-overlapping members
         # (disjoint gpu_indices) loaded concurrently; waves run in sequence. On
         # 6 GPUs this loads qwen[0,1] + 35B[2,3] + gemma[4,5] all at once, then

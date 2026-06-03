@@ -28,6 +28,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { TranscribeTab } from "./transcribe";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -66,7 +67,28 @@ export function RequestsTab({ app, appId }: { app?: AppRecord; appId?: string } 
   // back to app_id from props or the URL. Hook is called unconditionally.
   const fromPath = useAppIdFromPath();
   const resolvedAppId = app?.app_id ?? appId ?? fromPath;
-  return resolvedAppId ? <RequestsTabInner appId={resolvedAppId} app={app} /> : null;
+  // Chat vs audio (Whisper) mode. Always offered — model names can be anything
+  // (a custom ASR finetune won't match a "whisper" heuristic), so the audio mode
+  // and its model dropdown list every member; you pick whichever is your ASR model.
+  const [mode, setMode] = useState<"chat" | "audio">("chat");
+  if (!resolvedAppId) return null;
+  const chat = <RequestsTabInner appId={resolvedAppId} app={app} />;
+  if (!app) return chat; // no app record → no member list for the audio dropdown
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground">mode</span>
+        <Select value={mode} onValueChange={(v) => setMode(v as "chat" | "audio")}>
+          <SelectTrigger className="h-8 w-[240px] text-xs"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="chat" className="text-xs">Chat / text generation</SelectItem>
+            <SelectItem value="audio" className="text-xs">Audio transcription (Whisper)</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      {mode === "chat" ? chat : <TranscribeTab app={app} />}
+    </div>
+  );
 }
 
 function useAppIdFromPath(): string {

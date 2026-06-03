@@ -345,6 +345,66 @@ const ENDPOINTS: Endpoint[] = [
     ],
   },
   {
+    id: "audio-transcriptions",
+    group: "inference",
+    method: "POST",
+    path: "/v1/audio/transcriptions",
+    title: "Audio transcriptions (Whisper)",
+    description: (
+      <>
+        <p>OpenAI-compatible speech-to-text for a Whisper / ASR endpoint. This is <strong>multipart/form-data</strong> (a file upload), not JSON. Set <code>model</code> to the endpoint name (single-model) or a member model name (multi-model). Scope to one endpoint via <code>{`<base>/<endpoint>/v1/audio/transcriptions`}</code>.</p>
+        <p className="mt-2 text-xs text-muted-foreground">Supports wav/flac/ogg/mp3 (and m4a/webm). Max 25 MB.</p>
+      </>
+    ),
+    parameters: [
+      { name: "file", in: "body", type: "binary", required: true, doc: "Audio clip (multipart form field)." },
+      { name: "model", in: "body", type: "string", required: true, doc: "Endpoint name (single) or member model (multi)." },
+      { name: "language", in: "body", type: "string", doc: "ISO code (e.g. en, ms) — omit to auto-detect." },
+      { name: "prompt", in: "body", type: "string", doc: "Optional decoding prompt." },
+      { name: "response_format", in: "body", type: "string", doc: "json (default) | text | verbose_json | …" },
+      { name: "temperature", in: "body", type: "number", doc: "Sampling temperature." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/my-endpoint/v1/audio/transcriptions" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" \\
+  -F file=@clip.wav -F model=openai/whisper-large-v3-turbo -F language=en`,
+    },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "text": "hello world" }` },
+      { code: 400, codeLabel: "Bad Request", doc: "Empty upload, or the model isn't served by this endpoint.", sample: `{ "detail": { "error": "missing 'model' field in request" } }` },
+      { code: 413, codeLabel: "Too Large", doc: "Clip exceeds 25 MB.", sample: `{ "detail": { "error": "audio too large (max 25 MB)" } }` },
+      { code: 504, codeLabel: "Timeout", doc: "No result in 120s — the Whisper member is probably cold-starting / waking.", sample: `{ "detail": { "error": "no completion in 120s — worker probably cold-starting", "request_id": "req-…" } }` },
+    ],
+  },
+  {
+    id: "audio-translations",
+    group: "inference",
+    method: "POST",
+    path: "/v1/audio/translations",
+    title: "Audio translations (Whisper → English)",
+    description: (
+      <>
+        <p>Same as transcriptions, but the output is translated to English. <strong>multipart/form-data</strong>. Scope to one endpoint via <code>{`<base>/<endpoint>/v1/audio/translations`}</code>.</p>
+      </>
+    ),
+    parameters: [
+      { name: "file", in: "body", type: "binary", required: true, doc: "Audio clip (multipart form field)." },
+      { name: "model", in: "body", type: "string", required: true, doc: "Endpoint name (single) or member model (multi)." },
+      { name: "prompt", in: "body", type: "string", doc: "Optional decoding prompt." },
+      { name: "response_format", in: "body", type: "string", doc: "json (default) | text | …" },
+      { name: "temperature", in: "body", type: "number", doc: "Sampling temperature." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/my-endpoint/v1/audio/translations" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" \\
+  -F file=@clip.wav -F model=openai/whisper-large-v3-turbo`,
+    },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "text": "the content of the letter" }` },
+      { code: 400, codeLabel: "Bad Request", doc: "Empty upload, or the model isn't served by this endpoint.", sample: `{ "detail": { "error": "missing 'model' field in request" } }` },
+    ],
+  },
+  {
     id: "completions",
     group: "inference",
     method: "POST",

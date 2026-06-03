@@ -180,8 +180,8 @@ export function InferenceForm() {
   const [runpodProviderId, setRunpodProviderId] = useState<string>("");
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [vllm, setVllm] = useState({ ...DEFAULT_VLLM_ARGS });
-  const [members, setMembers] = useState<{ model: string; tp: number; pp: number; extra_args: string; gpus: string }[]>([
-    { model: "", tp: 1, pp: 1, extra_args: "", gpus: "" },
+  const [members, setMembers] = useState<{ model: string; tp: number; pp: number; extra_args: string; gpus: string; audio: boolean }[]>([
+    { model: "", tp: 1, pp: 1, extra_args: "", gpus: "", audio: false },
   ]);
   const [sleepLevel, setSleepLevel] = useState<1 | 2>(1);
   // VM-only: pin to specific physical GPU ids, e.g. "0,1,2,3". Empty = all GPUs.
@@ -353,7 +353,7 @@ export function InferenceForm() {
         vdIds.length > 0 && !vdInvalid
           ? new Set(vdIds)
           : new Set(Array.from({ length: vmGpuCount }, (_, k) => k));
-      const modelsPayload: { model: string; tp: number; pp: number; extra_args: string; gpu_indices?: number[] }[] = [];
+      const modelsPayload: { model: string; tp: number; pp: number; extra_args: string; gpu_indices?: number[]; task?: "transcription" }[] = [];
       for (let i = 0; i < members.length; i++) {
         const raw = members[i];
         const mdl = raw.model.trim();
@@ -392,6 +392,7 @@ export function InferenceForm() {
           pp,
           extra_args: raw.extra_args.trim(),
           ...(gpu_indices ? { gpu_indices } : {}),
+          ...(raw.audio ? { task: "transcription" } : {}),
         });
       }
       const body: DeployArg = {
@@ -845,7 +846,7 @@ export function InferenceForm() {
               <div className="space-y-4">
                 <Field
                   label="Models"
-                  hint={`Each model has its own TP × PP (set by the dropdowns — don't add --tensor-parallel-size / --pipeline-parallel-size; it uses tp×pp GPUs, e.g. TP=2 × PP=3 = 6), its own GPU ids (pre-filled with a suggestion — edit to pin, e.g. 0,1,2,3 or 3,4,5,6), and its own vLLM args (e.g. --reasoning-parser / --tool-call-parser). Models on disjoint GPUs stay resident together; overlapping ones swap in via sleep/wake.`}
+                  hint={`Each model has its own TP × PP (set by the dropdowns — don't add --tensor-parallel-size / --pipeline-parallel-size; it uses tp×pp GPUs, e.g. TP=2 × PP=3 = 6), its own GPU ids (pre-filled with a suggestion — edit to pin, e.g. 0,1,2,3 or 3,4,5,6), and its own vLLM args (e.g. --reasoning-parser / --tool-call-parser). Models on disjoint GPUs stay resident together; overlapping ones swap in via sleep/wake. Whisper/ASR models (e.g. openai/whisper-large-v3-turbo) work too — use TP=1; they're served via /v1/audio/transcriptions and get a Transcribe tab.`}
                   required
                 >
                   <div className="space-y-2">
@@ -928,6 +929,17 @@ export function InferenceForm() {
                                 : `suggested: ${memberSuggestions[i]}`}
                             </span>
                           )}
+                          <label className="ml-auto flex cursor-pointer select-none items-center gap-1.5 text-[11px] text-muted-foreground" title="Marks this as an audio/ASR (Whisper) model so the worker installs audio-decode deps. Set it for ASR finetunes whose name doesn't say 'whisper'.">
+                            <input
+                              type="checkbox"
+                              checked={m.audio}
+                              onChange={(e) =>
+                                setMembers((arr) => arr.map((x, j) => (j === i ? { ...x, audio: e.target.checked } : x)))
+                              }
+                              className="h-3.5 w-3.5 accent-primary"
+                            />
+                            Audio / ASR (Whisper)
+                          </label>
                         </div>
                         <Input
                           className="bg-muted/50 font-mono text-xs"
@@ -944,7 +956,7 @@ export function InferenceForm() {
                   </div>
                   <button
                     type="button"
-                    onClick={() => setMembers((arr) => [...arr, { model: "", tp: 1, pp: 1, extra_args: "", gpus: "" }])}
+                    onClick={() => setMembers((arr) => [...arr, { model: "", tp: 1, pp: 1, extra_args: "", gpus: "", audio: false }])}
                     className="mt-2 text-xs text-primary hover:underline"
                   >
                     + Add model

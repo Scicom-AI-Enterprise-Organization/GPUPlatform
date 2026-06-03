@@ -16,6 +16,10 @@ export type MultiModelMember = {
   // Optional explicit GPU pin (physical ids within visible_devices, len == tp*pp).
   // null/omitted = auto-pack into the next free (tp*pp)-wide slot.
   gpu_indices?: number[] | null;
+  // "transcription" → an audio/ASR (Whisper-family) model. Drives the audio-dep
+  // install on the worker + the audio playground; set it for ASR models whose
+  // name doesn't obviously say "whisper". Omitted/"generate" = a text model.
+  task?: "generate" | "transcription" | null;
 };
 
 export type ServingMode = "single" | "multi";

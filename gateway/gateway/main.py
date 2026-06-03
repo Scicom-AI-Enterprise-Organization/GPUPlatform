@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ from typing import Any, Optional
 import redis.asyncio as redis_async
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
@@ -73,6 +74,9 @@ class MultiModelMember(BaseModel):
     tp: int = 1                 # tensor-parallel size
     pp: int = 1                 # pipeline-parallel size; GPUs this model needs = tp * pp
     extra_args: str = ""        # per-model vLLM CLI args
+    # "transcription" marks an audio/ASR (Whisper) model so the worker installs the
+    # audio decode deps for it (name-independent — works for custom finetunes).
+    task: Optional[str] = None
     # Optional explicit GPU pin: the physical ids (within `visible_devices`) this
     # model runs on, e.g. [0,1,2,3]. len must == tp * pp. None/empty = auto-pack
     # into the next free (tp*pp)-wide slot. Models with disjoint pins load
@@ -2716,6 +2720,157 @@ async def openai_list_models_scoped(app_id: str, session: AsyncSession = Depends
     else:
         data.append({"id": app.app_id, "object": "model", "created": created, "owned_by": app.app_id})
     return {"object": "list", "data": data}
+
+
+# ----- OpenAI-compatible AUDIO routes (Whisper: transcriptions / translations) -----
+# These take multipart/form-data (a file upload), not JSON. The queue carries JSON
+# only, so we base64 the clip into the job payload under `_audio_b64`; the worker
+# rebuilds the multipart request for vLLM (see worker_agent.main.handle). Unary
+# only — transcription returns one JSON body, no streaming here.
+
+_AUDIO_MAX_BYTES = 25 * 1024 * 1024
+
+
+async def _build_audio_payload(file: UploadFile, model: str, **form) -> dict:
+    """Read + cap the uploaded clip, base64 it, and assemble the queue payload.
+    `form` holds the optional OpenAI fields (language/prompt/response_format/…) —
+    only the non-None ones are forwarded to vLLM."""
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail={"error": "empty audio upload"})
+    if len(data) > _AUDIO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail={"error": "audio too large (max 25 MB)"})
+    return {
+        "model": model,
+        "_audio_b64": base64.b64encode(data).decode(),
+        "_filename": file.filename or "audio.wav",
+        "_form": {k: v for k, v in form.items() if v is not None},
+    }
+
+
+async def _openai_audio_endpoint(
+    request: Request,
+    db_session: AsyncSession,
+    user: User,
+    payload: dict,
+    vllm_path: str,
+    explicit_app_id: Optional[str] = None,
+):
+    """Resolve the endpoint/model, enqueue the audio job, and (unary) wait for the
+    worker's result. Mirrors `_openai_endpoint` but with a longer deadline — a cold
+    Whisper member may need to load/wake before it can transcribe."""
+    rdb = request.app.state.redis
+    model_field = payload.get("model")
+    if explicit_app_id is not None:
+        app_id, target_model = await _resolve_endpoint_path(db_session, user, explicit_app_id, model_field)
+    else:
+        if not model_field:
+            raise HTTPException(status_code=400, detail={"error": "missing 'model' field in request"})
+        app_id, target_model = await _resolve_model_to_app(db_session, user, model_field)
+
+    request_id, _timeout_s = await _admit_and_enqueue(
+        rdb, db_session, app_id, user, payload, stream=False, endpoint=vllm_path,
+        target_model=target_model,
+    )
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        blob = await rdb.get(f"result:{request_id}")
+        if blob:
+            raw = json.loads(blob)
+            status = raw.get("status")
+            if status == "completed":
+                await _mirror_status_to_db(db_session, request_id, "completed", raw.get("output"))
+                return raw.get("output", {})
+            if status in ("timeout", "cancelled", "failed"):
+                await _mirror_status_to_db(db_session, request_id, status, raw.get("output"))
+                raise HTTPException(status_code=504, detail=raw.get("output"))
+        await asyncio.sleep(0.2)
+    await _mirror_status_to_db(
+        db_session, request_id, "timeout",
+        {"error": "no completion in 120s — worker probably cold-starting / waking the model"},
+    )
+    raise HTTPException(
+        status_code=504,
+        detail={"error": "no completion in 120s — worker probably cold-starting; retry", "request_id": request_id},
+    )
+
+
+@app.post("/v1/audio/transcriptions")
+async def openai_audio_transcriptions(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(None),
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    payload = await _build_audio_payload(
+        file, model, language=language, prompt=prompt,
+        response_format=response_format, temperature=temperature,
+    )
+    return await _openai_audio_endpoint(request, session, user, payload, "/v1/audio/transcriptions")
+
+
+@app.post("/v1/audio/translations")
+async def openai_audio_translations(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(None),
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    payload = await _build_audio_payload(
+        file, model, prompt=prompt, response_format=response_format, temperature=temperature,
+    )
+    return await _openai_audio_endpoint(request, session, user, payload, "/v1/audio/translations")
+
+
+@app.post("/{app_id}/v1/audio/transcriptions")
+async def openai_audio_transcriptions_scoped(
+    app_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(None),
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    payload = await _build_audio_payload(
+        file, model, language=language, prompt=prompt,
+        response_format=response_format, temperature=temperature,
+    )
+    return await _openai_audio_endpoint(
+        request, session, user, payload, "/v1/audio/transcriptions", explicit_app_id=app_id
+    )
+
+
+@app.post("/{app_id}/v1/audio/translations")
+async def openai_audio_translations_scoped(
+    app_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(None),
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    payload = await _build_audio_payload(
+        file, model, prompt=prompt, response_format=response_format, temperature=temperature,
+    )
+    return await _openai_audio_endpoint(
+        request, session, user, payload, "/v1/audio/translations", explicit_app_id=app_id
+    )
 
 
 # ----- workers (machine auth, not user auth) -----

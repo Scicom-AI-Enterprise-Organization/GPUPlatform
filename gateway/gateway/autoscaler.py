@@ -101,6 +101,7 @@ def build_multi_model_config(app) -> dict:
             "gpu_indices": gpu_indices,
             "extra_args": (m.get("extra_args", "") or ""),
             "sleep_level": default_level,
+            "task": (m.get("task") or None),
         })
         port += 1
     return {
