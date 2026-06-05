@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import signal
+import time
 import uuid
 from typing import Any
 
@@ -12,6 +13,45 @@ import redis.asyncio as redis_async
 from dotenv import load_dotenv
 
 logger = logging.getLogger("worker-agent")
+
+# Resilient redis client kwargs. The worker's redis (a public ELB) occasionally
+# times out; a bare client throws on every blip, which crashed the worker (the
+# unguarded startup ping) and churned the fleet. Bound socket ops, health-check
+# the connection, and auto-retry connection/timeout errors on EVERY command.
+_REDIS_KW: dict[str, Any] = dict(
+    decode_responses=True,
+    socket_connect_timeout=10,
+    socket_timeout=20,
+    socket_keepalive=True,
+    health_check_interval=30,
+    retry_on_timeout=True,
+)
+try:  # full retry policy (retries ConnectionError too) — best-effort across redis-py versions
+    from redis.asyncio.retry import Retry as _Retry
+    from redis.backoff import ExponentialBackoff as _ExpBackoff
+    from redis.exceptions import ConnectionError as _RedisConnErr, TimeoutError as _RedisTOErr
+    _REDIS_KW["retry"] = _Retry(_ExpBackoff(cap=10, base=0.5), retries=10)
+    _REDIS_KW["retry_on_error"] = [_RedisConnErr, _RedisTOErr]
+except Exception:  # noqa: BLE001 — older redis-py: socket timeouts + retry_on_timeout still apply
+    pass
+
+
+async def _redis_ready(rdb, *, timeout_s: float = 120.0) -> None:
+    """Wait for redis to answer, retrying transient blips with backoff. Crashing on
+    a startup blip just spawns a replacement that hits the same blip (crash-loop) —
+    so retry for up to timeout_s, then give up (genuinely-down redis still fails)."""
+    deadline = time.monotonic() + timeout_s
+    delay = 0.5
+    while True:
+        try:
+            await rdb.ping()
+            return
+        except Exception as e:  # noqa: BLE001
+            if time.monotonic() >= deadline:
+                raise
+            logger.warning("redis not ready (%s) — retrying in %.1fs", e, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10.0)
 
 
 async def register(gateway_url: str, machine_id: str, app_id: str, token: str) -> str:
@@ -465,7 +505,7 @@ async def main_async() -> None:
     redis_url = await register(gateway_url, machine_id, app_id, token)
     logger.info("registered with gateway, redis=%s", redis_url)
 
-    rdb = redis_async.from_url(redis_url, decode_responses=True)
+    rdb = redis_async.from_url(redis_url, **_REDIS_KW)
     drain_event = asyncio.Event()
     # Drain gracefully on SIGTERM/SIGINT so the `finally` runs sched.shutdown(),
     # which group-kills every vLLM engine + its tp workers. Without this, the
@@ -484,7 +524,7 @@ async def main_async() -> None:
         return
 
     try:
-        await rdb.ping()
+        await _redis_ready(rdb)
         hb_task = asyncio.create_task(
             heartbeat_loop(gateway_url, machine_id, app_id, drain_event)
         )
@@ -570,7 +610,7 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     ))
     monitor_task = asyncio.create_task(sched.monitor_loop(drain_event))
     try:
-        await rdb.ping()
+        await _redis_ready(rdb)
         await sched.start()
         await multi_poll_loop(rdb, f"queue:{app_id}", machine_id, sched, drain_event)
     finally:

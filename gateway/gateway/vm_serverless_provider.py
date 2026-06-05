@@ -221,14 +221,17 @@ class VMProvider(Provider):
                 '    base="${cfg%.json}"; name="$(basename "$base")"; mid="${name#worker-}"; '
                 '    pid="$(cat "$base.pid" 2>/dev/null)"; '
                 '    if [ -n "$pid" ]; then kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; fi; '
-                f'    {REMOTE_DIR}/venv/bin/python -m worker_agent.multi.cleanup "$base.enginepids" 2>/dev/null || true; '
                 '    pkill -9 -f "$name.json" 2>/dev/null || true; '
+                # Only pay the python-startup cost to reap engines for workers that
+                # actually recorded some (most crash-loop workers die at redis-ping
+                # BEFORE launching vLLM → empty/absent enginepids → skip).
+                f'    if [ -s "$base.enginepids" ]; then {REMOTE_DIR}/venv/bin/python -m worker_agent.multi.cleanup "$base.enginepids" 2>/dev/null || true; fi; '
                 '    rm -f "$base.json" "$base.pid" "$base.log" "$base.enginepids"; '
                 '    echo "PURGED $mid"; '
                 "  fi; "
                 "done"
             )
-            out = self._run(client, f"bash -lc {shlex.quote(script)}")
+            out = self._run(client, f"bash -lc {shlex.quote(script)}", timeout=110)
             return [ln.split(" ", 1)[1].strip() for ln in out.splitlines() if ln.startswith("PURGED ")]
         finally:
             try:
@@ -454,8 +457,8 @@ class VMProvider(Provider):
                 pass
 
     @staticmethod
-    def _run(client, cmd: str) -> str:
-        _, stdout, _ = client.exec_command(cmd, timeout=SSH_TIMEOUT_S)
+    def _run(client, cmd: str, timeout: float = SSH_TIMEOUT_S) -> str:
+        _, stdout, _ = client.exec_command(cmd, timeout=timeout)
         stdout.channel.recv_exit_status()
         return stdout.read().decode(errors="replace")
 

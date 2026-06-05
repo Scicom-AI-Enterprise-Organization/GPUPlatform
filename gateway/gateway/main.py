@@ -1840,17 +1840,22 @@ async def purge_app_workers(
     worker; if it was, it stays down until Redeploy."""
     await _load_owned_app(session, app_id, user)
     rdb = request.app.state.redis
-    terminated = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
+    tracked = len(await rdb.smembers(f"worker_index:{app_id}"))
     provider = await _provider_for_app(session, app_id, user, request.app.state)
     purged = 0
     if provider is not None:
+        # purge_app does the whole cleanup (kill processes + sweep on-disk state +
+        # clear redis) in a SINGLE SSH connection. We deliberately DON'T call
+        # _reprovision_workers first — that opens one 20s-timeout SSH per machine,
+        # which with crash-loop churn (dozens of stale machines) blows past the
+        # client timeout. The hard sweep covers tracked + orphan + stale alike.
         try:
             purged = await provider.purge_app(app_id)
         except Exception:
             logger.exception("purge workers app=%s: provider.purge_app failed", app_id)
             raise HTTPException(status_code=502, detail={"error": "purge failed on the provider — see gateway logs"})
-    logger.info("purge workers app=%s by user=%s: terminated=%d purged=%d", app_id, user.username, terminated, purged)
-    return {"ok": True, "app_id": app_id, "terminated": terminated, "purged": purged}
+    logger.info("purge workers app=%s by user=%s: tracked=%d purged=%d", app_id, user.username, tracked, purged)
+    return {"ok": True, "app_id": app_id, "terminated": tracked, "purged": purged}
 
 
 @app.patch("/apps/{app_id}/models", response_model=AppRecord)
