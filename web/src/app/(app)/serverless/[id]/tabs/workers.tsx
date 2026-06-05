@@ -478,7 +478,8 @@ const LEVEL_BADGES: Record<string, string> = {
 
 type FleetModel = {
   model: string;
-  state: string;        // launching | awake | asleep | dead | …
+  state: string;        // queued | launching | awake | asleep | dead | …
+  queue_ahead?: number; // when state === "queued": models loading ahead of it
   inflight?: number;
   gpus?: number[];
   tp?: number;
@@ -491,9 +492,19 @@ type FleetStatus = { workers: number; models: FleetModel[]; paused?: boolean };
 const FLEET_STATE_STYLES: Record<string, string> = {
   awake:     "bg-status-active/15 text-status-active",
   launching: "bg-status-idle/15 text-status-idle",
+  queued:    "bg-muted text-muted-foreground",
   asleep:    "bg-muted text-muted-foreground",
   dead:      "bg-status-down/15 text-status-down",
 };
+
+/** Label for a fleet member's state badge — queued models show their place in line. */
+function fleetStateLabel(m: FleetModel): string {
+  if (m.state === "queued") {
+    const n = m.queue_ahead ?? 0;
+    return n > 0 ? `queued (${n} ahead)` : "queued";
+  }
+  return m.state;
+}
 
 function MultiModelFleet({ app }: { app: AppRecord }) {
   const [status, setStatus] = useState<FleetStatus | null>(null);
@@ -765,7 +776,7 @@ function FleetModelRow({
             FLEET_STATE_STYLES[m.state] ?? "bg-muted text-muted-foreground",
           )}>
             <span className="h-1.5 w-1.5 rounded-full bg-current" />
-            {m.state}
+            {fleetStateLabel(m)}
           </span>
         </td>
         <td className="px-4 py-3 align-top font-mono text-xs">{m.gpus?.length ? m.gpus.join(",") : "—"}</td>

@@ -591,18 +591,6 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
         heartbeat_loop(gateway_url, machine_id, app_id, drain_event, snapshot_fn=snapshot, cmd_fn=cmd_fn)
     )
     self_log = os.environ.get("WORKER_SELF_LOG_PATH")
-    # Publish where each model's (+ this worker's) log file lives so the gateway can
-    # SSH-tail it on demand instead of us pushing every line. A tiny one-shot write,
-    # NOT the per-line flood.
-    try:
-        log_paths = {m.served_name: log_path_for(m, log_dir) for m in cfg.members}
-        if self_log:
-            log_paths["__worker__"] = self_log
-        if log_paths:
-            await rdb.hset(f"worker:{machine_id}:logpaths", mapping=log_paths)
-            await rdb.expire(f"worker:{machine_id}:logpaths", 86400)
-    except Exception:
-        logger.exception("failed to publish worker log paths")
     # One log shipper per member (+ the worker's own "__worker__" log), gated by
     # WORKER_LOG_SHIP: VM fleets set it to "0" because the gateway SSH-tails the log
     # files directly — no push, no /workers/logs flood, no redis log buffer. Providers
@@ -629,6 +617,20 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     monitor_task = asyncio.create_task(sched.monitor_loop(drain_event))
     try:
         await _redis_ready(rdb)
+        # Publish each model's (+ this worker's) log file path so the gateway can
+        # SSH-tail it on demand. MUST be after _redis_ready — doing it before raced
+        # ahead of the redis connection (DNS not resolved yet) and the write was
+        # silently lost, so the gateway had no path to tail → no logs in the UI.
+        try:
+            log_paths = {m.served_name: log_path_for(m, log_dir) for m in cfg.members}
+            if self_log:
+                log_paths["__worker__"] = self_log
+            if log_paths:
+                await rdb.hset(f"worker:{machine_id}:logpaths", mapping=log_paths)
+                await rdb.expire(f"worker:{machine_id}:logpaths", 86400)
+                logger.info("published %d log path(s) for SSH-tail", len(log_paths))
+        except Exception:
+            logger.exception("failed to publish worker log paths")
         await sched.start()
         await multi_poll_loop(rdb, f"queue:{app_id}", machine_id, sched, drain_event)
     finally:

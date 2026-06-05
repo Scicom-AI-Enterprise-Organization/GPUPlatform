@@ -29,6 +29,7 @@ logger = logging.getLogger("worker-agent.scheduler")
 
 
 class ModelState(str, enum.Enum):
+    QUEUED = "queued"        # waiting for an earlier wave to load + sleep (shares GPUs)
     LAUNCHING = "launching"
     AWAKE = "awake"
     ASLEEP = "asleep"
@@ -62,6 +63,7 @@ class ModelRuntime:
         self.restart_count = 0
         self.log_path: str | None = None
         self.reason: str | None = None  # human cause when state == DEAD
+        self.load_idx = 0  # position in the startup load order (for "in N queue")
 
     @property
     def base_url(self) -> str:
@@ -235,6 +237,9 @@ class MultiModelScheduler:
         # (disjoint gpu_indices) loaded concurrently; waves run in sequence. On
         # 6 GPUs this loads qwen[0,1] + 35B[2,3] + gemma[4,5] all at once, then
         # Mistral[0,1,2,3] in the next wave — instead of one model at a time.
+        # Precompute the waves up front so models waiting for a later wave can show
+        # their place in line ("in N queue") instead of a misleading "launching".
+        waves: list[list[ModelRuntime]] = []
         remaining = list(self._runtimes)
         while remaining:
             wave: list[ModelRuntime] = []
@@ -246,13 +251,26 @@ class MultiModelScheduler:
                 else:
                     wave.append(rt)
                     used |= rt.gpus
-            logger.info("loading wave (%d concurrent): %s", len(wave),
-                        [rt.member.served_name for rt in wave])
+            waves.append(wave)
+            remaining = rest
+        # Stable load order; everything past wave 0 starts QUEUED (waiting its turn).
+        idx = 0
+        for w, wv in enumerate(waves):
+            for rt in wv:
+                rt.load_idx = idx
+                idx += 1
+                if w > 0:
+                    rt.state = ModelState.QUEUED
+        # Load wave by wave; flip each wave to LAUNCHING as its turn comes.
+        for w, wv in enumerate(waves):
+            for rt in wv:
+                rt.state = ModelState.LAUNCHING
+            logger.info("loading wave %d/%d (%d concurrent): %s", w + 1, len(waves), len(wv),
+                        [rt.member.served_name for rt in wv])
             await asyncio.gather(
-                *(self._launch_and_sleep(rt) for rt in wave),
+                *(self._launch_and_sleep(rt) for rt in wv),
                 return_exceptions=True,
             )
-            remaining = rest
         # Greedily choose residents: first model per free GPU set, in config order.
         held: set[int] = set()
         for rt in self._runtimes:
@@ -481,10 +499,20 @@ class MultiModelScheduler:
                 pass
 
     def states_snapshot(self) -> list[dict]:
+        # Models still loading/queued, by load order — used to count how many are
+        # ahead of a QUEUED model so the UI can show "in N queue".
+        unsettled = [
+            rt.load_idx for rt in self._runtimes
+            if rt.state in (ModelState.QUEUED, ModelState.LAUNCHING)
+        ]
         return [
             {
                 "model": rt.member.served_name,
                 "state": rt.state.value,
+                "queue_ahead": (
+                    sum(1 for x in unsettled if x < rt.load_idx)
+                    if rt.state == ModelState.QUEUED else 0
+                ),
                 "inflight": rt.inflight,
                 "gpus": list(rt.member.gpu_indices),
                 "tp": rt.member.tp,
@@ -497,8 +525,8 @@ class MultiModelScheduler:
         ]
 
     def all_ready(self) -> bool:
-        """True once startup has settled (no model still LAUNCHING)."""
-        return all(rt.state != ModelState.LAUNCHING for rt in self._runtimes)
+        """True once startup has settled (nothing still queued or launching)."""
+        return all(rt.state not in (ModelState.QUEUED, ModelState.LAUNCHING) for rt in self._runtimes)
 
     def live_members(self) -> list[tuple[str, str]]:
         """(served_name, base_url) for members whose engine is running — for the
