@@ -1639,30 +1639,6 @@ async def get_app_status(
     }
 
 
-async def _resolve_log_target(rdb, app_id: str, model: str) -> tuple[Optional[str], Optional[str]]:
-    """(machine_id, remote log path) for the live worker serving `model` — paths
-    come from the hash the worker publishes at startup (`worker:<mid>:logpaths`).
-    Prefers a worker with a live heartbeat key so a fresh deployment wins over a
-    stale predecessor. (None, None) if no worker has published a path for it yet."""
-    workers = await rdb.smembers(f"worker_index:{app_id}")
-    best: Optional[tuple[int, str, str]] = None  # (live_flag, mid, path)
-    for mid in workers:
-        path = await rdb.hget(f"worker:{mid}:logpaths", model)
-        if not path:
-            continue
-        live = 1 if await rdb.exists(f"worker:{mid}") else 0
-        cand = (live, mid, path)
-        if best is None or cand > best:
-            best = cand
-    return (best[1], best[2]) if best else (None, None)
-
-
-# Coarse per-gateway cap on concurrent SSH log streams (each = 1 SSH channel +
-# remote `tail -F`), so abandoned browser tabs can't pile up tails on a box.
-_MAX_LOG_STREAMS = 64
-_active_log_streams = 0
-
-
 @app.get("/apps/{app_id}/models/logs")
 async def get_app_model_logs(
     app_id: str,
@@ -1672,106 +1648,26 @@ async def get_app_model_logs(
     user: User = Depends(require_section("inference")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Per-model vLLM stdout/stderr for a multi-model endpoint. VM fleets: the
-    gateway SSH-tails the log file on demand (the worker doesn't push — no
-    /workers/logs flood). Push providers (RunPod): read the redis-buffered logs the
-    worker shipped. Either way, returns the live/freshest worker's tail."""
+    """Per-model vLLM stdout/stderr for a multi-model VM endpoint. The worker
+    ships one log stream per member tagged by served_name; we bucket those under
+    `worker_logs:{mid}:{slug(model)}` and return the live worker's tail here so
+    the fleet UI can show why a specific model failed."""
     if tail < 1 or tail > WORKER_LOGS_CAP:
         raise HTTPException(status_code=400, detail=f"tail must be 1..{WORKER_LOGS_CAP}")
     app = await _load_owned_app(session, app_id, user)
     rdb = request.app.state.redis
-    provider = await _provider_for_app(session, app_id, user, request.app.state)
-    if provider is not None and provider.supports_log_tail():
-        mid, path = await _resolve_log_target(rdb, app_id, model)
-        lines: list[str] = []
-        if path:
-            try:
-                lines = await provider.tail_log(path, tail)
-            except Exception:
-                logger.exception("tail_log failed app=%s model=%s", app_id, model)
-        return {"app_id": app.app_id, "model": model, "lines": lines, "count": len(lines)}
-    # --- push providers (RunPod): redis-buffered logs ---
     slug = _logs_slug(model)
     workers = await rdb.smembers(f"worker_index:{app_id}")
-    lines = []
-    # Pick the MOST-RECENTLY-active worker for this model (newest last-push ts), so
-    # a redeployed model shows ITS logs rather than a stale predecessor's that
-    # hasn't TTL'd out yet. (A dead worker's crash log still wins while it's the
-    # only one — its reason stays visible until a fresh worker starts shipping.)
-    best_mid: Optional[str] = None
-    best_ts = -1.0
+    lines: list[str] = []
+    # Take the first worker that still has buffered logs for this model — the
+    # crash log outlives the heartbeat TTL (~1h), so a dead model's reason
+    # remains visible after its worker stops beating.
     for mid in workers:
-        ts = await rdb.get(f"worker_logs:{mid}:{slug}:ts")
-        if ts is None:
-            continue
-        try:
-            t = float(ts)
-        except (TypeError, ValueError):
-            continue
-        if t > best_ts:
-            best_ts, best_mid = t, mid
-    if best_mid is not None:
-        raw = await rdb.lrange(f"worker_logs:{best_mid}:{slug}", 0, tail - 1)
-        lines = list(reversed(raw))  # stored newest-first → chronological
-    else:
-        # No timestamps (pre-upgrade workers) → fall back to first-with-logs.
-        for mid in workers:
-            raw = await rdb.lrange(f"worker_logs:{mid}:{slug}", 0, tail - 1)
-            if raw:
-                lines = list(reversed(raw))
-                break
+        raw = await rdb.lrange(f"worker_logs:{mid}:{slug}", 0, tail - 1)
+        if raw:
+            lines = list(reversed(raw))  # stored newest-first → chronological
+            break
     return {"app_id": app.app_id, "model": model, "lines": lines, "count": len(lines)}
-
-
-@app.get("/apps/{app_id}/models/logs/stream")
-async def stream_app_model_logs(
-    app_id: str,
-    request: Request,
-    model: str,
-    tail: int = 400,
-    user: User = Depends(require_section("inference")),
-    session: AsyncSession = Depends(get_session),
-):
-    """Live SSE stream of a model's vLLM log via SSH `tail -F` (VM fleets only) —
-    one SSH channel per open viewer, closed (killing the remote tail) when the
-    browser disconnects. No worker push, no redis buffer, nothing when idle."""
-    if tail < 1 or tail > WORKER_LOGS_CAP:
-        raise HTTPException(status_code=400, detail=f"tail must be 1..{WORKER_LOGS_CAP}")
-    app = await _load_owned_app(session, app_id, user)
-    provider = await _provider_for_app(session, app_id, user, request.app.state)
-    if provider is None or not provider.supports_log_tail():
-        raise HTTPException(status_code=400, detail={"error": "live log streaming needs a VM-provider fleet"})
-    rdb = request.app.state.redis
-    _mid, path = await _resolve_log_target(rdb, app_id, model)
-    if not path:
-        raise HTTPException(status_code=404, detail={"error": "no live worker log for this model yet"})
-    if _active_log_streams >= _MAX_LOG_STREAMS:
-        raise HTTPException(status_code=429, detail={"error": "too many live log streams; close some and retry"})
-
-    async def gen():
-        global _active_log_streams
-        _active_log_streams += 1
-        agen = provider.tail_stream(path, tail)
-        try:
-            yield ": connected\n\n"
-            async for line in agen:
-                yield f"data: {json.dumps(line)}\n\n"
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            yield f"data: {json.dumps('[log stream error: ' + str(e) + ']')}\n\n"
-        finally:
-            try:
-                await agen.aclose()  # closes the SSH channel → kills the remote `tail -F`
-            except Exception:  # noqa: BLE001
-                pass
-            _active_log_streams -= 1
-
-    return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-    )
 
 
 @app.post("/apps/{app_id}/model-action")
@@ -3105,10 +3001,6 @@ async def ingest_worker_logs(req: WorkerLogsRequest, request: Request):
     await rdb.ltrim(key, 0, WORKER_LOGS_CAP - 1)
     # 1h TTL so logs naturally expire after the worker is gone.
     await rdb.expire(key, 3600)
-    # Stamp last-activity so the reader can pick the freshest worker for a model
-    # (a redeployed model has a new machine_id; without this the reader could
-    # return a stale predecessor's buffered logs that haven't TTL'd out yet).
-    await rdb.set(f"{key}:ts", str(time.time()), ex=3600)
     return {"ok": True, "stored": len(truncated)}
 
 

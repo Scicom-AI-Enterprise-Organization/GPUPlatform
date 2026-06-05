@@ -590,26 +590,26 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     hb_task = asyncio.create_task(
         heartbeat_loop(gateway_url, machine_id, app_id, drain_event, snapshot_fn=snapshot, cmd_fn=cmd_fn)
     )
-    self_log = os.environ.get("WORKER_SELF_LOG_PATH")
-    # One log shipper per member (+ the worker's own "__worker__" log), gated by
-    # WORKER_LOG_SHIP: VM fleets set it to "0" because the gateway SSH-tails the log
-    # files directly — no push, no /workers/logs flood, no redis log buffer. Providers
-    # the gateway can't SSH (RunPod pods) leave it on so the UI still gets logs.
-    log_tasks: list[asyncio.Task] = []
-    if os.environ.get("WORKER_LOG_SHIP", "1") != "0":
-        log_tasks = [
-            asyncio.create_task(
-                log_shipper_loop(
-                    gateway_url, machine_id, app_id,
-                    log_path_for(m, log_dir), drain_event, source=m.served_name,
-                )
+    # One log shipper per member, each tagged with the model's served_name so the
+    # gateway buckets logs per model (the single-file shipper can't — every model
+    # has its own vLLM process + log file).
+    log_tasks = [
+        asyncio.create_task(
+            log_shipper_loop(
+                gateway_url, machine_id, app_id,
+                log_path_for(m, log_dir), drain_event, source=m.served_name,
             )
-            for m in cfg.members
-        ]
-        if self_log:
-            log_tasks.append(asyncio.create_task(
-                log_shipper_loop(gateway_url, machine_id, app_id, self_log, drain_event, source="__worker__")
-            ))
+        )
+        for m in cfg.members
+    ]
+    # Also ship the worker-agent's OWN stdout log (scheduler events: wave-loading,
+    # sleep/wake, operator commands, preflight, dead reasons) under a reserved
+    # "__worker__" source, so the UI can show the fleet's control-plane log too.
+    self_log = os.environ.get("WORKER_SELF_LOG_PATH")
+    if self_log:
+        log_tasks.append(asyncio.create_task(
+            log_shipper_loop(gateway_url, machine_id, app_id, self_log, drain_event, source="__worker__")
+        ))
     # Ship each member's vLLM /metrics to the gateway's combined scrape target.
     log_tasks.append(asyncio.create_task(
         metrics_shipper_loop(gateway_url, machine_id, app_id, sched.live_members, drain_event)
@@ -617,20 +617,6 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     monitor_task = asyncio.create_task(sched.monitor_loop(drain_event))
     try:
         await _redis_ready(rdb)
-        # Publish each model's (+ this worker's) log file path so the gateway can
-        # SSH-tail it on demand. MUST be after _redis_ready — doing it before raced
-        # ahead of the redis connection (DNS not resolved yet) and the write was
-        # silently lost, so the gateway had no path to tail → no logs in the UI.
-        try:
-            log_paths = {m.served_name: log_path_for(m, log_dir) for m in cfg.members}
-            if self_log:
-                log_paths["__worker__"] = self_log
-            if log_paths:
-                await rdb.hset(f"worker:{machine_id}:logpaths", mapping=log_paths)
-                await rdb.expire(f"worker:{machine_id}:logpaths", 86400)
-                logger.info("published %d log path(s) for SSH-tail", len(log_paths))
-        except Exception:
-            logger.exception("failed to publish worker log paths")
         await sched.start()
         await multi_poll_loop(rdb, f"queue:{app_id}", machine_id, sched, drain_event)
     finally:

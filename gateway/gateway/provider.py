@@ -87,12 +87,6 @@ class Provider(ABC):
         cheaply (e.g. by pod name prefix) should override."""
         return await self.list_machines()
 
-    def supports_log_tail(self) -> bool:
-        """True if the gateway can SSH-tail this provider's worker log files on
-        demand (so the worker needn't push logs). VM providers override → True;
-        push-only providers (RunPod pods) stay False and keep the log shipper."""
-        return False
-
     async def forget_machine(self, machine_id: str) -> None:
         """Drop a machine from this provider's bookkeeping WITHOUT touching the box
         (the process is already dead). The reconciler uses this to reap a stale
