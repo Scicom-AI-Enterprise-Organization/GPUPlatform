@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -33,6 +34,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("gateway.reconciler")
 
 TICK_S = 5.0
+# An orphan (on the provider, not in Redis) is warned once, then reaped if it's
+# STILL unregistered this many seconds later. The grace must exceed worker
+# boot+register time so we never reap a machine that's merely still booting.
+ORPHAN_REAP_GRACE_S = 90.0
 
 
 async def reconciler_loop(
@@ -99,10 +104,11 @@ async def tick(
         provider_cache = {}
     providers = await _collect_providers(rdb, provider, sm, provider_cache)
 
-    provider_machines: set[str] = set()
+    machine_provider: dict[str, "Provider"] = {}
     for prov in providers:
         try:
-            provider_machines.update(await prov.list_machines())
+            for m in await prov.list_machines():
+                machine_provider.setdefault(m, prov)
         except NotImplementedError:
             continue
         except Exception:
@@ -110,6 +116,7 @@ async def tick(
             # whole tick rather than risk GC'ing machines we just couldn't see.
             logger.exception("list_machines failed for provider=%s; skipping tick", getattr(prov, "name", "?"))
             return
+    provider_machines = set(machine_provider)
 
     redis_machines: set[str] = set()
     async for key in rdb.scan_iter(match="worker_index:*"):
@@ -121,13 +128,35 @@ async def tick(
 
     for machine_id in gone:
         await _remove_machine(rdb, machine_id)
+        await rdb.delete(f"reconciler:orphan_since:{machine_id}")
         logger.info("reconciler: %s no longer in provider, GC'd from Redis", machine_id)
 
+    now = time.time()
     for machine_id in orphans:
-        logger.warning(
-            "reconciler: %s exists on provider but not in Redis (orphan)",
-            machine_id,
-        )
+        since_key = f"reconciler:orphan_since:{machine_id}"
+        since = await rdb.get(since_key)
+        if since is None:
+            # First time seen orphaned — record + warn ONCE (don't re-warn every
+            # 5s tick). A just-provisioned worker that hasn't registered yet lands
+            # here; the grace below lets it register before we'd reap it.
+            await rdb.set(since_key, str(now), ex=3600)
+            logger.warning(
+                "reconciler: %s on provider but not in Redis (orphan) — reaping in %ds if still unregistered",
+                machine_id, int(ORPHAN_REAP_GRACE_S),
+            )
+        elif now - float(since) >= ORPHAN_REAP_GRACE_S:
+            # Still unregistered after the grace → a dead provision remnant. Reap it
+            # from Redis AND the provider's listing so it stops being re-warned.
+            await _remove_machine(rdb, machine_id)
+            prov = machine_provider.get(machine_id)
+            if prov is not None:
+                try:
+                    await prov.forget_machine(machine_id)
+                except Exception:
+                    logger.exception("reconciler: forget_machine(%s) failed", machine_id)
+            await rdb.delete(since_key)
+            logger.info("reconciler: reaped stale orphan %s (unregistered for >%ds)", machine_id, int(ORPHAN_REAP_GRACE_S))
+        # else: within grace — stay quiet (already warned once).
 
 
 async def _remove_machine(rdb: "redis_async.Redis", machine_id: str) -> None:

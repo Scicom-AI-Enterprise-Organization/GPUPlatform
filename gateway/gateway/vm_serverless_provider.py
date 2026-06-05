@@ -185,6 +185,13 @@ class VMProvider(Provider):
                 out.append(mid)
         return out
 
+    async def forget_machine(self, machine_id: str) -> None:
+        """Drop a dead machine from this provider's redis bookkeeping (the set the
+        reconciler lists from) without SSHing — the process is already gone. Lets
+        the reconciler reap stale orphans so they stop being re-listed/warned."""
+        await self._rdb.srem(f"vm_machines:{self._provider_id}", machine_id)
+        await self._rdb.delete(f"vm_machine:{machine_id}:app")
+
     async def purge_app(self, app_id: str) -> int:
         """Hard cleanup: sweep EVERY on-disk worker remnant for this app (not just
         what redis tracks — crash-loop churn leaves orphan pidfiles/logs/configs),

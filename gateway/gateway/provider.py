@@ -87,6 +87,13 @@ class Provider(ABC):
         cheaply (e.g. by pod name prefix) should override."""
         return await self.list_machines()
 
+    async def forget_machine(self, machine_id: str) -> None:
+        """Drop a machine from this provider's bookkeeping WITHOUT touching the box
+        (the process is already dead). The reconciler uses this to reap a stale
+        orphan — a machine left in the provider's listing by a crashed provision
+        that never registered. Default no-op; providers with a machine set override."""
+        return None
+
     async def purge_app(self, app_id: str) -> int:
         """Hard cleanup of ALL of an app's worker remnants — including ones the
         reconciler/redis no longer tracks (e.g. crash-loop churn that left stale

@@ -174,8 +174,9 @@ async def log_shipper_loop(
     url = f"{gateway_url.rstrip('/')}/workers/logs"
     offset = 0
     leftover = b""
-    BATCH_INTERVAL_S = 2.0
-    MAX_BATCH_LINES = 200
+    BATCH_INTERVAL_S = 3.0
+    MAX_BATCH_LINES = 2000          # big batches → a chatty model (vLLM load spam) ships a
+    MAX_POST_BYTES = 512 * 1024     # few POSTs per tick, not dozens of 200-line ones
     MAX_LINE_BYTES = 4096
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -202,14 +203,19 @@ async def log_shipper_loop(
                     parts = data.split(b"\n")
                     leftover = parts[-1]
                     new_lines = parts[:-1]
-                    # Ship in batches so a backlog doesn't produce one giant POST.
-                    for i in range(0, len(new_lines), MAX_BATCH_LINES):
-                        batch = new_lines[i : i + MAX_BATCH_LINES]
-                        body = {
-                            "machine_id": machine_id,
-                            "app_id": app_id,
-                            "lines": [b[:MAX_LINE_BYTES].decode("utf-8", errors="replace") for b in batch],
-                        }
+                    # Ship in batches bounded by BOTH line count and byte size, so a
+                    # backlog drains in a few large POSTs instead of one-per-200-lines
+                    # (which floods the gateway when a model logs heavily / crash-loops).
+                    i = 0
+                    while i < len(new_lines):
+                        batch: list[str] = []
+                        nbytes = 0
+                        while i < len(new_lines) and len(batch) < MAX_BATCH_LINES and nbytes < MAX_POST_BYTES:
+                            line = new_lines[i][:MAX_LINE_BYTES].decode("utf-8", errors="replace")
+                            batch.append(line)
+                            nbytes += len(line) + 1
+                            i += 1
+                        body: dict[str, Any] = {"machine_id": machine_id, "app_id": app_id, "lines": batch}
                         if source is not None:
                             body["source"] = source
                         try:
