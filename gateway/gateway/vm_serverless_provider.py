@@ -369,6 +369,9 @@ class VMProvider(Provider):
                 **worker_env,
                 "WORKER_SELF_LOG_PATH": f"{remote_dir}/worker-{machine_id}.log",
                 "WORKER_ENGINE_PIDS_PATH": f"{remote_dir}/worker-{machine_id}.enginepids",
+                # VM fleets: the gateway SSH-tails the log files directly, so the
+                # worker must NOT push log lines (no /workers/logs flood / redis buffer).
+                "WORKER_LOG_SHIP": "0",
             }
             cfg_b64 = base64.b64encode(json.dumps(worker_env).encode()).decode()
             rc0, out0, err0 = self._run_full(
@@ -458,6 +461,67 @@ class VMProvider(Provider):
             )
             self._run(client, f"bash -lc {shlex.quote(script)}")
         finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def supports_log_tail(self) -> bool:
+        return True
+
+    async def tail_log(self, path: str, lines: int = 400) -> list[str]:
+        """Snapshot: return the last `lines` of a remote log file over SSH. Empty
+        list if the file doesn't exist yet. Blocking SSH → run in a thread."""
+        import asyncio
+        return await asyncio.to_thread(self._tail_snapshot_sync, path, lines)
+
+    def _tail_snapshot_sync(self, path: str, lines: int) -> list[str]:
+        client = self._connect_sync()
+        try:
+            # `tail -n N -- <path>` via bash -lc so ~ expands; 2>/dev/null → no
+            # error spew if the file isn't created yet.
+            # bash -c (NOT -lc): a login shell prints the box MOTD, which would
+            # pollute the log stream. Paths from the worker are absolute → no ~ needed.
+            cmd = f"bash -c {shlex.quote(f'tail -n {int(lines)} -- {shlex.quote(path)} 2>/dev/null')}"
+            out = self._run(client, cmd, timeout=20)
+            return out.splitlines()
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    async def tail_stream(self, path: str, lines: int = 400):
+        """Async generator yielding log lines from `tail -n N -F <path>` over SSH —
+        a live stream that re-follows on truncate/rotate (the launcher truncates the
+        log per launch). The SSH channel is closed when the generator is closed
+        (client disconnect), which kills the remote `tail` — no orphaned tails."""
+        import asyncio
+        client = await asyncio.to_thread(self._connect_sync)
+        chan = None
+        try:
+            transport = client.get_transport()
+            chan = transport.open_session()
+            chan.settimeout(None)
+            # bash -c (NOT -lc): avoid the login-shell MOTD polluting the stream.
+            cmd = f"bash -c {shlex.quote(f'tail -n {int(lines)} -F -- {shlex.quote(path)} 2>/dev/null')}"
+            chan.exec_command(cmd)
+            buf = b""
+            while True:
+                data = await asyncio.to_thread(chan.recv, 65536)
+                if not data:
+                    break
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    yield line.decode("utf-8", "replace")
+        finally:
+            # Closing the channel SIGHUPs the remote `tail -F` so it exits.
+            try:
+                if chan is not None:
+                    chan.close()
+            except Exception:
+                pass
             try:
                 client.close()
             except Exception:

@@ -861,13 +861,76 @@ function ModelLogs({ appId, model, onClose, label }: { appId: string; model: str
     }
   }, [appId, model]);
 
+  // Live tail via SSE (SSH `tail -F` on the box, VM fleets). Falls back to snapshot
+  // polling if the stream isn't available (RunPod / no worker yet) or errors. The
+  // fetch is aborted on close → the gateway closes the SSH channel → remote tail dies.
+  const pending = useRef<string[]>([]);
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    fetchLogs();
-    if (!autoTail) return;
-    const id = window.setInterval(fetchLogs, 2500);
-    return () => window.clearInterval(id);
-  }, [fetchLogs, autoTail]);
+    if (!autoTail) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      fetchLogs();
+      return;
+    }
+    const abort = new AbortController();
+    let stopped = false;
+    let pollId: number | undefined;
+    let flushId: number | undefined;
+    const flush = () => {
+      if (pending.current.length) {
+        const batch = pending.current;
+        pending.current = [];
+        setLines((prev) => [...prev, ...batch].slice(-2000));
+      }
+    };
+    const startPoll = () => {
+      fetchLogs();
+      pollId = window.setInterval(fetchLogs, 2500);
+    };
+    const run = async () => {
+      if (stopped) return;
+      try {
+        const url = `/api/proxy/apps/${encodeURIComponent(appId)}/models/logs/stream?model=${encodeURIComponent(model)}&tail=400`;
+        const r = await fetch(url, { signal: abort.signal, cache: "no-store" });
+        if (!r.ok || !r.body) {
+          if (!stopped) startPoll(); // not a VM stream / no worker yet → poll snapshot
+          return;
+        }
+        setErr(null);
+        setLoading(false);
+        pending.current = [];
+        setLines([]); // the stream re-sends the last 400 lines first
+        flushId = window.setInterval(flush, 250);
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done || stopped) break;
+          buf += dec.decode(value, { stream: true });
+          let i: number;
+          while ((i = buf.indexOf("\n\n")) >= 0) {
+            const evt = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            for (const ln of evt.split("\n")) {
+              if (!ln.startsWith("data:")) continue;
+              try { pending.current.push(JSON.parse(ln.slice(5).trim()) as string); } catch { /* skip */ }
+            }
+          }
+        }
+        if (flushId) { window.clearInterval(flushId); flushId = undefined; }
+        if (!stopped) window.setTimeout(run, 1500); // stream ended (worker restart) → reconnect
+      } catch {
+        if (!stopped && !abort.signal.aborted) window.setTimeout(run, 2000);
+      }
+    };
+    run();
+    return () => {
+      stopped = true;
+      abort.abort();
+      if (pollId) window.clearInterval(pollId);
+      if (flushId) window.clearInterval(flushId);
+    };
+  }, [appId, model, autoTail, fetchLogs]);
 
   // Auto-tail: keep pinned to the bottom unless the user scrolled up to read.
   const scrollRef = useRef<HTMLPreElement | null>(null);
@@ -895,7 +958,7 @@ function ModelLogs({ appId, model, onClose, label }: { appId: string; model: str
               onChange={(e) => setAutoTail(e.target.checked)}
               className="h-3 w-3"
             />
-            tail (poll every 2.5s)
+            live tail
           </label>
           <Button variant="outline" size="xs" onClick={fetchLogs}>
             <RefreshCw className="h-3 w-3" />
