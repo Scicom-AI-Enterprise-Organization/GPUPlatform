@@ -181,7 +181,7 @@ ecr-build-push-gateway:
 	  --tag $(ECR_REGISTRY)/$(GATEWAY_REPO):$(TAG) \
 	  --file ./gateway/Dockerfile \
 	  --push \
-	  ./gateway
+	  .
 
 # Build & push the worker image. amd64 only (vLLM is x86, PI hosts are x86).
 ecr-build-push-worker:

@@ -1,0 +1,36 @@
+# Build context for the repo-ROOT docker builds (gateway image + PI worker image).
+# Both only need gateway/ and worker-agent/ source; keep everything heavy or
+# secret out of the context so builds are fast and reproducible. (The web image
+# builds from ./web, so this file does not affect it.)
+
+.git
+.github
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/venv/
+**/*.egg-info/
+**/build/
+**/dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / Next.js (the gateway + PI worker builds never need web/)
+web/node_modules/
+web/.next/
+web/out/
+**/node_modules/
+
+# Secrets / local config — must never enter an image context
+**/.env
+**/.env.*
+!**/.env.example
+
+# Local tooling / scratch
+.claude/
+.idea/
+.vscode/
+**/*.log

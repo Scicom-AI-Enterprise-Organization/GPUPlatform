@@ -42,6 +42,9 @@ jobs:
               - '.github/workflows/**'
             gateway:
               - 'gateway/**'
+              # the gateway image bundles worker-agent/ source (it ships it to VM
+              # fleets), so a worker-agent change must rebuild the gateway too.
+              - 'worker-agent/**'
               - '.github/workflows/**'
             web:
               - 'web/**'
@@ -119,14 +122,16 @@ jobs:
             runner: ubuntu-latest
             suffix: amd64
             repo: aies/serverlessgpu-gateway-ecr
-            context: ./gateway
+            # context = repo root so the Dockerfile can COPY the sibling
+            # worker-agent/ source it ships to VM fleets on provision.
+            context: .
             dockerfile: ./gateway/Dockerfile
           - component: gateway
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             suffix: arm64
             repo: aies/serverlessgpu-gateway-ecr
-            context: ./gateway
+            context: .
             dockerfile: ./gateway/Dockerfile
           - component: web
             platform: linux/amd64
@@ -302,8 +307,9 @@ jobs:
           version: v3.14.0
 
       - name: Build gateway image
+        # context = repo root (Dockerfile COPYs the sibling worker-agent/ source)
         run: |
-          docker build -t serverlessgpu-gateway:test ./gateway
+          docker build -t serverlessgpu-gateway:test -f ./gateway/Dockerfile .
 
       - name: Side-load image into kind
         # kind nodes can't pull from your laptop's docker daemon — explicit load
