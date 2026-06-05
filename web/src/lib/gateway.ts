@@ -108,14 +108,32 @@ export class GatewayError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
   const url = isServer ? `${PUBLIC_BASE}${path}` : `/api/proxy${path}`;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(await authHeaders()),
     ...((init?.headers as Record<string, string>) ?? {}),
   };
-  const res = await fetch(url, { ...init, headers, cache: "no-store" });
+  // Always bound the request: without a timeout a slow/hung gateway call (e.g. a
+  // worker op that SSHes to a flaky box) spins forever with no error. On timeout
+  // or a network failure we throw a clear GatewayError so callers can surface it.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, { ...init, headers, cache: "no-store", signal: ctrl.signal });
+  } catch (e) {
+    if (ctrl.signal.aborted) {
+      throw new GatewayError(
+        504,
+        `request timed out after ${Math.round(timeoutMs / 1000)}s — the gateway took too long (the worker box may be slow or unreachable)`,
+      );
+    }
+    throw new GatewayError(0, e instanceof Error ? e.message : String(e));
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new GatewayError(res.status, body);
@@ -158,6 +176,13 @@ export const gateway = {
     request<{ ok: boolean; app_id: string; drained_workers: number }>(
       `/apps/${encodeURIComponent(id)}/restart`,
       { method: "POST" },
+      120_000, // drains + terminates over SSH — allow up to 2 min before timing out
+    ),
+  purgeApp: (id: string) =>
+    request<{ ok: boolean; app_id: string; terminated: number; purged: number }>(
+      `/apps/${encodeURIComponent(id)}/workers/purge`,
+      { method: "POST" },
+      120_000, // SSHes to the box, kills processes + sweeps many pidfiles — can be slow
     ),
   listAppRequests: (id: string, limit = 100) =>
     request<GatewayRequestRecord[]>(

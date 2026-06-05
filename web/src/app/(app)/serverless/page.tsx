@@ -45,7 +45,7 @@ export default async function ServerlessPage({
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Serverless Inference</h1>
             <p className="mt-1 text-sm text-muted-foreground">
-              Deploy and scale GPU-powered inference endpoints. Pay per second of compute.
+              Deploy and scale GPU-powered inference endpoints.
             </p>
           </div>
           {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}

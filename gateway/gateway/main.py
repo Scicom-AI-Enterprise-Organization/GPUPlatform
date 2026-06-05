@@ -1825,6 +1825,34 @@ async def kill_app_workers(
     return {"ok": True, "app_id": app_id, "killed_workers": n, "paused": True}
 
 
+@app.post("/apps/{app_id}/workers/purge")
+async def purge_app_workers(
+    app_id: str,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Hard reset: drain+terminate tracked/orphan workers, THEN sweep every on-disk
+    worker remnant for this endpoint on the box (stale pidfiles/logs/configs +
+    orphan vLLM engines left by crash-loop churn — which Redeploy/Kill don't touch)
+    and clear redis. Use to clean up after redis blips churned the fleet. Leaves the
+    paused state as-is: if the fleet wasn't killed, the autoscaler respawns a clean
+    worker; if it was, it stays down until Redeploy."""
+    await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    terminated = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
+    provider = await _provider_for_app(session, app_id, user, request.app.state)
+    purged = 0
+    if provider is not None:
+        try:
+            purged = await provider.purge_app(app_id)
+        except Exception:
+            logger.exception("purge workers app=%s: provider.purge_app failed", app_id)
+            raise HTTPException(status_code=502, detail={"error": "purge failed on the provider — see gateway logs"})
+    logger.info("purge workers app=%s by user=%s: terminated=%d purged=%d", app_id, user.username, terminated, purged)
+    return {"ok": True, "app_id": app_id, "terminated": terminated, "purged": purged}
+
+
 @app.patch("/apps/{app_id}/models", response_model=AppRecord)
 async def update_app_models(
     app_id: str,

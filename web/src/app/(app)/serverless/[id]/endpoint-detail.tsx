@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Loader2, RotateCw, Trash2 } from "lucide-react";
+import { Eraser, Loader2, RotateCw, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,7 +15,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { AppRecord } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
-import { deleteEndpoint, restartEndpoint } from "../actions";
+import { deleteEndpoint, purgeWorkers, restartEndpoint } from "../actions";
 import { OverviewTab } from "./tabs/overview";
 import { RequestsTab } from "./tabs/requests";
 import { StressTab } from "./tabs/stress";
@@ -54,6 +54,12 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
   const [confirmRedeploy, setConfirmRedeploy] = useState(false);
   const [redeployPending, startRedeploy] = useTransition();
   const [redeployError, setRedeployError] = useState<string | null>(null);
+  const [confirmPurge, setConfirmPurge] = useState(false);
+  const [purgePending, startPurge] = useTransition();
+  const [purgeError, setPurgeError] = useState<string | null>(null);
+  // Persistent inline result of the last worker op (redeploy/purge) — shown under
+  // the header buttons. NOT a toast (those vanish); stays until the next op.
+  const [opResult, setOpResult] = useState<{ ok: boolean; text: string } | null>(null);
   const avatar = avatarFor(app.name);
 
   function handleDelete() {
@@ -74,9 +80,26 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
       const res = await restartEndpoint(app.app_id);
       if (!res.ok) {
         setRedeployError(res.error);
+        setOpResult({ ok: false, text: `Redeploy failed: ${res.error}` });
         return;
       }
+      setOpResult({ ok: true, text: `Redeploy started — drained ${res.drained} worker(s). Models cold-start over the next minute.` });
       setConfirmRedeploy(false);
+      router.refresh();
+    });
+  }
+
+  function handlePurge() {
+    setPurgeError(null);
+    startPurge(async () => {
+      const res = await purgeWorkers(app.app_id);
+      if (!res.ok) {
+        setPurgeError(res.error);
+        setOpResult({ ok: false, text: `Purge failed: ${res.error}` });
+        return;
+      }
+      setOpResult({ ok: true, text: `Purged ${res.purged} stale worker(s); terminated ${res.terminated} tracked. The autoscaler will bring up a fresh worker unless the fleet is paused.` });
+      setConfirmPurge(false);
       router.refresh();
     });
   }
@@ -110,6 +133,15 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
             <Button
               variant="outline"
               size="sm"
+              onClick={() => setConfirmPurge(true)}
+              title="Hard-clean stale worker pidfiles + orphan processes on the box"
+            >
+              <Eraser className="h-4 w-4" />
+              Purge PIDs
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
               onClick={() => setConfirmDelete(true)}
               className="text-destructive hover:text-destructive"
             >
@@ -118,6 +150,26 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
             </Button>
           </div>
         </div>
+
+        {opResult && (
+          <div
+            className={`mt-3 flex items-start justify-between gap-3 rounded-md border px-3 py-2 text-sm ${
+              opResult.ok
+                ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300"
+                : "border-destructive/30 bg-destructive/5 text-destructive"
+            }`}
+          >
+            <span className="break-words">{opResult.text}</span>
+            <button
+              type="button"
+              onClick={() => setOpResult(null)}
+              className="shrink-0 opacity-70 hover:opacity-100"
+              aria-label="Dismiss"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
 
         <KpiBar app={app} />
 
@@ -167,6 +219,37 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
             <Button onClick={handleRedeploy} disabled={redeployPending}>
               {redeployPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCw className="h-4 w-4" />}
               Redeploy
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={confirmPurge}
+        onOpenChange={(o) => {
+          setConfirmPurge(o);
+          if (!o) setPurgeError(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Purge worker PIDs for {app.name}?</DialogTitle>
+            <DialogDescription>
+              Drains + terminates every worker for this endpoint, then sweeps <strong>all</strong> of its
+              stale pidfiles, logs, and orphan vLLM processes off the box (the leftovers a redis-blip
+              crash-loop leaves behind, which Redeploy doesn&apos;t clean), and clears Redis state. Only this
+              endpoint&apos;s workers are touched. The autoscaler then brings up a fresh worker (unless the
+              fleet is killed/paused).
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {purgeError && <p className="mr-auto text-sm text-destructive">{purgeError}</p>}
+            <Button variant="ghost" onClick={() => setConfirmPurge(false)} disabled={purgePending}>
+              Cancel
+            </Button>
+            <Button onClick={handlePurge} disabled={purgePending}>
+              {purgePending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eraser className="h-4 w-4" />}
+              Purge PIDs
             </Button>
           </DialogFooter>
         </DialogContent>

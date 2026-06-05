@@ -74,6 +74,18 @@ export async function restartEndpoint(
   }
 }
 
+export async function purgeWorkers(
+  appId: string,
+): Promise<{ ok: true; terminated: number; purged: number } | { ok: false; error: string }> {
+  try {
+    const res = await gateway.purgeApp(appId);
+    revalidatePath(`/serverless/${appId}`);
+    return { ok: true, terminated: res.terminated, purged: res.purged };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export async function deleteEndpoint(appId: string): Promise<DeployResult> {
   try {
     await gateway.deleteApp(appId);

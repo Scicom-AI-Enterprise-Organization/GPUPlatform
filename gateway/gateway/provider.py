@@ -87,6 +87,14 @@ class Provider(ABC):
         cheaply (e.g. by pod name prefix) should override."""
         return await self.list_machines()
 
+    async def purge_app(self, app_id: str) -> int:
+        """Hard cleanup of ALL of an app's worker remnants — including ones the
+        reconciler/redis no longer tracks (e.g. crash-loop churn that left stale
+        pidfiles + orphan processes on a VM). Kills processes, removes on-disk
+        state, and clears redis. Returns the number of remnants purged. Default
+        no-op (RunPod pods are reaped by terminate); VM providers override."""
+        return 0
+
     async def check_availability(
         self,
         gpu: str,

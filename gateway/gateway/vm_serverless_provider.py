@@ -185,6 +185,57 @@ class VMProvider(Provider):
                 out.append(mid)
         return out
 
+    async def purge_app(self, app_id: str) -> int:
+        """Hard cleanup: sweep EVERY on-disk worker remnant for this app (not just
+        what redis tracks — crash-loop churn leaves orphan pidfiles/logs/configs),
+        kill its process tree + vLLM engines, remove its files, then clear redis.
+        App-scoped via each config's APP_ID so a shared box's other endpoints are
+        untouched. Returns the number of machine remnants purged."""
+        import asyncio
+        machine_ids = await asyncio.to_thread(self._purge_sync, app_id)
+        idx = set(await self._rdb.smembers(f"worker_index:{app_id}"))
+        all_ids = set(machine_ids) | idx
+        for mid in all_ids:
+            await self._rdb.srem(f"vm_machines:{self._provider_id}", mid)
+            await self._rdb.delete(
+                f"vm_machine:{mid}:app", f"worker:{mid}", f"worker:{mid}:models",
+                f"register_token:{mid}", f"worker:{mid}:drain",
+            )
+        if all_ids:
+            await self._rdb.srem(f"worker_index:{app_id}", *all_ids)
+        logger.info("vm-purge: app=%s purged %d remnant(s) on %s", app_id, len(machine_ids), self._host)
+        return len(machine_ids)
+
+    def _purge_sync(self, app_id: str) -> list[str]:
+        client = self._connect_sync()
+        try:
+            # Match this app's worker configs by the exact APP_ID line. For each:
+            # TERM the worker's pgroup, reap its recorded engine pids (reuse-guarded
+            # cleanup module — never a box-wide vLLM pkill), pkill anything still on
+            # that config, then remove all of its on-disk files.
+            tag = '"APP_ID": ' + json.dumps(app_id)  # e.g. "APP_ID": "tm-fleet-2"
+            script = (
+                "shopt -s nullglob; "
+                f'for cfg in {REMOTE_DIR}/worker-*.json; do '
+                f'  if grep -qF {shlex.quote(tag)} "$cfg"; then '
+                '    base="${cfg%.json}"; name="$(basename "$base")"; mid="${name#worker-}"; '
+                '    pid="$(cat "$base.pid" 2>/dev/null)"; '
+                '    if [ -n "$pid" ]; then kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; fi; '
+                f'    {REMOTE_DIR}/venv/bin/python -m worker_agent.multi.cleanup "$base.enginepids" 2>/dev/null || true; '
+                '    pkill -9 -f "$name.json" 2>/dev/null || true; '
+                '    rm -f "$base.json" "$base.pid" "$base.log" "$base.enginepids"; '
+                '    echo "PURGED $mid"; '
+                "  fi; "
+                "done"
+            )
+            out = self._run(client, f"bash -lc {shlex.quote(script)}")
+            return [ln.split(" ", 1)[1].strip() for ln in out.splitlines() if ln.startswith("PURGED ")]
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     async def check_availability(
         self,
         gpu: str,
