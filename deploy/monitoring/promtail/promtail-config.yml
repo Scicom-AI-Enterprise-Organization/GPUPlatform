@@ -1,0 +1,55 @@
+# Promtail tails the gateway's JSON access log (written via
+# LOG_JSON=1 GATEWAY_ACCESS_LOG=deploy/monitoring/logs/gateway-access.log) and
+# ships to Loki, parsing the JSON so fields like status / route / app_id /
+# durationMs become queryable in Grafana via LogQL:
+#
+#   {service="gateway"} | json | status >= 500
+#   {service="gateway"} | json | durationMs > 1000
+#   {service="gateway", app_id="tm-fleet"} | json
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /promtail/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: gateway-access
+    static_configs:
+      - targets: [localhost]
+        labels:
+          service: gateway
+          __path__: /logs/*.log
+    pipeline_stages:
+      # Parse the JSON access line. Non-JSON lines fall through unchanged
+      # (the json stage is lenient on parse failure).
+      - json:
+          expressions:
+            level: level
+            kind: kind
+            status: status
+            statusClass: statusClass
+            route: route
+            method: method
+            app_id: app_id
+            durationMs: durationMs
+            requestId: requestId
+            msg: msg
+      # Promote low-cardinality fields to labels for fast filtering. status/route
+      # stay as parsed fields (high cardinality) — query them with `| json`.
+      - labels:
+          statusClass:
+          method:
+          app_id:
+          kind:
+      # Use the app's own millisecond timestamp.
+      - json:
+          expressions:
+            time: time
+      - timestamp:
+          source: time
+          format: UnixMs

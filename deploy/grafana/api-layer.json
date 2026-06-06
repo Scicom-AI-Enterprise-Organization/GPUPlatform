@@ -1,0 +1,192 @@
+{
+  "title": "GPUPlatform — API Layer (Metrics & Logs)",
+  "uid": "gpuplatform-api",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["gpuplatform", "api", "gateway"],
+  "timezone": "",
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      },
+      {
+        "name": "loki",
+        "type": "datasource",
+        "query": "loki",
+        "current": { "text": "Loki", "value": "Loki" }
+      },
+      {
+        "name": "app_id",
+        "label": "Fleet (app_id)",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(http_requests_total, app_id)",
+        "refresh": 2, "includeAll": true, "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "endpoint",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(http_requests_total, endpoint)",
+        "refresh": 2, "includeAll": true, "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "method",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(http_requests_total, method)",
+        "refresh": 2, "includeAll": true, "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "log_status", "label": "Log status (regex)", "type": "textbox",
+        "query": ".+", "current": { "text": ".+", "value": ".+" }
+      },
+      {
+        "name": "min_latency_ms", "label": "Min latency (ms)", "type": "textbox",
+        "query": "0", "current": { "text": "0", "value": "0" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 100, "title": "Overview (RED)", "type": "row", "collapsed": false,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 }, "panels": []
+    },
+    {
+      "id": 1, "title": "Request rate", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 0, "y": 1, "w": 6, "h": 6 },
+      "targets": [{ "expr": "sum(rate(http_requests_total{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "req/s", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 2, "title": "Error rate (4xx+5xx)", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 6, "y": 1, "w": 6, "h": 6 },
+      "targets": [{ "expr": "sum(rate(http_requests_total{http_status=~\"[45]..\",endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])) / clamp_min(sum(rate(http_requests_total{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])), 1e-9)", "legendFormat": "error", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.01 }, { "color": "red", "value": 0.05 }] } }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 3, "title": "p95 latency", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 12, "y": 1, "w": 6, "h": 6 },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "legendFormat": "p95", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 4, "title": "5xx rate", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 18, "y": 1, "w": 6, "h": 6 },
+      "targets": [{ "expr": "sum(rate(http_requests_total{http_status=~\"5..\",endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "5xx", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "reqps", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.001 }] } }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 5, "title": "Request rate by status code", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 0, "y": 7, "w": 12, "h": 9 },
+      "targets": [{ "expr": "sum by (http_status) (rate(http_requests_total{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "{{http_status}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "id": 6, "title": "Latency percentiles (p50 / p90 / p99)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 12, "y": 7, "w": 12, "h": 9 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.90, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "legendFormat": "p90", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 101, "title": "By endpoint", "type": "row", "collapsed": false,
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 1 }, "panels": []
+    },
+    {
+      "id": 10, "title": "Top endpoints by request rate", "type": "table",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 0, "y": 17, "w": 12, "h": 9 },
+      "targets": [{ "expr": "topk(25, sum by (endpoint) (rate(http_requests_total{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "refId": "A", "format": "table", "instant": true }],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "showHeader": true }
+    },
+    {
+      "id": 11, "title": "Top error endpoints (4xx / 5xx)", "type": "table",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 12, "y": 17, "w": 12, "h": 9 },
+      "targets": [{ "expr": "topk(25, sum by (endpoint, http_status) (rate(http_requests_total{http_status=~\"[45]..\",endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "refId": "A", "format": "table", "instant": true }],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "showHeader": true }
+    },
+    {
+      "id": 12, "title": "p95 latency by endpoint (top 10)", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 9 },
+      "targets": [{ "expr": "topk(10, histogram_quantile(0.95, sum by (le, endpoint) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))))", "legendFormat": "{{endpoint}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 102, "title": "Queue & workers", "type": "row", "collapsed": false,
+      "gridPos": { "x": 0, "y": 35, "w": 24, "h": 1 }, "panels": []
+    },
+    {
+      "id": 20, "title": "Queue depth vs live workers", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 0, "y": 36, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "gateway_queue_length{app_id=~\"$app_id\"}", "legendFormat": "queue {{app_id}}", "refId": "A" },
+        { "expr": "gateway_workers{app_id=~\"$app_id\"}", "legendFormat": "workers {{app_id}}", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "description": "Backlog vs capacity — rising queue with flat workers = saturation."
+    },
+    {
+      "id": 21, "title": "In-flight requests", "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 12, "y": 36, "w": 6, "h": 8 },
+      "targets": [{ "expr": "gateway_inflight_requests", "legendFormat": "in-flight", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 22, "title": "Total queued jobs", "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 18, "y": 36, "w": 6, "h": 8 },
+      "targets": [{ "expr": "sum(gateway_queue_length{app_id=~\"$app_id\"})", "legendFormat": "queued", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 103, "title": "Logs (filterable)", "type": "row", "collapsed": false,
+      "gridPos": { "x": 0, "y": 44, "w": 24, "h": 1 }, "panels": []
+    },
+    {
+      "id": 30, "title": "Request logs — filter by status (Log status regex) and Min latency", "type": "logs",
+      "datasource": { "type": "loki", "uid": "${loki}" },
+      "gridPos": { "x": 0, "y": 45, "w": 24, "h": 14 },
+      "targets": [{ "expr": "{service=\"gateway\"} | json | status=~\"$log_status\" | method=~\"$method\" | durationMs > $min_latency_ms | line_format \"{{.method}} {{.path}} → {{.status}} ({{.durationMs}}ms)\"", "refId": "A", "queryType": "range" }],
+      "options": { "showTime": true, "showLabels": false, "wrapLogMessage": false, "enableLogDetails": true, "dedupStrategy": "none", "sortOrder": "Descending" },
+      "description": "Live gateway access log from Loki. Set Log status regex (e.g. 5.. for 5xx) and Min latency (ms); the method dropdown also filters. Requires the gateway run with LOG_JSON=1."
+    },
+    {
+      "id": 31, "title": "Top error log lines (5xx)", "type": "logs",
+      "datasource": { "type": "loki", "uid": "${loki}" },
+      "gridPos": { "x": 0, "y": 59, "w": 24, "h": 8 },
+      "targets": [{ "expr": "{service=\"gateway\", statusClass=\"5xx\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} ({{.durationMs}}ms) app={{.app_id}} req={{.requestId}}\"", "refId": "A", "queryType": "range" }],
+      "options": { "showTime": true, "showLabels": false, "wrapLogMessage": true, "enableLogDetails": true, "dedupStrategy": "none", "sortOrder": "Descending" }
+    }
+  ]
+}
