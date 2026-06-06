@@ -47,6 +47,7 @@ from . import datasets_api as datasets_module
 from . import global_env_api as global_env_module
 from . import training_api as training_module
 from . import tracking_creds_api as tracking_creds_module
+from . import gitops_api as gitops_module
 
 logger = logging.getLogger("gateway")
 
@@ -399,6 +400,7 @@ async def lifespan(app: FastAPI):
     app.state.autoscaler_task = None
     app.state.reconciler_task = None
     app.state.bench_janitor_task = None
+    app.state.gitops_task = None
     if os.environ.get("BENCHMARK_S3_BUCKET", "").strip():
         # Materialize SSH key from env (prod) before anything else uses it.
         bench_module.bootstrap_ssh_key_from_env()
@@ -437,6 +439,14 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         logger.exception("autotrain: orphan reconcile failed")
+    # GitOps: reconcile platform resources declared in registered git repos.
+    # The loop self-disables with GITOPS_POLL=0; manual sync + webhook always work.
+    try:
+        app.state.gitops_task = asyncio.create_task(
+            gitops_module.gitops_reconcile_loop(app)
+        )
+    except Exception:
+        logger.exception("gitops: failed to start poll loop")
     if os.environ.get("AUTOSCALER", "0") == "1":
         from .provider import build_provider
         from .autoscaler import autoscaler_loop
@@ -487,7 +497,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task_attr in ("autoscaler_task", "reconciler_task", "bench_janitor_task"):
+        for task_attr in ("autoscaler_task", "reconciler_task", "bench_janitor_task", "gitops_task"):
             t = getattr(app.state, task_attr, None)
             if t:
                 t.cancel()
@@ -516,16 +526,29 @@ app.include_router(datasets_module.router)
 app.include_router(global_env_module.router)
 app.include_router(training_module.router)
 app.include_router(tracking_creds_module.router)
+app.include_router(gitops_module.router)
 
 
 @app.middleware("http")
 async def metrics_mw(request: Request, call_next):
     metrics.INFLIGHT.inc()
+    start = time.perf_counter()
     try:
         resp = await call_next(request)
         route_obj = request.scope.get("route")
         route = getattr(route_obj, "path", request.url.path) if route_obj else request.url.path
         metrics.REQUESTS_TOTAL.labels(route=route, status=str(resp.status_code)).inc()
+        # Serverless-API HTTP instrumentation (http_requests_total +
+        # http_request_duration_seconds, labelled method/endpoint/http_status/app_id).
+        # Match by route TEMPLATE (collapsing unmatched paths so 404 scanners can't
+        # explode cardinality) and skip probes + the metrics scrapes themselves.
+        endpoint = getattr(route_obj, "path", None) or "<unmatched>"
+        if endpoint not in metrics.IGNORE_PATHS:
+            app_id = (request.scope.get("path_params") or {}).get("app_id", "") or ""
+            metrics.observe_http(
+                request.method, endpoint, resp.status_code, app_id,
+                time.perf_counter() - start,
+            )
         return resp
     finally:
         metrics.INFLIGHT.dec()
@@ -1593,6 +1616,25 @@ async def get_app_status(
                         models_state.extend(json.loads(blob))
                     except (json.JSONDecodeError, TypeError):
                         pass
+    # Collapse to one entry per model. With >1 live worker every worker reports
+    # the same members (replicas of the fleet config), so the per-worker lists
+    # above contain duplicates — left as-is the UI gets two rows with the same
+    # key. Keep the "most awake" state across workers so a model that's serving
+    # on any worker shows as awake.
+    if models_state:
+        _STATE_RANK = {
+            "awake": 7, "waking": 6, "launching": 5, "queued": 4,
+            "draining": 3, "sleeping": 2, "asleep": 1, "dead": 0,
+        }
+        deduped: dict[str, dict] = {}
+        for ms in models_state:
+            name = ms.get("model")
+            if name is None:
+                continue
+            cur = deduped.get(name)
+            if cur is None or _STATE_RANK.get(ms.get("state"), -1) > _STATE_RANK.get(cur.get("state"), -1):
+                deduped[name] = ms
+        models_state = list(deduped.values())
     # Attach each model's localhost vLLM port. The gateway assigns these
     # deterministically when it builds the fleet config, so we can recompute
     # them here and surface `localhost:<port>` per model in the Workers tab —
@@ -3087,11 +3129,16 @@ async def workers_metrics(request: Request):
 
 @app.get("/{app_id}/metrics")
 async def app_metrics(app_id: str, request: Request):
-    """Per-endpoint Prometheus scrape: just this app's workers' vLLM /metrics,
-    relabeled. The natural sibling of the serving URL `{base}/{app_id}/v1/...`.
-    Public like /metrics + /metrics/workers — pure telemetry."""
-    body = await _collect_worker_metrics(request.app.state.redis, app_id=app_id)
-    return Response(content=body, media_type="text/plain; version=0.0.4")
+    """Per-endpoint Prometheus scrape: this app's workers' vLLM /metrics (relabeled)
+    PLUS the gateway's own HTTP metrics for this app (http_requests_total /
+    http_request_duration_seconds, labelled by http_status). The natural sibling of
+    the serving URL `{base}/{app_id}/v1/...`. Public like /metrics — pure telemetry.
+    Grafana scrapes this and can alert on non-2xx, e.g.:
+        sum(increase(http_requests_total{http_status!~"2.."}[5m])) > 0"""
+    worker_body = await _collect_worker_metrics(request.app.state.redis, app_id=app_id)
+    gw_body = metrics.render_app(app_id).decode("utf-8")
+    combined = f"{worker_body}\n{gw_body}" if worker_body else gw_body
+    return Response(content=combined, media_type="text/plain; version=0.0.4")
 
 
 async def _resolve_worker_app_id(rdb: Any, machine_id: str) -> Optional[str]:

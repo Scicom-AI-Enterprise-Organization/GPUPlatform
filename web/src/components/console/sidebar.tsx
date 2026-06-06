@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, KeyRound, Library, Lock, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
+import { BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -32,6 +32,7 @@ const ACCOUNT: Item[] = [
   { label: "Settings", href: "/settings", icon: Settings },
 ];
 const ADMIN: Item[] = [
+  { label: "GitOps", href: "/gitops", icon: GitBranch },
   { label: "Organization", href: "/organization", icon: Users },
   { label: "Roles", href: "/admin/roles", icon: Shield },
   { label: "Secrets", href: "/admin/secrets", icon: Lock },
@@ -87,6 +88,9 @@ export function ConsoleSidebar({
     }
     if (href === "/autotrain") {
       return pathname === "/autotrain" || pathname.startsWith("/autotrain/");
+    }
+    if (href === "/gitops") {
+      return pathname === "/gitops" || pathname.startsWith("/gitops/");
     }
     return pathname === href;
   };

@@ -348,6 +348,66 @@ class Dataset(Base):
     )
 
 
+class GitopsRepo(Base):
+    """A git repository the platform reconciles platform resources from (GitOps).
+
+    YAML manifests under `path` declare Apps / Storage / Datasets / Providers /
+    Benchmarks / TrainingRuns; the reconciler creates, updates and prunes the
+    live resources to match. Secrets are NEVER committed to git — manifests
+    reference `GlobalEnv` keys by name, resolved in-memory at apply time.
+
+    `token_secret` names a GlobalEnv key holding a git access token (private
+    repos). `webhook_secret_enc` is the Fernet-encrypted HMAC secret for the
+    push webhook. `prune=True` (the default) means a resource whose manifest is
+    removed gets deleted on the next sync (full GitOps)."""
+    __tablename__ = "gitops_repos"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # gitops-<hex8>
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    url: Mapped[str] = mapped_column(String(1024))
+    branch: Mapped[str] = mapped_column(String(255), default="main", server_default="main", nullable=False)
+    # Subdirectory within the repo to scan; NULL/empty → repo root.
+    path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    # GlobalEnv key holding a git token for private clone/fetch (NULL → public).
+    token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    webhook_secret_enc: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    prune: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    poll_interval: Mapped[int] = mapped_column(Integer, default=300, server_default="300", nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    last_synced_sha: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_sync_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # never | syncing | ok | error
+    last_sync_status: Mapped[str] = mapped_column(String(16), default="never", server_default="never", nullable=False)
+    last_sync_error: Mapped[Optional[str]] = mapped_column(String(8192), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class GitopsResource(Base):
+    """Ledger mapping a GitopsRepo manifest (kind, name) → the live platform
+    resource it created, plus the last-applied spec hash. Drives drift detection
+    (hash changed → re-apply) and prune (a ledger row whose manifest disappeared
+    → delete the underlying resource). `resource_id` is the platform id
+    (app name / store-… / ds-… / prov-… / bench-… / train-…); NULL if the last
+    create attempt failed (`status='error'`)."""
+    __tablename__ = "gitops_resources"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # gres-<hex8>
+    repo_id: Mapped[str] = mapped_column(ForeignKey("gitops_repos.id", ondelete="CASCADE"), index=True)
+    # app | storage | dataset | provider | benchmark | training_run
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    resource_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    spec_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="applied", server_default="applied", nullable=False)  # applied|error
+    error: Mapped[Optional[str]] = mapped_column(String(8192), nullable=True)
+    last_synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 class Request(Base):
     __tablename__ = "requests"
     request_id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -623,6 +683,13 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_token_secret VARCHAR(128)"
+        ))
+        # GitOps: one ledger row per (repo, kind, manifest name). Tables are
+        # created fresh by create_all above; the unique index is what the
+        # reconciler relies on to upsert the ledger.
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_gitops_resources_repo_kind_name "
+            "ON gitops_resources(repo_id, kind, name)"
         ))
 
 

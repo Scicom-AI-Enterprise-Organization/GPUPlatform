@@ -872,3 +872,75 @@ export type AuditLogRecord = {
   details: Record<string, unknown> | null;
   created_at: string;
 };
+
+// ---- GitOps ----
+
+export type GitopsSyncStatus = "never" | "syncing" | "ok" | "error";
+
+export type GitopsRepo = {
+  id: string;
+  name: string;
+  url: string;
+  branch: string;
+  path: string | null;
+  token_secret: string | null;
+  has_webhook_secret: boolean;
+  prune: boolean;
+  poll_interval: number;
+  enabled: boolean;
+  last_synced_sha: string | null;
+  last_sync_at: string | null;
+  last_sync_status: GitopsSyncStatus;
+  last_sync_error: string | null;
+  resource_count: number;
+  created_at: string;
+  created_by: string;
+};
+
+export type GitopsResource = {
+  id: string;
+  kind: string;
+  name: string;
+  resource_id: string | null;
+  generation: number;
+  status: "applied" | "error";
+  error: string | null;
+  last_synced_at: string;
+};
+
+export type CreateGitopsRepoBody = {
+  name: string;
+  url: string;
+  branch?: string;
+  path?: string | null;
+  token_secret?: string | null;
+  webhook_secret?: string | null;
+  prune?: boolean;
+  poll_interval?: number;
+  enabled?: boolean;
+};
+
+export type UpdateGitopsRepoBody = Partial<CreateGitopsRepoBody>;
+
+export type TestGitopsRepoBody = {
+  url: string;
+  branch?: string;
+  token_secret?: string | null;
+};
+
+export type TestGitopsRepoResult = {
+  ok: boolean;
+  message: string;
+  sha?: string | null;
+};
+
+export type GitopsSyncResult = {
+  ok: boolean;
+  skipped: boolean;
+  sha: string | null;
+  created: string[];
+  updated: string[];
+  pruned: string[];
+  unchanged: number;
+  errors: string[];
+};

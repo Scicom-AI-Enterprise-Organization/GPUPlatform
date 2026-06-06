@@ -1,0 +1,16 @@
+# Datasets reference a Storage by its manifest name (resolved to the live store-id).
+---
+kind: Dataset
+name: my-asr-corpus
+spec:
+  kind: s3
+  storage_id: prod-s3                 # cross-ref → the Storage above
+  s3_metadata_uri: datasets/asr/metadata.csv
+  audio_prefix: datasets/asr/audio/
+  description: "ASR training corpus (GitOps-managed)"
+---
+kind: Dataset
+name: hf-common-voice
+spec:
+  kind: hf
+  hf_repo: mozilla-foundation/common_voice_17_0

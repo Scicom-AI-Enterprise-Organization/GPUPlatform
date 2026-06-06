@@ -562,7 +562,13 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
   const configured: FleetModel[] = (app.models ?? []).map((m) => ({
     model: m.model, state: "—", tp: m.tp,
   }));
-  const rows = status?.models?.length ? status.models : configured;
+  // Dedupe by model name: with >1 live worker the status endpoint reports the
+  // same member once per worker (replicas) — collapse so each model is one row
+  // (and React keys stay unique). The gateway dedupes too; this is defensive.
+  const seenModels = new Set<string>();
+  const rows = (status?.models?.length ? status.models : configured).filter(
+    (m) => (seenModels.has(m.model) ? false : (seenModels.add(m.model), true)),
+  );
   const workerUp = (status?.workers ?? 0) > 0;
   const anyAwake = rows.some((m) => m.state === "awake");
 

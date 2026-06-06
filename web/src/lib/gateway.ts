@@ -55,6 +55,13 @@ import type {
   TrainingFile,
   TrackingCredentialRecord,
   CreateTrackingCredentialRequest,
+  GitopsRepo,
+  GitopsResource,
+  GitopsSyncResult,
+  CreateGitopsRepoBody,
+  UpdateGitopsRepoBody,
+  TestGitopsRepoBody,
+  TestGitopsRepoResult,
 } from "./types";
 
 export type GpuAvailability = {
@@ -481,6 +488,33 @@ export const gateway = {
       `/v1/storage/${encodeURIComponent(id)}`,
       { method: "DELETE" },
     ),
+
+  // ---- GitOps ----
+  listGitopsRepos: () => request<GitopsRepo[]>("/v1/gitops"),
+  getGitopsRepo: (id: string) =>
+    request<GitopsRepo>(`/v1/gitops/${encodeURIComponent(id)}`),
+  createGitopsRepo: (body: CreateGitopsRepoBody) =>
+    request<GitopsRepo>("/v1/gitops", { method: "POST", body: JSON.stringify(body) }),
+  testGitopsRepo: (body: TestGitopsRepoBody) =>
+    request<TestGitopsRepoResult>("/v1/gitops/test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateGitopsRepo: (id: string, body: UpdateGitopsRepoBody) =>
+    request<GitopsRepo>(`/v1/gitops/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteGitopsRepo: (id: string, prune = false) =>
+    request<{ ok: boolean; id: string; pruned: boolean }>(
+      `/v1/gitops/${encodeURIComponent(id)}?prune=${prune ? "true" : "false"}`,
+      { method: "DELETE" },
+    ),
+  listGitopsResources: (id: string) =>
+    request<GitopsResource[]>(`/v1/gitops/${encodeURIComponent(id)}/resources`),
+  // A manual reconcile can take a while (git fetch + create/spawn) — give it room.
+  syncGitopsRepo: (id: string) =>
+    request<GitopsSyncResult>(`/v1/gitops/${encodeURIComponent(id)}/sync`, { method: "POST" }, 120_000),
 
   // ---- Datasets (Autotrain) ----
   listDatasets: (scope: "mine" | "all" = "mine") =>
