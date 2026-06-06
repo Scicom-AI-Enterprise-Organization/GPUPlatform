@@ -549,8 +549,8 @@ async def metrics_mw(request: Request, call_next):
         elapsed = time.perf_counter() - start
         route_obj = request.scope.get("route")
         route = getattr(route_obj, "path", request.url.path) if route_obj else request.url.path
-        # Serverless-API HTTP instrumentation (http_requests_total +
-        # http_request_duration_seconds, labelled method/endpoint/http_status/app_id).
+        # Serverless-API HTTP instrumentation (serverless_http_requests_total +
+        # serverless_http_request_duration_seconds, labelled method/route/http_status/app_id).
         # Match by route TEMPLATE (collapsing unmatched paths so 404 scanners can't
         # explode cardinality) and skip probes + the metrics scrapes themselves.
         endpoint = getattr(route_obj, "path", None) or "<unmatched>"
@@ -3160,11 +3160,11 @@ async def workers_metrics(request: Request):
 @app.get("/{app_id}/metrics")
 async def app_metrics(app_id: str, request: Request):
     """Per-endpoint Prometheus scrape: this app's workers' vLLM /metrics (relabeled)
-    PLUS the gateway's own HTTP metrics for this app (http_requests_total /
-    http_request_duration_seconds, labelled by http_status). The natural sibling of
-    the serving URL `{base}/{app_id}/v1/...`. Public like /metrics — pure telemetry.
-    Grafana scrapes this and can alert on non-2xx, e.g.:
-        sum(increase(http_requests_total{http_status!~"2.."}[5m])) > 0"""
+    PLUS the gateway's own HTTP metrics for this app (serverless_http_requests_total /
+    serverless_http_request_duration_seconds, labelled by http_status). The natural
+    sibling of the serving URL `{base}/{app_id}/v1/...`. Public like /metrics — pure
+    telemetry. Grafana scrapes this and can alert on non-2xx, e.g.:
+        sum(increase(serverless_http_requests_total{http_status!~"2.."}[5m])) > 0"""
     worker_body = await _collect_worker_metrics(request.app.state.redis, app_id=app_id)
     gw_body = metrics.render_app(app_id).decode("utf-8")
     combined = f"{worker_body}\n{gw_body}" if worker_body else gw_body
