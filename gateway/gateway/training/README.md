@@ -64,8 +64,9 @@ If these are new, read this section slowly — the rest of the doc assumes them.
   Fast and stable; the whole target sequence is supervised in one forward pass.
 
 - **Multipacking.** Concatenating many short training examples into one fixed-length
-  block so almost no compute is wasted on padding — explained in full in §2.3,
-  because it's the trickiest idea here.
+  block so almost no compute is wasted on padding — explained in full in
+  [Multipacking](#23-multipacking--read-this-carefully), because it's the trickiest
+  idea here.
 
 ---
 
@@ -239,7 +240,7 @@ control tokens **in its vocabulary**, so the whole line tokenizes into ordinary
 Then these examples are **multipacked** (next section) into fixed-length blocks and
 written as Parquet/MDS shards (via the vendored `chinidataset`) with columns:
 `input_ids`, `position_ids`, `attention_mask` — note `attention_mask` here is **not**
-a 0/1 mask (see §2.3).
+a 0/1 mask (see [Multipacking](#23-multipacking--read-this-carefully)).
 
 ### 2.3 Multipacking — *read this carefully*
 
@@ -302,7 +303,8 @@ full-length block to kill padding waste, then use per-sample `position_ids` + va
 Build the prefix `<|im_start|>{speaker}: {text}<|speech_start|>` and let the LLM
 generate tokens until `<|im_end|>`. Strip the `<|s_N|>` tokens back to integers and
 call **`NeuCodec` decode** → waveform (written at the codec's 24 kHz output rate;
-see §2.1). Generate via `AutoModelForCausalLM` — **not** a custom `Model` wrapper
+see [Stage 1 — audio → speech tokens](#21-stage-1--audio--speech-tokens-ttsconvert_neucodecpy)).
+Generate via `AutoModelForCausalLM` — **not** a custom `Model` wrapper
 (that bug produced silence/garbage and was one of the validated fixes).
 
 ### 2.6 Evaluation — CER / MOS / similarity (`tts/tts_eval.py`)
@@ -371,7 +373,7 @@ optional HF push target. Whisper adds `language` + `task` (`transcription`/
 | **Text normalization** | Lowercasing / punctuation-stripping / number spell-out applied to both sides before WER/CER, so the score reflects content, not formatting. On by default for Whisper eval. |
 | **Log-mel spectrogram** | Audio as a frequency×time image on the perceptual mel scale, log-scaled. Whisper's encoder input (`input_features`). |
 | **NeuCodec** | Neural audio codec (`neuphonic/neucodec`) that encodes a waveform to discrete integer tokens and decodes them back. Turns audio into something an LLM can model. **Asymmetric SR: encoder in = 16 kHz, decoder out = 24 kHz** (`model.sample_rate == 24000`). |
-| **Speech token `<|s_N|>`** | A NeuCodec integer `N` rendered as a vocabulary token the LLM predicts. |
+| **Speech token `<\|s_N\|>`** | A NeuCodec integer `N` rendered as a vocabulary token the LLM predicts. |
 | **Cross-attention** | Decoder attending to the encoder's outputs — how Whisper conditions text on audio. |
 | **Teacher forcing** | Training a generator on ground-truth previous tokens. |
 | **Multipacking** | Concatenating many samples into one fixed-length block to eliminate padding waste; correctness via reset `position_ids` + varlen (block-diagonal) flash-attention. |
