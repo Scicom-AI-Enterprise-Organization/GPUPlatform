@@ -18,6 +18,7 @@ import {
   FlaskConical,
   Gauge,
   Info,
+  KeyRound,
   Loader2,
   Package,
   RefreshCw,
@@ -679,6 +680,12 @@ export function BenchmarkForm({
   // CUDA_VISIBLE_DEVICES pin + extra env exported for the run (cache/home dirs).
   const [visibleDevices, setVisibleDevices] = useState("");
   const [envText, setEnvText] = useState("");
+  // HuggingFace token for gated models — from a global secret (default) or a
+  // pasted token. `secretKeys` is the list of admin Secrets keys to pick from.
+  const [secretKeys, setSecretKeys] = useState<string[]>([]);
+  const [hfSource, setHfSource] = useState<"secret" | "paste">("secret");
+  const [hfToken, setHfToken] = useState("");
+  const [hfTokenSecret, setHfTokenSecret] = useState("");
 
   // Live SSH probe of the selected VM. Re-fires when the user changes the
   // provider, and when they hit the refresh button.
@@ -725,6 +732,13 @@ export function BenchmarkForm({
     gateway.listBenchmarkTemplates().then(setTemplates).catch(() => {});
     gateway.listProviders().then(setProviders).catch(() => {});
     gateway.listStorage().then(setStorages).catch(() => {});
+    // Global-secret keys the HF token can reference (keys only; values stay server-side).
+    fetch("/api/proxy/v1/global-env", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => {
+        if (Array.isArray(rows)) setSecretKeys(rows.map((r: { key: string }) => r.key));
+      })
+      .catch(() => {});
     gateway
       .listRunpodGpuTypes()
       .then((rows) => {
@@ -806,6 +820,11 @@ export function BenchmarkForm({
     setSubmitting(true);
     try {
       const envVars = parseEnvVars(envText);
+      // A pasted HF token rides along in env_vars (highest precedence at launch);
+      // a chosen global secret is sent as a key ref the gateway aliases to HF_TOKEN.
+      if (hfSource === "paste" && hfToken.trim()) {
+        envVars.HF_TOKEN = hfToken.trim();
+      }
       const created = await gateway.createBenchmark({
         name: name.trim(),
         config_yaml,
@@ -817,6 +836,7 @@ export function BenchmarkForm({
         cleanup_model: target === "vm" ? cleanupModel : undefined,
         ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
         ...(visibleDevices.trim() ? { visible_devices: visibleDevices.trim() } : {}),
+        ...(hfSource === "secret" && hfTokenSecret ? { hf_token_secret: hfTokenSecret } : {}),
       });
       toast.success(`Created ${created.id}`, { duration: 4000 });
       router.push(`/benchmark/${encodeURIComponent(created.id)}`);
@@ -910,7 +930,7 @@ export function BenchmarkForm({
       <Card>
         <CardContent className="pt-6">
           <div className="space-y-2">
-            <Label htmlFor="benchName" className="text-sm font-medium">
+            <Label htmlFor="benchName" className="text-xs uppercase tracking-wide text-muted-foreground">
               Benchmark name
             </Label>
             <Input
@@ -1040,7 +1060,7 @@ export function BenchmarkForm({
           {target === "vm" && (
             <div className="space-y-3">
               <div className="space-y-1.5">
-                <Label htmlFor="bench-provider" className="text-xs">VM provider</Label>
+                <Label htmlFor="bench-provider" className="text-xs uppercase tracking-wide text-muted-foreground">VM provider</Label>
                 {providers.length === 0 ? (
                   <p className="text-xs text-muted-foreground">
                     No VM providers registered. Add one at{" "}
@@ -1075,7 +1095,7 @@ export function BenchmarkForm({
               </div>
 
               <div className="space-y-1.5">
-                <Label htmlFor="bench-vm-base" className="text-xs">Working directory on VM</Label>
+                <Label htmlFor="bench-vm-base" className="text-xs uppercase tracking-wide text-muted-foreground">Working directory on VM</Label>
                 <Input
                   id="bench-vm-base"
                   value={form.vm_base_dir}
@@ -1240,7 +1260,7 @@ export function BenchmarkForm({
           >
             <div className="space-y-4">
               <div className="space-y-1.5">
-                <Label htmlFor="bench-cuda" className="text-xs">CUDA_VISIBLE_DEVICES</Label>
+                <Label htmlFor="bench-cuda" className="text-xs uppercase tracking-wide text-muted-foreground">CUDA_VISIBLE_DEVICES</Label>
                 <Input
                   id="bench-cuda"
                   value={visibleDevices}
@@ -1253,7 +1273,7 @@ export function BenchmarkForm({
                 </p>
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="bench-env" className="text-xs">Environment variables</Label>
+                <Label htmlFor="bench-env" className="text-xs uppercase tracking-wide text-muted-foreground">Environment variables</Label>
                 <Textarea
                   id="bench-env"
                   value={envText}
@@ -1277,6 +1297,79 @@ export function BenchmarkForm({
             </div>
           </SectionCard>
 
+          {/* HuggingFace token for gated models — a global secret (recommended,
+              rotates without editing this run) or a pasted token for this run. */}
+          <SectionCard
+            icon={<KeyRound className="h-4 w-4" />}
+            title="HuggingFace token"
+            description="For gated models. Use a global secret or paste a token. Leave on a secret to rotate without editing this benchmark."
+          >
+            <div className="space-y-2">
+              <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                {(["secret", "paste"] as const).map((src) => (
+                  <button
+                    key={src}
+                    type="button"
+                    onClick={() => setHfSource(src)}
+                    className={
+                      "rounded px-2.5 py-1 transition-colors " +
+                      (hfSource === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                    }
+                  >
+                    {src === "secret" ? "Global secret" : "Paste a token"}
+                  </button>
+                ))}
+              </div>
+
+              {hfSource === "secret" ? (
+                secretKeys.length > 0 ? (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="bench-hf-secret" className="text-xs uppercase tracking-wide text-muted-foreground">Global secret</Label>
+                    <Select value={hfTokenSecret} onValueChange={setHfTokenSecret}>
+                      <SelectTrigger id="bench-hf-secret">
+                        <SelectValue placeholder="Select a secret (e.g. HF_TOKEN)" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {secretKeys.map((k) => (
+                          <SelectItem key={k} value={k} className="font-mono text-xs">{k}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Resolved from{" "}
+                      <a href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</a>{" "}
+                      at launch and injected as <span className="font-mono">HF_TOKEN</span>.
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    No global secrets yet. Add one under{" "}
+                    <a href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</a>{" "}
+                    (e.g. <span className="font-mono">HF_TOKEN</span>), then pick it here — or switch to{" "}
+                    <span className="font-medium">Paste a token</span>.
+                  </p>
+                )
+              ) : (
+                <div className="space-y-1.5">
+                  <Label htmlFor="bench-hf-token" className="text-xs uppercase tracking-wide text-muted-foreground">Token</Label>
+                  <Input
+                    id="bench-hf-token"
+                    type="password"
+                    autoComplete="off"
+                    value={hfToken}
+                    onChange={(e) => setHfToken(e.target.value)}
+                    placeholder="hf_..."
+                    className="font-mono text-xs"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Sent with this run as <span className="font-mono">HF_TOKEN</span> (stored with the benchmark&apos;s env).
+                    Prefer a global secret for shared / rotating tokens.
+                  </p>
+                </div>
+              )}
+            </div>
+          </SectionCard>
+
           {/* Storage — where this run's logs.txt + result files land. Required;
               only enabled S3 storages are eligible (HF storages can't hold the
               raw log/result objects). */}
@@ -1286,7 +1379,7 @@ export function BenchmarkForm({
             description="S3 bucket the run's logs and metrics are written to."
           >
             <div className="space-y-1.5">
-              <Label htmlFor="bench-storage" className="text-xs">Storage</Label>
+              <Label htmlFor="bench-storage" className="text-xs uppercase tracking-wide text-muted-foreground">Storage</Label>
               {!hasStorage ? (
                 <p className="text-xs text-muted-foreground">
                   No S3 storage configured. Add one at{" "}
@@ -1634,7 +1727,7 @@ export function BenchmarkForm({
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
-            <Label htmlFor="tplName">Template name</Label>
+            <Label htmlFor="tplName" className="text-xs uppercase tracking-wide text-muted-foreground">Template name</Label>
             <Input
               id="tplName"
               autoFocus
@@ -2012,7 +2105,7 @@ function KebabField({
 }) {
   return (
     <div className="space-y-1.5">
-      <Label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+      <Label className="text-xs uppercase tracking-wide text-muted-foreground">
         {label}
       </Label>
       {children}
@@ -2082,7 +2175,7 @@ function FieldWrap({
   return (
     <div className={cn("space-y-1.5", wide ? "sm:col-span-2 lg:col-span-2" : "")}>
       <div className="flex items-center justify-between gap-2">
-        <Label className="text-xs font-medium">{label}</Label>
+        <Label className="text-xs uppercase tracking-wide text-muted-foreground">{label}</Label>
         {extra}
       </div>
       {children}

@@ -169,7 +169,7 @@ export function InferenceForm() {
   const [gpuCount, setGpuCount] = useState<number>(1);
   const [cloudType, setCloudType] = useState<"COMMUNITY" | "SECURE">("SECURE");
   const [containerDisk, setContainerDisk] = useState<string>("50");
-  const [volumeGb, setVolumeGb] = useState<string>("0");
+  const [volumeGb, setVolumeGb] = useState<string>("50");
   const [idleInput, setIdleInput] = useState("120"); // 2 min scale-to-zero (single-model only; multi VM fleets are always-on)
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [enableMetrics, setEnableMetrics] = useState(true);
@@ -197,6 +197,15 @@ export function InferenceForm() {
   // worker fall back to bare `python3` (no vLLM), which silently never launches.
   const [venvPath, setVenvPath] = useState("/share/vllm-venv");
   const [vllmVersion, setVllmVersion] = useState("");
+  // HuggingFace cache dir, exported as HF_HOME to every vLLM process. On a
+  // mounted volume → downloaded weights persist across (re-)provisions.
+  const [hfHome, setHfHome] = useState("/share/huggingface");
+  // HF auth token for gated / private models → the HF_TOKEN env var. Pick a
+  // global secret (referenced, resolved server-side at run-time) or paste one.
+  const [hfTokenSource, setHfTokenSource] = useState<"secret" | "paste">("secret");
+  const [hfToken, setHfToken] = useState("");
+  const [hfTokenSecret, setHfTokenSecret] = useState("");
+  const [secretKeys, setSecretKeys] = useState<string[]>([]);
   // Endpoint-level env applied to every vLLM process (cache/home dirs, etc.).
   // Pasted as `KEY=value` / `export KEY=value` lines; `mkdir` lines are ignored
   // (the worker auto-creates absolute-path values).
@@ -204,6 +213,20 @@ export function InferenceForm() {
 
   useEffect(() => {
     gateway.listProviders().then(setProviders).catch(() => {});
+  }, []);
+
+  // Global secrets (admin Secrets) the HF token can reference — keys only.
+  useEffect(() => {
+    let cancel = false;
+    fetch("/api/proxy/v1/global-env", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => {
+        if (!cancel && Array.isArray(rows)) setSecretKeys(rows.map((r: { key: string }) => r.key));
+      })
+      .catch(() => {});
+    return () => {
+      cancel = true;
+    };
   }, []);
 
   // Fetch the selected RunPod account's credit (named accounts only — the gateway
@@ -338,7 +361,22 @@ export function InferenceForm() {
   // Total GPUs the fleet wants = Σ (tp × pp) across members.
   const gpusUsed = cleanedMembers.reduce((acc, m) => acc + m.tp * m.pp, 0);
   const oversubscribed = mode === "multi" && fleetGpus > 0 && gpusUsed > fleetGpus;
-  const envVars = parseEnvVars(envText);
+  // HF_HOME + HF_TOKEN (their own fields) are exported as env vars; an explicit
+  // value in the env-vars box wins. Only where the venv/env fields show (VM/fleet).
+  // HF_TOKEN is either a pasted value or a `secret://KEY` ref the gateway resolves.
+  const hfTokenEnv: Record<string, string> =
+    !(isVm || cloudMulti)
+      ? {}
+      : hfTokenSource === "paste" && hfToken.trim()
+        ? { HF_TOKEN: hfToken.trim() }
+        : hfTokenSource === "secret" && hfTokenSecret
+          ? { HF_TOKEN: `secret://${hfTokenSecret}` }
+          : {};
+  const envVars = {
+    ...((isVm || cloudMulti) && hfHome.trim() ? { HF_HOME: hfHome.trim() } : {}),
+    ...hfTokenEnv,
+    ...parseEnvVars(envText),
+  };
   const hasEnvVars = Object.keys(envVars).length > 0;
 
   type DeployArg = Parameters<typeof deployEndpoint>[0];
@@ -356,6 +394,10 @@ export function InferenceForm() {
     setSubmitError(null);
     if (!name.trim()) {
       setSubmitError("Endpoint name is required.");
+      return;
+    }
+    if (target === "cloud" && !runpodProviderId) {
+      setSubmitError("Select a RunPod provider — add one under GPU Providers.");
       return;
     }
 
@@ -459,6 +501,10 @@ export function InferenceForm() {
             autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: parsedIdle },
             enable_metrics: enableMetrics,
             ...(hasEnvVars ? { env_vars: envVars } : {}),
+            // The fleet installs vLLM into its venv (a volume path persists across
+            // re-provisions); pin the version (default 0.19.1) for reproducibility.
+            ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
+            vllm_version: vllmVersion.trim() || "0.19.1",
           };
       startTransition(async () => applyResult(await deployEndpoint(body)));
       return;
@@ -595,27 +641,33 @@ export function InferenceForm() {
             {target === "cloud" ? (
               <Field
                 label="RunPod account"
-                hint="Which RunPod provider to bill against. Default = gateway env key."
+                hint="Which registered RunPod provider to run on."
               >
-                <Select
-                  value={runpodProviderId || "__default__"}
-                  onValueChange={(v) => setRunpodProviderId(v === "__default__" ? "" : v)}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__default__">Gateway default (RunPod)</SelectItem>
-                    {providers
-                      .filter((p) => p.kind === "runpod")
-                      .map((p) => (
-                        <SelectItem key={p.id} value={p.id}>
-                          {p.name}
-                          {p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
-                        </SelectItem>
-                      ))}
-                  </SelectContent>
-                </Select>
+                {providers.filter((p) => p.kind === "runpod").length === 0 ? (
+                  <p className="text-sm text-muted-foreground">
+                    No RunPod providers registered.{" "}
+                    <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">
+                      Add one
+                    </a>{" "}
+                    under GPU Providers.
+                  </p>
+                ) : (
+                  <Select value={runpodProviderId} onValueChange={setRunpodProviderId}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Choose a RunPod account…" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {providers
+                        .filter((p) => p.kind === "runpod")
+                        .map((p) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.name}
+                            {p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
+                          </SelectItem>
+                        ))}
+                    </SelectContent>
+                  </Select>
+                )}
                 {runpodProviderId && (
                   <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
                     <Wallet className="h-3.5 w-3.5" />
@@ -708,17 +760,6 @@ export function InferenceForm() {
                   </p>
                 ) : null}
               </Field>
-              <Field
-                label="vLLM venv path (optional)"
-                hint="A uv venv on the VM that has vLLM, e.g. /share/vllm-venv. The worker runs {venv}/bin/python -m vllm. Empty = bare python3 on the VM's PATH."
-              >
-                <Input
-                  value={venvPath}
-                  onChange={(e) => setVenvPath(e.target.value)}
-                  placeholder="/share/vllm-venv"
-                  className="font-mono text-xs"
-                />
-              </Field>
               </>
             ) : null}
 
@@ -810,7 +851,7 @@ export function InferenceForm() {
               </Field>
               <Field
                 label="Volume (GB)"
-                hint="Persistent volume. 0 = no persistent storage."
+                hint="Persistent volume mounted at /workspace (model cache). 0 = no persistent storage."
               >
                 <Input
                   type="text"
@@ -855,10 +896,14 @@ export function InferenceForm() {
               </Select>
             </Field>
 
-            {isVm && (
+            {(isVm || cloudMulti) && (
               <Field
                 label="vLLM version (optional)"
-                hint="Pin vLLM to this version in the VM's vLLM venv (set under Pod) — the worker uv pip installs it if missing. Empty = use whatever's installed."
+                hint={
+                  isVm
+                    ? "Pin vLLM to this version in the VM's vLLM venv (below) — the worker uv pip installs it if missing. Empty = use whatever's installed."
+                    : "Pin vLLM to this version — installed into the pod's venv on each provision. Empty = 0.19.1."
+                }
               >
                 <Input
                   value={vllmVersion}
@@ -866,6 +911,99 @@ export function InferenceForm() {
                   placeholder="0.19.1"
                   className="font-mono text-xs"
                 />
+              </Field>
+            )}
+
+            {(isVm || cloudMulti) && (
+              <Field
+                label="vLLM venv path"
+                hint={
+                  isVm
+                    ? "A uv venv on the VM that has vLLM, e.g. /share/vllm-venv. The worker runs {venv}/bin/python -m vllm. Empty = bare python3 on PATH."
+                    : "Where the pod builds its vLLM venv. Put it on a mounted volume (e.g. /share/vllm-venv) so vLLM isn't reinstalled on each re-provision."
+                }
+              >
+                <Input
+                  value={venvPath}
+                  onChange={(e) => setVenvPath(e.target.value)}
+                  placeholder="/share/vllm-venv"
+                  className="font-mono text-xs"
+                />
+              </Field>
+            )}
+
+            {(isVm || cloudMulti) && (
+              <Field
+                label="HF_HOME (model cache)"
+                hint="HuggingFace cache dir, exported to every vLLM process. Put it on a mounted volume so downloaded weights persist across re-provisions. Empty = image / OS default."
+              >
+                <Input
+                  value={hfHome}
+                  onChange={(e) => setHfHome(e.target.value)}
+                  placeholder="/share/huggingface"
+                  className="font-mono text-xs"
+                />
+              </Field>
+            )}
+
+            {(isVm || cloudMulti) && (
+              <Field
+                label="HF token (optional)"
+                hint="For gated / private models — exported as HF_TOKEN. Pick a global secret (referenced, resolved at run-time — rotate it in Secrets) or paste a token."
+              >
+                <div className="space-y-2">
+                  <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                    {(["secret", "paste"] as const).map((src) => (
+                      <button
+                        key={src}
+                        type="button"
+                        onClick={() => setHfTokenSource(src)}
+                        className={cn(
+                          "rounded px-2.5 py-1 transition-colors",
+                          hfTokenSource === src
+                            ? "bg-primary text-primary-foreground"
+                            : "text-muted-foreground hover:text-foreground",
+                        )}
+                      >
+                        {src === "secret" ? "Global secret" : "Paste a token"}
+                      </button>
+                    ))}
+                  </div>
+                  {hfTokenSource === "secret" ? (
+                    secretKeys.length > 0 ? (
+                      <Select value={hfTokenSecret} onValueChange={setHfTokenSecret}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select a secret (e.g. HF_TOKEN)" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {secretKeys.map((k) => (
+                            <SelectItem key={k} value={k}>
+                              {k}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        No global secrets yet. Add one under{" "}
+                        <a href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">
+                          Secrets
+                        </a>{" "}
+                        (e.g. <span className="font-mono">HF_TOKEN</span>), or switch to{" "}
+                        <span className="font-medium">Paste a token</span>.
+                      </p>
+                    )
+                  ) : (
+                    <Input
+                      type="password"
+                      value={hfToken}
+                      onChange={(e) => setHfToken(e.target.value)}
+                      placeholder="hf_…"
+                      autoComplete="off"
+                      className="font-mono text-xs"
+                    />
+                  )}
+                </div>
               </Field>
             )}
 
@@ -1260,11 +1398,15 @@ export function InferenceForm() {
             </>
             )}
 
-            {isVm && (
+            {(isVm || cloudMulti) && (
               <div className="border-t border-border pt-4">
                 <Field
                   label="Environment variables"
-                  hint="Applied to every vLLM process on the VM. One KEY=value per line (export / mkdir lines are fine — absolute-path values are auto-created). CUDA_VISIBLE_DEVICES is set per model automatically."
+                  hint={
+                    isVm
+                      ? "Applied to every vLLM process on the VM. One KEY=value per line (export / mkdir lines are fine — absolute-path values are auto-created). CUDA_VISIBLE_DEVICES is set per model automatically."
+                      : "Applied to every vLLM process in the pod fleet. One KEY=value per line. The pod is ephemeral — point caches at a mounted volume if you need them to survive a re-provision. CUDA_VISIBLE_DEVICES is set per model automatically."
+                  }
                 >
                   <textarea
                     value={envText}

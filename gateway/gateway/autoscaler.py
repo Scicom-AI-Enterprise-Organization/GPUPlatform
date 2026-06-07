@@ -309,8 +309,12 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
                 # gpu_indices, so only apply the global var outside multi.
                 env["CUDA_VISIBLE_DEVICES"] = app.visible_devices.strip()
             # Global env/secrets + this app's env vars (app overrides global),
-            # applied to every vLLM process on the worker.
-            _worker_env = {**global_env, **(getattr(app, "env_vars", None) or {})}
+            # applied to every vLLM process on the worker. `secret://KEY` values
+            # (e.g. a referenced HF token) resolve against the global secrets.
+            from .global_env_api import resolve_env_refs
+            _worker_env = resolve_env_refs(
+                {**global_env, **(getattr(app, "env_vars", None) or {})}, global_env
+            )
             if _worker_env:
                 env["WORKER_ENV_JSON"] = json.dumps(_worker_env)
             try:

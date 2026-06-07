@@ -260,7 +260,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       {/* Section: identity */}
       <Section title="Pod" description="A short name to remember this pod by.">
         <div className="space-y-1.5">
-          <Label htmlFor="cmp-name">Name</Label>
+          <Label htmlFor="cmp-name" className="text-xs uppercase tracking-wide text-muted-foreground">Name</Label>
           <Input
             id="cmp-name"
             value={name}
@@ -278,7 +278,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         description="Which API key to bill against. Default = gateway RunPod env key."
       >
         <div className="space-y-1.5">
-          <Label>API key</Label>
+          <Label className="text-xs uppercase tracking-wide text-muted-foreground">API key</Label>
           <Select
             value={providerId || "__default__"}
             onValueChange={(v) => setProviderId(v === "__default__" ? "" : v)}
@@ -312,7 +312,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       <Section title="Hardware" description="GPU type, count, and storage.">
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1.5">
-            <Label>GPU</Label>
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">GPU</Label>
             <Select value={gpuType} onValueChange={setGpuType}>
               <SelectTrigger>
                 <SelectValue />
@@ -332,7 +332,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="cmp-count">GPU count</Label>
+            <Label htmlFor="cmp-count" className="text-xs uppercase tracking-wide text-muted-foreground">GPU count</Label>
             <NumberField
               id="cmp-count"
               min={1}
@@ -343,7 +343,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="cmp-disk">Container disk (GB)</Label>
+            <Label htmlFor="cmp-disk" className="text-xs uppercase tracking-wide text-muted-foreground">Container disk (GB)</Label>
             <NumberField
               id="cmp-disk"
               min={10}
@@ -357,7 +357,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="cmp-volume">Volume (GB)</Label>
+            <Label htmlFor="cmp-volume" className="text-xs uppercase tracking-wide text-muted-foreground">Volume (GB)</Label>
             <NumberField
               id="cmp-volume"
               min={0}
@@ -371,7 +371,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
           </div>
 
           <div className="space-y-1.5 sm:col-span-2">
-            <Label>Cloud tier</Label>
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Cloud tier</Label>
             <div className="flex gap-2">
               <TierButton
                 active={!secureCloud}

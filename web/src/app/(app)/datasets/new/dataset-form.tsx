@@ -133,11 +133,11 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
         </CardHeader>
         <CardContent className="grid items-start gap-4 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="ds-name">Name</Label>
+            <Label htmlFor="ds-name" className="text-xs uppercase tracking-wide text-muted-foreground">Name</Label>
             <Input id="ds-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="libritts-clean" />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="ds-desc">Description (optional)</Label>
+            <Label htmlFor="ds-desc" className="text-xs uppercase tracking-wide text-muted-foreground">Description (optional)</Label>
             <Textarea
               id="ds-desc"
               value={description}
@@ -183,7 +183,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
           {(kind === "upload" || kind === "s3") && (
             <div className="grid items-start gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label>S3 storage</Label>
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">S3 storage</Label>
                 <Select value={storageId} onValueChange={setStorageId}>
                   <SelectTrigger>
                     <SelectValue placeholder={storageOptions.length ? "Choose a storage" : "No S3 storage configured"} />
@@ -206,7 +206,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
               </div>
               {kind === "s3" && (
                 <div className="space-y-2">
-                  <Label htmlFor="ds-s3uri">S3 metadata URI</Label>
+                  <Label htmlFor="ds-s3uri" className="text-xs uppercase tracking-wide text-muted-foreground">S3 metadata URI</Label>
                   <Input
                     id="ds-s3uri"
                     value={s3MetadataUri}
@@ -216,7 +216,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                 </div>
               )}
               <div className="space-y-2">
-                <Label htmlFor="ds-audioprefix">Audio prefix (optional)</Label>
+                <Label htmlFor="ds-audioprefix" className="text-xs uppercase tracking-wide text-muted-foreground">Audio prefix (optional)</Label>
                 <Input
                   id="ds-audioprefix"
                   value={audioPrefix}
@@ -233,7 +233,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
           {kind === "hf" && (
             <div className="grid items-start gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="ds-hfrepo">HuggingFace repo</Label>
+                <Label htmlFor="ds-hfrepo" className="text-xs uppercase tracking-wide text-muted-foreground">HuggingFace repo</Label>
                 <Input
                   id="ds-hfrepo"
                   value={hfRepo}
@@ -242,7 +242,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                 />
               </div>
               <div className="space-y-2">
-                <Label>HuggingFace storage (optional, for private repos)</Label>
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">HuggingFace storage (optional, for private repos)</Label>
                 <Select value={storageId} onValueChange={setStorageId}>
                   <SelectTrigger>
                     <SelectValue placeholder={storageOptions.length ? "Choose a HuggingFace storage (optional)" : "No HuggingFace storage configured"} />
@@ -261,7 +261,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
             <div className="space-y-4">
               <div className="grid items-start gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
-                  <Label htmlFor="ds-labelurl">Project URL</Label>
+                  <Label htmlFor="ds-labelurl" className="text-xs uppercase tracking-wide text-muted-foreground">Project URL</Label>
                   <Input
                     id="ds-labelurl"
                     value={labelProjectUrl}
@@ -273,7 +273,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                   </p>
                 </div>
                 <div className="space-y-2">
-                  <Label>Import which tasks</Label>
+                  <Label className="text-xs uppercase tracking-wide text-muted-foreground">Import which tasks</Label>
                   <Select value={labelStatus} onValueChange={setLabelStatus}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -288,7 +288,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
 
               <div className="space-y-2">
                 <div className="flex items-center gap-3">
-                  <Label>API token</Label>
+                  <Label className="text-xs uppercase tracking-wide text-muted-foreground">API token</Label>
                   <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
                     {(["paste", "secret"] as const).map((m) => (
                       <button

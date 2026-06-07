@@ -801,7 +801,7 @@ export function TrainingForm() {
             </Select>
             {testDatasetId === AUTO_SPLIT && (
               <div className="mt-2 flex items-center gap-2">
-                <Label className="text-xs text-muted-foreground">Hold-out %</Label>
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">Hold-out %</Label>
                 <Input type="number" min={1} max={50} className="w-24"
                   value={evalSplitPct} onChange={(e) => setEvalSplitPct(Number(e.target.value))} />
                 <span className="text-[11px] text-muted-foreground">
@@ -1084,7 +1084,7 @@ export function TrainingForm() {
         )}
         {isTts && (
           <div className="mt-5 space-y-1.5 border-t border-border pt-4">
-            <Label className="text-xs">Evaluation methods</Label>
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Evaluation methods</Label>
             <p className="text-xs text-muted-foreground">
               Synthesize the test set and score it (per eval, drives patience early-stop + best-model).
               Pick any combination — each runs independently. No test set = skipped.
@@ -1123,7 +1123,7 @@ export function TrainingForm() {
         )}
         {!isTts && (
         <div className="mt-5 space-y-1.5 border-t border-border pt-4">
-          <Label className="text-xs">Audio augmentation (training only)</Label>
+          <Label className="text-xs uppercase tracking-wide text-muted-foreground">Audio augmentation (training only)</Label>
           <p className="text-xs text-muted-foreground">
             Select techniques to harden the model against noisy / phone audio. One enabled
             technique is applied at random to each augmented training clip; eval is never augmented.
@@ -1155,7 +1155,7 @@ export function TrainingForm() {
           </div>
           {augmentTechniques.length > 0 && (
             <div className="flex items-center gap-2 pt-1">
-              <Label htmlFor="aug-prob" className="text-xs">Augment probability</Label>
+              <Label htmlFor="aug-prob" className="text-xs uppercase tracking-wide text-muted-foreground">Augment probability</Label>
               <Input id="aug-prob" type="number" min={0} max={1} step={0.05}
                 className="h-8 w-24 font-mono text-xs"
                 value={augmentProb}
@@ -1229,7 +1229,7 @@ export function TrainingForm() {
         {target === "vm" && (
           <div className="space-y-3">
             <div className="space-y-1.5">
-              <Label htmlFor="train-provider" className="text-xs">VM provider</Label>
+              <Label htmlFor="train-provider" className="text-xs uppercase tracking-wide text-muted-foreground">VM provider</Label>
               {vmProviders.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
                   No VM providers registered. Add one at{" "}
@@ -1337,7 +1337,7 @@ export function TrainingForm() {
         )}
 
         <div className="mt-5 space-y-1.5 border-t border-border pt-4">
-          <Label htmlFor="train-cuda" className="text-xs">CUDA_VISIBLE_DEVICES</Label>
+          <Label htmlFor="train-cuda" className="text-xs uppercase tracking-wide text-muted-foreground">CUDA_VISIBLE_DEVICES</Label>
           <Input id="train-cuda"
             className={cn("font-mono text-xs", vdError && "border-destructive focus-visible:ring-destructive")}
             placeholder="e.g. 0,1 (empty = all GPUs)"
@@ -1376,7 +1376,7 @@ export function TrainingForm() {
         })()}
 
         <div className="mt-4 space-y-1.5">
-          <Label htmlFor="train-workdir" className="text-xs">Checkpoint / temp directory</Label>
+          <Label htmlFor="train-workdir" className="text-xs uppercase tracking-wide text-muted-foreground">Checkpoint / temp directory</Label>
           <Input id="train-workdir" className="font-mono text-xs" placeholder="/share"
             value={workDir} onChange={(e) => setWorkDir(e.target.value)} />
           <p className="text-xs text-muted-foreground">
@@ -1387,7 +1387,7 @@ export function TrainingForm() {
         </div>
 
         <div className="mt-4 space-y-1.5">
-          <Label htmlFor="train-venv" className="text-xs">uv venv path</Label>
+          <Label htmlFor="train-venv" className="text-xs uppercase tracking-wide text-muted-foreground">uv venv path</Label>
           <Input id="train-venv" className="font-mono text-xs" placeholder="/share/autotrain-whisper"
             value={venvPath} onChange={(e) => setVenvPath(e.target.value)} />
           <p className="text-xs text-muted-foreground">
@@ -1411,7 +1411,7 @@ export function TrainingForm() {
         </label>
 
         <div className="mt-4 space-y-1.5">
-          <Label htmlFor="train-env" className="text-xs">Environment variables</Label>
+          <Label htmlFor="train-env" className="text-xs uppercase tracking-wide text-muted-foreground">Environment variables</Label>
           <Textarea
             id="train-env"
             rows={8}
@@ -1553,7 +1553,7 @@ function FieldWrap({ label, hint, extra, children }: {
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between gap-2">
-        <Label className="text-xs font-medium">{label}</Label>
+        <Label className="text-xs uppercase tracking-wide text-muted-foreground">{label}</Label>
         {extra}
       </div>
       {children}

@@ -130,3 +130,20 @@ async def load_global_env(session: AsyncSession) -> dict[str, str]:
         except Exception:
             continue
     return out
+
+
+_SECRET_REF = "secret://"
+
+
+def resolve_env_refs(env: dict[str, str], global_env: dict[str, str]) -> dict[str, str]:
+    """Replace `secret://<KEY>` env values with the named global secret's value —
+    so a workload can *reference* a secret (e.g. an HF token picked from Secrets)
+    instead of inlining it. Unknown / undecryptable keys resolve to "". Non-ref
+    values pass through unchanged."""
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        if isinstance(v, str) and v.startswith(_SECRET_REF):
+            out[k] = global_env.get(v[len(_SECRET_REF):], "")
+        else:
+            out[k] = v
+    return out

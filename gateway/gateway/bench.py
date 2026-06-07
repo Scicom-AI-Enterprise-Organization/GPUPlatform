@@ -110,6 +110,10 @@ class Benchmark(Base):
     env_vars: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     # CUDA_VISIBLE_DEVICES pin, e.g. "0,1,2,3". NULL/empty = all GPUs.
     visible_devices: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # A global-secret key (admin Secrets) whose value is injected as HF_TOKEN for
+    # this run — resolved fresh at launch so rotating the secret takes effect.
+    # NULL = none (a pasted token lands in env_vars["HF_TOKEN"] instead).
+    hf_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
 
 # ---------- S3 ----------------------------------------------------------
@@ -881,6 +885,12 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         # per-benchmark env var of the same name overrides it.
         from .global_env_api import load_global_env
         global_env = await load_global_env(s)
+        # A benchmark-selected HF token secret is aliased to HF_TOKEN at the
+        # per-run env layer (highest precedence) so it wins over the global one,
+        # resolved fresh here so rotating the secret takes effect on the next run.
+        hf_secret_key = getattr(b, "hf_token_secret", None)
+        if hf_secret_key and global_env.get(hf_secret_key):
+            run_env_vars = {**(run_env_vars or {}), "HF_TOKEN": global_env[hf_secret_key]}
         await s.commit()
 
     # Disambiguate provider kind. A runpod-kind provider_id picks WHICH
@@ -1369,6 +1379,9 @@ class CreateBenchmarkRequest(BaseModel):
     env_vars: Optional[dict[str, str]] = None
     # CUDA_VISIBLE_DEVICES pin, e.g. "0,1,2,3". Empty/None = all GPUs.
     visible_devices: Optional[str] = None
+    # HuggingFace token for gated models. A global-secret KEY (resolved to
+    # HF_TOKEN at launch). Pasted tokens come through env_vars["HF_TOKEN"].
+    hf_token_secret: Optional[str] = None
 
 
 class RenameBenchmarkRequest(BaseModel):
@@ -1393,6 +1406,7 @@ class BenchmarkRecord(BaseModel):
     storage_id: Optional[str] = None
     env_vars: Optional[dict[str, str]] = None
     visible_devices: Optional[str] = None
+    hf_token_secret: Optional[str] = None
 
 
 class FileRecord(BaseModel):
@@ -1439,6 +1453,7 @@ def _to_record(b: Benchmark, owner_username: str) -> BenchmarkRecord:
         storage_id=b.storage_id,
         env_vars=getattr(b, "env_vars", None) or None,
         visible_devices=getattr(b, "visible_devices", None) or None,
+        hf_token_secret=getattr(b, "hf_token_secret", None) or None,
     )
 
 
@@ -1566,6 +1581,7 @@ async def create_benchmark(
         cleanup_model=True if body.cleanup_model is None else bool(body.cleanup_model),
         env_vars={k: str(v) for k, v in (body.env_vars or {}).items()} or None,
         visible_devices=(body.visible_devices or "").strip() or None,
+        hf_token_secret=(body.hf_token_secret or "").strip() or None,
     )
     session.add(bench)
     await session.commit()

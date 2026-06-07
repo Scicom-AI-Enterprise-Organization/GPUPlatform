@@ -161,7 +161,7 @@ export function StorageForm() {
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <Label htmlFor="storage-kind">Kind</Label>
+            <Label htmlFor="storage-kind" className="text-xs uppercase tracking-wide text-muted-foreground">Kind</Label>
             <Select
               value={kind}
               onValueChange={(v) => {
@@ -179,7 +179,7 @@ export function StorageForm() {
             </Select>
           </div>
           <div>
-            <Label htmlFor="storage-name">Name</Label>
+            <Label htmlFor="storage-name" className="text-xs uppercase tracking-wide text-muted-foreground">Name</Label>
             <Input
               id="storage-name"
               value={name}
@@ -196,7 +196,7 @@ export function StorageForm() {
           <h2 className="mb-4 text-base font-medium">Bucket</h2>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div>
-              <Label htmlFor="s3-bucket">Bucket</Label>
+              <Label htmlFor="s3-bucket" className="text-xs uppercase tracking-wide text-muted-foreground">Bucket</Label>
               <Input
                 id="s3-bucket"
                 value={bucket}
@@ -209,7 +209,7 @@ export function StorageForm() {
               />
             </div>
             <div>
-              <Label htmlFor="s3-prefix">Prefix (optional)</Label>
+              <Label htmlFor="s3-prefix" className="text-xs uppercase tracking-wide text-muted-foreground">Prefix (optional)</Label>
               <Input
                 id="s3-prefix"
                 value={prefix}
@@ -219,7 +219,7 @@ export function StorageForm() {
               />
             </div>
             <div>
-              <Label htmlFor="s3-region">Region (optional)</Label>
+              <Label htmlFor="s3-region" className="text-xs uppercase tracking-wide text-muted-foreground">Region (optional)</Label>
               <Input
                 id="s3-region"
                 value={region}
@@ -232,7 +232,7 @@ export function StorageForm() {
               />
             </div>
             <div>
-              <Label htmlFor="s3-endpoint">Endpoint (optional)</Label>
+              <Label htmlFor="s3-endpoint" className="text-xs uppercase tracking-wide text-muted-foreground">Endpoint (optional)</Label>
               <Input
                 id="s3-endpoint"
                 value={endpoint}
@@ -259,7 +259,7 @@ export function StorageForm() {
             </p>
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               <div>
-                <Label htmlFor="s3-akid">Access key ID</Label>
+                <Label htmlFor="s3-akid" className="text-xs uppercase tracking-wide text-muted-foreground">Access key ID</Label>
                 <Input
                   id="s3-akid"
                   type="password"
@@ -273,7 +273,7 @@ export function StorageForm() {
                 />
               </div>
               <div>
-                <Label htmlFor="s3-sak">Secret access key</Label>
+                <Label htmlFor="s3-sak" className="text-xs uppercase tracking-wide text-muted-foreground">Secret access key</Label>
                 <Input
                   id="s3-sak"
                   type="password"
@@ -323,7 +323,7 @@ export function StorageForm() {
           {hfSource === "secret" ? (
             secretKeys.length > 0 ? (
               <>
-                <Label htmlFor="hf-secret">Global secret</Label>
+                <Label htmlFor="hf-secret" className="text-xs uppercase tracking-wide text-muted-foreground">Global secret</Label>
                 <Select
                   value={hfTokenSecret}
                   onValueChange={(v) => {
@@ -355,7 +355,7 @@ export function StorageForm() {
             )
           ) : (
             <>
-              <Label htmlFor="hf-token">Token</Label>
+              <Label htmlFor="hf-token" className="text-xs uppercase tracking-wide text-muted-foreground">Token</Label>
               <Input
                 id="hf-token"
                 type="password"
@@ -381,7 +381,7 @@ export function StorageForm() {
       )}
 
       <section className="rounded-lg border border-border bg-card p-5">
-        <Label htmlFor="storage-notes">Notes (optional)</Label>
+        <Label htmlFor="storage-notes" className="text-xs uppercase tracking-wide text-muted-foreground">Notes (optional)</Label>
         <Textarea
           id="storage-notes"
           value={notes}

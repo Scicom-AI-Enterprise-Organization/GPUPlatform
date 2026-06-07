@@ -1471,9 +1471,11 @@ async def create_app(
         sleep_level=sleep_level,
         env_vars={k: str(v) for k, v in (req.env_vars or {}).items()} or None,
         visible_devices=visible_devices_norm,
-        # VM serving knobs; ignored for cloud (RunPod/PI images bring their own vLLM).
-        venv_path=((req.venv_path or "").strip() or None) if is_vm else None,
-        vllm_version=((req.vllm_version or "").strip() or None) if is_vm else None,
+        # venv_path + vllm_version are honoured for a VM venv AND a RunPod multi-model
+        # fleet (installed into the pod venv — a volume path survives a re-provision);
+        # ignored for a single cloud pod (its image brings vLLM).
+        venv_path=((req.venv_path or "").strip() or None) if (is_vm or mode == "multi") else None,
+        vllm_version=((req.vllm_version or "").strip() or None) if (is_vm or mode == "multi") else None,
         created_at=datetime.now(timezone.utc),
     )
     session.add(record)
@@ -1537,9 +1539,11 @@ async def create_app(
         elif visible_devices_norm:
             # Single-model VM GPU pin (multi sets it per model from gpu_indices).
             env["CUDA_VISIBLE_DEVICES"] = visible_devices_norm
-        # Global env/secrets + this app's env vars (app overrides global).
-        from .global_env_api import load_global_env
-        _worker_env = {**(await load_global_env(session)), **(record.env_vars or {})}
+        # Global env/secrets + this app's env vars (app overrides global), with
+        # any `secret://KEY` references (e.g. a chosen HF token) resolved.
+        from .global_env_api import load_global_env, resolve_env_refs
+        _g = await load_global_env(session)
+        _worker_env = resolve_env_refs({**_g, **(record.env_vars or {})}, _g)
         if _worker_env:
             env["WORKER_ENV_JSON"] = json.dumps(_worker_env)
         try:

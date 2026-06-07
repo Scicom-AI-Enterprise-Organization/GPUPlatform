@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Inbox, KeyRound, Loader2, Lock, Pencil, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +19,10 @@ import type { GlobalEnvRecord } from "@/lib/types";
 
 const BASE = "/api/proxy/v1/global-env";
 const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// URL flag so an open "Add global variable" dialog is reflected in the address bar
+// (shareable / survives reload). Coexists with the tracking-credential manager's
+// own ?add value on the same page — each only reads/clears its own.
+const ADD_PARAM = "global-variable";
 
 /** Pull a readable message out of the gateway's {detail} / {detail:{error}} shape. */
 function errText(body: unknown, fallback: string): string {
@@ -36,8 +41,11 @@ type Form = { key: string; value: string; is_secret: boolean; description: strin
 const EMPTY: Form = { key: "", value: "", is_secret: true, description: "" };
 
 export function SecretsManager({ initial }: { initial: GlobalEnvRecord[] }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [rows, setRows] = useState<GlobalEnvRecord[]>(initial);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(searchParams.get("add") === ADD_PARAM);
   const [editingKey, setEditingKey] = useState<string | null>(null); // null = adding
   const [form, setForm] = useState<Form>(EMPTY);
   const [saving, setSaving] = useState(false);
@@ -54,11 +62,25 @@ export function SecretsManager({ initial }: { initial: GlobalEnvRecord[] }) {
     }
   }
 
+  // Add/remove ?add=global-variable without disturbing other query params.
+  function syncAddParam(on: boolean) {
+    const params = new URLSearchParams(searchParams.toString());
+    if (on) params.set("add", ADD_PARAM);
+    else if (params.get("add") === ADD_PARAM) params.delete("add");
+    const qs = params.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }
+  function closeDialog() {
+    setOpen(false);
+    setErr(null);
+    syncAddParam(false); // no-op for the edit dialog (param isn't set)
+  }
   function openAdd() {
     setEditingKey(null);
     setForm(EMPTY);
     setErr(null);
     setOpen(true);
+    syncAddParam(true);
   }
   function openEdit(row: GlobalEnvRecord) {
     setEditingKey(row.key);
@@ -100,7 +122,7 @@ export function SecretsManager({ initial }: { initial: GlobalEnvRecord[] }) {
         setErr(errText(parsed, r.statusText));
         return;
       }
-      setOpen(false);
+      closeDialog();
       await reload();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -195,7 +217,7 @@ export function SecretsManager({ initial }: { initial: GlobalEnvRecord[] }) {
       )}
 
       {/* add / edit */}
-      <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) setErr(null); }}>
+      <Dialog open={open} onOpenChange={(o) => (o ? setOpen(true) : closeDialog())}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{editingKey ? `Edit ${editingKey}` : "Add global variable"}</DialogTitle>
@@ -247,7 +269,7 @@ export function SecretsManager({ initial }: { initial: GlobalEnvRecord[] }) {
           </div>
           <DialogFooter>
             {err && <p className="mr-auto text-sm text-destructive">{err}</p>}
-            <Button variant="ghost" onClick={() => setOpen(false)} disabled={saving}>
+            <Button variant="ghost" onClick={closeDialog} disabled={saving}>
               Cancel
             </Button>
             <Button onClick={save} disabled={saving}>

@@ -177,6 +177,7 @@ export type BenchmarkRecord = {
   storage_id?: string | null;
   env_vars?: Record<string, string> | null;
   visible_devices?: string | null;
+  hf_token_secret?: string | null;
 };
 
 export type CreateBenchmarkRequest = {
@@ -194,6 +195,9 @@ export type CreateBenchmarkRequest = {
   env_vars?: Record<string, string>;
   // CUDA_VISIBLE_DEVICES pin, e.g. "0,1,2,3". Empty = all GPUs.
   visible_devices?: string;
+  // A global-secret key whose value is injected as HF_TOKEN at launch (gated
+  // models). A pasted token is sent via env_vars["HF_TOKEN"] instead.
+  hf_token_secret?: string | null;
 };
 
 export type BenchmarkFile = {

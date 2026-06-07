@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from . import audit as audit_module
 from . import crypto
 from .auth import current_user, require_admin
+from .compute import PI_GPU_TYPES, RUNPOD_GPU_TYPES, GpuTypeOption
 from .db import Provider, User, get_session
 from .vm_probe import availability_vm, metrics_vm, probe_vm
 
@@ -84,6 +85,10 @@ class ProviderRecord(BaseModel):
     user: Optional[str] = None
     gpus: Optional[list[str]] = None
     gpu_count: Optional[int] = None
+    # Cloud (runpod/pi): the catalog of GPU types this provider can provision, so
+    # API consumers (e.g. the labeling platform discovering where to run autotrain)
+    # see what's available. VM providers list their fixed physical GPUs in `gpus`.
+    available_gpus: Optional[list[GpuTypeOption]] = None
     # API-key-kind summary; absent for vm.
     api_key_last4: Optional[str] = None
     ssh_pub: Optional[str] = None
@@ -134,6 +139,15 @@ class ProviderMetricsResponse(BaseModel):
     checked_at: float
 
 
+# Cloud providers don't have fixed installed GPUs — they expose a catalog of
+# selectable types. Reuse the same lists the new-pod / benchmark forms read from
+# (/compute/{kind}/gpu-types) so a single source defines what's available.
+_GPU_CATALOG_BY_KIND: dict[str, list[dict]] = {
+    "runpod": RUNPOD_GPU_TYPES,
+    "pi": PI_GPU_TYPES,
+}
+
+
 def _to_record(p: Provider, owner_username: str) -> ProviderRecord:
     cfg = p.config or {}
     api_key_last4: Optional[str] = None
@@ -142,6 +156,8 @@ def _to_record(p: Provider, owner_username: str) -> ProviderRecord:
             api_key_last4 = crypto.decrypt(cfg["api_key_enc"])[-4:]
         except Exception:
             api_key_last4 = None
+    catalog = _GPU_CATALOG_BY_KIND.get(p.kind)
+    available_gpus = [GpuTypeOption(**g) for g in catalog] if catalog else None
     return ProviderRecord(
         id=p.id,
         name=p.name,
@@ -153,6 +169,7 @@ def _to_record(p: Provider, owner_username: str) -> ProviderRecord:
         user=cfg.get("user"),
         gpus=cfg.get("gpus"),
         gpu_count=cfg.get("gpu_count"),
+        available_gpus=available_gpus,
         api_key_last4=api_key_last4,
         ssh_pub=cfg.get("ssh_pub"),
         validated_at=cfg.get("validated_at"),

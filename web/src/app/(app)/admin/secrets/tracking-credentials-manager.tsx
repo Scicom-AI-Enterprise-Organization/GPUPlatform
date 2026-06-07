@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Activity, Inbox, Loader2, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -33,10 +34,17 @@ type Form = {
   password: string;
 };
 const EMPTY: Form = { name: "", kind: "wandb", api_key: "", uri: "", username: "", password: "" };
+// URL flag so an open "Add tracking credential" dialog shows in the address bar
+// (shareable / survives reload). Shares the ?add key with the global-env manager
+// above; each only reads/clears its own value.
+const ADD_PARAM = "tracking-credential";
 
 export function TrackingCredentialsManager({ initial }: { initial: TrackingCredentialRecord[] }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [rows, setRows] = useState<TrackingCredentialRecord[]>(initial);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(searchParams.get("add") === ADD_PARAM);
   const [form, setForm] = useState<Form>(EMPTY);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -48,6 +56,26 @@ export function TrackingCredentialsManager({ initial }: { initial: TrackingCrede
     } catch {
       /* keep optimistic view */
     }
+  }
+
+  // Add/remove ?add=tracking-credential without disturbing other query params.
+  function syncAddParam(on: boolean) {
+    const params = new URLSearchParams(searchParams.toString());
+    if (on) params.set("add", ADD_PARAM);
+    else if (params.get("add") === ADD_PARAM) params.delete("add");
+    const qs = params.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }
+  function openAdd() {
+    setForm(EMPTY);
+    setErr(null);
+    setOpen(true);
+    syncAddParam(true);
+  }
+  function closeDialog() {
+    setOpen(false);
+    setErr(null);
+    syncAddParam(false);
   }
 
   async function onSave() {
@@ -64,7 +92,7 @@ export function TrackingCredentialsManager({ initial }: { initial: TrackingCrede
           ? { api_key: form.api_key.trim() }
           : { uri: form.uri.trim(), username: form.username.trim(), password: form.password.trim() }),
       });
-      setOpen(false);
+      closeDialog();
       setForm(EMPTY);
       await reload();
     } catch (e) {
@@ -95,7 +123,7 @@ export function TrackingCredentialsManager({ initial }: { initial: TrackingCrede
           <h2 className="text-base font-medium">Tracking credentials</h2>
           <Badge variant="secondary" className="text-[10px]">{rows.length}</Badge>
         </div>
-        <Button size="sm" onClick={() => { setForm(EMPTY); setErr(null); setOpen(true); }}>
+        <Button size="sm" onClick={openAdd}>
           <Plus className="h-4 w-4" /> Add credential
         </Button>
       </div>
@@ -130,7 +158,7 @@ export function TrackingCredentialsManager({ initial }: { initial: TrackingCrede
         </ul>
       )}
 
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={open} onOpenChange={(o) => (o ? setOpen(true) : closeDialog())}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Add tracking credential</DialogTitle>
@@ -186,7 +214,7 @@ export function TrackingCredentialsManager({ initial }: { initial: TrackingCrede
             {err && <p className="text-sm text-destructive">{err}</p>}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+            <Button variant="outline" onClick={closeDialog}>Cancel</Button>
             <Button onClick={onSave} disabled={saving}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Save
             </Button>

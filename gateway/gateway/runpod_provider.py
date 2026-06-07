@@ -307,7 +307,9 @@ class RunPodProvider(Provider):
             if mm:
                 try:
                     cfg = json.loads(mm)
-                    cfg["venv_path"] = _POD_VENV  # where we install vllm on the pod
+                    # The endpoint's venv (e.g. on a mounted volume so it survives a
+                    # re-provision); else the default pod-local venv.
+                    cfg["venv_path"] = (cfg.get("venv_path") or "").strip() or _POD_VENV
                     env_vars["MULTI_MODEL_CONFIG"] = json.dumps(cfg)
                 except (ValueError, TypeError):
                     pass
@@ -432,15 +434,22 @@ class RunPodProvider(Provider):
             look_for_keys=False, allow_agent=False,
         )
         try:
-            # vLLM version to pin in the pod venv (None → latest that resolves).
+            # vLLM version to pin (None → latest that resolves) + the venv path the
+            # endpoint runs vLLM from (default _POD_VENV; a path on a mounted volume
+            # survives a re-provision so vLLM isn't reinstalled each time).
             vllm_ver = ""
+            venv = _POD_VENV
             try:
-                vllm_ver = (json.loads(worker_env.get("MULTI_MODEL_CONFIG") or "{}").get("vllm_version") or "")
+                _mmc = json.loads(worker_env.get("MULTI_MODEL_CONFIG") or "{}")
+                vllm_ver = (_mmc.get("vllm_version") or "")
+                venv = (_mmc.get("venv_path") or "").strip() or _POD_VENV
             except (ValueError, TypeError):
                 pass
             vllm_spec = f"vllm=={vllm_ver}" if vllm_ver else "vllm"
             script = (
-                f"set -ex; mkdir -p {_POD_REMOTE}; "
+                # $VENV (shlex-quoted) is the endpoint's venv; mkdir its parent so a
+                # volume-path like /share/vllm-venv works even if /share is bare.
+                f"set -ex; VENV={shlex.quote(venv)}; mkdir -p {_POD_REMOTE} \"$(dirname \"$VENV\")\"; "
                 f"echo {cfg_b64} | base64 -d > {shlex.quote(cfg_path)}; "
                 f"echo {wa_b64} | base64 -d > {_POD_REMOTE}/wa.tgz; "
                 f"rm -rf {_POD_REMOTE}/worker-agent && mkdir -p {_POD_REMOTE}/worker-agent && "
@@ -452,26 +461,27 @@ class RunPodProvider(Provider):
                 f"curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || true; "
                 f"export PATH=\"$HOME/.local/bin:$PATH\"; "
                 f"command -v uv >/dev/null 2>&1 || pip install -q uv; "
-                f"if [ ! -x {_POD_VENV}/bin/python ]; then uv venv {_POD_VENV} || python3 -m venv {_POD_VENV}; fi; "
-                # vLLM + the worker-agent into the pod venv (the multi launcher runs
-                # `{_POD_VENV}/bin/python -m vllm …`, set via MULTI_MODEL_CONFIG.venv_path).
+                # Reuse the venv if it's already populated (persistent volume); else build it.
+                f"if [ ! -x \"$VENV/bin/python\" ]; then uv venv \"$VENV\" || python3 -m venv \"$VENV\"; fi; "
+                # vLLM + the worker-agent into the venv (the multi launcher runs
+                # `$VENV/bin/python -m vllm …`, set via MULTI_MODEL_CONFIG.venv_path).
                 # Install vLLM with its NATIVE CUDA build (latest vLLM is cu13). The pod
                 # is pinned to a CUDA-13 host, so vLLM's bundled torch + CUDA libs match
                 # the driver — no torch-backend override (that mismatched vLLM's own
                 # cu13 binary against cu128 torch → "libcudart.so.13 missing").
                 # ninja + cmake: vLLM JIT-compiles CUDA kernels (cutlass/MoE/tilelang)
                 # at model load and dies with "[Errno 2] ... 'ninja'" without them.
-                f"uv pip install --python {_POD_VENV}/bin/python ninja cmake {shlex.quote(vllm_spec)} {_POD_REMOTE}/worker-agent; "
+                f"uv pip install --python \"$VENV/bin/python\" ninja cmake {shlex.quote(vllm_spec)} {_POD_REMOTE}/worker-agent; "
                 # Fast-fail (before the slow model load) if torch can't see the GPU —
                 # i.e. the installed CUDA build doesn't match the host driver. Use the
                 # venv python (a `uv venv` ships no pip). nvidia-smi above shows the host
                 # CUDA in the trace if this trips.
-                f"{_POD_VENV}/bin/python -c \"import torch,sys; sys.exit(0 if torch.cuda.is_available() else 3)\"; "
+                f"\"$VENV/bin/python\" -c \"import torch,sys; sys.exit(0 if torch.cuda.is_available() else 3)\"; "
                 # venv/bin FIRST on PATH so the JIT compiler (ninja) and the cu13
                 # nvcc (nvidia-cuda-nvcc, in the venv) are found by vLLM's kernel
                 # build — running venv/bin/python directly does NOT add venv/bin to PATH.
-                f"WORKER_CONFIG_FILE={cfg_path} PATH={_POD_VENV}/bin:$PATH "
-                f"  nohup {_POD_VENV}/bin/python -m worker_agent.main "
+                f"WORKER_CONFIG_FILE={cfg_path} PATH=\"$VENV/bin:$PATH\" "
+                f"  nohup \"$VENV/bin/python\" -m worker_agent.main "
                 f"  > {log_path} 2>&1 & echo $! > {pid_path}"
             )
             stdin, stdout, stderr = client.exec_command(f"bash -lc {shlex.quote(script)}", timeout=900)

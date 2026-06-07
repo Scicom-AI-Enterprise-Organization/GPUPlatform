@@ -105,23 +105,23 @@ export function RepoForm() {
         </div>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <Label className="mb-1.5" htmlFor="name">Name</Label>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground" htmlFor="name">Name</Label>
             <Input id="name" value={name} onChange={(e) => setName(e.target.value)} placeholder="prod-infra" />
           </div>
           <div>
-            <Label className="mb-1.5" htmlFor="branch">Branch</Label>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground" htmlFor="branch">Branch</Label>
             <Input id="branch" value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" />
           </div>
           <div className="md:col-span-2">
-            <Label className="mb-1.5" htmlFor="url">Repository URL</Label>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground" htmlFor="url">Repository URL</Label>
             <Input id="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://github.com/org/platform-gitops.git" />
           </div>
           <div>
-            <Label className="mb-1.5" htmlFor="path">Path <span className="text-muted-foreground">(optional)</span></Label>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground" htmlFor="path">Path <span className="text-muted-foreground">(optional)</span></Label>
             <Input id="path" value={path} onChange={(e) => setPath(e.target.value)} placeholder="manifests/" />
           </div>
           <div>
-            <Label className="mb-1.5" htmlFor="poll">Poll interval (seconds)</Label>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground" htmlFor="poll">Poll interval (seconds)</Label>
             <Input id="poll" type="number" min={30} value={pollInterval} onChange={(e) => setPollInterval(e.target.value)} />
           </div>
         </div>
@@ -133,12 +133,12 @@ export function RepoForm() {
         </div>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <Label className="mb-1.5" htmlFor="token">Token secret key</Label>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground" htmlFor="token">Token secret key</Label>
             <Input id="token" value={tokenSecret} onChange={(e) => setTokenSecret(e.target.value)} placeholder="GITHUB_DEPLOY_TOKEN" />
             <p className="mt-1 text-[11px] text-muted-foreground">A Secrets key holding a git access token (private repos).</p>
           </div>
           <div>
-            <Label className="mb-1.5" htmlFor="wh">Webhook HMAC secret</Label>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground" htmlFor="wh">Webhook HMAC secret</Label>
             <Input id="wh" type="password" value={webhookSecret} onChange={(e) => setWebhookSecret(e.target.value)} placeholder="(for push webhook)" />
             <p className="mt-1 text-[11px] text-muted-foreground">Point the push webhook at <span className="font-mono">/v1/gitops/webhook</span>.</p>
           </div>

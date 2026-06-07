@@ -638,6 +638,10 @@ async def init_db() -> None:
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_benchmarks_storage_id ON benchmarks(storage_id)"
         ))
+        # Per-benchmark HF token: a global-secret key aliased to HF_TOKEN at launch.
+        await conn.execute(text(
+            "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS hf_token_secret VARCHAR(128)"
+        ))
         # Providers table is created by Base.metadata.create_all above; nothing
         # to migrate yet since it landed on a fresh schema.
         # Storage: `enabled` toggle landed after the table's first cut, so add

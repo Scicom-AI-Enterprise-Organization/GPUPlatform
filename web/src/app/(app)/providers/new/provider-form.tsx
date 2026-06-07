@@ -161,7 +161,7 @@ export function ProviderForm() {
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <Label htmlFor="provider-kind">Type</Label>
+            <Label htmlFor="provider-kind" className="text-xs uppercase tracking-wide text-muted-foreground">Type</Label>
             <Select
               value={kind}
               onValueChange={(v) => {
@@ -180,7 +180,7 @@ export function ProviderForm() {
             </Select>
           </div>
           <div>
-            <Label htmlFor="provider-name">Name</Label>
+            <Label htmlFor="provider-name" className="text-xs uppercase tracking-wide text-muted-foreground">Name</Label>
             <Input
               id="provider-name"
               value={name}
@@ -208,7 +208,7 @@ export function ProviderForm() {
 
           <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_120px_1fr]">
             <div>
-              <Label htmlFor="vm-host">Host</Label>
+              <Label htmlFor="vm-host" className="text-xs uppercase tracking-wide text-muted-foreground">Host</Label>
               <Input
                 id="vm-host"
                 value={host}
@@ -221,7 +221,7 @@ export function ProviderForm() {
               />
             </div>
             <div>
-              <Label htmlFor="vm-port">Port</Label>
+              <Label htmlFor="vm-port" className="text-xs uppercase tracking-wide text-muted-foreground">Port</Label>
               <Input
                 id="vm-port"
                 value={port}
@@ -234,7 +234,7 @@ export function ProviderForm() {
               />
             </div>
             <div>
-              <Label htmlFor="vm-user">User</Label>
+              <Label htmlFor="vm-user" className="text-xs uppercase tracking-wide text-muted-foreground">User</Label>
               <Input
                 id="vm-user"
                 value={user}
@@ -250,7 +250,7 @@ export function ProviderForm() {
 
           <div className="mt-4">
             <div className="flex items-end justify-between">
-              <Label htmlFor="vm-key">Private key (PEM / OpenSSH)</Label>
+              <Label htmlFor="vm-key" className="text-xs uppercase tracking-wide text-muted-foreground">Private key (PEM / OpenSSH)</Label>
               <Button type="button" variant="outline" size="sm" onClick={onPickFile}>
                 <Upload className="h-3.5 w-3.5" />
                 Upload key file
@@ -294,7 +294,7 @@ export function ProviderForm() {
 
           <div className="grid grid-cols-1 gap-4">
             <div>
-              <Label htmlFor="api-key">API key</Label>
+              <Label htmlFor="api-key" className="text-xs uppercase tracking-wide text-muted-foreground">API key</Label>
               <Input
                 id="api-key"
                 type="password"
