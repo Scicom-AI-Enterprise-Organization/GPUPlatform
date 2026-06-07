@@ -13,9 +13,9 @@ Counters/gauges defined:
 
 Serverless-API HTTP instrumentation (the gateway's OWN request layer — NOT the
 vLLM worker metrics, which are shipped separately by the workers):
-  - http_requests_total{method, endpoint, http_status, app_id}
-  - http_request_duration_seconds{method, endpoint, http_status, app_id}  (histogram)
-`endpoint` is the matched ROUTE TEMPLATE (e.g. "/{app_id}/v1/chat/completions"),
+  - serverless_http_requests_total{method, route, http_status, app_id}
+  - serverless_http_request_duration_seconds{method, route, http_status, app_id}  (histogram)
+`route` is the matched ROUTE TEMPLATE (e.g. "/{app_id}/v1/chat/completions"),
 never the raw URL, so app_ids / request bodies can't blow up label cardinality.
 `app_id` is the path param for scoped routes (empty for global/control-plane ones),
 so `GET /{app_id}/metrics` can serve a per-fleet view (see render_app) for Grafana
@@ -96,18 +96,24 @@ _LATENCY_BUCKETS = (
     10.0, 30.0, 60.0, 120.0, float("inf"),
 )
 
-_HTTP_LABELS = ["method", "endpoint", "http_status", "app_id"]
+# Label is `route` (not `endpoint`): the kube scrape attaches its own target
+# label `endpoint` = the Service port name ("http"), which would shadow an app
+# label of the same name (it lands as `exported_endpoint`). `route` avoids that.
+_HTTP_LABELS = ["method", "route", "http_status", "app_id"]
 
+# `serverless_*` namespace so these don't collide with the vLLM workers' own
+# `http_requests_total` / `http_request_duration_seconds` (both scraped into the
+# same VictoriaMetrics).
 HTTP_REQUESTS_TOTAL = Counter(
-    "http_requests_total",
-    "Total HTTP Requests",
+    "serverless_http_requests_total",
+    "Total serverless gateway HTTP requests",
     _HTTP_LABELS,
     registry=_registry,
 )
 
 HTTP_REQUEST_DURATION = Histogram(
-    "http_request_duration_seconds",
-    "HTTP Request Latency",
+    "serverless_http_request_duration_seconds",
+    "Serverless gateway HTTP request latency",
     _HTTP_LABELS,
     buckets=_LATENCY_BUCKETS,
     registry=_registry,
@@ -137,10 +143,10 @@ def observe_http(
     (empty string for global/control-plane routes)."""
     s = str(status)
     HTTP_REQUESTS_TOTAL.labels(
-        method=method, endpoint=endpoint, http_status=s, app_id=app_id
+        method=method, route=endpoint, http_status=s, app_id=app_id
     ).inc()
     HTTP_REQUEST_DURATION.labels(
-        method=method, endpoint=endpoint, http_status=s, app_id=app_id
+        method=method, route=endpoint, http_status=s, app_id=app_id
     ).observe(duration_s)
 
 

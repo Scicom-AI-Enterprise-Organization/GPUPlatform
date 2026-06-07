@@ -1,0 +1,81 @@
+# GPUPlatform gateway API-layer observability stack:
+#   Prometheus (RED metrics) + Loki (request logs) + Promtail (log shipper)
+#   + Grafana (the "GPUPlatform — API Layer" dashboard).
+#
+# Self-contained — does NOT depend on any cluster's Grafana. It scrapes the local
+# gateway's /metrics and tails the gateway's JSON access log.
+#
+#   docker compose -f deploy/monitoring/docker-compose.monitoring.yml up -d
+#
+# The gateway runs on the host (.venv/bin/gateway on :8080), so from inside these
+# bridged containers we reach it at host.docker.internal:8080 via the host-gateway
+# alias. Run the gateway with JSON access logs teed to a file Promtail can tail:
+#
+#   LOG_JSON=1 GATEWAY_ACCESS_LOG=deploy/monitoring/logs/gateway-access.log .venv/bin/gateway
+#
+# Grafana:    http://localhost:3001  (admin / admin on first boot)
+# Prometheus: http://localhost:9091
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "9091:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [monitoring]
+
+  loki:
+    image: grafana/loki:3.2.1
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - lokidata:/loki
+    networks: [monitoring]
+
+  promtail:
+    image: grafana/promtail:3.2.1
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # The gateway's JSON access log, teed to a host file via GATEWAY_ACCESS_LOG.
+      - ./logs:/logs:ro
+      - promtailpos:/promtail
+    depends_on: [loki]
+    networks: [monitoring]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboard JSONs live in deploy/grafana (shared with the helm chart).
+      - ../grafana:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on: [prometheus, loki]
+    networks: [monitoring]
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  promdata:
+  lokidata:
+  promtailpos:
+  grafanadata:

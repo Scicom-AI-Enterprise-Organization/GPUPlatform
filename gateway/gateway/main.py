@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from . import metrics
+from . import accesslog
 from .auth import (
     SECTIONS,
     create_session,
@@ -384,6 +385,7 @@ def _to_app_record(app: App) -> AppRecord:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    accesslog.init_access_logging()  # idempotent; also covers the uvicorn reload subprocess
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
     logger.info("connecting to redis at %s", redis_url)
     app.state.redis = redis_async.from_url(redis_url, decode_responses=True)
@@ -532,26 +534,54 @@ app.include_router(gitops_module.router)
 @app.middleware("http")
 async def metrics_mw(request: Request, call_next):
     metrics.INFLIGHT.inc()
+    # Correlate metrics ↔ logs ↔ client. Honour an upstream X-Request-ID, else mint one.
+    request_id = request.headers.get("x-request-id") or f"req-{uuid.uuid4().hex[:12]}"
+    request.state.request_id = request_id
     start = time.perf_counter()
+    status_code = 500  # default if call_next raises before producing a response
+    resp = None
     try:
         resp = await call_next(request)
+        status_code = resp.status_code
+        resp.headers["x-request-id"] = request_id
+        return resp
+    finally:
+        elapsed = time.perf_counter() - start
         route_obj = request.scope.get("route")
         route = getattr(route_obj, "path", request.url.path) if route_obj else request.url.path
-        metrics.REQUESTS_TOTAL.labels(route=route, status=str(resp.status_code)).inc()
-        # Serverless-API HTTP instrumentation (http_requests_total +
-        # http_request_duration_seconds, labelled method/endpoint/http_status/app_id).
+        # Serverless-API HTTP instrumentation (serverless_http_requests_total +
+        # serverless_http_request_duration_seconds, labelled method/route/http_status/app_id).
         # Match by route TEMPLATE (collapsing unmatched paths so 404 scanners can't
         # explode cardinality) and skip probes + the metrics scrapes themselves.
         endpoint = getattr(route_obj, "path", None) or "<unmatched>"
+        app_id = (request.scope.get("path_params") or {}).get("app_id", "") or ""
+        # Recorded in finally so exceptions (status 500) still count.
+        metrics.REQUESTS_TOTAL.labels(route=route, status=str(status_code)).inc()
         if endpoint not in metrics.IGNORE_PATHS:
-            app_id = (request.scope.get("path_params") or {}).get("app_id", "") or ""
-            metrics.observe_http(
-                request.method, endpoint, resp.status_code, app_id,
-                time.perf_counter() - start,
-            )
-        return resp
-    finally:
+            metrics.observe_http(request.method, endpoint, status_code, app_id, elapsed)
         metrics.INFLIGHT.dec()
+        # Structured access log (per-app filterable in Loki).
+        fwd = request.headers.get("x-forwarded-for")
+        ip = (fwd.split(",")[0].strip() if fwd else None) or (
+            request.client.host if request.client else None
+        )
+        nbytes = None
+        if resp is not None and resp.headers.get("content-length"):
+            try:
+                nbytes = int(resp.headers["content-length"])
+            except (TypeError, ValueError):
+                nbytes = None
+        accesslog.log_request(
+            method=request.method,
+            route=route,
+            path=request.url.path,
+            status=status_code,
+            duration_ms=elapsed * 1000.0,
+            request_id=request_id,
+            app_id=app_id or None,
+            ip=ip,
+            nbytes=nbytes,
+        )
 
 
 # The build the gateway is serving. CI bakes the git short-sha in as APP_VERSION
@@ -3130,11 +3160,11 @@ async def workers_metrics(request: Request):
 @app.get("/{app_id}/metrics")
 async def app_metrics(app_id: str, request: Request):
     """Per-endpoint Prometheus scrape: this app's workers' vLLM /metrics (relabeled)
-    PLUS the gateway's own HTTP metrics for this app (http_requests_total /
-    http_request_duration_seconds, labelled by http_status). The natural sibling of
-    the serving URL `{base}/{app_id}/v1/...`. Public like /metrics — pure telemetry.
-    Grafana scrapes this and can alert on non-2xx, e.g.:
-        sum(increase(http_requests_total{http_status!~"2.."}[5m])) > 0"""
+    PLUS the gateway's own HTTP metrics for this app (serverless_http_requests_total /
+    serverless_http_request_duration_seconds, labelled by http_status). The natural
+    sibling of the serving URL `{base}/{app_id}/v1/...`. Public like /metrics — pure
+    telemetry. Grafana scrapes this and can alert on non-2xx, e.g.:
+        sum(increase(serverless_http_requests_total{http_status!~"2.."}[5m])) > 0"""
     worker_body = await _collect_worker_metrics(request.app.state.redis, app_id=app_id)
     gw_body = metrics.render_app(app_id).decode("utf-8")
     combined = f"{worker_body}\n{gw_body}" if worker_body else gw_body
@@ -3222,6 +3252,7 @@ def run():
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    accesslog.init_access_logging()
     host, port = os.environ.get("GATEWAY_BIND", "0.0.0.0:8080").rsplit(":", 1)
     # Local-dev hot reload: set GATEWAY_RELOAD=1 to restart the server on any
     # edit under the gateway package. Off by default so prod runs a single
