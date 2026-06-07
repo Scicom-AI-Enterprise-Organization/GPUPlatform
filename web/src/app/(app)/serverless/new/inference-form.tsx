@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useId, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { AlertCircle, AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, RefreshCw, Server, X } from "lucide-react";
+import { AlertCircle, AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, RefreshCw, Server, Wallet, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -31,7 +31,7 @@ import { deployEndpoint } from "../actions";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
-import type { ProviderRecord, VmAvailability } from "@/lib/types";
+import type { ProviderRecord, ProviderBalance, VmAvailability } from "@/lib/types";
 
 // vLLM is what the live RunPod template runs. SGLang is a placeholder for a
 // future template — keep it disabled so the option is visible but inert.
@@ -167,7 +167,7 @@ export function InferenceForm() {
   const [model, setModel] = useState("");
   const [gpu, setGpu] = useState("RTX3090");
   const [gpuCount, setGpuCount] = useState<number>(1);
-  const [cloudType, setCloudType] = useState<"COMMUNITY" | "SECURE">("COMMUNITY");
+  const [cloudType, setCloudType] = useState<"COMMUNITY" | "SECURE">("SECURE");
   const [containerDisk, setContainerDisk] = useState<string>("50");
   const [volumeGb, setVolumeGb] = useState<string>("0");
   const [idleInput, setIdleInput] = useState("120"); // 2 min scale-to-zero (single-model only; multi VM fleets are always-on)
@@ -184,6 +184,12 @@ export function InferenceForm() {
     { model: "", tp: 1, pp: 1, extra_args: "", gpus: "", audio: false },
   ]);
   const [sleepLevel, setSleepLevel] = useState<1 | 2>(1);
+  // Cloud (RunPod) can also run a multi-model fleet — same GPU time-sharing as a
+  // VM, but billed hourly so it honours the idle timeout (deletes the pod after N
+  // idle seconds, re-provisioned on demand). VM fleets are always multi + always-on.
+  const [cloudMulti, setCloudMulti] = useState(false);
+  const [runpodBalance, setRunpodBalance] = useState<ProviderBalance | null>(null);
+  const [runpodBalanceLoading, setRunpodBalanceLoading] = useState(false);
   // VM-only: pin to specific physical GPU ids, e.g. "0,1,2,3". Empty = all GPUs.
   const [visibleDevices, setVisibleDevices] = useState("");
   // VM-only: uv venv the worker runs `vllm serve` from + the vLLM version to pin.
@@ -199,6 +205,24 @@ export function InferenceForm() {
   useEffect(() => {
     gateway.listProviders().then(setProviders).catch(() => {});
   }, []);
+
+  // Fetch the selected RunPod account's credit (named accounts only — the gateway
+  // default has no provider row). Re-runs whenever the account dropdown changes.
+  useEffect(() => {
+    if (target !== "cloud" || !runpodProviderId) {
+      setRunpodBalance(null);
+      return;
+    }
+    let cancelled = false;
+    setRunpodBalanceLoading(true);
+    setRunpodBalance(null);
+    gateway
+      .getProviderBalance(runpodProviderId)
+      .then((b) => { if (!cancelled) setRunpodBalance(b); })
+      .catch(() => { if (!cancelled) setRunpodBalance(null); })
+      .finally(() => { if (!cancelled) setRunpodBalanceLoading(false); });
+    return () => { cancelled = true; };
+  }, [target, runpodProviderId]);
 
   // Live SSH probe of the selected VM — re-fires on provider change + refresh.
   type VmAvailState =
@@ -225,10 +249,11 @@ export function InferenceForm() {
   // chosen RunPod account ("" = gateway default). isVm now keys off the target.
   const providerId = target === "vm" ? vmProviderId : runpodProviderId;
   const isVm = target === "vm";
-  // Serving mode follows the target: VM → multi-model fleet (single-model serving
-  // + sleep/wake eviction); cloud (RunPod/PI) → single-model scale-to-zero. There
-  // is no single-model mode on a VM.
-  const mode: "single" | "multi" = isVm ? "multi" : "single";
+  // Serving mode: a VM is always a multi-model fleet (single-model serving +
+  // sleep/wake eviction). Cloud (RunPod) is single-model by default, or a
+  // multi-model fleet when the user opts in (cloudMulti) — same time-sharing as
+  // VM, plus idle-timeout auto-delete.
+  const mode: "single" | "multi" = isVm || cloudMulti ? "multi" : "single";
   const selectedProvider = providers.find((p) => p.id === vmProviderId) || null;
   const vmGpuCount = selectedProvider?.gpu_count ?? 0;
   // Optional GPU pin. vdIds = chosen physical ids; vdInvalid flags bad input;
@@ -243,27 +268,30 @@ export function InferenceForm() {
     (vdIds.some((n) => !Number.isInteger(n) || n < 0 || (vmGpuCount > 0 && n >= vmGpuCount)) ||
       new Set(vdIds).size !== vdIds.length);
   const effectiveVmGpuCount = isVm && vdIds.length > 0 && !vdInvalid ? vdIds.length : vmGpuCount;
+  // GPU universe the fleet packs onto: a VM uses its (optionally pinned) probed
+  // GPUs; a cloud multi-model fleet uses the requested RunPod pod gpuCount.
+  const fleetGpus = isVm ? effectiveVmGpuCount : gpuCount;
   // tp choices for multi: any (power-of-two) size up to the usable GPU count. We
   // do NOT require tp to divide the count — the packer + optional per-model GPU
   // pin handle non-dividing layouts, e.g. tp=4 on 7 GPUs → [0,1,2,3].
-  const tpChoices = effectiveVmGpuCount > 0
-    ? GPU_COUNT_CHOICES.filter((n) => n <= effectiveVmGpuCount)
+  const tpChoices = fleetGpus > 0
+    ? GPU_COUNT_CHOICES.filter((n) => n <= fleetGpus)
     : [1, 2, 4, 8];
   // Pipeline-parallel choices: any integer 1..usable (PP need not be a power of
   // two — e.g. TP=2 × PP=3 = 6 GPUs). A member uses tp × pp GPUs total.
   const ppChoices = Array.from(
-    { length: Math.max(1, effectiveVmGpuCount || 8) },
+    { length: Math.max(1, fleetGpus || 8) },
     (_, i) => i + 1,
   );
-  // Physical GPU universe used to suggest per-model pins: an explicit
-  // visible_devices pin, else 0..vmGpuCount-1. Suggestions mirror the gateway's
-  // auto-packer so "what you see is what deploys".
+  // Physical GPU universe used to suggest per-model pins. VM: an explicit
+  // visible_devices pin, else 0..vmGpuCount-1. Cloud multi: 0..gpuCount-1.
+  // Suggestions mirror the gateway's auto-packer so "what you see is what deploys".
   const physForSuggest =
-    isVm && vdIds.length > 0 && !vdInvalid
-      ? vdIds
-      : isVm
-        ? Array.from({ length: vmGpuCount }, (_, i) => i)
-        : [];
+    mode !== "multi"
+      ? []
+      : isVm && vdIds.length > 0 && !vdInvalid
+        ? vdIds
+        : Array.from({ length: fleetGpus }, (_, i) => i);
   // Each member occupies tp × pp consecutive GPUs.
   const memberSuggestions = suggestPacking(members.map((m) => m.tp * (m.pp || 1)), physForSuggest);
   const [unavailableModal, setUnavailableModal] = useState<
@@ -309,7 +337,7 @@ export function InferenceForm() {
     .filter((m) => m.model);
   // Total GPUs the fleet wants = Σ (tp × pp) across members.
   const gpusUsed = cleanedMembers.reduce((acc, m) => acc + m.tp * m.pp, 0);
-  const oversubscribed = mode === "multi" && effectiveVmGpuCount > 0 && gpusUsed > effectiveVmGpuCount;
+  const oversubscribed = mode === "multi" && fleetGpus > 0 && gpusUsed > fleetGpus;
   const envVars = parseEnvVars(envText);
   const hasEnvVars = Object.keys(envVars).length > 0;
 
@@ -332,10 +360,6 @@ export function InferenceForm() {
     }
 
     if (mode === "multi") {
-      if (!isVm) {
-        setSubmitError("Multi-model mode requires a VM provider.");
-        return;
-      }
       if (cleanedMembers.length === 0) {
         setSubmitError("Add at least one model.");
         return;
@@ -345,14 +369,20 @@ export function InferenceForm() {
         setSubmitError("Duplicate model names — each member must be unique.");
         return;
       }
-      if (vdInvalid) {
+      if (isVm && vdInvalid) {
         setSubmitError(`GPU IDs must be unique indices in 0..${(vmGpuCount || 1) - 1}.`);
         return;
       }
+      if (!isVm && (idleInvalid)) {
+        setSubmitError("Idle timeout must be 0–86400 seconds.");
+        return;
+      }
+      // The GPU pool models may pin onto: a VM's pinned/probed ids, else 0..N-1
+      // of the fleet's GPU count (cloud uses the requested gpuCount).
       const allowedGpus =
-        vdIds.length > 0 && !vdInvalid
+        isVm && vdIds.length > 0 && !vdInvalid
           ? new Set(vdIds)
-          : new Set(Array.from({ length: vmGpuCount }, (_, k) => k));
+          : new Set(Array.from({ length: fleetGpus }, (_, k) => k));
       const modelsPayload: { model: string; tp: number; pp: number; extra_args: string; gpu_indices?: number[]; task?: "transcription" }[] = [];
       for (let i = 0; i < members.length; i++) {
         const raw = members[i];
@@ -360,8 +390,8 @@ export function InferenceForm() {
         if (!mdl) continue;
         const pp = raw.pp || 1;
         const width = raw.tp * pp; // GPUs this member occupies (tensor × pipeline)
-        if (effectiveVmGpuCount > 0 && width > effectiveVmGpuCount) {
-          setSubmitError(`${mdl}: tp×pp=${width} (tp=${raw.tp}, pp=${pp}) exceeds the ${effectiveVmGpuCount} selected GPUs.`);
+        if (fleetGpus > 0 && width > fleetGpus) {
+          setSubmitError(`${mdl}: tp×pp=${width} (tp=${raw.tp}, pp=${pp}) exceeds the ${fleetGpus} GPUs.`);
           return;
         }
         const argErr = vllmArgsError(raw.extra_args.trim(), VLLM_RESERVED_MULTI, `model ${mdl}`);
@@ -378,11 +408,11 @@ export function InferenceForm() {
           setSubmitError(e instanceof Error ? e.message : String(e));
           return;
         }
-        if (gpu_indices && effectiveVmGpuCount > 0) {
+        if (gpu_indices && fleetGpus > 0) {
           const bad = gpu_indices.filter((g) => !allowedGpus.has(g));
           if (bad.length) {
             const pool = [...allowedGpus].sort((a, b) => a - b).join(",");
-            setSubmitError(`model ${mdl}: GPU id(s) ${bad.join(",")} aren't in the selected GPUs (${pool}).`);
+            setSubmitError(`model ${mdl}: GPU id(s) ${bad.join(",")} aren't in the GPU pool (${pool}).`);
             return;
           }
         }
@@ -395,21 +425,41 @@ export function InferenceForm() {
           ...(raw.audio ? { task: "transcription" } : {}),
         });
       }
-      const body: DeployArg = {
-        name: slugify(name),
-        gpu: "vm",
-        gpu_count: effectiveVmGpuCount,
-        provider_id: providerId || null,
-        mode: "multi",
-        models: modelsPayload,
-        sleep_level: sleepLevel,
-        autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: 0 },
-        enable_metrics: enableMetrics,
-        ...(hasEnvVars ? { env_vars: envVars } : {}),
-        ...(vdRaw ? { visible_devices: vdRaw } : {}),
-        ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
-        ...(vllmVersion.trim() ? { vllm_version: vllmVersion.trim() } : {}),
-      };
+      // VM multi-model fleet: always-on (idle 0), the VM's own GPUs, ships a
+      // worker-agent tarball over SSH (venv/visible_devices/vllm_version apply).
+      // Cloud multi-model fleet (RunPod): the requested GPU type + count, honours
+      // the idle timeout (deletes the pod after N idle seconds), pod-baked image.
+      const body: DeployArg = isVm
+        ? {
+            name: slugify(name),
+            gpu: "vm",
+            gpu_count: fleetGpus,
+            provider_id: providerId || null,
+            mode: "multi",
+            models: modelsPayload,
+            sleep_level: sleepLevel,
+            autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: 0 },
+            enable_metrics: enableMetrics,
+            ...(hasEnvVars ? { env_vars: envVars } : {}),
+            ...(vdRaw ? { visible_devices: vdRaw } : {}),
+            ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
+            ...(vllmVersion.trim() ? { vllm_version: vllmVersion.trim() } : {}),
+          }
+        : {
+            name: slugify(name),
+            gpu,
+            gpu_count: gpuCount,
+            cloud_type: cloudType,
+            container_disk_gb: parsedDisk,
+            volume_gb: parsedVolume,
+            provider_id: providerId || null,
+            mode: "multi",
+            models: modelsPayload,
+            sleep_level: sleepLevel,
+            autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: parsedIdle },
+            enable_metrics: enableMetrics,
+            ...(hasEnvVars ? { env_vars: envVars } : {}),
+          };
       startTransition(async () => applyResult(await deployEndpoint(body)));
       return;
     }
@@ -566,6 +616,16 @@ export function InferenceForm() {
                       ))}
                   </SelectContent>
                 </Select>
+                {runpodProviderId && (
+                  <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Wallet className="h-3.5 w-3.5" />
+                    {runpodBalanceLoading
+                      ? "Checking credit…"
+                      : runpodBalance?.ok && typeof runpodBalance.balance === "number"
+                        ? <>Credit: <span className="font-medium text-emerald-600">${runpodBalance.balance.toFixed(2)}</span></>
+                        : "Credit unavailable"}
+                  </p>
+                )}
               </Field>
             ) : (
               <Field
@@ -669,7 +729,7 @@ export function InferenceForm() {
               hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity."
             >
               <div className="grid grid-cols-2 gap-2">
-                {(["COMMUNITY", "SECURE"] as const).map((tier) => (
+                {(["SECURE", "COMMUNITY"] as const).map((tier) => (
                   <button
                     key={tier}
                     type="button"
@@ -809,6 +869,38 @@ export function InferenceForm() {
               </Field>
             )}
 
+            {target === "cloud" && (
+              <Field
+                label="Serving mode"
+                hint="Single = one model per pod, scale-to-zero. Multi-model fleet = several models time-sharing the pod's GPUs (sleep/wake), deleted after the idle timeout and re-provisioned on demand."
+              >
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setCloudMulti(false)}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                      !cloudMulti ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="font-medium">Single model</div>
+                    <div className="text-xs text-muted-foreground">One model, scale-to-zero.</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCloudMulti(true)}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                      cloudMulti ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="font-medium">Multi-model fleet</div>
+                    <div className="text-xs text-muted-foreground">Many models, idle auto-delete.</div>
+                  </button>
+                </div>
+              </Field>
+            )}
+
             <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
               {isVm ? (
                 <>
@@ -816,10 +908,16 @@ export function InferenceForm() {
                   GPUs and swap in via sleep/wake. Add one model for a single-model endpoint (you still get the
                   sleep/wake benefits).
                 </>
+              ) : cloudMulti ? (
+                <>
+                  <span className="font-medium text-foreground">Multi-model fleet on RunPod</span> — several models
+                  time-share the pod&apos;s GPUs via sleep/wake. The whole pod is deleted after the idle timeout and
+                  re-provisioned on the next request (set Idle timeout under Engine).
+                </>
               ) : (
                 <>
                   <span className="font-medium text-foreground">Single-model endpoint</span> — one model per RunPod /
-                  PI pod, scale-to-zero. Use a VM provider for a multi-model fleet.
+                  PI pod, scale-to-zero.
                 </>
               )}
             </div>
@@ -967,7 +1065,7 @@ export function InferenceForm() {
                   <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
                     <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     <span>
-                      Models need {gpusUsed} GPUs but the VM has {vmGpuCount} — they won&apos;t all stay
+                      Models need {gpusUsed} GPUs but the fleet has {fleetGpus} — they won&apos;t all stay
                       resident. Extra models are swapped in on demand via vLLM sleep/wake (first
                       request to a sleeping model waits for the swap).
                     </span>
@@ -995,17 +1093,19 @@ export function InferenceForm() {
 
         <Section title="Engine" description="Scaling behaviour, vLLM args, and metrics.">
           <div className="space-y-5">
-            {mode === "multi" && (
+            {mode === "multi" && isVm && (
               <p className="text-xs text-muted-foreground">
-                Multi-model endpoints are always-on (no scale-to-zero); per-model vLLM args
+                VM multi-model fleets are always-on (no scale-to-zero); per-model vLLM args
                 are set per model above. Models are evicted via sleep/wake, not torn down.
               </p>
             )}
-            {mode === "single" && (
+            {!isVm && (
             <>
             <Field
               label="Idle timeout (s)"
-              hint="Worker is torn down after this many seconds with no traffic. 0 keeps the worker on forever."
+              hint={cloudMulti
+                ? "After this many idle seconds the whole fleet pod is deleted (re-provisioned on the next request). 0 = always-on."
+                : "Worker is torn down after this many seconds with no traffic. 0 keeps the worker on forever."}
             >
               <Input
                 type="text"
@@ -1021,6 +1121,9 @@ export function InferenceForm() {
               Max workers is fixed at <span className="font-medium text-foreground">1</span> for now.
             </p>
 
+            {/* Single-model global vLLM args. A multi-model fleet sets vLLM args
+                per model in the Models section instead. */}
+            {mode === "single" && (
             <div className="border-t border-border pt-4">
               <button
                 type="button"
@@ -1153,6 +1256,7 @@ export function InferenceForm() {
             </div>
           )}
         </div>
+            )}
             </>
             )}
 
@@ -1216,11 +1320,10 @@ export function InferenceForm() {
           disabled={
             pending ||
             (isVm && vdInvalid) ||
-            (mode === "single" &&
-              (idleInvalid ||
-                advancedInvalid ||
-                (!isVm && (diskInvalid || volumeInvalid)) ||
-                explicitlyUnavailable))
+            // Cloud (single OR multi-fleet): pod sizing + idle + availability.
+            (!isVm && (idleInvalid || diskInvalid || volumeInvalid || explicitlyUnavailable)) ||
+            // Single-model only has global vLLM engine args to validate.
+            (mode === "single" && advancedInvalid)
           }
         >
           {pending && <Loader2 className="h-4 w-4 animate-spin" />}

@@ -572,6 +572,14 @@ export type ProviderRecord = {
   account_email?: string | null;
 };
 
+// RunPod account credit (USD) — GET /v1/providers/{id}/balance.
+export type ProviderBalance = {
+  ok: boolean;
+  balance?: number | null;
+  currency: string;
+  message: string;
+};
+
 // ---- Storage backends (S3 / HuggingFace destinations the platform writes to) ----
 export type StorageKind = "s3" | "huggingface";
 

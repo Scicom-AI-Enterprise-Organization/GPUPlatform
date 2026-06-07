@@ -208,6 +208,34 @@ async def _runpod_validate(api_key: str) -> tuple[bool, str, dict]:
     return False, f"HTTP {r.status_code}: {r.text[:200]}", {}
 
 
+async def _runpod_balance(api_key: str) -> tuple[Optional[float], str]:
+    """RunPod account credit in USD via the GraphQL `myself.clientBalance` — the
+    REST /v1 API has no balance route. Returns (balance, message); balance is None
+    on any error (network/auth/parse) and the message says why."""
+    base = os.environ.get("RUNPOD_GRAPHQL_BASE", "https://api.runpod.io/graphql").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as cli:
+            r = await cli.post(
+                base,
+                params={"api_key": api_key},
+                json={"query": "query { myself { clientBalance } }"},
+            )
+    except httpx.HTTPError as e:
+        return None, f"network error: {e}"
+    if r.status_code in (401, 403):
+        return None, "unauthorized"
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}"
+    try:
+        bal = r.json()["data"]["myself"]["clientBalance"]
+    except (ValueError, KeyError, TypeError):
+        return None, "unexpected response"
+    try:
+        return (float(bal) if bal is not None else None), "ok"
+    except (TypeError, ValueError):
+        return None, "non-numeric balance"
+
+
 async def _pi_validate(api_key: str) -> tuple[bool, str, dict]:
     """Cheap GET against Prime Intellect — list pods with limit=1."""
     base = os.environ.get("PI_API_BASE", "https://api.primeintellect.ai").rstrip("/")
@@ -506,6 +534,34 @@ async def provider_availability(
         ) for g in result.gpus],
         checked_at=result.checked_at,
     )
+
+
+class ProviderBalanceResponse(BaseModel):
+    ok: bool
+    balance: Optional[float] = None
+    currency: str = "USD"
+    message: str = "ok"
+
+
+@router.get("/{provider_id}/balance", response_model=ProviderBalanceResponse)
+async def provider_balance(
+    provider_id: str,
+    user: User = Depends(current_user),  # noqa: ARG001 — auth-only; any signed-in user
+    session: AsyncSession = Depends(get_session),
+):
+    """RunPod account credit (USD). Surfaced on the providers page card + the
+    create-endpoint form so you can see the selected account's budget before
+    spawning pods. Read-only; never returns the key."""
+    row = await session.get(Provider, provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+    if row.kind != "runpod":
+        raise HTTPException(status_code=400, detail="balance is only available for RunPod providers")
+    enc = (row.config or {}).get("api_key_enc")
+    if not enc:
+        raise HTTPException(status_code=500, detail="provider missing stored key")
+    bal, msg = await _runpod_balance(crypto.decrypt(enc))
+    return ProviderBalanceResponse(ok=bal is not None, balance=bal, message=msg)
 
 
 @router.get("/{provider_id}/metrics", response_model=ProviderMetricsResponse)

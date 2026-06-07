@@ -516,9 +516,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="serverless-gpu gateway",
     lifespan=lifespan,
+    # Swagger / ReDoc UIs stay off (the web UI ships its own /api-docs), but the
+    # machine-readable schema at /openapi.json is served publicly — it carries no
+    # auth dependency, so any client / tool can fetch it without a token.
     docs_url=None,
     redoc_url=None,
-    openapi_url=None,
+    openapi_url="/openapi.json",
 )
 app.include_router(bench_module.router)
 app.include_router(compute_module.router)
@@ -588,6 +591,53 @@ async def metrics_mw(request: Request, call_next):
 # at image-build time (see the Dockerfile + ci.yml build-args); "dev" for local /
 # unbaked runs.
 GATEWAY_VERSION = os.environ.get("APP_VERSION", "dev")
+
+
+# Routes that genuinely need no token — kept off the global security requirement
+# below so /openapi.json doesn't read as if login itself is gated.
+_OPENAPI_PUBLIC_PATHS = {
+    "/", "/health", "/ready", "/version", "/openapi.json", "/v1/models",
+    "/auth/login", "/auth/register", "/auth/github/upsert",
+}
+
+
+def _custom_openapi():
+    """FastAPI can't infer auth from our hand-rolled `current_user` dependency, so
+    the generated schema would show every route as public. Inject an HTTP-bearer
+    security scheme + a global requirement (minus the public routes) so the spec
+    honestly documents `Authorization: Bearer <sgpu_… key | session token>`."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+
+    schema = get_openapi(
+        title=app.title,
+        version=GATEWAY_VERSION,
+        description=(
+            "Serverless-GPU control-plane API. Authenticate with an API key "
+            "(prefix `sgpu_`, from the API tokens page) sent as "
+            "`Authorization: Bearer <key>`."
+        ),
+        routes=app.routes,
+    )
+    schema.setdefault("components", {})["securitySchemes"] = {
+        "bearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "description": "API key (prefix sgpu_) or a session token.",
+        },
+    }
+    schema["security"] = [{"bearerAuth": []}]
+    for path, ops in schema.get("paths", {}).items():
+        if path in _OPENAPI_PUBLIC_PATHS:
+            for op in ops.values():
+                if isinstance(op, dict):
+                    op["security"] = []
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi  # type: ignore[method-assign]
 
 
 @app.get("/")
@@ -1323,26 +1373,28 @@ async def create_app(
     autoscaler_dict = req.autoscaler.model_dump()
 
     if mode == "multi":
-        if not is_vm:
-            raise HTTPException(
-                status_code=400,
-                detail="multi-model mode requires a VM provider (provider_id of kind 'vm')",
-            )
         members = req.models or []
         if not members:
             raise HTTPException(status_code=400, detail="multi-model mode requires at least one model in 'models'")
-        total_gpus = int((prov.config or {}).get("gpu_count") or 0)
-        if total_gpus <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="VM provider has no probed GPUs — run Test on the provider first",
-            )
-        # Usable GPU universe: a visible_devices pin narrows it to that subset.
-        # Each model needs tp*pp GPUs (must be <= usable); the fleet packs each
-        # onto a (tp*pp)-wide slot via build_multi_model_config, which handles the
-        # width NOT dividing the total (e.g. width=4 on 6 GPUs → [0,1,2,3],
-        # leaving [4,5]). So we only require tp*pp <= usable, not exact division.
-        usable_gpus = len(vd_ids) if vd_ids else total_gpus
+        # Usable GPU universe to pack the fleet onto. Each model needs tp*pp GPUs
+        # (must be <= usable); build_multi_model_config packs each onto a (tp*pp)-
+        # wide slot and handles the width NOT dividing the total (e.g. width=4 on 6
+        # GPUs → [0,1,2,3], leaving [4,5]). So we only require tp*pp <= usable.
+        #   VM    → the provider's probed gpu_count (optionally narrowed by a
+        #           visible_devices pin); always-on (you own the box).
+        #   cloud → the requested gpu_count (the RunPod/PI pod's GPU count);
+        #           honours idle-timeout auto-delete of the whole pod.
+        if is_vm:
+            total_gpus = int((prov.config or {}).get("gpu_count") or 0)
+            if total_gpus <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="VM provider has no probed GPUs — run Test on the provider first",
+                )
+            usable_gpus = len(vd_ids) if vd_ids else total_gpus
+        else:
+            usable_gpus = int(gpu_count or 1)
+            vd_ids = None  # cloud pods have no GPU pin
         seen: set[str] = set()
         for m in members:
             if m.tp < 1:
@@ -1366,16 +1418,24 @@ async def create_app(
                 raise HTTPException(status_code=400, detail=str(e))
         if req.sleep_level not in (1, 2):
             raise HTTPException(status_code=400, detail="sleep_level must be 1 or 2")
-        # One always-on VM fleet — no scale-to-zero, one machine, deeper queue.
-        gpu = "vm"
-        gpu_count = usable_gpus
         model = ""
         models_json = [m.model_dump() for m in members]
         sleep_level = req.sleep_level
+        # One fleet box/pod with a deeper queue (it time-shares GPUs via sleep/wake).
         autoscaler_dict["max_containers"] = 1
-        autoscaler_dict["idle_timeout_s"] = 0
         if int(autoscaler_dict.get("tasks_per_container", 30) or 30) < 64:
             autoscaler_dict["tasks_per_container"] = 64
+        if is_vm:
+            # Always-on VM fleet — no scale-to-zero (you own the box).
+            gpu = "vm"
+            gpu_count = usable_gpus
+            autoscaler_dict["idle_timeout_s"] = 0
+        else:
+            # Cloud multi-model fleet (RunPod/PI): keep the requested GPU type +
+            # count and HONOUR idle_timeout_s — 0 = always-on, N>0 = delete the
+            # pod after N idle seconds (re-provisioned on the next request).
+            gpu = req.gpu
+            gpu_count = usable_gpus
     else:
         # VM providers serve multi-model fleets only — a 1-model fleet covers the
         # single-model case and adds sleep/wake, and single-model VM serving was

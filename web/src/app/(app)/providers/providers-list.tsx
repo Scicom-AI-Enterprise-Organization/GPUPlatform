@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { Activity, Cloud, Copy, Cpu, Inbox, KeyRound, LayoutGrid, List, MoreHorizontal, Search, Server, Trash2, User, X } from "lucide-react";
+import { Activity, Cloud, Copy, Cpu, Inbox, KeyRound, LayoutGrid, List, MoreHorizontal, Search, Server, Trash2, User, Wallet, X } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -22,7 +22,7 @@ import {
 import { gateway } from "@/lib/gateway";
 import { avatarFor } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
-import type { ProviderRecord } from "@/lib/types";
+import type { ProviderRecord, ProviderBalance } from "@/lib/types";
 
 function searchableText(p: ProviderRecord): string {
   return [p.name, p.id, p.kind, p.host ?? "", p.user ?? "", p.account_email ?? "", p.created_by ?? "", ...(p.gpus ?? [])]
@@ -38,6 +38,28 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
   const [testing, setTesting] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, string>>({});
   const [showPub, setShowPub] = useState<Record<string, boolean>>({});
+  // RunPod account credit (USD), fetched per-account on mount. Best-effort: a
+  // failed/unsupported lookup just leaves the badge off.
+  const [balances, setBalances] = useState<Record<string, ProviderBalance>>({});
+  useEffect(() => {
+    let cancelled = false;
+    for (const p of items) {
+      if (p.kind !== "runpod") continue;
+      gateway
+        .getProviderBalance(p.id)
+        .then((b) => {
+          if (!cancelled) setBalances((prev) => ({ ...prev, [p.id]: b }));
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [items]);
+  const creditLabel = (id: string): string | null => {
+    const b = balances[id];
+    return b?.ok && typeof b.balance === "number" ? `$${b.balance.toFixed(2)}` : null;
+  };
   const [q, setQ] = useState("");
   const [view, setView] = useState<"rows" | "grid">("grid");
   useEffect(() => {
@@ -173,7 +195,7 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
         {filtered.map((p) => (
           <li
             key={p.id}
-            className="rounded-xl border border-border bg-card p-4 transition-all hover:border-primary/40 hover:bg-card/80 hover:shadow-md"
+            className="flex flex-col rounded-xl border border-border bg-card p-4 transition-all hover:border-primary/40 hover:bg-card/80 hover:shadow-md"
           >
             <div className="flex items-start justify-between gap-3">
               <div className="flex min-w-0 items-center gap-3">
@@ -269,6 +291,15 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
                   ****{p.api_key_last4}
                 </span>
               )}
+              {p.kind === "runpod" && creditLabel(p.id) && (
+                <span
+                  className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-600"
+                  title="RunPod account credit"
+                >
+                  <Wallet className="h-3 w-3" />
+                  {creditLabel(p.id)}
+                </span>
+              )}
               {p.account_email && (
                 <span className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground">
                   {p.account_email}
@@ -277,7 +308,7 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
             </div>
 
             {(p.kind === "runpod" || p.kind === "pi") && p.ssh_pub && (
-              <div className="mt-2 text-xs">
+              <div className="mt-2 pb-2 text-xs">
                 <button
                   type="button"
                   className="text-muted-foreground hover:text-foreground"
@@ -315,7 +346,7 @@ export function ProvidersList({ items }: { items: ProviderRecord[] }) {
               </div>
             )}
 
-            <div className="mt-3 flex items-center justify-end border-t border-border/60 pt-2 text-xs text-muted-foreground">
+            <div className="mt-auto flex items-center justify-end border-t border-border/60 pt-2 text-xs text-muted-foreground">
               <span title={new Date(p.created_at).toISOString()}>
                 added {new Date(p.created_at).toLocaleString()}
               </span>

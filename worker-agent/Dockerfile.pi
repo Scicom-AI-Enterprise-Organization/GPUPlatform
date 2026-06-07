@@ -30,7 +30,7 @@ RUN curl -fsSL https://tailscale.com/install.sh | sh
 # boot when ENABLE_METRICS=true. Pre-install ansible/git so the cold-start
 # path is just `ansible-pull <repo>` — saves ~30s vs apt-get on each cold-start.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ansible git \
+    && apt-get install -y --no-install-recommends ansible git openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
 # Entrypoint: launch vllm-serve in the background, then worker-agent in

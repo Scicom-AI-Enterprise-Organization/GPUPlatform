@@ -21,6 +21,8 @@ Optional:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import time
@@ -92,6 +94,29 @@ def _map_gpu(name: str) -> str:
     return name  # assume caller already used RunPod's enum
 
 
+def _gen_ed25519() -> tuple[str, str]:
+    """(openssh_public_key, openssh_pem_private_key) for an ephemeral tunnel key."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    k = Ed25519PrivateKey.generate()
+    priv = k.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.OpenSSH,
+        serialization.NoEncryption(),
+    ).decode()
+    pub = k.public_key().public_bytes(
+        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
+    ).decode()
+    return pub, priv
+
+
+# Where the worker-agent + its vLLM venv live on the pod (mirrors the VM's ~/.sgpu).
+# RunPod pods run as root.
+_POD_REMOTE = "/root/.sgpu"
+_POD_VENV = "/root/.sgpu/venv"
+
+
 class RunPodProvider(Provider):
     name = "runpod"
 
@@ -106,6 +131,9 @@ class RunPodProvider(Provider):
         volume_in_gb: Optional[int] = None,
         ts_authkey: Optional[str] = None,
         name_prefix: Optional[str] = None,
+        reverse_tunnel: Optional[bool] = None,
+        ssh_priv_pem: Optional[str] = None,
+        ssh_pub: Optional[str] = None,
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("RUNPOD_API_KEY")
@@ -168,6 +196,58 @@ class RunPodProvider(Provider):
         )
         self._owns_client = client is None
 
+        # Reverse-tunnel mode: instead of the pod phoning home to a public
+        # GATEWAY_URL (which from RunPod's network points at the pod itself when
+        # the gateway runs on a laptop), we SSH into the pod and forward ITS
+        # loopback gateway+redis ports back to the gateway process — exactly like
+        # the VM provider's VM_REVERSE_TUNNEL. The pod gets our PUBLIC_KEY injected
+        # (the template writes it to authorized_keys, same as benchmaq) and the
+        # worker is pointed at 127.0.0.1. On by default; disable with
+        # RUNPOD_REVERSE_TUNNEL=0 (then prod uses the public GATEWAY_URL).
+        self.reverse_tunnel = (
+            reverse_tunnel
+            if reverse_tunnel is not None
+            else os.environ.get("RUNPOD_REVERSE_TUNNEL", "1").strip().lower() not in ("0", "false", "no", "")
+        )
+        self.ssh_priv_pem = ssh_priv_pem
+        self.ssh_pub = ssh_pub
+        # machine_id → (public_ip, ssh_port) once the pod is RUNNING + SSH is up.
+        self._ssh: dict[str, tuple[str, int]] = {}
+        if self.reverse_tunnel:
+            from . import vm_tunnel
+            gw_host, gw_port = vm_tunnel.parse_host_port(os.environ.get("GATEWAY_BIND", "127.0.0.1:8080"), 8080)
+            if gw_host in ("", "0.0.0.0"):
+                gw_host = "127.0.0.1"
+            rd_host, rd_port = vm_tunnel.parse_host_port(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379"), 6379)
+            if rd_host in ("", "0.0.0.0"):
+                rd_host = "127.0.0.1"
+            self._tunnel_gw = (gw_host, gw_port)
+            self._tunnel_redis = (rd_host, rd_port)
+            self._loop_gateway_url = f"http://127.0.0.1:{gw_port}"
+            self._loop_redis_url = f"redis://127.0.0.1:{rd_port}"
+            # No provider-row keypair (the gateway-default env account) → mint an
+            # ephemeral Ed25519 key for this gateway process. NOTE: it doesn't
+            # survive a gateway restart, so live pods can't reconnect — use a
+            # RunPod *provider row* (persistent ssh_pub/ssh_priv) for prod.
+            if not (self.ssh_priv_pem and self.ssh_pub):
+                self.ssh_pub, self.ssh_priv_pem = _gen_ed25519()
+                logger.warning(
+                    "runpod reverse-tunnel: no provider-row SSH key — using an ephemeral "
+                    "key (lost on restart; live pods won't reconnect). Use a provider row for prod."
+                )
+
+        # A RunPod pod is just a container/VM. In reverse-tunnel mode we boot a
+        # STOCK image that runs sshd + applies PUBLIC_KEY on its own (the benchmark
+        # image — CUDA 12.8 / torch 2.8), then SSH in and do exactly what the VM
+        # provider does: make a uv venv, `uv pip install` vllm + the worker-agent
+        # (shipped as a tarball — no git, no creds), and nohup the worker. No
+        # custom image to build/push; worker-agent code changes ship per provision.
+        self.image = os.environ.get(
+            "RUNPOD_IMAGE", "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+        )
+        # machine_id → the worker config (env dict) to write over SSH at launch.
+        self._worker_env: dict[str, dict] = {}
+
         # machine_id (ours) → pod_id (RunPod's)
         self._pod_ids: dict[str, str] = {}
 
@@ -209,16 +289,46 @@ class RunPodProvider(Provider):
         effective_volume = volume_gb if volume_gb is not None else self.volume_in_gb
         body: dict[str, Any] = {
             "name": pod_name,
-            "templateId": self.template_id,
             "gpuTypeIds": [_map_gpu(gpu)],
             "cloudType": effective_cloud,
             "gpuCount": max(1, int(gpu_count)),
             "containerDiskInGb": effective_disk,
             "volumeInGb": effective_volume,
-            "env": env_vars,
         }
-        if self.allowed_cuda_versions:
-            body["allowedCudaVersions"] = self.allowed_cuda_versions
+        if self.reverse_tunnel:
+            # Point the worker at the pod's own loopback (the tunnel forwards it to
+            # the gateway+redis) and run the vLLM fleet from the venv we build on
+            # the pod. The worker config is written over SSH at launch (NOT RunPod
+            # env), so the only pod env needed is PUBLIC_KEY (which the stock
+            # image's start.sh adds to authorized_keys so we can SSH in).
+            env_vars["GATEWAY_URL"] = self._loop_gateway_url
+            env_vars["WORKER_REDIS_URL"] = self._loop_redis_url
+            mm = env_vars.get("MULTI_MODEL_CONFIG")
+            if mm:
+                try:
+                    cfg = json.loads(mm)
+                    cfg["venv_path"] = _POD_VENV  # where we install vllm on the pod
+                    env_vars["MULTI_MODEL_CONFIG"] = json.dumps(cfg)
+                except (ValueError, TypeError):
+                    pass
+            self._worker_env[machine_id] = dict(env_vars)
+            body["imageName"] = self.image
+            body["ports"] = ["22/tcp", "8000/tcp"]
+            body["env"] = {"PUBLIC_KEY": self.ssh_pub} if self.ssh_pub else {}
+            # Latest vLLM is a CUDA-13 build (its wheels need libcudart.so.13 /
+            # driver 580+), so pin the host filter to a CUDA-13 driver — matching
+            # the serverless default (RUNPOD_ALLOWED_CUDA_VERSIONS=13.0). The cu128
+            # base image still runs here (forward-compatible: image-CUDA ≤ host-CUDA).
+            # Override RUNPOD_TUNNEL_CUDA (e.g. "12.8") only if you also pin an older,
+            # cu128-built vLLM via the member's vllm_version.
+            body["allowedCudaVersions"] = [
+                v.strip() for v in os.environ.get("RUNPOD_TUNNEL_CUDA", "13.0").split(",") if v.strip()
+            ]
+        else:
+            body["templateId"] = self.template_id
+            body["env"] = env_vars
+            if self.allowed_cuda_versions:
+                body["allowedCudaVersions"] = self.allowed_cuda_versions
 
         r = await self._client.post("/pods", json=body)
         if r.status_code >= 400:
@@ -229,6 +339,12 @@ class RunPodProvider(Provider):
             raise RuntimeError(f"RunPod provision response missing id: {data}")
 
         self._pod_ids[machine_id] = pod_id
+
+        # Bring up the reverse tunnel once the pod is RUNNING + SSH is reachable.
+        # The worker retries registration, so it tolerates the tunnel arriving a
+        # few seconds after it boots.
+        if self.reverse_tunnel:
+            asyncio.create_task(self._establish_tunnel(machine_id, pod_id))
 
         # RunPod's pod-create response carries the hourly rate it locked in
         # for this pod. Capture it best-effort so the UI can show a live cost
@@ -245,7 +361,168 @@ class RunPodProvider(Provider):
         )
         return ProvisionResult(machine_id=machine_id, cost_per_hr=cost_per_hr)
 
+    # ---- reverse-tunnel (mirrors the VM provider's VM_REVERSE_TUNNEL) --------
+
+    async def _establish_tunnel(self, machine_id: str, pod_id: str) -> None:
+        """Poll the pod until it's RUNNING + its SSH endpoint is up, then open a
+        reverse tunnel forwarding the pod's loopback gateway/redis ports home."""
+        from .compute import _extract_ssh  # reuse the portMappings/runtime.ports parser
+
+        deadline = time.time() + 600
+        ip = port = None
+        while time.time() < deadline:
+            try:
+                r = await self._client.get(f"/pods/{pod_id}")
+                if r.status_code == 200:
+                    ip, port = _extract_ssh(r.json())
+                    if ip and port:
+                        break
+            except Exception:  # noqa: BLE001 — transient while the pod boots
+                pass
+            await asyncio.sleep(5)
+        if not (ip and port):
+            logger.warning(
+                "runpod reverse-tunnel: pod %s (machine %s) SSH endpoint not ready in 600s — "
+                "worker can't phone home via the tunnel", pod_id, machine_id,
+            )
+            return
+        self._ssh[machine_id] = (ip, int(port))
+        logger.info("runpod reverse-tunnel: machine %s SSH at %s:%s", machine_id, ip, port)
+        # 1) bring up the reverse tunnel (gateway+redis → pod loopback), then
+        # 2) SSH in and launch the worker exactly like the VM provider (uv venv +
+        #    install vllm + worker-agent + nohup). The worker phones home via the
+        #    tunnel, so order matters: tunnel first.
+        await self._ensure_tunnel_for(machine_id)
+        try:
+            await asyncio.to_thread(self._launch_worker_sync, machine_id, ip, int(port))
+        except Exception:  # noqa: BLE001
+            logger.exception("runpod: worker launch over SSH failed for machine %s", machine_id)
+
+    def _launch_worker_sync(self, machine_id: str, ip: str, ssh_port: int) -> None:
+        """SSH into the pod and set it up like a VM: write the worker config, ship
+        the worker-agent tarball, make a uv venv, `uv pip install` vllm + the
+        worker-agent, then nohup the worker. Runs in a thread (paramiko is sync)."""
+        import paramiko
+        import shlex
+
+        from . import vm_probe
+        from .vm_serverless_provider import _worker_agent_tarball_b64
+
+        worker_env = dict(self._worker_env.get(machine_id) or {})
+        if not worker_env:
+            logger.warning("runpod: no stashed worker env for %s — skipping launch", machine_id)
+            return
+        cfg_path = f"{_POD_REMOTE}/worker-{machine_id}.json"
+        log_path = f"{_POD_REMOTE}/worker-{machine_id}.log"
+        pid_path = f"{_POD_REMOTE}/worker-{machine_id}.pid"
+        worker_env = {
+            **worker_env,
+            "WORKER_SELF_LOG_PATH": log_path,
+            "WORKER_ENGINE_PIDS_PATH": f"{_POD_REMOTE}/worker-{machine_id}.enginepids",
+        }
+        cfg_b64 = base64.b64encode(json.dumps(worker_env).encode()).decode()
+        wa_b64 = _worker_agent_tarball_b64()  # raises if the gateway didn't bundle the source
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=ip, port=ssh_port, username="root",
+            pkey=vm_probe._load_pkey(self.ssh_priv_pem),
+            timeout=30, banner_timeout=30, auth_timeout=30,
+            look_for_keys=False, allow_agent=False,
+        )
+        try:
+            # vLLM version to pin in the pod venv (None → latest that resolves).
+            vllm_ver = ""
+            try:
+                vllm_ver = (json.loads(worker_env.get("MULTI_MODEL_CONFIG") or "{}").get("vllm_version") or "")
+            except (ValueError, TypeError):
+                pass
+            vllm_spec = f"vllm=={vllm_ver}" if vllm_ver else "vllm"
+            script = (
+                f"set -ex; mkdir -p {_POD_REMOTE}; "
+                f"echo {cfg_b64} | base64 -d > {shlex.quote(cfg_path)}; "
+                f"echo {wa_b64} | base64 -d > {_POD_REMOTE}/wa.tgz; "
+                f"rm -rf {_POD_REMOTE}/worker-agent && mkdir -p {_POD_REMOTE}/worker-agent && "
+                f"  tar xzf {_POD_REMOTE}/wa.tgz -C {_POD_REMOTE}/worker-agent; "
+                # Log the host GPU + driver/CUDA into the -x trace (shows up if we fail).
+                f"nvidia-smi || true; "
+                # uv makes the big vllm install fast; refresh it (the stock image's may
+                # be old) into ~/.local/bin, PATH'd first below.
+                f"curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || true; "
+                f"export PATH=\"$HOME/.local/bin:$PATH\"; "
+                f"command -v uv >/dev/null 2>&1 || pip install -q uv; "
+                f"if [ ! -x {_POD_VENV}/bin/python ]; then uv venv {_POD_VENV} || python3 -m venv {_POD_VENV}; fi; "
+                # vLLM + the worker-agent into the pod venv (the multi launcher runs
+                # `{_POD_VENV}/bin/python -m vllm …`, set via MULTI_MODEL_CONFIG.venv_path).
+                # Install vLLM with its NATIVE CUDA build (latest vLLM is cu13). The pod
+                # is pinned to a CUDA-13 host, so vLLM's bundled torch + CUDA libs match
+                # the driver — no torch-backend override (that mismatched vLLM's own
+                # cu13 binary against cu128 torch → "libcudart.so.13 missing").
+                # ninja + cmake: vLLM JIT-compiles CUDA kernels (cutlass/MoE/tilelang)
+                # at model load and dies with "[Errno 2] ... 'ninja'" without them.
+                f"uv pip install --python {_POD_VENV}/bin/python ninja cmake {shlex.quote(vllm_spec)} {_POD_REMOTE}/worker-agent; "
+                # Fast-fail (before the slow model load) if torch can't see the GPU —
+                # i.e. the installed CUDA build doesn't match the host driver. Use the
+                # venv python (a `uv venv` ships no pip). nvidia-smi above shows the host
+                # CUDA in the trace if this trips.
+                f"{_POD_VENV}/bin/python -c \"import torch,sys; sys.exit(0 if torch.cuda.is_available() else 3)\"; "
+                # venv/bin FIRST on PATH so the JIT compiler (ninja) and the cu13
+                # nvcc (nvidia-cuda-nvcc, in the venv) are found by vLLM's kernel
+                # build — running venv/bin/python directly does NOT add venv/bin to PATH.
+                f"WORKER_CONFIG_FILE={cfg_path} PATH={_POD_VENV}/bin:$PATH "
+                f"  nohup {_POD_VENV}/bin/python -m worker_agent.main "
+                f"  > {log_path} 2>&1 & echo $! > {pid_path}"
+            )
+            stdin, stdout, stderr = client.exec_command(f"bash -lc {shlex.quote(script)}", timeout=900)
+            rc = stdout.channel.recv_exit_status()
+            if rc != 0:
+                # `set -ex` traces every command to stderr; the real failure is at
+                # the TAIL (after uv's resolve banner), so capture the end, not head.
+                out = stdout.read().decode(errors="replace")
+                err = stderr.read().decode(errors="replace")
+                tail = (out + "\n--- stderr ---\n" + err)[-3000:]
+                raise RuntimeError(f"runpod worker launch failed (rc={rc}):\n…{tail}")
+            logger.info("runpod: worker launched on pod %s (machine %s)", ip, machine_id)
+        finally:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _ensure_tunnel_for(self, machine_id: str) -> None:
+        ep = self._ssh.get(machine_id)
+        if not ep or not self.reverse_tunnel or not self.ssh_priv_pem:
+            return
+        ip, ssh_port = ep
+        from . import vm_tunnel
+        forwards = [
+            vm_tunnel.Forward(self._tunnel_gw[1], self._tunnel_gw[0], self._tunnel_gw[1]),
+            vm_tunnel.Forward(self._tunnel_redis[1], self._tunnel_redis[0], self._tunnel_redis[1]),
+        ]
+        await asyncio.to_thread(vm_tunnel.ensure, ip, ssh_port, "root", self.ssh_priv_pem, forwards)
+
+    async def ensure_connectivity(self) -> None:
+        """Each autoscaler tick: re-ensure every live pod's tunnel (heals drops /
+        reconnects after a transient SSH failure). New pods get their tunnel from
+        the provision-time task; this keeps the existing ones alive."""
+        if not self.reverse_tunnel:
+            return
+        for mid in list(self._ssh.keys()):
+            try:
+                await self._ensure_tunnel_for(mid)
+            except Exception:  # noqa: BLE001
+                logger.exception("runpod reverse-tunnel: re-ensure failed for machine %s", mid)
+
     async def terminate(self, machine_id: str) -> None:
+        self._worker_env.pop(machine_id, None)
+        ep = self._ssh.pop(machine_id, None)
+        if ep:
+            from . import vm_tunnel
+            try:
+                await asyncio.to_thread(vm_tunnel.close, ep[0])
+            except Exception:  # noqa: BLE001
+                logger.warning("runpod reverse-tunnel: failed to close tunnel for %s", machine_id)
         pod_id = self._pod_ids.pop(machine_id, None)
         if pod_id is None:
             pod_id = await self._lookup_pod_id_by_machine_id(machine_id)

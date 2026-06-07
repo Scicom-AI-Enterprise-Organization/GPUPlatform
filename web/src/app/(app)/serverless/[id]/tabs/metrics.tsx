@@ -104,6 +104,22 @@ type Summary = {
   latCountAll: number;
 };
 
+// The gateway's per-app HTTP metrics. Accept both the current `serverless_*`
+// names (labelled `route`) and the legacy `http_*` names (labelled `endpoint`)
+// so the tab works whether or not the gateway has picked up the rename — the
+// `/{app_id}/metrics` endpoint only ever contains the gateway's own request
+// metrics, so there's no collision with the vLLM workers' `http_requests_total`.
+const REQ_TOTAL_NAMES = new Set(["serverless_http_requests_total", "http_requests_total"]);
+const DUR_SUM_NAMES = new Set([
+  "serverless_http_request_duration_seconds_sum",
+  "http_request_duration_seconds_sum",
+]);
+const DUR_COUNT_NAMES = new Set([
+  "serverless_http_request_duration_seconds_count",
+  "http_request_duration_seconds_count",
+]);
+const routeOf = (labels: Record<string, string>) => labels.route ?? labels.endpoint ?? "";
+
 function summarize(samples: Sample[]): Summary {
   const rows = new Map<string, Row>();
   const get = (method: string, endpoint: string) => {
@@ -123,8 +139,8 @@ function summarize(samples: Sample[]): Summary {
   let latSumAll = 0;
   let latCountAll = 0;
   for (const s of samples) {
-    if (s.name === "serverless_http_requests_total") {
-      const r = get(s.labels.method ?? "", s.labels.route ?? "");
+    if (REQ_TOTAL_NAMES.has(s.name)) {
+      const r = get(s.labels.method ?? "", routeOf(s.labels));
       r.requests += s.value;
       total += s.value;
       const cls = (s.labels.http_status ?? "")[0];
@@ -135,12 +151,12 @@ function summarize(samples: Sample[]): Summary {
         if (cls === "4") c4 += s.value;
         else if (cls === "5") c5 += s.value;
       }
-    } else if (s.name === "serverless_http_request_duration_seconds_sum") {
-      const r = get(s.labels.method ?? "", s.labels.route ?? "");
+    } else if (DUR_SUM_NAMES.has(s.name)) {
+      const r = get(s.labels.method ?? "", routeOf(s.labels));
       r.latSum += s.value;
       latSumAll += s.value;
-    } else if (s.name === "serverless_http_request_duration_seconds_count") {
-      const r = get(s.labels.method ?? "", s.labels.route ?? "");
+    } else if (DUR_COUNT_NAMES.has(s.name)) {
+      const r = get(s.labels.method ?? "", routeOf(s.labels));
       r.latCount += s.value;
       latCountAll += s.value;
     }
@@ -237,12 +253,20 @@ export function MetricsTab({ app }: { app: AppRecord }) {
     summary && summary.latCountAll > 0 ? summary.latSumAll / summary.latCountAll : null;
   const hasHttp = summary != null && summary.rows.length > 0;
   const barData = summary
-    ? summary.rows.map((r) => ({
-        name: shortEndpoint(r.endpoint),
-        requests: r.requests,
-        errors: r.errors,
-      }))
+    ? summary.rows.map((r) => {
+        const full = `${r.method} ${shortEndpoint(r.endpoint)}`;
+        return {
+          // Display label for the left gutter; full name lives in the table below.
+          name: full.length > 26 ? `${full.slice(0, 25)}…` : full,
+          // Split the total into 2xx + errors so one stacked bar shows both.
+          success: Math.max(0, r.requests - r.errors),
+          errors: r.errors,
+          requests: r.requests,
+        };
+      })
     : [];
+  // Give each endpoint enough vertical room that bars aren't razor-thin.
+  const barChartHeight = Math.min(340, Math.max(132, barData.length * 34));
 
   return (
     <div className="space-y-5">
@@ -323,7 +347,7 @@ export function MetricsTab({ app }: { app: AppRecord }) {
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart
                     data={history}
-                    margin={{ top: 4, right: 8, left: -20, bottom: 0 }}
+                    margin={{ top: 4, right: 8, left: 0, bottom: 0 }}
                   >
                     <XAxis
                       dataKey="t"
@@ -335,7 +359,7 @@ export function MetricsTab({ app }: { app: AppRecord }) {
                       allowDecimals={false}
                       tick={{ fontSize: 10, fill: "#6b7280" }}
                       stroke="#d4d4d8"
-                      width={32}
+                      width={36}
                     />
                     <Tooltip contentStyle={TOOLTIP_STYLE} />
                     <Line
@@ -368,16 +392,17 @@ export function MetricsTab({ app }: { app: AppRecord }) {
           <div className="min-w-0 rounded-md border border-border bg-card p-3 text-foreground">
             <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
               <span className="font-medium">Requests by endpoint</span>
-              <LegendDot color={COLOR_REQ} label="requests" />
+              <LegendDot color={COLOR_REQ} label="2xx" />
               <LegendDot color={COLOR_ERR} label="errors" />
             </div>
-            <div className="h-48 w-full">
+            <div className="w-full" style={{ height: barChartHeight }}>
               {hasHttp ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart
                     data={barData}
                     layout="vertical"
-                    margin={{ top: 4, right: 16, left: 6, bottom: 0 }}
+                    margin={{ top: 4, right: 30, left: 4, bottom: 0 }}
+                    barCategoryGap="22%"
                   >
                     <XAxis
                       type="number"
@@ -386,23 +411,29 @@ export function MetricsTab({ app }: { app: AppRecord }) {
                       tick={{ fontSize: 10, fill: "#6b7280" }}
                       stroke="#d4d4d8"
                     />
-                    {/* Hidden so the bars span the full card width; the endpoint
-                        name is drawn inside the requests bar instead of a left
-                        column. */}
-                    <YAxis type="category" dataKey="name" hide />
+                    {/* Endpoint names in a readable left gutter — not white text
+                        inside the bars, which vanished when a short bar
+                        overflowed onto the card background. */}
+                    <YAxis
+                      type="category"
+                      dataKey="name"
+                      width={140}
+                      interval={0}
+                      tickLine={false}
+                      axisLine={false}
+                      tick={{ fontSize: 10, fill: "#9ca3af" }}
+                    />
                     <Tooltip
                       contentStyle={TOOLTIP_STYLE}
                       cursor={{ fill: "#000", opacity: 0.05 }}
                     />
-                    <Bar dataKey="requests" fill={COLOR_REQ} radius={[0, 3, 3, 0]}>
-                      <LabelList
-                        dataKey="name"
-                        position="insideLeft"
-                        fill="#ffffff"
-                        fontSize={11}
-                      />
+                    {/* One full-thickness bar per endpoint (2xx + errors stacked),
+                        instead of two thin grouped bars. The total count sits at
+                        the bar's end, on the card — always readable. */}
+                    <Bar dataKey="success" name="2xx" stackId="reqs" fill={COLOR_REQ} radius={[0, 0, 0, 0]} />
+                    <Bar dataKey="errors" name="errors" stackId="reqs" fill={COLOR_ERR} radius={[0, 3, 3, 0]}>
+                      <LabelList dataKey="requests" position="right" fontSize={10} fill="#9ca3af" />
                     </Bar>
-                    <Bar dataKey="errors" fill={COLOR_ERR} radius={[0, 3, 3, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
               ) : (

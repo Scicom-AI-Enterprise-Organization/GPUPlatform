@@ -53,12 +53,13 @@ function CodeBlock({ children, label }: { children: string; label?: string }) {
   );
 }
 
-type Method = "GET" | "POST" | "PATCH" | "DELETE";
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 function MethodBadge({ method, size = "sm" }: { method: Method; size?: "sm" | "xs" }) {
   const colour =
     method === "GET" ? "bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-200"
     : method === "POST" ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200"
+    : method === "PUT" ? "bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200"
     : method === "PATCH" ? "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200"
     : "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200";
   const sizing = size === "xs" ? "h-4 px-1 text-[9px]" : "h-5 px-1.5 text-[10px]";
@@ -104,11 +105,12 @@ const GROUPS: Group[] = [
   { id: "serverless", title: "Serverless endpoints", blurb: <>Create and manage autoscaling vLLM endpoints. Each endpoint scales to zero when idle.</> },
   { id: "inference", title: "Inference", blurb: <>Send requests to a deployed endpoint — OpenAI-compatible, or the native sync / streaming routes.</> },
   { id: "benchmarks", title: "Benchmarks", blurb: <>Run llm-benchmaq throughput/latency sweeps on a RunPod pod or a registered VM. Logs + results land in a storage backend.</> },
-  { id: "datasets", title: "Datasets", blurb: <>Audio + transcription datasets — backed by an uploaded metadata file, an S3 metadata file, or a HuggingFace repo. Browse rows, set the audio/transcription columns (per-split for HF repos with differing schemas), and transform a zip-of-audio repo into one with a real <code>audio</code> column (pushed to HF or materialised to S3).</> },
-  { id: "autotrain", title: "Autotrain", blurb: <>Fine-tune Whisper models on your datasets — SSH-orchestrated on a RunPod pod or a registered VM. Logs stream live; checkpoints + metrics land in a storage backend.</> },
-  { id: "compute", title: "Compute pods", blurb: <>Raw RunPod pods with SSH + JupyterLab. Creation may require admin approval.</> },
-  { id: "storage", title: "Storage", blurb: <>S3 / HuggingFace backends the platform writes to (dataset files, benchmark logs, inference logs). Writes are admin-only.</> },
-  { id: "providers", title: "GPU providers", blurb: <>Registered VMs / RunPod / Prime Intellect accounts that endpoints, benchmarks, and compute can target. Writes are admin-only.</> },
+  { id: "datasets", title: "Datasets", blurb: <>Audio + transcription (+ optional speaker) datasets — from an uploaded metadata file, an S3 metadata file, a HuggingFace repo, or a live labeling project. Browse + curate rows (exclude some from training), map the audio/transcription/speaker columns (per-split for HF), <strong>extract a real <code>audio</code> column</strong> from a zip-of-audio repo (→ HF / S3), or <strong>Pack for TTS</strong> (NeuCodec-encode + multipack into a <code>tts_packed</code> dataset).</> },
+  { id: "autotrain", title: "Autotrain", blurb: <>Fine-tune <strong>Whisper (ASR)</strong> or <strong>Qwen3 + NeuCodec (TTS)</strong> on your datasets, with optional <strong>hyperparameter sweeps</strong> — SSH-orchestrated on a RunPod pod or a registered VM. Logs stream live; checkpoints + metrics land in a storage backend.</> },
+  { id: "compute", title: "Compute pods", blurb: <>Raw RunPod / Prime Intellect pods with SSH + JupyterLab. Creation may require admin approval.</> },
+  { id: "storage", title: "Storage", blurb: <>S3 / HuggingFace backends the platform writes to (dataset files, benchmark logs, inference logs, trained models). Writes are admin-only.</> },
+  { id: "providers", title: "GPU providers", blurb: <>Registered VMs / RunPod / Prime Intellect accounts that endpoints, benchmarks, autotrain, and compute can target. Writes are admin-only.</> },
+  { id: "secrets", title: "Secrets & tracking", blurb: <>Org-wide global env vars (merged into every workload) and W&amp;B / MLflow tracking credentials an autotrain run can log to. Admin only.</> },
 ];
 
 const ENDPOINTS: Endpoint[] = [
@@ -848,19 +850,25 @@ vllm:gpu_cache_usage_perc{app_id="my-endpoint",model="…"} 0.41`,
     title: "Create a training run",
     description: (
       <>
-        <p>Queues a Whisper finetune against a dataset. The gateway SSHes to the target (a RunPod pod it spawns, or a registered VM via <code>provider_id</code>), runs the trainer, streams logs, and writes checkpoints + metrics under the run&apos;s storage prefix.</p>
+        <p>Queues an <strong>ASR</strong> (Whisper) or <strong>TTS</strong> (Qwen3 + NeuCodec, <code>task_type:&quot;tts&quot;</code>) finetune against a dataset. The gateway SSHes to the target (a RunPod pod it spawns, or a registered VM via <code>provider_id</code>), runs the trainer, streams logs, and writes checkpoints + metrics under the run&apos;s storage prefix.</p>
+        <p className="mt-2"><strong>Hyperparameter sweep:</strong> pass a <code>sweep</code> grid (<code>{`{param: [values]}`}</code>) and the gateway runs the cross-product of trials in a GPU-pinned pool on one box — concurrency is <code>#gpus / gpus_per_trial</code>. Empty <code>sweep</code> (the default) = a single run. See the second example below.</p>
         <p className="mt-2 text-xs text-muted-foreground">All hyperparameters are optional — the trainer has sensible defaults. Experiment-tracking creds (W&amp;B / MLflow) come from the global Secrets page, not the body.</p>
       </>
     ),
     parameters: [
       { name: "name", in: "body", type: "string", required: true, doc: "Run label (also the W&B/MLflow run name)." },
       { name: "dataset_id", in: "body", type: "string", required: true, doc: "Dataset to train on (must be yours, or admin)." },
-      { name: "base_model", in: "body", type: "string", required: true, doc: 'HF Whisper repo, e.g. "openai/whisper-small".' },
+      { name: "base_model", in: "body", type: "string", required: true, doc: 'HF model repo — a Whisper repo for ASR (e.g. "openai/whisper-small"), or a Qwen3 base for TTS.' },
+      { name: "task_type", in: "body", type: '"asr" | "tts"', doc: "Default asr (Whisper). tts = Qwen3 + NeuCodec on a tts_packed dataset." },
       { name: "test_dataset_id", in: "body", type: "string", doc: "Held-out eval dataset. Omit to split from train (eval_split_pct)." },
-      { name: "eval_metric", in: "body", type: '"wer" | "cer"', doc: "Default wer." },
+      { name: "sweep", in: "body", type: "{ [param]: value[] }", doc: 'Hyperparameter grid → cross-product of trials, run in a GPU-pinned pool on one box. e.g. {"learning_rate":[1e-4,1e-5],"precision":["fp32-bf16","bf16-bf16"]}. Empty = single run. Ranked by eval_metric (ASR) / loss (TTS).' },
+      { name: "gpus_per_trial", in: "body", type: "number", doc: "GPUs each sweep trial pins. Concurrency = #gpus / gpus_per_trial. Default 1." },
+      { name: "eval_metric", in: "body", type: '"wer" | "cer"', doc: "ASR only; also the sweep ranking metric. Default wer." },
       { name: "max_epochs / patience", in: "body", type: "number", doc: "Epoch cap; patience=0 disables early stop." },
       { name: "batch_size / grad_accum / learning_rate / warmup_steps / weight_decay", in: "body", type: "number", doc: "Optimizer knobs. Defaults: 8 / 1 / 1e-5 / 0 / 0." },
-      { name: "precision", in: "body", type: '"fp16" | "bf16"', doc: "Default fp16." },
+      { name: "precision", in: "body", type: "string", doc: 'Weight-load + autocast dtype, "<load>-<amp>". Default fp32-bf16; also bf16-bf16, fp16-fp16.' },
+      { name: "augment_techniques / augment_prob", in: "body", type: "string[] / number", doc: "ASR training-audio augmentation (telephone/noise/dropout/gain/pitch/speed/reverb/bandpass) at a probability. Default [] / 0.5." },
+      { name: "use_lora / lora_r / lora_alpha", in: "body", type: "mixed", doc: "Train LoRA adapters (merged into the base at save). Default off / 16 / 32." },
       { name: "language / task", in: "body", type: "string", doc: 'e.g. "ms" / "transcribe".' },
       { name: "provider_id", in: "body", type: "string", doc: "vm provider → bare metal; omit (or a runpod provider) → cloud pod." },
       { name: "gpu_type / gpu_count / secure_cloud / disk_gb / volume_gb", in: "body", type: "mixed", doc: "Cloud-pod hardware. Defaults: L40S / 1 / true / 60 / 80." },
@@ -870,14 +878,30 @@ vllm:gpu_cache_usage_perc{app_id="my-endpoint",model="…"} 0.41`,
       { name: "report_to", in: "body", type: '("mlflow" | "wandb")[]', doc: "Experiment trackers to log to. Default none." },
     ],
     request: {
-      sample: `curl -s -X POST "$SGPU/v1/training-runs" \\
+      sample: `# Single run
+curl -s -X POST "$SGPU/v1/training-runs" \\
   -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
   -d '{
     "name": "whisper-ms-v1",
     "dataset_id": "ds-1a2b3c4d",
     "base_model": "openai/whisper-small",
-    "language": "ms", "max_epochs": 3, "precision": "bf16",
+    "language": "ms", "max_epochs": 3, "precision": "fp32-bf16",
     "gpu_type": "NVIDIA L40S", "gpu_count": 1,
+    "storage_id": "store-1a2b3c4d"
+  }'
+
+# Hyperparameter sweep — the cross-product of \`sweep\` runs as GPU-pinned trials.
+# Here 4 trials (2 learning_rate x 2 precision); on a 2-GPU VM pinned by
+# visible_devices with gpus_per_trial=1, two trials run at a time.
+curl -s -X POST "$SGPU/v1/training-runs" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "whisper-ms-sweep",
+    "dataset_id": "ds-1a2b3c4d", "test_dataset_id": "ds-eval01",
+    "base_model": "openai/whisper-small",
+    "provider_id": "prov-1a2b3c4d", "visible_devices": "0,1", "gpus_per_trial": 1,
+    "eval_metric": "wer", "max_epochs": 5,
+    "sweep": { "learning_rate": [1e-4, 1e-5], "precision": ["fp32-bf16", "bf16-bf16"] },
     "storage_id": "store-1a2b3c4d"
   }'`,
     },
@@ -1231,6 +1255,570 @@ data: end` }],
     },
     responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "prov-…", "name": "runpod-main", "kind": "runpod", "api_key_last4": "0KV9", "...": "ProviderRecord" }` }],
   },
+
+  // ───── Serverless (fleet ops) ─────
+  {
+    id: "edit-models",
+    group: "serverless",
+    method: "PATCH",
+    path: "/apps/:id/models",
+    title: "Edit a multi-model fleet",
+    description: <>Replace the member list of a <code>mode:&quot;multi&quot;</code> endpoint in place (add / remove / re-TP / re-pin). Re-provisions and re-ships the worker-agent.</>,
+    parameters: [
+      { name: "models", in: "body", type: "Array<{model,tp,pp,extra_args,task,gpu_indices}>", required: true, doc: "The full new member list. task:\"transcription\" tags a Whisper/ASR member." },
+      { name: "visible_devices", in: "body", type: "string", doc: 'Re-pin the VM GPU pool, e.g. "0,1,2,3".' },
+      { name: "sleep_level", in: "body", type: "1 | 2", doc: "vLLM sleep level for idle eviction (1=offload to RAM, 2=discard)." },
+    ],
+    request: {
+      sample: `curl -s -X PATCH "$SGPU/apps/my-fleet/models" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "models": [
+      {"model": "Qwen/Qwen3-8B", "tp": 1},
+      {"model": "openai/whisper-large-v3", "tp": 1, "task": "transcription"}
+    ],
+    "visible_devices": "0,1"
+  }'`,
+    },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "app_id": "my-fleet", "mode": "multi", "models": [ … ] }` }],
+  },
+  {
+    id: "model-action",
+    group: "serverless",
+    method: "POST",
+    path: "/apps/:id/model-action",
+    title: "Sleep / wake / restart / kill a model",
+    description: <>Operator action on one member of a multi-model fleet (or the whole fleet). A request to an asleep model wakes it automatically — this is for manual control.</>,
+    parameters: [
+      { name: "action", in: "body", type: '"sleep" | "restart" | "kill" | "sleep_all"', required: true, doc: "sleep_all sleeps every awake member; the others target `model`." },
+      { name: "model", in: "body", type: "string", doc: "Member model name. Required for sleep / restart / kill; ignored by sleep_all." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/apps/my-fleet/model-action" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"action": "sleep", "model": "Qwen/Qwen3-8B"}'`,
+    },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true }` }],
+  },
+  {
+    id: "restart-app",
+    group: "serverless",
+    method: "POST",
+    path: "/apps/:id/restart",
+    title: "Redeploy an endpoint",
+    description: <>Drain the current workers and re-provision from the stored spec — picks up edited vLLM args / env / model list.</>,
+    request: { sample: `curl -s -X POST "$SGPU/apps/my-endpoint/restart" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "app_id": "my-endpoint" }` }],
+  },
+  {
+    id: "model-logs",
+    group: "serverless",
+    method: "GET",
+    path: "/apps/:id/models/logs",
+    title: "Per-model vLLM logs (fleet)",
+    description: <>The captured stdout of each member&apos;s vLLM process, plus the <code>__worker__</code> scheduler log (wave-loading, sleep/wake, dead reasons).</>,
+    parameters: [{ name: "model", in: "query", type: "string", doc: "Filter to one member's log. Omit for all + the scheduler." }],
+    request: { sample: `curl -s "$SGPU/apps/my-fleet/models/logs" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "logs": { "Qwen/Qwen3-8B": ["…"], "__worker__": ["[scheduler] waking Qwen/Qwen3-8B …"] } }` }],
+  },
+
+  // ───── Inference (more) ─────
+  {
+    id: "embeddings",
+    group: "inference",
+    method: "POST",
+    path: "/v1/embeddings",
+    title: "Embeddings (OpenAI-compatible)",
+    description: <>For an endpoint serving an embedding model. <code>model</code> is the endpoint / member name.</>,
+    request: {
+      sample: `curl -s "$SGPU/v1/embeddings" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"model": "my-embedder", "input": ["hello world"]}'`,
+    },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "object": "list", "data": [{ "index": 0, "embedding": [0.01, …] }], "model": "my-embedder" }` }],
+  },
+  {
+    id: "get-result",
+    group: "inference",
+    method: "GET",
+    path: "/result/:request_id",
+    title: "Poll a native job result",
+    description: <>Fetch the result of a <code>POST /run/:app_id</code> job by its <code>request_id</code>. Poll until <code>status</code> is <code>done</code> (or <code>error</code>).</>,
+    request: { sample: `curl -s "$SGPU/result/req-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "request_id": "req-1a2b3c4d", "status": "done", "output": { … } }` }],
+  },
+
+  // ───── Benchmarks (more) ─────
+  {
+    id: "get-benchmark",
+    group: "benchmarks",
+    method: "GET",
+    path: "/benchmarks/:id",
+    title: "Get a benchmark",
+    description: <>Status, exit code, the resolved <code>config_yaml</code>, cost, and (when finished) the aggregate <code>result_json</code>.</>,
+    request: { sample: `curl -s "$SGPU/benchmarks/bench-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "bench-1a2b3c4d", "status": "done", "exit_code": 0, "result_json": { … } }` }],
+  },
+  {
+    id: "benchmark-logs",
+    group: "benchmarks",
+    method: "GET",
+    path: "/benchmarks/:id/logs",
+    title: "Benchmark log tail",
+    description: <>The last <code>tail</code> lines of the run log. A live SSE form exists at <code>/benchmarks/:id/logs/stream</code>.</>,
+    parameters: [{ name: "tail", in: "query", type: "number", doc: "Lines from the end. Default 200." }],
+    request: { sample: `curl -s "$SGPU/benchmarks/bench-1a2b3c4d/logs?tail=200" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "lines": ["[gateway] provisioning …", "…"] }` }],
+  },
+  {
+    id: "duplicate-benchmark",
+    group: "benchmarks",
+    method: "POST",
+    path: "/benchmarks/:id/duplicate",
+    title: "Duplicate a benchmark",
+    description: <>Queue a new run with this one&apos;s exact config + target.</>,
+    request: { sample: `curl -s -X POST "$SGPU/benchmarks/bench-1a2b3c4d/duplicate" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "bench-9z8y7x6w", "status": "queued" }` }],
+  },
+  {
+    id: "rename-benchmark",
+    group: "benchmarks",
+    method: "PATCH",
+    path: "/benchmarks/:id",
+    title: "Rename a benchmark",
+    description: <>Change the display name.</>,
+    parameters: [{ name: "name", in: "body", type: "string", required: true, doc: "" }],
+    request: { sample: `curl -s -X PATCH "$SGPU/benchmarks/bench-1a2b3c4d" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"name": "qwen3-h100-final"}'` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "bench-1a2b3c4d", "name": "qwen3-h100-final" }` }],
+  },
+  {
+    id: "delete-benchmark",
+    group: "benchmarks",
+    method: "DELETE",
+    path: "/benchmarks/:id",
+    title: "Delete a benchmark",
+    description: <>Removes the record + kills any running subprocess. S3 result files are kept.</>,
+    request: { sample: `curl -s -X DELETE "$SGPU/benchmarks/bench-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "id": "bench-1a2b3c4d" }` }],
+  },
+
+  // ───── Datasets (more) ─────
+  {
+    id: "upload-dataset",
+    group: "datasets",
+    method: "POST",
+    path: "/v1/datasets/:id/upload",
+    title: "Upload a metadata file",
+    description: <>For a <code>kind:&quot;upload&quot;</code> dataset — POST a CSV / JSON / JSONL metadata table (multipart <code>file</code>); it&apos;s stored under the dataset&apos;s S3 storage.</>,
+    request: { sample: `curl -s -X POST "$SGPU/v1/datasets/ds-1a2b3c4d/upload" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" \\
+  -F file=@metadata.csv` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "filename": "metadata.csv", "format": "csv", "num_rows": 12000, "columns": ["audio","transcription"] }` }],
+  },
+  {
+    id: "row-inclusion",
+    group: "datasets",
+    method: "POST",
+    path: "/v1/datasets/:id/row-inclusion",
+    title: "Include / exclude rows from training",
+    description: <>Curate the training split: exclude specific metadata-row indices (the trainers skip them), re-include them, or <code>clear</code> all exclusions.</>,
+    parameters: [
+      { name: "indices", in: "body", type: "number[]", doc: "Metadata-row indices to act on." },
+      { name: "included", in: "body", type: "boolean", doc: "false = exclude the indices; true = re-include. Default true." },
+      { name: "clear", in: "body", type: "boolean", doc: "true = re-include ALL rows (ignores indices)." },
+    ],
+    request: { sample: `curl -s -X POST "$SGPU/v1/datasets/ds-1a2b3c4d/row-inclusion" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"indices": [3, 7, 42], "included": false}'` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "excluded_count": 3 }` }],
+  },
+  {
+    id: "pack-tts",
+    group: "datasets",
+    method: "POST",
+    path: "/v1/datasets/:id/pack-tts",
+    title: "Pack for TTS (NeuCodec)",
+    description: <>NeuCodec-encode + multipack a <code>{`{audio, transcription}`}</code> dataset into a <code>tts_packed</code> ChiniDataset on a GPU (a VM <code>provider_id</code>, or a fresh RunPod pod). The gateway then creates the packed dataset. Poll <code>transform_status</code>; cancel via <code>/cancel-transform</code>.</>,
+    parameters: [
+      { name: "storage_id", in: "body", type: "string", required: true, doc: "S3 storage for the packed shards." },
+      { name: "provider_id", in: "body", type: "string", doc: "kind=vm → bare metal; a runpod account / omit → spawn a pod." },
+      { name: "sequence_length", in: "body", type: "number", doc: "Multipack block length. Default 4096." },
+      { name: "gpu_type / gpu_count / visible_devices", in: "body", type: "mixed", doc: "Cloud-pod GPU / VM GPU pin." },
+    ],
+    request: { sample: `curl -s -X POST "$SGPU/v1/datasets/ds-1a2b3c4d/pack-tts" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "storage_id": "store-1a2b3c4d",
+    "provider_id": "prov-1a2b3c4d", "visible_devices": "0",
+    "sequence_length": 4096
+  }'` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "ds-1a2b3c4d", "transform_status": "running" }` }],
+  },
+  {
+    id: "sync-dataset",
+    group: "datasets",
+    method: "POST",
+    path: "/v1/datasets/:id/sync",
+    title: "Sync metadata to HuggingFace",
+    description: <>Push an uploaded dataset&apos;s metadata to a HF repo (token from a HF storage backend / env).</>,
+    parameters: [
+      { name: "hf_repo", in: "body", type: "string", required: true, doc: "owner/name." },
+      { name: "private", in: "body", type: "boolean", doc: "Default true." },
+    ],
+    request: { sample: `curl -s -X POST "$SGPU/v1/datasets/ds-1a2b3c4d/sync" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"hf_repo": "me/my-dataset", "private": true}'` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "ds-1a2b3c4d", "hf_repo": "me/my-dataset", "hf_synced_at": "2026-06-07T…" }` }],
+  },
+
+  // ───── Autotrain (more) ─────
+  {
+    id: "training-metrics",
+    group: "autotrain",
+    method: "GET",
+    path: "/v1/training-runs/:id/metrics",
+    title: "Training metrics",
+    description: <>Everything the detail page charts: per-step loss, per-epoch eval (WER/CER/eval-loss), per-GPU telemetry samples, per-trial sweep results, the best checkpoint, and the artifact. Persisted, so it works on finished runs too.</>,
+    request: { sample: `curl -s "$SGPU/v1/training-runs/train-1a2b3c4d/metrics" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{
+  "steps": [{ "step": 10, "loss": 1.84, "trial": 0 }, …],
+  "epochs": [{ "epoch": 1, "wer": 18.2, "cer": 6.1, "eval_loss": 0.72 }, …],
+  "trials": [{ "trial": 0, "params": { "learning_rate": 1e-4 }, "metric": 17.4, "status": "done" }, …],
+  "best": { "epoch": 4, "wer": 16.9 }, "gpu_samples": [ … ],
+  "tts_eval": { "cer": 0.041, "mos": 4.1, "similarity": 0.88 }
+}` }],
+  },
+  {
+    id: "restart-training",
+    group: "autotrain",
+    method: "POST",
+    path: "/v1/training-runs/:id/restart",
+    title: "Duplicate & run a training run",
+    description: <>Launch a fresh run with this run&apos;s exact config (same dataset, model, GPUs, sweep, hyperparameters). The original is untouched.</>,
+    request: { sample: `curl -s -X POST "$SGPU/v1/training-runs/train-1a2b3c4d/restart" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "train-9z8y7x6w", "status": "queued" }` }],
+  },
+
+  // ───── Compute (more) ─────
+  {
+    id: "list-compute",
+    group: "compute",
+    method: "GET",
+    path: "/compute",
+    title: "List pods",
+    description: <>Your pods (admins can pass <code>?scope=all</code>).</>,
+    parameters: [{ name: "scope", in: "query", type: '"mine" | "all"', doc: "Default mine (admin only for all)." }],
+    request: { sample: `curl -s "$SGPU/compute?scope=mine" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `[ { "id": "pod-1a2b3c4d", "status": "running", "gpu": "H100", "...": "…" } ]` }],
+  },
+  {
+    id: "get-compute",
+    group: "compute",
+    method: "GET",
+    path: "/compute/:id",
+    title: "Get a pod",
+    description: <>Status + cost for one pod.</>,
+    request: { sample: `curl -s "$SGPU/compute/pod-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "pod-1a2b3c4d", "status": "running", "cost_per_hr": 2.99 }` }],
+  },
+
+  // ───── Storage (more) ─────
+  {
+    id: "test-storage",
+    group: "storage",
+    method: "POST",
+    path: "/v1/storage/test",
+    title: "Test a storage config",
+    description: <>Validate connectivity for an unsaved config (the new-storage form calls this) — or pass <code>storage_id</code> to re-test a saved one. Uses the supplied creds, else the gateway env.</>,
+    request: { sample: `curl -s -X POST "$SGPU/v1/storage/test" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"kind": "s3", "bucket": "my-bucket", "region": "ap-southeast-1"}'` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "message": "listed my-bucket (read+write OK)" }` }],
+  },
+  {
+    id: "delete-storage",
+    group: "storage",
+    method: "DELETE",
+    path: "/v1/storage/:id",
+    title: "Delete a storage (admin)",
+    description: <>Removes the record + stored credentials. The remote bucket / repo is untouched.</>,
+    request: { sample: `curl -s -X DELETE "$SGPU/v1/storage/store-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "id": "store-1a2b3c4d" }` }],
+  },
+
+  // ───── Providers (more) ─────
+  {
+    id: "test-provider",
+    group: "providers",
+    method: "POST",
+    path: "/v1/providers/test",
+    title: "Test a provider",
+    description: <>Verify SSH (vm) or the API key (runpod / pi) before saving — or pass <code>provider_id</code> to re-test a saved row (also probes a VM&apos;s GPU count).</>,
+    request: { sample: `curl -s -X POST "$SGPU/v1/providers/test" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"kind": "runpod", "api": {"api_key": "rpa_…"}}'` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "message": "RunPod key valid · 14 GPU types available" }` }],
+  },
+  {
+    id: "delete-provider",
+    group: "providers",
+    method: "DELETE",
+    path: "/v1/providers/:id",
+    title: "Delete a provider (admin)",
+    description: <>Removes the account from this org. Workloads referencing it fall back to the gateway default. The remote VM is not touched.</>,
+    request: { sample: `curl -s -X DELETE "$SGPU/v1/providers/prov-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "id": "prov-1a2b3c4d" }` }],
+  },
+
+  // ───── Secrets & tracking ─────
+  {
+    id: "list-global-env",
+    group: "secrets",
+    method: "GET",
+    path: "/v1/global-env",
+    title: "List global env vars",
+    description: <>Key/value pairs merged into every workload (benchmark pods, serverless workers, training runs). Secret values are masked in the response.</>,
+    request: { sample: `curl -s "$SGPU/v1/global-env" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `[ { "key": "HF_TOKEN", "is_secret": true, "value": null, "value_preview": "hf_…XbBh" } ]` }],
+  },
+  {
+    id: "set-global-env",
+    group: "secrets",
+    method: "PUT",
+    path: "/v1/global-env/:key",
+    title: "Set a global env var (admin)",
+    description: <>Upsert a key. <code>is_secret</code> values are encrypted at rest + masked in reads. A storage / dataset can reference one by key instead of inlining the token.</>,
+    parameters: [
+      { name: "value", in: "body", type: "string", required: true, doc: "" },
+      { name: "is_secret", in: "body", type: "boolean", doc: "Default true (encrypted + masked)." },
+      { name: "description", in: "body", type: "string", doc: "Optional note." },
+    ],
+    request: { sample: `curl -s -X PUT "$SGPU/v1/global-env/HF_TOKEN" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"value": "hf_xxx", "is_secret": true}'` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "key": "HF_TOKEN", "is_secret": true, "value_preview": "hf_…xxx" }` }],
+  },
+  {
+    id: "list-tracking",
+    group: "secrets",
+    method: "GET",
+    path: "/v1/tracking-credentials",
+    title: "List tracking credentials",
+    description: <>Named W&amp;B / MLflow credentials an autotrain run can point <code>report_to</code> at. Secrets are masked.</>,
+    request: { sample: `curl -s "$SGPU/v1/tracking-credentials" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `[ { "id": "trk-1a2b3c4d", "name": "team-wandb", "kind": "wandb", "preview": "…b3c4" } ]` }],
+  },
+  {
+    id: "create-tracking",
+    group: "secrets",
+    method: "POST",
+    path: "/v1/tracking-credentials",
+    title: "Add a tracking credential (admin)",
+    description: <>Store a W&amp;B API key, or an MLflow URI (+ optional basic-auth). The runner decrypts the chosen one and injects the tracker&apos;s env at train time.</>,
+    parameters: [
+      { name: "name", in: "body", type: "string", required: true, doc: "" },
+      { name: "kind", in: "body", type: '"wandb" | "mlflow"', required: true, doc: "" },
+      { name: "api_key", in: "body", type: "string", doc: "wandb." },
+      { name: "uri / username / password", in: "body", type: "string", doc: "mlflow." },
+    ],
+    request: { sample: `curl -s -X POST "$SGPU/v1/tracking-credentials" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"name": "team-wandb", "kind": "wandb", "api_key": "…"}'` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "id": "trk-1a2b3c4d", "name": "team-wandb", "kind": "wandb", "preview": "…b3c4" }` }],
+  },
+];
+
+// End-to-end "recipes": the multi-step flows behind each product surface, the
+// way you'd actually drive them with curl. These narrate scenarios (RunPod vs
+// VM, single vs multi-model, ASR vs TTS sweep) that the per-endpoint reference
+// below can't — values map to the request models documented there.
+interface Recipe {
+  id: string;
+  title: string;
+  blurb: React.ReactNode;
+  steps: Array<{ label: string; sample: string }>;
+}
+
+const RECIPES: Recipe[] = [
+  {
+    id: "rcp-setup",
+    title: "0 · Register a provider + storage",
+    blurb: <>Everything below targets your own credentials. Register a GPU provider (where workloads run) and a storage backend (where artifacts land) once — admin only.</>,
+    steps: [
+      {
+        label: "Add a RunPod account (or a VM)",
+        sample: `# RunPod / Prime Intellect — just an API key:
+curl -s -X POST "$SGPU/v1/providers" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"name": "runpod-main", "kind": "runpod", "api": {"api_key": "rpa_…"}}'
+
+# Your own SSH box — host + PEM key (used for VM fleets, bare-metal benchmark/autotrain):
+curl -s -X POST "$SGPU/v1/providers" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"name": "lab-vm", "kind": "vm", "vm": {"host": "10.0.0.5", "port": 22, "user": "root", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\\n…"}}'`,
+      },
+      {
+        label: "Add an S3 storage",
+        sample: `curl -s -X POST "$SGPU/v1/storage" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"name": "s3-main", "kind": "s3", "bucket": "my-bucket", "region": "ap-southeast-1",
+       "access_key_id": "AKIA…", "secret_access_key": "…"}'
+# → {"id": "store-1a2b3c4d", …}   (note the prov-… and store-… ids for the steps below)`,
+      },
+    ],
+  },
+  {
+    id: "rcp-serverless-runpod",
+    title: "1 · Serverless on RunPod (single model)",
+    blurb: <>One model → one autoscaling, OpenAI-compatible endpoint on a fresh RunPod pod. Scales to zero when idle.</>,
+    steps: [
+      {
+        label: "Create the endpoint",
+        sample: `curl -s -X POST "$SGPU/apps" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "qwen",
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "gpu": "H100", "gpu_count": 1,
+    "provider_id": "prov-1a2b3c4d",
+    "autoscaler": {"max_containers": 3, "tasks_per_container": 30, "idle_timeout_s": 300}
+  }'`,
+      },
+      {
+        label: "Call it (OpenAI-compatible)",
+        sample: `curl -s "$SGPU/v1/chat/completions" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"model": "qwen", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 128}'
+
+# stream it (SSE):
+curl -sN "$SGPU/v1/chat/completions" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"model": "qwen", "messages": [{"role": "user", "content": "hi"}], "stream": true}'`,
+      },
+    ],
+  },
+  {
+    id: "rcp-serverless-fleet",
+    title: "2 · Multi-model fleet on one VM",
+    blurb: <>Several vLLM servers time-sharing a VM&apos;s GPUs via sleep/wake. Pin each to a TP slice; a request wakes the target (evicting idle ones if needed). Whisper/ASR members are tagged <code>task:&quot;transcription&quot;</code>.</>,
+    steps: [
+      {
+        label: "Create the fleet (mode: multi, VM provider)",
+        sample: `curl -s -X POST "$SGPU/apps" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "fleet", "gpu": "vm", "mode": "multi",
+    "provider_id": "prov-vm01", "visible_devices": "0,1", "sleep_level": 1,
+    "models": [
+      {"model": "Qwen/Qwen3-8B", "tp": 1},
+      {"model": "openai/whisper-large-v3", "tp": 1, "task": "transcription"}
+    ]
+  }'`,
+      },
+      {
+        label: "Discover served models, then call one",
+        sample: `curl -s "$SGPU/v1/models"                                   # every member across the fleet (no token needed)
+curl -s "$SGPU/v1/chat/completions" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"model": "Qwen/Qwen3-8B", "messages": [{"role": "user", "content": "hi"}]}'
+# transcription against the Whisper member (multipart):
+curl -s -F file=@clip.mp3 -F model=openai/whisper-large-v3 \\
+  -H "Authorization: Bearer $SGPU_API_KEY" "$SGPU/fleet/v1/audio/transcriptions"`,
+      },
+      {
+        label: "Operate it (sleep a member)",
+        sample: `curl -s -X POST "$SGPU/apps/fleet/model-action" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"action": "sleep", "model": "Qwen/Qwen3-8B"}'`,
+      },
+    ],
+  },
+  {
+    id: "rcp-datasets",
+    title: "3 · Datasets — extract audio & Pack for TTS",
+    blurb: <>An <code>hf</code>/<code>label</code> source stores audio in archives, so it only <em>extracts</em> a real audio column. An <code>s3</code>/<code>upload</code> source already has audio, so it <em>packs</em> for TTS (NeuCodec → <code>tts_packed</code>).</>,
+    steps: [
+      {
+        label: "Register an HF dataset, then extract its audio column",
+        sample: `DS=$(curl -s -X POST "$SGPU/v1/datasets" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"name": "stage1", "kind": "hf", "hf_repo": "org/asr-corpus", "storage_id": "store-1a2b3c4d"}' | jq -r .id)
+
+curl -s -X POST "$SGPU/v1/datasets/$DS/transform" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"target": "s3", "storage_id": "store-1a2b3c4d"}'   # → a new s3 dataset with a real audio column`,
+      },
+      {
+        label: "Pack an s3 dataset for TTS",
+        sample: `curl -s -X POST "$SGPU/v1/datasets/ds-audio01/pack-tts" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"storage_id": "store-1a2b3c4d", "provider_id": "prov-vm01", "visible_devices": "0", "sequence_length": 4096}'
+# → creates a tts_packed dataset (ds-packed01) once transform_status hits done.`,
+      },
+    ],
+  },
+  {
+    id: "rcp-autotrain-asr",
+    title: "4 · Autotrain — Whisper (ASR) sweep",
+    blurb: <>Fine-tune Whisper with a hyperparameter sweep on a 2-GPU VM: the cross-product of <code>sweep</code> runs as GPU-pinned trials (concurrency = <code>#gpus / gpus_per_trial</code>), ranked by <code>eval_metric</code>.</>,
+    steps: [
+      {
+        label: "Launch the sweep",
+        sample: `curl -s -X POST "$SGPU/v1/training-runs" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "whisper-sweep", "task_type": "asr",
+    "base_model": "openai/whisper-large-v3-turbo",
+    "dataset_id": "ds-train01", "test_dataset_id": "ds-eval01",
+    "provider_id": "prov-vm01", "visible_devices": "0,1", "gpus_per_trial": 1,
+    "eval_metric": "wer", "max_epochs": 5,
+    "augment_techniques": ["telephone", "noise"], "augment_prob": 0.5,
+    "sweep": {"learning_rate": [1e-4, 1e-5], "precision": ["fp32-bf16", "bf16-bf16"]},
+    "storage_id": "store-1a2b3c4d"
+  }'`,
+      },
+      {
+        label: "Watch trials + metrics",
+        sample: `curl -sN "$SGPU/v1/training-runs/train-1a2b3c4d/logs/stream" -H "Authorization: Bearer $SGPU_API_KEY"
+curl -s  "$SGPU/v1/training-runs/train-1a2b3c4d/metrics"     -H "Authorization: Bearer $SGPU_API_KEY"
+# metrics.trials = per-trial {params, metric (WER), status}; metrics.best = winning checkpoint.`,
+      },
+    ],
+  },
+  {
+    id: "rcp-autotrain-tts",
+    title: "5 · Autotrain — TTS (Qwen3 + NeuCodec)",
+    blurb: <>TTS trains on a <code>tts_packed</code> dataset (recipe 3) and is scored post-training by audio eval methods. Add a <code>sweep</code> exactly like ASR; trials are ranked by loss.</>,
+    steps: [
+      {
+        label: "Launch a TTS run with eval",
+        sample: `curl -s -X POST "$SGPU/v1/training-runs" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "tts-v1", "task_type": "tts",
+    "base_model": "Qwen/Qwen3-1.7B-Base",
+    "dataset_id": "ds-packed01",
+    "provider_id": "prov-vm01", "visible_devices": "0,1",
+    "max_epochs": 1, "eval_methods": ["cer", "mos", "similarity"], "eval_max_samples": 64,
+    "storage_id": "store-1a2b3c4d"
+  }'`,
+      },
+      {
+        label: "Read the audio eval",
+        sample: `curl -s "$SGPU/v1/training-runs/train-1a2b3c4d/metrics" -H "Authorization: Bearer $SGPU_API_KEY" | jq .tts_eval
+# → { "cer": 0.041, "mos": 4.1, "similarity": 0.88 }`,
+      },
+    ],
+  },
+  {
+    id: "rcp-benchmark",
+    title: "6 · Benchmark on a VM",
+    blurb: <>Run an <code>llm-benchmaq</code> throughput/latency sweep over SSH on a registered VM, pinned to specific GPUs (<code>visible_devices</code> → <code>CUDA_VISIBLE_DEVICES</code>; the count is the TP size). Results archive to S3.</>,
+    steps: [
+      {
+        label: "Queue the run",
+        sample: `curl -s -X POST "$SGPU/benchmarks" -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "qwen3-gpu01", "provider_id": "prov-vm01", "storage_id": "store-1a2b3c4d",
+    "visible_devices": "0,1", "cleanup_model": false,
+    "config_yaml": "remote:\\n  uv: {path: ~/.bench-venv, python_version: \\"3.11\\"}\\n  dependencies: [vllm==0.19.1, hf_transfer]\\nbenchmark:\\n- name: bt\\n  engine: vllm\\n  model: {repo_id: qwen/qwen3-8b}\\n  serve: {tensor_parallel_size: 2, port: 18017}\\n  bench:\\n  - {endpoint: /v1/completions, dataset_name: random, random_input_len: 128, random_output_len: 128, num_prompts: 50, max_concurrency: 50}\\n  results: {save_result: true}"
+  }'`,
+      },
+      {
+        label: "Stream logs, then read results",
+        sample: `curl -s "$SGPU/benchmarks/bench-1a2b3c4d/logs?tail=200" -H "Authorization: Bearer $SGPU_API_KEY"
+curl -s "$SGPU/benchmarks/bench-1a2b3c4d"                -H "Authorization: Bearer $SGPU_API_KEY" | jq .result_json`,
+      },
+    ],
+  },
 ];
 
 const ERROR_TABLE: Array<{ code: string; meaning: string }> = [
@@ -1341,6 +1929,11 @@ export function ApiDocs() {
             <a href="#auth" className="block px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-foreground/80 hover:text-foreground">
               Authentication
             </a>
+            {!query && (
+              <a href="#recipes" className="block px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-foreground/80 hover:text-foreground">
+                Recipes
+              </a>
+            )}
             {grouped.map(({ group, items }) => (
               <div key={group.id} className="space-y-px">
                 <a href={`#${group.id}`} className="block px-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-foreground/80">
@@ -1408,6 +2001,10 @@ export SGPU_API_KEY="sgpu_…"`}
           <p className="text-xs text-muted-foreground">
             Create a token at{" "}
             <Link href="/api-keys" className="underline underline-offset-2">API tokens</Link>. You can hold multiple tokens.
+            {" "}Machine-readable schema (no auth):{" "}
+            <a href="/openapi.json" target="_blank" rel="noreferrer" className="font-mono underline underline-offset-2">
+              /openapi.json
+            </a>.
           </p>
         </header>
 
@@ -1420,6 +2017,29 @@ export SGPU_API_KEY="sgpu_…"`}
             by creating a new key and revoking the old one.
           </p>
         </section>
+
+        {!query && (
+          <section id="recipes" className="space-y-5 scroll-mt-4 border-t border-border pt-5">
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight">Recipes</h2>
+              <p className="mt-0.5 text-sm text-muted-foreground">
+                End-to-end flows for the whole platform — RunPod vs VM, single vs multi-model, dataset
+                prep, ASR / TTS sweeps, and benchmarks — driven with <code>curl</code>. Set{" "}
+                <code>$SGPU</code> + <code>$SGPU_API_KEY</code> first (see above); each step&apos;s fields
+                are documented in the endpoint reference below.
+              </p>
+            </div>
+            {RECIPES.map((r) => (
+              <div key={r.id} id={r.id} className="scroll-mt-4 space-y-2.5 rounded-lg border border-border bg-muted/20 p-4">
+                <h3 className="text-base font-semibold tracking-tight">{r.title}</h3>
+                <div className="text-sm text-muted-foreground">{r.blurb}</div>
+                {r.steps.map((s, i) => (
+                  <CodeBlock key={i} label={s.label}>{s.sample}</CodeBlock>
+                ))}
+              </div>
+            ))}
+          </section>
+        )}
 
         {grouped.map(({ group, items }) => (
           <div key={group.id}>

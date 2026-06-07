@@ -32,8 +32,14 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
   const headers: Record<string, string> = {
     "Content-Type": req.headers.get("content-type") ?? "application/json",
   };
+  // Prefer an explicit Authorization header — this is how external API-key
+  // clients (an `sgpu_` token) reach the gateway in prod, where the gateway
+  // itself isn't exposed. Fall back to the httpOnly session cookie for in-app
+  // (browser) calls, which don't send an Authorization header.
+  const authHeader = req.headers.get("authorization");
   const token = req.cookies.get(TOKEN_COOKIE)?.value;
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (authHeader) headers["Authorization"] = authHeader;
+  else if (token) headers["Authorization"] = `Bearer ${token}`;
   // Forward Range so media elements can request byte ranges (audio seeking).
   const range = req.headers.get("range");
   if (range) headers["Range"] = range;

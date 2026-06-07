@@ -16,7 +16,13 @@ from . import vllm_ctl
 
 logger = logging.getLogger("worker-agent.launcher")
 
-LAUNCH_HEALTH_TIMEOUT_S = 900.0  # cold model load can be minutes
+# Cold model load can take many minutes: a large MoE (e.g. 35B-A3B) at a long
+# max-model-len re-downloads tens of GB (no persistent volume) and then spends
+# ~13 min in engine init (weight load + compile + CUDA-graph capture) before
+# /health flips to 200. 900s used to clip models that were *seconds* from ready,
+# so the scheduler killed a nearly-loaded server. Give cold starts real headroom;
+# override with VLLM_LAUNCH_HEALTH_TIMEOUT_S. (Fatal-error scan still aborts early.)
+LAUNCH_HEALTH_TIMEOUT_S = float(os.environ.get("VLLM_LAUNCH_HEALTH_TIMEOUT_S", "2400"))  # 40 min
 
 
 def log_path_for(member: MemberModel, log_dir: str) -> str:

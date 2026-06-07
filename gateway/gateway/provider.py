@@ -267,7 +267,15 @@ async def resolve_app_provider(session, app, *, redis, fallback: Optional[Provid
         from .provider_resolve import resolve_cloud_creds
         from .runpod_provider import RunPodProvider
         creds = await resolve_cloud_creds(session, pid, "runpod")
-        inst = RunPodProvider(api_key=creds.api_key)
+        # The row's auto-generated SSH keypair lets the gateway reverse-tunnel
+        # into the pod (inject pub via PUBLIC_KEY, connect with the priv) — see
+        # RunPodProvider's reverse_tunnel mode. Persistent across restarts (unlike
+        # the env-default account's ephemeral key), so prod tunnels reconnect.
+        inst = RunPodProvider(
+            api_key=creds.api_key,
+            ssh_priv_pem=creds.ssh_priv_pem,
+            ssh_pub=creds.ssh_pub,
+        )
     elif row.kind == "pi":
         from .provider_resolve import resolve_cloud_creds
         from .pi_provider import PrimeIntellectProvider
