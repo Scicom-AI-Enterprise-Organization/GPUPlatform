@@ -123,8 +123,8 @@ function summarize(samples: Sample[]): Summary {
   let latSumAll = 0;
   let latCountAll = 0;
   for (const s of samples) {
-    if (s.name === "http_requests_total") {
-      const r = get(s.labels.method ?? "", s.labels.endpoint ?? "");
+    if (s.name === "serverless_http_requests_total") {
+      const r = get(s.labels.method ?? "", s.labels.route ?? "");
       r.requests += s.value;
       total += s.value;
       const cls = (s.labels.http_status ?? "")[0];
@@ -135,12 +135,12 @@ function summarize(samples: Sample[]): Summary {
         if (cls === "4") c4 += s.value;
         else if (cls === "5") c5 += s.value;
       }
-    } else if (s.name === "http_request_duration_seconds_sum") {
-      const r = get(s.labels.method ?? "", s.labels.endpoint ?? "");
+    } else if (s.name === "serverless_http_request_duration_seconds_sum") {
+      const r = get(s.labels.method ?? "", s.labels.route ?? "");
       r.latSum += s.value;
       latSumAll += s.value;
-    } else if (s.name === "http_request_duration_seconds_count") {
-      const r = get(s.labels.method ?? "", s.labels.endpoint ?? "");
+    } else if (s.name === "serverless_http_request_duration_seconds_count") {
+      const r = get(s.labels.method ?? "", s.labels.route ?? "");
       r.latCount += s.value;
       latCountAll += s.value;
     }

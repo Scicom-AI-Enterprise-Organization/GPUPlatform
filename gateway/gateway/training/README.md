@@ -140,6 +140,38 @@ it strips a leading BOS that the decoder re-adds).
 Multi-GPU is `torchrun` (DDP): each GPU is a separate process/rank running the same
 script; only rank 0 logs and uploads.
 
+### 1.4 Evaluation — WER / CER (built into the training loop)
+
+ASR eval is **inline**: there's no separate eval script. Every epoch (or every
+`eval_steps`) the `Seq2SeqTrainer` runs the eval set with **`predict_with_generate=True`**
+— it *actually generates* transcripts (real autoregressive decoding), not just the
+teacher-forced loss — and `compute_metrics()` scores them.
+
+Two metrics (both lower = better), computed via HuggingFace `evaluate` (jiwer under
+the hood) and reported ×100:
+- **WER (Word Error Rate)** — edit distance at the **word** level.
+- **CER (Character Error Rate)** — edit distance at the **character** level (more
+  forgiving; the headline number for non-spaced languages and small models).
+
+**Text normalization matters and is on by default.** Before scoring, both prediction
+and reference go through Whisper's normalizer (`tokenizer.normalize` for English,
+`tokenizer.basic_normalize` otherwise) — lowercase, strip punctuation, spell out
+numbers, etc. Without it, WER/CER are inflated by casing/punctuation and aren't
+comparable to any published Whisper number. Opt out with `normalize_text=false` to
+score raw text. (Empty references are dropped — jiwer errors on a blank reference.)
+
+How the metric is consumed:
+- emitted per epoch as `@@METRIC {epoch, wer, cer, eval_loss, train_loss}` (the
+  AutoTrain UI plots these) and reported to W&B/MLflow if configured;
+- drives **early stopping** (`patience`) and `load_best_model_at_end` — the checkpoint
+  with the best eval metric is what gets uploaded, not the last one.
+
+```
+eval audio ─► model.generate() ─► predicted text ┐
+                                                  ├─► normalize both ─► WER, CER (×100)
+ground-truth transcript ──────────────────────────┘                    → best-checkpoint + early stop
+```
+
 ---
 
 ## 2. TTS finetuning — `tts_finetune.py` (orchestrator) + `tts/`
@@ -265,15 +297,39 @@ full-length block to kill padding waste, then use per-sample `position_ids` + va
   tokens, then `<|im_end|>`. Metrics are loss-only (W&B/MLflow via HF Trainer
   `report_to`).
 
-### 2.5 Inference & eval (`tts/tts_infer.py`, `tts/tts_eval.py`)
+### 2.5 Inference (`tts/tts_infer.py`)
 
-- **Generate:** build the prefix `<|im_start|>{speaker}: {text}<|speech_start|>` and
-  let the LLM generate tokens until `<|im_end|>`. Strip the `<|s_N|>` tokens back to
-  integers and call **`NeuCodec` decode** to get the waveform. (Generate via
-  `AutoModelForCausalLM`, not a custom `Model` wrapper.)
-- **Eval:** `tts_eval.py` computes **CER** (transcribe the synthesized audio with
-  Whisper, compare to the input text), plus **MOS** (naturalness) and speaker
-  **similarity** using the Scicom eval models.
+Build the prefix `<|im_start|>{speaker}: {text}<|speech_start|>` and let the LLM
+generate tokens until `<|im_end|>`. Strip the `<|s_N|>` tokens back to integers and
+call **`NeuCodec` decode** → waveform (written at the codec's 24 kHz output rate;
+see §2.1). Generate via `AutoModelForCausalLM` — **not** a custom `Model` wrapper
+(that bug produced silence/garbage and was one of the validated fixes).
+
+### 2.6 Evaluation — CER / MOS / similarity (`tts/tts_eval.py`)
+
+Unlike Whisper, TTS eval is a **separate script run after training** (you can't score
+"how good is the speech" with a training loss). It re-synthesizes the **test split**
+and scores the generated audio with any combination of three metrics (pick via config;
+heavy models are imported lazily so you only pay for what you select):
+
+| Metric | What it answers | How (`tts_eval.py`) |
+|--------|-----------------|---------------------|
+| **CER** | *Did it say the right words?* (intelligibility) | ASR the generated audio with **Whisper** (`AutoModelForSpeechSeq2Seq`), then `jiwer.cer` vs. the reference transcript (capped at 1.0). Lower = better. |
+| **MOS** | *Does it sound natural?* (quality) | Predicted naturalness via **UTMOSv2** (`utmosv2.create_model(pretrained=True).predict(..., num_repetitions=5)`). No reference needed; higher = better (~1–5). |
+| **similarity** | *Does it sound like the target speaker?* (voice fidelity) | **TitaNet** speaker embeddings of generated vs. **reference** audio → cosine similarity. Higher = better (0–1). |
+
+The harness, per utterance in the packed test set:
+1. take the prompt up to `<|speech_start|>`, **generate** the speech tokens, NeuCodec-decode → **generated** wav;
+2. decode the **reference** speech tokens already in the record → **reference** wav;
+3. the **reference transcript** is the text;
+4. score: generated-wav-vs-text (CER), generated-wav (MOS), generated-vs-reference-wav (similarity).
+
+Emits one `@@METRIC {json}` per method + `@@DONE`. Notes / gotchas baked into the code
+(learned the hard way — see the validated fixes):
+- the eval tokenizer **must match the one used in `pack_stage1`** (same `<|s_N|>` vocab) or the speech tokens won't line up;
+- decode/transcribe with **librosa**, not system ffmpeg (the box has no ffmpeg);
+- the Whisper ASR step reads the generated wav at **16 kHz** (its encoder rate), while NeuCodec writes it at **24 kHz** — resampling is handled in the loader;
+- scorer APIs mirror the Scicom `Multilingual-TTS` `calculate_{cer,mos,similarity}.py` verbatim, so numbers are comparable to that reference.
 
 ---
 
@@ -308,7 +364,11 @@ optional HF push target. Whisper adds `language` + `task` (`transcription`/
 
 | Term | Meaning |
 |------|---------|
-| **WER / CER** | Word / Character Error Rate — edit distance between predicted and reference text (lower is better). Whisper's eval metrics; CER is also used to score TTS output. |
+| **WER / CER** | Word / Character Error Rate — edit distance between predicted and reference text (lower is better). Whisper's eval metrics; CER also scores TTS intelligibility (ASR the synthesized audio, compare to the input text). |
+| **MOS** | Mean Opinion Score — speech naturalness/quality, ~1–5, higher better. We predict it (no human raters) with **UTMOSv2**. |
+| **UTMOSv2** | A no-reference model that predicts MOS from a waveform — the TTS naturalness metric. |
+| **TitaNet** | A speaker-embedding model; cosine similarity between the generated and reference embeddings = TTS speaker/voice similarity (higher better). |
+| **Text normalization** | Lowercasing / punctuation-stripping / number spell-out applied to both sides before WER/CER, so the score reflects content, not formatting. On by default for Whisper eval. |
 | **Log-mel spectrogram** | Audio as a frequency×time image on the perceptual mel scale, log-scaled. Whisper's encoder input (`input_features`). |
 | **NeuCodec** | Neural audio codec (`neuphonic/neucodec`) that encodes a waveform to discrete integer tokens and decodes them back. Turns audio into something an LLM can model. **Asymmetric SR: encoder in = 16 kHz, decoder out = 24 kHz** (`model.sample_rate == 24000`). |
 | **Speech token `<|s_N|>`** | A NeuCodec integer `N` rendered as a vocabulary token the LLM predicts. |

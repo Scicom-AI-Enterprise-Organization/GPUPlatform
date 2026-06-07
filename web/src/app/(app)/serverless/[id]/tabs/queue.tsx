@@ -2,10 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { ChevronDown, ChevronRight, Copy, Loader2, RefreshCw } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, Loader2, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -52,6 +53,7 @@ export function QueueTab({ app }: { app: AppRecord }) {
   const [data, setData] = useState<QueueResponse | null>(null);
   const [err, setErr] = useState<{ msg: string; hint?: string } | null>(null);
   const [loading, setLoading] = useState(false);
+  const [flushing, setFlushing] = useState(false);
   const [filter, setFilter] = useState<Bucket | "all">("all");
 
   // Clicking a request id deep-links it via ?req=<id> (shareable). Clicking the
@@ -93,6 +95,27 @@ export function QueueTab({ app }: { app: AppRecord }) {
     return () => window.clearInterval(id);
   }, [fetchQueue]);
 
+  const queued = data?.queue_length ?? 0;
+  const onFlush = useCallback(async () => {
+    if (!window.confirm(
+      `Flush ${queued} queued job${queued === 1 ? "" : "s"} on ${app.app_id}? ` +
+        `Jobs already running on a worker are not affected.`,
+    )) return;
+    setFlushing(true);
+    try {
+      const r = await gateway.flushQueue(app.app_id);
+      toast.success(
+        `Flushed ${r.flushed} queued job${r.flushed === 1 ? "" : "s"}`,
+        { duration: 3000 },
+      );
+      fetchQueue();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlushing(false);
+    }
+  }, [app.app_id, queued, fetchQueue]);
+
   const cap = app.autoscaler.max_containers * app.autoscaler.tasks_per_container;
 
   const filtered = useMemo(() => {
@@ -127,10 +150,23 @@ export function QueueTab({ app }: { app: AppRecord }) {
         <Stat label="Workers" value={data?.worker_count ?? 0} />
         <Stat label="Capacity" value={cap} />
         <div className="flex-1" />
-        <Button variant="outline" size="xs" onClick={fetchQueue} disabled={loading}>
-          {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="xs"
+            onClick={onFlush}
+            disabled={flushing || queued === 0}
+            title={queued === 0 ? "No queued jobs to flush" : `Drop ${queued} queued job(s)`}
+            className="text-destructive hover:text-destructive"
+          >
+            {flushing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+            Flush queue
+          </Button>
+          <Button variant="outline" size="xs" onClick={fetchQueue} disabled={loading}>
+            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+            Refresh
+          </Button>
+        </div>
       </div>
 
       <div className="flex gap-1 border-b border-border">

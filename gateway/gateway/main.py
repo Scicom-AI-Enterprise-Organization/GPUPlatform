@@ -1879,6 +1879,61 @@ async def restart_app_workers(
     return {"ok": True, "app_id": app_id, "drained_workers": n}
 
 
+@app.post("/apps/{app_id}/queue/flush")
+async def flush_app_queue(
+    app_id: str,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Drop every job still waiting in the queue (not yet picked up by a worker).
+    Already-running requests are left alone — we only clear the Redis list
+    `queue:{app_id}` and mark the corresponding still-queued rows as cancelled.
+    The LRANGE+DEL is transactional so a job enqueued mid-flush isn't silently
+    lost (it stays on the fresh list, recorded, for a worker to pick up)."""
+    await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    key = f"queue:{app_id}"
+    async with rdb.pipeline(transaction=True) as pipe:
+        pipe.lrange(key, 0, -1)
+        pipe.delete(key)
+        raw, _ = await pipe.execute()
+
+    request_ids: list[str] = []
+    for item in raw or []:
+        try:
+            rid = json.loads(item).get("request_id")
+        except (json.JSONDecodeError, TypeError):
+            rid = None
+        if rid:
+            request_ids.append(rid)
+
+    now = datetime.now(timezone.utc)
+    cancelled = 0
+    for rid in request_ids:
+        row = await session.get(ReqRow, rid)
+        if row is not None and row.status in ("pending", "queued"):
+            row.status = "cancelled"
+            if row.completed_at is None:
+                row.completed_at = now
+            cancelled += 1
+        # Unblock any client polling /result/<id>: surface a terminal status.
+        await rdb.set(
+            f"result:{rid}",
+            json.dumps({"status": "cancelled", "error": "flushed from queue"}),
+            ex=3600,
+        )
+    await session.commit()
+
+    logger.info("flush queue app=%s by user=%s: dropped %d, cancelled %d rows",
+                app_id, user.username, len(request_ids), cancelled)
+    await audit_module.record(
+        user, "inference.queue_flush", "app", app_id, app_id,
+        details={"flushed": len(request_ids), "cancelled": cancelled},
+    )
+    return {"ok": True, "app_id": app_id, "flushed": len(request_ids), "cancelled": cancelled}
+
+
 @app.post("/apps/{app_id}/workers/kill")
 async def kill_app_workers(
     app_id: str,

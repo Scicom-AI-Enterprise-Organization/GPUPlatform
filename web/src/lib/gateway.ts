@@ -191,6 +191,12 @@ export const gateway = {
       { method: "POST" },
       120_000, // SSHes to the box, kills processes + sweeps many pidfiles — can be slow
     ),
+  // Drop every job still waiting in the queue (running requests are untouched).
+  flushQueue: (id: string) =>
+    request<{ ok: boolean; app_id: string; flushed: number; cancelled: number }>(
+      `/apps/${encodeURIComponent(id)}/queue/flush`,
+      { method: "POST" },
+    ),
   listAppRequests: (id: string, limit = 100) =>
     request<GatewayRequestRecord[]>(
       `/apps/${encodeURIComponent(id)}/requests?limit=${limit}`,

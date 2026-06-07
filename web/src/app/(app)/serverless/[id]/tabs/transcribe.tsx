@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AudioLines, Loader2, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
@@ -183,15 +183,17 @@ export function TranscribeTab({ app }: { app: AppRecord }) {
       </Card>
 
       <Card>
-        <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
+        <CardHeader>
           <div>
             <CardTitle className="text-sm font-medium">Transcription history</CardTitle>
             <p className="text-xs text-muted-foreground">Tracked per browser. {history.length} of {MAX_HISTORY} max.</p>
           </div>
           {history.length > 0 && (
-            <Button variant="outline" size="xs" onClick={clearAll} className="text-muted-foreground hover:text-destructive">
-              <Trash2 className="h-3 w-3" /> Clear all
-            </Button>
+            <CardAction>
+              <Button variant="outline" size="xs" onClick={clearAll} className="text-muted-foreground hover:text-destructive">
+                <Trash2 className="h-3 w-3" /> Clear all
+              </Button>
+            </CardAction>
           )}
         </CardHeader>
         <CardContent className="space-y-2">

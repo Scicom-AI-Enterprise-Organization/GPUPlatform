@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { NumberField } from "@/components/ui/number-field";
 import {
@@ -799,7 +799,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
       </Card>
 
       <Card>
-        <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
+        <CardHeader>
           <div>
             <CardTitle className="text-sm font-medium">Request history</CardTitle>
             <p className="text-xs text-muted-foreground">
@@ -807,15 +807,17 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
             </p>
           </div>
           {history.length > 0 && (
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={clearAll}
-              className="text-muted-foreground hover:text-destructive"
-            >
-              <Trash2 className="h-3 w-3" />
-              Clear all
-            </Button>
+            <CardAction>
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={clearAll}
+                className="text-muted-foreground hover:text-destructive"
+              >
+                <Trash2 className="h-3 w-3" />
+                Clear all
+              </Button>
+            </CardAction>
           )}
         </CardHeader>
         <div className="flex items-center gap-2 border-y border-border bg-muted/30 px-3 py-2">
