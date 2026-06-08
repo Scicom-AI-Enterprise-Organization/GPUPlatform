@@ -49,6 +49,7 @@ from . import global_env_api as global_env_module
 from . import training_api as training_module
 from . import tracking_creds_api as tracking_creds_module
 from . import gitops_api as gitops_module
+from . import usage_api as usage_module
 
 logger = logging.getLogger("gateway")
 
@@ -532,6 +533,7 @@ app.include_router(global_env_module.router)
 app.include_router(training_module.router)
 app.include_router(tracking_creds_module.router)
 app.include_router(gitops_module.router)
+app.include_router(usage_module.router)
 
 
 @app.middleware("http")

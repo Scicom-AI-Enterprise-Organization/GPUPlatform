@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
+import { BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -37,6 +37,7 @@ const ADMIN: Item[] = [
   { label: "Roles", href: "/admin/roles", icon: Shield },
   { label: "Secrets", href: "/admin/secrets", icon: Lock },
   { label: "Audit log", href: "/admin/audit", icon: ScrollText },
+  { label: "Usage Reports", href: "/admin/usage-reports", icon: BarChart3 },
 ];
 const MANAGE: Item[] = [
   { label: "Compute approvals", href: "/admin/compute-approvals", icon: CheckSquare },
