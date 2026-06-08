@@ -591,10 +591,14 @@ async def _flush_result(run_id: str, result: dict) -> None:
 
 async def _finalize(run_id: str, status: str, exit_code: Optional[int],
                     error_text: Optional[str], result_json: Optional[dict] = None) -> None:
+    prev_status: Optional[str] = None
+    task = ""
     async with session_factory()() as s:
         row = await s.get(TrainingRun, run_id)
         if row is None or row.status in ("cancelled",):
             return
+        prev_status = row.status
+        task = row.task_type or ""
         row.status = status
         row.exit_code = exit_code
         if error_text:
@@ -603,6 +607,15 @@ async def _finalize(run_id: str, status: str, exit_code: Optional[int],
             row.result_json = result_json
         row.ended_at = datetime.now(timezone.utc)
         await s.commit()
+    # Count the terminal transition once (guards against _finalize being called
+    # twice for the same run, e.g. process-exit + janitor). This monotonic counter
+    # is what Grafana alerts on for autotrain failures — see metrics.py.
+    if status in ("done", "failed") and prev_status != status:
+        try:
+            from . import metrics
+            metrics.AUTOTRAIN_RUNS_FINISHED.labels(status=status, task=task).inc()
+        except Exception:
+            pass
 
 
 async def _finish_tts_pack(run_id: str, cfg: dict, packed: dict) -> str:

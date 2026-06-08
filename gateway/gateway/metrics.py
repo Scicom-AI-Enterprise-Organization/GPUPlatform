@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from prometheus_client import (
@@ -128,7 +129,7 @@ IGNORE_PATHS = {
     p.strip()
     for p in os.environ.get(
         "METRICS_IGNORE_PATHS",
-        "/metrics,/{app_id}/metrics,/health,/ready,/version,/",
+        "/metrics,/metrics/resources,/{app_id}/metrics,/health,/ready,/version,/",
     ).split(",")
     if p.strip()
 }
@@ -171,6 +172,210 @@ def render_app(app_id: str) -> bytes:
     reg = CollectorRegistry()
     reg.register(_AppFilter())
     return generate_latest(reg)
+
+
+# ---- Platform resource metrics (sampled from Postgres per scrape) -----------
+# Served at GET /api/metrics as a business/ops exporter — a SEPARATE registry so
+# it stays independent of the infra `/metrics` target (which is Redis + HTTP).
+# The autotrain series are the priority: alert in Grafana on a failed train via
+#   platform_autotrain_runs{status="failed"} > 0            (simple, always present)
+#   platform_autotrain_run_info{status="failed"} == 1       (per-run, labelled name/owner)
+_resource_registry = CollectorRegistry()
+
+RES_APPS = Gauge(
+    "platform_serverless_apps", "Serverless inference endpoints", registry=_resource_registry
+)
+RES_APP_INFO = Gauge(
+    "platform_serverless_app_info",
+    "One series per serverless endpoint (value 1); model/gpu/mode as labels",
+    ["app_id", "model", "gpu", "mode"],
+    registry=_resource_registry,
+)
+RES_DATASETS = Gauge(
+    "platform_datasets", "Autotrain datasets by kind", ["kind"], registry=_resource_registry
+)
+RES_DATASET_ROWS = Gauge(
+    "platform_dataset_rows", "Total rows across all datasets (sum of num_rows)", registry=_resource_registry
+)
+RES_DATASET_BYTES = Gauge(
+    "platform_dataset_bytes", "Total dataset size in bytes (sum of size_bytes)", registry=_resource_registry
+)
+RES_STORAGE = Gauge(
+    "platform_storage_backends", "Storage backends by kind", ["kind"], registry=_resource_registry
+)
+RES_PROVIDERS = Gauge(
+    "platform_gpu_providers", "GPU providers by kind", ["kind"], registry=_resource_registry
+)
+RES_COMPUTE = Gauge(
+    "platform_compute_pods", "Compute (notebook) pods by status", ["status"], registry=_resource_registry
+)
+RES_USERS = Gauge(
+    "platform_users", "Platform users by role", ["role"], registry=_resource_registry
+)
+RES_BENCH = Gauge(
+    "platform_benchmarks", "Benchmarks by status", ["status"], registry=_resource_registry
+)
+RES_RUNS = Gauge(
+    "platform_autotrain_runs", "Autotrain training runs by status and task", ["status", "task"], registry=_resource_registry
+)
+RES_RUN_INFO = Gauge(
+    "platform_autotrain_run_info",
+    "One series per autotrain run (value 1); status carried as a label for per-run alerting",
+    ["run_id", "name", "task", "status", "owner"],
+    registry=_resource_registry,
+)
+RES_RUN_RUNNING_SECONDS = Gauge(
+    "platform_autotrain_run_running_seconds",
+    "Seconds a currently-RUNNING autotrain run has been going — alert on stuck runs, "
+    "e.g. platform_autotrain_run_running_seconds > 14400 (4h)",
+    ["run_id", "name", "task", "owner"],
+    registry=_resource_registry,
+)
+RES_GITOPS = Gauge(
+    "platform_gitops_repos", "GitOps repos by last sync status", ["sync_status"], registry=_resource_registry
+)
+RES_GITOPS_RESOURCES = Gauge(
+    "platform_gitops_resources", "GitOps-managed resources by kind and status", ["kind", "status"], registry=_resource_registry
+)
+
+# Monotonic counter bumped ONCE when a training run reaches a terminal state
+# (done/failed) — incremented at the finalize transition, NOT sampled. This is
+# the alert-friendly autotrain failure signal: unlike the cumulative
+# `platform_autotrain_runs{status="failed"}` gauge (which is >0 forever once any
+# run has ever failed), this fires only on NEW failures and auto-resolves:
+#   increase(platform_autotrain_runs_finished_total{status="failed"}[10m]) > 0
+AUTOTRAIN_RUNS_FINISHED = Counter(
+    "platform_autotrain_runs_finished_total",
+    "Autotrain runs that reached a terminal state, counted once at the transition",
+    ["status", "task"],
+    registry=_resource_registry,
+)
+# Pre-create the common failure series at 0 so dashboards/alerts have a baseline
+# before the first post-restart failure (instead of evaluating to no-data).
+for _t in ("asr", "tts"):
+    AUTOTRAIN_RUNS_FINISHED.labels(status="failed", task=_t)
+
+# Always emit these statuses (0 when none) so alert expressions like
+# `platform_autotrain_runs{status="failed"} > 0` always have a series to evaluate
+# instead of going to no-data when the platform has never had a failure.
+_RUN_STATUSES = ("queued", "running", "done", "failed", "cancelled")
+_BENCH_STATUSES = ("queued", "running", "done", "failed", "cancelled")
+# Bound the per-run info cardinality to the most recent runs.
+_RUN_INFO_LIMIT = 500
+
+
+async def sample_resources(session) -> None:
+    """Sample platform resource counts + per-run autotrain state from Postgres
+    into the resource registry. Cheap COUNT/GROUP BY queries; called per scrape."""
+    from sqlalchemy import func, select
+
+    from .bench import Benchmark
+    from .compute import ComputePod
+    from .db import App, Dataset, Provider, Storage, User
+    from .training_api import TrainingRun
+    try:
+        from .db import GitopsRepo, GitopsResource
+    except Exception:  # pragma: no cover — gitops tables optional
+        GitopsRepo = GitopsResource = None
+
+    async def _count(model) -> int:
+        return int((await session.execute(select(func.count()).select_from(model))).scalar() or 0)
+
+    async def _group(gauge, col, label: str, *, default_label: str = "unknown") -> None:
+        gauge.clear()
+        for key, n in (await session.execute(select(col, func.count()).group_by(col))).all():
+            gauge.labels(**{label: key or default_label}).set(int(n))
+
+    # ---- serverless apps (count + per-app info) ----
+    RES_APPS.set(await _count(App))
+    RES_APP_INFO.clear()
+    for a in (await session.execute(select(App))).scalars().all():
+        RES_APP_INFO.labels(
+            app_id=a.app_id, model=(a.model or ""), gpu=(a.gpu or ""),
+            mode=(getattr(a, "mode", "single") or "single"),
+        ).set(1)
+
+    # ---- datasets (by kind + total rows/bytes) ----
+    await _group(RES_DATASETS, Dataset.kind, "kind")
+    RES_DATASET_ROWS.set(int((await session.execute(
+        select(func.coalesce(func.sum(Dataset.num_rows), 0))
+    )).scalar() or 0))
+    RES_DATASET_BYTES.set(int((await session.execute(
+        select(func.coalesce(func.sum(Dataset.size_bytes), 0))
+    )).scalar() or 0))
+
+    # ---- storage / providers / compute pods / users ----
+    await _group(RES_STORAGE, Storage.kind, "kind")
+    await _group(RES_PROVIDERS, Provider.kind, "kind")
+    await _group(RES_COMPUTE, ComputePod.status, "status")
+    await _group(RES_USERS, User.role, "role")
+
+    # ---- benchmarks (always emit the known statuses, 0 when none) ----
+    bench_counts = {s: 0 for s in _BENCH_STATUSES}
+    for status, n in (await session.execute(
+        select(Benchmark.status, func.count()).group_by(Benchmark.status)
+    )).all():
+        bench_counts[status or "unknown"] = int(n)
+    RES_BENCH.clear()
+    for status, n in bench_counts.items():
+        RES_BENCH.labels(status=status).set(n)
+
+    # ---- autotrain run counts by (status, task) ----
+    run_counts: dict[tuple[str, str], int] = {}
+    for status, task, n in (await session.execute(
+        select(TrainingRun.status, TrainingRun.task_type, func.count())
+        .group_by(TrainingRun.status, TrainingRun.task_type)
+    )).all():
+        run_counts[(status or "unknown", task or "")] = int(n)
+    for t in ("asr", "tts"):  # keep failed/{asr,tts} present for clean alerting
+        run_counts.setdefault(("failed", t), 0)
+    RES_RUNS.clear()
+    for (status, task), n in run_counts.items():
+        RES_RUNS.labels(status=status, task=task).set(n)
+
+    # ---- per-run info + running-duration (most recent runs) ----
+    now = datetime.now(timezone.utc)
+    rows = (await session.execute(
+        select(TrainingRun).order_by(TrainingRun.created_at.desc()).limit(_RUN_INFO_LIMIT)
+    )).scalars().all()
+    owners: dict[int, str] = {}
+    owner_ids = {r.owner_id for r in rows}
+    if owner_ids:
+        for u in (await session.execute(select(User).where(User.id.in_(owner_ids)))).scalars().all():
+            owners[u.id] = u.username
+    RES_RUN_INFO.clear()
+    RES_RUN_RUNNING_SECONDS.clear()
+    for r in rows:
+        owner = owners.get(r.owner_id, "?")
+        RES_RUN_INFO.labels(
+            run_id=r.id, name=r.name or r.id, task=r.task_type or "",
+            status=r.status or "unknown", owner=owner,
+        ).set(1)
+        if r.status == "running":
+            start = r.started_at or r.created_at
+            if start is not None:
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                RES_RUN_RUNNING_SECONDS.labels(
+                    run_id=r.id, name=r.name or r.id, task=r.task_type or "", owner=owner,
+                ).set(max(0.0, (now - start).total_seconds()))
+
+    # ---- gitops (repos by sync status + managed resources by kind/status) ----
+    if GitopsRepo is not None:
+        await _group(RES_GITOPS, GitopsRepo.last_sync_status, "sync_status", default_label="never")
+        RES_GITOPS_RESOURCES.clear()
+        for kind, status, n in (await session.execute(
+            select(GitopsResource.kind, GitopsResource.status, func.count())
+            .group_by(GitopsResource.kind, GitopsResource.status)
+        )).all():
+            RES_GITOPS_RESOURCES.labels(kind=kind or "unknown", status=status or "unknown").set(int(n))
+
+
+async def render_resources(session) -> tuple[bytes, str]:
+    """Sample Postgres resources, then serialize the resource registry. Backs
+    GET /api/metrics."""
+    await sample_resources(session)
+    return generate_latest(_resource_registry), CONTENT_TYPE_LATEST
 
 
 async def render(rdb: "redis_async.Redis") -> tuple[bytes, str]:

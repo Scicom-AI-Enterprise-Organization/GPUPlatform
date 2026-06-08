@@ -676,6 +676,21 @@ async def metrics_endpoint(request: Request):
     return Response(content=body, media_type=ctype)
 
 
+@app.get("/metrics/resources")
+async def resource_metrics_endpoint():
+    """Prometheus exporter for platform resources (serverless apps, benchmarks,
+    storage, datasets, GPU providers, GitOps) sampled from Postgres — separate
+    from the infra `/metrics` target. The web app re-exposes this at
+    `/api/metrics` for scrapers hitting the web host. Path is `/metrics/resources`
+    (not `/api/metrics`) so it can't be shadowed by the `/{app_id}/metrics` route.
+    Autotrain runs are the headline: alert on a NEW failure with
+    `increase(platform_autotrain_runs_finished_total{status="failed"}[10m]) > 0`.
+    Auth-exempt like /metrics — gate via ingress/network if needed."""
+    async with session_factory()() as session:
+        body, ctype = await metrics.render_resources(session)
+    return Response(content=body, media_type=ctype)
+
+
 # ----- auth -----
 
 @app.post("/auth/register", response_model=TokenResponse)
