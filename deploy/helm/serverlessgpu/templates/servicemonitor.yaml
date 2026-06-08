@@ -19,4 +19,11 @@ spec:
       path: /metrics
       interval: {{ .Values.metrics.serviceMonitor.interval | default "30s" }}
       scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout | default "10s" }}
+    # Platform resource inventory (platform_* gauges: apps, datasets, users,
+    # benchmarks, autotrain runs, GPU providers, compute pods, GitOps). Sampled
+    # from Postgres on each scrape and slow-moving, so scrape it less often.
+    - port: http
+      path: /metrics/resources
+      interval: {{ .Values.metrics.serviceMonitor.resourceInterval | default "60s" }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout | default "15s" }}
 {{- end }}
