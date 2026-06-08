@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import current_user
@@ -222,7 +222,18 @@ async def usage_report(
     scope = "platform" if is_admin else "owner"
     eff_owner = (owner_id if (is_admin and owner_id is not None) else None) if is_admin else user.id
 
-    stmt = select(ReqRow).where(ReqRow.created_at >= start_utc, ReqRow.created_at < end_utc)
+    # Project to small columns only and extract `model` + token counts in SQL, so
+    # we never load the (potentially multi-KB) payload/output JSON blobs into
+    # memory. A full-row load over a wide window on a busy platform OOMs the
+    # gateway (each row carries the request payload + vLLM output).
+    model_col = func.json_extract_path_text(ReqRow.payload, "model").label("model")
+    tin_col = func.json_extract_path_text(ReqRow.output, "usage", "prompt_tokens").label("tin")
+    tout_col = func.json_extract_path_text(ReqRow.output, "usage", "completion_tokens").label("tout")
+    stmt = select(
+        ReqRow.request_id, ReqRow.app_id, ReqRow.owner_id, ReqRow.endpoint,
+        ReqRow.status, ReqRow.created_at, ReqRow.completed_at,
+        model_col, tin_col, tout_col,
+    ).where(ReqRow.created_at >= start_utc, ReqRow.created_at < end_utc)
     if eff_owner is not None:
         stmt = stmt.where(ReqRow.owner_id == eff_owner)
     if app_id:
@@ -231,7 +242,7 @@ async def usage_report(
         wanted = [s.strip() for s in status.split(",") if s.strip()]
         if wanted:
             stmt = stmt.where(ReqRow.status.in_(wanted))
-    rows = list((await session.execute(stmt.order_by(ReqRow.created_at))).scalars().all())
+    rows = (await session.execute(stmt.order_by(ReqRow.created_at))).all()
 
     # Resolve apps + users for labels/model fallback.
     app_ids = {r.app_id for r in rows}
@@ -245,12 +256,20 @@ async def usage_report(
         for u in (await session.execute(select(User).where(User.id.in_(owner_ids)))).scalars().all():
             users[u.id] = u
 
-    def model_of(r: ReqRow) -> str:
-        m = r.payload.get("model") if isinstance(r.payload, dict) else None
+    def model_of(r) -> str:
+        m = r.model
         if not m:
             a = apps.get(r.app_id)
             m = (a.model if a and a.model else None) or "(unknown)"
         return str(m)
+
+    def toks_of(r) -> tuple[int, int, bool]:
+        def _i(x) -> int:
+            try:
+                return int(x) if x not in (None, "") else 0
+            except (TypeError, ValueError):
+                return 0
+        return _i(r.tin), _i(r.tout), (r.tin is not None or r.tout is not None)
 
     # Full model list (for the filter dropdown) before applying the model filter.
     models_all = sorted({model_of(r) for r in rows})
@@ -279,7 +298,7 @@ async def usage_report(
     for r in rows:
         oc = _outcome(r.status)
         m = model_of(r)
-        pin, pout, had = _tokens(r.output)
+        pin, pout, had = toks_of(r)
         toks = pin + pout
         local = r.created_at.astimezone(zone)
 
