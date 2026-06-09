@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import httpx
 import redis.asyncio as redis_async
 import uvicorn
 from dotenv import load_dotenv
@@ -49,10 +50,18 @@ from . import global_env_api as global_env_module
 from . import training_api as training_module
 from . import tracking_creds_api as tracking_creds_module
 from . import gitops_api as gitops_module
+from . import proxy_api as proxy_module
 
 logger = logging.getLogger("gateway")
 
 WORKER_TTL_S = 30
+# How long a client-disconnect cancel marker (cancel:{request_id}) lives. Must
+# outlast the time a job can sit in the queue before the worker dequeues it —
+# otherwise a 60s marker expires long before a deeply-queued request is picked
+# up and the cancel is silently lost (worker then burns GPU on a dead request).
+# Aligned with the result-key TTL (3600s); a job queued longer than that is dead
+# anyway (its result key has expired too).
+_CANCEL_TTL_S = 3600
 
 
 class AutoscalerSpec(BaseModel):
@@ -449,6 +458,21 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         logger.exception("gitops: failed to start poll loop")
+    # LLM API proxy: shared httpx client + live state + health-check loop.
+    app.state.proxy_http = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=10.0),
+        follow_redirects=True,
+    )
+    app.state.proxy_health = {}
+    app.state.proxy_live = {}
+    app.state.proxy_sems = {}
+    app.state.proxy_healthcheck_task = None
+    try:
+        app.state.proxy_healthcheck_task = asyncio.create_task(
+            proxy_module.proxy_health_loop(app)
+        )
+    except Exception:
+        logger.exception("proxy: failed to start health loop")
     if os.environ.get("AUTOSCALER", "0") == "1":
         from .provider import build_provider
         from .autoscaler import autoscaler_loop
@@ -499,7 +523,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task_attr in ("autoscaler_task", "reconciler_task", "bench_janitor_task", "gitops_task"):
+        for task_attr in ("autoscaler_task", "reconciler_task", "bench_janitor_task", "gitops_task", "proxy_healthcheck_task"):
             t = getattr(app.state, task_attr, None)
             if t:
                 t.cancel()
@@ -507,6 +531,12 @@ async def lifespan(app: FastAPI):
                     await t
                 except (asyncio.CancelledError, BaseException):
                     pass
+        proxy_http = getattr(app.state, "proxy_http", None)
+        if proxy_http is not None:
+            try:
+                await proxy_http.aclose()
+            except Exception:
+                pass
         if app.state.provider:
             await app.state.provider.shutdown()
         await app.state.redis.aclose()
@@ -532,6 +562,8 @@ app.include_router(global_env_module.router)
 app.include_router(training_module.router)
 app.include_router(tracking_creds_module.router)
 app.include_router(gitops_module.router)
+app.include_router(proxy_module.router)
+app.include_router(proxy_module.data_router)
 
 
 @app.middleware("http")
@@ -1970,7 +2002,7 @@ async def flush_app_queue(
     `queue:{app_id}` and mark the corresponding still-queued rows as cancelled.
     The LRANGE+DEL is transactional so a job enqueued mid-flush isn't silently
     lost (it stays on the fresh list, recorded, for a worker to pick up)."""
-    await _load_owned_app(session, app_id, user)
+    app = await _load_owned_app(session, app_id, user)
     rdb = request.app.state.redis
     key = f"queue:{app_id}"
     async with rdb.pipeline(transaction=True) as pipe:
@@ -2000,6 +2032,41 @@ async def flush_app_queue(
         await rdb.set(
             f"result:{rid}",
             json.dumps({"status": "cancelled", "error": "flushed from queue"}),
+            ex=3600,
+        )
+
+    # Also clear ORPHANED pending/queued rows: ones no longer in the queue and not
+    # actually being served. A worker can dequeue a job then die / be terminated
+    # before finalizing it (common after idle-delete or a failed cold start) — the
+    # row stays stuck "pending" (shown as "in queue") and the redis flush above
+    # can't reach it. Cancel such a row only when it CAN'T be in flight: no live
+    # worker for the app, or it's older than the request timeout (a real request
+    # resolves within that). Genuinely in-flight requests are left alone.
+    from datetime import timedelta
+    from sqlalchemy import select as _select
+    live_worker = False
+    for _mid in await rdb.smembers(f"worker_index:{app_id}"):
+        if await rdb.exists(f"worker:{_mid}"):
+            live_worker = True
+            break
+    timeout_s = int(getattr(app, "request_timeout_s", 600) or 600)
+    stale_before = now - timedelta(seconds=timeout_s)
+    flushed_ids = set(request_ids)
+    stuck_rows = (await session.execute(
+        _select(ReqRow).where(ReqRow.app_id == app_id, ReqRow.status.in_(("pending", "queued")))
+    )).scalars().all()
+    for row in stuck_rows:
+        if row.request_id in flushed_ids:
+            continue  # already handled via the redis-queue path above
+        if live_worker and row.created_at and row.created_at > stale_before:
+            continue  # could be genuinely in flight on a live worker — leave it
+        row.status = "cancelled"
+        if row.completed_at is None:
+            row.completed_at = now
+        cancelled += 1
+        await rdb.set(
+            f"result:{row.request_id}",
+            json.dumps({"status": "cancelled", "error": "flushed (orphaned / not being served)"}),
             ex=3600,
         )
     await session.commit()
@@ -2062,6 +2129,43 @@ async def purge_app_workers(
             raise HTTPException(status_code=502, detail={"error": "purge failed on the provider — see gateway logs"})
     logger.info("purge workers app=%s by user=%s: tracked=%d purged=%d", app_id, user.username, tracked, purged)
     return {"ok": True, "app_id": app_id, "terminated": tracked, "purged": purged}
+
+
+@app.post("/apps/{app_id}/workers/{machine_id}/terminate")
+async def terminate_app_worker(
+    app_id: str,
+    machine_id: str,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete ONE worker's container (terminate its pod) WITHOUT pausing the
+    autoscaler — unlike /workers/kill, which pauses so the fleet stays down. The
+    fleet drops toward zero, freeing the GPU / stopping billing; the next request
+    re-provisions it (scale-from-zero). For the Workers-tab per-pod Delete button."""
+    await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    from .autoscaler import emit_worker_event
+    provider = await _provider_for_app(session, app_id, user, request.app.state)
+    if provider is None:
+        raise HTTPException(status_code=400, detail={"error": "no provider configured for this endpoint"})
+    try:
+        await provider.terminate(machine_id)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("terminate worker app=%s machine=%s failed", app_id, machine_id)
+        await emit_worker_event(rdb, machine_id, app_id, "error", "terminate failed (manual delete)")
+        raise HTTPException(status_code=502, detail={"error": f"provider terminate failed: {(str(e) or repr(e))[:300]}"})
+    await rdb.delete(
+        f"worker:{machine_id}", f"worker:{machine_id}:models",
+        f"register_token:{machine_id}", f"worker_cost:{machine_id}", f"worker:{machine_id}:drain",
+    )
+    await rdb.srem(f"worker_index:{app_id}", machine_id)
+    await emit_worker_event(
+        rdb, machine_id, app_id, "info",
+        "container deleted (manual) — autoscaler will re-provision on the next request",
+    )
+    logger.info("manual terminate app=%s machine=%s by user=%s (autoscaler NOT paused)", app_id, machine_id, user.username)
+    return {"ok": True, "app_id": app_id, "machine_id": machine_id, "paused": False}
 
 
 @app.patch("/apps/{app_id}/models", response_model=AppRecord)
@@ -2341,37 +2445,48 @@ async def _admit_and_enqueue(
         workers = await rdb.smembers(f"worker_index:{app_id}")
         live = [m for m in workers if await rdb.exists(f"worker:{m}")]
         if not live:
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "no worker is up yet — the endpoint is still provisioning. Retry shortly.", "state": "provisioning"},
-            )
-        mid = live[0]
-        try:
-            wstate = json.loads(await rdb.get(f"worker:{mid}") or "{}")
-        except (json.JSONDecodeError, TypeError):
-            wstate = {}
-        try:
-            models_state = json.loads(await rdb.get(f"worker:{mid}:models") or "[]")
-        except (json.JSONDecodeError, TypeError):
-            models_state = []
-        tinfo = next((m for m in models_state if m.get("model") == target), None) if target else None
-        if tinfo and tinfo.get("state") == "dead":
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": f"model '{target}' is not running (dead) — restart it from the Workers tab.",
-                    "state": "dead", "model": target, "reason": tinfo.get("reason"),
-                },
-            )
-        if wstate.get("status") and wstate.get("status") != "ready":
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "the model fleet is still warming up — every model must finish loading and go to sleep before any can serve. Retry shortly.",
-                    "state": "warming_up",
-                    "models": [{"model": m.get("model"), "state": m.get("state")} for m in models_state],
-                },
-            )
+            # No worker up. A fleet that scales to zero (idle_timeout_s > 0) must
+            # WAKE on a request: fall through to enqueue so the autoscaler
+            # provisions from zero — the queued job keeps the booting pod alive and
+            # is served once it's ready (cancel-on-disconnect cleans up if the
+            # client gives up mid cold-start). Always-on fleets (idle=0) with no
+            # worker are mid-initial-provision → fail fast so the caller retries
+            # instead of holding this request through a multi-minute cold start.
+            idle_timeout_s = int((cfg or {}).get("idle_timeout_s", 0) or 0)
+            if idle_timeout_s <= 0:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "no worker is up yet — the endpoint is still provisioning. Retry shortly.", "state": "provisioning"},
+                )
+            logger.info("scale-from-zero: waking idle-scaled multi fleet %s (no live worker) via enqueue", app_id)
+        else:
+            mid = live[0]
+            try:
+                wstate = json.loads(await rdb.get(f"worker:{mid}") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                wstate = {}
+            try:
+                models_state = json.loads(await rdb.get(f"worker:{mid}:models") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                models_state = []
+            tinfo = next((m for m in models_state if m.get("model") == target), None) if target else None
+            if tinfo and tinfo.get("state") == "dead":
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": f"model '{target}' is not running (dead) — restart it from the Workers tab.",
+                        "state": "dead", "model": target, "reason": tinfo.get("reason"),
+                    },
+                )
+            if wstate.get("status") and wstate.get("status") != "ready":
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "the model fleet is still warming up — every model must finish loading and go to sleep before any can serve. Retry shortly.",
+                        "state": "warming_up",
+                        "models": [{"model": m.get("model"), "state": m.get("state")} for m in models_state],
+                    },
+                )
     request_id = f"req-{uuid.uuid4().hex[:12]}"
     timeout_s = int(app.request_timeout_s)
     job = {
@@ -2468,7 +2583,8 @@ async def stream(
     }
     if target_model:
         job["target_model"] = target_model
-    await rdb.lpush(f"queue:{app_id}", json.dumps(job))
+    job_blob = json.dumps(job)
+    await rdb.lpush(f"queue:{app_id}", job_blob)
     await rdb.set(f"result:{request_id}", json.dumps({"status": "pending"}), ex=3600)
     await rdb.set(f"app:{app_id}:last_request_ts", str(time.time()))
     logger.info("enqueued stream %s on %s (timeout=%ss)", request_id, app_id, timeout_s)
@@ -2491,11 +2607,7 @@ async def stream(
                     continue
         finally:
             if not finished_normally:
-                try:
-                    await rdb.set(f"cancel:{request_id}", "1", ex=60)
-                    logger.info("client disconnected from %s, signaled cancel", request_id)
-                except Exception:
-                    pass
+                await _cancel_on_disconnect(rdb, request_id, app_id, job_blob)
             await pubsub.unsubscribe(channel)
             await pubsub.aclose()
 
@@ -2590,6 +2702,47 @@ async def get_request(
     return _to_request_record(row)
 
 
+class AppWorkerRow(BaseModel):
+    machine_id: str
+    status: str                      # provisioning | loading | ready | … (from the heartbeat)
+    alive: bool                      # worker:{mid} still present (heartbeated within WORKER_TTL_S)
+    last_seen: Optional[float] = None
+
+
+@app.get("/apps/{app_id}/workers", response_model=list[AppWorkerRow])
+async def list_app_workers(
+    app_id: str,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Workers the gateway currently tracks for this app, and whether each is still
+    alive (heartbeating). The Workers tab cross-references this with the provider's
+    pod list: a pod can be `running` on RunPod while its worker never registered /
+    stopped heartbeating (the localhost-registration gotcha) — here that shows as a
+    machine_id with `alive=false` (or absent entirely)."""
+    await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    mids = await rdb.smembers(f"worker_index:{app_id}")
+    out: list[AppWorkerRow] = []
+    for mid in mids:
+        blob = await rdb.get(f"worker:{mid}")
+        if not blob:
+            out.append(AppWorkerRow(machine_id=mid, status="gone", alive=False))
+            continue
+        try:
+            w = json.loads(blob)
+        except (json.JSONDecodeError, TypeError):
+            w = {}
+        out.append(AppWorkerRow(
+            machine_id=mid,
+            status=str(w.get("status") or "unknown"),
+            alive=True,
+            last_seen=w.get("last_seen"),
+        ))
+    return out
+
+
 @app.get("/apps/{app_id}/requests", response_model=list[RequestRecord])
 async def list_app_requests(
     app_id: str,
@@ -2644,6 +2797,49 @@ async def _mirror_status_to_db(
         from datetime import datetime, timezone
         row.completed_at = datetime.now(timezone.utc)
     await session.commit()
+
+
+async def _cancel_on_disconnect(
+    rdb, request_id: str, app_id: Optional[str] = None, job_blob: Optional[str] = None
+) -> None:
+    """A streaming client disconnected before the response finished. Two jobs:
+    (1) signal the worker to stop — `cancel:{request_id}`, honored by its
+        pre-dequeue check AND mid-stream poll;
+    (2) if the request hasn't already produced a terminal result, mark it
+        cancelled NOW — Redis result + the Postgres row — so the queue UI flips to
+        `failed` immediately instead of waiting for the worker to reach it. When we
+        still hold the exact enqueued blob, also LREM it so the worker never even
+        dequeues it (the OpenAI path has no blob in scope → the worker's pre-check
+        skip-drains it cheaply instead).
+    Best-effort: never raises into the stream teardown. The Postgres write uses a
+    FRESH short-lived session — never the streamed request's, which would pin a pool
+    connection for the whole stream (see the SSE pool-exhaustion gotcha)."""
+    try:
+        await rdb.set(f"cancel:{request_id}", "1", ex=_CANCEL_TTL_S)
+    except Exception:
+        logger.warning("cancel-on-disconnect: couldn't set cancel flag for %s", request_id)
+        return
+    try:
+        blob = await rdb.get(f"result:{request_id}")
+        cur = json.loads(blob).get("status") if blob else None
+        if cur not in (None, "pending"):
+            return  # worker already wrote a terminal result — don't clobber it
+        out = {"error": "client disconnected"}
+        await rdb.set(
+            f"result:{request_id}",
+            json.dumps({"status": "cancelled", "output": out}),
+            ex=_CANCEL_TTL_S,
+        )
+        if job_blob and app_id:
+            try:
+                await rdb.lrem(f"queue:{app_id}", 0, job_blob)
+            except Exception:
+                pass
+        async with session_factory()() as s:
+            await _mirror_status_to_db(s, request_id, "cancelled", out)
+        logger.info("client disconnected from %s → cancelled (queue shows failed)", request_id)
+    except Exception:
+        logger.exception("cancel-on-disconnect: couldn't finalize %s", request_id)
 
 
 async def _resolve_model_to_app(session: AsyncSession, user: User, model_name: str) -> tuple[str, Optional[str]]:
@@ -2821,10 +3017,7 @@ async def _openai_endpoint(
             yield "data: [DONE]\n\n"
         finally:
             if not finished:
-                try:
-                    await rdb.set(f"cancel:{request_id}", "1", ex=60)
-                except Exception:
-                    pass
+                await _cancel_on_disconnect(rdb, request_id, app_id)
             await pubsub.unsubscribe(channel)
             await pubsub.aclose()
 

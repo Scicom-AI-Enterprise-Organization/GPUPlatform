@@ -12,6 +12,10 @@ export type StressConfig = {
   outputLen: number;
   numPrompts: number;
   concurrency: number;
+  // When true the target is a plain OpenAI-compatible /v1/chat/completions
+  // endpoint (e.g. the LLM proxy): send `stream:true` and omit the gateway-only
+  // `endpoint` control field. Default false = the worker-queue /stream/{app_id}.
+  openai?: boolean;
 };
 
 export type ReqResult = {
@@ -69,11 +73,12 @@ export async function oneRequest(
   let usageOut: number | null = null;
   let promptTokens = 0;
   const body: Record<string, unknown> = {
-    endpoint: "/v1/chat/completions",
     messages: [{ role: "user", content: makePrompt(cfg.inputLen) }],
     max_tokens: cfg.outputLen,
     stream_options: { include_usage: true },
   };
+  if (cfg.openai) body.stream = true;            // OpenAI endpoint needs the explicit flag
+  else body.endpoint = "/v1/chat/completions";   // worker-queue /stream control field
   if (cfg.model) body.model = cfg.model;
   try {
     const res = await fetch(streamUrl, {

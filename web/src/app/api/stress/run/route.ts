@@ -24,8 +24,11 @@ export async function POST(req: NextRequest) {
   const token = req.cookies.get(TOKEN_COOKIE)?.value;
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const appId = typeof body?.app_id === "string" ? body.app_id : "";
-  if (!appId) {
-    return new Response(JSON.stringify({ error: "app_id required" }), {
+  // `path` targets an OpenAI-compatible endpoint directly (e.g. the LLM proxy:
+  // "proxy/<name>/v1/chat/completions"); `app_id` uses the worker-queue stream.
+  const path = typeof body?.path === "string" ? body.path.replace(/^\/+/, "") : "";
+  if (!appId && !path) {
+    return new Response(JSON.stringify({ error: "app_id or path required" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
@@ -37,9 +40,10 @@ export async function POST(req: NextRequest) {
     outputLen: clamp(body?.output_len, 1, 8192, 128),
     numPrompts: clamp(body?.num_prompts, 1, 5000, 50),
     concurrency: clamp(body?.concurrency, 1, 1024, 10),
+    openai: !!path,
   };
 
-  const streamUrl = `${BASE}/stream/${encodeURIComponent(appId)}`;
+  const streamUrl = path ? `${BASE}/${path}` : `${BASE}/stream/${encodeURIComponent(appId)}`;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 

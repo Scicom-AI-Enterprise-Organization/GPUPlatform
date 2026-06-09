@@ -2,9 +2,17 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AlertTriangle, Ban, ChevronDown, ChevronRight, FileText, Loader2, Moon, RefreshCw, RotateCw, X } from "lucide-react";
+import { AlertTriangle, Ban, ChevronDown, ChevronRight, ExternalLink, FileText, Loader2, Moon, RefreshCw, RotateCw, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
 import { BurnFlame } from "@/components/burn-flame";
 import type { AppRecord } from "@/lib/types";
@@ -42,10 +50,20 @@ const POLL_MS = 10_000;
 const STORAGE_KEY = (appId: string) => `serverless-ui:workers:${appId}`;
 
 export function WorkersTab({ app }: { app: AppRecord }) {
-  // A multi-model VM endpoint has no RunPod pods — the meaningful unit is the
-  // model fleet (each member's resident/asleep state + GPUs), from the status
-  // endpoint. The RunPod pods table below only applies to cloud endpoints.
-  if (app.mode === "multi") return <MultiModelFleet app={app} />;
+  // The meaningful unit for a multi-model endpoint is the model fleet (each
+  // member's resident/asleep state + GPUs), from the status endpoint. A VM multi
+  // endpoint has no pods, so that's all. A *cloud* (RunPod) multi endpoint also
+  // runs on a real pod — show the pods table too (container link + alive status).
+  const isVm = app.gpu === "vm";
+  if (app.mode === "multi") {
+    if (isVm) return <MultiModelFleet app={app} />;
+    return (
+      <div className="space-y-4">
+        <MultiModelFleet app={app} />
+        <RunpodWorkersTab app={app} />
+      </div>
+    );
+  }
   return <RunpodWorkersTab app={app} />;
 }
 
@@ -54,6 +72,9 @@ function RunpodWorkersTab({ app }: { app: AppRecord }) {
   const [remembered, setRemembered] = useState<WorkerRow[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Gateway-side liveness keyed by machine_id: is the worker actually registered
+  // + heartbeating, vs a pod that's "running" on RunPod but never phoned home.
+  const [aliveById, setAliveById] = useState<Record<string, { alive: boolean; status: string }>>({});
 
   useEffect(() => {
     try {
@@ -74,6 +95,20 @@ function RunpodWorkersTab({ app }: { app: AppRecord }) {
       const body = (await r.json()) as ApiResponse;
       if (!r.ok) throw new Error(body?.error ?? r.statusText);
       setLive(body.workers);
+      // Best-effort: which of these machine_ids are actually registered +
+      // heartbeating to the gateway (vs a pod RunPod calls "running" that never
+      // phoned home). The pod table still renders if this fetch fails.
+      try {
+        const ar = await fetch(`/api/proxy/apps/${encodeURIComponent(app.app_id)}/workers`, { cache: "no-store" });
+        if (ar.ok) {
+          const aw = (await ar.json()) as { machine_id: string; alive: boolean; status: string }[];
+          const m: Record<string, { alive: boolean; status: string }> = {};
+          for (const w of aw) m[w.machine_id] = { alive: w.alive, status: w.status };
+          setAliveById(m);
+        }
+      } catch {
+        /* liveness is best-effort */
+      }
 
       setRemembered((prev) => {
         const map = new Map(prev.map((w) => [w.machine_id, w]));
@@ -178,21 +213,23 @@ function RunpodWorkersTab({ app }: { app: AppRecord }) {
               <th className="w-6 px-2 py-2"></th>
               <th className="px-4 py-2 font-medium">Worker ID</th>
               <th className="px-4 py-2 font-medium">Status</th>
+              <th className="px-4 py-2 font-medium">Alive</th>
               <th className="px-4 py-2 font-medium">Region</th>
               <th className="px-4 py-2 font-medium">GPU</th>
               <th className="px-4 py-2 font-medium">vCPUs</th>
               <th className="px-4 py-2 font-medium">RAM</th>
               <th className="px-4 py-2 font-medium">Cost</th>
               <th className="px-4 py-2 font-medium">Created</th>
+              <th className="px-4 py-2 font-medium text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((w) => (
-              <WorkerRow key={w.machine_id} w={w} />
+              <WorkerRow key={w.machine_id} w={w} gw={aliveById[w.machine_id]} appId={app.app_id} onAction={fetchLive} onError={setErr} />
             ))}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={9} className="px-4 py-12 text-center text-sm text-muted-foreground">
+                <td colSpan={11} className="px-4 py-12 text-center text-sm text-muted-foreground">
                   {loading ? "Loading workers from RunPod…" : "No workers — fire a request to trigger the autoscaler."}
                 </td>
               </tr>
@@ -204,8 +241,37 @@ function RunpodWorkersTab({ app }: { app: AppRecord }) {
   );
 }
 
-function WorkerRow({ w }: { w: WorkerRow }) {
+function WorkerRow({
+  w, gw, appId, onAction, onError,
+}: {
+  w: WorkerRow;
+  gw?: { alive: boolean; status: string };
+  appId: string;
+  onAction: () => void;
+  onError: (msg: string) => void;
+}) {
   const [open, setOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  async function terminate() {
+    setConfirm(false);
+    setDeleting(true);
+    try {
+      const r = await fetch(
+        `/api/proxy/apps/${encodeURIComponent(appId)}/workers/${encodeURIComponent(w.machine_id)}/terminate`,
+        { method: "POST" },
+      );
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({}));
+        throw new Error(b?.detail?.error ?? b?.error ?? r.statusText);
+      }
+      onAction();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleting(false);
+    }
+  }
   return (
     <>
       <tr className={cn("border-b border-border/60 last:border-b-0", w.status === "terminated" && "opacity-60")}>
@@ -218,7 +284,22 @@ function WorkerRow({ w }: { w: WorkerRow }) {
             {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
           </button>
         </td>
-        <td className="px-4 py-3 font-mono text-xs">{w.machine_id}</td>
+        <td className="px-4 py-3 font-mono text-xs">
+          {w.pod_id ? (
+            <a
+              href={`https://console.runpod.io/pods?id=${encodeURIComponent(w.pod_id)}`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 hover:text-foreground hover:underline"
+              title="Open this pod's container in the RunPod console"
+            >
+              {w.machine_id}
+              <ExternalLink className="h-3 w-3 opacity-60" />
+            </a>
+          ) : (
+            w.machine_id
+          )}
+        </td>
         <td className="px-4 py-3">
           <span className={cn(
             "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs",
@@ -227,6 +308,27 @@ function WorkerRow({ w }: { w: WorkerRow }) {
             <span className="h-1.5 w-1.5 rounded-full bg-current" />
             {w.status}
           </span>
+        </td>
+        <td className="px-4 py-3">
+          {w.status === "terminated" ? (
+            <span className="text-xs text-muted-foreground">—</span>
+          ) : gw?.alive ? (
+            <span className={cn(
+              "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs",
+              gw.status === "ready" ? "bg-status-active/15 text-status-active" : "bg-status-idle/15 text-status-idle",
+            )}>
+              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+              {gw.status === "ready" ? "alive" : gw.status}
+            </span>
+          ) : (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-full bg-status-down/15 px-2 py-0.5 text-xs text-status-down"
+              title="RunPod shows this pod, but its worker hasn't registered / stopped heartbeating to the gateway"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+              not registered
+            </span>
+          )}
         </td>
         <td className="px-4 py-3">
           {w.region ? (
@@ -247,14 +349,50 @@ function WorkerRow({ w }: { w: WorkerRow }) {
         <td className="px-4 py-3 text-xs text-muted-foreground">
           {w.created_at ? new Date(w.created_at).toLocaleString() : "—"}
         </td>
+        <td className="px-4 py-3 text-right">
+          {w.status !== "terminated" && (
+            <Button
+              variant="outline"
+              size="xs"
+              className="text-destructive hover:text-destructive"
+              onClick={() => setConfirm(true)}
+              disabled={deleting}
+              title="Delete this container — the fleet re-provisions on the next request"
+            >
+              {deleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+              Delete
+            </Button>
+          )}
+        </td>
       </tr>
       {open && (
         <tr className="border-b border-border/60 bg-muted/20">
-          <td colSpan={9} className="px-4 py-3">
+          <td colSpan={11} className="px-4 py-3">
             <WorkerLogs machineId={w.machine_id} />
           </td>
         </tr>
       )}
+      <Dialog open={confirm} onOpenChange={(o) => !deleting && setConfirm(o)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete container</DialogTitle>
+            <DialogDescription>
+              Delete container <code className="font-mono">{w.machine_id}</code>? The fleet drops
+              to zero — the next request re-provisions it automatically. In-flight jobs on this
+              container are interrupted.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setConfirm(false)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={terminate} disabled={deleting}>
+              {deleting && <Loader2 className="h-4 w-4 animate-spin" />}
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

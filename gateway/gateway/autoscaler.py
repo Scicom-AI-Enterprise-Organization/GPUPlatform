@@ -401,21 +401,55 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
     elif idle_timeout_s > 0 and desired < current and queue_len == 0 and idle_for >= idle_timeout_s:
         if workers:
             from . import metrics as _metrics
-            victim = workers[0]
-            try:
-                await provider.terminate(victim)
-                _metrics.TERMINATE_TOTAL.labels(provider=provider.name, ok="true").inc()
-                await emit_worker_event(
-                    rdb, victim, app_id, "info",
-                    f"terminated (idle for {int(idle_for)}s)",
+            # Don't tear down a worker that's still coming up or actively serving.
+            # A multi-model cold start can outlast idle_timeout_s while the waking
+            # request is already in flight (dequeued → queue_len==0 — but the model
+            # is still loading), so terminating on queue_len+idle alone would kill
+            # the pod mid-load and strand that request as stuck "pending". Pick an
+            # idle, READY victim; a worker whose heartbeat expired (crashed) is also
+            # fair game (cleanup). If none qualify, wait for the next tick.
+            victim = None
+            for mid in workers:
+                wblob = await rdb.get(f"worker:{mid}")
+                wst = None
+                if wblob:
+                    try:
+                        wst = json.loads(wblob).get("status")
+                    except (json.JSONDecodeError, TypeError):
+                        wst = None
+                if wst and wst != "ready":
+                    continue  # provisioning / loading — let the cold start finish
+                inflight = 0
+                mblob = await rdb.get(f"worker:{mid}:models")
+                if mblob:
+                    try:
+                        inflight = sum(int(m.get("inflight") or 0) for m in json.loads(mblob))
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        inflight = 0
+                if inflight > 0:
+                    continue  # actively serving in-flight requests
+                victim = mid
+                break
+            if victim is None:
+                logger.info(
+                    "scale-down %s: holding — worker(s) still loading or serving (idle %.0fs)",
+                    app_id, idle_for,
                 )
-            except Exception:
-                _metrics.TERMINATE_TOTAL.labels(provider=provider.name, ok="false").inc()
-                await emit_worker_event(rdb, victim, app_id, "error", "terminate failed (provider error)")
-                raise
-            await rdb.delete(f"worker:{victim}")
-            await rdb.srem(f"worker_index:{app_id}", victim)
-            logger.info("scaled down %s: -1 worker (%s, idle %.0fs)", app_id, victim, idle_for)
+            else:
+                try:
+                    await provider.terminate(victim)
+                    _metrics.TERMINATE_TOTAL.labels(provider=provider.name, ok="true").inc()
+                    await emit_worker_event(
+                        rdb, victim, app_id, "info",
+                        f"terminated (idle for {int(idle_for)}s)",
+                    )
+                except Exception:
+                    _metrics.TERMINATE_TOTAL.labels(provider=provider.name, ok="false").inc()
+                    await emit_worker_event(rdb, victim, app_id, "error", "terminate failed (provider error)")
+                    raise
+                await rdb.delete(f"worker:{victim}")
+                await rdb.srem(f"worker_index:{app_id}", victim)
+                logger.info("scaled down %s: -1 worker (%s, idle %.0fs)", app_id, victim, idle_for)
 
 
 async def _record_provision_error(rdb: "redis_async.Redis", app_id: str, msg: str) -> None:

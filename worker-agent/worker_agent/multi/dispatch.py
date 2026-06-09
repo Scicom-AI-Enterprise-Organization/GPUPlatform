@@ -68,6 +68,18 @@ async def multi_poll_loop(
 async def _handle_job(rdb, job, machine_id, sched, only_member, run_unary, run_stream, sem):
     try:
         request_id = job["request_id"]
+        # The client may have disconnected / timed out while this job waited in the
+        # queue — the gateway then sets cancel:{request_id}. Bail BEFORE the model
+        # wake + prefill so we don't burn GPU on a request nobody's waiting for.
+        # One EXISTS per job (not per token) → off the streaming hot path, so it
+        # can't affect token throughput. Mid-stream cancel (run_stream) still covers
+        # requests abandoned *after* dispatch starts.
+        if await rdb.exists(f"cancel:{request_id}"):
+            await _error_result(
+                rdb, request_id, machine_id,
+                "client cancelled before dispatch", status="cancelled",
+            )
+            return
         payload = job.get("payload", {})
         stream = bool(job.get("stream"))
         timeout_s = float(job.get("timeout_s", 600))

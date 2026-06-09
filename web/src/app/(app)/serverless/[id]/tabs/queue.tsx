@@ -6,6 +6,14 @@ import { ChevronDown, ChevronRight, Copy, Loader2, RefreshCw, Trash2 } from "luc
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -54,6 +62,7 @@ export function QueueTab({ app }: { app: AppRecord }) {
   const [err, setErr] = useState<{ msg: string; hint?: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [flushing, setFlushing] = useState(false);
+  const [confirmFlush, setConfirmFlush] = useState(false);
   const [filter, setFilter] = useState<Bucket | "all">("all");
 
   // Clicking a request id deep-links it via ?req=<id> (shareable). Clicking the
@@ -97,15 +106,12 @@ export function QueueTab({ app }: { app: AppRecord }) {
 
   const queued = data?.queue_length ?? 0;
   const onFlush = useCallback(async () => {
-    if (!window.confirm(
-      `Flush ${queued} queued job${queued === 1 ? "" : "s"} on ${app.app_id}? ` +
-        `Jobs already running on a worker are not affected.`,
-    )) return;
+    setConfirmFlush(false);
     setFlushing(true);
     try {
       const r = await gateway.flushQueue(app.app_id);
       toast.success(
-        `Flushed ${r.flushed} queued job${r.flushed === 1 ? "" : "s"}`,
+        `Cleared ${r.cancelled} queued job${r.cancelled === 1 ? "" : "s"}`,
         { duration: 3000 },
       );
       fetchQueue();
@@ -114,7 +120,7 @@ export function QueueTab({ app }: { app: AppRecord }) {
     } finally {
       setFlushing(false);
     }
-  }, [app.app_id, queued, fetchQueue]);
+  }, [app.app_id, fetchQueue]);
 
   const cap = app.autoscaler.max_containers * app.autoscaler.tasks_per_container;
 
@@ -154,7 +160,7 @@ export function QueueTab({ app }: { app: AppRecord }) {
           <Button
             variant="outline"
             size="xs"
-            onClick={onFlush}
+            onClick={() => setConfirmFlush(true)}
             disabled={flushing || queued === 0}
             title={queued === 0 ? "No queued jobs to flush" : `Drop ${queued} queued job(s)`}
             className="text-destructive hover:text-destructive"
@@ -247,6 +253,28 @@ export function QueueTab({ app }: { app: AppRecord }) {
         Source: <code className="font-mono">LRANGE queue:{app.app_id}</code> + <code className="font-mono">SCAN result:req-*</code> via <code className="font-mono">kubectl exec</code> on{" "}
         <code className="font-mono">serverlessgpu-redis-0</code>. Result blobs filtered to <code className="font-mono">output.model = {app.app_id}</code>. TTL on result keys is 1 h.
       </p>
+
+      <Dialog open={confirmFlush} onOpenChange={(o) => !flushing && setConfirmFlush(o)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Flush queue</DialogTitle>
+            <DialogDescription>
+              Flush {queued} queued job{queued === 1 ? "" : "s"} on{" "}
+              <code className="font-mono">{app.app_id}</code>? Jobs already running on a worker
+              are not affected.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setConfirmFlush(false)} disabled={flushing}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={onFlush} disabled={flushing}>
+              {flushing && <Loader2 className="h-4 w-4 animate-spin" />}
+              Flush queue
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

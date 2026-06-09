@@ -63,6 +63,13 @@ import type {
   UpdateGitopsRepoBody,
   TestGitopsRepoBody,
   TestGitopsRepoResult,
+  ProxyEndpoint,
+  ProxyUpstreamHealth,
+  ProxyRequest,
+  CreateProxyBody,
+  UpdateProxyBody,
+  TestProxyUpstreamBody,
+  TestProxyUpstreamResult,
 } from "./types";
 
 export type GpuAvailability = {
@@ -524,6 +531,32 @@ export const gateway = {
   // A manual reconcile can take a while (git fetch + create/spawn) — give it room.
   syncGitopsRepo: (id: string) =>
     request<GitopsSyncResult>(`/v1/gitops/${encodeURIComponent(id)}/sync`, { method: "POST" }, 120_000),
+
+  // ---- LLM API proxy ----
+  listProxies: () => request<ProxyEndpoint[]>("/v1/proxy"),
+  getProxy: (id: string) => request<ProxyEndpoint>(`/v1/proxy/${encodeURIComponent(id)}`),
+  createProxy: (body: CreateProxyBody) =>
+    request<ProxyEndpoint>("/v1/proxy", { method: "POST", body: JSON.stringify(body) }),
+  updateProxy: (id: string, body: UpdateProxyBody) =>
+    request<ProxyEndpoint>(`/v1/proxy/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteProxy: (id: string) =>
+    request<{ ok: boolean; id: string }>(`/v1/proxy/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  getProxyHealth: (id: string) =>
+    request<ProxyUpstreamHealth[]>(`/v1/proxy/${encodeURIComponent(id)}/health`),
+  getProxyRequests: (id: string, limit = 50) =>
+    request<ProxyRequest[]>(`/v1/proxy/${encodeURIComponent(id)}/requests?limit=${limit}`),
+  cancelProxyRequest: (id: string, reqId: string) =>
+    request<{ ok: boolean; id: string }>(
+      `/v1/proxy/${encodeURIComponent(id)}/requests/${encodeURIComponent(reqId)}/cancel`,
+      { method: "POST" },
+    ),
+  flushProxyQueue: (id: string) =>
+    request<{ ok: boolean; flushed: number }>(
+      `/v1/proxy/${encodeURIComponent(id)}/flush`,
+      { method: "POST" },
+    ),
+  testProxyUpstream: (body: TestProxyUpstreamBody) =>
+    request<TestProxyUpstreamResult>("/v1/proxy/test", { method: "POST", body: JSON.stringify(body) }),
 
   // ---- Datasets (Autotrain) ----
   listDatasets: (scope: "mine" | "all" = "mine") =>

@@ -461,6 +461,7 @@ async def init_db() -> None:
     from . import bench  # noqa: F401
     from . import compute  # noqa: F401
     from . import training_api  # noqa: F401
+    from . import proxy_api  # noqa: F401  # registers ProxyEndpoint / ProxyRequest
     _engine = create_async_engine(get_database_url(), pool_pre_ping=True)
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     async with _engine.begin() as conn:

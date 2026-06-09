@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
+import { BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -25,6 +25,7 @@ const RESOURCES: Item[] = [
   { label: "Autotrain", href: "/autotrain", icon: Sparkles },
   { label: "Compute", href: "/compute", icon: Box, section: "compute" },
   { label: "GPU Providers", href: "/providers", icon: Cloud },
+  { label: "LLM API Proxy", href: "/proxy", icon: Network },
 ];
 const ACCOUNT: Item[] = [
   { label: "API tokens", href: "/api-keys", icon: KeyRound },
@@ -91,6 +92,9 @@ export function ConsoleSidebar({
     }
     if (href === "/gitops") {
       return pathname === "/gitops" || pathname.startsWith("/gitops/");
+    }
+    if (href === "/proxy") {
+      return pathname === "/proxy" || pathname.startsWith("/proxy/");
     }
     return pathname === href;
   };

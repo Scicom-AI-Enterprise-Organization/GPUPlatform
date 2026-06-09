@@ -33,10 +33,13 @@ import { cleanVllmArgs } from "@/lib/vllm-args";
 import { restartEndpoint, updateAutoscaler } from "../../actions";
 
 export function OverviewTab({ app }: { app: AppRecord }) {
-  // A multi-model VM endpoint is one fixed, always-on node that time-shares
-  // its GPUs via vLLM sleep/wake — none of the RunPod autoscaler knobs apply,
-  // and each member model has its own vLLM args. Swap those cards out.
+  // A multi-model VM endpoint is one fixed, always-on node that time-shares its
+  // GPUs via vLLM sleep/wake — the scale/idle knobs don't apply (read-only card).
+  // A multi-model *cloud* endpoint (RunPod, gpu != "vm") still scales the pod and
+  // honours idle_timeout_s (idle → delete the pod), so it gets the editable scale
+  // card. Each member model has its own vLLM args either way.
   const isMulti = app.mode === "multi";
+  const isVm = app.gpu === "vm";
   return (
     <div className="space-y-4">
       <ProvisionErrorBanner appId={app.app_id} />
@@ -44,7 +47,7 @@ export function OverviewTab({ app }: { app: AppRecord }) {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <DetailCard app={app} />
-        {isMulti ? <VmServingCard app={app} /> : <ScaleStrategyCard app={app} />}
+        {isMulti && isVm ? <VmServingCard app={app} /> : <ScaleStrategyCard app={app} />}
       </div>
 
       {isMulti ? <MultiModelArgsCard app={app} /> : <EngineArgsCard app={app} />}

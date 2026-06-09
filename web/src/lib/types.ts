@@ -956,3 +956,95 @@ export type GitopsSyncResult = {
   unchanged: number;
   errors: string[];
 };
+
+// ---- LLM API proxy ----
+
+export type ProxyUpstream = {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key_secret?: string | null;
+  has_inline_key: boolean;
+  models: Record<string, string>; // alias -> real upstream model
+  priority: number;
+  enabled: boolean;
+};
+
+export type ProxyEndpoint = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  max_concurrency: number;
+  timeout_s: number;
+  upstreams: ProxyUpstream[];
+  inflight: number;
+  queued: number;
+  created_at: string;
+  created_by: string;
+};
+
+// Upstream spec sent on create/update. `api_key` is write-only (paste); blank on
+// edit preserves the stored key. `api_key_secret` references a Secrets key.
+export type ProxyUpstreamSpec = {
+  id?: string;
+  name: string;
+  base_url: string;
+  api_key_secret?: string | null;
+  api_key?: string | null;
+  models: Record<string, string>;
+  priority: number;
+  enabled: boolean;
+};
+
+export type CreateProxyBody = {
+  name: string;
+  max_concurrency?: number;
+  timeout_s?: number;
+  enabled?: boolean;
+  upstreams: ProxyUpstreamSpec[];
+};
+
+export type UpdateProxyBody = Partial<CreateProxyBody>;
+
+export type ProxyUpstreamHealth = {
+  upstream_id: string;
+  name: string;
+  alive: boolean | null; // null = not probed yet
+  latency_ms?: number | null;
+  checked_at?: number | null;
+  error?: string | null;
+  stale: boolean;
+};
+
+export type ProxyRequest = {
+  id: string;
+  endpoint_id: string;
+  owner?: string | null;
+  model?: string | null;
+  upstream?: string | null;
+  status: "queued" | "running" | "completed" | "cancelled" | "failed";
+  is_stream: boolean;
+  status_code?: number | null;
+  latency_ms?: number | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  error_text?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  live: boolean;
+};
+
+export type TestProxyUpstreamBody = {
+  base_url: string;
+  api_key_secret?: string | null;
+  api_key?: string | null;
+  model?: string | null; // real upstream model to chat-test; omitted = probe /models
+};
+
+export type TestProxyUpstreamResult = {
+  ok: boolean;
+  message: string;
+  latency_ms?: number | null;
+  models: string[];
+};
