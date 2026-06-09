@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gateway"
-version = "0.1.0"
+version = "0.2.1"
 description = "Serverless-GPU control-plane gateway (FastAPI + Redis)"
 requires-python = ">=3.10"
 dependencies = [
@@ -29,8 +29,9 @@ dependencies = [
     "datasets>=2.20",
     "soundfile>=0.12",
     # llm-benchmaq is the CLI we shell out to for benchmark runs. Public repo;
-    # pulls in paramiko/scp/etc.
-    "benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@75d1353",
+    # pulls in paramiko/scp/etc. Tracks @main so benchmaq fixes (e.g. hf download
+    # for huggingface_hub>=1.0 / Gemma 4) ship on the next gateway image build.
+    "benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@main",
 ]
 
 [project.scripts]

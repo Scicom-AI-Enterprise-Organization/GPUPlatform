@@ -1048,3 +1048,80 @@ export type TestProxyUpstreamResult = {
   latency_ms?: number | null;
   models: string[];
 };
+
+// ── Usage reports ───────────────────────────────────────────────────────────
+// Mirrors gateway/gateway/usage_api.py response models. 4xx/5xx are approximated
+// from request status (cancelled≈4xx; failed/error/timeout≈5xx). Tokens are
+// best-effort from the stored response `usage` block.
+export type UsageSummary = {
+  total_requests: number;
+  completed: number;
+  server_error: number;     // ~5xx
+  client_cancelled: number; // ~4xx
+  pending: number;
+  success_rate: number | null;
+  tokens_in: number;
+  tokens_out: number;
+  tokens_total: number;
+  token_coverage_pct: number | null;
+  distinct_models: number;
+  distinct_apps: number;
+  distinct_users: number;
+  avg_latency_s: number | null;
+  p95_latency_s: number | null;
+};
+export type UsageByModel = {
+  model: string; requests: number; completed: number; server_error: number;
+  client_cancelled: number; tokens_total: number; avg_latency_s: number | null;
+};
+export type UsageByApp = {
+  app_id: string; name: string; requests: number; completed: number;
+  server_error: number; success_rate: number | null; tokens_total: number;
+};
+export type UsageByUser = { owner_id: number; username: string; requests: number; tokens_total: number };
+export type UsageByEndpoint = { endpoint: string; requests: number; completed: number; server_error: number };
+export type UsageTimePoint = {
+  ts: number; label: string; total: number; by_model: Record<string, number>;
+  success: number; server_error: number; client_cancelled: number;
+};
+export type UsageDayRequest = {
+  request_id: string; app_id: string; model: string; endpoint: string; username: string;
+  status: string; outcome: string; start_time: string; end_time: string; elapsed_label: string;
+};
+export type UsageDay = {
+  date: string; day_label: string; requests: number; completed: number;
+  server_error: number; client_cancelled: number; tokens_total: number; jobs: UsageDayRequest[];
+};
+export type UsageReport = {
+  period: { from: string; to: string; from_date: string; to_date: string };
+  scope: "platform" | "owner";
+  bucket: "hour" | "day";
+  summary: UsageSummary;
+  by_model: UsageByModel[];
+  by_app: UsageByApp[];
+  by_user: UsageByUser[];
+  by_endpoint: UsageByEndpoint[];
+  time_series: UsageTimePoint[];
+  daily: UsageDay[];
+  models: string[];
+  apps: { app_id: string; name: string }[];
+  users: { owner_id: number; username: string }[];
+  note: string;
+};
+export type UsageReportParams = {
+  from?: string; to?: string; tz?: string;
+  app_id?: string; owner_id?: number; model?: string; status?: string;
+  bucket?: "auto" | "hour" | "day";
+};
+export type SpendRow = { resource_type: string; count: number; cost_usd: number; gpu_hours: number | null };
+export type SpendByUser = { owner_id: number; username: string; cost_usd: number };
+export type UsageSpend = {
+  period: { from_date: string; to_date: string };
+  scope: string;
+  by_type: SpendRow[];
+  by_user: SpendByUser[];
+  total_cost_usd: number;
+  has_cost_data: boolean;
+  note: string;
+};
+export type UsageSpendParams = { from?: string; to?: string; tz?: string; owner_id?: number };

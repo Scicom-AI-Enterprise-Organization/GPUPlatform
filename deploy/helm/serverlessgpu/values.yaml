@@ -168,6 +168,9 @@ metrics:
     enabled: true
     interval: 30s
     scrapeTimeout: 10s
+    # Separate, gentler interval for the /metrics/resources inventory exporter
+    # (platform_* gauges) — it hits Postgres on every scrape and barely moves.
+    resourceInterval: 60s
 
 # GitOps mode: when true, the chart skips rendering Secret resources for
 # postgres/redis/runpod/primeintellect/auth/web. You must provision matching

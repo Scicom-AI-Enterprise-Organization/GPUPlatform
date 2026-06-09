@@ -584,3 +584,22 @@
     animation: santa-fly 9s linear infinite !important;
   }
 }
+
+/* ── Print: strip the console chrome so Usage Reports print as a clean PDF ──
+   Screen UI is hidden via Tailwind `print:hidden`; the print-only mirror uses
+   `hidden print:block .report-document`. Here we drop the sidebar/topbar and
+   release the app-shell's fixed height/overflow so the document flows + paginates. */
+@media print {
+  aside, header { display: none !important; }
+  main { overflow: visible !important; }
+  .h-screen { height: auto !important; }
+  .overflow-hidden { overflow: visible !important; }
+  .overflow-y-auto { overflow: visible !important; }
+  .report-document {
+    padding: 0 !important;
+    max-width: 100% !important;
+  }
+  .report-document table { page-break-inside: auto; }
+  .report-document tr { page-break-inside: avoid; }
+  .report-document h2, .report-document h3 { page-break-after: avoid; }
+}

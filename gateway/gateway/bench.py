@@ -434,7 +434,7 @@ def _resolve_config(
         uv.setdefault("python_version", "3.11")
         uv.setdefault(
             "benchmaq_ref",
-            "git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@75d1353",
+            "git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@main",
         )
         # If the form rendered a vLLM pin under remote.dependencies (legacy
         # path), surface it as uv.vllm_version so the new ssh backend picks
@@ -931,7 +931,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 "installed benchmaq lacks the SSH backend (run_remote_ssh) — VM "
                 "benchmarks need the pinned ref. Reinstall: uv pip install "
                 "--reinstall-package benchmaq "
-                "'benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@75d1353'"
+                "'benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@main'"
             )
             await _push_log(redis, bench_id, f"[gateway] {msg}")
             async with session_factory()() as s:
