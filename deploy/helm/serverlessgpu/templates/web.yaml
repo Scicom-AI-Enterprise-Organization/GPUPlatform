@@ -60,6 +60,16 @@ spec:
               value: {{ $publicGw | quote }}
             - name: GATEWAY_URL_INTERNAL
               value: "http://{{ include "serverlessgpu.fullname" . }}-gateway"
+            {{- /* Surfaced (browser-side) as the "Internal" option in the
+                  Run-a-job snippet cards so in-cluster callers can hit the
+                  gateway Service directly and skip the ingress hop. Defaults
+                  to the gateway Service FQDN unless overridden. */}}
+            {{- $internalGw := .Values.web.internalGatewayUrl }}
+            {{- if not $internalGw }}
+            {{- $internalGw = printf "http://%s-gateway.%s.svc.cluster.local" (include "serverlessgpu.fullname" .) .Release.Namespace }}
+            {{- end }}
+            - name: NEXT_PUBLIC_GATEWAY_INTERNAL_URL
+              value: {{ $internalGw | quote }}
             {{- if or .Values.web.runpodApiKey .Values.externalSecrets }}
             - name: RUNPOD_API_KEY
               valueFrom:

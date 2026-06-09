@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { BaseUrlToggle, type UrlTarget } from "@/components/console/base-url-toggle";
 import type { AppRecord } from "@/lib/types";
 import { gateway, type AppStatus } from "@/lib/gateway";
 import { parseGpuIds, parsePhys, suggestPacking } from "@/lib/gpu-pin";
@@ -559,8 +560,13 @@ function formatAgo(d: Date): string {
 
 function RequestPanel({ app }: { app: AppRecord }) {
   const [reveal, setReveal] = useState(false);
+  const [urlTarget, setUrlTarget] = useState<UrlTarget>("public");
   const { token, loading: tokenLoading } = useApiToken();
-  const base = process.env.NEXT_PUBLIC_GATEWAY_URL ?? gateway.baseUrl;
+  const publicBase = process.env.NEXT_PUBLIC_GATEWAY_URL ?? gateway.baseUrl;
+  const internalBase = process.env.NEXT_PUBLIC_GATEWAY_INTERNAL_URL ?? "";
+  // "internal" swaps in the in-cluster Service URL so the copied snippet skips
+  // the public ingress hop; only offered when an internal URL is configured.
+  const base = urlTarget === "internal" && internalBase ? internalBase : publicBase;
   // The OpenAI `model` field. A multi-model endpoint rejects the endpoint name
   // (you must name a member), so default to the first member; single-mode keeps
   // using the endpoint name, which resolves back-compat.
@@ -582,19 +588,22 @@ function RequestPanel({ app }: { app: AppRecord }) {
             OpenAI-compatible. Autoscales to meet demand.
           </span>
         </div>
-        {token ? (
-          <Button variant="outline" size="xs" onClick={() => setReveal((v) => !v)}>
-            {reveal ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-            {reveal ? "Hide" : "Reveal"} key
-          </Button>
-        ) : !tokenLoading ? (
-          <Link
-            href="/login?next=/serverless"
-            className="text-xs text-primary hover:underline"
-          >
-            Sign in to use your key
-          </Link>
-        ) : null}
+        <div className="flex items-center gap-2">
+          {internalBase && <BaseUrlToggle value={urlTarget} onChange={setUrlTarget} />}
+          {token ? (
+            <Button variant="outline" size="xs" onClick={() => setReveal((v) => !v)}>
+              {reveal ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+              {reveal ? "Hide" : "Reveal"} key
+            </Button>
+          ) : !tokenLoading ? (
+            <Link
+              href="/login?next=/serverless"
+              className="text-xs text-primary hover:underline"
+            >
+              Sign in to use your key
+            </Link>
+          ) : null}
+        </div>
       </CardHeader>
       <CardContent>
         <Tabs defaultValue="curl">
@@ -640,6 +649,11 @@ function RequestPanel({ app }: { app: AppRecord }) {
             <DocsLink />
           </TabsContent>
         </Tabs>
+        {urlTarget === "internal" && (
+          <p className="mt-3 text-[11px] text-muted-foreground">
+            In-cluster URL — reachable only from pods in the same Kubernetes cluster; bypasses the public ingress.
+          </p>
+        )}
       </CardContent>
     </Card>
   );
