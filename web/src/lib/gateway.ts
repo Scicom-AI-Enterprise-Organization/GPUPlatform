@@ -70,20 +70,7 @@ import type {
   UpdateProxyBody,
   TestProxyUpstreamBody,
   TestProxyUpstreamResult,
-  UsageReport,
-  UsageReportParams,
-  UsageSpend,
-  UsageSpendParams,
 } from "./types";
-
-// Build a query string from a flat params object, dropping undefined/empty values.
-function usageQuery(params: Record<string, string | number | undefined>): string {
-  const q = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") q.set(k, String(v));
-  }
-  return q.toString();
-}
 
 export type GpuAvailability = {
   gpu: string;
@@ -701,12 +688,6 @@ export const gateway = {
       `/admin/audit-logs${qs ? `?${qs}` : ""}`,
     );
   },
-
-  // ── Usage reports (admin) ─────────────────────────────────────────────────
-  getUsageReport: (params: UsageReportParams = {}) =>
-    request<UsageReport>(`/v1/usage/report?${usageQuery(params)}`),
-  getUsageSpend: (params: UsageSpendParams = {}) =>
-    request<UsageSpend>(`/v1/usage/spend?${usageQuery(params)}`),
 };
 
 // Per-model state reported by a multi-model worker's heartbeat.
