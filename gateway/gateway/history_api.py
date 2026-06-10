@@ -29,6 +29,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -81,6 +82,40 @@ def _int(x: Any) -> Optional[int]:
         return int(x) if x not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+
+def _bench_meta(config_yaml: Optional[str]) -> dict[str, Any]:
+    """Best-effort GPU + serve topology from a benchmark's submitted config YAML.
+    The `benchmarks` table has no gpu column — the GPU (and TP/DP/EP) live in the
+    config the user submitted (`runpod.pod.*` + the first `benchmark[].serve.*`).
+    All keys are None when absent (e.g. a manual/`base_url` run names no pod)."""
+    meta: dict[str, Any] = {
+        "gpu_type": None, "gpu_count": None, "engine": None, "base_url": None,
+        "tensor_parallel_size": None, "data_parallel_size": None,
+        "expert_parallel": None, "max_model_len": None,
+    }
+    if not config_yaml:
+        return meta
+    try:
+        cfg = yaml.safe_load(config_yaml)
+    except yaml.YAMLError:
+        return meta
+    if not isinstance(cfg, dict):
+        return meta
+    runpod = cfg.get("runpod") if isinstance(cfg.get("runpod"), dict) else {}
+    pod = runpod.get("pod") if isinstance(runpod.get("pod"), dict) else {}
+    meta["gpu_type"] = pod.get("gpu_type")
+    meta["gpu_count"] = pod.get("gpu_count")
+    benches = cfg.get("benchmark")
+    first = benches[0] if isinstance(benches, list) and benches and isinstance(benches[0], dict) else {}
+    meta["engine"] = first.get("engine")
+    meta["base_url"] = first.get("base_url")
+    serve = first.get("serve") if isinstance(first.get("serve"), dict) else {}
+    meta["tensor_parallel_size"] = serve.get("tensor_parallel_size")
+    meta["data_parallel_size"] = serve.get("data_parallel_size")
+    meta["expert_parallel"] = serve.get("enable_expert_parallel")
+    meta["max_model_len"] = serve.get("max_model_len")
+    return meta
 
 
 async def _owner_filter(session: AsyncSession, user: Optional[str], owner_id: Optional[int]) -> Optional[int]:
@@ -200,6 +235,8 @@ async def history_benchmarks(
         created_at=_iso(r.created_at), started_at=_iso(r.started_at), ended_at=_iso(r.ended_at),
         duration_s=_duration_s(r.started_at or r.created_at, r.ended_at), error_text=r.error_text,
         detail={
+            **_bench_meta(r.config_yaml),       # gpu_type, gpu_count, engine, TP/DP/EP, base_url, ...
+            "visible_devices": r.visible_devices,
             "exit_code": r.exit_code, "cost_per_hr": r.cost_per_hr, "provider_id": r.provider_id,
             "storage_id": r.storage_id, "runpod_pod_id": r.runpod_pod_id, "result_json": r.result_json,
         },
