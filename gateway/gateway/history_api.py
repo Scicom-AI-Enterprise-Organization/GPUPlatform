@@ -36,7 +36,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import require_admin
-from .db import Request as ReqRow, User, get_session, get_user_by_username
+from .db import Provider, Request as ReqRow, User, get_session, get_user_by_username
 
 router = APIRouter(prefix="/v1/history", tags=["history"])
 
@@ -229,18 +229,40 @@ async def history_benchmarks(
         session, Benchmark, since=s_dt, until=u_dt, status=status, owner=owner,
         limit=limit, offset=offset, order=order)
     umap = await _user_map(session, [r.owner_id for r in rows])
-    jobs = [JobRecord(
-        kind="benchmark", id=r.id, name=r.name, owner_id=r.owner_id,
-        user=_username(umap, r.owner_id), status=r.status,
-        created_at=_iso(r.created_at), started_at=_iso(r.started_at), ended_at=_iso(r.ended_at),
-        duration_s=_duration_s(r.started_at or r.created_at, r.ended_at), error_text=r.error_text,
-        detail={
-            **_bench_meta(r.config_yaml),       # gpu_type, gpu_count, engine, TP/DP/EP, base_url, ...
-            "visible_devices": r.visible_devices,
-            "exit_code": r.exit_code, "cost_per_hr": r.cost_per_hr, "provider_id": r.provider_id,
-            "storage_id": r.storage_id, "runpod_pod_id": r.runpod_pod_id, "result_json": r.result_json,
-        },
-    ) for r in rows]
+    # VM benchmarks keep their GPU on the registered provider (set by its last
+    # Test / nvidia-smi), NOT in config_yaml — resolve providers for this page so
+    # VM runs report a gpu_type too, not just the RunPod path.
+    prov_ids = {r.provider_id for r in rows if r.provider_id}
+    provmap: dict[str, Provider] = {}
+    if prov_ids:
+        for p in (await session.execute(select(Provider).where(Provider.id.in_(prov_ids)))).scalars().all():
+            provmap[p.id] = p
+
+    jobs = []
+    for r in rows:
+        meta = _bench_meta(r.config_yaml)       # gpu_type, gpu_count, engine, TP/DP/EP, base_url, ...
+        prov = provmap.get(r.provider_id) if r.provider_id else None
+        if prov is not None and prov.kind == "vm":
+            gpus = (prov.config or {}).get("gpus") or []
+            if not meta["gpu_type"] and gpus:
+                meta["gpu_type"] = gpus[0]
+            if meta["gpu_count"] is None:
+                meta["gpu_count"] = (prov.config or {}).get("gpu_count") or (len(gpus) or None)
+        # backend the run executed on: vm | runpod | pi | external (base_url) | runpod (platform default)
+        backend = prov.kind if prov is not None else ("external" if meta["base_url"] else "runpod")
+        jobs.append(JobRecord(
+            kind="benchmark", id=r.id, name=r.name, owner_id=r.owner_id,
+            user=_username(umap, r.owner_id), status=r.status,
+            created_at=_iso(r.created_at), started_at=_iso(r.started_at), ended_at=_iso(r.ended_at),
+            duration_s=_duration_s(r.started_at or r.created_at, r.ended_at), error_text=r.error_text,
+            detail={
+                **meta,
+                "backend": backend,
+                "visible_devices": r.visible_devices,
+                "exit_code": r.exit_code, "cost_per_hr": r.cost_per_hr, "provider_id": r.provider_id,
+                "storage_id": r.storage_id, "runpod_pod_id": r.runpod_pod_id, "result_json": r.result_json,
+            },
+        ))
     return HistoryResponse(
         kind="benchmark", count=len(jobs), has_more=has_more,
         window={"since": _iso(s_dt), "until": _iso(u_dt)}, jobs=jobs,
