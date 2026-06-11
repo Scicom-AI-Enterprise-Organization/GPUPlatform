@@ -37,10 +37,12 @@ async function fetchKind(
 ): Promise<{ jobs: JobRecord[]; truncated: boolean }> {
   const jobs: JobRecord[] = [];
   for (let page = 0; page < MAX_PAGES; page++) {
+    // Newest-first: when a high-volume kind (inference) hits MAX_PAGES, the
+    // dropped records are the oldest in the window, not the latest traffic.
     const qs = new URLSearchParams({
       since,
       until,
-      order: "asc",
+      order: "desc",
       limit: String(PAGE),
       offset: String(page * PAGE),
     });

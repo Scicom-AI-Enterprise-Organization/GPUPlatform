@@ -486,6 +486,9 @@ async def history_inference(
     if app_ids:
         for a in (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all():
             appmap[a.app_id] = a
+    # Provider attribution comes from the serving app — same provider_kind /
+    # provider_name fields the discrete job kinds carry.
+    provmap = await _prov_map(session, {a.provider_id for a in appmap.values()})
     jobs = []
     for r in rows:
         a = appmap.get(r.app_id)
@@ -499,6 +502,7 @@ async def history_inference(
                 "prompt_tokens": _int(r.tin), "completion_tokens": _int(r.tout),
                 "requested_gpu_type": a.gpu if a else None,
                 "requested_gpu_count": a.gpu_count if a else None,
+                **_prov_fields(provmap.get(a.provider_id) if a else None),
                 "worker": r.worker_meta,
             },
         ))
