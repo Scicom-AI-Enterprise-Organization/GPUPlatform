@@ -79,10 +79,25 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str]]:
     # size-cached fetch); point it at the packed prefix instead of the model.
     packed_dir = cfg.get("packed_dir") or "/tmp/sgpu-tts-label-packed"
     _download_model({**cfg, "model_s3": packed_uri, "model_dir": packed_dir})
+    # Resolve the dir that actually holds index.json: the requested subdir → a flat
+    # pack (index.json at the root) → else a single named split subdir (e.g.
+    # `default`, produced when the source dataset had no split column), preferring
+    # train/. _read_packed reads <read_dir>/index.json directly, so read_dir must be
+    # the split dir itself.
     read_dir = os.path.join(packed_dir, subdir) if subdir else packed_dir
     if not os.path.exists(os.path.join(read_dir, "index.json")):
-        # Fall back to the prefix root if the requested subdir has no index.
-        read_dir = packed_dir
+        read_dir = packed_dir  # flat?
+        if not os.path.exists(os.path.join(read_dir, "index.json")):
+            try:
+                subs = [d for d in sorted(os.listdir(packed_dir))
+                        if os.path.isdir(os.path.join(packed_dir, d))
+                        and os.path.exists(os.path.join(packed_dir, d, "index.json"))]
+            except OSError:
+                subs = []
+            # prefer train/ then default/ then the first split with an index
+            pick = next((s for s in ("train", "default") if s in subs), subs[0] if subs else None)
+            if pick:
+                read_dir = os.path.join(packed_dir, pick)
     log(f"reading texts from {read_dir} (random={is_random}, want {n})")
 
     tok = AutoTokenizer.from_pretrained(cfg["model_dir"])
