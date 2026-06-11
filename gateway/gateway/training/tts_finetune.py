@@ -592,6 +592,9 @@ def run(cfg: dict) -> None:
     # ---- evaluation (CER / MOS / similarity) on the test set ----
     eval_methods = [m for m in (cfg.get("eval_methods") or []) if m in ("cer", "mos", "similarity")]
     if eval_methods and os.path.isdir(out_dir):
+        # Phase marker → the UI shows "running · evaluating" while the eval model
+        # loads + scores (tts_eval then emits its own per-sample progress).
+        log("[AUTOTRAIN_PROGRESS] step=evaluating percent=0")
         # eval set, in priority order: (1) a separate packed test dataset, (2) the
         # dataset's own held-out test split (test_from_split), (3) else the train
         # dir (sampled — no held-out set, scores generation on the train shards).
@@ -631,15 +634,39 @@ def run(cfg: dict) -> None:
     if art.get("bucket") and os.path.isdir(out_dir):
         cli = _s3_client(art)
         base_key = art["prefix"].rstrip("/") + "/model"
+        # Collect the final-model files first (skip intermediate `checkpoint-N/`
+        # dirs — HF keeps save_total_limit of them, several GB each) so we know the
+        # total and can log steady progress: a multi-GB upload is otherwise silent
+        # for minutes and the run looks stuck on the logs tab.
+        uploads: list[tuple[str, str]] = []  # (local_path, rel_key)
+        total_bytes = 0
         for root, dirs, files in os.walk(out_dir):
-            # Only ship the final model at the out_dir root — skip intermediate
-            # `checkpoint-N/` dirs (HF keeps save_total_limit of them, several GB
-            # each; uploading them all dwarfs a short run's training time).
             dirs[:] = [d for d in dirs if not d.startswith("checkpoint-")]
             for fn in files:
                 fp = os.path.join(root, fn)
-                rel = os.path.relpath(fp, out_dir)
-                cli.upload_file(fp, art["bucket"], f"{base_key}/{rel}")
+                uploads.append((fp, os.path.relpath(fp, out_dir)))
+                try:
+                    total_bytes += os.path.getsize(fp)
+                except OSError:
+                    pass
+        n = len(uploads)
+        log(f"[upload] uploading {n} file(s) · {total_bytes / 1e6:.0f} MB → s3://{art['bucket']}/{base_key}/ …")
+        log("[AUTOTRAIN_PROGRESS] step=uploading percent=0")
+        done_bytes = 0
+        last_pct = -1
+        for i, (fp, rel) in enumerate(uploads, 1):
+            cli.upload_file(fp, art["bucket"], f"{base_key}/{rel}")
+            try:
+                done_bytes += os.path.getsize(fp)
+            except OSError:
+                pass
+            pct = int(done_bytes * 100 / total_bytes) if total_bytes else int(i * 100 / max(1, n))
+            # Emit on each ~5% tick (and the final file) so the logs tab + the
+            # "running · uploading N%" header stay live without flooding the log.
+            if pct >= last_pct + 5 or i == n:
+                last_pct = pct
+                log(f"[upload] {i}/{n} files · {done_bytes / 1e6:.0f}/{total_bytes / 1e6:.0f} MB ({pct}%)")
+                log(f"[AUTOTRAIN_PROGRESS] step=uploading percent={pct}")
         s3_uri = f"s3://{art['bucket']}/{base_key}/"
         log(f"[upload] checkpoint → {s3_uri}")
 
@@ -647,6 +674,8 @@ def run(cfg: dict) -> None:
     if cfg.get("hf_push_repo") and cfg.get("hf_token"):
         try:
             from huggingface_hub import HfApi
+            log(f"[upload] pushing model to Hugging Face → {cfg['hf_push_repo']} …")
+            log("[AUTOTRAIN_PROGRESS] step=pushing_hf percent=0")
             HfApi().upload_folder(
                 folder_path=out_dir, repo_id=cfg["hf_push_repo"],
                 repo_type="model", token=cfg["hf_token"],

@@ -515,6 +515,37 @@ export function TrainingForm() {
     ? datasets.filter((d) => d.kind === "tts_packed")
     : datasets.filter((d) => d.kind !== "tts_packed");
 
+  // Optimizer steps per epoch ≈ ceil(train_rows / (batch × grad_accum × world_size)).
+  // world_size = #GPUs whenever DDP runs: TTS ALWAYS torchruns (nproc = #GPUs), ASR
+  // only on multi-GPU with DDP on (single-process DataParallel doesn't GPU-multiply
+  // the per-step batch). train_rows = the tts_packed train split, else the dataset's
+  // rows (minus the auto-split eval fraction for ASR). null when unknown.
+  const epochSteps = useMemo(() => {
+    if (sweepOn || durationMode !== "epochs") return null;
+    const d = datasets.find((x) => x.id === datasetId);
+    if (!d) return null;
+    let trainRows: number | null = null;
+    const sp = (d.split_fields as Record<string, unknown> | null | undefined)?.["_tts_pack"];
+    const splits = (sp as Record<string, unknown> | null | undefined)?.["splits"] as
+      | Record<string, unknown> | undefined;
+    if (splits && typeof splits.train === "number") trainRows = splits.train;
+    else if (typeof d.num_rows === "number") {
+      trainRows = !isTts && testDatasetId === AUTO_SPLIT
+        ? Math.round(d.num_rows * (1 - evalSplitPct / 100))
+        : d.num_rows;
+    }
+    if (!trainRows || trainRows <= 0) return null;
+    const nGpus = visibleDevices.trim()
+      ? visibleDevices.split(",").filter((x) => x.trim()).length
+      : gpuBound;
+    const worldSize = isTts ? Math.max(1, nGpus) : (useDdp && nGpus > 1 ? nGpus : 1);
+    const effBatch = Math.max(1, batchSize) * Math.max(1, gradAccum) * worldSize;
+    const perEpoch = Math.ceil(trainRows / effBatch);
+    if (!Number.isFinite(perEpoch) || perEpoch <= 0) return null;
+    return { perEpoch, total: perEpoch * Math.max(1, maxEpochs), trainRows, worldSize };
+  }, [sweepOn, durationMode, datasets, datasetId, isTts, testDatasetId, evalSplitPct,
+      visibleDevices, gpuBound, useDdp, batchSize, gradAccum, maxEpochs]);
+
   function pickTask(t: "asr" | "tts") {
     setTaskType(t);
     setModelChoice(t === "tts" ? DEFAULT_TTS_BASE : DEFAULT_WHISPER);
@@ -955,7 +986,7 @@ export function TrainingForm() {
                          : "Stop after this many optimizer steps (overrides epochs — handy for quick debug runs).")
               : (sweepOn ? "Epoch counts to try — one trial each (e.g. 3, 5)."
                          : "Stop after this many epochs (or earlier on patience).")}>
-            <div className="flex gap-2">
+            <div className="flex items-center gap-2">
               <Select value={durationMode} onValueChange={(v) => setDurationMode(v as "epochs" | "steps")}>
                 <SelectTrigger className="w-[108px] shrink-0"><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -974,6 +1005,15 @@ export function TrainingForm() {
                     : <NumberField min={1} value={maxSteps} onChange={setMaxSteps} />
                 )}
               </div>
+              {epochSteps && (
+                <span
+                  className="shrink-0 whitespace-nowrap text-xs text-muted-foreground"
+                  title={`${epochSteps.trainRows.toLocaleString()} train rows ÷ (batch ${batchSize} × grad-accum ${gradAccum}${epochSteps.worldSize > 1 ? ` × ${epochSteps.worldSize} GPUs (DDP)` : ""})`}
+                >
+                  ≈ <span className="font-mono text-foreground">{epochSteps.perEpoch.toLocaleString()}</span> steps/epoch ·{" "}
+                  <span className="font-mono text-foreground">{epochSteps.total.toLocaleString()}</span> total
+                </span>
+              )}
             </div>
           </FieldWrap>
           {sweepOn ? (

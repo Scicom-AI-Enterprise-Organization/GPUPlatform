@@ -307,6 +307,24 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/terminate`,
       { method: "POST" },
     ),
+  /** (Re)run the Label-platform export for a finished TTS run (synthesize N clips +
+   * create a recording+MOS project). Runs in the background; progress streams to logs. */
+  retryLabelExport: (
+    id: string,
+    body: {
+      base_url?: string;
+      base_url_secret?: string | null;
+      token?: string;
+      token_secret?: string | null;
+      project_name?: string | null;
+      samples?: number;
+      mos_axes?: string[];
+    },
+  ) =>
+    request<{ status: string }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/label-export`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   /** Clone a run's config into a fresh queued run and launch it. */
   restartTrainingRun: (id: string) =>
     request<TrainingRunRecord>(

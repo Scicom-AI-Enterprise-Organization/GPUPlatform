@@ -157,9 +157,9 @@ def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
             key = f"{base_key}/{idx:04d}.wav"
             cli.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
             items.append({"key": key, "text": ref_text})
-            log(f"clip {idx}: {len(wav) / int(sr):.2f}s → s3://{bucket}/{key}")
+            log(f"clip {idx + 1}/{len(utts)}: {len(wav) / int(sr):.2f}s → s3://{bucket}/{key}")
         except Exception as e:  # noqa: BLE001
-            log(f"clip {idx} failed: {e}")
+            log(f"clip {idx + 1}/{len(utts)} failed: {e}")
     return items
 
 

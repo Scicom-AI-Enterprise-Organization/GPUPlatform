@@ -85,6 +85,10 @@ _TTS_EVAL_METHODS = {"cer", "mos", "similarity"}
 # teardown state (RunPod id + api key) so terminate can delete the pod.
 _active_runners: dict[str, asyncio.Task] = {}
 _RUN_STATE: dict[str, dict] = {}
+# On-demand label exports in flight (the retry endpoint), keyed by run id → its
+# background task. Re-clicking "Export to Label" cancels a stuck attempt and starts
+# fresh (the cancelled task's project-creation step never runs, so no duplicate).
+_active_label_exports: dict[str, asyncio.Task] = {}
 # Cached SSH client per run for the live GPU-util poll (reused across polls).
 _GPU_SSH: dict[str, Any] = {}
 
@@ -673,6 +677,22 @@ def _tts_pack_splits(ds: Optional[Dataset]) -> dict:
     return ((ds.split_fields or {}).get("_tts_pack") or {}).get("splits") or {}
 
 
+async def _set_label_export_state(run_id: str, state: dict) -> None:
+    """Merge a label-export status object into result_json.label_export so the UI can
+    show 'exporting to Label' (instead of 'done') while a post-train export runs, and
+    revert once it finishes. Unlike _flush_result this updates an already-done run."""
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None or row.status == "cancelled":
+            return
+        rj = dict(row.result_json or {})
+        cur = dict(rj.get("label_export") or {})
+        cur.update(state)
+        rj["label_export"] = cur
+        row.result_json = rj
+        await s.commit()
+
+
 async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, redis) -> None:
     """Post-train: synthesize N clips from the finished TTS model on the run's VM,
     upload them to the run's S3 storage, then create a Label-platform *recording*
@@ -765,75 +785,114 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
     ssh = await _resolve_run_ssh(row)
     if ssh is None:
         await _push_log(redis, run_id, "[gateway] label export: can't reach the run's VM (skipped)")
-        return
-    await _push_log(redis, run_id, f"[gateway] label export: synthesizing {n} clips ({source_desc}) …")
-    manifest = await asyncio.to_thread(
-        _run_tts_label_export_ssh, *ssh, run_id, model_s3, creds, packed_uri, "",
-        is_random, n, speaker, creds["bucket"], upload_prefix, dict(cfg), "auto",
-    )
-    items = manifest.get("items") or []
-    if not items:
-        await _push_log(redis, run_id, "[gateway] label export: no clips synthesized — skipped")
+        await _set_label_export_state(run_id, {"status": "failed", "error": "can't reach the run's VM"})
         return
 
-    # ---- Label platform: create project → storage → MOS → tasks ----
-    import httpx
+    # Mark the export in-flight so the UI shows "exporting to Label" instead of the
+    # run's terminal "done" status until it finishes (or fails).
+    await _set_label_export_state(run_id, {"status": "running"})
+    # Stream the VM-side synthesis/upload log to the run's logs (the script runs in a
+    # thread; it appends lines to this buffer and an async pump mirrors them to Redis,
+    # the same decoupling run_training uses) — so a multi-minute synth isn't silent.
+    export_lines: list[str] = []
+    _sent = {"n": 0}
 
-    proj_name = (cfg.get("label_project_name") or f"{run_name}-eval")[:200]
-    axes = [a for a in (cfg.get("label_mos_axes") or []) if a] or ["Naturalness", "Intelligibility", "Noise"]
-    headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as cli:
-        r = await cli.post(f"{base_url}/api/projects", headers=headers, json={
-            "name": proj_name, "type": "recording",
-            "description": f"Autotrain TTS eval — {run_name} ({run_id})",
-        })
-        r.raise_for_status()
-        pid = ((r.json() or {}).get("project") or {}).get("id")
-        if not pid:
-            raise RuntimeError(f"create project returned no id: {r.text[:200]}")
-        r = await cli.put(f"{base_url}/api/projects/{pid}/storage", headers=headers, json={
-            "provider": "s3", "bucket": creds["bucket"], "region": creds["region"],
-            "prefix": "", "endpoint": creds.get("endpoint") or "",
-            "access_key": creds.get("access_key") or "", "secret_key": creds.get("secret_key") or "",
-        })
-        r.raise_for_status()
-        r = await cli.patch(f"{base_url}/api/projects/{pid}", headers=headers,
-                            json={"mos_enabled": True, "mos_axes": axes})
-        r.raise_for_status()
-        tasks = [{"transcription": it.get("text") or "", "audio_filename": it.get("key") or ""}
-                 for it in items if it.get("key")]
-        r = await cli.post(f"{base_url}/api/projects/{pid}/tasks", headers=headers, json={"tasks": tasks})
-        r.raise_for_status()
+    async def _export_pump() -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            while _sent["n"] < len(export_lines):
+                await _push_log(redis, run_id, export_lines[_sent["n"]])
+                _sent["n"] += 1
 
-    # Round-trip: a kind=label dataset pointing at the new project + stamp the run.
-    label_ds_id = "ds-" + os.urandom(4).hex()
-    async with session_factory()() as s:
-        s.add(Dataset(
-            id=label_ds_id, owner_id=owner_id,
-            name=(f"{run_name}-tts-eval-labels")[:255],
-            description=(f"Human MOS / recording labels for autotrain TTS run {run_id}")[:2048],
-            kind="label", storage_id=storage_id,
-            label_base_url=base_url, label_project_id=pid,
-            # Reference the Secrets key when one was used (no token copy); else store
-            # the resolved token Fernet-encrypted, like the datasets create path.
-            label_token_secret=(tok_secret or None),
-            label_token_enc=(None if tok_secret else crypto.encrypt(json.dumps({"token": token}))),
-            label_status="approved",
-            audio_field="audio_url", transcription_field="transcription",
-        ))
-        run2 = await s.get(TrainingRun, run_id)
-        if run2 is not None:
-            rj = dict(run2.result_json or {})
-            rj["label_project"] = {
-                "id": pid, "url": f"{base_url}/dashboard/projects/{pid}",
-                "count": len(tasks), "dataset_id": label_ds_id, "project_name": proj_name,
-            }
-            run2.result_json = rj
-        await s.commit()
-    await _push_log(
-        redis, run_id,
-        f"[gateway] label project created: {base_url}/dashboard/projects/{pid} "
-        f"({len(tasks)} clips) + dataset {label_ds_id}")
+    pump_task = asyncio.create_task(_export_pump())
+    try:
+        await _push_log(redis, run_id, f"[gateway] label export: synthesizing {n} clips ({source_desc}) …")
+        manifest = await asyncio.to_thread(
+            _run_tts_label_export_ssh, *ssh, run_id, model_s3, creds, packed_uri, "",
+            is_random, n, speaker, creds["bucket"], upload_prefix, dict(cfg), "auto",
+            export_lines.append,
+        )
+        items = manifest.get("items") or []
+        if not items:
+            await _push_log(redis, run_id, "[gateway] label export: no clips synthesized")
+            await _set_label_export_state(run_id, {"status": "failed", "error": "no clips synthesized"})
+            return
+
+        # ---- Label platform: create project → storage → MOS → tasks ----
+        import httpx
+
+        proj_name = (cfg.get("label_project_name") or f"{run_name}-eval")[:200]
+        axes = [a for a in (cfg.get("label_mos_axes") or []) if a] or ["Naturalness", "Intelligibility", "Noise"]
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as cli:
+            r = await cli.post(f"{base_url}/api/projects", headers=headers, json={
+                "name": proj_name, "type": "recording",
+                "description": f"Autotrain TTS eval — {run_name} ({run_id})",
+            })
+            r.raise_for_status()
+            pid = ((r.json() or {}).get("project") or {}).get("id")
+            if not pid:
+                raise RuntimeError(f"create project returned no id: {r.text[:200]}")
+            r = await cli.put(f"{base_url}/api/projects/{pid}/storage", headers=headers, json={
+                "provider": "s3", "bucket": creds["bucket"], "region": creds["region"],
+                "prefix": "", "endpoint": creds.get("endpoint") or "",
+                "access_key": creds.get("access_key") or "", "secret_key": creds.get("secret_key") or "",
+            })
+            r.raise_for_status()
+            r = await cli.patch(f"{base_url}/api/projects/{pid}", headers=headers,
+                                json={"mos_enabled": True, "mos_axes": axes})
+            r.raise_for_status()
+            tasks = [{"transcription": it.get("text") or "", "audio_filename": it.get("key") or ""}
+                     for it in items if it.get("key")]
+            r = await cli.post(f"{base_url}/api/projects/{pid}/tasks", headers=headers, json={"tasks": tasks})
+            r.raise_for_status()
+
+        # Round-trip: a kind=label dataset pointing at the new project + stamp the run.
+        label_ds_id = "ds-" + os.urandom(4).hex()
+        async with session_factory()() as s:
+            s.add(Dataset(
+                id=label_ds_id, owner_id=owner_id,
+                name=(f"{run_name}-tts-eval-labels")[:255],
+                description=(f"Human MOS / recording labels for autotrain TTS run {run_id}")[:2048],
+                kind="label", storage_id=storage_id,
+                label_base_url=base_url, label_project_id=pid,
+                # Reference the Secrets key when one was used (no token copy); else store
+                # the resolved token Fernet-encrypted, like the datasets create path.
+                label_token_secret=(tok_secret or None),
+                label_token_enc=(None if tok_secret else crypto.encrypt(json.dumps({"token": token}))),
+                label_status="approved",
+                audio_field="audio_url", transcription_field="transcription",
+            ))
+            run2 = await s.get(TrainingRun, run_id)
+            if run2 is not None:
+                rj = dict(run2.result_json or {})
+                rj["label_project"] = {
+                    "id": pid, "url": f"{base_url}/dashboard/projects/{pid}",
+                    "count": len(tasks), "dataset_id": label_ds_id, "project_name": proj_name,
+                }
+                rj["label_export"] = {"status": "done"}
+                run2.result_json = rj
+            await s.commit()
+        await _push_log(
+            redis, run_id,
+            f"[gateway] label project created: {base_url}/dashboard/projects/{pid} "
+            f"({len(tasks)} clips) + dataset {label_ds_id}")
+    except Exception as e:  # noqa: BLE001 — record the failure, then re-raise so the caller logs it
+        await _set_label_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
+        raise
+    finally:
+        pump_task.cancel()
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        # Flush any lines the pump hadn't mirrored yet.
+        while _sent["n"] < len(export_lines):
+            try:
+                await _push_log(redis, run_id, export_lines[_sent["n"]])
+            except Exception:  # noqa: BLE001
+                pass
+            _sent["n"] += 1
 
 
 async def _mirror_pack_log(redis, run_id: str, dataset_id: Optional[str]) -> None:
@@ -2034,6 +2093,113 @@ async def get_training_run(
     )
 
 
+class LabelExportRequest(BaseModel):
+    # All optional — fall back to the run's config_json. A pasted token wins over a
+    # secret-key ref; both are stored on the run's config so a later retry reuses them.
+    base_url: Optional[str] = None
+    base_url_secret: Optional[str] = None
+    token: Optional[str] = None
+    token_secret: Optional[str] = None
+    project_name: Optional[str] = None
+    samples: Optional[int] = None
+    mos_axes: Optional[list[str]] = None
+
+
+@router.post("/{run_id}/label-export")
+async def retry_label_export(
+    run_id: str,
+    body: LabelExportRequest,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """(Re)run the Label-platform export for a finished TTS run: synthesize N clips
+    from the trained model + create/seed a recording+MOS project. Used when the run
+    finished without label creds, or to re-export. Runs in the background (synthesis
+    over SSH takes minutes) — progress streams to the run's logs and the
+    result_json.label_project card appears when done. VM-provider runs only."""
+    row = await _owned(run_id, user, session)
+    if (row.task_type or "asr") != "tts":
+        raise HTTPException(status_code=400, detail="label export is for TTS runs")
+    if row.status != "done":
+        raise HTTPException(status_code=400, detail="the run must finish successfully first")
+    if not (((row.result_json or {}).get("artifact") or {}).get("s3_uri")):
+        raise HTTPException(status_code=400, detail="no trained model artifact for this run")
+    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+    if prov is None or prov.kind != "vm":
+        raise HTTPException(status_code=400, detail=("label export runs on a VM provider; this run "
+                            "used a cloud pod (gone after training). Re-run on a VM."))
+    # A previous export still in flight (possibly stuck on a slow synth)? Cancel it
+    # and start fresh — re-clicking "Export to Label" supersedes it. The cancelled
+    # task's project-creation step never runs, so no duplicate project is created
+    # (the orphaned VM synth just finishes + is discarded).
+    prev = _active_label_exports.pop(run_id, None)
+    if prev is not None and not prev.done():
+        prev.cancel()
+        await _push_log(request.app.state.redis, run_id,
+                        "[gateway] label export: superseded by a new request — restarting")
+
+    cfg = dict(row.config_json or {})
+    if body.base_url is not None or body.base_url_secret is not None:
+        cfg["label_base_url"] = ((body.base_url or "").strip().rstrip("/")
+                                 or cfg.get("label_base_url") or "http://localhost:3002")
+        cfg["label_base_url_secret"] = (body.base_url_secret or "").strip() or None
+    if (body.token_secret or "").strip():
+        cfg["label_token_secret"] = body.token_secret.strip()
+        cfg["label_token_enc"] = None
+    elif (body.token or "").strip():
+        cfg["label_token_enc"] = crypto.encrypt(json.dumps({"token": body.token.strip()}))
+        cfg["label_token_secret"] = None
+    if body.project_name is not None:
+        cfg["label_project_name"] = body.project_name.strip() or None
+    if body.samples is not None:
+        cfg["label_samples"] = max(1, int(body.samples))
+    if body.mos_axes is not None:
+        cfg["label_mos_axes"] = [a.strip() for a in body.mos_axes if str(a).strip()]
+    cfg["label_export"] = True
+
+    has_url = bool((cfg.get("label_base_url_secret") or "").strip() or (cfg.get("label_base_url") or "").strip())
+    has_tok = bool((cfg.get("label_token_secret") or "").strip() or cfg.get("label_token_enc"))
+    if not has_url:
+        raise HTTPException(status_code=400, detail="provide the Label platform URL")
+    if not has_tok:
+        raise HTTPException(status_code=400, detail="provide a Label platform API token (or pick a secret)")
+
+    # Persist the (merged) label_* fields so the run remembers them for next time.
+    result = dict(row.result_json or {})
+    async with session_factory()() as s:
+        r2 = await s.get(TrainingRun, run_id)
+        if r2 is not None:
+            merged = dict(r2.config_json or {})
+            for k in ("label_export", "label_base_url", "label_base_url_secret",
+                      "label_token_secret", "label_token_enc", "label_project_name",
+                      "label_samples", "label_mos_axes"):
+                merged[k] = cfg.get(k)
+            r2.config_json = merged
+            await s.commit()
+
+    redis = request.app.state.redis
+
+    async def _bg() -> None:
+        try:
+            await _push_log(redis, run_id, "[gateway] label export: retrying on request …")
+            await _create_label_project_for_run(run_id, cfg, result, redis)
+        except asyncio.CancelledError:
+            await _push_log(redis, run_id, "[gateway] label export: cancelled (superseded)")
+            raise
+        except Exception as e:  # noqa: BLE001
+            await _push_log(redis, run_id, f"[gateway] label export failed: {e}")
+        finally:
+            # Only clear the entry if it's still ours (a superseding request may have
+            # already replaced it with a newer task).
+            if _active_label_exports.get(run_id) is asyncio.current_task():
+                _active_label_exports.pop(run_id, None)
+
+    task = asyncio.create_task(_bg())
+    _active_label_exports[run_id] = task
+    return {"status": "started"}
+
+
 @router.get("/{run_id}/metrics")
 async def training_metrics(
     run_id: str,
@@ -2717,11 +2883,13 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
                               run_id: str, model_s3: str, creds: dict, packed_uri: str,
                               split_subdir: str, is_random: bool, n_samples: int,
                               speaker: str, upload_bucket: str, upload_prefix: str,
-                              cfg: dict, gpu: str = "auto") -> dict:
+                              cfg: dict, gpu: str = "auto", line_sink=None) -> dict:
     """SSH to the run's VM, ship the whole tts/ dir, synthesize n_samples clips from
     the finetuned model + upload them to S3, and return the parsed @@LABEL manifest
     {bucket, items:[{key,text}], count}. Blocking — call via to_thread. The TTS
-    batch twin of _run_synthesize_ssh."""
+    batch twin of _run_synthesize_ssh. `line_sink(str)` (if given) receives every
+    VM-side log line so the caller can stream synthesis progress to the run's logs
+    (otherwise a multi-minute synth/upload is silent and the run looks stuck)."""
     import tempfile
 
     cli = _ssh_connect(host, int(port), user, key_filename)
@@ -2760,6 +2928,11 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
         def on_line(line: str) -> None:
             j = line.find("@@LABEL ")
             if j < 0:
+                if line_sink is not None:
+                    try:
+                        line_sink(line)  # stream synth/upload progress to the run's logs
+                    except Exception:  # noqa: BLE001
+                        pass
                 if len(out["lines"]) < 400:  # keep a tail for errors
                     out["lines"].append(line)
                 return

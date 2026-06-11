@@ -275,6 +275,12 @@ export type TrainingResult = {
     dataset_id?: string | null;
     project_name?: string | null;
   } | null;
+  // TTS only: status of an in-flight / finished post-train Label export. While
+  // "running" the UI shows "exporting to Label" instead of the run's "done".
+  label_export?: {
+    status: "running" | "done" | "failed";
+    error?: string | null;
+  } | null;
   error?: string;
 };
 

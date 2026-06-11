@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AudioLines, Check, ChevronDown, Copy, Download, ExternalLink, Loader2, Pencil, RotateCcw, Trash2, X, XCircle } from "lucide-react";
+import { AudioLines, Check, ChevronDown, Copy, Download, ExternalLink, Loader2, Pencil, RotateCcw, Trash2, Upload, X, XCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -43,7 +43,7 @@ import { formatCostUSD, formatRateUSD, useLiveCost } from "@/lib/cost";
 import { BurnFlame } from "@/components/burn-flame";
 import { JsonView } from "@/components/json-view";
 import { cn } from "@/lib/utils";
-import type { TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
+import type { DatasetRecord, GlobalEnvRecord, TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
 
 // Distinct colours for per-trial sweep loss curves.
 const TRIAL_COLORS = ["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9", "#ec4899", "#84cc16"];
@@ -75,6 +75,28 @@ const STATUS_STYLES: Record<string, string> = {
   failed: "border-destructive/40 bg-destructive/10 text-destructive",
   cancelled: "border-border bg-muted text-muted-foreground",
 };
+
+// Friendly label for the current post-training phase (from result_json.progress.step,
+// set by the trainer's [AUTOTRAIN_PROGRESS] markers). Shown beside the "running"
+// status so a long, otherwise-silent step (e.g. multi-GB S3 upload) isn't mistaken
+// for a stuck run. Returns null when not running or no phase is known.
+const PHASE_LABELS: Record<string, string> = {
+  evaluating: "evaluating",
+  tts_eval_gen: "evaluating",
+  uploading: "uploading to S3",
+  pushing_hf: "pushing to Hugging Face",
+};
+function runningPhase(run: TrainingRunRecord): string | null {
+  if (run.status !== "running") return null;
+  const p = run.result_json?.progress;
+  const step = p?.step ? String(p.step) : "";
+  if (!step) return null;
+  const label = PHASE_LABELS[step] ?? step.replace(/_/g, " ");
+  const pct = typeof p?.percent === "number" ? p.percent : null;
+  return pct != null && (step === "uploading" || step === "pushing_hf")
+    ? `${label} · ${Math.round(pct)}%`
+    : label;
+}
 
 // A run is a sweep if its config carries a non-empty sweep grid.
 export function isSweepConfig(config: Record<string, unknown> | undefined | null): boolean {
@@ -115,6 +137,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const [run, setRun] = useState<TrainingRunRecord>(initial);
   const [busy, setBusy] = useState(false);
   const terminal = ["done", "failed", "cancelled"].includes(run.status);
+  // A post-train Label export is running in the background — the run itself is
+  // already "done", so show "exporting to Label" instead and keep polling.
+  const exporting = run.result_json?.label_export?.status === "running";
 
   // Tab reflected in the URL (?tab=…) so it's deep-linkable + survives refresh.
   const tab = searchParams.get("tab") || "metrics";
@@ -144,9 +169,10 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     };
   }, [run.id, terminal]);
 
-  // Poll the record while queued/running so status + metrics refresh.
+  // Poll the record while queued/running — or while a post-train Label export is
+  // in flight — so the status + the label_project card refresh.
   useEffect(() => {
-    if (terminal) return;
+    if (terminal && !exporting) return;
     const t = setInterval(async () => {
       try {
         setRun(await gateway.getTrainingRun(run.id));
@@ -155,7 +181,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       }
     }, 5000);
     return () => clearInterval(t);
-  }, [run.id, terminal]);
+  }, [run.id, terminal, exporting]);
 
   // Single log stream for the whole page: feeds the Logs tab AND the live loss
   // curve. We parse @@STEP lines into points as they arrive; once the run
@@ -239,6 +265,73 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     }
   }
 
+  // On-demand Label-platform export (retry) for finished TTS runs — the run may
+  // have finished without label creds, or you may want to re-export. Prefilled
+  // from the run's config; the token is never stored back unencrypted.
+  const lcfg = (run.config_json ?? {}) as Record<string, unknown>;
+  const [labelOpen, setLabelOpen] = useState(false);
+  // URL + token can each be typed in or referenced from the Secrets page (GlobalEnv),
+  // mirroring the autotrain create form. Prefilled from the run's config.
+  const [labelUrlMode, setLabelUrlMode] = useState<"paste" | "secret">(
+    typeof lcfg.label_base_url_secret === "string" && lcfg.label_base_url_secret ? "secret" : "paste",
+  );
+  const [labelUrl, setLabelUrl] = useState(
+    typeof lcfg.label_base_url === "string" && lcfg.label_base_url ? lcfg.label_base_url : "http://localhost:3002",
+  );
+  const [labelUrlSecret, setLabelUrlSecret] = useState(
+    typeof lcfg.label_base_url_secret === "string" ? lcfg.label_base_url_secret : "",
+  );
+  const [labelTokenMode, setLabelTokenMode] = useState<"paste" | "secret">(
+    typeof lcfg.label_token_secret === "string" && lcfg.label_token_secret ? "secret" : "paste",
+  );
+  const [labelToken, setLabelToken] = useState("");
+  const [labelTokenSecret, setLabelTokenSecret] = useState(
+    typeof lcfg.label_token_secret === "string" ? lcfg.label_token_secret : "",
+  );
+  const [labelSecrets, setLabelSecrets] = useState<GlobalEnvRecord[]>([]);
+  const [labelProject, setLabelProject] = useState(
+    typeof lcfg.label_project_name === "string" ? lcfg.label_project_name : "",
+  );
+  const [labelSamples, setLabelSamples] = useState(
+    typeof lcfg.label_samples === "number" ? lcfg.label_samples : 32,
+  );
+  const [labelAxes, setLabelAxes] = useState(
+    Array.isArray(lcfg.label_mos_axes) ? (lcfg.label_mos_axes as unknown[]).map(String).join(", ") : "Naturalness, Intelligibility, Noise",
+  );
+  const [labelBusy, setLabelBusy] = useState(false);
+  const [labelErr, setLabelErr] = useState<string | null>(null);
+  const [labelDone, setLabelDone] = useState(false);
+
+  // Load Secrets-page keys the first time the export dialog opens.
+  useEffect(() => {
+    if (!labelOpen || labelSecrets.length) return;
+    gateway.listGlobalEnv().then(setLabelSecrets).catch(() => {});
+  }, [labelOpen, labelSecrets.length]);
+
+  const labelUrlOk = labelUrlMode === "paste" ? !!labelUrl.trim() : !!labelUrlSecret;
+  const labelTokenOk = labelTokenMode === "paste" ? !!labelToken.trim() : !!labelTokenSecret;
+
+  async function submitLabelExport() {
+    setLabelBusy(true);
+    setLabelErr(null);
+    try {
+      await gateway.retryLabelExport(run.id, {
+        base_url: labelUrlMode === "paste" ? (labelUrl.trim() || undefined) : undefined,
+        base_url_secret: labelUrlMode === "secret" ? (labelUrlSecret || null) : null,
+        token: labelTokenMode === "paste" ? (labelToken.trim() || undefined) : undefined,
+        token_secret: labelTokenMode === "secret" ? (labelTokenSecret || null) : null,
+        project_name: labelProject.trim() || null,
+        samples: labelSamples,
+        mos_axes: labelAxes.split(",").map((s) => s.trim()).filter(Boolean),
+      });
+      setLabelDone(true);
+    } catch (e) {
+      setLabelErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLabelBusy(false);
+    }
+  }
+
   function onTerminate() {
     setConfirmError(null);
     setConfirmOpts({
@@ -297,8 +390,13 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   }
 
   // Open the create form pre-filled from this run's config, without launching.
+  // Pass ?task= so the form mounts with the right task (and thus the right model
+  // list + dataset filter) on the FIRST render — otherwise it defaults to asr and
+  // an effect flips asr→tts, which leaves the model/dataset/test Selects applying
+  // their (tts) values against the wrong (asr) option set, so they don't inherit.
   function onEditAsNew() {
-    router.push(`/autotrain/new?from=${encodeURIComponent(run.id)}`);
+    const task = run.task_type === "tts" ? "tts" : "asr";
+    router.push(`/autotrain/new?from=${encodeURIComponent(run.id)}&task=${task}`);
   }
 
   return (
@@ -342,7 +440,19 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
                 </button>
               </>
             )}
-            <Badge variant="outline" className={STATUS_STYLES[run.status] ?? ""}>{run.status}</Badge>
+            {exporting ? (
+              <Badge variant="outline" className={STATUS_STYLES.running}>
+                <Loader2 className="mr-1 h-3 w-3 animate-spin" /> exporting to Label
+              </Badge>
+            ) : (
+              <Badge variant="outline" className={STATUS_STYLES[run.status] ?? ""}>{run.status}</Badge>
+            )}
+            {!exporting && runningPhase(run) && (
+              <span className="flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                {runningPhase(run)}
+              </span>
+            )}
             <RunKindBadge sweep={isSweep} trials={isSweep ? trials.length : undefined} />
           </div>
           <p className="mt-1 font-mono text-xs text-muted-foreground">
@@ -370,6 +480,16 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <XCircle className="h-4 w-4" />} Terminate
             </Button>
           )}
+          {run.task_type === "tts" && run.status === "done" && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => { setLabelErr(null); setLabelDone(false); setLabelOpen(true); }}
+              title="Synthesize sample clips and create a Label-platform recording+MOS project"
+            >
+              <Upload className="h-4 w-4" /> Export to Label
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={onDelete} disabled={busy}>
             <Trash2 className="h-4 w-4" /> Delete
           </Button>
@@ -377,7 +497,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       </div>
 
         <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-5">
-          <Kpi label="Status" value={run.status} />
+          <Kpi label="Status" value={exporting ? "exporting to Label" : run.status} />
           <Kpi
             label="GPU"
             value={run.gpu_type ? `${run.gpu_type}${run.gpu_count > 1 ? ` ×${run.gpu_count}` : ""}` : "—"}
@@ -408,7 +528,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </div>
       )}
 
-      {tab === "metrics" && (<>
+      {tab === "metrics" && (<div className="space-y-4 mb-4">
       {best && !isSweep && (
         <Card>
           <CardHeader className="pb-2"><CardTitle className="text-sm">Best checkpoint</CardTitle></CardHeader>
@@ -514,7 +634,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           </CardContent>
         </Card>
       )}
-      </>)}
+      </div>)}
 
       <Tabs value={tab} onValueChange={onTab} className="!block">
         <TabsContent value="metrics" className="!flex-none space-y-4">
@@ -607,6 +727,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               <Stat label="Base model" value={run.base_model} mono />
             </CardContent>
           </Card>
+          <StepEstimate run={run} />
           <JsonView value={run.config_json} />
         </TabsContent>
 
@@ -649,7 +770,183 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={labelOpen} onOpenChange={(o) => { if (!labelBusy) setLabelOpen(o); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Export to Label platform</DialogTitle>
+            <DialogDescription>
+              Synthesize {labelSamples} clip{labelSamples === 1 ? "" : "s"} from this run&apos;s trained model and
+              create a Label-platform recording project with MOS rating, seeded with them. Runs in the background;
+              watch the Logs tab for progress.
+            </DialogDescription>
+          </DialogHeader>
+          {labelDone ? (
+            <p className="flex items-center gap-2 py-2 text-sm text-emerald-600 dark:text-emerald-400">
+              <Check className="h-4 w-4" /> Export started — the status shows “exporting to Label” and the
+              synthesis streams to the Logs tab; an “Open in Label” link appears on this page when it finishes.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-3">
+                  <label className="text-xs uppercase tracking-wide text-muted-foreground">Label platform URL</label>
+                  <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
+                    {(["paste", "secret"] as const).map((m) => (
+                      <button key={m} type="button" onClick={() => setLabelUrlMode(m)}
+                        className={cn("px-2.5 py-1 transition-colors",
+                          labelUrlMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
+                        {m === "paste" ? "Paste" : "From secret"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {labelUrlMode === "paste" ? (
+                  <Input className="font-mono" value={labelUrl} placeholder="http://localhost:3002"
+                    onChange={(e) => setLabelUrl(e.target.value)} />
+                ) : (
+                  <Select value={labelUrlSecret} onValueChange={setLabelUrlSecret}>
+                    <SelectTrigger><SelectValue placeholder={labelSecrets.length ? "Choose a secret" : "No secrets configured"} /></SelectTrigger>
+                    <SelectContent>
+                      {labelSecrets.map((s) => (
+                        <SelectItem key={s.key} value={s.key}>{s.key}{s.value_preview ? ` — ${s.value_preview}` : ""}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-3">
+                  <label className="text-xs uppercase tracking-wide text-muted-foreground">API token</label>
+                  <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
+                    {(["paste", "secret"] as const).map((m) => (
+                      <button key={m} type="button" onClick={() => setLabelTokenMode(m)}
+                        className={cn("px-2.5 py-1 transition-colors",
+                          labelTokenMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
+                        {m === "paste" ? "Paste" : "From secret"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {labelTokenMode === "paste" ? (
+                  <>
+                    <Input type="password" className="font-mono" value={labelToken} placeholder="lpat_…"
+                      onChange={(e) => setLabelToken(e.target.value)} />
+                    <p className="text-[11px] text-muted-foreground">Admin personal access token. Stored encrypted on the run.</p>
+                  </>
+                ) : (
+                  <Select value={labelTokenSecret} onValueChange={setLabelTokenSecret}>
+                    <SelectTrigger><SelectValue placeholder={labelSecrets.some((s) => s.is_secret) ? "Choose a secret" : "No secrets configured"} /></SelectTrigger>
+                    <SelectContent>
+                      {labelSecrets.filter((s) => s.is_secret).map((s) => (
+                        <SelectItem key={s.key} value={s.key}>{s.key}{s.value_preview ? ` — ${s.value_preview}` : ""}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <label className="text-xs uppercase tracking-wide text-muted-foreground">Project name</label>
+                  <Input value={labelProject} placeholder={`${run.name}-eval`}
+                    onChange={(e) => setLabelProject(e.target.value)} />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs uppercase tracking-wide text-muted-foreground">Samples</label>
+                  <Input type="number" min={1} value={labelSamples}
+                    onChange={(e) => setLabelSamples(Math.max(1, Number.parseInt(e.target.value, 10) || 1))} />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs uppercase tracking-wide text-muted-foreground">MOS axes</label>
+                <Input value={labelAxes} placeholder="Naturalness, Intelligibility, Noise"
+                  onChange={(e) => setLabelAxes(e.target.value)} />
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            {labelErr && <p className="mr-auto text-sm text-destructive">{labelErr}</p>}
+            <Button variant="outline" onClick={() => setLabelOpen(false)} disabled={labelBusy}>
+              {labelDone ? "Close" : "Cancel"}
+            </Button>
+            {!labelDone && (
+              <Button onClick={submitLabelExport} disabled={labelBusy || !labelUrlOk || !labelTokenOk}>
+                {labelBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                Start export
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
+  );
+}
+
+// Estimated optimizer-step count for this run's config. steps/epoch ≈
+// ceil(train_rows / (batch × grad_accum × world_size)). world_size = #GPUs whenever
+// DDP runs: TTS ALWAYS torchruns (nproc = #GPUs), ASR only on multi-GPU with DDP on.
+// train_rows = the tts_packed train split, else the dataset's rows (minus the
+// auto-split eval fraction for ASR). Fetches the dataset for its row count.
+function StepEstimate({ run }: { run: TrainingRunRecord }) {
+  const [ds, setDs] = useState<DatasetRecord | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!run.dataset_id) return;
+    gateway.getDataset(run.dataset_id).then((d) => { if (!cancelled) setDs(d); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [run.dataset_id]);
+
+  const c = (run.config_json ?? {}) as Record<string, unknown>;
+  const numOf = (v: unknown, d: number) =>
+    typeof v === "number" && Number.isFinite(v) ? v
+    : typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v)) ? Number(v) : d;
+  const isTts = (run.task_type ?? c.task_type) === "tts";
+  const batch = numOf(c.batch_size, 0);
+  const gradAccum = Math.max(1, numOf(c.grad_accum, 1));
+  const epochs = Math.max(1, numOf(c.max_epochs, 0));
+  const maxSteps = numOf(c.max_steps, 0);
+  const useDdp = c.use_ddp !== false;
+
+  // train rows
+  let trainRows: number | null = null;
+  const sp = (ds?.split_fields as Record<string, unknown> | null | undefined)?.["_tts_pack"];
+  const splits = (sp as Record<string, unknown> | null | undefined)?.["splits"] as Record<string, unknown> | undefined;
+  if (splits && typeof splits.train === "number") trainRows = splits.train as number;
+  else if (ds && typeof ds.num_rows === "number") {
+    const evalPct = numOf(c.eval_split_pct, 0);
+    trainRows = !isTts && !run.test_dataset_id && evalPct > 0
+      ? Math.round(ds.num_rows * (1 - evalPct / 100))
+      : ds.num_rows;
+  }
+
+  const nGpus = run.visible_devices && run.visible_devices.trim()
+    ? run.visible_devices.split(",").filter((x) => x.trim()).length
+    : Math.max(1, run.gpu_count || 1);
+  const worldSize = isTts ? Math.max(1, nGpus) : (useDdp && nGpus > 1 ? nGpus : 1);
+  const effBatch = Math.max(1, batch) * gradAccum * worldSize;
+  const perEpoch = trainRows && trainRows > 0 ? Math.ceil(trainRows / effBatch) : null;
+  if (batch <= 0 || perEpoch == null) return null;
+  const total = perEpoch * epochs;
+
+  return (
+    <Card>
+      <CardHeader className="pb-2"><CardTitle className="text-sm">Estimated steps</CardTitle></CardHeader>
+      <CardContent className="space-y-2">
+        <div className="flex flex-wrap gap-x-8 gap-y-3 text-sm">
+          <Stat label="Steps / epoch" value={`≈ ${perEpoch.toLocaleString()}`} />
+          <Stat
+            label={maxSteps > 0 ? "Total (step-capped)" : "Total steps"}
+            value={maxSteps > 0 ? `≈ ${Math.min(maxSteps, total).toLocaleString()} (cap ${maxSteps.toLocaleString()})` : `≈ ${total.toLocaleString()}`}
+          />
+          <Stat label="Effective batch" value={`${effBatch.toLocaleString()}`} />
+          <Stat label="World size" value={worldSize > 1 ? `${worldSize} GPUs (DDP)` : "1"} />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          {trainRows!.toLocaleString()} train rows ÷ (batch {batch} × grad-accum {gradAccum}
+          {worldSize > 1 ? ` × ${worldSize} GPUs` : ""}) × {epochs} epoch{epochs === 1 ? "" : "s"}.
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 
