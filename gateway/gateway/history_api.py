@@ -629,3 +629,63 @@ async def history_inference_summary(
         note=("Exact creation counts for serverless inference requests, grouped by "
               "day/app/user/status with provider attribution — use instead of paging "
               f"/inference for analytics (defaults to the last {DEFAULT_WINDOW_DAYS}d)."))
+
+
+# ── endpoint lifecycle ───────────────────────────────────────────────────────
+# Serverless endpoint creations/deletions, read from the immutable audit log
+# (apps are hard-deleted, so the apps table can't serve history). One record
+# per lifecycle event; `status` is "created" | "deleted".
+
+@router.get("/endpoints", response_model=HistoryResponse)
+async def history_endpoints(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
+    user: Optional[str] = _Q_USER, limit: int = _Q_LIMIT,
+    offset: int = _Q_OFFSET, order: str = _Q_ORDER,
+):
+    from .db import AuditLog
+    s_dt, u_dt = _parse_dt(since, "since"), _parse_dt(until, "until")
+    st = select(AuditLog).where(AuditLog.action.in_(("inference.create", "inference.delete")))
+    if s_dt is not None:
+        st = st.where(AuditLog.created_at >= s_dt)
+    if u_dt is not None:
+        st = st.where(AuditLog.created_at < u_dt)
+    if user:
+        st = st.where(AuditLog.actor_username == user)
+    st = st.order_by(AuditLog.created_at.asc() if order == "asc" else AuditLog.created_at.desc())
+    rows = (await session.execute(st.offset(offset).limit(limit + 1))).scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    # Provider attribution via the app row when it still exists (deleted
+    # endpoints keep their audit details but lose the provider link).
+    app_ids = {r.resource_id for r in rows if r.resource_id}
+    appmap: dict[str, App] = {}
+    if app_ids:
+        for a in (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all():
+            appmap[a.app_id] = a
+    provmap = await _prov_map(session, {a.provider_id for a in appmap.values()})
+
+    jobs = []
+    for r in rows:
+        d = r.details or {}
+        a = appmap.get(r.resource_id or "")
+        jobs.append(JobRecord(
+            kind="endpoint", id=str(r.id), name=r.resource_name, owner_id=r.actor_id,
+            user=r.actor_username, status="created" if r.action == "inference.create" else "deleted",
+            created_at=_iso(r.created_at), started_at=None, ended_at=None,
+            duration_s=None, error_text=None,
+            detail={
+                "app_id": r.resource_id, "action": r.action,
+                "mode": d.get("mode"), "model": d.get("model"), "models": d.get("models"),
+                "gpu_type": d.get("gpu"), "gpu_count": d.get("gpu_count"),
+                **_prov_fields(provmap.get(a.provider_id) if a else None),
+                "still_exists": a is not None,
+            },
+        ))
+    return HistoryResponse(
+        kind="endpoint", count=len(jobs), has_more=has_more,
+        window={"since": _iso(s_dt), "until": _iso(u_dt)}, jobs=jobs,
+        note=("Serverless endpoint lifecycle events from the audit log "
+              "(status: created|deleted; survives endpoint deletion)."))

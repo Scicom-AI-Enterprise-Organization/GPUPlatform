@@ -22,6 +22,7 @@ const KINDS: { kind: string; path: string }[] = [
   { kind: "compute", path: "compute" },
   { kind: "inference", path: "inference" },
   { kind: "proxy", path: "proxy" },
+  { kind: "endpoint", path: "endpoints" },
 ];
 
 const PAGE = 1000; // gateway max

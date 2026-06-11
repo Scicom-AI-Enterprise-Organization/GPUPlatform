@@ -169,6 +169,7 @@ const PLATFORMS = [
 
 const APPS = [
   { value: "serverless", label: "Serverless", platform: "gpuplatform" },
+  { value: "endpoint", label: "Endpoints", platform: "gpuplatform" },
   { value: "benchmark", label: "Benchmark", platform: "gpuplatform" },
   { value: "autotrain", label: "Autotrain", platform: "gpuplatform" },
   { value: "compute", label: "Compute", platform: "gpuplatform" },
@@ -178,6 +179,7 @@ const APPS = [
 
 const APP_COLORS: Record<string, string> = {
   serverless: "#60a5fa",
+  endpoint: "#22d3ee",
   benchmark: "#f59e0b",
   autotrain: "#a78bfa",
   compute: "#34d399",
@@ -189,6 +191,7 @@ const APP_LABEL = (v: string) => APPS.find((a) => a.value === v)?.label ?? v;
 
 const KIND_TO_APP: Record<string, string> = {
   inference: "serverless",
+  endpoint: "endpoint",
   benchmark: "benchmark",
   training: "autotrain",
   compute: "compute",
@@ -527,7 +530,7 @@ const fmtTime = (d: Date | null): string =>
     : "—";
 
 const STATUS_COLOR = (s: string) =>
-  /complet|succe|stopped/.test(s)
+  /complet|succe|stopped|created/.test(s)
     ? "text-emerald-600 dark:text-emerald-400"
     : /fail|error|timeout|cancel/.test(s)
       ? "text-red-600 dark:text-red-400"
