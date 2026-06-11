@@ -676,6 +676,13 @@ export function AnalyticsView() {
     [recs, hasSummary],
   );
   const tableRecs = useMemo(() => recs.filter((r) => !r.synthetic), [recs]);
+  // Jobs explorer: discrete jobs and endpoint lifecycle only — per-request
+  // inference rows are noise there (the inference board covers the traffic);
+  // the timeline/nodes tabs keep them for node-occupancy.
+  const explorerRecs = useMemo(
+    () => tableRecs.filter((r) => r.app !== "serverless"),
+    [tableRecs],
+  );
 
   const totals = useMemo(() => {
     const spend = chartRecs.reduce((s, r) => s + r.costUsd, 0);
@@ -847,8 +854,8 @@ export function AnalyticsView() {
           return dir * a.status.localeCompare(b.status);
       }
     };
-    return [...tableRecs].sort(cmp);
-  }, [tableRecs, sortKey, sortAsc]);
+    return [...explorerRecs].sort(cmp);
+  }, [explorerRecs, sortKey, sortAsc]);
 
   const pageCount = Math.max(1, Math.ceil(sortedRecs.length / PAGE_SIZE));
   // Clamp rather than reset-in-effect: filter/sort changes can shrink the list.
@@ -1334,9 +1341,10 @@ export function AnalyticsView() {
               <div>
                 <h2 className="text-sm font-semibold">Jobs explorer</h2>
                 <p className="text-xs text-muted-foreground">
-                  Every job / request in the period — which GPU it used, on which node, when and
-                  for how long. Click a row for the full record. Records from before node
-                  reporting shipped show &ldquo;—&rdquo;.
+                  Every job in the period — endpoint creations, benchmarks, autotrain, compute,
+                  Slurm — which GPU it used, on which node, when and for how long. Inference API
+                  requests are not listed here (see the Serverless inference board). Click a row
+                  for the full record.
                 </p>
               </div>
               <Button variant="outline" size="sm" onClick={exportJobsCsv} disabled={loading}>
