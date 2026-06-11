@@ -120,8 +120,27 @@ type SlurmDailyJob = {
   clusterId?: string | null;
 };
 
+type SlurmRunningJob = {
+  slurmJobId: number | null;
+  jobName: string | null;
+  unixUsername: string | null;
+  state: string;
+  elapsedLabel: string;
+  partition: string | null;
+  nodeList: string | null;
+  gresDetail: string | null;
+  cudaVisibleDevices: string | null;
+  // v1.0.215+
+  clusterName?: string | null;
+  createdAt?: string;
+  gpus?: number;
+  id?: string;
+  clusterId?: string | null;
+};
+
 type SlurmReport = {
   summary: { totalJobs: number; gpuHours: number; cpuHours: number };
+  currentlyRunning?: SlurmRunningJob[];
   dailyJobHistory: {
     date: string;
     completed: number;
@@ -411,6 +430,39 @@ function normalizeInferenceSummary(rows: InferenceSummaryRow[]): Rec[] {
   }));
 }
 
+// Currently-running/pending Slurm jobs — same Rec shape so the running board
+// can alias + filter them like everything else (never mixed into the charts).
+function normalizeSlurmRunning(jobs: SlurmRunningJob[], baseUrl?: string): Rec[] {
+  return jobs.map((j, i) => {
+    const start = j.createdAt ? new Date(j.createdAt) : null;
+    return {
+      platform: "slurmui" as const,
+      app: "slurmjob",
+      id: j.slurmJobId != null ? String(j.slurmJobId) : `running-${i}`,
+      name: j.jobName,
+      user: j.unixUsername ?? "(unknown)",
+      date: start ? localDate(start) : "",
+      start,
+      end: null,
+      durationS: start ? (Date.now() - start.getTime()) / 1000 : null,
+      status: (j.state ?? "running").toLowerCase(),
+      costUsd: 0,
+      gpuHours: 0,
+      source: str(j.clusterName) ?? (j.partition ? `Slurm · ${j.partition}` : "Slurm"),
+      gpuModel: str(j.gresDetail),
+      gpuCount: typeof j.gpus === "number" && j.gpus > 0 ? j.gpus : null,
+      node: str(j.nodeList),
+      devices: str(j.cudaVisibleDevices),
+      raw: j as unknown as Record<string, unknown>,
+      count: 1,
+      href:
+        baseUrl && j.clusterId && j.id
+          ? `${baseUrl}/clusters/${j.clusterId}/jobs/${j.id}`
+          : null,
+    };
+  });
+}
+
 function normalizeSlurm(report: SlurmReport, baseUrl?: string): Rec[] {
   const recs: Rec[] = [];
   for (const day of report.dailyJobHistory ?? []) {
@@ -609,6 +661,7 @@ export function AnalyticsView() {
   const [gpuRecs, setGpuRecs] = useState<Rec[]>([]);
   const [summaryRecs, setSummaryRecs] = useState<Rec[]>([]);
   const [slurmRecs, setSlurmRecs] = useState<Rec[]>([]);
+  const [slurmRunning, setSlurmRunning] = useState<Rec[]>([]);
   const [slurmState, setSlurmState] = useState<"ok" | "unconfigured" | "error">("ok");
   const [truncated, setTruncated] = useState<string[]>([]);
 
@@ -657,12 +710,17 @@ export function AnalyticsView() {
 
     if (slurm.status === "fulfilled" && slurm.value.configured && "report" in slurm.value && slurm.value.report) {
       setSlurmRecs(normalizeSlurm(slurm.value.report, slurm.value.baseUrl));
+      setSlurmRunning(
+        normalizeSlurmRunning(slurm.value.report.currentlyRunning ?? [], slurm.value.baseUrl),
+      );
       setSlurmState("ok");
     } else if (slurm.status === "fulfilled" && !slurm.value.configured) {
       setSlurmRecs([]);
+      setSlurmRunning([]);
       setSlurmState("unconfigured");
     } else {
       setSlurmRecs([]);
+      setSlurmRunning([]);
       setSlurmState("error");
     }
     setLoading(false);
@@ -733,6 +791,27 @@ export function AnalyticsView() {
     () => tableRecs.filter((r) => r.app !== "serverless"),
     [tableRecs],
   );
+
+  // Running-now board: in-flight work from both platforms. GPU Platform side
+  // comes from the (period-bound, filtered) records; the Slurm side uses the
+  // report's live currentlyRunning list, aliased + filtered the same way.
+  const runningRows = useMemo(() => {
+    const active = /running|creating|provision|queued|pending/;
+    const gpu = tableRecs.filter(
+      (r) => r.app !== "serverless" && r.app !== "endpoint" && active.test(r.status),
+    );
+    const slurm = platforms.has("slurmui")
+      ? slurmRunning
+          .map((r) => {
+            const canon = aliasSource(aliases, r.node) ?? aliasSource(aliases, r.source);
+            return canon && canon !== r.source ? { ...r, source: canon } : r;
+          })
+          .filter((r) => !excludedSources.has(r.source))
+      : [];
+    return [...gpu, ...slurm].sort(
+      (a, b) => (b.start?.getTime() ?? 0) - (a.start?.getTime() ?? 0),
+    );
+  }, [tableRecs, slurmRunning, platforms, aliases, excludedSources]);
 
   const totals = useMemo(() => {
     const spend = chartRecs.reduce((s, r) => s + r.costUsd, 0);
@@ -1281,6 +1360,99 @@ export function AnalyticsView() {
         </div>
       </div>
 
+      </div>
+
+      {/* ── Running now ────────────────────────────────────────────────────── */}
+      <div className="rounded-lg border bg-card p-4">
+        <h2 className="mb-1 flex items-center gap-2 text-sm font-semibold">
+          Running now
+          {runningRows.length > 0 && (
+            <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+              {runningRows.length} active
+            </span>
+          )}
+        </h2>
+        <p className="mb-3 text-xs text-muted-foreground">
+          In-flight work across both platforms — running/pending Slurm jobs (live from Aura)
+          and active benchmark / autotrain / compute jobs.
+        </p>
+        {runningRows.length === 0 ? (
+          <div className="flex h-16 items-center justify-center text-sm text-muted-foreground">
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Nothing running right now."}
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="border-y bg-muted/40 text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2 text-left font-medium">App</th>
+                  <th className="px-3 py-2 text-left font-medium">Name</th>
+                  <th className="px-3 py-2 text-left font-medium">User</th>
+                  <th className="px-3 py-2 text-left font-medium">GPU source</th>
+                  <th className="px-3 py-2 text-left font-medium">Node</th>
+                  <th className="px-3 py-2 text-left font-medium">Devices</th>
+                  <th className="px-3 py-2 text-right font-medium">GPUs</th>
+                  <th className="px-3 py-2 text-left font-medium">Started</th>
+                  <th className="px-3 py-2 text-left font-medium">Elapsed</th>
+                  <th className="px-3 py-2 text-left font-medium">Status</th>
+                  <th className="w-8 px-2 py-2" />
+                </tr>
+              </thead>
+              <tbody>
+                {runningRows.map((r, i) => (
+                  <tr
+                    key={`run-${r.platform}-${r.id}-${i}`}
+                    className="cursor-pointer border-b last:border-0 hover:bg-muted/30"
+                    onClick={() => setDetailRec(r)}
+                  >
+                    <td className="whitespace-nowrap px-3 py-2">
+                      <span
+                        className="mr-1.5 inline-block h-2 w-2 rounded-full align-middle"
+                        style={{ background: APP_COLORS[r.app] ?? "#999" }}
+                      />
+                      {APP_LABEL(r.app)}
+                    </td>
+                    <td className="max-w-[14rem] truncate px-3 py-2" title={r.name ?? undefined}>
+                      {r.name ?? "—"}
+                    </td>
+                    <td className="max-w-[10rem] truncate px-3 py-2">{r.user}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{r.source}</td>
+                    <td className="max-w-[12rem] truncate px-3 py-2 font-mono">{r.node ?? "—"}</td>
+                    <td className="whitespace-nowrap px-3 py-2 font-mono">
+                      {r.devices != null ? `GPU ${r.devices}` : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums">{r.gpuCount ?? "—"}</td>
+                    <td className="whitespace-nowrap px-3 py-2 font-mono tabular-nums">
+                      {fmtTime(r.start)}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 tabular-nums">
+                      {fmtDur(
+                        r.start ? (Date.now() - r.start.getTime()) / 1000 : r.durationS,
+                      )}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 text-blue-500 dark:text-blue-400">
+                      {r.status}
+                    </td>
+                    <td className="px-2 py-2">
+                      {r.href && (
+                        <a
+                          href={r.href}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open in a new tab"
+                          className="text-muted-foreground hover:text-foreground"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" />
+                        </a>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* ── Serverless inference board ─────────────────────────────────────── */}
