@@ -82,6 +82,16 @@ type SlurmDailyJob = {
   unixUsername: string | null;
   state: string;
   partition: string | null;
+  // Granular fields added in SlurmUI v1.0.213 — absent from older deployments,
+  // so all optional and the normalizer degrades to day-granular rows.
+  clusterName?: string | null;
+  nodeList?: string | null;
+  gresDetail?: string | null;
+  cudaVisibleDevices?: string | null;
+  createdAt?: string;
+  endedAt?: string | null;
+  durationSec?: number;
+  gpus?: number;
 };
 
 type SlurmReport = {
@@ -284,10 +294,13 @@ function normalizeSlurm(report: SlurmReport): Rec[] {
   const recs: Rec[] = [];
   for (const day of report.dailyJobHistory ?? []) {
     const jobs = day.jobs ?? [];
-    // GPU-hours arrive per-day, not per-job — spread evenly so user totals
-    // still sum to the true daily figure.
+    // Older SlurmUI deployments report GPU-hours per-day only — spread evenly
+    // so user totals still sum to the true daily figure. Newer ones carry
+    // per-job durationSec + gpus, which the same day total is computed from.
     const perJobGpuH = jobs.length ? num(day.gpuHours) / jobs.length : 0;
     for (const j of jobs) {
+      const start = j.createdAt ? new Date(j.createdAt) : null;
+      const durS = typeof j.durationSec === "number" ? j.durationSec : null;
       recs.push({
         platform: "slurmui",
         app: "slurmjob",
@@ -295,17 +308,29 @@ function normalizeSlurm(report: SlurmReport): Rec[] {
         name: j.jobName,
         user: j.unixUsername ?? "(unknown)",
         date: day.date,
-        start: null, // the reports API is day-granular; no per-job timestamps
-        end: null,
-        durationS: null,
+        start,
+        end: j.endedAt
+          ? new Date(j.endedAt)
+          : start && durS != null
+            ? new Date(start.getTime() + durS * 1000)
+            : null,
+        durationS: durS,
         status: (j.state ?? "").toLowerCase(),
         costUsd: 0,
-        gpuHours: perJobGpuH,
-        source: j.partition ? `Slurm · ${j.partition}` : "Slurm",
-        gpuModel: null,
-        gpuCount: null,
-        node: null,
-        devices: null,
+        gpuHours:
+          durS != null && typeof j.gpus === "number"
+            ? (durS / 3600) * j.gpus
+            : perJobGpuH,
+        // Cluster name (TM-H20, …) matches the GPU Platform provider name for
+        // the same hardware, so both platforms' activity on one machine lands
+        // under a single GPU-source filter entry.
+        source:
+          str(j.clusterName) ??
+          (j.partition ? `Slurm · ${j.partition}` : "Slurm"),
+        gpuModel: str(j.gresDetail),
+        gpuCount: typeof j.gpus === "number" && j.gpus > 0 ? j.gpus : null,
+        node: str(j.nodeList),
+        devices: str(j.cudaVisibleDevices),
         raw: j as unknown as Record<string, unknown>,
       });
     }
@@ -492,9 +517,21 @@ export function AnalyticsView() {
 
   // ── filtered + aggregated views ────────────────────────────────────────────
 
+  // SlurmUI cluster names are lowercase ("tm-h20") while GPU Platform provider
+  // names are uppercase ("TM-H20") for the same hardware — fold Slurm sources
+  // onto the GPU Platform label case-insensitively so each machine is one
+  // filter entry.
+  const mergedSlurmRecs = useMemo(() => {
+    const byLower = new Map(gpuRecs.map((r) => [r.source.toLowerCase(), r.source]));
+    return slurmRecs.map((r) => {
+      const canon = byLower.get(r.source.toLowerCase());
+      return canon && canon !== r.source ? { ...r, source: canon } : r;
+    });
+  }, [gpuRecs, slurmRecs]);
+
   const allSources = useMemo(
-    () => [...new Set([...gpuRecs, ...slurmRecs].map((r) => r.source))].sort(),
-    [gpuRecs, slurmRecs],
+    () => [...new Set([...gpuRecs, ...mergedSlurmRecs].map((r) => r.source))].sort(),
+    [gpuRecs, mergedSlurmRecs],
   );
 
   const sourceSelected = useMemo(
@@ -504,13 +541,13 @@ export function AnalyticsView() {
 
   const recs = useMemo(
     () =>
-      [...gpuRecs, ...slurmRecs].filter(
+      [...gpuRecs, ...mergedSlurmRecs].filter(
         (r) =>
           platforms.has(r.platform) &&
           apps.has(r.app) &&
           !excludedSources.has(r.source),
       ),
-    [gpuRecs, slurmRecs, platforms, apps, excludedSources],
+    [gpuRecs, mergedSlurmRecs, platforms, apps, excludedSources],
   );
 
   const days = useMemo(() => eachDay(from, to), [from, to]);
@@ -1108,8 +1145,8 @@ export function AnalyticsView() {
             <h2 className="mb-1 text-sm font-semibold">Node timeline</h2>
             <p className="mb-3 text-xs text-muted-foreground">
               What ran on each node across the period — one bar per job, colored by app. Hover
-              for details, click for the full record. Slurm jobs are excluded (the reports API
-              has no per-job timestamps); busiest 14 nodes shown.
+              for details, click for the full record. Busiest 14 nodes shown; records without
+              node attribution (old jobs, older SlurmUI versions) are excluded.
             </p>
             {timelineNodes.length === 0 && !loading ? (
               <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
