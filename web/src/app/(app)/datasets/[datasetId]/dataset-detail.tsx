@@ -13,6 +13,7 @@ import { TransformationCard } from "./transformation-card";
 import { RowBrowser } from "./row-browser";
 import { UploadCard } from "./upload-card";
 import { SyncCard } from "./sync-card";
+import { DatasetFilesCard } from "./files-card";
 
 function fmtBytes(n?: number | null): string {
   if (!n && n !== 0) return "—";
@@ -69,10 +70,14 @@ export function DatasetDetail({
   const showRows = hasMetadata && !!preview;
   const showTransform = canTransform || canPack;
   const isUpload = dataset.kind === "upload";
+  // S3-backed datasets get a Files tab listing their objects (presigned downloads).
+  // hf / label datasets have no S3 backing → no tab.
+  const showFiles = !!dataset.storage_name && ["s3", "tts_packed", "upload"].includes(dataset.kind);
 
   const tabs = [
     showRows && { value: "rows", label: "Rows" },
     { value: "columns", label: "Columns" },
+    showFiles && { value: "files", label: "Files" },
     showTransform && { value: "transform", label: "Transform" },
     { value: "details", label: "Details" },
   ].filter(Boolean) as { value: string; label: string }[];
@@ -171,6 +176,12 @@ export function DatasetDetail({
               splitFields={dataset.split_fields}
             />
           </TabsContent>
+
+          {showFiles && (
+            <TabsContent value="files" className="!flex-none">
+              <DatasetFilesCard datasetId={dataset.id} split={searchParams.get("split")} />
+            </TabsContent>
+          )}
 
           {showTransform && (
             <TabsContent value="transform" className="!flex-none">

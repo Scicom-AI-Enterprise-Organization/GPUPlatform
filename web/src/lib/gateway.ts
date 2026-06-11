@@ -35,6 +35,7 @@ import type {
   TtsPackRequest,
   DatasetRecord,
   DatasetPreview,
+  DatasetFile,
   SyncDatasetRequest,
   GlobalEnvRecord,
   PolicyRole,
@@ -604,6 +605,12 @@ export const gateway = {
     request<{ ok: boolean; id: string }>(
       `/v1/datasets/${encodeURIComponent(id)}`,
       { method: "DELETE" },
+    ),
+  /** S3 objects backing a dataset (Files tab). `split` narrows a split-aware
+   * tts_packed dataset to that split's subdir. */
+  listDatasetFiles: (id: string, split?: string | null) =>
+    request<DatasetFile[]>(
+      `/v1/datasets/${encodeURIComponent(id)}/files${split ? `?split=${encodeURIComponent(split)}` : ""}`,
     ),
   getDatasetPreview: (
     id: string,

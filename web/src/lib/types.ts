@@ -432,6 +432,16 @@ export type TrainingFile = {
   download_url: string;
 };
 
+// An S3 object backing a dataset (Files tab). `name` is relative to the listed
+// prefix; `key` is the full S3 key.
+export type DatasetFile = {
+  name: string;
+  key: string;
+  size: number;
+  modified: string;
+  download_url: string;
+};
+
 export type TrainingGpu = {
   index: number;
   util: number;        // % GPU utilisation

@@ -370,6 +370,27 @@ def build_dataset(cfg: dict, work: str) -> tuple[str, str]:
     return sources_path, meta
 
 
+# Split subdir names treated as a held-out eval set (never trained on).
+_TEST_SPLIT_NAMES = ("test", "validation", "valid", "dev")
+
+
+def _split_subdirs(root: str) -> list[str]:
+    """Immediate subdirs of `root` that are themselves ChiniDataset shards (carry
+    their own index.json), sorted. A split-aware pack writes packed/<split>/ where
+    <split> is whatever the source rows' `split` field held — it defaults to 'train'
+    but can be 'default', 'test', a language code, … (the 'Pack for TTS' transform
+    of a single-split HF dataset commonly yields 'default'). The trainer must
+    therefore DISCOVER split names rather than assume a literal 'train'."""
+    try:
+        return sorted(
+            n for n in os.listdir(root)
+            if os.path.isdir(os.path.join(root, n))
+            and os.path.exists(os.path.join(root, n, "index.json"))
+        )
+    except OSError:
+        return []
+
+
 def _splits_in(meta_jsonl: str) -> list[str]:
     """Distinct splits in meta.jsonl, first-seen order (e.g. train then test).
     Falls back to ['train'] when rows carry no split."""
@@ -493,16 +514,33 @@ def run(cfg: dict) -> None:
     # held-out packed/test (not a sample of the training shards).
     def _has_index(d):
         return os.path.exists(os.path.join(d, "index.json"))
-    # Prefer the explicit split subdirs (train/ + held-out test/) whenever a
-    # train/ subdir exists. A split-aware pack may ALSO carry a flat combined
-    # index.json at the packed/ root (train+test mixed) — training on that would
-    # leak the test records, so the train/ split takes priority over the root.
-    train_dir = os.path.join(packed, "train") if _has_index(os.path.join(packed, "train")) else packed
-    split_test_dir = None
-    for _sp in ("test", "validation", "valid", "dev"):
-        if _has_index(os.path.join(packed, _sp)):
-            split_test_dir = os.path.join(packed, _sp)
-            break
+    subdirs = _split_subdirs(packed)
+    # Held-out eval split: first recognised test-ish subdir, if any.
+    split_test_dir = next(
+        (os.path.join(packed, s) for s in _TEST_SPLIT_NAMES if s in subdirs), None)
+    # Train split, in priority order:
+    #  1. an explicit train/ subdir — a split-aware pack may ALSO carry a flat
+    #     combined index.json at the packed/ root (train+test mixed); training on
+    #     that root would leak test records, so train/ takes priority over it;
+    #  2. a flat packed/index.json (legacy single-dir pack);
+    #  3. the sole non-test split subdir, WHATEVER it's named ('default', a lang
+    #     code, …) — this is the reuse-a-pre-packed-dataset case that otherwise
+    #     fell through to `packed` and died with "index.json not found".
+    # Falling back to `packed` when nothing matched preserves the clear
+    # FileNotFoundError downstream rather than masking a genuinely empty download.
+    if "train" in subdirs:
+        train_dir = os.path.join(packed, "train")
+    elif _has_index(packed):
+        train_dir = packed
+    else:
+        non_test = [s for s in subdirs if s not in _TEST_SPLIT_NAMES]
+        if non_test:
+            train_dir = os.path.join(packed, non_test[0])
+            if len(non_test) > 1:
+                log(f"[train] multiple non-test split subdirs {non_test}; "
+                    f"training on {non_test[0]!r}")
+        else:
+            train_dir = packed
     log(f"[train] train_dir={train_dir}" + (f"  held-out split={split_test_dir}" if split_test_dir else ""))
 
     # Fresh output dir. /share/out is reused across runs on a VM, and a leftover
@@ -603,12 +641,16 @@ def run(cfg: dict) -> None:
         if isinstance(test_ds, dict) and test_ds.get("packed_uri"):
             eval_dir = os.path.join(work, "eval_packed")
             _download_s3_prefix(test_ds, test_ds["packed_uri"], eval_dir)
-            # a split-aware separate test dataset → prefer its held-out split
+            # a split-aware separate test dataset → prefer a held-out test split,
+            # else fall back to its sole split subdir (e.g. a 'default'-named pack)
+            # so an arbitrarily-named single split still evals instead of silently
+            # finding no index.json at the prefix root.
             if not _has_index(eval_dir):
-                for _sp in ("test", "validation", "valid", "dev"):
-                    if _has_index(os.path.join(eval_dir, _sp)):
-                        eval_dir = os.path.join(eval_dir, _sp)
-                        break
+                esubs = _split_subdirs(eval_dir)
+                pick = next((s for s in _TEST_SPLIT_NAMES if s in esubs), None) \
+                    or (esubs[0] if esubs else None)
+                if pick:
+                    eval_dir = os.path.join(eval_dir, pick)
         elif cfg.get("test_from_split") and split_test_dir:
             eval_dir = split_test_dir
         try:

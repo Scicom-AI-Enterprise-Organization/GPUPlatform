@@ -30,7 +30,6 @@ jobs:
     outputs:
       gateway: ${{ steps.filter.outputs.gateway }}
       web: ${{ steps.filter.outputs.web }}
-      worker: ${{ steps.filter.outputs.worker }}
       helm: ${{ steps.filter.outputs.helm }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
@@ -49,9 +48,6 @@ jobs:
               - '.github/workflows/**'
             web:
               - 'web/**'
-              - '.github/workflows/**'
-            worker:
-              - 'worker-agent/**'
               - '.github/workflows/**'
             helm:
               - 'deploy/helm/**'
@@ -225,66 +221,6 @@ jobs:
             --tag "${IMAGE}:latest" \
             "${IMAGE}:${TAG}-amd64" \
             "${IMAGE}:${TAG}-arm64"
-
-  # ── PI worker (amd64 only) ────────────────────────────────────────────────
-  # vLLM is x86-only and PI's GPU hosts are x86, so this image is single-arch
-  # (an arm64 build would fail) and lives in ECR Public, not the private ECR.
-  build-worker:
-    name: build pi-worker (amd64)
-    runs-on: ubuntu-latest
-    needs: [helm, changes, meta]
-    if: needs.changes.outputs.worker == 'true'
-    env:
-      ECR_PUBLIC_ALIAS: o6x1g6b0
-      WORKER_REPO: serverlessgpu-pi-worker
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Configure AWS credentials (GitHub OIDC)
-        if: needs.meta.outputs.push == 'true'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ env.ECR_ROLE }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GitHubActions-Serverlessgpu
-
-      - name: Login to ECR Public
-        if: needs.meta.outputs.push == 'true'
-        uses: aws-actions/amazon-ecr-login@v2
-        with:
-          registry-type: public
-
-      - name: Build & maybe push PI worker image (amd64)
-        # Build context is repo root because Dockerfile.pi COPYs
-        # `worker-agent/...` and `entrypoint-pi.sh`.
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./worker-agent/Dockerfile.pi
-          platforms: linux/amd64
-          push: ${{ needs.meta.outputs.push == 'true' }}
-          tags: |
-            public.ecr.aws/${{ env.ECR_PUBLIC_ALIAS }}/${{ env.WORKER_REPO }}:${{ needs.meta.outputs.sha_short }}
-            public.ecr.aws/${{ env.ECR_PUBLIC_ALIAS }}/${{ env.WORKER_REPO }}:latest
-          cache-from: type=gha,scope=pi-worker
-          cache-to: type=gha,scope=pi-worker,mode=max
-          provenance: false
-
-      # Local dev fake-worker image (used by docker-compose). Never pushed —
-      # this just verifies it builds so `make compose-up` doesn't break for
-      # someone who pulled main fresh.
-      - name: Build local worker image (verify only, no push)
-        uses: docker/build-push-action@v6
-        with:
-          context: ./worker-agent
-          file: ./worker-agent/Dockerfile
-          push: false
-          tags: serverlessgpu-worker-local:test
-          cache-from: type=gha,scope=worker-local
-          cache-to: type=gha,scope=worker-local,mode=max
 
   # Spin up a real (tiny) k8s cluster, build the gateway image, side-load it,
   # `helm install` the chart, and verify pods reach Ready + /health and /ready

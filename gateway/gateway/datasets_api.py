@@ -553,6 +553,81 @@ async def get_dataset(
     )
 
 
+class DatasetFile(BaseModel):
+    name: str            # key relative to the listed prefix
+    key: str             # full S3 key
+    size: int = 0
+    modified: str = ""   # ISO8601
+    download_url: str    # presigned GET (1h)
+
+
+@router.get("/{dataset_id}/files", response_model=list[DatasetFile])
+async def list_dataset_files(
+    dataset_id: str,
+    split: Optional[str] = Query(None, description="for a split-aware tts_packed dataset, list only this split's subdir"),
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """List the S3 objects backing a dataset, with presigned download links. For a
+    split-aware tts_packed dataset, `?split=` narrows to that split's subdir.
+    Returns [] for datasets with no S3 backing (hf / label)."""
+    d = await _require_dataset(session, dataset_id, user)
+    storage = await session.get(Storage, d.storage_id) if d.storage_id else None
+    if storage is None or storage.kind != "s3":
+        return []
+    target, base = _s3_target_and_prefix(storage)
+
+    # Resolve the bucket + prefix to list under, from s3_metadata_uri (an absolute
+    # s3:// URI for tts_packed/transformed datasets, else a key under the storage
+    # prefix), falling back to the dataset's own datasets/<id>/ folder.
+    uri = (d.s3_metadata_uri or "").strip()
+    if uri.startswith("s3://"):
+        u = urlparse(uri)
+        if u.netloc:
+            target = dataclasses.replace(target, bucket=u.netloc)
+        listing = u.path.lstrip("/").rstrip("/")
+    elif uri:
+        listing = _join_key(base, uri)
+    else:
+        listing = _join_key(base, "datasets", dataset_id)
+
+    # If s3_metadata_uri points at a single metadata FILE (has an extension), list
+    # its parent dir instead. tts_packed's URI is already a prefix dir.
+    if listing and d.kind != "tts_packed":
+        last = listing.rsplit("/", 1)[-1]
+        if "." in last:
+            listing = listing.rsplit("/", 1)[0] if "/" in listing else ""
+
+    # Split-aware tts_packed: narrow to <prefix>/<split>/ when that subdir exists.
+    sp = (split or "").strip().strip("/")
+    if sp and d.kind == "tts_packed" and listing:
+        cand = f"{listing}/{sp}"
+        try:
+            if bench.s3_list(cand + "/", target=target):
+                listing = cand
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not listing:
+        return []
+    pfx = listing.rstrip("/") + "/"
+    out: list[DatasetFile] = []
+    try:
+        for obj in bench.s3_list(pfx, target=target):
+            key = obj["key"]
+            name = key[len(pfx):] if key.startswith(pfx) else key
+            out.append(DatasetFile(
+                name=name, key=key, size=obj.get("size", 0),
+                modified=obj.get("modified", ""),
+                download_url=bench.s3_presign_get(key, target=target),
+            ))
+            if len(out) >= 1000:  # cap — huge audio datasets can have many objects
+                break
+    except Exception as e:  # noqa: BLE001
+        logger.warning("dataset %s: file list failed: %s", dataset_id, e)
+    return out
+
+
 @router.patch("/{dataset_id}", response_model=DatasetRecord)
 async def update_dataset(
     dataset_id: str,
