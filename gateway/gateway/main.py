@@ -2657,6 +2657,9 @@ async def get_result(
         if row.status != status or row.output != output:
             row.status = status
             row.output = output
+            wm = _worker_meta_from_result(raw)
+            if wm is not None:
+                row.worker_meta = wm
             if status != "pending" and row.completed_at is None:
                 from datetime import datetime, timezone
                 row.completed_at = datetime.now(timezone.utc)
@@ -2796,7 +2799,8 @@ async def list_app_requests(
             raw = json.loads(blob)
             rstatus = raw.get("status")
             if rstatus and rstatus != "pending" and rstatus != r.status:
-                await _mirror_status_to_db(session, r.request_id, rstatus, raw.get("output"))
+                await _mirror_status_to_db(session, r.request_id, rstatus, raw.get("output"),
+                                           worker_meta=_worker_meta_from_result(raw))
                 r.status = rstatus
                 r.output = raw.get("output")
             continue
@@ -2819,8 +2823,21 @@ async def list_app_requests(
     return [_to_request_record(r) for r in rows]
 
 
+def _worker_meta_from_result(raw: dict) -> Optional[dict]:
+    """Node identity from a worker's Redis result blob — `node` (hostname, GPU
+    inventory, CUDA_VISIBLE_DEVICES, runpod_pod_id) plus the worker's machine_id.
+    None when the result never came from a worker (orphan/gateway-side failures)."""
+    if not isinstance(raw, dict):
+        return None
+    meta = dict(raw.get("node") or {})
+    if raw.get("machine_id"):
+        meta["machine_id"] = raw["machine_id"]
+    return meta or None
+
+
 async def _mirror_status_to_db(
-    session: AsyncSession, request_id: str, status: str, output: Any
+    session: AsyncSession, request_id: str, status: str, output: Any,
+    worker_meta: Optional[dict] = None,
 ) -> None:
     """Reflect a terminal Redis result back into the requests table so the
     request-history UI shows it as completed/failed instead of stuck queued.
@@ -2828,10 +2845,12 @@ async def _mirror_status_to_db(
     row = await session.get(ReqRow, request_id)
     if row is None:
         return
-    if row.status == status and row.output == output:
+    if row.status == status and row.output == output and (worker_meta is None or row.worker_meta == worker_meta):
         return
     row.status = status
     row.output = output
+    if worker_meta is not None:
+        row.worker_meta = worker_meta
     if row.completed_at is None and status != "pending":
         from datetime import datetime, timezone
         row.completed_at = datetime.now(timezone.utc)
@@ -3014,10 +3033,10 @@ async def _openai_endpoint(
                 raw = json.loads(blob)
                 status = raw.get("status")
                 if status == "completed":
-                    await _mirror_status_to_db(db_session, request_id, "completed", raw.get("output"))
+                    await _mirror_status_to_db(db_session, request_id, "completed", raw.get("output"), worker_meta=_worker_meta_from_result(raw))
                     return raw.get("output", {})
                 if status in ("timeout", "cancelled", "failed"):
-                    await _mirror_status_to_db(db_session, request_id, status, raw.get("output"))
+                    await _mirror_status_to_db(db_session, request_id, status, raw.get("output"), worker_meta=_worker_meta_from_result(raw))
                     raise HTTPException(status_code=504, detail=raw.get("output"))
             await asyncio.sleep(0.2)
         await _mirror_status_to_db(
@@ -3250,10 +3269,10 @@ async def _openai_audio_endpoint(
             raw = json.loads(blob)
             status = raw.get("status")
             if status == "completed":
-                await _mirror_status_to_db(db_session, request_id, "completed", raw.get("output"))
+                await _mirror_status_to_db(db_session, request_id, "completed", raw.get("output"), worker_meta=_worker_meta_from_result(raw))
                 return raw.get("output", {})
             if status in ("timeout", "cancelled", "failed"):
-                await _mirror_status_to_db(db_session, request_id, status, raw.get("output"))
+                await _mirror_status_to_db(db_session, request_id, status, raw.get("output"), worker_meta=_worker_meta_from_result(raw))
                 raise HTTPException(status_code=504, detail=raw.get("output"))
         await asyncio.sleep(0.2)
     await _mirror_status_to_db(

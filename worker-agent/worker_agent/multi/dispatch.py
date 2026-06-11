@@ -125,6 +125,7 @@ async def _error_result(rdb, request_id, machine_id, message, *, status="failed"
     out = {"error": message}
     if available is not None:
         out["available_models"] = available
-    result = {"status": status, "output": out, "machine_id": machine_id}
+    from worker_agent.main import node_meta
+    result = {"status": status, "output": out, "machine_id": machine_id, "node": node_meta()}
     await rdb.set(f"result:{request_id}", json.dumps(result), ex=3600)
     logger.warning("job %s → %s: %s", request_id, status, message)

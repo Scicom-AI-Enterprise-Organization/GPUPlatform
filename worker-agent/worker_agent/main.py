@@ -36,6 +36,47 @@ except Exception:  # noqa: BLE001 — older redis-py: socket timeouts + retry_on
     pass
 
 
+_NODE_META: dict[str, Any] | None = None
+
+
+def node_meta() -> dict[str, Any]:
+    """Best-effort identity of the node this worker runs on, stamped into every
+    result so the gateway can persist *where* a request was served (history API).
+    Probed once per process: hostname + provider pod id from env, GPU inventory
+    via nvidia-smi (never fatal — a CPU box / missing binary just omits GPUs)."""
+    global _NODE_META
+    if _NODE_META is not None:
+        return _NODE_META
+    import socket
+    import subprocess
+    meta: dict[str, Any] = {"hostname": socket.gethostname()}
+    if os.environ.get("RUNPOD_POD_ID"):
+        meta["runpod_pod_id"] = os.environ["RUNPOD_POD_ID"]
+    if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
+        meta["visible_devices"] = os.environ["CUDA_VISIBLE_DEVICES"]
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        gpus = [
+            [p.strip() for p in line.split(",")]
+            for line in out.splitlines() if line.strip()
+        ]
+        if gpus:
+            meta["gpu_name"] = gpus[0][0]
+            meta["gpu_count"] = len(gpus)
+            if len(gpus[0]) > 1:
+                meta["gpu_memory"] = gpus[0][1]
+            if len(gpus[0]) > 2:
+                meta["driver_version"] = gpus[0][2]
+    except Exception:  # noqa: BLE001 — nvidia-smi absent/broken: report without GPUs
+        pass
+    _NODE_META = meta
+    return meta
+
+
 async def _redis_ready(rdb, *, timeout_s: float = 120.0) -> None:
     """Wait for redis to answer, retrying transient blips with backoff. Crashing on
     a startup blip just spawns a replacement that hits the same blip (crash-loop) —
@@ -344,13 +385,14 @@ async def poll_loop(rdb, queue_key: str, machine_id: str, mode: str, model_id: s
 async def _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint="/v1/completions", base_url=None):
     try:
         output = await asyncio.wait_for(handle(mode, model_id, payload, endpoint, base_url=base_url), timeout=timeout_s)
-        result = {"status": "completed", "output": output, "machine_id": machine_id}
+        result = {"status": "completed", "output": output, "machine_id": machine_id, "node": node_meta()}
     except asyncio.TimeoutError:
         logger.warning("%s timed out after %ss", request_id, timeout_s)
         result = {
             "status": "timeout",
             "output": {"error": f"request exceeded timeout_s={timeout_s}"},
             "machine_id": machine_id,
+            "node": node_meta(),
         }
     await rdb.set(f"result:{request_id}", json.dumps(result), ex=3600)
     logger.info("wrote result for %s status=%s", request_id, result["status"])
@@ -431,7 +473,7 @@ async def _run_stream(rdb, request_id, machine_id, mode, model_id, payload, time
         status = "cancelled"
     else:
         status = "completed"
-    final = {"status": status, "output": last, "machine_id": machine_id, "streamed": True}
+    final = {"status": status, "output": last, "machine_id": machine_id, "streamed": True, "node": node_meta()}
     await rdb.set(f"result:{request_id}", json.dumps(final), ex=3600)
     logger.info("streamed %s status=%s", request_id, status)
 
