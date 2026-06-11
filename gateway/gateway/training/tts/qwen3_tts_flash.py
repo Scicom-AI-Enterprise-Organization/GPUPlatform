@@ -383,12 +383,26 @@ def main():
         model.print_trainable_parameters()
 
     # Split-aware packed dataset keeps train/ + test/ subdirs (StreamingDataset
-    # reads local/<split>/); a flat packed dir (legacy / single split) has shards
-    # at the root. Train on `train`, evaluate on `test` when present.
+    # reads local/<split>/); a flat packed dir (legacy) has shards at the root.
+    # Train on `train`, evaluate on `test` when present.
     _tf = data_args.train_file
     _has_train = os.path.isdir(os.path.join(_tf, 'train'))
     _has_test = os.path.isdir(os.path.join(_tf, 'test'))
-    dataset = DatasetFixed(_tf, split='train' if _has_train else None)
+    _has_flat = os.path.exists(os.path.join(_tf, 'index.json'))
+    # Resolve the training split: an explicit `train/` → a flat pack (index.json at
+    # the root) → else a single named split (e.g. `default`, produced when the source
+    # dataset had no split column). Without the last case a `default`-only pack hits
+    # "index.json not found at <packed>/index.json".
+    if _has_train:
+        _train_split = 'train'
+    elif _has_flat:
+        _train_split = None
+    else:
+        _subs = [d for d in sorted(os.listdir(_tf))
+                 if os.path.isdir(os.path.join(_tf, d))
+                 and os.path.exists(os.path.join(_tf, d, 'index.json'))]
+        _train_split = _subs[0] if _subs else None
+    dataset = DatasetFixed(_tf, split=_train_split)
     # "No test set" (--skip_eval) → never evaluate, even when a test/ split exists.
     eval_dataset = DatasetFixed(_tf, split='test') if (_has_test and not data_args.skip_eval) else None
     print('dataset', len(dataset), dataset[0]['attention_mask'].shape,
