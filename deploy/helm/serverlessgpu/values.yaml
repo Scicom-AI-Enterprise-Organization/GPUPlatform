@@ -57,6 +57,9 @@ ingress:
   host: api.serverlessgpu.example.com
   # Optional second hostname routed at the web UI (when web.enabled).
   webHost: ""
+  # Optional nginx max request body size (e.g. "5m"). Empty leaves the
+  # ingress-nginx default (1m). Applies to the whole Ingress (both hosts).
+  proxyBodySize: ""
   tls:
     enabled: true
     # If using cert-manager, this annotation is enough; certificate auto-issues.
