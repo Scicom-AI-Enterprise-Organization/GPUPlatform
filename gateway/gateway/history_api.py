@@ -36,7 +36,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import require_admin
-from .db import Provider, Request as ReqRow, User, get_session, get_user_by_username
+from .db import App, Provider, Request as ReqRow, User, get_session, get_user_by_username
 
 router = APIRouter(prefix="/v1/history", tags=["history"])
 
@@ -116,6 +116,27 @@ def _bench_meta(config_yaml: Optional[str]) -> dict[str, Any]:
     meta["expert_parallel"] = serve.get("enable_expert_parallel")
     meta["max_model_len"] = serve.get("max_model_len")
     return meta
+
+
+async def _prov_map(session: AsyncSession, prov_ids: set[Optional[str]]) -> dict[str, Provider]:
+    """Resolve provider_id → Provider row for one page of records, so every kind
+    can report which backend (vm | runpod | pi) and which registered account a
+    job ran on instead of an opaque provider_id."""
+    ids = {p for p in prov_ids if p}
+    if not ids:
+        return {}
+    rows = (await session.execute(select(Provider).where(Provider.id.in_(ids)))).scalars().all()
+    return {p.id: p for p in rows}
+
+
+def _prov_fields(prov: Optional[Provider]) -> dict[str, Any]:
+    """{provider_kind, provider_name} for a detail blob. provider_kind is None
+    (not "runpod") when no provider row resolves — the caller decides the
+    platform-default backend for its own kind."""
+    return {
+        "provider_kind": prov.kind if prov else None,
+        "provider_name": prov.name if prov else None,
+    }
 
 
 async def _owner_filter(session: AsyncSession, user: Optional[str], owner_id: Optional[int]) -> Optional[int]:
@@ -210,6 +231,87 @@ async def history_index(_: User = Depends(require_admin)):
         "params": ["since", "until", "status", "user", "owner_id", "limit", "offset", "order"],
         "note": "Admin only. inference/proxy default to the last "
                 f"{DEFAULT_WINDOW_DAYS}d when `since` is omitted.",
+        # Self-describing schema: every key a consumer can expect, per kind.
+        "fields": {
+            "envelope": {
+                "kind": "record type: benchmark | training | compute | inference | proxy",
+                "id": "platform id (bench-*/train-*/cmp-*/req-*/prx-*)",
+                "name": "human name; for inference/proxy this is the served model",
+                "user": "username of the owner ('(anonymous)' if none)",
+                "owner_id": "numeric user id",
+                "status": "lifecycle status (see each endpoint's note for its values)",
+                "created_at": "ISO-8601 submission time",
+                "started_at": "ISO-8601 execution start (null if never started)",
+                "ended_at": "ISO-8601 terminal time (null if still running)",
+                "duration_s": "ended_at - started_at (or created_at) in seconds",
+                "error_text": "failure reason when status is failed/error",
+                "detail": "kind-specific extras, see below",
+            },
+            "common_detail": {
+                "provider_kind": "backend the job ran on: vm | runpod | pi; null = platform-default cloud",
+                "provider_name": "display name of the registered provider account; null = platform default",
+                "provider_id": "id of the registered provider account",
+                "gpu_type": "GPU model requested/used (e.g. 'NVIDIA H100 80GB HBM3')",
+                "gpu_count": "number of GPUs",
+                "cost_per_hr": "hourly $ rate captured at spawn (null when unknown, e.g. own VM)",
+                "visible_devices": "CUDA_VISIBLE_DEVICES pin requested for the job (null = all GPUs)",
+            },
+            "benchmark_detail": {
+                "engine": "serving engine benchmarked (vllm | ...)",
+                "base_url": "external OpenAI-compatible URL when benchmarking an already-running server",
+                "backend": "vm | runpod | pi | external — where the run executed",
+                "tensor_parallel_size": "vLLM TP degree from the serve config",
+                "data_parallel_size": "vLLM DP degree from the serve config",
+                "expert_parallel": "whether expert parallelism was enabled",
+                "max_model_len": "context length the server was launched with",
+                "exit_code": "benchmaq process exit code",
+                "runpod_pod_id": "cloud pod id when spawned on RunPod",
+                "storage_id": "storage backend the results were synced to",
+                "result_json": "throughput/TTFT/TPOT/E2EL summary per concurrency",
+            },
+            "training_detail": {
+                "base_model": "HF model the finetune started from",
+                "task_type": "asr (Whisper) | tts (Qwen3+NeuCodec)",
+                "dataset_id": "training dataset",
+                "storage_id": "storage backend for logs/artifacts",
+                "runpod_pod_id": "cloud pod id when spawned on RunPod",
+                "exit_code": "trainer process exit code",
+                "result_json": "per-epoch metrics (wer/cer/loss), best epoch, artifact URIs",
+            },
+            "compute_detail": {
+                "image": "container image the pod booted",
+                "cloud_type": "SECURE | COMMUNITY (RunPod tier)",
+                "container_disk_gb": "ephemeral container disk size",
+                "volume_gb": "persistent volume size",
+                "public_ip": "node address SSH was exposed on (null until ready)",
+                "ssh_port": "SSH port on public_ip",
+                "runpod_pod_id": "cloud pod id when spawned on RunPod",
+            },
+            "inference_detail": {
+                "app_id": "endpoint the request was served by",
+                "model": "model name from the request payload",
+                "endpoint": "API path used (/v1/chat/completions, /v1/audio/transcriptions, ...)",
+                "is_stream": "whether the request was SSE streaming",
+                "prompt_tokens": "input tokens (best-effort from vLLM usage; null for most streams)",
+                "completion_tokens": "output tokens (best-effort; null for most streams)",
+                "requested_gpu_type": "GPU type the endpoint is configured to run on",
+                "requested_gpu_count": "GPUs per worker the endpoint requests",
+                "worker": ("node that actually served the request (null for pre-upgrade rows or "
+                           "requests that never reached a worker): {machine_id, hostname, gpu_name, "
+                           "gpu_count, gpu_memory, driver_version, visible_devices (CUDA_VISIBLE_DEVICES "
+                           "as seen by the worker), runpod_pod_id}"),
+            },
+            "proxy_detail": {
+                "endpoint_id": "proxy endpoint id",
+                "model": "model name requested",
+                "upstream": "upstream base URL the proxy forwarded to",
+                "status_code": "upstream HTTP status",
+                "latency_ms": "upstream latency",
+                "is_stream": "whether the request was streaming",
+                "prompt_tokens": "input tokens reported by the upstream",
+                "completion_tokens": "output tokens reported by the upstream",
+            },
+        },
     }
 
 
@@ -232,11 +334,7 @@ async def history_benchmarks(
     # VM benchmarks keep their GPU on the registered provider (set by its last
     # Test / nvidia-smi), NOT in config_yaml — resolve providers for this page so
     # VM runs report a gpu_type too, not just the RunPod path.
-    prov_ids = {r.provider_id for r in rows if r.provider_id}
-    provmap: dict[str, Provider] = {}
-    if prov_ids:
-        for p in (await session.execute(select(Provider).where(Provider.id.in_(prov_ids)))).scalars().all():
-            provmap[p.id] = p
+    provmap = await _prov_map(session, {r.provider_id for r in rows})
 
     jobs = []
     for r in rows:
@@ -257,6 +355,7 @@ async def history_benchmarks(
             duration_s=_duration_s(r.started_at or r.created_at, r.ended_at), error_text=r.error_text,
             detail={
                 **meta,
+                **_prov_fields(prov),
                 "backend": backend,
                 "visible_devices": r.visible_devices,
                 "exit_code": r.exit_code, "cost_per_hr": r.cost_per_hr, "provider_id": r.provider_id,
@@ -285,6 +384,7 @@ async def history_training(
         session, TrainingRun, since=s_dt, until=u_dt, status=status, owner=owner,
         limit=limit, offset=offset, order=order)
     umap = await _user_map(session, [r.owner_id for r in rows])
+    provmap = await _prov_map(session, {r.provider_id for r in rows})
     jobs = [JobRecord(
         kind="training", id=r.id, name=r.name, owner_id=r.owner_id,
         user=_username(umap, r.owner_id), status=r.status,
@@ -293,6 +393,9 @@ async def history_training(
         detail={
             "base_model": r.base_model, "task_type": r.task_type, "dataset_id": r.dataset_id,
             "gpu_type": r.gpu_type, "gpu_count": r.gpu_count, "cost_per_hr": r.cost_per_hr,
+            **_prov_fields(provmap.get(r.provider_id)),
+            "visible_devices": r.visible_devices, "storage_id": r.storage_id,
+            "runpod_pod_id": r.runpod_pod_id,
             "exit_code": r.exit_code, "provider_id": r.provider_id, "result_json": r.result_json,
         },
     ) for r in rows]
@@ -318,6 +421,7 @@ async def history_compute(
         session, ComputePod, since=s_dt, until=u_dt, status=status, owner=owner,
         limit=limit, offset=offset, order=order)
     umap = await _user_map(session, [r.owner_id for r in rows])
+    provmap = await _prov_map(session, {r.provider_id for r in rows})
     jobs = [JobRecord(
         kind="compute", id=r.id, name=r.name, owner_id=r.owner_id,
         user=_username(umap, r.owner_id), status=r.status,
@@ -326,6 +430,10 @@ async def history_compute(
         detail={
             "gpu_type": r.gpu_type, "gpu_count": r.gpu_count, "image": r.image,
             "cloud_type": r.cloud_type, "cost_per_hr": r.cost_per_hr, "provider_id": r.provider_id,
+            **_prov_fields(provmap.get(r.provider_id)),
+            "container_disk_gb": r.container_disk_gb, "volume_gb": r.volume_gb,
+            "public_ip": r.public_ip, "ssh_port": r.ssh_port,
+            "runpod_pod_id": r.runpod_pod_id,
         },
     ) for r in rows]
     return HistoryResponse(
@@ -356,6 +464,7 @@ async def history_inference(
     st = select(
         ReqRow.request_id, ReqRow.app_id, ReqRow.owner_id, ReqRow.endpoint,
         ReqRow.status, ReqRow.is_stream, ReqRow.created_at, ReqRow.completed_at,
+        ReqRow.worker_meta,
         model_col, tin_col, tout_col,
     ).where(ReqRow.created_at >= s_dt)
     if u_dt is not None:
@@ -370,16 +479,29 @@ async def history_inference(
     has_more = len(rows) > limit
     rows = rows[:limit]
     umap = await _user_map(session, [r.owner_id for r in rows])
-    jobs = [JobRecord(
-        kind="inference", id=r.request_id, name=r.model, owner_id=r.owner_id,
-        user=_username(umap, r.owner_id), status=r.status,
-        created_at=_iso(r.created_at), started_at=None, ended_at=_iso(r.completed_at),
-        duration_s=_duration_s(r.created_at, r.completed_at), error_text=None,
-        detail={
-            "app_id": r.app_id, "model": r.model, "endpoint": r.endpoint, "is_stream": r.is_stream,
-            "prompt_tokens": _int(r.tin), "completion_tokens": _int(r.tout),
-        },
-    ) for r in rows]
+    # The endpoint's configured GPU shape — what was *requested*; the worker_meta
+    # blob (stamped by the worker that served the request) is what *actually ran*.
+    app_ids = {r.app_id for r in rows if r.app_id}
+    appmap: dict[str, App] = {}
+    if app_ids:
+        for a in (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all():
+            appmap[a.app_id] = a
+    jobs = []
+    for r in rows:
+        a = appmap.get(r.app_id)
+        jobs.append(JobRecord(
+            kind="inference", id=r.request_id, name=r.model, owner_id=r.owner_id,
+            user=_username(umap, r.owner_id), status=r.status,
+            created_at=_iso(r.created_at), started_at=None, ended_at=_iso(r.completed_at),
+            duration_s=_duration_s(r.created_at, r.completed_at), error_text=None,
+            detail={
+                "app_id": r.app_id, "model": r.model, "endpoint": r.endpoint, "is_stream": r.is_stream,
+                "prompt_tokens": _int(r.tin), "completion_tokens": _int(r.tout),
+                "requested_gpu_type": a.gpu if a else None,
+                "requested_gpu_count": a.gpu_count if a else None,
+                "worker": r.worker_meta,
+            },
+        ))
     return HistoryResponse(
         kind="inference", count=len(jobs), has_more=has_more,
         window={"since": _iso(s_dt), "until": _iso(u_dt)}, jobs=jobs,

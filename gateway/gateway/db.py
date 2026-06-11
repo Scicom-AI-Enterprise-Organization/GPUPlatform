@@ -417,6 +417,11 @@ class Request(Base):
     payload: Mapped[dict] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     output: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # Where the request was served — written by the worker into its Redis result
+    # ({machine_id, hostname, gpu_name, gpu_count, gpu_memory, driver_version,
+    # visible_devices, runpod_pod_id}) and mirrored here alongside status/output.
+    # NULL for requests that never reached a worker (or pre-upgrade rows).
+    worker_meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     is_stream: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
@@ -642,6 +647,11 @@ async def init_db() -> None:
         # Per-benchmark HF token: a global-secret key aliased to HF_TOKEN at launch.
         await conn.execute(text(
             "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS hf_token_secret VARCHAR(128)"
+        ))
+        # Worker/node identity per inference request (history API): mirrored
+        # from the worker's Redis result alongside status/output.
+        await conn.execute(text(
+            "ALTER TABLE requests ADD COLUMN IF NOT EXISTS worker_meta JSON"
         ))
         # Providers table is created by Base.metadata.create_all above; nothing
         # to migrate yet since it landed on a fresh schema.
