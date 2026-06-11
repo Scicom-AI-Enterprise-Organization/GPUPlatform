@@ -662,6 +662,8 @@ export function AnalyticsView() {
   const [summaryRecs, setSummaryRecs] = useState<Rec[]>([]);
   const [slurmRecs, setSlurmRecs] = useState<Rec[]>([]);
   const [slurmRunning, setSlurmRunning] = useState<Rec[]>([]);
+  // Snapshot taken at data-load time — elapsed times are display-only.
+  const [nowTs, setNowTs] = useState(0);
   const [slurmState, setSlurmState] = useState<"ok" | "unconfigured" | "error">("ok");
   const [truncated, setTruncated] = useState<string[]>([]);
 
@@ -676,6 +678,7 @@ export function AnalyticsView() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setNowTs(Date.now());
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
     const [gpu, slurm, aliasRes] = await Promise.allSettled([
       fetch(
@@ -812,6 +815,7 @@ export function AnalyticsView() {
       (a, b) => (b.start?.getTime() ?? 0) - (a.start?.getTime() ?? 0),
     );
   }, [tableRecs, slurmRunning, platforms, aliases, excludedSources]);
+
 
   const totals = useMemo(() => {
     const spend = chartRecs.reduce((s, r) => s + r.costUsd, 0);
@@ -1426,9 +1430,7 @@ export function AnalyticsView() {
                       {fmtTime(r.start)}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 tabular-nums">
-                      {fmtDur(
-                        r.start ? (Date.now() - r.start.getTime()) / 1000 : r.durationS,
-                      )}
+                      {fmtDur(r.start && nowTs ? (nowTs - r.start.getTime()) / 1000 : r.durationS)}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-blue-500 dark:text-blue-400">
                       {r.status}
