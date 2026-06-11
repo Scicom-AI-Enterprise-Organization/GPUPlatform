@@ -2269,6 +2269,57 @@ async def rename_training_run(
     return _to_record(row, u.username if u else "?")
 
 
+async def _kill_and_clean_vm_run(row: TrainingRun) -> None:
+    """SSH to the run's VM, group-kill the detached trainer, and delete its
+    checkpoints/work dir + per-run staging + run files. The trainer is launched
+    with `setsid` so it SURVIVES the gateway task cancel — without this it keeps
+    training (holding the GPU) and its checkpoints pile up on /share. No-op for a
+    RunPod run (the pod teardown takes everything with it) or if SSH is unresolvable."""
+    prov = None
+    if row.provider_id:
+        async with session_factory()() as s:
+            prov = await s.get(Provider, row.provider_id)
+    if prov is None or prov.kind != "vm":
+        return
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        return
+    rlog, rpid, rsh = _remote_run_paths(row.id)
+    stage = f"/tmp/sgpu_run_{row.id}"
+    wd = ((row.result_json or {}).get("work_dir_remote") or "").strip()
+
+    def _do() -> None:
+        cli = _ssh_connect(*ssh)
+        try:
+            # The trainer logs "[trainer] work dir: <path>" early; recover it from the
+            # remote log if it wasn't persisted to result_json yet, so we delete the
+            # exact dir (never a glob that could hit a concurrent run).
+            workdir = wd
+            if not workdir:
+                try:
+                    m = re.search(r"\[trainer\] work dir: (\S+)", _ssh_capture(cli, f"cat {rlog} 2>/dev/null"))
+                    if m:
+                        workdir = m.group(1)
+                except Exception:  # noqa: BLE001
+                    pass
+            # Group-kill the detached run-script's session (it's a setsid session
+            # leader, so pid == pgid → -P reaches torchrun + its workers).
+            _ssh_capture(cli, (
+                f'P="$(cat {rpid} 2>/dev/null)"; '
+                f'if [ -n "$P" ]; then kill -TERM -"$P" 2>/dev/null || kill -TERM "$P" 2>/dev/null; '
+                f'sleep 2; kill -KILL -"$P" 2>/dev/null || kill -KILL "$P" 2>/dev/null || true; fi'))
+            targets = [t for t in [workdir, stage, rlog, rpid, rsh] if t]
+            if targets:
+                _ssh_capture(cli, "rm -rf " + " ".join(shlex.quote(t) for t in targets))
+        finally:
+            try:
+                cli.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    await asyncio.to_thread(_do)
+
+
 @router.delete("/{run_id}")
 async def delete_training_run(
     run_id: str,
@@ -2282,6 +2333,12 @@ async def delete_training_run(
     st = _RUN_STATE.pop(run_id, None)
     if st:
         await _terminate_pod(st["api_key"], st["runpod_id"])
+    else:
+        # VM run: kill the (detached) trainer + delete its checkpoints before the row goes.
+        try:
+            await _kill_and_clean_vm_run(row)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("delete %s: VM kill/cleanup failed: %s", run_id, e)
     await session.delete(row)
     await session.commit()
     return {"ok": True, "id": run_id}
@@ -2302,6 +2359,13 @@ async def terminate_training_run(
     st = _RUN_STATE.pop(run_id, None)
     if st:
         await _terminate_pod(st["api_key"], st["runpod_id"])
+    else:
+        # VM run: the detached trainer survives the task cancel — SSH-kill it and
+        # delete its checkpoints/work dir so it stops training + frees /share.
+        try:
+            await _kill_and_clean_vm_run(row)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("terminate %s: VM kill/cleanup failed: %s", run_id, e)
     row.status = "cancelled"
     row.ended_at = datetime.now(timezone.utc)
     await session.commit()
