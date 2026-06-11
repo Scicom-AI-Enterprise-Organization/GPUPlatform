@@ -596,6 +596,11 @@ def run(cfg: dict) -> None:
     if _max_steps > 0:
         cadence_args += ["--max_steps", str(_max_steps)]
         log(f"[train] step cap: max_steps={_max_steps} (overrides epochs)")
+    # "No test set" → tell qwen3 to skip eval even if the packed dir has a test/
+    # subdir (it otherwise force-evals on it).
+    if cfg.get("no_eval"):
+        cadence_args += ["--skip_eval", "true"]
+        log("[train] no_eval: evaluation disabled (ignoring any test/ split)")
     log(f"[train] cadence: eval={_evs} save={_svs}" + (f" every {cfg.get('eval_steps')} steps" if _evs == 'steps' else ""))
     last_loss = _run_loss([
         # venv python's torch.distributed.run (sys.executable is the venv python

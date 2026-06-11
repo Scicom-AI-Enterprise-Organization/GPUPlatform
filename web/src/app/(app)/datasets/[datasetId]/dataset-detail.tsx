@@ -2,7 +2,6 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { DatasetPreview, DatasetRecord, StorageRecord } from "@/lib/types";
@@ -59,6 +58,8 @@ export function DatasetDetail({
   hasMetadata,
   canTransform,
   canPack,
+  initialView,
+  initialSplit,
 }: {
   dataset: DatasetRecord;
   preview: DatasetPreview | null;
@@ -66,6 +67,8 @@ export function DatasetDetail({
   hasMetadata: boolean;
   canTransform: boolean;
   canPack: boolean;
+  initialView?: string;
+  initialSplit?: string | null;
 }) {
   const showRows = hasMetadata && !!preview;
   const showTransform = canTransform || canPack;
@@ -85,13 +88,15 @@ export function DatasetDetail({
   const defaultTab = showRows ? "rows" : isUpload && !hasMetadata ? "details" : valid[0];
 
   // Top-level tab lives in `?view=` (the Transform card owns `?tab=` for its own
-  // audio/pack sub-tabs — keep them separate). Update via history.replaceState so
-  // switching tabs doesn't re-run the page's server fetch (dataset + preview).
-  const searchParams = useSearchParams();
-  const [tab, setTabState] = useState(() => {
-    const v = searchParams.get("view");
-    return v && valid.includes(v) ? v : defaultTab;
-  });
+  // audio/pack sub-tabs — keep them separate). The initial value comes from the
+  // server (page.tsx reads `?view=`) as a prop, NOT useSearchParams() — reading
+  // the URL during the first client render shifts the React tree boundary vs the
+  // server, drifting Radix's useId seed → a hydration mismatch on the tabs.
+  // Updates use history.replaceState so switching tabs doesn't re-run the page's
+  // server fetch (dataset + preview).
+  const [tab, setTabState] = useState(() =>
+    initialView && valid.includes(initialView) ? initialView : defaultTab,
+  );
   const setTab = (v: string) => {
     setTabState(v);
     if (typeof window === "undefined") return;
@@ -179,7 +184,7 @@ export function DatasetDetail({
 
           {showFiles && (
             <TabsContent value="files" className="!flex-none">
-              <DatasetFilesCard datasetId={dataset.id} split={searchParams.get("split")} />
+              <DatasetFilesCard datasetId={dataset.id} split={initialSplit ?? null} />
             </TabsContent>
           )}
 

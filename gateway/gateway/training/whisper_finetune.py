@@ -512,14 +512,20 @@ def run(cfg: dict) -> None:
     log(f"[train] base_model={base_model} metric={metric_name} "
         f"max_epochs={cfg['max_epochs']} patience={cfg.get('patience', 0)}")
 
+    no_eval = bool(cfg.get("no_eval"))
     pairs = load_pairs(cfg["dataset"], work)
-    if cfg.get("test_dataset"):
+    if no_eval:
+        # "No test set" — train on everything, no held-out eval (no WER/CER, no
+        # best-checkpoint selection, no early stop). The final/last model is saved.
+        train_pairs, eval_pairs = pairs, []
+        log(f"[split] no_eval: training on all {len(train_pairs)} rows — evaluation disabled")
+    elif cfg.get("test_dataset"):
         train_pairs = pairs
         eval_pairs = load_pairs(cfg["test_dataset"], work)
         log(f"[split] separate test dataset: {len(train_pairs)} train / {len(eval_pairs)} eval")
     else:
         train_pairs, eval_pairs = split_pairs(pairs, cfg)
-    if not train_pairs or not eval_pairs:
+    if not train_pairs or (not no_eval and not eval_pairs):
         raise RuntimeError(
             f"need both train and eval examples (got {len(train_pairs)}/{len(eval_pairs)})"
         )
@@ -577,8 +583,8 @@ def run(cfg: dict) -> None:
     aug_prob = float(cfg.get("augment_prob", 0.5))
     train_ds = _LazyAsrDataset(train_pairs, processor, work,
                                augment_techniques=aug_techs, augment_prob=aug_prob)
-    eval_ds = _LazyAsrDataset(eval_pairs, processor, work)  # never augment eval
-    log(f"[trainer] {len(train_ds)} train / {len(eval_ds)} eval examples "
+    eval_ds = None if no_eval else _LazyAsrDataset(eval_pairs, processor, work)  # never augment eval
+    log(f"[trainer] {len(train_ds)} train / {0 if no_eval else len(eval_ds)} eval examples "
         f"— audio fetched + decoded lazily per item during training"
         + (f"; augment p={aug_prob}: {', '.join(aug_techs)}" if aug_techs else ""))
 
@@ -700,7 +706,7 @@ def run(cfg: dict) -> None:
         weight_decay=float(cfg.get("weight_decay", 0.0)),
         num_train_epochs=float(cfg["max_epochs"]),
         max_steps=(_max_steps if _max_steps > 0 else -1),
-        eval_strategy=_eval_strat,
+        eval_strategy=("no" if no_eval else _eval_strat),
         save_strategy=_eval_strat,
         eval_steps=_eval_steps,
         save_steps=_eval_steps,
@@ -708,9 +714,11 @@ def run(cfg: dict) -> None:
         generation_max_length=int(cfg.get("generation_max_length", 225)),
         fp16=(amp == "fp16"),
         bf16=(amp == "bf16"),
-        load_best_model_at_end=True,
-        metric_for_best_model=metric_name,
-        greater_is_better=False,
+        # No eval → no "best" to load (load_best needs eval==save strategy); keep
+        # the last checkpoint instead.
+        load_best_model_at_end=(not no_eval),
+        metric_for_best_model=(None if no_eval else metric_name),
+        greater_is_better=(None if no_eval else False),
         save_total_limit=1,
         logging_steps=eff_logging_steps,
         # Parallel lazy audio fetch/decode in __getitem__, overlapped with GPU.
@@ -751,7 +759,7 @@ def run(cfg: dict) -> None:
 
     callbacks: list = [MetricEmitter()]
     patience = int(cfg.get("patience", 0) or 0)
-    if patience > 0:
+    if patience > 0 and not no_eval:  # early stopping needs eval metrics
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience))
 
     trainer = Seq2SeqTrainer(
@@ -760,7 +768,7 @@ def run(cfg: dict) -> None:
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         data_collator=Collator(),
-        compute_metrics=compute_metrics,
+        compute_metrics=(None if no_eval else compute_metrics),
         processing_class=processor,
         callbacks=callbacks,
     )
@@ -770,14 +778,18 @@ def run(cfg: dict) -> None:
     stopped_early = epochs_ran < int(cfg["max_epochs"])
 
     # evaluate() is a collective op under DDP — EVERY rank must call it or the
-    # ranks deadlock. Save + upload + push happen on rank 0 only (below).
-    final = trainer.evaluate()
-    best = {
-        "epoch": epochs_ran,
-        "wer": final.get("eval_wer"),
-        "cer": final.get("eval_cer"),
-        "eval_loss": final.get("eval_loss"),
-    }
+    # ranks deadlock. Save + upload + push happen on rank 0 only (below). With
+    # no_eval there's no eval set, so every rank skips it (still collective-safe).
+    if no_eval:
+        best = {"epoch": epochs_ran, "wer": None, "cer": None, "eval_loss": None}
+    else:
+        final = trainer.evaluate()
+        best = {
+            "epoch": epochs_ran,
+            "wer": final.get("eval_wer"),
+            "cer": final.get("eval_cer"),
+            "eval_loss": final.get("eval_loss"),
+        }
     if not _IS_MAIN:
         return  # non-main DDP ranks: nothing more to do; rank 0 saves/uploads.
 

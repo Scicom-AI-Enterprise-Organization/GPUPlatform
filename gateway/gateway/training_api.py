@@ -984,7 +984,11 @@ async def run_training(redis, run_id: str) -> None:
             return v if v not in (None, "") else (os.environ.get(k) or None)
 
         cfg["dataset"] = await _resolve_dataset_spec(dataset_id, g("HF_TOKEN"))
-        if test_dataset_id and test_dataset_id != dataset_id:
+        if cfg.get("no_eval"):
+            # "No test set" — train on everything, no eval. Never resolve a test
+            # dataset or set test_from_split (the trainers force eval off).
+            await _push_log(redis, run_id, "[gateway] no_eval: training with no test set / no eval")
+        elif test_dataset_id and test_dataset_id != dataset_id:
             cfg["test_dataset"] = await _resolve_dataset_spec(test_dataset_id, g("HF_TOKEN"))
         elif test_dataset_id and test_dataset_id == dataset_id:
             # Train + eval on the SAME dataset → evaluate on its built-in
@@ -1259,20 +1263,26 @@ async def run_training(redis, run_id: str) -> None:
         cfg_path.write_text(json.dumps(cfg))
         cli = await asyncio.to_thread(_ssh_connect, host, int(port), user, key_filename)
         try:
-            remote_cfg = "/tmp/autotrain_config.json"
+            # Per-run staging dir so two runs on the SAME VM (e.g. an ASR + a TTS on
+            # disjoint GPUs, or two of the same kind) never clobber each other's
+            # config or worker code at a shared /tmp path — the second ship would
+            # otherwise win and the first trainer reads the wrong config/script
+            # (wrong model/dataset → crash). The TTS worker resolves TTS_DIR as a
+            # sibling (THIS_DIR/tts) and the sweep orchestrator resolves its worker
+            # as a sibling too, so everything must be co-located in `stage`.
+            stage = f"/tmp/sgpu_run_{run_id}"
+            remote_cfg = f"{stage}/config.json"
             await asyncio.to_thread(_ssh_put, cli, str(cfg_path), remote_cfg)
             base = _trainer_script_path().parent  # gateway/gateway/training/
-            # Ship the worker for the task type …
             if task_type == "tts":
-                await asyncio.to_thread(_ssh_put, cli, str(base / "tts_finetune.py"), "/tmp/tts_finetune.py")
-                # Ship the whole tts/ dir as a tarball — it now carries the
-                # vendored chinidataset package (Parquet streaming) alongside the
-                # convert/pack/train scripts.
-                await asyncio.to_thread(_ssh_put_dir_tar, cli, str(base / "tts"), "/tmp/tts")
-                worker_remote = "/tmp/tts_finetune.py"
+                await asyncio.to_thread(_ssh_put, cli, str(base / "tts_finetune.py"), f"{stage}/tts_finetune.py")
+                # The tts/ dir carries the vendored chinidataset package + the
+                # convert/pack/train scripts; ship it as a sibling of the worker.
+                await asyncio.to_thread(_ssh_put_dir_tar, cli, str(base / "tts"), f"{stage}/tts")
+                worker_remote = f"{stage}/tts_finetune.py"
             else:
-                await asyncio.to_thread(_ssh_put, cli, str(_trainer_script_path()), "/tmp/whisper_finetune.py")
-                worker_remote = "/tmp/whisper_finetune.py"
+                await asyncio.to_thread(_ssh_put, cli, str(_trainer_script_path()), f"{stage}/whisper_finetune.py")
+                worker_remote = f"{stage}/whisper_finetune.py"
             # … then either the worker directly, or the sweep orchestrator over it.
             # User OS env (HOME, cache dirs, …) exported before the trainer in
             # both sweep and single runs — absolute values mkdir'd. GPU pinning
@@ -1288,8 +1298,8 @@ async def run_training(redis, run_id: str) -> None:
                 raise RuntimeError(f"dependency setup (uv venv {venv_path}) failed (rc={drc})")
             # --- run phase: launch the trainer from the venv python ---
             if sweep_on:
-                await asyncio.to_thread(_ssh_put, cli, str(base / "sweep_runner.py"), "/tmp/sweep_runner.py")
-                remote_script = "/tmp/sweep_runner.py"
+                await asyncio.to_thread(_ssh_put, cli, str(base / "sweep_runner.py"), f"{stage}/sweep_runner.py")
+                remote_script = f"{stage}/sweep_runner.py"
                 env_prefix = ""  # the orchestrator pins each trial itself
                 launch = f"{venv_py} -u"
             else:
@@ -1327,7 +1337,12 @@ async def run_training(redis, run_id: str) -> None:
             # trailing @@RC), so a dead pidfile always implies @@RC is already in the
             # log. (Recording $! of `setsid` raced: setsid can exit before @@RC, so a
             # liveness check would see "dead" mid-run and mis-finalize the run.)
-            run_sh = f"#!/bin/bash\necho $$ > {rpid}\n{cmd}\necho \"@@RC:$?\"\n"
+            # @@RC captures the trainer's exit code BEFORE the per-run stage dir is
+            # removed (rlog/rpid live outside `stage`, so finalize-from-log still
+            # works). A killed process skips this — `stage` is tiny, so a leftover is
+            # harmless.
+            run_sh = (f"#!/bin/bash\necho $$ > {rpid}\n{cmd}\nRC=$?\n"
+                      f"echo \"@@RC:$RC\"\nrm -rf {stage} 2>/dev/null || true\n")
             await asyncio.to_thread(_ssh_put_bytes, cli, run_sh.encode(), rsh)
             await asyncio.to_thread(
                 _ssh_exec, cli,
@@ -1622,6 +1637,10 @@ class CreateTrainingRunRequest(BaseModel):
     save_strategy: str = "epoch"
     save_steps: int = 500
     patience: int = 0                  # 0 = no early stop
+    # Disable evaluation entirely: train on ALL data with no held-out test set, no
+    # eval loss / WER-CER, no best-checkpoint selection, no early stopping. The
+    # form's "No test set" option. test_dataset_id should be null when set.
+    no_eval: bool = False
     eval_split_pct: float = 10.0
     split_seed: int = 42
     batch_size: int = 8
@@ -1939,6 +1958,7 @@ async def create_training_run(
         "eval_strategy": body.eval_strategy, "eval_steps": body.eval_steps,
         "save_strategy": body.save_strategy, "save_steps": body.save_steps,
         "patience": body.patience, "eval_split_pct": body.eval_split_pct,
+        "no_eval": bool(body.no_eval),
         "split_seed": body.split_seed, "batch_size": body.batch_size,
         "grad_accum": body.grad_accum, "learning_rate": body.learning_rate,
         "warmup_steps": body.warmup_steps, "lr_scheduler_type": body.lr_scheduler_type,

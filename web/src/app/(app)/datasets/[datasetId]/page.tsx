@@ -9,7 +9,7 @@ export default async function DatasetDetailPage({
   searchParams,
 }: {
   params: Promise<{ datasetId: string }>;
-  searchParams: Promise<{ offset?: string; limit?: string; split?: string; speaker?: string }>;
+  searchParams: Promise<{ offset?: string; limit?: string; split?: string; speaker?: string; view?: string }>;
 }) {
   const { datasetId } = await params;
   const sp = await searchParams;
@@ -85,6 +85,8 @@ export default async function DatasetDetailPage({
           hasMetadata={hasMetadata}
           canTransform={canTransform}
           canPack={canPack}
+          initialView={sp.view}
+          initialSplit={split ?? null}
         />
       )}
     </div>

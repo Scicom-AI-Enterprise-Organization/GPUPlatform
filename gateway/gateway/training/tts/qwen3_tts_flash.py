@@ -192,6 +192,9 @@ class DataTrainingArguments:
     train_file: Optional[str] = field(
         default=None, metadata={
             "help": "The input training data file (a text file)."})
+    skip_eval: bool = field(
+        default=False, metadata={
+            "help": "Disable evaluation even if the packed dir has a test/ split (the 'No test set' option)."})
     block_size: Optional[int] = field(
         default=None,
         metadata={
@@ -386,9 +389,11 @@ def main():
     _has_train = os.path.isdir(os.path.join(_tf, 'train'))
     _has_test = os.path.isdir(os.path.join(_tf, 'test'))
     dataset = DatasetFixed(_tf, split='train' if _has_train else None)
-    eval_dataset = DatasetFixed(_tf, split='test') if _has_test else None
+    # "No test set" (--skip_eval) → never evaluate, even when a test/ split exists.
+    eval_dataset = DatasetFixed(_tf, split='test') if (_has_test and not data_args.skip_eval) else None
     print('dataset', len(dataset), dataset[0]['attention_mask'].shape,
-          '| eval', (len(eval_dataset) if eval_dataset is not None else 0))
+          '| eval', (len(eval_dataset) if eval_dataset is not None else 0),
+          '| skip_eval', data_args.skip_eval)
     def _evs_name(a):
         return str(getattr(a, "eval_strategy", None) or getattr(a, "evaluation_strategy", "") or "").split(".")[-1].lower()
     if eval_dataset is not None:

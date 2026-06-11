@@ -351,6 +351,9 @@ export type CreateTrainingRunRequest = {
   save_strategy?: "epoch" | "steps";
   save_steps?: number;
   patience?: number;
+  // "No test set" — train on everything with no eval / WER-CER / best-checkpoint /
+  // early stop. test_dataset_id should be null when set.
+  no_eval?: boolean;
   // Normalize text (case/punctuation) before WER/CER (Whisper-style). Off = raw.
   normalize_text?: boolean;
   eval_split_pct?: number;

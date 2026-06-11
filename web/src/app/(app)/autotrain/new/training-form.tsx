@@ -77,6 +77,7 @@ const TTS_BASE_MODELS = [
 const DEFAULT_TTS_BASE = "Scicom-intl/Multilingual-TTS-1.7B-Base";
 const CUSTOM = "__custom__";
 const AUTO_SPLIT = "__auto__";
+const NO_TEST = "__none__";   // "No test set" — train on everything, skip eval
 
 // A split-aware tts_packed dataset stores its splits at `split_fields._tts_pack.splits`
 // (e.g. {train, test}); such a dataset can serve as its OWN test set (the trainer
@@ -375,7 +376,7 @@ export function TrainingForm() {
         else if (r.base_model) { setModelChoice(CUSTOM); setCustomModel(r.base_model); }
         setName(r.name || (tt === "tts" ? "tts-finetune" : "whisper-finetune"));
         setDatasetId(r.dataset_id || "");
-        setTestDatasetId(r.test_dataset_id || AUTO_SPLIT);
+        setTestDatasetId(c.no_eval ? NO_TEST : (r.test_dataset_id || AUTO_SPLIT));
         if (c.eval_split_pct != null) setEvalSplitPct(num(c.eval_split_pct, 10));
         // training
         if (c.grad_accum != null) setGradAccum(num(c.grad_accum, 4));
@@ -677,7 +678,8 @@ export function TrainingForm() {
       dataset_id: datasetId,
       base_model: baseModel,
       task_type: taskType,
-      test_dataset_id: testDatasetId === AUTO_SPLIT ? null : testDatasetId,
+      test_dataset_id: testDatasetId === AUTO_SPLIT || testDatasetId === NO_TEST ? null : testDatasetId,
+      no_eval: testDatasetId === NO_TEST,
       eval_metric: evalMetric,
       normalize_text: normalizeText,
       max_epochs: maxEpochs,
@@ -860,6 +862,7 @@ export function TrainingForm() {
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value={AUTO_SPLIT}>— Auto-split from training set —</SelectItem>
+                <SelectItem value={NO_TEST}>— No test set (skip eval) —</SelectItem>
                 {/* TTS: a split-aware packed dataset can be its own test set (its
                     `test` subdir); other packed datasets are also selectable. */}
                 {pickDatasets
@@ -881,6 +884,13 @@ export function TrainingForm() {
                   {isTts ? "held out from the packed records for eval loss" : "uses a `split` column if present"}
                 </span>
               </div>
+            )}
+            {testDatasetId === NO_TEST && (
+              <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+                Trains on the full dataset with <span className="font-medium">no evaluation</span> —
+                no {isTts ? "eval loss" : "WER/CER"}, no best-checkpoint selection, no early stopping.
+                The final (last-step) model is saved.
+              </p>
             )}
             {testDatasetId === datasetId && datasetId !== "" && (
               <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
