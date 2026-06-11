@@ -120,6 +120,28 @@ HTTP_REQUEST_DURATION = Histogram(
     registry=_registry,
 )
 
+# Job OUTCOMES, as opposed to HTTP statuses: async requests (/run/{app_id})
+# return HTTP 200 at enqueue, so a job that later fails/times out (worker died,
+# queue eaten, model wake OOM) never shows as a 5xx in the HTTP counters. This
+# counts terminal job-status transitions instead — bumped wherever a Redis
+# result is mirrored into the requests table. Lazy mirroring means a failed job
+# is counted when first observed (result poll / queue page / orphan sweep), not
+# at the instant it failed.
+JOBS_TOTAL = Counter(
+    "serverless_jobs_total",
+    "Terminal inference job outcomes (completed / failed / timeout / cancelled)",
+    ["app_id", "status"],
+    registry=_registry,
+)
+
+
+def observe_job_outcome(app_id: str, status: str) -> None:
+    """Record one job reaching a terminal status. Caller guarantees this is a
+    real transition (old status != new status) so outcomes aren't double-counted."""
+    if status and status != "pending":
+        JOBS_TOTAL.labels(app_id=app_id or "", status=status).inc()
+
+
 # Route TEMPLATES excluded from the HTTP instrumentation — health/readiness probes
 # and the metrics scrapes themselves (global + per-app), which would otherwise
 # drown out real API traffic. Override with METRICS_IGNORE_PATHS (comma-separated
