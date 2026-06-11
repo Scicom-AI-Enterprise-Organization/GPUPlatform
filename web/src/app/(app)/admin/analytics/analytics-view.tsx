@@ -173,7 +173,6 @@ const APPS = [
   { value: "benchmark", label: "Benchmark", platform: "gpuplatform" },
   { value: "autotrain", label: "Autotrain", platform: "gpuplatform" },
   { value: "compute", label: "Compute", platform: "gpuplatform" },
-  { value: "proxy", label: "LLM Proxy", platform: "gpuplatform" },
   { value: "slurmjob", label: "Slurm jobs", platform: "slurmui" },
 ] as const;
 
@@ -183,7 +182,6 @@ const APP_COLORS: Record<string, string> = {
   benchmark: "#f59e0b",
   autotrain: "#a78bfa",
   compute: "#34d399",
-  proxy: "#f472b6",
   slurmjob: "#fbbf24",
 };
 
@@ -195,7 +193,6 @@ const KIND_TO_APP: Record<string, string> = {
   benchmark: "benchmark",
   training: "autotrain",
   compute: "compute",
-  proxy: "proxy",
 };
 
 function periodRange(period: Period): { from: Date; to: Date } {

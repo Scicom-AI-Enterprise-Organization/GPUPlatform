@@ -21,7 +21,6 @@ const KINDS: { kind: string; path: string }[] = [
   { kind: "training", path: "training" },
   { kind: "compute", path: "compute" },
   { kind: "inference", path: "inference" },
-  { kind: "proxy", path: "proxy" },
   { kind: "endpoint", path: "endpoints" },
 ];
 

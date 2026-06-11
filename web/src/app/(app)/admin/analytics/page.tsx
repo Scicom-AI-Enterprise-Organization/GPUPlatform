@@ -15,8 +15,8 @@ export default async function AnalyticsPage() {
         <header className="mb-6">
           <h1 className="text-2xl font-semibold tracking-tight">Analytics</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Platform-wide usage and spend across GPU Platform (serverless, benchmark,
-            autotrain, compute, LLM proxy) and SlurmUI jobs.
+            Platform-wide GPU usage and spend across GPU Platform (serverless, endpoints,
+            benchmark, autotrain, compute) and SlurmUI jobs.
           </p>
         </header>
         <AnalyticsView />
