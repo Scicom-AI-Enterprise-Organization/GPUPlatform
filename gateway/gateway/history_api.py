@@ -632,9 +632,17 @@ async def history_inference_summary(
 
 
 # ── endpoint lifecycle ───────────────────────────────────────────────────────
-# Serverless endpoint creations/deletions, read from the immutable audit log
-# (apps are hard-deleted, so the apps table can't serve history). One record
-# per lifecycle event; `status` is "created" | "deleted".
+# Serverless endpoint lifecycle, read from the immutable audit log (apps are
+# hard-deleted, so the apps table can't serve history). One record per event.
+
+_ENDPOINT_ACTIONS = {
+    "inference.create": "created",
+    "inference.delete": "deleted",
+    "inference.stop": "stopped",       # Kill all workers (autoscaler paused)
+    "inference.purge": "purged",       # hard reset of all worker state
+    "inference.restart": "restarted",  # Redeploy / resume
+}
+
 
 @router.get("/endpoints", response_model=HistoryResponse)
 async def history_endpoints(
@@ -646,7 +654,7 @@ async def history_endpoints(
 ):
     from .db import AuditLog
     s_dt, u_dt = _parse_dt(since, "since"), _parse_dt(until, "until")
-    st = select(AuditLog).where(AuditLog.action.in_(("inference.create", "inference.delete")))
+    st = select(AuditLog).where(AuditLog.action.in_(tuple(_ENDPOINT_ACTIONS)))
     if s_dt is not None:
         st = st.where(AuditLog.created_at >= s_dt)
     if u_dt is not None:
@@ -671,15 +679,34 @@ async def history_endpoints(
     for r in rows:
         d = r.details or {}
         a = appmap.get(r.resource_id or "")
+        # GPU placement: the audit snapshot wins (survives deletion); fall back
+        # to the live app row for events recorded before placement was logged.
+        live_member_idx = {
+            str(m.get("model")): m.get("gpu_indices")
+            for m in ((a.models if a else None) or [])
+            if isinstance(m, dict) and m.get("gpu_indices")
+        } or None
         jobs.append(JobRecord(
             kind="endpoint", id=str(r.id), name=r.resource_name, owner_id=r.actor_id,
-            user=r.actor_username, status="created" if r.action == "inference.create" else "deleted",
+            user=r.actor_username, status=_ENDPOINT_ACTIONS.get(r.action, r.action),
             created_at=_iso(r.created_at), started_at=None, ended_at=None,
             duration_s=None, error_text=None,
             detail={
                 "app_id": r.resource_id, "action": r.action,
-                "mode": d.get("mode"), "model": d.get("model"), "models": d.get("models"),
-                "gpu_type": d.get("gpu"), "gpu_count": d.get("gpu_count"),
+                "mode": d.get("mode") or (a.mode if a else None),
+                "model": d.get("model") or (a.model if a else None),
+                "models": d.get("models"),
+                "gpu_type": d.get("gpu") or (a.gpu if a else None),
+                "gpu_count": d.get("gpu_count") or (a.gpu_count if a else None),
+                # CUDA device ids: endpoint-level pin + per-member assignment
+                "visible_devices": d.get("visible_devices") or (a.visible_devices if a else None),
+                "member_gpu_indices": d.get("member_gpu_indices") or live_member_idx,
+                # worker counts for stop/purge/restart events
+                "workers": {
+                    k: d[k]
+                    for k in ("killed_workers", "drained_workers", "terminated", "purged", "paused")
+                    if k in d
+                } or None,
                 **_prov_fields(provmap.get(a.provider_id) if a else None),
                 "still_exists": a is not None,
             },
@@ -688,4 +715,5 @@ async def history_endpoints(
         kind="endpoint", count=len(jobs), has_more=has_more,
         window={"since": _iso(s_dt), "until": _iso(u_dt)}, jobs=jobs,
         note=("Serverless endpoint lifecycle events from the audit log "
-              "(status: created|deleted; survives endpoint deletion)."))
+              "(status: created|deleted|stopped|purged|restarted; survives endpoint "
+              "deletion; visible_devices / member_gpu_indices = CUDA device ids)."))
