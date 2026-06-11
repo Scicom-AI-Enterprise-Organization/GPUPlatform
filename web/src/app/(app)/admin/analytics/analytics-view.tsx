@@ -574,7 +574,16 @@ const STATUS_COLOR = (s: string) =>
       ? "text-red-600 dark:text-red-400"
       : "text-muted-foreground";
 
-type SortKey = "start" | "app" | "user" | "source" | "gpu" | "node" | "duration" | "status";
+type SortKey =
+  | "start"
+  | "app"
+  | "name"
+  | "user"
+  | "source"
+  | "gpu"
+  | "node"
+  | "duration"
+  | "status";
 
 // ── component ────────────────────────────────────────────────────────────────
 
@@ -883,6 +892,8 @@ export function AnalyticsView() {
           return dir * ((a.durationS ?? -1) - (b.durationS ?? -1));
         case "app":
           return dir * a.app.localeCompare(b.app);
+        case "name":
+          return dir * (a.name ?? "").localeCompare(b.name ?? "");
         case "user":
           return dir * a.user.localeCompare(b.user);
         case "source":
@@ -1398,6 +1409,7 @@ export function AnalyticsView() {
                   <tr>
                     {sortHeader("start", "Start")}
                     {sortHeader("app", "App")}
+                    {sortHeader("name", "Name")}
                     {sortHeader("user", "User")}
                     {sortHeader("source", "GPU source")}
                     {sortHeader("gpu", "GPU")}
@@ -1424,6 +1436,9 @@ export function AnalyticsView() {
                           style={{ background: APP_COLORS[r.app] ?? "#999" }}
                         />
                         {APP_LABEL(r.app)}
+                      </td>
+                      <td className="max-w-[14rem] truncate px-3 py-2" title={r.name ?? undefined}>
+                        {r.name ?? "—"}
                       </td>
                       <td className="max-w-[10rem] truncate px-3 py-2">{r.user}</td>
                       <td className="whitespace-nowrap px-3 py-2">{r.source}</td>
