@@ -26,6 +26,17 @@ from .db import Dataset, Storage, session_factory
 
 logger = logging.getLogger("gateway.dataset_transform")
 
+# Force HF downloads onto the plain HTTPS path. The accelerated backends —
+# `hf_transfer` (Rust multi-conn) and Xet (content-addressed dedup) — stall
+# mid-transfer on some networks: the dataset clone hangs at a few % (observed
+# wedging at ~14% of Scicom-intl/TM-Voice). Set here at import so a fresh
+# huggingface_hub import reads them; `_download` also patches the live constants
+# in case hf_hub was already imported by another module (its download path reads
+# `constants.HF_HUB_DISABLE_XET`, computed once at import — so env-only is too
+# late in a long-running gateway).
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
 _AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac")
 _META_NAMES = ("metadata", "train", "data")
 _META_EXTS = (".csv", ".tsv", ".parquet", ".jsonl", ".json")
@@ -293,6 +304,20 @@ def _download(
     shows no %) by polling the on-disk size against the repo's total size."""
     import threading
     from huggingface_hub import HfApi, snapshot_download
+
+    # Belt-and-suspenders to the import-time env set above: if hf_hub was already
+    # imported by another module, its constants are fixed, so patch them on the
+    # live module (the download path reads `constants.HF_HUB_DISABLE_XET`). Forces
+    # the plain HTTPS path and avoids the hf_transfer/Xet mid-transfer stall.
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    try:
+        import huggingface_hub.constants as _hfc
+        _hfc.HF_HUB_DISABLE_XET = True
+        if hasattr(_hfc, "HF_HUB_ENABLE_HF_TRANSFER"):
+            _hfc.HF_HUB_ENABLE_HF_TRANSFER = False
+    except Exception:  # noqa: BLE001 — best-effort; env vars still apply
+        pass
 
     os.makedirs(dest, exist_ok=True)
     total_bytes = 0
