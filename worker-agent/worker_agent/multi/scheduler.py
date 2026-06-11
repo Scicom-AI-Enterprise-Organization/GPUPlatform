@@ -27,6 +27,12 @@ from . import launcher, vllm_ctl, cleanup
 
 logger = logging.getLogger("worker-agent.scheduler")
 
+# Consecutive failed /health probes on a settled (awake/asleep) member before we
+# treat its engine as dead and force a relaunch. The monitor ticks every ~5s, so
+# this is ~15s of unresponsiveness — long enough to ride out a transient blip,
+# short enough that a wedged engine doesn't sit "awake" forever.
+HEALTH_FAIL_LIMIT = 3
+
 
 class ModelState(str, enum.Enum):
     QUEUED = "queued"        # waiting for an earlier wave to load + sleep (shares GPUs)
@@ -64,6 +70,7 @@ class ModelRuntime:
         self.log_path: str | None = None
         self.reason: str | None = None  # human cause when state == DEAD
         self.load_idx = 0  # position in the startup load order (for "in N queue")
+        self.health_fail = 0  # consecutive failed /health probes (monitor_loop)
 
     @property
     def base_url(self) -> str:
@@ -472,24 +479,59 @@ class MultiModelScheduler:
     # ---- monitoring + reporting + shutdown --------------------------------
 
     async def monitor_loop(self, drain_event: asyncio.Event) -> None:
-        """Relaunch crashed vLLM processes (bounded retries)."""
+        """Relaunch dead vLLM engines (bounded retries). Catches BOTH failure modes:
+
+        (a) the api_server PROCESS exits → `proc.returncode` is set; and
+        (b) the ENGINE dies while the api_server process lingers — e.g. a CUDA
+            OOM during `/wake_up` raises EngineDeadError and segfaults the
+            EngineCore + tp workers, but the parent keeps its socket open, so
+            `proc.returncode` stays None. `_wake` already flipped the member to
+            AWAKE (the /wake_up POST returned 200 before the async OOM), so a
+            returncode-only check leaves it stuck "awake" forever and the next
+            wake OOMs against the corpse. We actively probe /health on settled
+            (awake/asleep) members — it reflects engine liveness, not just the
+            socket — and force a relaunch after HEALTH_FAIL_LIMIT misses.
+        """
         while not drain_event.is_set():
             for rt in self._runtimes:
                 proc = rt.proc
-                if proc is not None and proc.returncode is not None and rt.state != ModelState.DEAD:
-                    logger.warning("vllm for %s died (rc=%s); relaunching", rt.member.model, proc.returncode)
-                    async with self._cond:
-                        rt.state = ModelState.LAUNCHING
-                        rt.inflight = 0
-                        rt.swapping = False
-                        rt.reason = None
-                        self._cond.notify_all()
-                    if rt.restart_count < 5:
-                        rt.restart_count += 1
-                        await self._launch_and_sleep(rt)
+                if proc is None or rt.state == ModelState.DEAD:
+                    continue
+                died = proc.returncode is not None
+                cause = f"rc={proc.returncode}"
+                # Engine-liveness probe — only on settled states (a wake/sleep/
+                # launch in flight is allowed to be briefly unresponsive).
+                if not died and rt.state in (ModelState.AWAKE, ModelState.ASLEEP):
+                    if await vllm_ctl.is_healthy(self._client, rt.base_url):
+                        rt.health_fail = 0
                     else:
-                        async with self._cond:
-                            self._mark_dead(rt)
+                        rt.health_fail += 1
+                        if rt.health_fail >= HEALTH_FAIL_LIMIT:
+                            died = True
+                            cause = f"engine unresponsive ({rt.health_fail}× /health)"
+                if not died:
+                    continue
+                logger.warning("vllm for %s died (%s); relaunching", rt.member.model, cause)
+                async with self._cond:
+                    rt.state = ModelState.LAUNCHING
+                    rt.inflight = 0
+                    rt.swapping = False
+                    rt.reason = None
+                    rt.health_fail = 0
+                    self._cond.notify_all()
+                # Engine wedged (process alive but unresponsive)? Group-kill it so
+                # it stops holding GPU memory before we reload — else the relaunch
+                # OOMs against the corpse. Harmless no-op once the process exited.
+                if proc.returncode is None:
+                    await launcher.terminate(proc)
+                    rt.proc = None
+                    rt.pgid = None
+                if rt.restart_count < 5:
+                    rt.restart_count += 1
+                    await self._launch_and_sleep(rt)
+                else:
+                    async with self._cond:
+                        self._mark_dead(rt)
             # Refresh the persisted engine groups: picks up tp workers that
             # spawned after launch and drops any engine that has since died.
             self._dump_pids()
