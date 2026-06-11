@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Eraser, Loader2, RotateCw, Trash2, X } from "lucide-react";
@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { AppRecord } from "@/lib/types";
+import { gateway, type AppStatus } from "@/lib/gateway";
 import { avatarFor } from "@/lib/avatar";
 import { deleteEndpoint, purgeWorkers, restartEndpoint } from "../actions";
 import { OverviewTab } from "./tabs/overview";
@@ -291,11 +292,27 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
 }
 
 function KpiBar({ app }: { app: AppRecord }) {
+  // Live worker + queue counts from /apps/{id}/status (was hardcoded "0").
+  const [status, setStatus] = useState<AppStatus | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const s = await gateway.getAppStatus(app.app_id);
+        if (!cancelled) setStatus(s);
+      } catch {
+        // best-effort; KpiBar falls back to 0 while unreachable
+      }
+    };
+    poll();
+    const id = setInterval(poll, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [app.app_id]);
+
   return (
     <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
-      <Kpi value="0" label="running workers" />
-      <Kpi value="0" label="jobs in progress" />
-      <Kpi value="0" label="jobs waiting in queue" />
+      <Kpi value={String(status?.workers ?? 0)} label="running workers" />
+      <Kpi value={String(status?.queue_len ?? 0)} label="requests waiting in queue" />
       <Kpi
         value={String(Math.min(1, app.autoscaler.max_containers))}
         label="active worker recommended"

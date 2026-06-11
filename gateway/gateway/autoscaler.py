@@ -34,6 +34,12 @@ logger = logging.getLogger("gateway.autoscaler")
 TICK_S = 1.0
 REGISTRATION_TOKEN_TTL_S = 1800  # 30 min — covers slow ECR pulls + vLLM model load
 PROVISION_COOLDOWN_S = 60  # back off this long after a provider provision failure
+# A freshly-provisioned worker that hasn't reported `ready` yet is still cold-
+# starting (image pull + vLLM install + model load) — its heartbeat blob can even
+# lapse mid-load. Don't reclaim it as "crashed" within this window; only past it
+# is a never-ready worker treated as genuinely dead. Aligns with the registration
+# token / launch-health budget.
+COLD_START_GRACE_S = float(os.environ.get("COLD_START_GRACE_S", str(REGISTRATION_TOKEN_TTL_S)))
 PROVISION_ERROR_TTL_S = 600  # how long the UI keeps showing the last error
 
 # Worker events ring: per-worker timeline of lifecycle events the UI shows
@@ -383,6 +389,15 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
                 }),
                 ex=REGISTRATION_TOKEN_TTL_S,
             )
+            # Provision timestamp in a sidecar (the heartbeat overwrites worker:*
+            # and shrinks its TTL to WORKER_TTL_S, so the original spawn time would
+            # be lost). Lets idle-teardown tell a still-cold-starting worker from a
+            # genuinely dead one — see COLD_START_GRACE_S below.
+            await rdb.set(
+                f"worker:{machine_id}:provisioned_at",
+                str(time.time()),
+                ex=REGISTRATION_TOKEN_TTL_S,
+            )
             # Cost lives in a sidecar key because heartbeat/register overwrites
             # the worker:* blob — we want the original spawn-time quote to stick
             # for the life of the worker.
@@ -409,6 +424,7 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
             # idle, READY victim; a worker whose heartbeat expired (crashed) is also
             # fair game (cleanup). If none qualify, wait for the next tick.
             victim = None
+            now = time.time()
             for mid in workers:
                 wblob = await rdb.get(f"worker:{mid}")
                 wst = None
@@ -419,6 +435,32 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
                         wst = None
                 if wst and wst != "ready":
                     continue  # provisioning / loading — let the cold start finish
+                ready_blob = await rdb.get(f"worker:{mid}:ready_since")
+                if ready_blob is None:
+                    # Never reported `ready` (its heartbeat blob may even have
+                    # lapsed mid-load). Don't kill it inside the cold-start window
+                    # — only reclaim it once it's blown past the grace as a dead
+                    # pod. This is what protects a scale-from-zero pod that's still
+                    # coming up to serve the very request that woke it.
+                    pblob = await rdb.get(f"worker:{mid}:provisioned_at")
+                    try:
+                        provisioned_at = float(pblob) if pblob else 0.0
+                    except (TypeError, ValueError):
+                        provisioned_at = 0.0
+                    if provisioned_at and (now - provisioned_at) < COLD_START_GRACE_S:
+                        continue
+                else:
+                    # Has been ready. Give it a full idle window *after* it became
+                    # servable before tearing down — idle_for is measured from the
+                    # waking request's arrival, which a long cold start can outrun,
+                    # so without this the pod is killed the instant it goes ready
+                    # (before the dispatcher can pick up the queued job → stranded).
+                    try:
+                        ready_since = float(ready_blob)
+                    except (TypeError, ValueError):
+                        ready_since = 0.0
+                    if ready_since and (now - ready_since) < idle_timeout_s:
+                        continue
                 inflight = 0
                 mblob = await rdb.get(f"worker:{mid}:models")
                 if mblob:
@@ -447,7 +489,11 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
                     _metrics.TERMINATE_TOTAL.labels(provider=provider.name, ok="false").inc()
                     await emit_worker_event(rdb, victim, app_id, "error", "terminate failed (provider error)")
                     raise
-                await rdb.delete(f"worker:{victim}")
+                await rdb.delete(
+                    f"worker:{victim}",
+                    f"worker:{victim}:ready_since",
+                    f"worker:{victim}:provisioned_at",
+                )
                 await rdb.srem(f"worker_index:{app_id}", victim)
                 logger.info("scaled down %s: -1 worker (%s, idle %.0fs)", app_id, victim, idle_for)
 

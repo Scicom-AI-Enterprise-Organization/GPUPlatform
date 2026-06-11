@@ -323,10 +323,14 @@ function WorkerRow({
           ) : (
             <span
               className="inline-flex items-center gap-1.5 rounded-full bg-status-down/15 px-2 py-0.5 text-xs text-status-down"
-              title="RunPod shows this pod, but its worker hasn't registered / stopped heartbeating to the gateway"
+              title={
+                gw
+                  ? "The gateway tracked this worker but it has stopped heartbeating (last contact > 60s ago) — its agent died or its tunnel to the gateway dropped. The pod is likely billing without serving; delete it."
+                  : "RunPod shows this pod running, but no worker ever registered to the gateway (bootstrap failed, or its reverse tunnel never came up)."
+              }
             >
               <span className="h-1.5 w-1.5 rounded-full bg-current" />
-              not registered
+              {gw ? "no heartbeat" : "not registered"}
             </span>
           )}
         </td>

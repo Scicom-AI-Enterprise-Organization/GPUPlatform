@@ -129,7 +129,7 @@ IGNORE_PATHS = {
     p.strip()
     for p in os.environ.get(
         "METRICS_IGNORE_PATHS",
-        "/metrics,/metrics/resources,/{app_id}/metrics,/health,/ready,/version,/",
+        "/metrics,/metrics/resources,/{app_id}/metrics,/proxy/{endpoint}/metrics,/health,/ready,/version,/",
     ).split(",")
     if p.strip()
 }
@@ -171,6 +171,59 @@ def render_app(app_id: str) -> bytes:
 
     reg = CollectorRegistry()
     reg.register(_AppFilter())
+    return generate_latest(reg)
+
+
+# ---- LLM-proxy metrics (the /proxy/{name} router) ---------------------------
+# The proxy funnels every request through _handle/_finish, not the OpenAI app
+# routes, so it gets its own series (labelled by the endpoint id, the model alias
+# the client sent, the upstream that actually served it, and the outcome).
+_PROXY_LABELS = ["proxy", "model", "upstream", "status"]
+PROXY_REQUESTS_TOTAL = Counter(
+    "proxy_requests_total",
+    "LLM-proxy requests routed, by endpoint / model alias / chosen upstream / outcome",
+    _PROXY_LABELS,
+    registry=_registry,
+)
+PROXY_REQUEST_DURATION = Histogram(
+    "proxy_request_duration_seconds",
+    "LLM-proxy request latency (gateway-observed, end to end)",
+    ["proxy", "model"],
+    buckets=_LATENCY_BUCKETS,
+    registry=_registry,
+)
+
+
+def observe_proxy(
+    proxy: str, model: str, upstream: str, status: str, duration_s: float | None = None
+) -> None:
+    """Record one proxied request: bump the outcome counter and, when the request
+    actually ran (latency known), observe its latency. `proxy` is the endpoint id;
+    `status` is the terminal state (completed / failed / cancelled / timeout / …)."""
+    PROXY_REQUESTS_TOTAL.labels(
+        proxy=proxy, model=model or "", upstream=upstream or "", status=status
+    ).inc()
+    if duration_s is not None:
+        PROXY_REQUEST_DURATION.labels(proxy=proxy, model=model or "").observe(duration_s)
+
+
+def render_proxy(proxy: str) -> bytes:
+    """Prometheus exposition of ONE proxy endpoint's metrics, filtered to its id —
+    served at `GET /proxy/{name}/metrics`, the sibling of `/{app_id}/metrics`."""
+
+    class _ProxyFilter:
+        def collect(self):
+            for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION):
+                for mf in metric.collect():
+                    samples = [s for s in mf.samples if s.labels.get("proxy") == proxy]
+                    if not samples:
+                        continue
+                    m = Metric(mf.name, mf.documentation, mf.type)
+                    m.samples = samples
+                    yield m
+
+    reg = CollectorRegistry()
+    reg.register(_ProxyFilter())
     return generate_latest(reg)
 
 

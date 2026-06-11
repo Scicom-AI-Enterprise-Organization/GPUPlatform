@@ -2160,6 +2160,7 @@ async def terminate_app_worker(
     await rdb.delete(
         f"worker:{machine_id}", f"worker:{machine_id}:models",
         f"register_token:{machine_id}", f"worker_cost:{machine_id}", f"worker:{machine_id}:drain",
+        f"worker:{machine_id}:ready_since", f"worker:{machine_id}:provisioned_at",
     )
     await rdb.srem(f"worker_index:{app_id}", machine_id)
     await emit_worker_event(
@@ -2727,6 +2728,7 @@ async def list_app_workers(
     rdb = request.app.state.redis
     mids = await rdb.smembers(f"worker_index:{app_id}")
     out: list[AppWorkerRow] = []
+    now = time.time()
     for mid in mids:
         blob = await rdb.get(f"worker:{mid}")
         if not blob:
@@ -2736,11 +2738,19 @@ async def list_app_workers(
             w = json.loads(blob)
         except (json.JSONDecodeError, TypeError):
             w = {}
+        last_seen = w.get("last_seen")
+        # `alive` = actually HEARTBEATING, not merely "the redis key exists". The
+        # autoscaler writes a `provisioning` placeholder at provision time with a
+        # longer TTL, so a worker that never phoned home (broken reverse tunnel,
+        # failed bootstrap) would otherwise read as alive+provisioning forever. A
+        # live worker refreshes worker:{mid} every <WORKER_TTL_S, so a stale
+        # last_seen means it isn't heartbeating.
+        fresh = isinstance(last_seen, (int, float)) and (now - last_seen) <= WORKER_TTL_S * 2
         out.append(AppWorkerRow(
             machine_id=mid,
             status=str(w.get("status") or "unknown"),
-            alive=True,
-            last_seen=w.get("last_seen"),
+            alive=bool(fresh),
+            last_seen=last_seen,
         ))
     return out
 
@@ -3353,6 +3363,15 @@ async def heartbeat(req: WorkerHeartbeatRequest, request: Request):
     }
     await rdb.set(f"worker:{req.machine_id}", json.dumps(state), ex=WORKER_TTL_S)
     await rdb.sadd(f"worker_index:{req.app_id}", req.machine_id)
+    # Stamp the instant this worker first became servable. The autoscaler uses it
+    # to give a freshly-ready worker a full idle window before teardown — a cold
+    # start can outlast idle_timeout_s, so a request that woke a scale-to-zero
+    # fleet would otherwise be stranded when the pod is torn down the moment it
+    # goes ready (idle_for is measured from request *arrival*, not fulfilment).
+    # set-once (NX): survives the loading→ready→loading churn of a model swap.
+    if req.status == "ready":
+        from .autoscaler import REGISTRATION_TOKEN_TTL_S as _REG_TTL
+        await rdb.set(f"worker:{req.machine_id}:ready_since", str(time.time()), ex=_REG_TTL, nx=True)
     # Multi-model workers report per-model state (awake/asleep/loading + queue);
     # stash it for the status endpoint. Longer TTL than the heartbeat so a missed
     # beat doesn't blank the UI.

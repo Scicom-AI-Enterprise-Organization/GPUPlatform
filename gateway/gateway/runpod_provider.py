@@ -235,6 +235,18 @@ class RunPodProvider(Provider):
                     "runpod reverse-tunnel: no provider-row SSH key — using an ephemeral "
                     "key (lost on restart; live pods won't reconnect). Use a provider row for prod."
                 )
+                # Debug aid: dump the ephemeral private key so an operator can SSH
+                # into the pod (same key that's in its authorized_keys) to read
+                # worker/vLLM logs directly. Only when explicitly opted in.
+                dump = os.environ.get("RUNPOD_TUNNEL_KEY_DUMP")
+                if dump:
+                    try:
+                        with open(dump, "w") as fh:
+                            fh.write(self.ssh_priv_pem)
+                        os.chmod(dump, 0o600)
+                        logger.warning("runpod reverse-tunnel: ephemeral private key written to %s (debug)", dump)
+                    except OSError as e:
+                        logger.warning("runpod reverse-tunnel: could not dump key to %s: %s", dump, e)
 
         # A RunPod pod is just a container/VM. In reverse-tunnel mode we boot a
         # STOCK image that runs sshd + applies PUBLIC_KEY on its own (the benchmark

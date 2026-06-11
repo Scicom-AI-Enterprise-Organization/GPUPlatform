@@ -362,6 +362,15 @@ async def _finish(request_id: str, status: str, *, status_code: Optional[int] = 
             row.error_text = error[:2048]
         row.completed_at = datetime.now(timezone.utc)
         await s.commit()
+        # Per-proxy Prometheus metric (served at GET /proxy/{name}/metrics).
+        try:
+            from . import metrics as _metrics
+            _metrics.observe_proxy(
+                row.endpoint_id, row.model, (upstream or row.upstream or ""), status,
+                (latency_ms / 1000.0) if latency_ms is not None else None,
+            )
+        except Exception:
+            pass
 
 
 # ---------- forwarding engine ------------------------------------------------
@@ -603,6 +612,18 @@ async def proxy_models(endpoint: str, user: User = Depends(current_user), sessio
     return {"object": "list", "data": [
         {"id": a, "object": "model", "created": 0, "owned_by": endpoint} for a in sorted(aliases)
     ]}
+
+
+@data_router.get("/proxy/{endpoint}/metrics")
+async def proxy_metrics(endpoint: str, session: AsyncSession = Depends(get_session)):
+    """Per-proxy Prometheus scrape — request counts + latency by model / upstream /
+    outcome for this endpoint. Public like `/{app_id}/metrics` (pure telemetry, no
+    secrets); the natural sibling of the serving URL `/proxy/{name}/v1/...`."""
+    from . import metrics as _metrics
+    ep = (await session.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint))).scalar_one_or_none()
+    if ep is None:
+        raise HTTPException(status_code=404, detail={"error": f"proxy endpoint '{endpoint}' not found"})
+    return Response(content=_metrics.render_proxy(ep.id), media_type="text/plain; version=0.0.4")
 
 
 # ---------- management routes (admin) ----------------------------------------
