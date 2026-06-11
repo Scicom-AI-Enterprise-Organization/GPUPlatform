@@ -40,6 +40,15 @@
         "current": { "text": "All", "value": "$__all" }
       },
       {
+        "name": "status",
+        "label": "HTTP status",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(serverless_http_requests_total, http_status)",
+        "refresh": 2, "includeAll": true, "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
         "name": "method",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
@@ -66,7 +75,7 @@
       "id": 1, "title": "Request rate", "type": "stat",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "x": 0, "y": 1, "w": 6, "h": 6 },
-      "targets": [{ "expr": "sum(rate(serverless_http_requests_total{route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "req/s", "refId": "A" }],
+      "targets": [{ "expr": "sum(rate(serverless_http_requests_total{http_status=~\"$status\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "req/s", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
       "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
     },
@@ -74,7 +83,7 @@
       "id": 2, "title": "Error rate (4xx+5xx)", "type": "stat",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "x": 6, "y": 1, "w": 6, "h": 6 },
-      "targets": [{ "expr": "sum(rate(serverless_http_requests_total{http_status=~\"[45]..\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])) / clamp_min(sum(rate(serverless_http_requests_total{route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])), 1e-9)", "legendFormat": "error", "refId": "A" }],
+      "targets": [{ "expr": "sum(rate(serverless_http_requests_total{http_status=~\"[45]..\",http_status=~\"$status\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])) / clamp_min(sum(rate(serverless_http_requests_total{http_status=~\"$status\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])), 1e-9)", "legendFormat": "error", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.01 }, { "color": "red", "value": 0.05 }] } }, "overrides": [] },
       "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
     },
@@ -90,7 +99,7 @@
       "id": 4, "title": "5xx rate", "type": "stat",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "x": 18, "y": 1, "w": 6, "h": 6 },
-      "targets": [{ "expr": "sum(rate(serverless_http_requests_total{http_status=~\"5..\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "5xx", "refId": "A" }],
+      "targets": [{ "expr": "sum(rate(serverless_http_requests_total{http_status=~\"5..\",http_status=~\"$status\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "5xx", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "reqps", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.001 }] } }, "overrides": [] },
       "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
     },
@@ -98,7 +107,15 @@
       "id": 5, "title": "Request rate by status code", "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "x": 0, "y": 7, "w": 12, "h": 9 },
-      "targets": [{ "expr": "sum by (http_status) (rate(serverless_http_requests_total{route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "{{http_status}}", "refId": "A" }],
+      "targets": [{ "expr": "sum by (http_status) (rate(serverless_http_requests_total{http_status=~\"$status\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "{{http_status}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "id": 104, "title": "Job outcomes (terminal status, async-aware)", "type": "timeseries",
+      "description": "Terminal inference JOB outcomes (serverless_jobs_total). Catches failures the HTTP panels miss: /run/{app_id} returns 200 at enqueue, so a job that later fails/times out never shows as a 5xx. Counted when the gateway first observes the terminal Redis result (lazy mirror).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 9 },
+      "targets": [{ "expr": "sum by (status) (rate(serverless_jobs_total{app_id=~\"$app_id\"}[$__rate_interval]))", "legendFormat": "{{status}}", "refId": "A" }],
       "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "stacking": { "mode": "normal" } } }, "overrides": [] }
     },
     {
@@ -120,7 +137,7 @@
       "id": 10, "title": "Top endpoints by request rate", "type": "table",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "x": 0, "y": 17, "w": 12, "h": 9 },
-      "targets": [{ "expr": "topk(25, sum by (route) (rate(serverless_http_requests_total{route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "refId": "A", "format": "table", "instant": true }],
+      "targets": [{ "expr": "topk(25, sum by (route) (rate(serverless_http_requests_total{http_status=~\"$status\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "refId": "A", "format": "table", "instant": true }],
       "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
       "options": { "showHeader": true }
     },
@@ -128,7 +145,7 @@
       "id": 11, "title": "Top error endpoints (4xx / 5xx)", "type": "table",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "x": 12, "y": 17, "w": 12, "h": 9 },
-      "targets": [{ "expr": "topk(25, sum by (route, http_status) (rate(serverless_http_requests_total{http_status=~\"[45]..\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "refId": "A", "format": "table", "instant": true }],
+      "targets": [{ "expr": "topk(25, sum by (route, http_status) (rate(serverless_http_requests_total{http_status=~\"[45]..\",http_status=~\"$status\",route=~\"$endpoint\",method=~\"$method\",app_id=~\"$app_id\"}[$__rate_interval])))", "refId": "A", "format": "table", "instant": true }],
       "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
       "options": { "showHeader": true }
     },

@@ -2655,6 +2655,8 @@ async def get_result(
             raise HTTPException(status_code=403, detail="not your request")
         # Mirror redis -> postgres so the row reflects current state, surviving Redis TTL.
         if row.status != status or row.output != output:
+            if row.status != status:
+                metrics.observe_job_outcome(row.app_id, status)
             row.status = status
             row.output = output
             wm = _worker_meta_from_result(raw)
@@ -2847,6 +2849,8 @@ async def _mirror_status_to_db(
         return
     if row.status == status and row.output == output and (worker_meta is None or row.worker_meta == worker_meta):
         return
+    if row.status != status:
+        metrics.observe_job_outcome(row.app_id, status)
     row.status = status
     row.output = output
     if worker_meta is not None:
