@@ -19,6 +19,7 @@ env:
   ECR_ROLE: arn:aws:iam::865626945255:role/AIES-Serverlessgpu-ECRAccessRole
   ECR_REGISTRY: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com
   PUBLIC_GATEWAY_URL: https://serverlessgpu.aies.scicom.dev
+  INTERNAL_GATEWAY_URL: http://serverlessgpu-gateway.serverlessgpu.svc.cluster.local
 
 jobs:
   # Detect which components changed so image builds can be skipped when
@@ -175,6 +176,7 @@ jobs:
           push: ${{ needs.meta.outputs.push == 'true' }}
           build-args: |
             NEXT_PUBLIC_GATEWAY_URL=${{ env.PUBLIC_GATEWAY_URL }}
+            NEXT_PUBLIC_GATEWAY_INTERNAL_URL=${{ env.INTERNAL_GATEWAY_URL }}
             APP_VERSION=${{ needs.meta.outputs.sha_short }}
           tags: ${{ env.ECR_REGISTRY }}/${{ matrix.repo }}:${{ needs.meta.outputs.sha_short }}-${{ matrix.suffix }}
           cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.suffix }}

@@ -13,6 +13,11 @@ COPY . .
 # `http://localhost:8080` fallback.
 ARG NEXT_PUBLIC_GATEWAY_URL=https://serverlessgpu.aies.scicom.dev
 ENV NEXT_PUBLIC_GATEWAY_URL=${NEXT_PUBLIC_GATEWAY_URL}
+# In-cluster gateway Service URL. Baked at build time (like the public URL above)
+# so the "Run a job" cards can offer a Public/Internal snippet toggle. Empty =
+# toggle hidden. A runtime pod env can't drive this — NEXT_PUBLIC_* is inlined here.
+ARG NEXT_PUBLIC_GATEWAY_INTERNAL_URL=http://serverlessgpu-gateway.serverlessgpu.svc.cluster.local
+ENV NEXT_PUBLIC_GATEWAY_INTERNAL_URL=${NEXT_PUBLIC_GATEWAY_INTERNAL_URL}
 # Release version (git short-sha) shown in the sidebar footer. CI passes
 # `--build-arg APP_VERSION=<sha>`; defaults to "dev" for local builds.
 ARG APP_VERSION=dev
