@@ -568,7 +568,7 @@ const fmtTime = (d: Date | null): string =>
     : "—";
 
 const STATUS_COLOR = (s: string) =>
-  /complet|succe|stopped|created/.test(s)
+  /complet|succe|done|finish|stopped|created/.test(s)
     ? "text-emerald-600 dark:text-emerald-400"
     : /fail|error|timeout|cancel/.test(s)
       ? "text-red-600 dark:text-red-400"
