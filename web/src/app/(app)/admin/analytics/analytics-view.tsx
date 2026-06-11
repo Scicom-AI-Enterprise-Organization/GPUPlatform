@@ -216,13 +216,48 @@ const str = (x: unknown): string | null =>
 const obj = (x: unknown): Record<string, unknown> =>
   x && typeof x === "object" ? (x as Record<string, unknown>) : {};
 
+// Canonical GPU-source labels. Both platforms name the same physical machine
+// differently — GPU Platform by provider name (tm-2-l40s-vm1, TM-H20), Slurm
+// by cluster (tm, tm-l40s) or node hostname (scicom-gpu1-<hash>) — so fold
+// every raw name onto one label via longest-prefix match (case-insensitive).
+// Unmatched names pass through unchanged; extend this list as machines are
+// added.
+const SOURCE_ALIASES: [prefix: string, label: string][] = [
+  // Slurm node hostnames (hash-suffixed, hence prefix match)
+  ["scicom-gpu1", "TM-VM1"],
+  ["scicom-gpu2", "TM-VM2"],
+  ["scicom-ucc", "TM-UCC"],
+  // GPU Platform provider names for the same VMs
+  ["tm-2-l40s-vm1", "TM-VM1"],
+  ["tm-2-l40s-vm2", "TM-VM2"],
+  // Slurm cluster names
+  ["tm-h20", "TM-H20"],
+  ["tm-l40s", "TM-UCC"], // single-node cluster on the UCC machine
+  ["primeintellect", "Prime Intellect GPUs"],
+  ["prime-intellect", "Prime Intellect GPUs"],
+];
+
+function aliasSource(name: string | null): string | null {
+  if (!name) return null;
+  const n = name.toLowerCase();
+  let best: string | null = null;
+  let bestLen = -1;
+  for (const [prefix, label] of SOURCE_ALIASES) {
+    if (n.startsWith(prefix) && prefix.length > bestLen) {
+      best = label;
+      bestLen = prefix.length;
+    }
+  }
+  return best;
+}
+
 // "Where did this run" label, best-effort from the history detail blob:
 // a registered provider's name wins (TM-H20, TM-VM1, …); otherwise the cloud
 // kind; for serverless/proxy requests fall back to the serving worker's GPU
 // or the endpoint's configured GPU.
 function gpuSource(detail: Record<string, unknown>): string {
   const provName = str(detail?.provider_name);
-  if (provName) return provName;
+  if (provName) return aliasSource(provName) ?? provName;
   const kind = str(detail?.provider_kind) ?? str(detail?.backend);
   if (kind === "pi") return "Prime Intellect GPUs";
   if (kind === "runpod") return "RunPod GPUs";
@@ -321,10 +356,13 @@ function normalizeSlurm(report: SlurmReport): Rec[] {
           durS != null && typeof j.gpus === "number"
             ? (durS / 3600) * j.gpus
             : perJobGpuH,
-        // Cluster name (TM-H20, …) matches the GPU Platform provider name for
-        // the same hardware, so both platforms' activity on one machine lands
-        // under a single GPU-source filter entry.
+        // Attribute to the machine, not the Slurm cluster: alias the first
+        // node in nodeList (a Slurm "tm" cluster spans TM-VM1 + TM-VM2), then
+        // the cluster name, so activity aggregates with GPU Platform jobs on
+        // the same hardware.
         source:
+          aliasSource(str(j.nodeList)?.split(",")[0] ?? null) ??
+          aliasSource(str(j.clusterName)) ??
           str(j.clusterName) ??
           (j.partition ? `Slurm · ${j.partition}` : "Slurm"),
         gpuModel: str(j.gresDetail),
