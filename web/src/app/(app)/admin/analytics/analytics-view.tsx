@@ -72,9 +72,23 @@ type HistoryJob = {
   detail: Record<string, unknown>;
 };
 
+type InferenceSummaryRow = {
+  date: string;
+  app_id: string | null;
+  user: string | null;
+  status: string;
+  provider_kind: string | null;
+  provider_name: string | null;
+  count: number;
+};
+
 type GpuPlatformPayload = {
   kinds: Record<string, HistoryJob[]>;
   truncated: string[];
+  // Exact per-day creation counts for inference (gateway GROUP BY). When
+  // present, charts/totals count serverless from this instead of the capped
+  // raw records (which then only feed the Jobs explorer).
+  inference_summary?: InferenceSummaryRow[] | null;
 };
 
 type SlurmDailyJob = {
@@ -135,6 +149,8 @@ type Rec = {
   node: string | null; // hostname / machine id / pod id
   devices: string | null; // CUDA_VISIBLE_DEVICES on the node
   raw: Record<string, unknown>; // full record for the detail drawer
+  count: number; // 1 for real records; >1 for aggregated summary rows
+  synthetic?: boolean; // true = aggregate row (charts only, never in tables)
 };
 
 // ── filters ──────────────────────────────────────────────────────────────────
@@ -324,10 +340,38 @@ function normalizeGpuPlatform(payload: GpuPlatformPayload): Rec[] {
           str(detail.pod_id),
         devices: str(worker.visible_devices) ?? str(detail.visible_devices),
         raw: j as unknown as Record<string, unknown>,
+        count: 1,
       });
     }
   }
   return recs;
+}
+
+// Aggregate inference counts → synthetic chart records (one per
+// day×app×user×status group, weighted by `count`).
+function normalizeInferenceSummary(rows: InferenceSummaryRow[]): Rec[] {
+  return rows.map((r, i) => ({
+    platform: "gpuplatform" as const,
+    app: "serverless",
+    id: `summary-${i}`,
+    name: r.app_id,
+    user: r.user ?? "(unknown)",
+    date: r.date,
+    start: null,
+    end: null,
+    durationS: null,
+    status: r.status,
+    costUsd: 0,
+    gpuHours: 0,
+    source: gpuSource({ provider_kind: r.provider_kind, provider_name: r.provider_name }),
+    gpuModel: null,
+    gpuCount: null,
+    node: null,
+    devices: null,
+    raw: r as unknown as Record<string, unknown>,
+    count: r.count,
+    synthetic: true,
+  }));
 }
 
 function normalizeSlurm(report: SlurmReport): Rec[] {
@@ -372,6 +416,7 @@ function normalizeSlurm(report: SlurmReport): Rec[] {
         node: str(j.nodeList),
         devices: str(j.cudaVisibleDevices),
         raw: j as unknown as Record<string, unknown>,
+        count: 1,
       });
     }
   }
@@ -512,6 +557,7 @@ export function AnalyticsView() {
 
   const [loading, setLoading] = useState(true);
   const [gpuRecs, setGpuRecs] = useState<Rec[]>([]);
+  const [summaryRecs, setSummaryRecs] = useState<Rec[]>([]);
   const [slurmRecs, setSlurmRecs] = useState<Rec[]>([]);
   const [slurmState, setSlurmState] = useState<"ok" | "unconfigured" | "error">("ok");
   const [truncated, setTruncated] = useState<string[]>([]);
@@ -530,7 +576,7 @@ export function AnalyticsView() {
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
     const [gpu, slurm, aliasRes] = await Promise.allSettled([
       fetch(
-        `/api/analytics/gpuplatform?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}`,
+        `/api/analytics/gpuplatform?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}&tz=${encodeURIComponent(tz)}`,
         { cache: "no-store" },
       ).then((r) => (r.ok ? (r.json() as Promise<GpuPlatformPayload>) : Promise.reject(r.status))),
       fetch(
@@ -548,9 +594,15 @@ export function AnalyticsView() {
 
     if (gpu.status === "fulfilled") {
       setGpuRecs(normalizeGpuPlatform(gpu.value));
+      setSummaryRecs(
+        gpu.value.inference_summary
+          ? normalizeInferenceSummary(gpu.value.inference_summary)
+          : [],
+      );
       setTruncated(gpu.value.truncated);
     } else {
       setGpuRecs([]);
+      setSummaryRecs([]);
     }
 
     if (slurm.status === "fulfilled" && slurm.value.configured && "report" in slurm.value && slurm.value.report) {
@@ -577,7 +629,7 @@ export function AnalyticsView() {
   // are separate machines), then fold remaining Slurm sources onto GPU
   // Platform labels case-insensitively ("tm-h20" cluster ↔ "TM-H20" provider).
   const allRecs = useMemo(() => {
-    const aliased = [...gpuRecs, ...slurmRecs].map((r) => {
+    const aliased = [...gpuRecs, ...summaryRecs, ...slurmRecs].map((r) => {
       const canon = aliasSource(aliases, r.node) ?? aliasSource(aliases, r.source);
       return canon && canon !== r.source ? { ...r, source: canon } : r;
     });
@@ -590,7 +642,7 @@ export function AnalyticsView() {
       const canon = byLower.get(r.source.toLowerCase());
       return canon && canon !== r.source ? { ...r, source: canon } : r;
     });
-  }, [gpuRecs, slurmRecs, aliases]);
+  }, [gpuRecs, summaryRecs, slurmRecs, aliases]);
 
   const allSources = useMemo(
     () => [...new Set(allRecs.map((r) => r.source))].sort(),
@@ -615,19 +667,29 @@ export function AnalyticsView() {
 
   const days = useMemo(() => eachDay(from, to), [from, to]);
 
+  // Charts/totals: when the exact inference summary is available, raw
+  // serverless records are excluded (they'd double-count, and they're capped).
+  // Tables/timeline: real records only, never the synthetic aggregates.
+  const hasSummary = summaryRecs.length > 0;
+  const chartRecs = useMemo(
+    () => (hasSummary ? recs.filter((r) => r.synthetic || r.app !== "serverless") : recs),
+    [recs, hasSummary],
+  );
+  const tableRecs = useMemo(() => recs.filter((r) => !r.synthetic), [recs]);
+
   const totals = useMemo(() => {
-    const spend = recs.reduce((s, r) => s + r.costUsd, 0);
-    const gpuHours = recs.reduce((s, r) => s + r.gpuHours, 0);
-    const users = new Set(recs.map((r) => r.user));
+    const spend = chartRecs.reduce((s, r) => s + r.costUsd, 0);
+    const gpuHours = chartRecs.reduce((s, r) => s + r.gpuHours, 0);
+    const users = new Set(chartRecs.map((r) => r.user));
     return {
       spend,
       gpuHours,
       dailyAvg: days.length ? spend / days.length : 0,
       activeUsers: users.size,
       days: days.length,
-      activity: recs.length,
+      activity: chartRecs.reduce((s, r) => s + r.count, 0),
     };
-  }, [recs, days]);
+  }, [chartRecs, days]);
 
   const activeApps = useMemo(
     () => APPS.filter((a) => apps.has(a.value) && platforms.has(a.platform)),
@@ -637,14 +699,14 @@ export function AnalyticsView() {
   const chartData = useMemo(() => {
     const byDay = new Map<string, Record<string, number>>();
     for (const d of days) byDay.set(d, {});
-    for (const r of recs) {
+    for (const r of chartRecs) {
       const row = byDay.get(r.date);
       if (!row) continue;
-      row[r.app] = (row[r.app] ?? 0) + 1;
+      row[r.app] = (row[r.app] ?? 0) + r.count;
       row.__spend = (row.__spend ?? 0) + r.costUsd;
     }
     return days.map((d) => ({ date: d.slice(5), ...byDay.get(d) }));
-  }, [recs, days]);
+  }, [chartRecs, days]);
 
   // Donut: share of activity by app over the period.
   const appPie = useMemo(
@@ -652,11 +714,13 @@ export function AnalyticsView() {
       activeApps
         .map((a) => ({
           name: a.label,
-          value: recs.filter((r) => r.app === a.value).length,
+          value: chartRecs
+            .filter((r) => r.app === a.value)
+            .reduce((s, r) => s + r.count, 0),
           fill: APP_COLORS[a.value],
         }))
         .filter((s) => s.value > 0),
-    [recs, activeApps],
+    [chartRecs, activeApps],
   );
 
   // Feeds the CSV export.
@@ -664,20 +728,20 @@ export function AnalyticsView() {
     () =>
       days
         .map((d) => {
-          const dayRecs = recs.filter((r) => r.date === d);
+          const dayRecs = chartRecs.filter((r) => r.date === d);
           const perApp: Record<string, number> = {};
-          for (const r of dayRecs) perApp[r.app] = (perApp[r.app] ?? 0) + 1;
+          for (const r of dayRecs) perApp[r.app] = (perApp[r.app] ?? 0) + r.count;
           return {
             date: d,
             spend: dayRecs.reduce((s, r) => s + r.costUsd, 0),
             gpuHours: dayRecs.reduce((s, r) => s + r.gpuHours, 0),
             users: new Set(dayRecs.map((r) => r.user)).size,
             perApp,
-            total: dayRecs.length,
+            total: dayRecs.reduce((s, r) => s + r.count, 0),
           };
         })
         .reverse(),
-    [recs, days],
+    [chartRecs, days],
   );
 
   // Jobs explorer: sorted + paged
@@ -703,8 +767,8 @@ export function AnalyticsView() {
           return dir * a.status.localeCompare(b.status);
       }
     };
-    return [...recs].sort(cmp);
-  }, [recs, sortKey, sortAsc]);
+    return [...tableRecs].sort(cmp);
+  }, [tableRecs, sortKey, sortAsc]);
 
   const pageCount = Math.max(1, Math.ceil(sortedRecs.length / PAGE_SIZE));
   // Clamp rather than reset-in-effect: filter/sort changes can shrink the list.
@@ -714,21 +778,21 @@ export function AnalyticsView() {
   // GPU hours grouped by source and by GPU model
   const gpuHoursBySource = useMemo(() => {
     const m = new Map<string, { gpuHours: number; jobs: number; spend: number }>();
-    for (const r of recs) {
+    for (const r of chartRecs) {
       const e = m.get(r.source) ?? { gpuHours: 0, jobs: 0, spend: 0 };
       e.gpuHours += r.gpuHours;
-      e.jobs += 1;
+      e.jobs += r.count;
       e.spend += r.costUsd;
       m.set(r.source, e);
     }
     return [...m.entries()]
       .map(([source, v]) => ({ source, ...v }))
       .sort((a, b) => b.gpuHours - a.gpuHours);
-  }, [recs]);
+  }, [chartRecs]);
 
   const gpuHoursByModel = useMemo(() => {
     const m = new Map<string, { gpuHours: number; jobs: number }>();
-    for (const r of recs) {
+    for (const r of tableRecs) {
       const key = r.gpuModel ?? "(not recorded)";
       const e = m.get(key) ?? { gpuHours: 0, jobs: 0 };
       e.gpuHours += r.gpuHours;
@@ -738,12 +802,12 @@ export function AnalyticsView() {
     return [...m.entries()]
       .map(([model, v]) => ({ model, ...v }))
       .sort((a, b) => b.gpuHours - a.gpuHours);
-  }, [recs]);
+  }, [tableRecs]);
 
   // Node timeline: only records with real timestamps and a known node.
   const timelineNodes = useMemo(() => {
     const byNode = new Map<string, Rec[]>();
-    for (const r of recs) {
+    for (const r of tableRecs) {
       if (!r.start || !r.node) continue;
       const list = byNode.get(r.node) ?? [];
       list.push(r);
@@ -752,7 +816,7 @@ export function AnalyticsView() {
     return [...byNode.entries()]
       .sort((a, b) => b[1].length - a[1].length)
       .slice(0, 14);
-  }, [recs]);
+  }, [tableRecs]);
 
   // Node utilization rollup
   const nodeRows = useMemo(() => {
@@ -761,7 +825,7 @@ export function AnalyticsView() {
       string,
       { jobs: number; busyS: number; gpu: string | null; sources: Set<string>; lastSeen: Date | null }
     >();
-    for (const r of recs) {
+    for (const r of tableRecs) {
       if (!r.node) continue;
       const e =
         m.get(r.node) ?? { jobs: 0, busyS: 0, gpu: null, sources: new Set<string>(), lastSeen: null };
@@ -784,7 +848,7 @@ export function AnalyticsView() {
         lastSeen: v.lastSeen,
       }))
       .sort((a, b) => b.busyH - a.busyH);
-  }, [recs, from, to]);
+  }, [tableRecs, from, to]);
 
   const exportCsv = () => {
     const appCols = activeApps.map((a) => a.value);
@@ -846,7 +910,7 @@ export function AnalyticsView() {
       e.count += 1;
       seen.set(name, e);
     };
-    for (const r of [...gpuRecs, ...slurmRecs]) {
+    for (const r of [...gpuRecs, ...summaryRecs, ...slurmRecs]) {
       const from =
         r.platform === "slurmui"
           ? `SlurmUI (Aura) · cluster ${r.source}${r.gpuModel ? ` · ${r.gpuModel}` : ""}`
@@ -858,7 +922,7 @@ export function AnalyticsView() {
       .filter(([name]) => !aliasSource(draftAliases, name))
       .map(([name, v]) => ({ name, origin: [...v.origin].join("; "), count: v.count }))
       .sort((a, b) => b.count - a.count);
-  }, [configOpen, gpuRecs, slurmRecs, draftAliases]);
+  }, [configOpen, gpuRecs, summaryRecs, slurmRecs, draftAliases]);
 
   const openConfig = () => {
     setDraftAliases(aliases.map((a) => ({ ...a })));
@@ -971,8 +1035,11 @@ export function AnalyticsView() {
       )}
       {truncated.length > 0 && (
         <p className="rounded-md border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-600 dark:text-yellow-400">
-          Partial data: {truncated.join(", ")} exceeded 5,000 records in this period; totals
-          for those kinds are an undercount.
+          {truncated.join(", ")} exceeded 5,000 records in this period — the Jobs explorer /
+          timeline show the most recent 5,000.{" "}
+          {hasSummary && truncated.includes("inference")
+            ? "Charts and totals use exact serverless counts from the summary API, so they are not affected."
+            : "Totals for those kinds are an undercount."}
         </p>
       )}
 

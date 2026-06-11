@@ -557,3 +557,75 @@ async def history_proxy(
         window={"since": _iso(s_dt), "until": _iso(u_dt)}, jobs=jobs,
         note=(f"LLM-proxy requests (defaults to the last {DEFAULT_WINDOW_DAYS}d when `since` is "
               "omitted). status: queued|running|completed|cancelled|failed."))
+
+
+# ── inference summary ────────────────────────────────────────────────────────
+# The requests table is far too large to ship row-by-row to a dashboard
+# (raw endpoints cap out and undercount). For serverless, analytics only needs
+# *creation counts*, so this aggregates in SQL — exact over any window, a few
+# hundred rows out.
+
+class InferenceSummaryRow(BaseModel):
+    date: str                       # YYYY-MM-DD in the requested tz
+    app_id: Optional[str]
+    user: Optional[str]
+    status: str
+    provider_kind: Optional[str]
+    provider_name: Optional[str]
+    count: int
+
+
+class InferenceSummaryResponse(BaseModel):
+    kind: str = "inference_summary"
+    window: dict[str, Any]
+    rows: list[InferenceSummaryRow]
+    note: str
+
+
+@router.get("/summary", response_model=InferenceSummaryResponse)
+async def history_inference_summary(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
+    tz: str = Query("UTC", description="IANA timezone for day bucketing"),
+):
+    from zoneinfo import ZoneInfo
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"unknown timezone: {tz}")
+    s_dt, u_dt = _parse_dt(since, "since"), _parse_dt(until, "until")
+    if s_dt is None:
+        s_dt = datetime.now(timezone.utc) - timedelta(days=DEFAULT_WINDOW_DAYS)
+    day = func.to_char(func.timezone(tz, ReqRow.created_at), "YYYY-MM-DD").label("day")
+    st = (
+        select(day, ReqRow.app_id, ReqRow.owner_id, ReqRow.status, func.count().label("n"))
+        .where(ReqRow.created_at >= s_dt)
+    )
+    if u_dt is not None:
+        st = st.where(ReqRow.created_at < u_dt)
+    st = st.group_by(day, ReqRow.app_id, ReqRow.owner_id, ReqRow.status)
+    rows = (await session.execute(st)).all()
+
+    umap = await _user_map(session, [r.owner_id for r in rows])
+    app_ids = {r.app_id for r in rows if r.app_id}
+    appmap: dict[str, App] = {}
+    if app_ids:
+        for a in (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all():
+            appmap[a.app_id] = a
+    provmap = await _prov_map(session, {a.provider_id for a in appmap.values()})
+
+    out = []
+    for r in rows:
+        a = appmap.get(r.app_id)
+        prov = provmap.get(a.provider_id) if a else None
+        out.append(InferenceSummaryRow(
+            date=r.day, app_id=r.app_id, user=_username(umap, r.owner_id),
+            status=r.status, count=r.n, **_prov_fields(prov),
+        ))
+    out.sort(key=lambda x: (x.date, x.app_id or "", x.status))
+    return InferenceSummaryResponse(
+        window={"since": _iso(s_dt), "until": _iso(u_dt)}, rows=out,
+        note=("Exact creation counts for serverless inference requests, grouped by "
+              "day/app/user/status with provider attribution — use instead of paging "
+              f"/inference for analytics (defaults to the last {DEFAULT_WINDOW_DAYS}d)."))

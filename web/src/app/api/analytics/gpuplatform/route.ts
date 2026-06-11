@@ -69,14 +69,27 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "since and until are required" }, { status: 400 });
   }
 
-  const results = await Promise.all(
-    KINDS.map(async ({ kind, path }) => ({ kind, ...(await fetchKind(token, path, since, until)) })),
-  );
+  // Exact creation counts for the high-volume inference kind — charts use
+  // these; the raw (capped) inference page only feeds the Jobs explorer.
+  const tz = req.nextUrl.searchParams.get("tz") ?? "UTC";
+  const summaryReq = fetch(
+    `${GATEWAY}/v1/history/summary?${new URLSearchParams({ since, until, tz })}`,
+    { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" },
+  )
+    .then(async (r) => (r.ok ? ((await r.json()) as { rows: unknown[] }).rows : null))
+    .catch(() => null);
+
+  const [results, inferenceSummary] = await Promise.all([
+    Promise.all(
+      KINDS.map(async ({ kind, path }) => ({ kind, ...(await fetchKind(token, path, since, until)) })),
+    ),
+    summaryReq,
+  ]);
   const kinds: Record<string, JobRecord[]> = {};
   const truncated: string[] = [];
   for (const r of results) {
     kinds[r.kind] = r.jobs;
     if (r.truncated) truncated.push(r.kind);
   }
-  return NextResponse.json({ kinds, truncated });
+  return NextResponse.json({ kinds, truncated, inference_summary: inferenceSummary });
 }
