@@ -74,6 +74,11 @@ web:
     pullPolicy: IfNotPresent
   # If empty, derived from ingress.host (same as the gateway URL).
   publicGatewayUrl: ""
+  # In-cluster gateway URL shown as the "Internal" option in the Run-a-job
+  # snippet cards (lets callers inside the cluster skip the ingress hop). If
+  # empty, derived from the gateway Service DNS:
+  # http://<release>-serverlessgpu-gateway.<namespace>.svc.cluster.local
+  internalGatewayUrl: ""
   # Optional RunPod API key the UI uses for direct read-only RunPod calls
   # (worker status etc.). Set via --set; never commit.
   runpodApiKey: ""

@@ -11,6 +11,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 import type { ProxyEndpoint, ProxyRequest, ProxyUpstreamHealth } from "@/lib/types";
+import { BaseUrlToggle, type UrlTarget } from "@/components/console/base-url-toggle";
 import { ProxyPlayground } from "./proxy-playground";
 import { ProxyStress } from "./proxy-stress";
 
@@ -67,6 +68,7 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
   const [reqs, setReqs] = useState<ProxyRequest[]>([]);
   const [token, setToken] = useState<string | null>(null);
   const [reveal, setReveal] = useState(false);
+  const [urlTarget, setUrlTarget] = useState<UrlTarget>("public");
   const [filter, setFilter] = useState<"all" | (typeof BUCKETS)[number]>("all");
   const [flushing, setFlushing] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -126,6 +128,13 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
   const visToken = reveal && token ? token : token ? maskToken(token) : "sgpu_…";
   const realToken = token ?? "YOUR_API_KEY";
 
+  const internalBase = process.env.NEXT_PUBLIC_GATEWAY_INTERNAL_URL ?? "";
+  // Snippet base only — the header URL + Playground keep the public base (an
+  // in-cluster Service DNS isn't reachable from the browser). "internal" lets
+  // an in-cluster caller copy a snippet that skips the ingress hop.
+  const snippetBase =
+    urlTarget === "internal" && internalBase ? `${internalBase}/proxy/${ep.name}/v1` : proxyBase;
+
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       {/* header zone — title + actions + tab bar (matches the serverless detail) */}
@@ -175,11 +184,14 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
                 <CardTitle className="text-sm font-medium">Run a job</CardTitle>
                 <span className="text-xs text-muted-foreground">OpenAI-compatible · priority + health-aware failover.</span>
               </div>
-              {token && (
-                <Button variant="outline" size="xs" onClick={() => setReveal((v) => !v)}>
-                  {reveal ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}{reveal ? "Hide" : "Reveal"} key
-                </Button>
-              )}
+              <div className="flex items-center gap-2">
+                {internalBase && <BaseUrlToggle value={urlTarget} onChange={setUrlTarget} />}
+                {token && (
+                  <Button variant="outline" size="xs" onClick={() => setReveal((v) => !v)}>
+                    {reveal ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}{reveal ? "Hide" : "Reveal"} key
+                  </Button>
+                )}
+              </div>
             </CardHeader>
             <CardContent>
               <div className="mb-3 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
@@ -196,21 +208,26 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
                   <p className="text-sm text-muted-foreground">
                     OpenAI <code className="font-mono">/proxy/{ep.name}/v1/chat/completions</code> — returns the full completion JSON in one call.
                   </p>
-                  <CodeBlock display={curlChat(proxyBase, visToken, model0)} copy={curlChat(proxyBase, realToken, model0)} />
+                  <CodeBlock display={curlChat(snippetBase, visToken, model0)} copy={curlChat(snippetBase, realToken, model0)} />
                 </TabsContent>
                 <TabsContent value="curl-stream" className="mt-3 space-y-3">
                   <p className="text-sm text-muted-foreground">
                     Same endpoint with <code className="font-mono">&quot;stream&quot;: true</code> — token-by-token Server-Sent Events.
                   </p>
-                  <CodeBlock display={curlChatStream(proxyBase, visToken, model0)} copy={curlChatStream(proxyBase, realToken, model0)} />
+                  <CodeBlock display={curlChatStream(snippetBase, visToken, model0)} copy={curlChatStream(snippetBase, realToken, model0)} />
                 </TabsContent>
                 <TabsContent value="openai" className="mt-3 space-y-3">
                   <p className="text-sm text-muted-foreground">
-                    Point any OpenAI client at <code className="font-mono">{proxyBase}</code> — set <code className="font-mono">model</code> to one of the aliases above.
+                    Point any OpenAI client at <code className="font-mono">{snippetBase}</code> — set <code className="font-mono">model</code> to one of the aliases above.
                   </p>
-                  <CodeBlock display={openaiSnippet(proxyBase, visToken, model0)} copy={openaiSnippet(proxyBase, realToken, model0)} />
+                  <CodeBlock display={openaiSnippet(snippetBase, visToken, model0)} copy={openaiSnippet(snippetBase, realToken, model0)} />
                 </TabsContent>
               </Tabs>
+              {urlTarget === "internal" && (
+                <p className="mt-3 text-[11px] text-muted-foreground">
+                  In-cluster URL — reachable only from pods in the same Kubernetes cluster; bypasses the public ingress.
+                </p>
+              )}
               <p className="mt-3 text-[11px] text-muted-foreground">
                 Shown with your session token. For scripts/CI, use a long-lived key from <Link href="/api-keys" className="underline underline-offset-2 hover:text-foreground">API tokens</Link>.
               </p>
