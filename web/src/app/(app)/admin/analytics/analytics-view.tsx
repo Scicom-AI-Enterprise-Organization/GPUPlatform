@@ -33,8 +33,9 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { ChevronDown, Download, Loader2 } from "lucide-react";
+import { ChevronDown, Download, Loader2, Plus, Settings2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -219,33 +220,37 @@ const obj = (x: unknown): Record<string, unknown> =>
 // Canonical GPU-source labels. Both platforms name the same physical machine
 // differently — GPU Platform by provider name (tm-2-l40s-vm1, TM-H20), Slurm
 // by cluster (tm, tm-l40s) or node hostname (scicom-gpu1-<hash>) — so fold
-// every raw name onto one label via longest-prefix match (case-insensitive).
-// Unmatched names pass through unchanged; extend this list as machines are
-// added.
-const SOURCE_ALIASES: [prefix: string, label: string][] = [
+// every raw name onto one label via longest-prefix match (case-insensitive),
+// checked against the record's node hostname first, then its raw source.
+// The map is editable in the UI ("Configure sources") and persisted in the
+// gateway's global-env store; these defaults seed it until first save.
+type SourceAlias = { prefix: string; label: string };
+
+const DEFAULT_SOURCE_ALIASES: SourceAlias[] = [
   // Slurm node hostnames (hash-suffixed, hence prefix match)
-  ["scicom-gpu1", "TM-VM1"],
-  ["scicom-gpu2", "TM-VM2"],
-  ["scicom-ucc", "TM-UCC"],
+  { prefix: "scicom-gpu1", label: "TM-VM1" },
+  { prefix: "scicom-gpu2", label: "TM-VM2" },
+  { prefix: "scicom-ucc", label: "TM-UCC" },
   // GPU Platform provider names for the same VMs
-  ["tm-2-l40s-vm1", "TM-VM1"],
-  ["tm-2-l40s-vm2", "TM-VM2"],
+  { prefix: "tm-2-l40s-vm1", label: "TM-VM1" },
+  { prefix: "tm-2-l40s-vm2", label: "TM-VM2" },
   // Slurm cluster names
-  ["tm-h20", "TM-H20"],
-  ["tm-l40s", "TM-UCC"], // single-node cluster on the UCC machine
-  ["primeintellect", "Prime Intellect GPUs"],
-  ["prime-intellect", "Prime Intellect GPUs"],
+  { prefix: "tm-h20", label: "TM-H20" },
+  { prefix: "tm-l40s", label: "TM-UCC" }, // single-node cluster on the UCC machine
+  { prefix: "primeintellect", label: "Prime Intellect GPUs" },
+  { prefix: "prime-intellect", label: "Prime Intellect GPUs" },
 ];
 
-function aliasSource(name: string | null): string | null {
+function aliasSource(aliases: SourceAlias[], name: string | null): string | null {
   if (!name) return null;
   const n = name.toLowerCase();
   let best: string | null = null;
   let bestLen = -1;
-  for (const [prefix, label] of SOURCE_ALIASES) {
-    if (n.startsWith(prefix) && prefix.length > bestLen) {
+  for (const { prefix, label } of aliases) {
+    const p = prefix.toLowerCase();
+    if (n.startsWith(p) && p.length > bestLen) {
       best = label;
-      bestLen = prefix.length;
+      bestLen = p.length;
     }
   }
   return best;
@@ -257,7 +262,7 @@ function aliasSource(name: string | null): string | null {
 // or the endpoint's configured GPU.
 function gpuSource(detail: Record<string, unknown>): string {
   const provName = str(detail?.provider_name);
-  if (provName) return aliasSource(provName) ?? provName;
+  if (provName) return provName;
   const kind = str(detail?.provider_kind) ?? str(detail?.backend);
   if (kind === "pi") return "Prime Intellect GPUs";
   if (kind === "runpod") return "RunPod GPUs";
@@ -356,13 +361,10 @@ function normalizeSlurm(report: SlurmReport): Rec[] {
           durS != null && typeof j.gpus === "number"
             ? (durS / 3600) * j.gpus
             : perJobGpuH,
-        // Attribute to the machine, not the Slurm cluster: alias the first
-        // node in nodeList (a Slurm "tm" cluster spans TM-VM1 + TM-VM2), then
-        // the cluster name, so activity aggregates with GPU Platform jobs on
+        // Raw source; the component aliases node-first (a Slurm "tm" cluster
+        // spans TM-VM1 + TM-VM2) so it aggregates with GPU Platform jobs on
         // the same hardware.
         source:
-          aliasSource(str(j.nodeList)?.split(",")[0] ?? null) ??
-          aliasSource(str(j.clusterName)) ??
           str(j.clusterName) ??
           (j.partition ? `Slurm · ${j.partition}` : "Slurm"),
         gpuModel: str(j.gresDetail),
@@ -500,6 +502,14 @@ export function AnalyticsView() {
   // newly-seen sources (a just-registered VM, a new partition) start checked.
   const [excludedSources, setExcludedSources] = useState<Set<string>>(new Set());
 
+  // Source alias map — seeded with defaults, replaced by the stored map when
+  // one exists (gateway global-env, edited via the Configure dialog).
+  const [aliases, setAliases] = useState<SourceAlias[]>(DEFAULT_SOURCE_ALIASES);
+  const [configOpen, setConfigOpen] = useState(false);
+  const [draftAliases, setDraftAliases] = useState<SourceAlias[]>([]);
+  const [savingAliases, setSavingAliases] = useState(false);
+  const [aliasError, setAliasError] = useState<string | null>(null);
+
   const [loading, setLoading] = useState(true);
   const [gpuRecs, setGpuRecs] = useState<Rec[]>([]);
   const [slurmRecs, setSlurmRecs] = useState<Rec[]>([]);
@@ -518,7 +528,7 @@ export function AnalyticsView() {
   const load = useCallback(async () => {
     setLoading(true);
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
-    const [gpu, slurm] = await Promise.allSettled([
+    const [gpu, slurm, aliasRes] = await Promise.allSettled([
       fetch(
         `/api/analytics/gpuplatform?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}`,
         { cache: "no-store" },
@@ -527,7 +537,14 @@ export function AnalyticsView() {
         `/api/analytics/slurm?from=${localDate(from)}&to=${localDate(to)}&tz=${encodeURIComponent(tz)}`,
         { cache: "no-store" },
       ).then((r) => r.json() as Promise<SlurmPayload>),
+      fetch("/api/analytics/aliases", { cache: "no-store" }).then(
+        (r) => r.json() as Promise<{ aliases: SourceAlias[] | null }>,
+      ),
     ]);
+
+    if (aliasRes.status === "fulfilled" && aliasRes.value.aliases) {
+      setAliases(aliasRes.value.aliases);
+    }
 
     if (gpu.status === "fulfilled") {
       setGpuRecs(normalizeGpuPlatform(gpu.value));
@@ -555,21 +572,29 @@ export function AnalyticsView() {
 
   // ── filtered + aggregated views ────────────────────────────────────────────
 
-  // SlurmUI cluster names are lowercase ("tm-h20") while GPU Platform provider
-  // names are uppercase ("TM-H20") for the same hardware — fold Slurm sources
-  // onto the GPU Platform label case-insensitively so each machine is one
-  // filter entry.
-  const mergedSlurmRecs = useMemo(() => {
-    const byLower = new Map(gpuRecs.map((r) => [r.source.toLowerCase(), r.source]));
-    return slurmRecs.map((r) => {
+  // Canonicalize every record's source via the alias map — the node hostname
+  // wins over the raw source name (a Slurm "tm" cluster spans two VMs that
+  // are separate machines), then fold remaining Slurm sources onto GPU
+  // Platform labels case-insensitively ("tm-h20" cluster ↔ "TM-H20" provider).
+  const allRecs = useMemo(() => {
+    const aliased = [...gpuRecs, ...slurmRecs].map((r) => {
+      const canon = aliasSource(aliases, r.node) ?? aliasSource(aliases, r.source);
+      return canon && canon !== r.source ? { ...r, source: canon } : r;
+    });
+    const byLower = new Map(
+      aliased
+        .filter((r) => r.platform === "gpuplatform")
+        .map((r) => [r.source.toLowerCase(), r.source]),
+    );
+    return aliased.map((r) => {
       const canon = byLower.get(r.source.toLowerCase());
       return canon && canon !== r.source ? { ...r, source: canon } : r;
     });
-  }, [gpuRecs, slurmRecs]);
+  }, [gpuRecs, slurmRecs, aliases]);
 
   const allSources = useMemo(
-    () => [...new Set([...gpuRecs, ...mergedSlurmRecs].map((r) => r.source))].sort(),
-    [gpuRecs, mergedSlurmRecs],
+    () => [...new Set(allRecs.map((r) => r.source))].sort(),
+    [allRecs],
   );
 
   const sourceSelected = useMemo(
@@ -579,13 +604,13 @@ export function AnalyticsView() {
 
   const recs = useMemo(
     () =>
-      [...gpuRecs, ...mergedSlurmRecs].filter(
+      allRecs.filter(
         (r) =>
           platforms.has(r.platform) &&
           apps.has(r.app) &&
           !excludedSources.has(r.source),
       ),
-    [gpuRecs, mergedSlurmRecs, platforms, apps, excludedSources],
+    [allRecs, platforms, apps, excludedSources],
   );
 
   const days = useMemo(() => eachDay(from, to), [from, to]);
@@ -808,6 +833,32 @@ export function AnalyticsView() {
   const fmtUsd = (v: number) =>
     v.toLocaleString("en-US", { style: "currency", currency: "USD" });
 
+  const openConfig = () => {
+    setDraftAliases(aliases.map((a) => ({ ...a })));
+    setAliasError(null);
+    setConfigOpen(true);
+  };
+
+  const saveAliases = async () => {
+    setSavingAliases(true);
+    setAliasError(null);
+    try {
+      const r = await fetch("/api/analytics/aliases", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ aliases: draftAliases }),
+      });
+      if (!r.ok) throw new Error(`save failed (${r.status})`);
+      const body = (await r.json()) as { aliases: SourceAlias[] };
+      setAliases(body.aliases);
+      setConfigOpen(false);
+    } catch (e) {
+      setAliasError(e instanceof Error ? e.message : "save failed");
+    } finally {
+      setSavingAliases(false);
+    }
+  };
+
   const sortHeader = (key: SortKey, label: string) => (
     <th
       className="cursor-pointer select-none whitespace-nowrap px-3 py-2 text-left font-medium hover:text-foreground"
@@ -856,6 +907,15 @@ export function AnalyticsView() {
             }
           />
         )}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 text-muted-foreground"
+          onClick={openConfig}
+          title="Configure how raw machine / cluster / node names map onto GPU-source labels"
+        >
+          <Settings2 className="mr-1.5 h-3.5 w-3.5" /> Configure sources
+        </Button>
         <div className="ml-auto flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={exportCsv} disabled={loading}>
             <Download className="mr-1.5 h-3.5 w-3.5" /> Export CSV
@@ -1302,6 +1362,79 @@ export function AnalyticsView() {
           </div>
         </TabsContent>
       </Tabs>
+
+      {/* Configure sources dialog */}
+      <Dialog open={configOpen} onOpenChange={setConfigOpen}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="text-sm">Configure GPU sources</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 text-xs">
+            <p className="text-muted-foreground">
+              Map raw names onto one GPU-source label so both platforms aggregate per machine.
+              A record&apos;s <span className="font-mono">node hostname</span> is matched first,
+              then its provider / cluster name — by name <em>prefix</em>, case-insensitive,
+              longest match wins (so <span className="font-mono">scicom-gpu1</span> covers{" "}
+              <span className="font-mono">scicom-gpu1-p945…</span>). Unmatched names show as-is.
+            </p>
+            <div className="max-h-72 space-y-1.5 overflow-y-auto pr-1">
+              <div className="grid grid-cols-[1fr_1fr_2rem] gap-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <span>Name prefix</span>
+                <span>Shows as</span>
+                <span />
+              </div>
+              {draftAliases.map((a, i) => (
+                <div key={i} className="grid grid-cols-[1fr_1fr_2rem] items-center gap-2">
+                  <Input
+                    value={a.prefix}
+                    placeholder="scicom-gpu1"
+                    className="h-8 font-mono text-xs"
+                    onChange={(e) =>
+                      setDraftAliases(
+                        draftAliases.map((x, j) => (j === i ? { ...x, prefix: e.target.value } : x)),
+                      )
+                    }
+                  />
+                  <Input
+                    value={a.label}
+                    placeholder="TM-VM1"
+                    className="h-8 text-xs"
+                    onChange={(e) =>
+                      setDraftAliases(
+                        draftAliases.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)),
+                      )
+                    }
+                  />
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0 text-muted-foreground hover:text-red-500"
+                    onClick={() => setDraftAliases(draftAliases.filter((_, j) => j !== i))}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setDraftAliases([...draftAliases, { prefix: "", label: "" }])}
+            >
+              <Plus className="mr-1.5 h-3.5 w-3.5" /> Add mapping
+            </Button>
+            {aliasError && <p className="text-red-500">{aliasError}</p>}
+            <div className="flex justify-end gap-2 pt-1">
+              <Button variant="outline" size="sm" onClick={() => setConfigOpen(false)}>
+                Cancel
+              </Button>
+              <Button size="sm" onClick={saveAliases} disabled={savingAliases}>
+                {savingAliases && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />} Save
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Record detail drawer */}
       <Dialog open={detailRec !== null} onOpenChange={(o) => !o && setDetailRec(null)}>
