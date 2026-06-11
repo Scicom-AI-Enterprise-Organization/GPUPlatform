@@ -18,7 +18,10 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
   Legend,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -78,7 +81,7 @@ type SlurmPayload =
   | { configured: false }
   | { configured: true; report?: SlurmReport; error?: string };
 
-// One normalized activity record — every chart/table below derives from these.
+// One normalized activity record — every chart below derives from these.
 type Rec = {
   platform: "gpuplatform" | "slurmui";
   app: string; // serverless | benchmark | autotrain | compute | proxy | slurmjob
@@ -87,6 +90,10 @@ type Rec = {
   status: string;
   costUsd: number; // 0 when the source has no $ figure
   gpuHours: number; // 0 when unknown
+  // Where it ran — registered provider name (TM-H20, TM-VM1, …), a cloud
+  // ("RunPod GPUs", "Prime Intellect GPUs") or a Slurm partition. Free-form:
+  // the GPU-source filter is built dynamically from whatever shows up here.
+  source: string;
 };
 
 // ── filters ──────────────────────────────────────────────────────────────────
@@ -161,6 +168,29 @@ const num = (x: unknown): number => (typeof x === "number" && isFinite(x) ? x : 
 
 // ── normalization ────────────────────────────────────────────────────────────
 
+const str = (x: unknown): string | null =>
+  typeof x === "string" && x.trim() ? x.trim() : null;
+
+// "Where did this run" label, best-effort from the history detail blob:
+// a registered provider's name wins (TM-H20, TM-VM1, …); otherwise the cloud
+// kind; for serverless/proxy requests fall back to the serving worker's GPU
+// or the endpoint's configured GPU.
+function gpuSource(detail: Record<string, unknown>): string {
+  const provName = str(detail?.provider_name);
+  if (provName) return provName;
+  const kind = str(detail?.provider_kind) ?? str(detail?.backend);
+  if (kind === "pi") return "Prime Intellect GPUs";
+  if (kind === "runpod") return "RunPod GPUs";
+  if (kind === "external") return "External";
+  const worker = detail?.worker as Record<string, unknown> | null | undefined;
+  return (
+    str(worker?.gpu_name) ??
+    str(detail?.requested_gpu_type) ??
+    str(detail?.gpu_type) ??
+    "RunPod GPUs" // platform-default cloud when no provider is recorded
+  );
+}
+
 function normalizeGpuPlatform(payload: GpuPlatformPayload): Rec[] {
   const recs: Rec[] = [];
   for (const [kind, jobs] of Object.entries(payload.kinds)) {
@@ -171,6 +201,7 @@ function normalizeGpuPlatform(payload: GpuPlatformPayload): Rec[] {
       const costPerHr = num(j.detail?.cost_per_hr);
       const gpuCount = num(j.detail?.gpu_count) || 1;
       recs.push({
+        source: gpuSource(j.detail ?? {}),
         platform: "gpuplatform",
         app,
         user: j.user,
@@ -195,6 +226,7 @@ function normalizeSlurm(report: SlurmReport): Rec[] {
     const perJobGpuH = jobs.length ? num(day.gpuHours) / jobs.length : 0;
     for (const j of jobs) {
       recs.push({
+        source: j.partition ? `Slurm · ${j.partition}` : "Slurm",
         platform: "slurmui",
         app: "slurmjob",
         user: j.unixUsername ?? "(unknown)",
@@ -233,6 +265,9 @@ export function AnalyticsView() {
     new Set(["gpuplatform", "slurmui"]),
   );
   const [apps, setApps] = useState<Set<string>>(new Set(APPS.map((a) => a.value)));
+  // GPU sources are discovered from the data, so we track the UNchecked ones —
+  // newly-seen sources (a just-registered VM, a new partition) start checked.
+  const [excludedSources, setExcludedSources] = useState<Set<string>>(new Set());
 
   const [loading, setLoading] = useState(true);
   const [gpuRecs, setGpuRecs] = useState<Rec[]>([]);
@@ -282,12 +317,20 @@ export function AnalyticsView() {
 
   // ── filtered + aggregated views ────────────────────────────────────────────
 
+  const allSources = useMemo(
+    () => [...new Set([...gpuRecs, ...slurmRecs].map((r) => r.source))].sort(),
+    [gpuRecs, slurmRecs],
+  );
+
   const recs = useMemo(
     () =>
       [...gpuRecs, ...slurmRecs].filter(
-        (r) => platforms.has(r.platform) && apps.has(r.app),
+        (r) =>
+          platforms.has(r.platform) &&
+          apps.has(r.app) &&
+          !excludedSources.has(r.source),
       ),
-    [gpuRecs, slurmRecs, platforms, apps],
+    [gpuRecs, slurmRecs, platforms, apps, excludedSources],
   );
 
   const days = useMemo(() => eachDay(from, to), [from, to]);
@@ -323,29 +366,20 @@ export function AnalyticsView() {
     return days.map((d) => ({ date: d.slice(5), ...byDay.get(d) }));
   }, [recs, days]);
 
-  const userRows = useMemo(() => {
-    type Row = {
-      user: string;
-      spend: number;
-      gpuHours: number;
-      daysActive: Set<string>;
-      perApp: Record<string, number>;
-    };
-    const m = new Map<string, Row>();
-    for (const r of recs) {
-      let row = m.get(r.user);
-      if (!row) {
-        row = { user: r.user, spend: 0, gpuHours: 0, daysActive: new Set(), perApp: {} };
-        m.set(r.user, row);
-      }
-      row.spend += r.costUsd;
-      row.gpuHours += r.gpuHours;
-      row.daysActive.add(r.date);
-      row.perApp[r.app] = (row.perApp[r.app] ?? 0) + 1;
-    }
-    return [...m.values()].sort((a, b) => b.spend - a.spend || b.gpuHours - a.gpuHours);
-  }, [recs]);
+  // Donut: share of activity by app over the period.
+  const appPie = useMemo(
+    () =>
+      activeApps
+        .map((a) => ({
+          name: a.label,
+          value: recs.filter((r) => r.app === a.value).length,
+          fill: APP_COLORS[a.value],
+        }))
+        .filter((s) => s.value > 0),
+    [recs, activeApps],
+  );
 
+  // Kept (table removed) — still feeds the CSV export.
   const dailyRows = useMemo(
     () =>
       days
@@ -432,6 +466,22 @@ export function AnalyticsView() {
             </label>
           ))}
         </div>
+        {allSources.length > 0 && (
+          <div className="flex w-full flex-wrap items-center gap-3">
+            <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              GPU source
+            </span>
+            {allSources.map((s) => (
+              <label key={s} className="flex cursor-pointer items-center gap-1.5 text-sm">
+                <Checkbox
+                  checked={!excludedSources.has(s)}
+                  onCheckedChange={() => toggle(excludedSources, s, setExcludedSources)}
+                />
+                {s}
+              </label>
+            ))}
+          </div>
+        )}
         <div className="ml-auto flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={exportCsv} disabled={loading}>
             <Download className="mr-1.5 h-3.5 w-3.5" /> Export CSV
@@ -486,6 +536,45 @@ export function AnalyticsView() {
         ))}
       </div>
 
+      <div className="grid gap-6 lg:grid-cols-2">
+      {/* Activity by app (donut) */}
+      <div className="rounded-lg border bg-card p-4">
+        <h2 className="mb-1 text-sm font-semibold">Activity by app</h2>
+        <p className="mb-3 text-xs text-muted-foreground">
+          Share of jobs / requests per app for the selected period and filters.
+        </p>
+        <div className="h-64">
+          {appPie.length === 0 && !loading ? (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+              No analytics data for the selected period.
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie
+                  data={appPie}
+                  dataKey="value"
+                  nameKey="name"
+                  innerRadius="55%"
+                  outerRadius="85%"
+                  paddingAngle={2}
+                  strokeWidth={0}
+                >
+                  {appPie.map((s) => (
+                    <Cell key={s.name} fill={s.fill} />
+                  ))}
+                </Pie>
+                <Tooltip
+                  formatter={(v) => [num(v).toLocaleString(), "records"]}
+                  contentStyle={{ fontSize: 12 }}
+                />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+              </PieChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      </div>
+
       {/* Daily activity chart */}
       <div className="rounded-lg border bg-card p-4">
         <h2 className="mb-1 text-sm font-semibold">Daily activity</h2>
@@ -525,113 +614,8 @@ export function AnalyticsView() {
         </div>
       </div>
 
-      {/* User breakdown */}
-      <div className="rounded-lg border bg-card">
-        <div className="border-b px-5 py-4">
-          <h2 className="text-sm font-semibold">User breakdown</h2>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            Period totals and per-app activity by user.
-          </p>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-                <th className="px-5 py-2.5 font-medium">User</th>
-                <th className="px-3 py-2.5 text-right font-medium">Spend</th>
-                <th className="px-3 py-2.5 text-right font-medium">GPU hours</th>
-                <th className="px-3 py-2.5 text-right font-medium">Days active</th>
-                {activeApps.map((a) => (
-                  <th key={a.value} className="px-3 py-2.5 text-right font-medium">
-                    {a.label}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {userRows.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={4 + activeApps.length}
-                    className="px-5 py-8 text-center text-muted-foreground"
-                  >
-                    {loading ? "Loading…" : "No analytics data for the selected period."}
-                  </td>
-                </tr>
-              ) : (
-                userRows.map((u) => (
-                  <tr key={u.user} className="border-b last:border-0 hover:bg-muted/40">
-                    <td className="px-5 py-2.5 font-medium">{u.user}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{fmtUsd(u.spend)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{u.gpuHours.toFixed(1)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{u.daysActive.size}</td>
-                    {activeApps.map((a) => (
-                      <td key={a.value} className="px-3 py-2.5 text-right tabular-nums">
-                        {u.perApp[a.value] ?? 0}
-                      </td>
-                    ))}
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
       </div>
 
-      {/* Daily breakdown */}
-      <div className="rounded-lg border bg-card">
-        <div className="border-b px-5 py-4">
-          <h2 className="text-sm font-semibold">Daily breakdown</h2>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            Daily totals and per-app activity for this period.
-          </p>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-                <th className="px-5 py-2.5 font-medium">Date</th>
-                <th className="px-3 py-2.5 text-right font-medium">Spend</th>
-                <th className="px-3 py-2.5 text-right font-medium">GPU hours</th>
-                <th className="px-3 py-2.5 text-right font-medium">Users</th>
-                {activeApps.map((a) => (
-                  <th key={a.value} className="px-3 py-2.5 text-right font-medium">
-                    {a.label}
-                  </th>
-                ))}
-                <th className="px-3 py-2.5 text-right font-medium">Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {dailyRows.every((d) => d.total === 0) && !loading ? (
-                <tr>
-                  <td
-                    colSpan={5 + activeApps.length}
-                    className="px-5 py-8 text-center text-muted-foreground"
-                  >
-                    No analytics data for the selected period.
-                  </td>
-                </tr>
-              ) : (
-                dailyRows.map((d) => (
-                  <tr key={d.date} className="border-b last:border-0 hover:bg-muted/40">
-                    <td className="px-5 py-2.5 font-medium">{d.date}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{fmtUsd(d.spend)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{d.gpuHours.toFixed(1)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{d.users}</td>
-                    {activeApps.map((a) => (
-                      <td key={a.value} className="px-3 py-2.5 text-right tabular-nums">
-                        {d.perApp[a.value] ?? 0}
-                      </td>
-                    ))}
-                    <td className="px-3 py-2.5 text-right font-medium tabular-nums">{d.total}</td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   );
 }
