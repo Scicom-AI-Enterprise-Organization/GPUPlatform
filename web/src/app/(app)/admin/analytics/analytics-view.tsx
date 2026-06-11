@@ -833,6 +833,33 @@ export function AnalyticsView() {
   const fmtUsd = (v: number) =>
     v.toLocaleString("en-US", { style: "currency", currency: "USD" });
 
+  // Raw node/cluster/provider names seen in the loaded data that no draft
+  // mapping covers yet — shown in the Configure dialog with their origin so
+  // the admin knows who each name belongs to before pointing it at a label.
+  const unmappedNames = useMemo(() => {
+    if (!configOpen) return [];
+    const seen = new Map<string, { origin: Set<string>; count: number }>();
+    const note = (name: string | null, origin: string) => {
+      if (!name) return;
+      const e = seen.get(name) ?? { origin: new Set<string>(), count: 0 };
+      e.origin.add(origin);
+      e.count += 1;
+      seen.set(name, e);
+    };
+    for (const r of [...gpuRecs, ...slurmRecs]) {
+      const from =
+        r.platform === "slurmui"
+          ? `SlurmUI (Aura) · cluster ${r.source}${r.gpuModel ? ` · ${r.gpuModel}` : ""}`
+          : `GPU Platform · ${APP_LABEL(r.app)}${r.gpuModel ? ` · ${r.gpuModel}` : ""}`;
+      note(r.node, from);
+      note(r.source, from);
+    }
+    return [...seen.entries()]
+      .filter(([name]) => !aliasSource(draftAliases, name))
+      .map(([name, v]) => ({ name, origin: [...v.origin].join("; "), count: v.count }))
+      .sort((a, b) => b.count - a.count);
+  }, [configOpen, gpuRecs, slurmRecs, draftAliases]);
+
   const openConfig = () => {
     setDraftAliases(aliases.map((a) => ({ ...a })));
     setAliasError(null);
@@ -1423,6 +1450,34 @@ export function AnalyticsView() {
             >
               <Plus className="mr-1.5 h-3.5 w-3.5" /> Add mapping
             </Button>
+            {unmappedNames.length > 0 && (
+              <div className="space-y-1.5 rounded-md border border-yellow-500/30 bg-yellow-500/5 p-2.5">
+                <div className="font-medium">
+                  Unmapped names in the current data — click + to map one:
+                </div>
+                <div className="max-h-40 space-y-1 overflow-y-auto">
+                  {unmappedNames.map((u) => (
+                    <div key={u.name} className="flex items-center gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 w-6 shrink-0 p-0"
+                        title={`Add mapping for ${u.name}`}
+                        onClick={() =>
+                          setDraftAliases([...draftAliases, { prefix: u.name, label: "" }])
+                        }
+                      >
+                        <Plus className="h-3 w-3" />
+                      </Button>
+                      <span className="shrink-0 font-mono">{u.name}</span>
+                      <span className="truncate text-muted-foreground" title={u.origin}>
+                        — {u.origin} ({u.count} records)
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {aliasError && <p className="text-red-500">{aliasError}</p>}
             <div className="flex justify-end gap-2 pt-1">
               <Button variant="outline" size="sm" onClick={() => setConfigOpen(false)}>
