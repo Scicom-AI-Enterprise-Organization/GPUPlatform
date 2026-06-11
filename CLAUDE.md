@@ -76,6 +76,16 @@ To add Whisper to an existing fleet: **Overview → Models → Edit → add the 
 Audio, Save** — that re-provisions and re-ships the worker-agent + ensures the audio deps. (A
 member needs a GPU slot; small fleets time-share via sleep/wake. Sleep-mode works fine with Whisper.)
 
+### Label platform (data-labelling app)
+
+A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)
+the gateway talks to for human labelling — both **read** (a `kind=label` Dataset imports
+labelled rows) and **write** (autotrain TTS auto-creates a recording+MOS project after a run).
+Auth is a `lpat_…` PAT carrying its owner's role (create-project needs an admin PAT). Full API
+reference + the audio-filename↔storage prefix gotcha: **`docs/LABEL_PLATFORM.md`**. Gateway
+integration lives in `datasets_api.py` (read) and `training_api.py` `_create_label_project_for_run`
++ `training/tts/tts_label_export.py` (write, VM-only — synthesis needs the box).
+
 ### Testing the gateway locally (current `.env` reality)
 
 `gateway/.env` is currently `AUTH_DISABLED=0` + `GATEWAY_RELOAD=0` (despite older notes saying

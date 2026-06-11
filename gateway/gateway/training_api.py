@@ -666,6 +666,176 @@ async def _set_dataset_transform(dataset_id: Optional[str], status: str, log_lin
         await s.commit()
 
 
+def _tts_pack_splits(ds: Optional[Dataset]) -> dict:
+    """Per-split record counts of a tts_packed dataset (split_fields._tts_pack.splits)."""
+    if ds is None:
+        return {}
+    return ((ds.split_fields or {}).get("_tts_pack") or {}).get("splits") or {}
+
+
+async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, redis) -> None:
+    """Post-train: synthesize N clips from the finished TTS model on the run's VM,
+    upload them to the run's S3 storage, then create a Label-platform *recording*
+    project (MOS rating enabled), configure its storage, import the clips as tasks,
+    and auto-create a round-trip kind=label Dataset. Records the project under
+    result_json.label_project. VM-provider runs only (synthesis needs the box)."""
+    # URL + token each resolve from a Secrets-page (GlobalEnv) key when one was
+    # picked, else from the pasted value (token = Fernet-encrypted label_token_enc).
+    genv = await _resolve_global_env()
+    url_secret = (cfg.get("label_base_url_secret") or "").strip()
+    if url_secret:
+        base_url = (genv.get(url_secret) or "").strip().rstrip("/")
+    else:
+        base_url = (cfg.get("label_base_url") or "").strip().rstrip("/")
+    tok_secret = (cfg.get("label_token_secret") or "").strip()
+    token = None
+    if tok_secret:
+        token = (genv.get(tok_secret) or "").strip() or None
+    else:
+        enc = cfg.get("label_token_enc")
+        if enc:
+            try:
+                token = (json.loads(crypto.decrypt(enc)) or {}).get("token")
+            except Exception:  # noqa: BLE001
+                token = None
+    if not base_url:
+        await _push_log(redis, run_id, "[gateway] label export: base_url missing/unresolved — skipped")
+        return
+    if not token:
+        await _push_log(redis, run_id, "[gateway] label export: token missing/unresolved — skipped")
+        return
+    model_s3 = ((result or {}).get("artifact") or {}).get("s3_uri")
+    if not model_s3:
+        await _push_log(redis, run_id, "[gateway] label export: no model artifact — skipped")
+        return
+    model_s3 = ((result or {}).get("artifact") or {}).get("s3_uri")
+    if not model_s3:
+        await _push_log(redis, run_id, "[gateway] label export: no model artifact — skipped")
+        return
+
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None:
+            return
+        prov = await s.get(Provider, row.provider_id) if row.provider_id else None
+        storage = await s.get(Storage, row.storage_id) if row.storage_id else None
+        main_ds = await s.get(Dataset, row.dataset_id) if row.dataset_id else None
+        test_ds = await s.get(Dataset, row.test_dataset_id) if row.test_dataset_id else None
+        owner_id = row.owner_id
+        run_name = row.name or run_id
+        storage_id = row.storage_id
+    if prov is None or prov.kind != "vm":
+        await _push_log(redis, run_id, "[gateway] label export needs a VM provider (skipped)")
+        return
+
+    creds = _s3_creds_from_storage(storage)
+    if not creds.get("bucket"):
+        await _push_log(redis, run_id, "[gateway] label export: storage has no S3 bucket — skipped")
+        return
+
+    # Pick the text source: a separate test dataset → else the main dataset's
+    # held-out test split → else a random sample of the train split (or flat root).
+    if test_ds is not None and test_ds.s3_metadata_uri:
+        base = test_ds.s3_metadata_uri.rstrip("/")
+        tsp = _tts_pack_splits(test_ds)
+        packed_uri = f"{base}/test" if "test" in tsp else base
+        is_random, source_desc = False, "test dataset"
+    else:
+        base = (main_ds.s3_metadata_uri or "").rstrip("/") if main_ds else ""
+        if not base:
+            await _push_log(redis, run_id, "[gateway] label export: no packed dataset uri — skipped")
+            return
+        msp = _tts_pack_splits(main_ds)
+        if "test" in msp:
+            packed_uri, is_random, source_desc = f"{base}/test", False, "held-out test split"
+        elif "train" in msp:
+            packed_uri, is_random, source_desc = f"{base}/train", True, "random train sample"
+        else:
+            packed_uri, is_random, source_desc = base, True, "random sample"
+
+    n = max(1, int(cfg.get("label_samples") or 32))
+    speaker = (cfg.get("default_speaker") or "").strip()
+    # Object key under the run's storage prefix → put the FULL key in audio_filename
+    # and set the Label storage prefix to "" so BOTH the proxy playback path and the
+    # bare-key S3 export presign resolve to the same object.
+    sp = (creds.get("prefix") or "").strip("/")
+    upload_prefix = (f"{sp}/training-runs/{run_id}/tts-label" if sp
+                     else f"training-runs/{run_id}/tts-label")
+
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        await _push_log(redis, run_id, "[gateway] label export: can't reach the run's VM (skipped)")
+        return
+    await _push_log(redis, run_id, f"[gateway] label export: synthesizing {n} clips ({source_desc}) …")
+    manifest = await asyncio.to_thread(
+        _run_tts_label_export_ssh, *ssh, run_id, model_s3, creds, packed_uri, "",
+        is_random, n, speaker, creds["bucket"], upload_prefix, dict(cfg), "auto",
+    )
+    items = manifest.get("items") or []
+    if not items:
+        await _push_log(redis, run_id, "[gateway] label export: no clips synthesized — skipped")
+        return
+
+    # ---- Label platform: create project → storage → MOS → tasks ----
+    import httpx
+
+    proj_name = (cfg.get("label_project_name") or f"{run_name}-eval")[:200]
+    axes = [a for a in (cfg.get("label_mos_axes") or []) if a] or ["Naturalness", "Intelligibility", "Noise"]
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as cli:
+        r = await cli.post(f"{base_url}/api/projects", headers=headers, json={
+            "name": proj_name, "type": "recording",
+            "description": f"Autotrain TTS eval — {run_name} ({run_id})",
+        })
+        r.raise_for_status()
+        pid = ((r.json() or {}).get("project") or {}).get("id")
+        if not pid:
+            raise RuntimeError(f"create project returned no id: {r.text[:200]}")
+        r = await cli.put(f"{base_url}/api/projects/{pid}/storage", headers=headers, json={
+            "provider": "s3", "bucket": creds["bucket"], "region": creds["region"],
+            "prefix": "", "endpoint": creds.get("endpoint") or "",
+            "access_key": creds.get("access_key") or "", "secret_key": creds.get("secret_key") or "",
+        })
+        r.raise_for_status()
+        r = await cli.patch(f"{base_url}/api/projects/{pid}", headers=headers,
+                            json={"mos_enabled": True, "mos_axes": axes})
+        r.raise_for_status()
+        tasks = [{"transcription": it.get("text") or "", "audio_filename": it.get("key") or ""}
+                 for it in items if it.get("key")]
+        r = await cli.post(f"{base_url}/api/projects/{pid}/tasks", headers=headers, json={"tasks": tasks})
+        r.raise_for_status()
+
+    # Round-trip: a kind=label dataset pointing at the new project + stamp the run.
+    label_ds_id = "ds-" + os.urandom(4).hex()
+    async with session_factory()() as s:
+        s.add(Dataset(
+            id=label_ds_id, owner_id=owner_id,
+            name=(f"{run_name}-tts-eval-labels")[:255],
+            description=(f"Human MOS / recording labels for autotrain TTS run {run_id}")[:2048],
+            kind="label", storage_id=storage_id,
+            label_base_url=base_url, label_project_id=pid,
+            # Reference the Secrets key when one was used (no token copy); else store
+            # the resolved token Fernet-encrypted, like the datasets create path.
+            label_token_secret=(tok_secret or None),
+            label_token_enc=(None if tok_secret else crypto.encrypt(json.dumps({"token": token}))),
+            label_status="approved",
+            audio_field="audio_url", transcription_field="transcription",
+        ))
+        run2 = await s.get(TrainingRun, run_id)
+        if run2 is not None:
+            rj = dict(run2.result_json or {})
+            rj["label_project"] = {
+                "id": pid, "url": f"{base_url}/dashboard/projects/{pid}",
+                "count": len(tasks), "dataset_id": label_ds_id, "project_name": proj_name,
+            }
+            run2.result_json = rj
+        await s.commit()
+    await _push_log(
+        redis, run_id,
+        f"[gateway] label project created: {base_url}/dashboard/projects/{pid} "
+        f"({len(tasks)} clips) + dataset {label_ds_id}")
+
+
 async def _mirror_pack_log(redis, run_id: str, dataset_id: Optional[str]) -> None:
     """Mirror a pack run's live log tail into the source dataset's transform_log
     (replace, not append) every few seconds, so the datasets UI shows the real
@@ -1189,6 +1359,15 @@ async def run_training(redis, run_id: str) -> None:
         else:
             await _set_dataset_transform(src_id, "failed", err or f"pack failed (rc={rc})")
 
+    # After a successful TTS run, optionally synthesize a handful of clips from the
+    # trained model and seed a Label-platform recording+MOS project with them.
+    # Best-effort: a failure here never marks the run failed.
+    if status == "done" and (cfg.get("task_type") == "tts") and cfg.get("label_export"):
+        try:
+            await _create_label_project_for_run(run_id, cfg, result, redis)
+        except Exception as e:  # noqa: BLE001
+            await _push_log(redis, run_id, f"[gateway] label export failed: {e}")
+
     if runpod_id and api_key:
         await _terminate_pod(api_key, runpod_id)
         await _push_log(redis, run_id, f"[gateway] pod {runpod_id} torn down")
@@ -1425,6 +1604,20 @@ class CreateTrainingRunRequest(BaseModel):
     # gen + NeuCodec-decode + scorer pass dominates a short run, so a small count
     # keeps debug runs fast. Default 64.
     eval_max_samples: int = 64
+    # TTS-only: after a successful run, synthesize N clips from the trained model
+    # and auto-create a Label-platform *recording* project (with MOS rating) seeded
+    # with them, for human listening / MOS. Texts come from the held-out test split
+    # if present, else a random sample of the train split. VM-provider runs only
+    # (synthesis needs the box). The token is Fernet-encrypted into the run config —
+    # never stored or returned in plaintext.
+    label_export: bool = False
+    label_base_url: str = "http://localhost:3002"
+    label_base_url_secret: Optional[str] = None  # GlobalEnv key holding the URL (wins over label_base_url)
+    label_token: Optional[str] = None            # lpat_… PAT (admin); never persisted raw
+    label_token_secret: Optional[str] = None     # GlobalEnv key holding the lpat (wins over label_token)
+    label_project_name: Optional[str] = None     # defaults to "<run name>-eval"
+    label_samples: int = 32
+    label_mos_axes: list[str] = ["Naturalness", "Intelligibility", "Noise"]
     precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
@@ -1700,6 +1893,21 @@ async def create_training_run(
         "augment_prob": body.augment_prob,
         "eval_methods": [m for m in (body.eval_methods or []) if m in _TTS_EVAL_METHODS],
         "eval_max_samples": body.eval_max_samples,
+        # Post-train Label-platform export (TTS only). The token is stored Fernet-
+        # encrypted (label_token_enc) like the kind=label dataset's — never raw.
+        "label_export": bool(body.label_export and body.task_type == "tts"),
+        "label_base_url": (body.label_base_url or "").strip().rstrip("/") or "http://localhost:3002",
+        "label_base_url_secret": (body.label_base_url_secret or "").strip() or None,
+        # Token: a Secrets-page key reference wins; else the pasted token Fernet-encrypted.
+        "label_token_secret": (body.label_token_secret or "").strip() or None,
+        "label_token_enc": (
+            crypto.encrypt(json.dumps({"token": body.label_token.strip()}))
+            if (body.label_export and body.label_token and body.label_token.strip()
+                and not (body.label_token_secret or "").strip()) else None
+        ),
+        "label_project_name": (body.label_project_name or "").strip() or None,
+        "label_samples": int(body.label_samples or 32),
+        "label_mos_axes": [a.strip() for a in (body.label_mos_axes or []) if str(a).strip()],
         "precision": body.precision, "language": body.language, "task": body.task,
         "base_model": body.base_model,
         # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab
@@ -2498,6 +2706,82 @@ def _run_synthesize_ssh(host: str, port: int, user: str, key_filename: str,
             raise RuntimeError(f"synthesis produced no audio (rc={rc}):\n{tail}")
         return (out["wav"], int(out["sr"] or 24000), out.get("device"), out["lines"][-120:],
                 out.get("prompt"), out.get("gen_text"))  # wav is base64
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str,
+                              run_id: str, model_s3: str, creds: dict, packed_uri: str,
+                              split_subdir: str, is_random: bool, n_samples: int,
+                              speaker: str, upload_bucket: str, upload_prefix: str,
+                              cfg: dict, gpu: str = "auto") -> dict:
+    """SSH to the run's VM, ship the whole tts/ dir, synthesize n_samples clips from
+    the finetuned model + upload them to S3, and return the parsed @@LABEL manifest
+    {bucket, items:[{key,text}], count}. Blocking — call via to_thread. The TTS
+    batch twin of _run_synthesize_ssh."""
+    import tempfile
+
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        # Ship the whole tts/ dir (chinidataset + tts_eval + tts_infer + the export
+        # script import as siblings) — the export reads packed shards + synthesizes.
+        _ssh_put_dir_tar(cli, str(base / "tts"), "/tmp/sgpu_tts_label")
+        work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
+        tconf = {
+            "model_s3": model_s3,
+            "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+            "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+            "model_dir": f"{work_dir}/sgpu-tts-label/{run_id}/model",
+            "packed_dir": f"{work_dir}/sgpu-tts-label/{run_id}/packed",
+            "packed_uri": packed_uri, "split_subdir": split_subdir or "",
+            "random": bool(is_random), "n_samples": int(n_samples), "seed": 42,
+            "speaker": speaker or "", "gpu": gpu or "auto", "max_new_tokens": 1024,
+            "upload_bucket": upload_bucket, "upload_prefix": upload_prefix,
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(tconf))
+            local_cfg = f.name
+        try:
+            _ssh_put(cli, local_cfg, "/tmp/sgpu_tts_label_cfg.json")
+        finally:
+            try:
+                os.unlink(local_cfg)
+            except OSError:
+                pass
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        venv = (cfg.get("venv_path") or "/share/autotrain-tts").rstrip("/")
+        py = f"{venv}/bin/python"
+        out: dict = {"manifest": None, "error": None, "lines": []}
+
+        def on_line(line: str) -> None:
+            j = line.find("@@LABEL ")
+            if j < 0:
+                if len(out["lines"]) < 400:  # keep a tail for errors
+                    out["lines"].append(line)
+                return
+            try:
+                obj = json.loads(line[j + len("@@LABEL "):])
+            except Exception:  # noqa: BLE001
+                return
+            if obj.get("error"):
+                out["error"] = obj["error"]
+            else:
+                out["manifest"] = obj
+
+        cmd = (f'{user_env}PY="{py}"; '
+               f'if [ ! -x "$PY" ]; then echo "venv python not found at $PY — train this run first"; exit 1; fi; '
+               f'"$PY" -u /tmp/sgpu_tts_label/tts_label_export.py --config /tmp/sgpu_tts_label_cfg.json')
+        rc = _ssh_run_stream(cli, cmd, on_line)
+        if out["error"]:
+            raise RuntimeError(out["error"])
+        if not out["manifest"]:
+            tail = "\n".join(out["lines"][-15:])
+            raise RuntimeError(f"label export produced no manifest (rc={rc}):\n{tail}")
+        return out["manifest"]
     finally:
         try:
             cli.close()

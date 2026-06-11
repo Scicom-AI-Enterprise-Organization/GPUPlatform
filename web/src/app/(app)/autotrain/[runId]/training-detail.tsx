@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AudioLines, Check, ChevronDown, Copy, Download, Loader2, Pencil, RotateCcw, Trash2, X, XCircle } from "lucide-react";
+import { AudioLines, Check, ChevronDown, Copy, Download, ExternalLink, Loader2, Pencil, RotateCcw, Trash2, X, XCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -435,6 +435,36 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
             {run.result_json.tts_eval.cer != null && <Stat label="CER ↓" value={fmt(run.result_json.tts_eval.cer, 4)} />}
             {run.result_json.tts_eval.mos != null && <Stat label="MOS ↑ (UTMOSv2)" value={fmt(run.result_json.tts_eval.mos, 3)} />}
             {run.result_json.tts_eval.similarity != null && <Stat label="Speaker sim ↑ (TitaNet)" value={fmt(run.result_json.tts_eval.similarity, 4)} />}
+          </CardContent>
+        </Card>
+      )}
+
+      {run.result_json?.label_project && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">
+              Label project created
+              {run.result_json.label_project.count != null ? ` · ${run.result_json.label_project.count} clips` : ""}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
+            <a
+              href={run.result_json.label_project.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 font-medium text-primary hover:underline"
+            >
+              Open in Label
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+            {run.result_json.label_project.dataset_id && (
+              <a
+                href={`/datasets/${run.result_json.label_project.dataset_id}`}
+                className="inline-flex items-center gap-1.5 text-muted-foreground hover:text-foreground hover:underline"
+              >
+                Linked dataset <span className="font-mono">{run.result_json.label_project.dataset_id}</span>
+              </a>
+            )}
           </CardContent>
         </Card>
       )}

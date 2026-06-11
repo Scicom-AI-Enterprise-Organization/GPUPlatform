@@ -51,6 +51,7 @@ import { cn } from "@/lib/utils";
 import type {
   CreateTrainingRunRequest,
   DatasetRecord,
+  GlobalEnvRecord,
   GpuTypeOption,
   ProviderRecord,
   StorageRecord,
@@ -291,6 +292,21 @@ export function TrainingForm() {
   // eval — the gen + NeuCodec decode + Whisper/UTMOSv2/TitaNet pass dominates a
   // short run, so a small count (e.g. 8) keeps debug runs snappy.
   const [evalMaxSamples, setEvalMaxSamples] = useState(64);
+  // Post-train (TTS): synthesize N clips from the trained model + auto-create a
+  // Label-platform recording+MOS project seeded with them. Token is never echoed
+  // back (stored encrypted server-side), so it isn't prefilled when cloning a run.
+  const [labelExport, setLabelExport] = useState(false);
+  // URL + token can each be typed in or referenced from the Secrets page (GlobalEnv).
+  const [labelUrlMode, setLabelUrlMode] = useState<"paste" | "secret">("paste");
+  const [labelBaseUrl, setLabelBaseUrl] = useState("http://localhost:3002");
+  const [labelBaseUrlSecret, setLabelBaseUrlSecret] = useState("");
+  const [labelTokenMode, setLabelTokenMode] = useState<"paste" | "secret">("paste");
+  const [labelToken, setLabelToken] = useState("");
+  const [labelTokenSecret, setLabelTokenSecret] = useState("");
+  const [secrets, setSecrets] = useState<GlobalEnvRecord[]>([]);
+  const [labelProjectName, setLabelProjectName] = useState("");
+  const [labelSamples, setLabelSamples] = useState(32);
+  const [labelMosAxes, setLabelMosAxes] = useState("Naturalness, Intelligibility, Noise");
   // experiment tracking — named credentials from the Secrets page (picked per run)
   const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
   const [wandbCredId, setWandbCredId] = useState("");
@@ -325,6 +341,7 @@ export function TrainingForm() {
     gateway.listStorage().then(setStorages).catch(() => {});
     gateway.listProviders().then(setProviders).catch(() => {});
     gateway.listTrackingCredentials().then(setTrackingCreds).catch(() => {});
+    gateway.listGlobalEnv().then(setSecrets).catch(() => {});
     gateway
       .listRunpodGpuTypes()
       .then((rows) => {
@@ -407,6 +424,19 @@ export function TrainingForm() {
         if (c.augment_prob != null) setAugmentProb(num(c.augment_prob, 0.5));
         if (Array.isArray(c.eval_methods)) setEvalMethods(arr(c.eval_methods).map(String));
         if (c.eval_max_samples != null) setEvalMaxSamples(num(c.eval_max_samples, 64));
+        // label export (token is never returned — left blank for the user to re-enter)
+        if (c.label_export != null) setLabelExport(!!c.label_export);
+        if (typeof c.label_base_url === "string" && c.label_base_url) setLabelBaseUrl(c.label_base_url);
+        if (typeof c.label_base_url_secret === "string" && c.label_base_url_secret) {
+          setLabelUrlMode("secret"); setLabelBaseUrlSecret(c.label_base_url_secret);
+        }
+        if (typeof c.label_token_secret === "string" && c.label_token_secret) {
+          setLabelTokenMode("secret"); setLabelTokenSecret(c.label_token_secret);
+        }
+        if (typeof c.label_project_name === "string") setLabelProjectName(c.label_project_name);
+        if (c.label_samples != null) setLabelSamples(num(c.label_samples, 32));
+        if (Array.isArray(c.label_mos_axes) && c.label_mos_axes.length)
+          setLabelMosAxes(arr(c.label_mos_axes).map(String).join(", "));
         // run on
         if (r.provider_kind === "vm") { setTarget("vm"); setProviderId(r.provider_id || ""); }
         else if (r.provider_id) { setTarget("cloud"); setRunpodProviderId(r.provider_id); }
@@ -649,6 +679,18 @@ export function TrainingForm() {
       // dataset + base model, so they're not sent from the form. The chosen
       // audio-eval methods (CER / MOS / similarity) run on the test set.
       ...(isTts ? { eval_methods: evalMethods, eval_max_samples: evalMaxSamples } : {}),
+      ...(isTts && labelExport
+        ? {
+            label_export: true,
+            label_base_url: labelUrlMode === "paste" ? (labelBaseUrl.trim() || "http://localhost:3002") : "",
+            label_base_url_secret: labelUrlMode === "secret" ? (labelBaseUrlSecret || null) : null,
+            label_token: labelTokenMode === "paste" ? (labelToken.trim() || null) : null,
+            label_token_secret: labelTokenMode === "secret" ? (labelTokenSecret || null) : null,
+            label_project_name: labelProjectName.trim() || null,
+            label_samples: labelSamples,
+            label_mos_axes: labelMosAxes.split(",").map((s) => s.trim()).filter(Boolean),
+          }
+        : {}),
       ...(sweepOn && Object.keys(sweepGrid).length
         ? { sweep: sweepGrid, gpus_per_trial: gpusPerTrial }
         : {}),
@@ -1119,6 +1161,93 @@ export function TrainingForm() {
                 <NumberField min={1} value={evalMaxSamples} onChange={setEvalMaxSamples} />
               </FieldWrap>
             </div>
+          </div>
+        )}
+        {isTts && (
+          <div className="mt-5 space-y-1.5 border-t border-border pt-4">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Human evaluation (Label platform)</Label>
+            <p className="text-xs text-muted-foreground">
+              After a successful run, synthesize a few clips from the trained model and auto-create a
+              Label-platform <span className="font-medium">recording</span> project with MOS rating enabled,
+              seeded with them. Texts come from the held-out test split if present, else a random sample of the
+              train split. Runs on the VM only (synthesis needs the box).
+            </p>
+            <label className="flex cursor-pointer items-center gap-2 pt-1 text-sm">
+              <input type="checkbox" checked={labelExport} onChange={(e) => setLabelExport(e.target.checked)}
+                className="h-4 w-4 accent-primary" />
+              <span>Create a labelling project after training</span>
+            </label>
+            {labelExport && (
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-3">
+                    <Label className="text-xs uppercase tracking-wide text-muted-foreground">Label platform URL</Label>
+                    <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
+                      {(["paste", "secret"] as const).map((m) => (
+                        <button key={m} type="button" onClick={() => setLabelUrlMode(m)}
+                          className={cn("px-2.5 py-1 transition-colors",
+                            labelUrlMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
+                          {m === "paste" ? "Paste" : "From secret"}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {labelUrlMode === "paste" ? (
+                    <Input className="font-mono" value={labelBaseUrl} placeholder="http://localhost:3002"
+                      onChange={(e) => setLabelBaseUrl(e.target.value)} />
+                  ) : (
+                    <Select value={labelBaseUrlSecret} onValueChange={setLabelBaseUrlSecret}>
+                      <SelectTrigger><SelectValue placeholder={secrets.length ? "Choose a secret" : "No secrets configured"} /></SelectTrigger>
+                      <SelectContent>
+                        {secrets.map((s) => (
+                          <SelectItem key={s.key} value={s.key}>{s.key}{s.value_preview ? ` — ${s.value_preview}` : ""}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+                </div>
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-3">
+                    <Label className="text-xs uppercase tracking-wide text-muted-foreground">API token</Label>
+                    <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
+                      {(["paste", "secret"] as const).map((m) => (
+                        <button key={m} type="button" onClick={() => setLabelTokenMode(m)}
+                          className={cn("px-2.5 py-1 transition-colors",
+                            labelTokenMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
+                          {m === "paste" ? "Paste" : "From secret"}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {labelTokenMode === "paste" ? (
+                    <Input type="password" className="font-mono" value={labelToken} placeholder="lpat_…"
+                      onChange={(e) => setLabelToken(e.target.value)} />
+                  ) : (
+                    <Select value={labelTokenSecret} onValueChange={setLabelTokenSecret}>
+                      <SelectTrigger><SelectValue placeholder={secrets.some((s) => s.is_secret) ? "Choose a secret" : "No secrets configured"} /></SelectTrigger>
+                      <SelectContent>
+                        {secrets.filter((s) => s.is_secret).map((s) => (
+                          <SelectItem key={s.key} value={s.key}>{s.key}{s.value_preview ? ` — ${s.value_preview}` : ""}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+                </div>
+                <FieldWrap label="Project name" hint="Defaults to “<run name>-eval”.">
+                  <Input value={labelProjectName} placeholder={`${name || "tts-finetune"}-eval`}
+                    onChange={(e) => setLabelProjectName(e.target.value)} />
+                </FieldWrap>
+                <FieldWrap label="Number of samples" hint="How many clips to synthesize + import as tasks.">
+                  <NumberField min={1} value={labelSamples} onChange={setLabelSamples} />
+                </FieldWrap>
+                <div className="sm:col-span-2">
+                  <FieldWrap label="MOS axes" hint="Comma-separated 1–5 rating axes for the recording project.">
+                    <Input value={labelMosAxes} placeholder="Naturalness, Intelligibility, Noise"
+                      onChange={(e) => setLabelMosAxes(e.target.value)} />
+                  </FieldWrap>
+                </div>
+              </div>
+            )}
           </div>
         )}
         {!isTts && (

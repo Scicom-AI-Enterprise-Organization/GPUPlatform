@@ -26,8 +26,10 @@ type Item = {
 function bucketFor(status: string): Bucket {
   const s = status.toLowerCase();
   if (s === "completed" || s === "ready") return "completed";
-  if (s === "timeout" || s === "cancelled" || s === "error") return "failed";
-  if (s === "pending") return "in queue";
+  // Any terminal failure → "failed". `failed` was missing here, so worker errors
+  // (_error_result writes status="failed") wrongly showed as "in progress" forever.
+  if (s === "timeout" || s === "cancelled" || s === "error" || s === "failed") return "failed";
+  if (s === "pending" || s === "queued") return "in queue";
   return "in progress";
 }
 

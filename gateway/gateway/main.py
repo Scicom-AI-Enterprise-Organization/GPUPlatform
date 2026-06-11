@@ -2765,10 +2765,15 @@ async def list_app_requests(
     status_filter: Optional[str] = None,
 ):
     """Recent requests for an app, newest first. Owner-scoped (admin sees all).
-    Reconciles any still-queued/pending rows against Redis on the way out, so
-    rows that completed without ever being polled don't appear stuck."""
-    await _load_owned_app(session, app_id, user)
+    Reconciles unsettled rows against Redis on the way out so the queue UI shows
+    reality: a still-queued/pending row that completed without ever being polled,
+    AND a `timeout` row whose client gave up at the 60s unary poll but whose worker
+    kept going and produced a result afterwards (the cold-start case — the worker
+    isn't cancelled by the client's 504). The Redis result lives ~1h, which bounds
+    which rows can still be upgraded."""
+    app = await _load_owned_app(session, app_id, user)
     from sqlalchemy import select, desc
+    from datetime import datetime, timezone, timedelta
     stmt = select(ReqRow).where(ReqRow.app_id == app_id).order_by(desc(ReqRow.created_at)).limit(min(limit, 200))
     if status_filter:
         stmt = stmt.where(ReqRow.status == status_filter)
@@ -2776,18 +2781,40 @@ async def list_app_requests(
     rows = list(result.scalars().all())
 
     rdb = request.app.state.redis
+    # A still-pending/queued row older than this, with Redis having forgotten it
+    # (result TTL 1h ≥ request_timeout_s), was orphaned and will never resolve.
+    orphan_timeout_s = int(getattr(app, "request_timeout_s", 600) or 600)
+    orphan_before = datetime.now(timezone.utc) - timedelta(seconds=orphan_timeout_s)
     for r in rows:
-        if r.status not in ("queued", "pending"):
+        # `timeout` is reconcilable too: the gateway marks a unary request `timeout`
+        # when its 60s poll lapses, but the job stays queued and the worker may
+        # complete it later — Redis then holds the real terminal result.
+        if r.status not in ("queued", "pending", "timeout"):
             continue
         blob = await rdb.get(f"result:{r.request_id}")
-        if not blob:
+        if blob:
+            raw = json.loads(blob)
+            rstatus = raw.get("status")
+            if rstatus and rstatus != "pending" and rstatus != r.status:
+                await _mirror_status_to_db(session, r.request_id, rstatus, raw.get("output"))
+                r.status = rstatus
+                r.output = raw.get("output")
             continue
-        raw = json.loads(blob)
-        rstatus = raw.get("status")
-        if rstatus and rstatus != "pending" and rstatus != r.status:
-            await _mirror_status_to_db(session, r.request_id, rstatus, raw.get("output"))
-            r.status = rstatus
-            r.output = raw.get("output")
+        # No Redis result key. A still-pending/queued row older than the request
+        # timeout was orphaned — a gateway restart killed its poll loop mid-flight,
+        # or its queued job was flushed — and won't resolve on its own. Settle it
+        # `failed` so the queue UI stops showing a phantom "in queue" job. A genuinely
+        # in-flight request (even a long cold start) still has result:{id}=pending in
+        # Redis, so it never reaches here. `timeout` rows with no result: leave them.
+        if r.status in ("queued", "pending"):
+            ca = r.created_at
+            if ca is not None and ca.tzinfo is None:
+                ca = ca.replace(tzinfo=timezone.utc)
+            if ca is None or ca < orphan_before:
+                out = {"error": "orphaned — never completed (gateway restart mid-request, or its queued job was flushed / result expired)"}
+                await _mirror_status_to_db(session, r.request_id, "failed", out)
+                r.status = "failed"
+                r.output = out
 
     return [_to_request_record(r) for r in rows]
 

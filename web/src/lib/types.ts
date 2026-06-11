@@ -267,6 +267,14 @@ export type TrainingResult = {
     similarity?: number | null;
   } | null;
   progress?: { step?: string; percent?: number } | null;
+  // TTS only: the auto-created Label-platform recording+MOS project (post-train).
+  label_project?: {
+    id: string;
+    url: string;
+    count: number;
+    dataset_id?: string | null;
+    project_name?: string | null;
+  } | null;
   error?: string;
 };
 
@@ -398,6 +406,17 @@ export type CreateTrainingRunRequest = {
   // TTS-only: audio eval methods to run on the test set (cer | mos | similarity).
   eval_methods?: string[];
   eval_max_samples?: number;
+  // TTS-only: after a successful run, synthesize N clips from the trained model and
+  // auto-create a Label-platform recording+MOS project seeded with them. The token
+  // is Fernet-encrypted into the run config server-side — never stored raw.
+  label_export?: boolean;
+  label_base_url?: string;
+  label_base_url_secret?: string | null; // GlobalEnv key holding the URL (wins over label_base_url)
+  label_token?: string | null;
+  label_token_secret?: string | null;    // GlobalEnv key holding the lpat (wins over label_token)
+  label_project_name?: string | null;
+  label_samples?: number;
+  label_mos_axes?: string[];
 };
 
 export type TrainingFile = {
