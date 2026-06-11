@@ -696,32 +696,112 @@ export function AnalyticsView() {
     [apps, platforms],
   );
 
+  // Serverless inference is orders of magnitude higher-volume than the
+  // discrete job kinds — it gets its own board below; the main app charts
+  // show everything else so jobs stay readable.
+  const infRecs = useMemo(
+    () => chartRecs.filter((r) => r.app === "serverless"),
+    [chartRecs],
+  );
+  const jobChartRecs = useMemo(
+    () => chartRecs.filter((r) => r.app !== "serverless"),
+    [chartRecs],
+  );
+
   const chartData = useMemo(() => {
     const byDay = new Map<string, Record<string, number>>();
     for (const d of days) byDay.set(d, {});
-    for (const r of chartRecs) {
+    for (const r of jobChartRecs) {
       const row = byDay.get(r.date);
       if (!row) continue;
       row[r.app] = (row[r.app] ?? 0) + r.count;
       row.__spend = (row.__spend ?? 0) + r.costUsd;
     }
     return days.map((d) => ({ date: d.slice(5), ...byDay.get(d) }));
-  }, [chartRecs, days]);
+  }, [jobChartRecs, days]);
 
-  // Donut: share of activity by app over the period.
+  // Donut: share of activity by app over the period (jobs only — inference
+  // has its own board).
   const appPie = useMemo(
     () =>
       activeApps
+        .filter((a) => a.value !== "serverless")
         .map((a) => ({
           name: a.label,
-          value: chartRecs
+          value: jobChartRecs
             .filter((r) => r.app === a.value)
             .reduce((s, r) => s + r.count, 0),
           fill: APP_COLORS[a.value],
         }))
         .filter((s) => s.value > 0),
-    [chartRecs, activeApps],
+    [jobChartRecs, activeApps],
   );
+
+  // ── serverless inference board ─────────────────────────────────────────────
+
+  const INF_STATUS_COLORS: Record<string, string> = {
+    completed: "#34d399",
+    failed: "#f87171",
+    timeout: "#fbbf24",
+    cancelled: "#94a3b8",
+  };
+  const infStatusColor = (s: string) => INF_STATUS_COLORS[s] ?? "#60a5fa";
+
+  const infTotals = useMemo(() => {
+    const total = infRecs.reduce((s, r) => s + r.count, 0);
+    const byStatus = new Map<string, number>();
+    for (const r of infRecs) byStatus.set(r.status, (byStatus.get(r.status) ?? 0) + r.count);
+    const completed = byStatus.get("completed") ?? 0;
+    return {
+      total,
+      completed,
+      failed: (byStatus.get("failed") ?? 0) + (byStatus.get("timeout") ?? 0),
+      successPct: total ? (completed / total) * 100 : 0,
+      endpoints: new Set(infRecs.map((r) => r.name ?? "?")).size,
+      users: new Set(infRecs.map((r) => r.user)).size,
+    };
+  }, [infRecs]);
+
+  const infStatuses = useMemo(
+    () =>
+      [...new Set(infRecs.map((r) => r.status))].sort(
+        (a, b) =>
+          ["completed", "failed", "timeout", "cancelled"].indexOf(a) -
+          ["completed", "failed", "timeout", "cancelled"].indexOf(b),
+      ),
+    [infRecs],
+  );
+
+  const infChartData = useMemo(() => {
+    const byDay = new Map<string, Record<string, number>>();
+    for (const d of days) byDay.set(d, {});
+    for (const r of infRecs) {
+      const row = byDay.get(r.date);
+      if (!row) continue;
+      row[r.status] = (row[r.status] ?? 0) + r.count;
+    }
+    return days.map((d) => ({ date: d.slice(5), ...byDay.get(d) }));
+  }, [infRecs, days]);
+
+  const infByEndpoint = useMemo(() => {
+    const m = new Map<
+      string,
+      { total: number; completed: number; failed: number; users: Set<string>; source: string }
+    >();
+    for (const r of infRecs) {
+      const key = r.name ?? "(unknown endpoint)";
+      const e =
+        m.get(key) ?? { total: 0, completed: 0, failed: 0, users: new Set<string>(), source: r.source };
+      e.total += r.count;
+      if (r.status === "completed") e.completed += r.count;
+      if (r.status === "failed" || r.status === "timeout") e.failed += r.count;
+      e.users.add(r.user);
+      m.set(key, e);
+    }
+    return [...m.entries()]
+      .map(([endpoint, v]) => ({ endpoint, ...v, userCount: v.users.size }))
+      .sort((a, b) => b.total - a.total);
+  }, [infRecs]);
 
   // Feeds the CSV export.
   const dailyRows = useMemo(
@@ -1107,7 +1187,8 @@ export function AnalyticsView() {
       <div className="rounded-lg border bg-card p-4">
         <h2 className="mb-1 text-sm font-semibold">Daily activity</h2>
         <p className="mb-3 text-xs text-muted-foreground">
-          Jobs / requests per day, by app. Hover for the per-app split and the day&apos;s spend.
+          Jobs per day, by app (serverless inference has its own board below). Hover for the
+          per-app split and the day&apos;s spend.
         </p>
         <div className="h-64">
           {totals.activity === 0 && !loading ? (
@@ -1130,9 +1211,11 @@ export function AnalyticsView() {
                   contentStyle={{ fontSize: 12 }}
                 />
                 <Legend formatter={(v: string) => APP_LABEL(v)} wrapperStyle={{ fontSize: 12 }} />
-                {activeApps.map((a) => (
-                  <Bar key={a.value} dataKey={a.value} stackId="apps" fill={APP_COLORS[a.value]} />
-                ))}
+                {activeApps
+                  .filter((a) => a.value !== "serverless")
+                  .map((a) => (
+                    <Bar key={a.value} dataKey={a.value} stackId="apps" fill={APP_COLORS[a.value]} />
+                  ))}
               </BarChart>
             </ResponsiveContainer>
           )}
@@ -1140,6 +1223,100 @@ export function AnalyticsView() {
       </div>
 
       </div>
+
+      {/* ── Serverless inference board ─────────────────────────────────────── */}
+      {apps.has("serverless") && platforms.has("gpuplatform") && (
+        <div className="rounded-lg border bg-card p-4">
+          <h2 className="mb-1 text-sm font-semibold">Serverless inference</h2>
+          <p className="mb-3 text-xs text-muted-foreground">
+            Request creations on the serverless API — exact counts from the gateway summary,
+            split by outcome. Filtered by the same period / GPU source as everything else.
+          </p>
+          {infRecs.length === 0 && !loading ? (
+            <div className="flex h-24 items-center justify-center text-sm text-muted-foreground">
+              No inference requests in the selected period.
+            </div>
+          ) : (
+            <>
+              <div className="mb-4 grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border lg:grid-cols-5">
+                {[
+                  { label: "Requests", value: infTotals.total.toLocaleString() },
+                  { label: "Completed", value: infTotals.completed.toLocaleString() },
+                  { label: "Failed / timeout", value: infTotals.failed.toLocaleString() },
+                  { label: "Success rate", value: `${infTotals.successPct.toFixed(1)}%` },
+                  { label: "Endpoints · users", value: `${infTotals.endpoints} · ${infTotals.users}` },
+                ].map((c) => (
+                  <div key={c.label} className="bg-card px-4 py-3">
+                    <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {c.label}
+                    </div>
+                    <div className="mt-0.5 text-xl font-semibold tabular-nums">
+                      {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : c.value}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="grid gap-6 lg:grid-cols-2">
+                <div>
+                  <h3 className="mb-2 text-xs font-medium text-muted-foreground">
+                    Requests per day, by status
+                  </h3>
+                  <div className="h-56">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={infChartData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
+                        <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+                        <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
+                        <Tooltip
+                          formatter={(v, name) => [num(v).toLocaleString(), String(name)]}
+                          contentStyle={{ fontSize: 12 }}
+                        />
+                        <Legend wrapperStyle={{ fontSize: 12 }} />
+                        {infStatuses.map((s) => (
+                          <Bar key={s} dataKey={s} stackId="inf" fill={infStatusColor(s)} />
+                        ))}
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+                <div>
+                  <h3 className="mb-2 text-xs font-medium text-muted-foreground">By endpoint</h3>
+                  <table className="w-full text-xs">
+                    <thead className="border-y bg-muted/40 text-muted-foreground">
+                      <tr>
+                        <th className="px-3 py-2 text-left font-medium">Endpoint</th>
+                        <th className="px-3 py-2 text-left font-medium">GPU source</th>
+                        <th className="px-3 py-2 text-right font-medium">Requests</th>
+                        <th className="px-3 py-2 text-right font-medium">Completed</th>
+                        <th className="px-3 py-2 text-right font-medium">Failed</th>
+                        <th className="px-3 py-2 text-right font-medium">Users</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {infByEndpoint.map((e) => (
+                        <tr key={e.endpoint} className="border-b last:border-0">
+                          <td className="max-w-[12rem] truncate px-3 py-2 font-mono">{e.endpoint}</td>
+                          <td className="whitespace-nowrap px-3 py-2">{e.source}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {e.total.toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {e.completed.toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {e.failed.toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">{e.userCount}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       {/* ── Granular views ─────────────────────────────────────────────────── */}
       <Tabs defaultValue="jobs">
