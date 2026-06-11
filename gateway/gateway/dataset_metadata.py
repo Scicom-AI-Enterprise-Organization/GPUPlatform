@@ -24,6 +24,10 @@ REQUIRED_FIELDS_FALLBACK = {
     "transcription": ["transcription", "text", "sentence", "transcript", "label"],
 }
 
+# Optional speaker column — detected so multi-speaker datasets map the speaker
+# picker + TTS packer to the right column (None when absent → single speaker).
+SPEAKER_FIELD_FALLBACK = ["speaker", "speaker_id", "speaker_name", "spk", "spk_id", "speaker_label"]
+
 
 class DatasetParseError(Exception):
     """Raised on an unparseable / invalid metadata file. The API maps this to a
@@ -113,6 +117,7 @@ def parse_metadata_bytes(filename: str, body: bytes) -> dict[str, Any]:
     columns = list(rows[0].keys())
     audio_field = _pick_field(columns, REQUIRED_FIELDS_FALLBACK["audio"])
     transcription_field = _pick_field(columns, REQUIRED_FIELDS_FALLBACK["transcription"])
+    speaker_field = _pick_field(columns, SPEAKER_FIELD_FALLBACK)
 
     if not audio_field:
         raise DatasetParseError(
@@ -132,6 +137,18 @@ def parse_metadata_bytes(filename: str, body: bytes) -> dict[str, Any]:
         "preview": rows[:PREVIEW_ROWS],
         "audio_field": audio_field,
         "transcription_field": transcription_field,
+        "speaker_field": speaker_field,
+    }
+
+
+def detect_fields(columns: list[str]) -> dict[str, Any]:
+    """Best-effort column → role mapping for a metadata table (no validation, no
+    raising). Used to backfill a dataset row's field mappings from the file's
+    actual columns. Any role with no matching column comes back None."""
+    return {
+        "audio_field": _pick_field(columns, REQUIRED_FIELDS_FALLBACK["audio"]),
+        "transcription_field": _pick_field(columns, REQUIRED_FIELDS_FALLBACK["transcription"]),
+        "speaker_field": _pick_field(columns, SPEAKER_FIELD_FALLBACK),
     }
 
 

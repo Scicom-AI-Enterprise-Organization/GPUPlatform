@@ -487,6 +487,28 @@ async def create_dataset(
         row.audio_field = "audio_url"
         row.transcription_field = "transcription"
         row.num_rows = label_num_rows
+    elif req.kind == "s3":
+        # Introspect the metadata file up front so format/num_rows + the
+        # audio/transcription/speaker mappings are correct from the first view
+        # (CreateDatasetRequest carries no field hints). Best-effort: a transient
+        # read/parse issue must not block creation — the preview re-heals on open.
+        try:
+            target, _base = _s3_target_and_prefix(storage)
+            u = urlparse(row.s3_metadata_uri or "")
+            t = dataclasses.replace(target, bucket=u.netloc) if u.scheme == "s3" else target
+            key = u.path.lstrip("/") if u.scheme == "s3" else (row.s3_metadata_uri or "")
+            mdname = os.path.basename(key)
+            text = await _run_sync(bench.s3_get_text, key, t)
+            if text:
+                all_rows = dataset_metadata.parse_rows(mdname, text.encode("utf-8"), 10**9)
+                cols = list(all_rows[0].keys()) if all_rows else []
+                try:
+                    fmt = dataset_metadata.detect_format(mdname)
+                except dataset_metadata.DatasetParseError:
+                    fmt = None
+                _stamp_detected_fields(row, cols, len(all_rows), fmt)
+        except Exception as e:  # noqa: BLE001 — best-effort; preview re-heals
+            logger.warning("s3 metadata introspect failed for new dataset %s: %s", did, e)
     session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -629,6 +651,9 @@ async def upload_metadata(
     d.num_rows = parsed["num_rows"]
     d.audio_field = parsed["audio_field"]
     d.transcription_field = parsed["transcription_field"]
+    # Auto-detect the speaker column too (None when absent → single speaker); a
+    # re-upload re-detects against the new file.
+    d.speaker_field = parsed.get("speaker_field")
     d.size_bytes = len(body)
     d.hf_synced_at = None  # content changed → mark out of sync
     await session.commit()
@@ -1025,6 +1050,42 @@ async def _packed_records_cached(
     return recs
 
 
+def _stamp_detected_fields(
+    d: Dataset, columns: list[str], num_rows: Optional[int], fmt: Optional[str]
+) -> bool:
+    """Backfill format/num_rows and auto-map the audio/transcription/speaker
+    columns onto a dataset row from the metadata's ACTUAL columns. Only fills a
+    null and repairs a mapping that doesn't point at a real column — it never
+    clobbers a valid, user-chosen field. Returns True if anything changed.
+
+    This is why an s3-metadata import (which can't know the columns up front) and
+    any older row with stale defaults self-heal: `transcription` defaulting to a
+    column that doesn't exist (the file uses `text`) gets repaired, and `speaker`
+    gets discovered."""
+    changed = False
+    if fmt and not d.format:
+        d.format = fmt
+        changed = True
+    if num_rows is not None and d.num_rows is None:
+        d.num_rows = num_rows
+        changed = True
+    if not columns:
+        return changed
+    det = dataset_metadata.detect_fields(columns)
+    if (not d.audio_field or d.audio_field not in columns) and det["audio_field"]:
+        if det["audio_field"] != d.audio_field:
+            d.audio_field = det["audio_field"]
+            changed = True
+    if (not d.transcription_field or d.transcription_field not in columns) and det["transcription_field"]:
+        if det["transcription_field"] != d.transcription_field:
+            d.transcription_field = det["transcription_field"]
+            changed = True
+    if not d.speaker_field and det["speaker_field"]:
+        d.speaker_field = det["speaker_field"]
+        changed = True
+    return changed
+
+
 @router.get("/{dataset_id}/preview", response_model=PreviewResponse)
 async def preview_dataset(
     dataset_id: str,
@@ -1147,6 +1208,20 @@ async def preview_dataset(
         # Metadata tables are small (text + URLs) → parse all to get the true row
         # count, then slice the requested page.
         all_rows = dataset_metadata.parse_rows(mdname, text.encode("utf-8"), 10**9)
+        # Self-heal a stale record: an s3-metadata import can't know the columns up
+        # front (CreateDatasetRequest has no field hints), so format/num_rows stay
+        # null and the field mappings fall to defaults that may not match the file
+        # (e.g. `transcription` when the column is `text`). Backfill from the actual
+        # columns now — only filling nulls / repairing broken mappings — so this page
+        # and the trainers see the right columns. Cheap: the file is already parsed.
+        try:
+            _fmt = dataset_metadata.detect_format(mdname)
+        except dataset_metadata.DatasetParseError:
+            _fmt = None
+        _cols = list(all_rows[0].keys()) if all_rows else []
+        if _stamp_detected_fields(d, _cols, len(all_rows), _fmt):
+            await session.commit()
+            af, tf = d.audio_field, d.transcription_field
         excluded = {int(x) for x in (d.excluded_rows or [])}
         # Pair each row with its stable GLOBAL index (file order) before any split
         # filtering — that's the identity the trainers use (they read the same

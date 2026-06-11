@@ -28,6 +28,12 @@ dependencies = [
     "huggingface_hub>=0.24",
     "datasets>=2.20",
     "soundfile>=0.12",
+    # Packed-row preview (datasets_api.packed-row) decodes tts_packed token blocks
+    # back to per-utterance text via the standalone tokenizers lib (Tokenizer.from_file
+    # on a downloaded tokenizer.json) — deliberately NOT importing transformers. Not a
+    # transitive dep of datasets/huggingface_hub, so it must be declared or the decode
+    # fails with "No module named 'tokenizers'" on a clean gateway image.
+    "tokenizers>=0.20",
     # llm-benchmaq is the CLI we shell out to for benchmark runs. Public repo;
     # pulls in paramiko/scp/etc. Tracks @main so benchmaq fixes (e.g. hf download
     # for huggingface_hub>=1.0 / Gemma 4) ship on the next gateway image build.
