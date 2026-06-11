@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import tarfile
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,13 +102,19 @@ async def _log(dataset_id: str, line: str) -> None:
     logger.info("transform %s: %s", dataset_id, line)
 
 
-def _make_progress(dataset_id: str, loop: asyncio.AbstractEventLoop) -> Callable[[str, int, int], None]:
+def _make_progress(dataset_id: str, loop: asyncio.AbstractEventLoop) -> Callable[..., None]:
     """A thread-safe progress callback for the blocking ETL steps (which run in a
     threadpool). Appends an `[AUTOTRAIN_PROGRESS]` marker to transform_log so the
-    UI can show a percentage + ETA — the same marker format the TTS pack emits."""
-    def progress(step: str, processed: int, total: int) -> None:
+    UI can show a percentage + ETA — the same marker format the TTS pack emits.
+    `rate`, when given, is appended as `rate=<MB/s>` (the download step's transfer
+    speed); the UI marker parser ignores unknown keys, so it's purely additive."""
+    def progress(step: str, processed: int, total: int, rate: Optional[float] = None) -> None:
         pct = (processed / total * 100.0) if total else 0.0
         line = f"[AUTOTRAIN_PROGRESS] step={step} processed={processed} total={total} percent={pct:.1f}"
+        if rate is not None:
+            # Trailing unit reads cleanly in the log; the marker parser tokenises on
+            # whitespace and ignores the unit-only `MB/s` token (and the `rate` key).
+            line += f" rate={rate:.1f} MB/s"
         try:
             fut = asyncio.run_coroutine_threadsafe(_log(dataset_id, line), loop)
             fut.add_done_callback(lambda f: f.cancelled() or f.exception())  # retrieve → no "never awaited" warning
@@ -342,9 +349,19 @@ def _download(
     stop = threading.Event()
 
     def _poll() -> None:
+        prev_bytes = _dir_bytes()
+        prev_t = time.monotonic()
         while not stop.wait(2.0):
-            if progress and total_bytes:
-                progress("download", min(_dir_bytes(), total_bytes) // mb, total_bytes // mb)
+            if not (progress and total_bytes):
+                continue
+            cur_bytes = _dir_bytes()
+            now = time.monotonic()
+            dt = now - prev_t
+            # MB/s over this interval — the live download speed (0 if the dir didn't
+            # grow, e.g. a cached re-run where snapshot_download fetches nothing).
+            rate = max(0.0, (cur_bytes - prev_bytes) / dt / mb) if dt > 0 else 0.0
+            prev_bytes, prev_t = cur_bytes, now
+            progress("download", min(cur_bytes, total_bytes) // mb, total_bytes // mb, rate)
 
     poller = threading.Thread(target=_poll, daemon=True)
     poller.start()
