@@ -2,7 +2,7 @@
 
 A multi-tenant GPU workload platform. One control plane, four product surfaces:
 
-- **Serverless** — deploy a model with the `serverlessgpu` Python decorator (or the web UI) and get an autoscaling, OpenAI-compatible HTTP endpoint backed by vLLM (scales to zero when idle) — or stand up a **multi-model fleet on one SSH VM** that time-shares its GPUs via vLLM sleep/wake.
+- **Serverless** — deploy a model with the `serverlessgpu` Python decorator (or the web UI) and get an autoscaling, OpenAI-compatible HTTP endpoint backed by vLLM — chat / completions / embeddings, plus **Whisper audio** (`/v1/audio/transcriptions`) — that scales to zero when idle. Or stand up a **multi-model fleet** that time-shares its GPUs via vLLM sleep/wake, on your own **SSH VM** or a **cloud RunPod pod** — the cloud fleet scales to zero on idle and re-provisions itself on the next request.
 - **Autotrain** — finetune **Whisper (ASR)** or **Qwen3 + NeuCodec (TTS)** on your own datasets. Hyperparameter sweeps, audio augmentation, live per-step loss + per-epoch WER/CER, GPU telemetry, and W&B / MLflow tracking — orchestrated over SSH on your VM or a RunPod pod, with the model pushed to S3 / Hugging Face.
 - **Benchmark** — SSH-orchestrated [`llm-benchmaq`](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) sweeps on RunPod / Prime Intellect / your own VM, with live log streaming, S3-archived results, and a side-by-side compare view.
 - **Compute** — provision long-lived bare-metal GPU pods with SSH (and JupyterLab on Prime Intellect). Optional admin-approval gate.
@@ -19,7 +19,7 @@ Users bring their own provider credentials; the gateway routes each workload to 
   - [Deploy — SDK + CLI](#deploy--sdk--cli)
   - [Call it — OpenAI-compatible API](#call-it--openai-compatible-api)
   - [Operate it — the endpoint console](#operate-it--the-endpoint-console)
-- [Multi-model fleet on one VM](#multi-model-fleet-on-one-vm-gpu-time-sharing)
+- [Multi-model fleets (VM or cloud RunPod)](#multi-model-fleets-vm-or-cloud-runpod)
 - [Autotrain (finetuning)](#autotrain-finetuning)
 - [Datasets](#datasets)
 - [Benchmark](#benchmark)
@@ -54,7 +54,7 @@ Split control-plane / data-plane — the same shape as Modal / Beam / RunPod Ser
 
 - **Control plane** (this repo) — gateway + web + Postgres + Redis. CPU-only, runs in k8s (Helm chart included).
 - **Data plane** — two patterns, both on the user's own provider account:
-  - **Serverless (long-lived workers)** — a GPU worker registers with the gateway, `BRPOP`s jobs off its Redis queue, runs vLLM, and publishes streaming tokens back via pub/sub.
+  - **Serverless workers** — a GPU worker (a registered VM, or a RunPod pod the gateway provisions and **reverse-SSH-tunnels** so even a localhost gateway is reachable) `BRPOP`s jobs off its Redis queue, runs vLLM, and publishes streaming tokens back via pub/sub. Cloud fleets scale to zero when idle and re-provision on the next request.
   - **SSH-orchestrated jobs (Autotrain + Benchmark)** — the gateway connects over SSH to a VM (or a freshly-spawned RunPod/PI pod), ships the runner script, runs it pinned to the chosen GPUs, parses structured progress off stdout (loss/metrics/log tail) for the live UI + SSE, and archives the artifacts (trained model / `result.json`) to your S3 storage.
 
 Deeper dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (component walk-through, Redis key schema, design rationale).
@@ -88,7 +88,7 @@ Open `http://localhost:3000`. With `AUTH_DISABLED=1` in `gateway/.env`, login is
 
 Both are gitignored — templates live next to them as `.env.example`. **Reset:** `docker compose down -v` (wipes Postgres + Redis volumes).
 
-**Why no real GPU locally?** Real provisioning (`PROVIDER=runpod` / `=pi`) spawns a pod on the provider's network that has to phone home to your gateway + Redis. `localhost` isn't reachable from the public internet. For real workers, deploy the gateway to k8s — see [docs/DEPLOY.md](docs/DEPLOY.md).
+**Real GPUs from a local gateway?** A spawned pod must phone home to your gateway + Redis, and `localhost` isn't reachable from the provider's network. The **RunPod and VM providers solve this with a reverse SSH tunnel** (on by default): the gateway SSHes into the pod and forwards the pod's loopback `gateway`+`redis` ports back home, so even a laptop gateway can drive real RunPod/VM workers — no public ingress, no custom worker image. (Prime Intellect has no such tunnel; for PI, or for a hands-off prod deploy, run the gateway in k8s — see [docs/DEPLOY.md](docs/DEPLOY.md).)
 
 ## Serverless inference
 
@@ -125,7 +125,7 @@ The same endpoint can be created from the web UI at `/serverless/new` (provider,
 
 ### Call it — OpenAI-compatible API
 
-Every endpoint is reachable at `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings`. Point any OpenAI client at the gateway URL with an API key from the **API tokens** page (prefix `sgpu_`). The `model` field is the **endpoint name** for a single-model endpoint, or a **member model name** for a multi-model fleet.
+Every endpoint is reachable at `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings` — and, for a Whisper member, `/v1/audio/transcriptions` + `/v1/audio/translations` (multipart file upload). Point any OpenAI client at the gateway URL with an API key from the **API tokens** page (prefix `sgpu_`). The `model` field is the **endpoint name** for a single-model endpoint, or a **member model name** for a multi-model fleet. All routes also exist scoped under `/{app_id}/v1/...`.
 
 ```bash
 GATEWAY=http://localhost:8080            # your gateway URL
@@ -140,6 +140,11 @@ curl -s "$GATEWAY/v1/chat/completions" \
 curl -sN "$GATEWAY/v1/chat/completions" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"model":"qwen","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# Whisper transcription — multipart upload; model = the ASR member's name
+curl -s "$GATEWAY/v1/audio/transcriptions" \
+  -H "Authorization: Bearer $KEY" \
+  -F file=@clip.mp3 -F model=openai/whisper-large-v3
 
 # Discover every served model across the fleet (no token required)
 curl -s "$GATEWAY/v1/models"
@@ -157,19 +162,28 @@ A lower-level async job API also exists — `POST /run/{app}` returns a `request
 
 The endpoint detail page (`/serverless/{id}`) has a tab for each operational concern:
 
-- **Overview** — model/GPU/autoscaler config, env vars, per-model vLLM args, the OpenAI/cURL snippets, and **Redeploy** / **Delete**.
-- **Playground** — fire chat completions interactively: model picker, `reasoning_effort`, `temperature`, "disable thinking" (`chat_template_kwargs.enable_thinking=false`), streaming toggle. Shows **reasoning + answer** panels live, **tokens/sec + TTFT**, and the equivalent **cURL** for the exact request. All settings deep-link into the URL.
+- **Overview** — model/GPU/autoscaler config (idle timeout is editable for single-model and **cloud multi-model** endpoints; read-only for an always-on VM fleet), env vars, per-model vLLM args, the OpenAI/cURL snippets, and **Redeploy** / **Delete**.
+- **Playground** — a **Chat** ↔ **Audio transcription** toggle. *Chat:* model picker, `reasoning_effort`, `temperature`, "disable thinking" (`chat_template_kwargs.enable_thinking=false`), streaming toggle; live **reasoning + answer** panels, **tokens/sec + TTFT**, and the equivalent **cURL**. *Audio:* upload a clip and transcribe/translate with a Whisper member. All settings deep-link into the URL.
 - **Stress test** — a `vllm bench serve`-style concurrency load against the live endpoint (input/output length, num prompts, concurrency) reporting throughput + TTFT/TPOT/E2E latency percentiles.
-- **Queue** — live `queue:{app}` + `result:*` view; click a request id to deep-link it.
-- **Workers** — for a fleet, each model's state (awake / asleep / loading / dead, **why** it died), its GPUs, TP, in-flight count, **localhost:port**, and per-model **Sleep / Restart / Kill / Logs** actions.
+- **Metrics** — live graphs scraped from the endpoint's own Prometheus exporter at `/{app_id}/metrics`: requests over time + errors, requests-by-route, and latency. Gateway-side HTTP metrics (`serverless_http_requests_total` / `_duration_seconds`), not persisted.
+- **Queue** — live request view bucketed **in queue / in progress / completed / failed**; click a request id to deep-link it. **Flush queue** (a styled confirm dialog) drops jobs still waiting *and* clears orphaned/stuck `pending` rows that a worker dequeued but never finalized.
+- **Workers** — for a fleet, each model's state (awake / asleep / loading / dead, **why** it died), GPUs, TP, in-flight count, and per-model **Sleep / Restart / Kill / Logs**. For a **cloud (RunPod)** endpoint, also a pods table: each container links to the **RunPod console**, an **Alive** column flags whether the worker actually registered + is heartbeating (vs a pod that's "running" but never phoned home), and a per-container **Delete** frees the GPU (the next request re-provisions).
 
-## Multi-model fleet on one VM (GPU time-sharing)
+## Multi-model fleets (VM or cloud RunPod)
 
-Instead of one model per endpoint, a single SSH-reachable VM can host **several vLLM
-servers that share its GPUs** by sleeping and waking on demand. You pick the models,
-pin each to a tensor-parallel GPU slice, and the gateway packs them onto the VM's
-GPUs; the worker-agent loads them, puts the idle ones to sleep, and wakes the right
-one when a request arrives.
+Instead of one model per endpoint, a single worker can host **several vLLM servers that
+share its GPUs** by sleeping and waking on demand. You pick the models, pin each to a
+tensor-parallel GPU slice, and the gateway packs them onto the worker's GPUs; the
+worker-agent loads them, sleeps the idle ones, and wakes the right one per request. A
+fleet runs on either:
+
+- **your own SSH VM** — always-on; the gateway ships the worker-agent over SSH and the
+  GPUs are time-shared by sleep/wake; **or**
+- **a cloud RunPod pod** — provisioned on demand from a stock CUDA image (no custom image
+  to build). The gateway opens a **reverse SSH tunnel** into the pod, ships the
+  worker-agent tarball, `uv pip install`s vLLM into a pod venv, and launches it — all
+  reachable from a localhost gateway. The cloud fleet **scales to zero** when idle and
+  **re-provisions on the next request**.
 
 - **Request-driven sleep/wake** — a request for an asleep model wakes it; if its GPUs
   are held by other awake models, those are slept first (LRU), then the target wakes.
@@ -179,9 +193,19 @@ one when a request arrives.
   ones serialize behind a per-GPU lock, so a 119B model can't OOM a 27B one mid-boot.
 - **vLLM sleep levels** — level 1 offloads weights to CPU RAM (fast wake); level 2
   discards them for a smaller footprint (slow wake = reload from disk). Chosen per fleet.
-- **Operate from the UI** — the Workers tab shows each model's state and *why* a dead
-  one died, with per-model **Sleep / Restart / Kill / Logs** actions, a fleet-wide
-  **Sleep all**, and a **Worker log** view of the scheduler itself.
+- **Scale to zero / from zero** (cloud) — with `idle_timeout_s > 0` the idle pod is
+  deleted (no GPU bill); the next request re-provisions it, waits out the cold load, and
+  is served. The idle-terminator never kills a pod that's still **loading** or has
+  **in-flight** requests, so the waking request isn't stranded mid cold-start.
+  `idle_timeout_s = 0` keeps the fleet always-on.
+- **Cancel on disconnect** — if a client times out / disconnects, the gateway marks the
+  request cancelled (it shows immediately as `failed` in the Queue tab), removes it from
+  the queue, and signals the worker — which skips it *before* waking a model (and stops
+  mid-stream if it was already running), so no GPU burns on abandoned work.
+- **Operate from the UI** — the Workers tab shows each model's state and *why* a dead one
+  died, with per-model **Sleep / Restart / Kill / Logs**, a fleet-wide **Sleep all**, the
+  scheduler's own **Worker log**, and (cloud) the pod's **RunPod-console** link, an
+  **Alive** indicator, and a **Delete container** button.
 - **Public model list** — `GET /v1/models` lists every served model across the fleet
   (no token required), so any OpenAI client can discover them.
 
@@ -255,12 +279,12 @@ Each user registers their own providers under `/providers`. Supported kinds:
 
 | Kind | What it is | Used by |
 |---|---|---|
-| `runpod` | RunPod API key | Serverless, Compute, Benchmark |
+| `runpod` | RunPod API key | Serverless (single **+ multi-model fleet**, reverse-tunnelled), Compute, Benchmark |
 | `pi` | Prime Intellect API key | Serverless, Compute, Benchmark |
 | `vm` | Your own SSH-reachable box | Serverless (multi-model fleet), Benchmark (bare-metal) |
 | `fake` | In-process dev provider | Local development only |
 
-Credentials are encrypted at rest. Provider resolution per request: explicit `provider_id` → the user's sole provider of that kind → gateway-wide env fallback (`RUNPOD_API_KEY`, `PI_API_KEY`).
+Credentials are encrypted at rest. Provider resolution per request: explicit `provider_id` → the user's sole provider of that kind → gateway-wide env fallback (`RUNPOD_API_KEY`, `PI_API_KEY`). `GET /v1/providers` also returns each cloud provider's **available GPU catalog** (`available_gpus` — id / label / VRAM), so a client can discover where it can run; `vm` providers report their fixed physical GPUs instead.
 
 ## Storage
 
@@ -286,7 +310,7 @@ Mint a long-lived bearer token on the **API tokens** page (or `POST /api-keys`).
 
 | Area | Key endpoints |
 |---|---|
-| Serverless | `POST /apps` · `GET /apps` · `GET /apps/{id}/status` · `POST /v1/chat/completions` · `GET /v1/models` · `POST /run/{app}` · `GET /result/{id}` |
+| Serverless | `POST /apps` · `GET /apps` · `GET /apps/{id}/status` · `GET /apps/{id}/workers` · `POST /apps/{id}/workers/{mid}/terminate` · `POST /apps/{id}/queue/flush` · `POST /v1/chat/completions` · `POST /v1/audio/transcriptions` · `GET /v1/models` · `POST /run/{app}` · `GET /result/{id}` · `GET /{app}/metrics` (per-endpoint Prometheus) |
 | Autotrain | `POST /v1/training-runs` · `GET /v1/training-runs` · `GET /v1/training-runs/{id}` · `GET /v1/training-runs/{id}/metrics` · `GET /v1/training-runs/{id}/files` · `GET /v1/training-runs/{id}/logs/stream` · `POST /v1/training-runs/{id}/restart` · `POST /v1/training-runs/{id}/terminate` · `POST /v1/training-runs/{id}/transcribe` · `POST /v1/training-runs/{id}/synthesize` |
 | Datasets | `GET /v1/datasets` · `POST /v1/datasets` · `POST /v1/datasets/{id}/upload` · `GET /v1/datasets/{id}/preview` · `POST /v1/datasets/{id}/row-inclusion` · `POST /v1/datasets/{id}/transform` · `POST /v1/datasets/{id}/pack-tts` · `POST /v1/datasets/{id}/sync` |
 | Benchmark | `POST /benchmarks` · `GET /benchmarks/{id}` · `GET /benchmarks/{id}/logs?tail=` · `POST /benchmarks/{id}/duplicate` · `PATCH /benchmarks/{id}` (rename) · `POST /benchmarks/{id}/terminate` |
@@ -381,7 +405,7 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 
 - **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/training-runs`, `/v1/datasets`, `/v1/providers`, `/v1/storage`, `/v1/global-env`, `/v1/tracking-credentials`, `/api-keys`, `/auth`, `/admin/*`, `/metrics`
 - **Trainers** (`gateway/gateway/training/`) — standalone runner scripts shipped over SSH per run: `whisper_finetune.py` (ASR), `tts_finetune.py` (the TTS pipeline — NeuCodec-encode → multipack into a ChiniDataset → Qwen3 causal-LM train → CER/MOS/similarity eval, with a **pack-only** mode that powers the dataset Pack-for-TTS step), and `sweep_runner.py` (GPU-pinned multi-trial orchestrator)
-- **Worker agent** (`worker-agent/`) — `BRPOP`s jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub; also drives the **multi-model VM fleet** — wave-loads each vLLM, sleeps/wakes them per request, runs operator commands (sleep/restart/kill), and ships per-model + scheduler logs to the gateway
+- **Worker agent** (`worker-agent/`) — `BRPOP`s jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub (and rebuilds the multipart upload for Whisper `/v1/audio/*`); also drives the **multi-model fleet** on a VM **or a reverse-tunnelled RunPod pod** — wave-loads each vLLM, sleeps/wakes them per request, skips cancelled jobs before waking a model, runs operator commands (sleep/restart/kill), and ships per-model + scheduler logs to the gateway. The RunPod reverse-tunnel provisioning lives in `gateway/gateway/runpod_provider.py`.
 - **SDK + CLI** (`sdk/serverlessgpu/`) — `@endpoint` decorator, `QueueDepthAutoscaler`, and the `serverlessgpu` CLI
 - **Web** (`web/`) — Next.js UI: Serverless, Autotrain, Datasets, Benchmark, Compute, Providers, Storage, API tokens, Admin (users / roles / audit / approvals / provisioned / secrets)
 - **Helm chart** (`deploy/helm/serverlessgpu/`) — gateway + web + Postgres + Redis + Ingress (SSE-safe) + ServiceMonitor

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
+import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Eraser, Loader2, RotateCw, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -39,16 +40,15 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const initialTab: EndpointTab = (() => {
-    const t = searchParams.get("tab");
-    return t && ENDPOINT_TAB_VALUES.includes(t) ? (t as EndpointTab) : "overview";
-  })();
-  const [tab, setTabState] = useState<EndpointTab>(initialTab);
-  const setTab = (v: EndpointTab) => {
-    setTabState(v);
+  // Active tab is derived from the URL (?tab=) and each trigger is a real <Link>,
+  // so right-click / middle-click / ⌘-click "open in new tab" works. A normal
+  // click still switches in place (useSearchParams is reactive to soft nav).
+  const tabParam = searchParams.get("tab");
+  const tab: EndpointTab = tabParam && ENDPOINT_TAB_VALUES.includes(tabParam) ? (tabParam as EndpointTab) : "overview";
+  const tabHref = (v: EndpointTab) => {
     const params = new URLSearchParams(searchParams.toString());
     params.set("tab", v);
-    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+    return `${pathname}?${params.toString()}`;
   };
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [pending, startTransition] = useTransition();
@@ -175,11 +175,11 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
 
         <KpiBar app={app} />
 
-        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="mt-2">
+        <Tabs value={tab} className="mt-2">
           <TabsList variant="line" className="bg-transparent">
             {TABS.map((t) => (
-              <TabsTrigger key={t.value} value={t.value}>
-                {t.label}
+              <TabsTrigger key={t.value} value={t.value} asChild>
+                <Link href={tabHref(t.value)} scroll={false}>{t.label}</Link>
               </TabsTrigger>
             ))}
           </TabsList>
@@ -187,7 +187,7 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
       </div>
 
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 scrollbar-thin">
-        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)}>
+        <Tabs value={tab}>
           <TabsContent value="overview"><OverviewTab app={app} /></TabsContent>
           <TabsContent value="playground"><RequestsTab app={app} /></TabsContent>
           <TabsContent value="stress"><StressTab app={app} /></TabsContent>

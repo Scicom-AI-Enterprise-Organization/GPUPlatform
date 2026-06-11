@@ -51,16 +51,16 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
   const aliases = Array.from(new Set(ep.upstreams.flatMap((u) => Object.keys(u.models))));
   const proxyBase = `${baseUrl}/proxy/${ep.name}/v1`;
 
-  const initialTab: ProxyTab = (() => {
-    const t = searchParams.get("tab");
-    return t && TAB_VALUES.includes(t) ? (t as ProxyTab) : "overview";
-  })();
-  const [tab, setTabState] = useState<ProxyTab>(initialTab);
-  const setTab = (v: ProxyTab) => {
-    setTabState(v);
+  // The active tab is derived from the URL (?tab=), and each trigger is a real
+  // <Link> — so right-click / middle-click / ⌘-click "open in new tab" works.
+  // useSearchParams is reactive to soft navigations, so a normal click still
+  // switches tabs in place without a full reload.
+  const tabParam = searchParams.get("tab");
+  const tab: ProxyTab = tabParam && TAB_VALUES.includes(tabParam) ? (tabParam as ProxyTab) : "overview";
+  const tabHref = (v: ProxyTab) => {
     const p = new URLSearchParams(searchParams.toString());
     p.set("tab", v);
-    router.replace(`${pathname}?${p.toString()}`, { scroll: false });
+    return `${pathname}?${p.toString()}`;
   };
 
   const [health, setHealth] = useState<ProxyUpstreamHealth[]>([]);
@@ -153,16 +153,20 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
             <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={onDelete}><Trash2 className="h-4 w-4" /> Delete</Button>
           </div>
         </div>
-        <Tabs value={tab} onValueChange={(v) => setTab(v as ProxyTab)} className="mt-3">
+        <Tabs value={tab} className="mt-3">
           <TabsList variant="line" className="bg-transparent">
-            {TABS.map((t) => <TabsTrigger key={t.value} value={t.value}>{t.label}</TabsTrigger>)}
+            {TABS.map((t) => (
+              <TabsTrigger key={t.value} value={t.value} asChild>
+                <Link href={tabHref(t.value)} scroll={false}>{t.label}</Link>
+              </TabsTrigger>
+            ))}
           </TabsList>
         </Tabs>
       </div>
 
       {/* scroll zone — second Tabs holds the content (same value/handler) */}
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 scrollbar-thin">
-        <Tabs value={tab} onValueChange={(v) => setTab(v as ProxyTab)}>
+        <Tabs value={tab}>
           {/* ---- Overview ---- */}
           <TabsContent value="overview" className="space-y-4">
           <Card>
