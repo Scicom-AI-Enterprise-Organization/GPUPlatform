@@ -1471,7 +1471,7 @@ export function AnalyticsView() {
                   ))}
                   {pageRecs.length === 0 && !loading && (
                     <tr>
-                      <td colSpan={10} className="px-3 py-8 text-center text-muted-foreground">
+                      <td colSpan={11} className="px-3 py-8 text-center text-muted-foreground">
                         No records match the current filters.
                       </td>
                     </tr>
