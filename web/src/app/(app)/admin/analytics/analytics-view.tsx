@@ -33,7 +33,15 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { ChevronDown, Download, Loader2, Plus, Settings2, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  Download,
+  ExternalLink,
+  Loader2,
+  Plus,
+  Settings2,
+  Trash2,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -107,6 +115,9 @@ type SlurmDailyJob = {
   endedAt?: string | null;
   durationSec?: number;
   gpus?: number;
+  // deep-link parts (SlurmUI v1.0.214+): /clusters/{clusterId}/jobs/{id}
+  id?: string;
+  clusterId?: string | null;
 };
 
 type SlurmReport = {
@@ -123,7 +134,7 @@ type SlurmReport = {
 
 type SlurmPayload =
   | { configured: false }
-  | { configured: true; report?: SlurmReport; error?: string };
+  | { configured: true; baseUrl?: string; report?: SlurmReport; error?: string };
 
 // One normalized activity record — every chart below derives from these.
 type Rec = {
@@ -151,6 +162,7 @@ type Rec = {
   raw: Record<string, unknown>; // full record for the detail drawer
   count: number; // 1 for real records; >1 for aggregated summary rows
   synthetic?: boolean; // true = aggregate row (charts only, never in tables)
+  href: string | null; // deep link to the source page (relative or absolute)
 };
 
 // ── filters ──────────────────────────────────────────────────────────────────
@@ -341,10 +353,34 @@ function normalizeGpuPlatform(payload: GpuPlatformPayload): Rec[] {
         devices: str(worker.visible_devices) ?? str(detail.visible_devices),
         raw: j as unknown as Record<string, unknown>,
         count: 1,
+        href: recHref(kind, j),
       });
     }
   }
   return recs;
+}
+
+// Deep link to the record's own page in the console (relative URL, new tab).
+function recHref(kind: string, j: HistoryJob): string | null {
+  const detail = j.detail ?? {};
+  switch (kind) {
+    case "benchmark":
+      return `/benchmark/${j.id}`;
+    case "training":
+      return `/autotrain/${j.id}`;
+    case "compute":
+      return `/compute/${j.id}`;
+    case "endpoint": {
+      const appId = str(detail.app_id);
+      return detail.still_exists && appId ? `/serverless/${appId}` : null;
+    }
+    case "inference": {
+      const appId = str(detail.app_id);
+      return appId ? `/serverless/${appId}` : null;
+    }
+    default:
+      return null;
+  }
 }
 
 // Aggregate inference counts → synthetic chart records (one per
@@ -371,10 +407,11 @@ function normalizeInferenceSummary(rows: InferenceSummaryRow[]): Rec[] {
     raw: r as unknown as Record<string, unknown>,
     count: r.count,
     synthetic: true,
+    href: null,
   }));
 }
 
-function normalizeSlurm(report: SlurmReport): Rec[] {
+function normalizeSlurm(report: SlurmReport, baseUrl?: string): Rec[] {
   const recs: Rec[] = [];
   for (const day of report.dailyJobHistory ?? []) {
     const jobs = day.jobs ?? [];
@@ -417,6 +454,10 @@ function normalizeSlurm(report: SlurmReport): Rec[] {
         devices: str(j.cudaVisibleDevices),
         raw: j as unknown as Record<string, unknown>,
         count: 1,
+        href:
+          baseUrl && j.clusterId && j.id
+            ? `${baseUrl}/clusters/${j.clusterId}/jobs/${j.id}`
+            : null,
       });
     }
   }
@@ -606,7 +647,7 @@ export function AnalyticsView() {
     }
 
     if (slurm.status === "fulfilled" && slurm.value.configured && "report" in slurm.value && slurm.value.report) {
-      setSlurmRecs(normalizeSlurm(slurm.value.report));
+      setSlurmRecs(normalizeSlurm(slurm.value.report, slurm.value.baseUrl));
       setSlurmState("ok");
     } else if (slurm.status === "fulfilled" && !slurm.value.configured) {
       setSlurmRecs([]);
@@ -1364,6 +1405,7 @@ export function AnalyticsView() {
                     <th className="px-3 py-2 text-left font-medium">Devices</th>
                     {sortHeader("duration", "Duration")}
                     {sortHeader("status", "Status")}
+                    <th className="w-8 px-2 py-2" />
                   </tr>
                 </thead>
                 <tbody>
@@ -1396,11 +1438,25 @@ export function AnalyticsView() {
                       <td className={`whitespace-nowrap px-3 py-2 ${STATUS_COLOR(r.status)}`}>
                         {r.status}
                       </td>
+                      <td className="px-2 py-2">
+                        {r.href && (
+                          <a
+                            href={r.href}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="Open in a new tab"
+                            className="text-muted-foreground hover:text-foreground"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
+                          </a>
+                        )}
+                      </td>
                     </tr>
                   ))}
                   {pageRecs.length === 0 && !loading && (
                     <tr>
-                      <td colSpan={9} className="px-3 py-8 text-center text-muted-foreground">
+                      <td colSpan={10} className="px-3 py-8 text-center text-muted-foreground">
                         No records match the current filters.
                       </td>
                     </tr>
@@ -1747,8 +1803,18 @@ export function AnalyticsView() {
       <Dialog open={detailRec !== null} onOpenChange={(o) => !o && setDetailRec(null)}>
         <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
           <DialogHeader>
-            <DialogTitle className="text-sm">
+            <DialogTitle className="flex items-center gap-2 text-sm">
               {detailRec ? `${APP_LABEL(detailRec.app)} · ${detailRec.id}` : ""}
+              {detailRec?.href && (
+                <a
+                  href={detailRec.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 text-xs font-normal text-primary hover:underline"
+                >
+                  Open <ExternalLink className="h-3 w-3" />
+                </a>
+              )}
             </DialogTitle>
           </DialogHeader>
           {detailRec && (
