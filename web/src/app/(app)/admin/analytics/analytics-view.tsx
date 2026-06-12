@@ -796,10 +796,10 @@ export function AnalyticsView() {
     const t1 = to.getTime();
     const nowClamp = Math.min(nowTs || t1, t1);
     const byDate = new Map<string, CalBlock[]>();
-    const push = (b: CalBlock) => {
-      const arr = byDate.get(b.date) ?? [];
+    const push = (date: string, b: CalBlock) => {
+      const arr = byDate.get(date) ?? [];
       arr.push(b);
-      byDate.set(b.date, arr);
+      byDate.set(date, arr);
     };
     for (const { app, spans } of gpuTimeline) {
       const node = workerApps[app]?.node ?? "—";
@@ -816,7 +816,7 @@ export function AnalyticsView() {
           const bs = Math.max(s, dayStart);
           const be = Math.min(e, dayEnd);
           if (be > bs) {
-            push({
+            push(localDate(new Date(dayStart)), {
               app,
               node,
               mid: sp.mid,
