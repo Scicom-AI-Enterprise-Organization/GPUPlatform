@@ -654,14 +654,28 @@ type WorkerSpan = {
 };
 type GpuTimelineRow = { app: string; spans: WorkerSpan[] };
 type AppMeta = { name: string; node: string; gpu: string | null; gpu_ids: number[] };
-type HourCell = { active: boolean; running: boolean };
-type CalRow = {
-  date: string; // YYYY-MM-DD (local)
-  node: string;
+// One calendar event block = a worker's serving span clipped to a single day.
+type CalBlock = {
   app: string;
-  gpu: number;
-  hours: HourCell[]; // length 24, index = hour of day
+  node: string;
+  mid: string;
+  start: number; // epoch ms, clipped to [day 00:00, day 24:00]
+  end: number; // epoch ms
+  running: boolean;
+  lane: number; // vertical lane for overlap stacking
 };
+type CalDay = { date: string; blocks: CalBlock[]; lanes: number };
+
+// 12-hour clock like Google Calendar — "6:12pm", "5am".
+const fmt12 = (ms: number): string => {
+  const d = new Date(ms);
+  let h = d.getHours();
+  const m = d.getMinutes();
+  const ap = h < 12 ? "am" : "pm";
+  h = h % 12 || 12;
+  return m === 0 ? `${h}${ap}` : `${h}:${String(m).padStart(2, "0")}${ap}`;
+};
+const DAY_MS = 86_400_000;
 
 const WORKER_ON = new Set(["provisioned", "registered", "scaled_up"]);
 const WORKER_OFF = new Set(["terminated", "idle_terminated", "terminate_failed"]);
@@ -775,55 +789,67 @@ export function AnalyticsView() {
 
   const gpuTimeline = useMemo(() => buildGpuTimeline(workerEvents), [workerEvents]);
 
-  // Calendar grid: one row per (date, node/endpoint, GPU id); 24 hourly cells
-  // marked active when that endpoint's worker was serving during the hour.
-  const gpuCalendar = useMemo<CalRow[]>(() => {
+  // Calendar: one row per day; each worker serving-span becomes an event block
+  // clipped to the day(s) it touches, then lane-packed so overlaps stack.
+  const gpuDays = useMemo<CalDay[]>(() => {
     const t0 = from.getTime();
     const t1 = to.getTime();
     const nowClamp = Math.min(nowTs || t1, t1);
-    const rows: CalRow[] = [];
+    const byDate = new Map<string, CalBlock[]>();
+    const push = (b: CalBlock) => {
+      const arr = byDate.get(b.date) ?? [];
+      arr.push(b);
+      byDate.set(b.date, arr);
+    };
     for (const { app, spans } of gpuTimeline) {
-      const meta = workerApps[app];
-      const node = meta?.node ?? "—";
-      const gpuIds = meta?.gpu_ids?.length ? meta.gpu_ids : [0];
-      // dateKey → 24 hour cells, accumulated across this endpoint's spans.
-      const byDate = new Map<string, HourCell[]>();
-      const ensure = (k: string): HourCell[] => {
-        let cells = byDate.get(k);
-        if (!cells) {
-          cells = Array.from({ length: 24 }, () => ({ active: false, running: false }));
-          byDate.set(k, cells);
-        }
-        return cells;
-      };
+      const node = workerApps[app]?.node ?? "—";
       for (const sp of spans) {
         const s = Math.max(sp.start, t0);
         const e = Math.min(sp.end ?? nowClamp, t1);
         if (e <= s) continue;
-        // Walk hour-aligned buckets from start to end.
-        const first = new Date(s);
-        first.setMinutes(0, 0, 0);
-        for (let cur = first.getTime(); cur < e; cur += 3_600_000) {
-          const d = new Date(cur);
-          const cell = ensure(localDate(d))[d.getHours()];
-          cell.active = true;
-          if (sp.running) cell.running = true;
+        // Split the span across local-day boundaries.
+        const cur = new Date(s);
+        cur.setHours(0, 0, 0, 0);
+        while (cur.getTime() < e) {
+          const dayStart = cur.getTime();
+          const dayEnd = dayStart + DAY_MS;
+          const bs = Math.max(s, dayStart);
+          const be = Math.min(e, dayEnd);
+          if (be > bs) {
+            push({
+              app,
+              node,
+              mid: sp.mid,
+              start: bs,
+              end: be,
+              running: sp.running && be >= e,
+              lane: 0,
+            });
+          }
+          cur.setTime(dayEnd);
+          cur.setHours(0, 0, 0, 0); // re-align (DST-safe)
         }
       }
-      for (const date of [...byDate.keys()].sort()) {
-        const hours = byDate.get(date)!;
-        for (const gpu of gpuIds) rows.push({ date, node, app, gpu, hours });
-      }
     }
-    // Most recent day first, then node / endpoint / GPU for stable grouping.
-    rows.sort(
-      (a, b) =>
-        b.date.localeCompare(a.date) ||
-        a.node.localeCompare(b.node) ||
-        a.app.localeCompare(b.app) ||
-        a.gpu - b.gpu,
-    );
-    return rows;
+    const days: CalDay[] = [];
+    for (const [date, blocks] of byDate) {
+      blocks.sort((a, b) => a.start - b.start);
+      // Greedy interval lane packing (like calendar column layout).
+      const laneEnds: number[] = [];
+      for (const b of blocks) {
+        let lane = laneEnds.findIndex((end) => end <= b.start);
+        if (lane === -1) {
+          lane = laneEnds.length;
+          laneEnds.push(b.end);
+        } else {
+          laneEnds[lane] = b.end;
+        }
+        b.lane = lane;
+      }
+      days.push({ date, blocks, lanes: Math.max(1, laneEnds.length) });
+    }
+    days.sort((a, b) => b.date.localeCompare(a.date)); // newest day first
+    return days;
   }, [gpuTimeline, workerApps, from, to, nowTs]);
 
   const load = useCallback(async () => {
@@ -2008,15 +2034,15 @@ export function AnalyticsView() {
           </div>
         </TabsContent>
 
-        {/* GPU Timeline — per-day, per-node, per-GPU hourly occupancy grid */}
+        {/* GPU Timeline — calendar: one row per day, fluid event blocks per endpoint */}
         <TabsContent value="gputimeline">
           <div className="rounded-lg border bg-card p-4">
             <h2 className="mb-1 text-sm font-semibold">GPU Timeline</h2>
             <p className="mb-3 text-xs text-muted-foreground">
-              Hourly occupancy per node + GPU — a cell is filled for each hour the endpoint&apos;s
-              worker was serving. Green = running now, indigo = was serving (since stopped). Node
-              is the provider the endpoint is bound to; GPU ids come from the endpoint&apos;s device
-              pin. Sourced from the durable worker-events log.
+              When each inference endpoint was serving, laid out like a calendar — one row per day,
+              time left→right. Each block is a worker&apos;s life, labelled with the endpoint and
+              its exact window; overlaps stack into lanes. Green = running now, indigo = since
+              stopped. Sourced from the durable worker-events log.
             </p>
             <div className="mb-3 flex items-center gap-4 text-[10px] text-muted-foreground">
               <span className="flex items-center gap-1.5">
@@ -2025,75 +2051,78 @@ export function AnalyticsView() {
               <span className="flex items-center gap-1.5">
                 <span className="inline-block h-2.5 w-2.5 rounded-sm bg-indigo-500" /> served
               </span>
-              <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-muted" /> idle
-              </span>
             </div>
-            {gpuCalendar.length === 0 && !loading ? (
+            {gpuDays.length === 0 && !loading ? (
               <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
                 No inference worker activity in the selected period.
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="border-separate border-spacing-0 text-[10px]">
-                  <thead>
-                    <tr className="text-muted-foreground">
-                      <th className="sticky left-0 z-10 bg-card px-2 py-1 text-left font-medium">
-                        Date
-                      </th>
-                      <th className="px-2 py-1 text-left font-medium">Node</th>
-                      <th className="px-2 py-1 text-left font-medium">Endpoint</th>
-                      <th className="px-2 py-1 text-right font-medium">GPU</th>
-                      {Array.from({ length: 24 }, (_, h) => (
-                        <th
-                          key={h}
-                          className="w-5 px-0 py-1 text-center font-normal tabular-nums"
-                          title={`${String(h).padStart(2, "0")}:00–${String((h + 1) % 24).padStart(2, "0")}:00`}
-                        >
-                          {String(h).padStart(2, "0")}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(() => {
-                      let prevDate = "";
-                      let prevGroup = ""; // date|node|endpoint
-                      return gpuCalendar.map((row, idx) => {
-                        const group = `${row.date}|${row.node}|${row.app}`;
-                        const showDate = row.date !== prevDate;
-                        const showGroup = group !== prevGroup;
-                        prevDate = row.date;
-                        prevGroup = group;
-                        return (
-                          <tr key={idx} className="hover:bg-muted/30">
-                            <td className="sticky left-0 z-10 bg-card px-2 py-0.5 font-mono tabular-nums">
-                              {showDate ? row.date : ""}
-                            </td>
-                            <td className="px-2 py-0.5 font-mono">{showGroup ? row.node : ""}</td>
-                            <td
-                              className="max-w-[10rem] truncate px-2 py-0.5 font-mono"
-                              title={row.app}
+              <div className="overflow-hidden rounded-md border">
+                {/* Hour axis */}
+                <div className="flex border-b bg-muted/30 text-[10px] text-muted-foreground">
+                  <div className="w-28 shrink-0 border-r px-2 py-1 font-medium">Day</div>
+                  <div className="relative h-6 flex-1">
+                    {Array.from({ length: 13 }, (_, i) => i * 2).map((h) => (
+                      <span
+                        key={h}
+                        className="absolute top-1 -translate-x-1/2 tabular-nums"
+                        style={{ left: `${(h / 24) * 100}%` }}
+                      >
+                        {h === 0 ? "12a" : h === 12 ? "12p" : h < 12 ? `${h}a` : `${h - 12}p`}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                {/* Day rows */}
+                {gpuDays.map((day) => {
+                  const dayStart = new Date(`${day.date}T00:00:00`).getTime();
+                  const LANE = 30; // px per stacked lane
+                  const d = new Date(`${day.date}T00:00:00`);
+                  const weekday = d.toLocaleDateString(undefined, { weekday: "short" });
+                  return (
+                    <div key={day.date} className="flex border-b last:border-b-0">
+                      <div className="w-28 shrink-0 border-r px-2 py-2 font-mono text-[11px]">
+                        <div className="tabular-nums">{day.date}</div>
+                        <div className="text-[10px] text-muted-foreground">{weekday}</div>
+                      </div>
+                      <div
+                        className="relative flex-1"
+                        style={{
+                          height: `${day.lanes * LANE + 6}px`,
+                          backgroundImage:
+                            "repeating-linear-gradient(to right, hsl(var(--border)) 0 1px, transparent 1px calc(100% / 24))",
+                        }}
+                      >
+                        {day.blocks.map((b, i) => {
+                          const left = ((b.start - dayStart) / DAY_MS) * 100;
+                          const width = Math.max(((b.end - b.start) / DAY_MS) * 100, 0.7);
+                          return (
+                            <div
+                              key={i}
+                              className={`absolute overflow-hidden rounded-md border px-1.5 py-0.5 text-[10px] leading-tight text-white shadow-sm ${b.running ? "border-emerald-400/40 bg-emerald-600" : "border-indigo-400/40 bg-indigo-600"}`}
+                              style={{
+                                left: `${Math.min(left, 99)}%`,
+                                width: `${Math.min(width, 100 - left)}%`,
+                                top: `${b.lane * LANE + 3}px`,
+                                height: `${LANE - 4}px`,
+                              }}
+                              title={
+                                `${b.app}  ·  ${b.node}\n` +
+                                `${fmt12(b.start)} – ${b.running ? "now" : fmt12(b.end)}\n` +
+                                `worker ${b.mid}`
+                              }
                             >
-                              {showGroup ? row.app : ""}
-                            </td>
-                            <td className="px-2 py-0.5 text-right font-mono tabular-nums">
-                              {row.gpu}
-                            </td>
-                            {row.hours.map((c, h) => (
-                              <td key={h} className="p-0">
-                                <div
-                                  className={`mx-px h-3.5 w-4 rounded-[2px] ${c.active ? (c.running ? "bg-emerald-500" : "bg-indigo-500") : "bg-muted/40"}`}
-                                  title={`${row.date} ${String(h).padStart(2, "0")}:00 · ${row.node} · ${row.app} GPU${row.gpu} — ${c.active ? (c.running ? "running" : "served") : "idle"}`}
-                                />
-                              </td>
-                            ))}
-                          </tr>
-                        );
-                      });
-                    })()}
-                  </tbody>
-                </table>
+                              <div className="truncate font-medium">{b.app}</div>
+                              <div className="truncate text-white/80">
+                                {fmt12(b.start)}–{b.running ? "now" : fmt12(b.end)}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
