@@ -142,7 +142,16 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
         bal = ", ".join(f"{s}×{c}" for s, c in sorted(Counter(s for _, _, s in out).items()))
         log(f"balancing {len(out)} clip(s) across {len(speakers)} speaker(s): {bal}")
         return out
-    return [(pt, rt, "") for (pt, rt) in selected]
+    # No balancing: keep each clip's original packed voice, but recover its speaker
+    # name (the "<|im_start|>{speaker}: …" prefix) so the optional transcription
+    # prefix can still tag it.
+    from tts_eval import _IM_START, _SPEECH_START
+
+    def _spk(pt: str) -> str:
+        left = pt.split(_SPEECH_START, 1)[0].replace(_IM_START, "").strip()
+        return left.split(":", 1)[0].strip() if ":" in left else ""
+
+    return [(pt, rt, _spk(pt)) for (pt, rt) in selected]
 
 
 def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
@@ -172,6 +181,10 @@ def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
 
     import re as _re
 
+    # Optionally prefix each task's transcription with the speaker name (e.g.
+    # "TM_Mandarin: hello world") so labellers see who's speaking.
+    speaker_prefix = bool(cfg.get("label_speaker_prefix"))
+
     cli = _upload_client(cfg)
     bucket = cfg["upload_bucket"]
     base_key = cfg["upload_prefix"].strip("/")
@@ -197,7 +210,8 @@ def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
             safe = _re.sub(r"[^A-Za-z0-9._-]+", "-", speaker).strip("-") if speaker else ""
             key = f"{base_key}/{idx:04d}{('_' + safe) if safe else ''}.wav"
             cli.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
-            items.append({"key": key, "text": ref_text, "speaker": speaker})
+            task_text = f"{speaker}: {ref_text}" if (speaker_prefix and speaker) else ref_text
+            items.append({"key": key, "text": task_text, "speaker": speaker})
             tag = f" [{speaker}]" if speaker else ""
             log(f"clip {idx + 1}/{len(utts)}{tag}: {len(wav) / int(sr):.2f}s → s3://{bucket}/{key}")
         except Exception as e:  # noqa: BLE001

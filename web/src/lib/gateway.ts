@@ -328,6 +328,7 @@ export const gateway = {
       samples?: number;
       mos_axes?: string[];
       speakers?: string[];
+      speaker_prefix?: boolean;
     },
   ) =>
     request<{ status: string }>(

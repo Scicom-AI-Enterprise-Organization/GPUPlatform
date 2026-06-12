@@ -196,6 +196,16 @@ async def availability_vm(host: str, port: int, user: str, private_key: str) -> 
 # metrics page. One SSH round-trip; not persisted (the UI polls + graphs live).
 # --------------------------------------------------------------------------
 @dataclass
+class GpuProc:
+    """A process bound to a GPU (matched by CUDA_VISIBLE_DEVICES). `pid` is the
+    container-namespace pid — the one `ps`/`kill` see on the box (NOT the host pid
+    nvidia-smi reports, which differs under a container)."""
+    pid: int
+    comm: str
+    cmd: str
+
+
+@dataclass
 class GpuMetric:
     index: int
     name: str
@@ -203,6 +213,7 @@ class GpuMetric:
     mem_used_mib: int
     mem_total_mib: int
     temp_c: int
+    processes: list[GpuProc] = field(default_factory=list)
 
 
 @dataclass
@@ -224,7 +235,19 @@ _METRICS_CMD = (
     "echo @@CPU1; grep '^cpu' /proc/stat; sleep 0.4; echo @@CPU2; grep '^cpu' /proc/stat; "
     "echo @@MEM; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; echo @@GPU; "
     "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu "
-    "--format=csv,noheader,nounits 2>/dev/null"
+    "--format=csv,noheader,nounits 2>/dev/null; "
+    # Per-GPU processes by CUDA_VISIBLE_DEVICES (container-namespace pids — the ones
+    # ps/kill see; nvidia-smi's compute-apps pids are host-namespace under a
+    # container and don't match). One line per GPU process: pid|cvd|comm|cmd.
+    "echo @@PROC; "
+    "for e in /proc/[0-9]*/environ; do "
+    "p=${e%/environ}; p=${p#/proc/}; "
+    "cvd=$(tr '\\0' '\\n' < \"$e\" 2>/dev/null | sed -n 's/^CUDA_VISIBLE_DEVICES=//p' | head -1); "
+    "[ -z \"$cvd\" ] && continue; "
+    "comm=$(cat /proc/$p/comm 2>/dev/null); "
+    "cmd=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-110); "
+    "echo \"$p|$cvd|$comm|$cmd\"; "
+    "done 2>/dev/null"
 )
 
 
@@ -267,7 +290,7 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
         cur = None
         for ln in out.splitlines():
             s = ln.strip()
-            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU"):
+            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@PROC"):
                 cur = s
                 sec[cur] = []
             elif cur:
@@ -324,6 +347,20 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
                                       int(parts[3]), int(parts[4]), int(parts[5])))
             except ValueError:
                 continue
+
+        # @@PROC: pid|CUDA_VISIBLE_DEVICES|comm|cmd → attach to the physical GPUs the
+        # process can see (CVD value == physical index). One process can span GPUs (TP).
+        proc_for: list[tuple[set[int], GpuProc]] = []
+        for ln in sec.get("@@PROC", []):
+            bits = ln.split("|", 3)
+            if len(bits) < 4 or not bits[0].strip().isdigit():
+                continue
+            idxs = {int(t) for t in bits[1].split(",") if t.strip().isdigit()}
+            if not idxs:
+                continue
+            proc_for.append((idxs, GpuProc(int(bits[0]), bits[2].strip(), bits[3].strip())))
+        for g in gpus:
+            g.processes = [gp for (idxs, gp) in proc_for if g.index in idxs]
 
         ok = mem_total_mib > 0 or bool(gpus) or cpu_pct >= 0
         return VmMetricsResult(

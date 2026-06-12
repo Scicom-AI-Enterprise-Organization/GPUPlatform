@@ -1745,6 +1745,8 @@ class CreateTrainingRunRequest(BaseModel):
     # Balance the synthesized eval clips across these speaker names (round-robin),
     # e.g. ["A","B"] + 32 samples → 16 each. Empty → original packed voices.
     label_speakers: list[str] = []
+    # Prefix each Label task's transcription with the speaker name ("spk: text").
+    label_speaker_prefix: bool = False
     precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
@@ -2037,6 +2039,7 @@ async def create_training_run(
         "label_samples": int(body.label_samples or 32),
         "label_mos_axes": [a.strip() for a in (body.label_mos_axes or []) if str(a).strip()],
         "label_speakers": [str(s).strip() for s in (body.label_speakers or []) if str(s).strip()],
+        "label_speaker_prefix": bool(body.label_speaker_prefix),
         "precision": body.precision, "language": body.language, "task": body.task,
         "base_model": body.base_model,
         # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab
@@ -2174,6 +2177,7 @@ class LabelExportRequest(BaseModel):
     samples: Optional[int] = None
     mos_axes: Optional[list[str]] = None
     speakers: Optional[list[str]] = None  # balance clips across these speaker names
+    speaker_prefix: Optional[bool] = None  # prefix transcription with the speaker name
 
 
 @router.post("/{run_id}/label-export")
@@ -2229,6 +2233,8 @@ async def retry_label_export(
         cfg["label_mos_axes"] = [a.strip() for a in body.mos_axes if str(a).strip()]
     if body.speakers is not None:
         cfg["label_speakers"] = [s.strip() for s in body.speakers if str(s).strip()]
+    if body.speaker_prefix is not None:
+        cfg["label_speaker_prefix"] = bool(body.speaker_prefix)
     cfg["label_export"] = True
 
     has_url = bool((cfg.get("label_base_url_secret") or "").strip() or (cfg.get("label_base_url") or "").strip())
@@ -2246,7 +2252,7 @@ async def retry_label_export(
             merged = dict(r2.config_json or {})
             for k in ("label_export", "label_base_url", "label_base_url_secret",
                       "label_token_secret", "label_token_enc", "label_project_name",
-                      "label_samples", "label_mos_axes", "label_speakers"):
+                      "label_samples", "label_mos_axes", "label_speakers", "label_speaker_prefix"):
                 merged[k] = cfg.get(k)
             r2.config_json = merged
             await s.commit()
@@ -3394,6 +3400,8 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
             # Balance the synthesized clips round-robin across these speaker names
             # (e.g. 2 speakers + 32 samples → 16 each). Empty → original packed voices.
             "label_speakers": [str(s).strip() for s in (cfg.get("label_speakers") or []) if str(s).strip()],
+            # Prefix each task's transcription with the speaker name ("spk: text").
+            "label_speaker_prefix": bool(cfg.get("label_speaker_prefix")),
         }
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(tconf))

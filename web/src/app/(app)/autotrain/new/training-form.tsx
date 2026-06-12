@@ -308,6 +308,7 @@ export function TrainingForm() {
   const [labelProjectName, setLabelProjectName] = useState("");
   const [labelSamples, setLabelSamples] = useState(32);
   const [labelSpeakers, setLabelSpeakers] = useState("");
+  const [labelSpeakerPrefix, setLabelSpeakerPrefix] = useState(false);
   const [labelMosAxes, setLabelMosAxes] = useState("Naturalness, Intelligibility, Noise");
   // experiment tracking — named credentials from the Secrets page (picked per run)
   const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
@@ -441,6 +442,7 @@ export function TrainingForm() {
           setLabelMosAxes(arr(c.label_mos_axes).map(String).join(", "));
         if (Array.isArray(c.label_speakers) && c.label_speakers.length)
           setLabelSpeakers(arr(c.label_speakers).map(String).join(", "));
+        if (c.label_speaker_prefix != null) setLabelSpeakerPrefix(!!c.label_speaker_prefix);
         // run on
         if (r.provider_kind === "vm") { setTarget("vm"); setProviderId(r.provider_id || ""); }
         else if (r.provider_id) { setTarget("cloud"); setRunpodProviderId(r.provider_id); }
@@ -726,6 +728,7 @@ export function TrainingForm() {
             label_samples: labelSamples,
             label_mos_axes: labelMosAxes.split(",").map((s) => s.trim()).filter(Boolean),
             label_speakers: labelSpeakers.split(",").map((s) => s.trim()).filter(Boolean),
+            label_speaker_prefix: labelSpeakerPrefix,
           }
         : {}),
       ...(sweepOn && Object.keys(sweepGrid).length
@@ -1306,6 +1309,11 @@ export function TrainingForm() {
                       onChange={(e) => setLabelSpeakers(e.target.value)} />
                   </FieldWrap>
                 </div>
+                <label className="flex cursor-pointer items-center gap-2 text-sm sm:col-span-2">
+                  <input type="checkbox" checked={labelSpeakerPrefix} onChange={(e) => setLabelSpeakerPrefix(e.target.checked)}
+                    className="h-4 w-4 accent-primary" />
+                  <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
+                </label>
               </div>
             )}
           </div>

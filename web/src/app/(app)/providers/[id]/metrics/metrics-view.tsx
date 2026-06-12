@@ -252,6 +252,23 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
                         { k: "mem", color: "#0ea5e9", label: "mem" },
                       ]}
                     />
+                    <div className="mt-2 border-t border-border pt-1.5 font-mono text-[10px]">
+                      {(g.processes?.length ?? 0) === 0 ? (
+                        <span className="text-muted-foreground">no processes</span>
+                      ) : (
+                        <div className="space-y-0.5">
+                          {g.processes!.map((p) => {
+                            const model = p.cmd.match(/--model[=\s]+(\S+)/)?.[1];
+                            return (
+                              <div key={p.pid} className="flex items-center justify-between gap-2" title={p.cmd}>
+                                <span className="text-foreground">pid {p.pid}</span>
+                                <span className="truncate text-muted-foreground">{model || p.comm || "?"}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 );
               })}

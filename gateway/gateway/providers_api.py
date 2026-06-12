@@ -118,6 +118,12 @@ class AvailabilityResponse(BaseModel):
     checked_at: float
 
 
+class GpuProcInfo(BaseModel):
+    pid: int          # container-namespace pid (what ps/kill see on the box)
+    comm: str
+    cmd: str
+
+
 class GpuMetricInfo(BaseModel):
     index: int
     name: str
@@ -125,6 +131,7 @@ class GpuMetricInfo(BaseModel):
     mem_used_mib: int
     mem_total_mib: int
     temp_c: int
+    processes: list[GpuProcInfo] = []
 
 
 class ProviderMetricsResponse(BaseModel):
@@ -614,6 +621,7 @@ async def provider_metrics(
         gpus=[GpuMetricInfo(
             index=g.index, name=g.name, util_pct=g.util_pct,
             mem_used_mib=g.mem_used_mib, mem_total_mib=g.mem_total_mib, temp_c=g.temp_c,
+            processes=[GpuProcInfo(pid=p.pid, comm=p.comm, cmd=p.cmd) for p in g.processes],
         ) for g in result.gpus],
         checked_at=result.checked_at,
     )

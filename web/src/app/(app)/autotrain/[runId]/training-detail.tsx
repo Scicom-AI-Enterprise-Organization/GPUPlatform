@@ -312,6 +312,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const [labelSpeakers, setLabelSpeakers] = useState(
     Array.isArray(lcfg.label_speakers) ? (lcfg.label_speakers as unknown[]).map(String).join(", ") : "",
   );
+  const [labelSpeakerPrefix, setLabelSpeakerPrefix] = useState(!!lcfg.label_speaker_prefix);
   const [labelBusy, setLabelBusy] = useState(false);
   const [labelErr, setLabelErr] = useState<string | null>(null);
   const [labelDone, setLabelDone] = useState(false);
@@ -338,6 +339,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         samples: labelSamples,
         mos_axes: labelAxes.split(",").map((s) => s.trim()).filter(Boolean),
         speakers: labelSpeakers.split(",").map((s) => s.trim()).filter(Boolean),
+        speaker_prefix: labelSpeakerPrefix,
       });
       setLabelDone(true);
     } catch (e) {
@@ -1006,6 +1008,11 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
                   Comma-separated. Balances the clips evenly across these voices (e.g. 2 speakers + {labelSamples} samples → {Math.floor(labelSamples / 2)} each). Blank → the dataset&apos;s original voices.
                 </p>
               </div>
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={labelSpeakerPrefix} onChange={(e) => setLabelSpeakerPrefix(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
+              </label>
             </div>
           )}
           <DialogFooter>

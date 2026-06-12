@@ -438,6 +438,7 @@ export type CreateTrainingRunRequest = {
   label_samples?: number;
   label_mos_axes?: string[];
   label_speakers?: string[]; // balance synthesized eval clips across these speaker names
+  label_speaker_prefix?: boolean; // prefix each task transcription with the speaker name
 };
 
 export type TrainingFile = {
@@ -880,6 +881,12 @@ export type VmAvailability = {
 };
 
 // Live VM host metrics (CPU / memory / per-GPU), polled + graphed (not persisted).
+export type ProviderGpuProc = {
+  pid: number; // container-namespace pid (what ps/kill see on the box)
+  comm: string;
+  cmd: string;
+};
+
 export type ProviderGpuMetric = {
   index: number;
   name: string;
@@ -887,6 +894,7 @@ export type ProviderGpuMetric = {
   mem_used_mib: number;
   mem_total_mib: number;
   temp_c: number;
+  processes?: ProviderGpuProc[];
 };
 
 export type ProviderMetrics = {
