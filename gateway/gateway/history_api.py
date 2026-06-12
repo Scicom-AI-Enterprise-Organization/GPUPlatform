@@ -486,6 +486,9 @@ async def history_inference(
     if app_ids:
         for a in (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all():
             appmap[a.app_id] = a
+    # Provider attribution comes from the serving app — same provider_kind /
+    # provider_name fields the discrete job kinds carry.
+    provmap = await _prov_map(session, {a.provider_id for a in appmap.values()})
     jobs = []
     for r in rows:
         a = appmap.get(r.app_id)
@@ -499,6 +502,7 @@ async def history_inference(
                 "prompt_tokens": _int(r.tin), "completion_tokens": _int(r.tout),
                 "requested_gpu_type": a.gpu if a else None,
                 "requested_gpu_count": a.gpu_count if a else None,
+                **_prov_fields(provmap.get(a.provider_id) if a else None),
                 "worker": r.worker_meta,
             },
         ))
@@ -553,3 +557,163 @@ async def history_proxy(
         window={"since": _iso(s_dt), "until": _iso(u_dt)}, jobs=jobs,
         note=(f"LLM-proxy requests (defaults to the last {DEFAULT_WINDOW_DAYS}d when `since` is "
               "omitted). status: queued|running|completed|cancelled|failed."))
+
+
+# ── inference summary ────────────────────────────────────────────────────────
+# The requests table is far too large to ship row-by-row to a dashboard
+# (raw endpoints cap out and undercount). For serverless, analytics only needs
+# *creation counts*, so this aggregates in SQL — exact over any window, a few
+# hundred rows out.
+
+class InferenceSummaryRow(BaseModel):
+    date: str                       # YYYY-MM-DD in the requested tz
+    app_id: Optional[str]
+    user: Optional[str]
+    status: str
+    provider_kind: Optional[str]
+    provider_name: Optional[str]
+    count: int
+
+
+class InferenceSummaryResponse(BaseModel):
+    kind: str = "inference_summary"
+    window: dict[str, Any]
+    rows: list[InferenceSummaryRow]
+    note: str
+
+
+@router.get("/summary", response_model=InferenceSummaryResponse)
+async def history_inference_summary(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
+    tz: str = Query("UTC", description="IANA timezone for day bucketing"),
+):
+    from zoneinfo import ZoneInfo
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"unknown timezone: {tz}")
+    s_dt, u_dt = _parse_dt(since, "since"), _parse_dt(until, "until")
+    if s_dt is None:
+        s_dt = datetime.now(timezone.utc) - timedelta(days=DEFAULT_WINDOW_DAYS)
+    day = func.to_char(func.timezone(tz, ReqRow.created_at), "YYYY-MM-DD").label("day")
+    st = (
+        select(day, ReqRow.app_id, ReqRow.owner_id, ReqRow.status, func.count().label("n"))
+        .where(ReqRow.created_at >= s_dt)
+    )
+    if u_dt is not None:
+        st = st.where(ReqRow.created_at < u_dt)
+    st = st.group_by(day, ReqRow.app_id, ReqRow.owner_id, ReqRow.status)
+    rows = (await session.execute(st)).all()
+
+    umap = await _user_map(session, [r.owner_id for r in rows])
+    app_ids = {r.app_id for r in rows if r.app_id}
+    appmap: dict[str, App] = {}
+    if app_ids:
+        for a in (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all():
+            appmap[a.app_id] = a
+    provmap = await _prov_map(session, {a.provider_id for a in appmap.values()})
+
+    out = []
+    for r in rows:
+        a = appmap.get(r.app_id)
+        prov = provmap.get(a.provider_id) if a else None
+        out.append(InferenceSummaryRow(
+            date=r.day, app_id=r.app_id, user=_username(umap, r.owner_id),
+            status=r.status, count=r.n, **_prov_fields(prov),
+        ))
+    out.sort(key=lambda x: (x.date, x.app_id or "", x.status))
+    return InferenceSummaryResponse(
+        window={"since": _iso(s_dt), "until": _iso(u_dt)}, rows=out,
+        note=("Exact creation counts for serverless inference requests, grouped by "
+              "day/app/user/status with provider attribution — use instead of paging "
+              f"/inference for analytics (defaults to the last {DEFAULT_WINDOW_DAYS}d)."))
+
+
+# ── endpoint lifecycle ───────────────────────────────────────────────────────
+# Serverless endpoint lifecycle, read from the immutable audit log (apps are
+# hard-deleted, so the apps table can't serve history). One record per event.
+
+_ENDPOINT_ACTIONS = {
+    "inference.create": "created",
+    "inference.delete": "deleted",
+    "inference.stop": "stopped",       # Kill all workers (autoscaler paused)
+    "inference.purge": "purged",       # hard reset of all worker state
+    "inference.restart": "restarted",  # Redeploy / resume
+}
+
+
+@router.get("/endpoints", response_model=HistoryResponse)
+async def history_endpoints(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
+    user: Optional[str] = _Q_USER, limit: int = _Q_LIMIT,
+    offset: int = _Q_OFFSET, order: str = _Q_ORDER,
+):
+    from .db import AuditLog
+    s_dt, u_dt = _parse_dt(since, "since"), _parse_dt(until, "until")
+    st = select(AuditLog).where(AuditLog.action.in_(tuple(_ENDPOINT_ACTIONS)))
+    if s_dt is not None:
+        st = st.where(AuditLog.created_at >= s_dt)
+    if u_dt is not None:
+        st = st.where(AuditLog.created_at < u_dt)
+    if user:
+        st = st.where(AuditLog.actor_username == user)
+    st = st.order_by(AuditLog.created_at.asc() if order == "asc" else AuditLog.created_at.desc())
+    rows = (await session.execute(st.offset(offset).limit(limit + 1))).scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    # Provider attribution via the app row when it still exists (deleted
+    # endpoints keep their audit details but lose the provider link).
+    app_ids = {r.resource_id for r in rows if r.resource_id}
+    appmap: dict[str, App] = {}
+    if app_ids:
+        for a in (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all():
+            appmap[a.app_id] = a
+    provmap = await _prov_map(session, {a.provider_id for a in appmap.values()})
+
+    jobs = []
+    for r in rows:
+        d = r.details or {}
+        a = appmap.get(r.resource_id or "")
+        # GPU placement: the audit snapshot wins (survives deletion); fall back
+        # to the live app row for events recorded before placement was logged.
+        live_member_idx = {
+            str(m.get("model")): m.get("gpu_indices")
+            for m in ((a.models if a else None) or [])
+            if isinstance(m, dict) and m.get("gpu_indices")
+        } or None
+        jobs.append(JobRecord(
+            kind="endpoint", id=str(r.id), name=r.resource_name, owner_id=r.actor_id,
+            user=r.actor_username, status=_ENDPOINT_ACTIONS.get(r.action, r.action),
+            created_at=_iso(r.created_at), started_at=None, ended_at=None,
+            duration_s=None, error_text=None,
+            detail={
+                "app_id": r.resource_id, "action": r.action,
+                "mode": d.get("mode") or (a.mode if a else None),
+                "model": d.get("model") or (a.model if a else None),
+                "models": d.get("models"),
+                "gpu_type": d.get("gpu") or (a.gpu if a else None),
+                "gpu_count": d.get("gpu_count") or (a.gpu_count if a else None),
+                # CUDA device ids: endpoint-level pin + per-member assignment
+                "visible_devices": d.get("visible_devices") or (a.visible_devices if a else None),
+                "member_gpu_indices": d.get("member_gpu_indices") or live_member_idx,
+                # worker counts for stop/purge/restart events
+                "workers": {
+                    k: d[k]
+                    for k in ("killed_workers", "drained_workers", "terminated", "purged", "paused")
+                    if k in d
+                } or None,
+                **_prov_fields(provmap.get(a.provider_id) if a else None),
+                "still_exists": a is not None,
+            },
+        ))
+    return HistoryResponse(
+        kind="endpoint", count=len(jobs), has_more=has_more,
+        window={"since": _iso(s_dt), "until": _iso(u_dt)}, jobs=jobs,
+        note=("Serverless endpoint lifecycle events from the audit log "
+              "(status: created|deleted|stopped|purged|restarted; survives endpoint "
+              "deletion; visible_devices / member_gpu_indices = CUDA device ids)."))

@@ -44,7 +44,9 @@ export async function GET(req: NextRequest) {
       );
     }
     const body = await r.json();
-    return NextResponse.json({ configured: true, report: body });
+    // baseUrl lets the client build deep links to Aura job pages
+    // (/clusters/{clusterId}/jobs/{id}) — it's not a secret, only the token is.
+    return NextResponse.json({ configured: true, baseUrl: base, report: body });
   } catch {
     return NextResponse.json(
       { configured: true, error: "SlurmUI unreachable" },

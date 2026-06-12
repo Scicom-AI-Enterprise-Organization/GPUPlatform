@@ -49,6 +49,8 @@ ACTIONS = {
     "inference.create",
     "inference.delete",
     "inference.restart",
+    "inference.stop",
+    "inference.purge",
     "inference.update_autoscaler",
     "benchmark.create",
     "benchmark.delete",

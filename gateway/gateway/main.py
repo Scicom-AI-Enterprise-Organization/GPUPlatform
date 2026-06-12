@@ -1666,6 +1666,12 @@ async def create_app(
             "models": [m.get("model") for m in (models_json or [])] or None,
             "gpu": record.gpu,
             "gpu_count": record.gpu_count,
+            "visible_devices": record.visible_devices,
+            "member_gpu_indices": {
+                str(m.get("model")): m.get("gpu_indices")
+                for m in (models_json or [])
+                if isinstance(m, dict) and m.get("gpu_indices")
+            } or None,
         },
     )
     return CreateAppResponse(app_id=req.name, url=f"/run/{req.name}")
@@ -1989,6 +1995,10 @@ async def restart_app_workers(
     rdb = request.app.state.redis
     await rdb.delete(f"app:{app_id}:paused")  # resume if it was killed
     n = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
+    await audit_module.record(
+        user, "inference.restart", "app", app_id, app_id,
+        details={"drained_workers": n},
+    )
     return {"ok": True, "app_id": app_id, "drained_workers": n}
 
 
@@ -2097,6 +2107,10 @@ async def kill_app_workers(
     await rdb.set(f"app:{app_id}:paused", "1")
     n = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
     logger.info("kill workers app=%s by user=%s: terminated %d, paused", app_id, user.username, n)
+    await audit_module.record(
+        user, "inference.stop", "app", app_id, app_id,
+        details={"killed_workers": n, "paused": True},
+    )
     return {"ok": True, "app_id": app_id, "killed_workers": n, "paused": True}
 
 
@@ -2130,6 +2144,10 @@ async def purge_app_workers(
             logger.exception("purge workers app=%s: provider.purge_app failed", app_id)
             raise HTTPException(status_code=502, detail={"error": "purge failed on the provider — see gateway logs"})
     logger.info("purge workers app=%s by user=%s: tracked=%d purged=%d", app_id, user.username, tracked, purged)
+    await audit_module.record(
+        user, "inference.purge", "app", app_id, app_id,
+        details={"terminated": tracked, "purged": purged},
+    )
     return {"ok": True, "app_id": app_id, "terminated": tracked, "purged": purged}
 
 
