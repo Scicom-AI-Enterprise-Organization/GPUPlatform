@@ -654,7 +654,10 @@ type WorkerSpan = {
 };
 type GpuTimelineRow = { app: string; spans: WorkerSpan[] };
 type AppMeta = { name: string; node: string; gpu: string | null; gpu_ids: number[] };
-// One calendar event block = a worker's serving span clipped to a single day.
+// A GPU lane = one horizontal row for a single (node, GPU) within a day.
+type GpuLane = { node: string; gpu: number };
+// One calendar event block = a worker's serving span clipped to a single day,
+// spanning the contiguous GPU lanes it occupies (laneStart .. laneStart+laneSpan).
 type CalBlock = {
   app: string;
   node: string;
@@ -662,10 +665,11 @@ type CalBlock = {
   start: number; // epoch ms, clipped to [day 00:00, day 24:00]
   end: number; // epoch ms
   running: boolean;
+  laneStart: number; // index into the day's lane list
+  laneSpan: number; // how many GPU lanes the block covers
+  gpuLabel: string; // e.g. "0–3" or "4"
 };
-// A GPU lane = one horizontal row for a single (node, GPU) within a day.
-type GpuLane = { node: string; gpu: number; blocks: CalBlock[] };
-type CalDay = { date: string; lanes: GpuLane[] };
+type CalDay = { date: string; lanes: GpuLane[]; blocks: CalBlock[] };
 
 // 12-hour clock like Google Calendar — "6:12pm", "5am".
 const fmt12 = (ms: number): string => {
@@ -791,36 +795,39 @@ export function AnalyticsView() {
   const gpuTimeline = useMemo(() => buildGpuTimeline(workerEvents), [workerEvents]);
 
   // Calendar: one row per day, sub-divided into a lane per (node, GPU). A
-  // worker serving-span is clipped per day and placed in every GPU it occupies.
+  // worker serving-span is clipped per day; one merged block spans all the
+  // contiguous GPU lanes that endpoint occupies (so 4 GPUs = 1 tall block).
   const gpuDays = useMemo<CalDay[]>(() => {
     const t0 = from.getTime();
     const t1 = to.getTime();
     const nowClamp = Math.min(nowTs || t1, t1);
-    // date → laneKey ("node|gpu") → lane
-    const byDate = new Map<string, Map<string, GpuLane>>();
-    const laneFor = (date: string, node: string, gpu: number): GpuLane => {
-      let lanes = byDate.get(date);
-      if (!lanes) {
-        lanes = new Map();
-        byDate.set(date, lanes);
+    type Raw = {
+      app: string;
+      node: string;
+      mid: string;
+      start: number;
+      end: number;
+      running: boolean;
+      gpus: number[];
+    };
+    // date → { lane keys seen, raw per-day blocks }
+    const byDate = new Map<string, { laneKeys: Set<string>; raw: Raw[] }>();
+    const bucket = (date: string) => {
+      let b = byDate.get(date);
+      if (!b) {
+        b = { laneKeys: new Set(), raw: [] };
+        byDate.set(date, b);
       }
-      const key = `${node}|${gpu}`;
-      let lane = lanes.get(key);
-      if (!lane) {
-        lane = { node, gpu, blocks: [] };
-        lanes.set(key, lane);
-      }
-      return lane;
+      return b;
     };
     for (const { app, spans } of gpuTimeline) {
       const meta = workerApps[app];
       const node = meta?.node ?? "—";
-      const gpuIds = meta?.gpu_ids?.length ? meta.gpu_ids : [0];
+      const gpus = meta?.gpu_ids?.length ? meta.gpu_ids : [0];
       for (const sp of spans) {
         const s = Math.max(sp.start, t0);
         const e = Math.min(sp.end ?? nowClamp, t1);
         if (e <= s) continue;
-        // Split the span across local-day boundaries.
         const cur = new Date(s);
         cur.setHours(0, 0, 0, 0);
         while (cur.getTime() < e) {
@@ -829,16 +836,9 @@ export function AnalyticsView() {
           const bs = Math.max(s, dayStart);
           const be = Math.min(e, dayEnd);
           if (be > bs) {
-            const block: CalBlock = {
-              app,
-              node,
-              mid: sp.mid,
-              start: bs,
-              end: be,
-              running: sp.running && be >= e,
-            };
-            const date = localDate(new Date(dayStart));
-            for (const gpu of gpuIds) laneFor(date, node, gpu).blocks.push(block);
+            const b = bucket(localDate(new Date(dayStart)));
+            for (const g of gpus) b.laneKeys.add(`${node}|${g}`);
+            b.raw.push({ app, node, mid: sp.mid, start: bs, end: be, running: sp.running && be >= e, gpus });
           }
           cur.setTime(dayEnd);
           cur.setHours(0, 0, 0, 0); // re-align (DST-safe)
@@ -846,12 +846,49 @@ export function AnalyticsView() {
       }
     }
     const days: CalDay[] = [];
-    for (const [date, lanes] of byDate) {
-      const laneList = [...lanes.values()].sort(
-        (a, b) => a.node.localeCompare(b.node) || a.gpu - b.gpu,
-      );
-      for (const lane of laneList) lane.blocks.sort((a, b) => a.start - b.start);
-      days.push({ date, lanes: laneList });
+    for (const [date, { laneKeys, raw }] of byDate) {
+      // Stable lane ordering: node, then GPU id.
+      const lanes: GpuLane[] = [...laneKeys]
+        .map((k) => {
+          const [node, gpu] = k.split("|");
+          return { node, gpu: Number(gpu) };
+        })
+        .sort((a, b) => a.node.localeCompare(b.node) || a.gpu - b.gpu);
+      const laneIndex = new Map(lanes.map((l, i) => [`${l.node}|${l.gpu}`, i]));
+      const blocks: CalBlock[] = [];
+      for (const r of raw) {
+        const idx = r.gpus
+          .map((g) => laneIndex.get(`${r.node}|${g}`))
+          .filter((v): v is number => v != null)
+          .sort((a, b) => a - b);
+        if (!idx.length) continue;
+        // Split into consecutive runs so a block only spans contiguous lanes.
+        let run: number[] = [idx[0]];
+        const flush = () => {
+          const gpuIds = run.map((i) => lanes[i].gpu);
+          blocks.push({
+            app: r.app,
+            node: r.node,
+            mid: r.mid,
+            start: r.start,
+            end: r.end,
+            running: r.running,
+            laneStart: run[0],
+            laneSpan: run.length,
+            gpuLabel: gpuIds.length > 1 ? `${gpuIds[0]}–${gpuIds[gpuIds.length - 1]}` : `${gpuIds[0]}`,
+          });
+        };
+        for (let i = 1; i < idx.length; i++) {
+          if (idx[i] === run[run.length - 1] + 1) run.push(idx[i]);
+          else {
+            flush();
+            run = [idx[i]];
+          }
+        }
+        flush();
+      }
+      blocks.sort((a, b) => a.start - b.start);
+      days.push({ date, lanes, blocks });
     }
     days.sort((a, b) => b.date.localeCompare(a.date)); // newest day first
     return days;
@@ -2078,10 +2115,12 @@ export function AnalyticsView() {
                     ))}
                   </div>
                 </div>
-                {/* Day rows, each split into per-GPU lanes */}
+                {/* Day rows — GPU column + a single timeline canvas where a
+                    block spans the GPU lanes its endpoint occupies */}
                 {gpuDays.map((day) => {
                   const dayStart = new Date(`${day.date}T00:00:00`).getTime();
                   const LANE = 44; // px per GPU lane — spacious
+                  const total = day.lanes.length * LANE;
                   const d = new Date(`${day.date}T00:00:00`);
                   const weekday = d.toLocaleDateString(undefined, { weekday: "short" });
                   return (
@@ -2089,62 +2128,71 @@ export function AnalyticsView() {
                       {/* Day label spans all of the day's GPU lanes */}
                       <div
                         className="flex w-32 shrink-0 flex-col justify-center border-r px-3 font-mono"
-                        style={{ height: `${day.lanes.length * LANE}px` }}
+                        style={{ height: `${total}px` }}
                       >
                         <div className="tabular-nums">{day.date}</div>
                         <div className="text-[11px] text-muted-foreground">{weekday}</div>
                       </div>
-                      {/* GPU column + timeline lanes */}
-                      <div className="flex flex-1 flex-col">
+                      {/* GPU id column */}
+                      <div className="w-16 shrink-0 border-r" style={{ height: `${total}px` }}>
                         {day.lanes.map((lane, li) => (
                           <div
                             key={li}
-                            className="flex border-b border-border/30 last:border-b-0"
+                            className="flex items-center justify-end border-b border-border/30 px-2 font-mono tabular-nums text-muted-foreground last:border-b-0"
                             style={{ height: `${LANE}px` }}
+                            title={`${lane.node} · GPU ${lane.gpu}`}
                           >
-                            <div
-                              className="flex w-16 shrink-0 items-center justify-end border-r px-2 font-mono tabular-nums text-muted-foreground"
-                              title={`${lane.node} · GPU ${lane.gpu}`}
-                            >
-                              {lane.gpu}
-                            </div>
-                            <div className="relative flex-1">
-                              {/* per-hour gridlines */}
-                              <div className="pointer-events-none absolute inset-0 flex">
-                                {Array.from({ length: 24 }, (_, h) => (
-                                  <div
-                                    key={h}
-                                    className="flex-1 border-r border-border/40 last:border-r-0"
-                                  />
-                                ))}
-                              </div>
-                              {lane.blocks.map((b, i) => {
-                                const left = ((b.start - dayStart) / DAY_MS) * 100;
-                                const width = Math.max(((b.end - b.start) / DAY_MS) * 100, 0.8);
-                                return (
-                                  <div
-                                    key={i}
-                                    className={`absolute inset-y-1 overflow-hidden rounded-md border px-2 py-1 leading-tight text-white shadow-sm ${b.running ? "border-emerald-400/40 bg-emerald-600" : "border-indigo-400/40 bg-indigo-600"}`}
-                                    style={{
-                                      left: `${Math.min(left, 99)}%`,
-                                      width: `${Math.min(width, 100 - left)}%`,
-                                    }}
-                                    title={
-                                      `${b.app}  ·  ${b.node} GPU${lane.gpu}\n` +
-                                      `${fmt12(b.start)} – ${b.running ? "now" : fmt12(b.end)}\n` +
-                                      `worker ${b.mid}`
-                                    }
-                                  >
-                                    <div className="truncate font-medium">{b.app}</div>
-                                    <div className="truncate text-[11px] text-white/80">
-                                      {fmt12(b.start)}–{b.running ? "now" : fmt12(b.end)}
-                                    </div>
-                                  </div>
-                                );
-                              })}
-                            </div>
+                            {lane.gpu}
                           </div>
                         ))}
+                      </div>
+                      {/* Timeline canvas */}
+                      <div className="relative flex-1" style={{ height: `${total}px` }}>
+                        {/* horizontal lane gridlines */}
+                        <div className="pointer-events-none absolute inset-0 flex flex-col">
+                          {day.lanes.map((_, li) => (
+                            <div
+                              key={li}
+                              className="border-b border-border/30 last:border-b-0"
+                              style={{ height: `${LANE}px` }}
+                            />
+                          ))}
+                        </div>
+                        {/* vertical hour gridlines */}
+                        <div className="pointer-events-none absolute inset-0 flex">
+                          {Array.from({ length: 24 }, (_, h) => (
+                            <div
+                              key={h}
+                              className="flex-1 border-r border-border/40 last:border-r-0"
+                            />
+                          ))}
+                        </div>
+                        {day.blocks.map((b, i) => {
+                          const left = ((b.start - dayStart) / DAY_MS) * 100;
+                          const width = Math.max(((b.end - b.start) / DAY_MS) * 100, 0.8);
+                          return (
+                            <div
+                              key={i}
+                              className={`absolute overflow-hidden rounded-md border px-2 py-1 leading-tight text-white shadow-sm ${b.running ? "border-emerald-400/40 bg-emerald-600" : "border-indigo-400/40 bg-indigo-600"}`}
+                              style={{
+                                left: `${Math.min(left, 99)}%`,
+                                width: `${Math.min(width, 100 - left)}%`,
+                                top: `${b.laneStart * LANE + 4}px`,
+                                height: `${b.laneSpan * LANE - 8}px`,
+                              }}
+                              title={
+                                `${b.app}  ·  ${b.node} GPU ${b.gpuLabel}\n` +
+                                `${fmt12(b.start)} – ${b.running ? "now" : fmt12(b.end)}\n` +
+                                `worker ${b.mid}`
+                              }
+                            >
+                              <div className="truncate font-medium">{b.app}</div>
+                              <div className="truncate text-[11px] text-white/80">
+                                {fmt12(b.start)}–{b.running ? "now" : fmt12(b.end)}
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   );
