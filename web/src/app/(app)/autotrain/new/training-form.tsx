@@ -838,7 +838,7 @@ export function TrainingForm() {
           <FieldWrap label="Training dataset"
             hint={isTts ? "A NeuCodec-packed dataset (kind=tts_packed) from the Datasets page." : "From the Datasets page."}>
             <Select value={datasetId} onValueChange={setDatasetId}>
-              <SelectTrigger>
+              <SelectTrigger className="w-full min-w-0 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate">
                 <SelectValue placeholder={
                   pickDatasets.length ? "Pick a dataset…" : (isTts ? "No packed datasets — pack one first" : "No datasets yet")
                 } />
@@ -863,7 +863,7 @@ export function TrainingForm() {
               ? "Use this dataset's own test split (if it was packed with one), pick another packed dataset, or auto-split a hold-out for eval loss."
               : "Held out for per-epoch WER/CER. Auto-split if none."}>
             <Select value={testDatasetId} onValueChange={setTestDatasetId}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectTrigger className="w-full min-w-0 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value={AUTO_SPLIT}>— Auto-split from training set —</SelectItem>
                 <SelectItem value={NO_TEST}>— No test set (skip eval) —</SelectItem>

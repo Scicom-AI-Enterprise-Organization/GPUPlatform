@@ -411,6 +411,19 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     });
   }
 
+  function onStopEarly() {
+    setConfirmError(null);
+    setConfirmOpts({
+      title: "Stop training early?",
+      description: "The trainer finishes the current step, then saves + uploads the partial model and finalizes the run (and runs any Label/HF export). Unlike Terminate, the model trained so far is kept.",
+      confirmLabel: "Stop & save",
+      busyLabel: "Signalling…",
+      run: async () => {
+        setRun(await gateway.stopTrainingEarly(run.id));
+      },
+    });
+  }
+
   function onDelete() {
     setConfirmError(null);
     setConfirmOpts({
@@ -540,6 +553,14 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          {run.status === "running" && (
+            <Button variant="outline" size="sm" onClick={onStopEarly}
+              disabled={busy || !!run.result_json?.stopping_early}
+              title="Finish the current step, save + upload the partial model, then finalize">
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              {run.result_json?.stopping_early ? "Stopping…" : "Stop & save"}
+            </Button>
+          )}
           {!terminal && (
             <Button variant="outline" size="sm" onClick={onTerminate} disabled={busy} className="text-destructive">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <XCircle className="h-4 w-4" />} Terminate
