@@ -2402,8 +2402,41 @@ async def admin_list_worker_events(
     stmt = stmt.order_by(WorkerEvent.created_at.desc()).limit(limit)
     rows = list((await session.execute(stmt)).scalars().all())
     rows.reverse()
+
+    # Resolve node (the provider the endpoint is bound to) + the GPU ids each
+    # endpoint occupies, by joining App → Provider. Done here at read time so
+    # the timeline gets node/GPU columns without a worker_events schema change
+    # and works for rows logged before this existed.
+    from .db import Provider
+    app_ids = {r.app_id for r in rows if r.app_id}
+    apps_meta: dict[str, dict] = {}
+    if app_ids:
+        arows = (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all()
+        prov_ids = {a.provider_id for a in arows if a.provider_id}
+        pname: dict[str, str] = {}
+        if prov_ids:
+            prows = (await session.execute(select(Provider).where(Provider.id.in_(prov_ids)))).scalars().all()
+            pname = {p.id: p.name for p in prows}
+        for a in arows:
+            vd = (getattr(a, "visible_devices", None) or "").strip()
+            if vd:
+                try:
+                    gpu_ids = [int(x.strip()) for x in vd.split(",") if x.strip() != ""]
+                except ValueError:
+                    gpu_ids = list(range(int(a.gpu_count or 1)))
+            else:
+                gpu_ids = list(range(int(a.gpu_count or 1)))
+            node = (pname.get(a.provider_id) if a.provider_id else None) or (a.gpu or "shared")
+            apps_meta[a.app_id] = {
+                "name": a.name,
+                "node": node,
+                "gpu": a.gpu,
+                "gpu_ids": gpu_ids,
+            }
+
     return {
         "count": len(rows),
+        "apps": apps_meta,
         "events": [
             {
                 "id": r.id,

@@ -653,6 +653,15 @@ type WorkerSpan = {
   running: boolean;
 };
 type GpuTimelineRow = { app: string; spans: WorkerSpan[] };
+type AppMeta = { name: string; node: string; gpu: string | null; gpu_ids: number[] };
+type HourCell = { active: boolean; running: boolean };
+type CalRow = {
+  date: string; // YYYY-MM-DD (local)
+  node: string;
+  app: string;
+  gpu: number;
+  hours: HourCell[]; // length 24, index = hour of day
+};
 
 const WORKER_ON = new Set(["provisioned", "registered", "scaled_up"]);
 const WORKER_OFF = new Set(["terminated", "idle_terminated", "terminate_failed"]);
@@ -747,8 +756,10 @@ export function AnalyticsView() {
   const [nowTs, setNowTs] = useState(0);
   const [slurmState, setSlurmState] = useState<"ok" | "unconfigured" | "error">("ok");
   const [truncated, setTruncated] = useState<string[]>([]);
-  // GPU Timeline: durable inference worker on/off events for the period.
+  // GPU Timeline: durable inference worker on/off events for the period, plus
+  // per-endpoint node + GPU-id metadata resolved server-side.
   const [workerEvents, setWorkerEvents] = useState<WorkerEvt[]>([]);
+  const [workerApps, setWorkerApps] = useState<Record<string, AppMeta>>({});
 
   // Jobs explorer state
   const [sortKey, setSortKey] = useState<SortKey>("start");
@@ -763,6 +774,57 @@ export function AnalyticsView() {
   );
 
   const gpuTimeline = useMemo(() => buildGpuTimeline(workerEvents), [workerEvents]);
+
+  // Calendar grid: one row per (date, node/endpoint, GPU id); 24 hourly cells
+  // marked active when that endpoint's worker was serving during the hour.
+  const gpuCalendar = useMemo<CalRow[]>(() => {
+    const t0 = from.getTime();
+    const t1 = to.getTime();
+    const nowClamp = Math.min(nowTs || t1, t1);
+    const rows: CalRow[] = [];
+    for (const { app, spans } of gpuTimeline) {
+      const meta = workerApps[app];
+      const node = meta?.node ?? "—";
+      const gpuIds = meta?.gpu_ids?.length ? meta.gpu_ids : [0];
+      // dateKey → 24 hour cells, accumulated across this endpoint's spans.
+      const byDate = new Map<string, HourCell[]>();
+      const ensure = (k: string): HourCell[] => {
+        let cells = byDate.get(k);
+        if (!cells) {
+          cells = Array.from({ length: 24 }, () => ({ active: false, running: false }));
+          byDate.set(k, cells);
+        }
+        return cells;
+      };
+      for (const sp of spans) {
+        const s = Math.max(sp.start, t0);
+        const e = Math.min(sp.end ?? nowClamp, t1);
+        if (e <= s) continue;
+        // Walk hour-aligned buckets from start to end.
+        const first = new Date(s);
+        first.setMinutes(0, 0, 0);
+        for (let cur = first.getTime(); cur < e; cur += 3_600_000) {
+          const d = new Date(cur);
+          const cell = ensure(localDate(d))[d.getHours()];
+          cell.active = true;
+          if (sp.running) cell.running = true;
+        }
+      }
+      for (const date of [...byDate.keys()].sort()) {
+        const hours = byDate.get(date)!;
+        for (const gpu of gpuIds) rows.push({ date, node, app, gpu, hours });
+      }
+    }
+    // Most recent day first, then node / endpoint / GPU for stable grouping.
+    rows.sort(
+      (a, b) =>
+        b.date.localeCompare(a.date) ||
+        a.node.localeCompare(b.node) ||
+        a.app.localeCompare(b.app) ||
+        a.gpu - b.gpu,
+    );
+    return rows;
+  }, [gpuTimeline, workerApps, from, to, nowTs]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -783,12 +845,15 @@ export function AnalyticsView() {
       fetch(
         `/api/analytics/worker-events?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}`,
         { cache: "no-store" },
-      ).then((r) => (r.ok ? (r.json() as Promise<{ events: WorkerEvt[] }>) : Promise.reject(r.status))),
+      ).then((r) =>
+        r.ok
+          ? (r.json() as Promise<{ events: WorkerEvt[]; apps: Record<string, AppMeta> }>)
+          : Promise.reject(r.status),
+      ),
     ]);
 
-    setWorkerEvents(
-      workerEv.status === "fulfilled" ? (workerEv.value.events ?? []) : [],
-    );
+    setWorkerEvents(workerEv.status === "fulfilled" ? (workerEv.value.events ?? []) : []);
+    setWorkerApps(workerEv.status === "fulfilled" ? (workerEv.value.apps ?? {}) : {});
 
     if (aliasRes.status === "fulfilled" && aliasRes.value.aliases) {
       setAliases(aliasRes.value.aliases);
@@ -1943,76 +2008,92 @@ export function AnalyticsView() {
           </div>
         </TabsContent>
 
-        {/* GPU Timeline — inference worker on/off spans, grouped by endpoint */}
+        {/* GPU Timeline — per-day, per-node, per-GPU hourly occupancy grid */}
         <TabsContent value="gputimeline">
           <div className="rounded-lg border bg-card p-4">
             <h2 className="mb-1 text-sm font-semibold">GPU Timeline</h2>
             <p className="mb-3 text-xs text-muted-foreground">
-              When each inference endpoint was actually serving — one bar per worker life
-              (provisioned → terminated). Green = still running, indigo = stopped. Hover for
-              who stopped it and why. Sourced from the durable worker-events log.
+              Hourly occupancy per node + GPU — a cell is filled for each hour the endpoint&apos;s
+              worker was serving. Green = running now, indigo = was serving (since stopped). Node
+              is the provider the endpoint is bound to; GPU ids come from the endpoint&apos;s device
+              pin. Sourced from the durable worker-events log.
             </p>
             <div className="mb-3 flex items-center gap-4 text-[10px] text-muted-foreground">
               <span className="flex items-center gap-1.5">
                 <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" /> running
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-indigo-500" /> stopped
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-indigo-500" /> served
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-muted" /> idle
               </span>
             </div>
-            {gpuTimeline.length === 0 && !loading ? (
+            {gpuCalendar.length === 0 && !loading ? (
               <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
                 No inference worker activity in the selected period.
               </div>
             ) : (
-              <div className="space-y-1.5">
-                {gpuTimeline.map((row) => {
-                  const t0 = from.getTime();
-                  const span = Math.max(to.getTime() - t0, 1);
-                  const nowClamp = Math.min(nowTs || to.getTime(), to.getTime());
-                  return (
-                    <div key={row.app} className="flex items-center gap-3">
-                      <div
-                        className="w-44 shrink-0 truncate text-right font-mono text-[11px] text-muted-foreground"
-                        title={row.app}
-                      >
-                        {row.app}
-                      </div>
-                      <div className="relative h-6 flex-1 overflow-hidden rounded bg-muted/40">
-                        {row.spans.map((sp, i) => {
-                          const e = Math.min(sp.end ?? nowClamp, to.getTime());
-                          const left = Math.max(((sp.start - t0) / span) * 100, 0);
-                          const width = Math.max(((e - sp.start) / span) * 100, 0.4);
-                          const durS = Math.max(0, (e - sp.start) / 1000);
-                          return (
-                            <div
-                              key={i}
-                              className={`absolute top-0.5 bottom-0.5 rounded-sm opacity-80 hover:opacity-100 ${sp.running ? "bg-emerald-500" : "bg-indigo-500"}`}
-                              style={{
-                                left: `${left}%`,
-                                width: `${Math.min(width, 100 - left)}%`,
-                              }}
-                              title={
-                                `worker ${sp.mid}\n` +
-                                `${fmtTime(new Date(sp.start))} → ${sp.running ? "running" : fmtTime(new Date(e))} (${fmtDur(durS)})\n` +
-                                (sp.running
-                                  ? "still serving"
-                                  : `stopped: ${sp.endReason ?? "?"}${sp.actor ? ` by ${sp.actor}` : ""}`)
-                              }
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-                <div className="flex items-center gap-3 pt-1">
-                  <div className="w-44 shrink-0" />
-                  <div className="flex flex-1 justify-between text-[10px] text-muted-foreground">
-                    <span>{fmtTime(from)}</span>
-                    <span>{fmtTime(to)}</span>
-                  </div>
-                </div>
+              <div className="overflow-x-auto">
+                <table className="border-separate border-spacing-0 text-[10px]">
+                  <thead>
+                    <tr className="text-muted-foreground">
+                      <th className="sticky left-0 z-10 bg-card px-2 py-1 text-left font-medium">
+                        Date
+                      </th>
+                      <th className="px-2 py-1 text-left font-medium">Node</th>
+                      <th className="px-2 py-1 text-left font-medium">Endpoint</th>
+                      <th className="px-2 py-1 text-right font-medium">GPU</th>
+                      {Array.from({ length: 24 }, (_, h) => (
+                        <th
+                          key={h}
+                          className="w-5 px-0 py-1 text-center font-normal tabular-nums"
+                          title={`${String(h).padStart(2, "0")}:00–${String((h + 1) % 24).padStart(2, "0")}:00`}
+                        >
+                          {String(h).padStart(2, "0")}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(() => {
+                      let prevDate = "";
+                      let prevGroup = ""; // date|node|endpoint
+                      return gpuCalendar.map((row, idx) => {
+                        const group = `${row.date}|${row.node}|${row.app}`;
+                        const showDate = row.date !== prevDate;
+                        const showGroup = group !== prevGroup;
+                        prevDate = row.date;
+                        prevGroup = group;
+                        return (
+                          <tr key={idx} className="hover:bg-muted/30">
+                            <td className="sticky left-0 z-10 bg-card px-2 py-0.5 font-mono tabular-nums">
+                              {showDate ? row.date : ""}
+                            </td>
+                            <td className="px-2 py-0.5 font-mono">{showGroup ? row.node : ""}</td>
+                            <td
+                              className="max-w-[10rem] truncate px-2 py-0.5 font-mono"
+                              title={row.app}
+                            >
+                              {showGroup ? row.app : ""}
+                            </td>
+                            <td className="px-2 py-0.5 text-right font-mono tabular-nums">
+                              {row.gpu}
+                            </td>
+                            {row.hours.map((c, h) => (
+                              <td key={h} className="p-0">
+                                <div
+                                  className={`mx-px h-3.5 w-4 rounded-[2px] ${c.active ? (c.running ? "bg-emerald-500" : "bg-indigo-500") : "bg-muted/40"}`}
+                                  title={`${row.date} ${String(h).padStart(2, "0")}:00 · ${row.node} · ${row.app} GPU${row.gpu} — ${c.active ? (c.running ? "running" : "served") : "idle"}`}
+                                />
+                              </td>
+                            ))}
+                          </tr>
+                        );
+                      });
+                    })()}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
