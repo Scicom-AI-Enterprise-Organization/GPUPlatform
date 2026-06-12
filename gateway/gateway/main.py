@@ -39,7 +39,7 @@ from .auth import (
     revoke_session,
     verify_password,
 )
-from .db import ApiKey, App, AuditLog, PolicyRole, Request as ReqRow, StressRun, User, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
+from .db import ApiKey, App, AuditLog, PolicyRole, Request as ReqRow, StressRun, User, WorkerEvent, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
 from . import audit as audit_module
 from . import bench as bench_module
 from . import compute as compute_module
@@ -1900,6 +1900,10 @@ async def app_model_action(
     if action == "sleep_all":
         await rdb.rpush(f"app:{app_id}:model_cmds", json.dumps({"model": "*", "action": "sleep_all"}))
         await rdb.expire(f"app:{app_id}:model_cmds", 300)
+        await audit_module.record(
+            user, "inference.model_action", "app", app_id, app_id,
+            details={"action": "sleep_all", "model": "*"},
+        )
         return {"ok": True, "queued": action}
     members = [m.get("model") for m in (app.models or [])]
     if req.model not in members:
@@ -1909,6 +1913,10 @@ async def app_model_action(
         )
     await rdb.rpush(f"app:{app_id}:model_cmds", json.dumps({"model": req.model, "action": action}))
     await rdb.expire(f"app:{app_id}:model_cmds", 300)
+    await audit_module.record(
+        user, "inference.model_action", "app", app_id, app_id,
+        details={"action": action, "model": req.model},
+    )
     return {"ok": True, "queued": action, "model": req.model}
 
 
@@ -1953,6 +1961,10 @@ async def update_app_autoscaler(
             f"app:{app_id}:last_request_ts", str(time.time())
         )
     logger.info("autoscaler updated app=%s by user=%s: %s", app_id, user.username, updates)
+    await audit_module.record(
+        user, "inference.update_autoscaler", "app", app_id, target.name,
+        details={"changes": updates},
+    )
     return _to_app_record(target)
 
 
@@ -1968,7 +1980,8 @@ async def _reprovision_workers(rdb, session, app_id: str, user: User, app_state)
     tracked = set(await rdb.smembers(f"worker_index:{app_id}"))
     for mid in tracked:
         await rdb.set(f"worker:{mid}:drain", "1", ex=600)
-        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (reprovision)")
+        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (reprovision)",
+                                actor=getattr(user, "username", None))
 
     provider = await _provider_for_app(session, app_id, user, app_state)
     all_machines = set(tracked)
@@ -1983,10 +1996,12 @@ async def _reprovision_workers(rdb, session, app_id: str, user: User, app_state)
         for mid in all_machines:
             try:
                 await provider.terminate(mid)
-                await emit_worker_event(rdb, mid, app_id, "info", "terminated (reprovision)")
+                await emit_worker_event(rdb, mid, app_id, "info", "terminated (reprovision)",
+                                        actor=getattr(user, "username", None))
             except Exception:
                 logger.exception("reprovision app %s: provider.terminate(%s) failed", app_id, mid)
-                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (reprovision)")
+                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (reprovision)",
+                                        actor=getattr(user, "username", None))
 
     for mid in all_machines:
         await rdb.delete(f"worker:{mid}", f"register_token:{mid}", f"worker:{mid}:models")
@@ -2270,7 +2285,78 @@ async def update_app_models(
     n = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
     logger.info("models updated app=%s by user=%s: %d models, reprovisioned %d worker(s)",
                 app_id, user.username, len(req.models), n)
+    await audit_module.record(
+        user, "inference.update_models", "app", app_id, target.name,
+        details={"models": [m.model for m in req.models], "reprovisioned_workers": n},
+    )
     return _to_app_record(target)
+
+
+@app.get("/apps/{app_id}/worker-events")
+async def list_worker_events(
+    app_id: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 2000,
+):
+    """Durable worker lifecycle timeline for one endpoint — survives the Redis
+    ring's 1h TTL, so this is what an on/off calendar/analytics view reads.
+
+    Returns rows **oldest-first** (natural for a left-to-right timeline). `since`
+    / `until` accept ISO-8601 or a unix epoch (seconds); both optional. Pair
+    `provisioned`/`registered` with `terminated`/`idle_terminated` per
+    `machine_id` to reconstruct serving spans."""
+    from sqlalchemy import select, and_
+    await _load_owned_app(session, app_id, user)  # owner/admin authorization
+    if limit < 1 or limit > 10000:
+        raise HTTPException(status_code=400, detail="limit must be 1..10000")
+
+    def _parse_ts(v: str) -> datetime:
+        v = v.strip()
+        try:
+            return datetime.fromtimestamp(float(v), tz=timezone.utc)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"bad timestamp: {v!r}")
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    conds = [WorkerEvent.app_id == app_id]
+    if since:
+        conds.append(WorkerEvent.created_at >= _parse_ts(since))
+    if until:
+        conds.append(WorkerEvent.created_at <= _parse_ts(until))
+    # Take the newest `limit` rows for the window, then flip to chronological —
+    # so a tight cap keeps the most recent activity rather than the oldest.
+    stmt = (
+        select(WorkerEvent)
+        .where(and_(*conds))
+        .order_by(WorkerEvent.created_at.desc())
+        .limit(limit)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    rows.reverse()
+    return {
+        "app_id": app_id,
+        "count": len(rows),
+        "events": [
+            {
+                "id": r.id,
+                "machine_id": r.machine_id,
+                "event": r.event,
+                "level": r.level,
+                "message": r.message,
+                "actor": r.actor_username,
+                "details": r.details,
+                "ts": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
 
 
 # ── Stress-test run history: persisted per endpoint so runs / models can be
@@ -2410,7 +2496,8 @@ async def delete_app(
     tracked = set(await rdb.smembers(f"worker_index:{app_id}"))
     for mid in tracked:
         await rdb.set(f"worker:{mid}:drain", "1", ex=600)
-        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (app deleted)")
+        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (app deleted)",
+                                actor=getattr(user, "username", None))
     logger.info("delete app %s: marked %d tracked workers for drain", app_id, len(tracked))
 
     provider = await _provider_for_app(session, app_id, user, request.app.state)
@@ -2426,10 +2513,12 @@ async def delete_app(
         for mid in all_machines:
             try:
                 await provider.terminate(mid)
-                await emit_worker_event(rdb, mid, app_id, "info", "terminated (app deleted)")
+                await emit_worker_event(rdb, mid, app_id, "info", "terminated (app deleted)",
+                                        actor=getattr(user, "username", None))
             except Exception:
                 logger.exception("delete app %s: provider.terminate(%s) failed", app_id, mid)
-                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (app delete)")
+                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (app delete)",
+                                        actor=getattr(user, "username", None))
 
     for mid in all_machines:
         await rdb.delete(f"worker:{mid}", f"register_token:{mid}", f"worker:{mid}:models")

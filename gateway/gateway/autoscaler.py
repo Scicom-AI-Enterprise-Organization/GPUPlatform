@@ -149,18 +149,83 @@ def build_metrics_env(app_id: str, provider_name: str) -> dict[str, str]:
     }
 
 
+def _classify_worker_event(msg: str) -> str:
+    """Derive a short, stable event key from the human ring message so the
+    durable `worker_events` rows are queryable/groupable without forcing every
+    call site to pass an explicit key. Falls back to the first word slug for
+    messages we don't recognise — new phrasings still get a sensible key."""
+    m = (msg or "").lower()
+    if m.startswith("provisioned"):
+        return "provisioned"
+    if m.startswith("registered"):
+        return "registered"
+    if m.startswith("scaled up"):
+        return "scaled_up"
+    if m.startswith("scaled down"):
+        return "scaled_down"
+    if m.startswith("drain"):
+        return "drained"
+    if m.startswith("terminate failed") or "terminate failed" in m:
+        return "terminate_failed"
+    if m.startswith("terminated"):
+        # Distinguish autoscaler idle-teardown from explicit reprovision/delete
+        # so the calendar can colour "scaled down for idle" vs "user redeploy".
+        return "idle_terminated" if "idle" in m else "terminated"
+    # Unknown phrasing → slug of the first word (alnum only).
+    head = (m.split() or ["event"])[0]
+    return "".join(c for c in head if c.isalnum()) or "event"
+
+
+async def _persist_worker_event(
+    machine_id: str,
+    app_id: str,
+    level: str,
+    msg: str,
+    event: str,
+    actor: "str | None",
+    details: "dict | None",
+) -> None:
+    """Best-effort durable copy of a worker lifecycle event. Never raises —
+    a Postgres hiccup must not break the Redis ring write or the action that
+    triggered it (mirrors audit.record's contract)."""
+    try:
+        from .db import WorkerEvent, session_factory
+        async with session_factory()() as s:
+            s.add(WorkerEvent(
+                app_id=app_id or "",
+                machine_id=machine_id,
+                event=event,
+                level=level,
+                message=(msg or "")[:512],
+                actor_username=actor,
+                details=details or None,
+            ))
+            await s.commit()
+    except Exception:
+        logger.exception("persist worker_event failed for %s (%s)", machine_id, event)
+
+
 async def emit_worker_event(
     rdb: "redis_async.Redis",
     machine_id: str,
     app_id: str,
     level: str,
     msg: str,
+    *,
+    event: "str | None" = None,
+    actor: "str | None" = None,
+    details: "dict | None" = None,
 ) -> None:
-    """Append a lifecycle event to the worker's capped Redis ring.
+    """Append a lifecycle event to the worker's capped Redis ring (hot path the
+    UI tails live) AND to the durable `worker_events` table (survives the ring's
+    1h TTL, so analytics can reconstruct uptime spans long after teardown).
 
     Also stamps `worker_app:{mid}` so the read endpoint can authorize a
     request even after the worker pod has been torn down (worker:{mid}
-    expires when the worker stops heartbeating)."""
+    expires when the worker stops heartbeating).
+
+    `event` overrides the derived event key; `actor` attributes user-triggered
+    events (kill/redeploy/delete); `details` is a small free-form blob."""
     if not machine_id:
         return
     try:
@@ -173,6 +238,11 @@ async def emit_worker_event(
             await rdb.set(f"worker_app:{machine_id}", app_id, ex=WORKER_EVENTS_TTL_S)
     except Exception:
         logger.exception("emit_worker_event failed for %s", machine_id)
+    # Durable copy is separate so a Redis blip doesn't skip it and vice-versa.
+    await _persist_worker_event(
+        machine_id, app_id, level, msg,
+        event or _classify_worker_event(msg), actor, details,
+    )
 
 
 async def autoscaler_loop(
