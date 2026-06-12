@@ -474,6 +474,18 @@ def main():
                     "eval_loss": float(logs["eval_loss"]),
                 }), flush=True)
 
+    # Graceful early-stop: the gateway's /stop-early `touch`es $SGPU_STOP_FLAG; we
+    # poll it each step and stop cleanly so the partial model is still saved/merged.
+    class _StopFlag(TrainerCallback):
+        def __init__(self):
+            self.path = os.environ.get("SGPU_STOP_FLAG")
+        def on_step_end(self, args, state, control, **kw):
+            if self.path and os.path.exists(self.path):
+                control.should_training_stop = True
+                if state.is_world_process_zero:
+                    print("[trainer] early-stop flag seen → stopping after this step; saving model", flush=True)
+            return control
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -483,7 +495,7 @@ def main():
         data_collator=collator,
         compute_metrics=None,
         preprocess_logits_for_metrics=None,
-        callbacks=[_ProgressEmitter()],
+        callbacks=[_ProgressEmitter(), _StopFlag()],
     )
 
     if training_args.do_train:

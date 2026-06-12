@@ -757,7 +757,19 @@ def run(cfg: dict) -> None:
                 "train_loss": train_loss,
             })
 
-    callbacks: list = [MetricEmitter()]
+    # Graceful early-stop: the gateway's /stop-early `touch`es $SGPU_STOP_FLAG; we
+    # poll it each step and stop cleanly so the partial model is still saved+uploaded.
+    class StopFlag(TrainerCallback):
+        def __init__(self):
+            self.path = os.environ.get("SGPU_STOP_FLAG")
+        def on_step_end(self, args, state, control, **kw):
+            if self.path and os.path.exists(self.path):
+                control.should_training_stop = True
+                if state.is_world_process_zero:
+                    print("[trainer] early-stop flag seen → stopping after this step; saving model", flush=True)
+            return control
+
+    callbacks: list = [MetricEmitter(), StopFlag()]
     patience = int(cfg.get("patience", 0) or 0)
     if patience > 0 and not no_eval:  # early stopping needs eval metrics
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience))

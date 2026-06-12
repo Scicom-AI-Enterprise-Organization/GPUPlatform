@@ -308,6 +308,13 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/terminate`,
       { method: "POST" },
     ),
+  /** Gracefully stop a running run: the trainer saves + uploads the partial model
+   * and finalizes (vs terminate, which hard-kills + discards). */
+  stopTrainingEarly: (id: string) =>
+    request<TrainingRunRecord>(
+      `/v1/training-runs/${encodeURIComponent(id)}/stop-early`,
+      { method: "POST" },
+    ),
   /** (Re)run the Label-platform export for a finished TTS run (synthesize N clips +
    * create a recording+MOS project). Runs in the background; progress streams to logs. */
   retryLabelExport: (

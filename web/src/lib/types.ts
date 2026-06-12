@@ -258,6 +258,9 @@ export type TrainingResult = {
   } | null;
   artifact?: { s3_uri?: string | null; hf_repo?: string | null } | null;
   stopped_early?: boolean;
+  // Set when the user clicked "Stop & save" — the trainer is finishing the current
+  // step + saving the partial model. Cleared implicitly when the run finalizes.
+  stopping_early?: boolean;
   trials?: TrainingTrial[];
   // TTS audio eval (post-training): CER / MOS (UTMOSv2) / speaker similarity (TitaNet).
   tts_eval?: {

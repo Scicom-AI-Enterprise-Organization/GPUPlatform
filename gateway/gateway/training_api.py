@@ -1329,7 +1329,12 @@ async def run_training(redis, run_id: str) -> None:
                     await _push_log(redis, run_id, f"[gateway] DDP via torch.distributed.run · {n_gpus} GPUs (free port)")
                 else:
                     launch = f"{venv_py} -u"
-            cmd = f"{user_env}{env_prefix}{launch} {remote_script} --config {remote_cfg}"
+            # Graceful early-stop signal: the trainer polls this flag file each step
+            # (a TrainerCallback) → stops cleanly + saves/uploads the partial model.
+            # `export` so it propagates to torchrun's worker processes; the
+            # /stop-early endpoint just `touch`es this path over SSH.
+            stop_flag = f"{stage}/STOP"
+            cmd = f"{user_env}export SGPU_STOP_FLAG={stop_flag};{env_prefix}{launch} {remote_script} --config {remote_cfg}"
             await _push_log(redis, run_id, f"[gateway] $ {cmd}")
             # Detach the trainer into its own session with output → a log file, so a
             # gateway restart / SSH drop can't SIGHUP-kill it. Stream by tailing that
@@ -2615,6 +2620,49 @@ async def terminate_training_run(
     row.status = "cancelled"
     row.ended_at = datetime.now(timezone.utc)
     await session.commit()
+    u = await session.get(User, row.owner_id)
+    return _to_record(row, u.username if u else "?")
+
+
+@router.post("/{run_id}/stop-early", response_model=TrainingRunRecord)
+async def stop_training_early(
+    run_id: str,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Gracefully stop a RUNNING training run: signal the trainer to finish at the
+    next step and SAVE + upload the partial model (then finalize as done, run any
+    label/HF export). Contrast /terminate, which hard-kills and discards. The
+    trainer polls $SGPU_STOP_FLAG every step; we just `touch` that file over SSH."""
+    row = await _owned(run_id, user, session)
+    if row.status != "running":
+        raise HTTPException(status_code=409, detail=f"run is {row.status}, not running")
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        raise HTTPException(status_code=400, detail="can't reach the run's box to signal early-stop")
+    stop_flag = f"/tmp/sgpu_run_{run_id}/STOP"
+
+    def _touch() -> None:
+        cli = _ssh_connect(ssh[0], int(ssh[1]), ssh[2], ssh[3])
+        try:
+            _ssh_capture(cli, f"touch {stop_flag} 2>/dev/null || true")
+        finally:
+            cli.close()
+
+    await asyncio.to_thread(_touch)
+    redis = request.app.state.redis
+    await _push_log(redis, run_id, "[gateway] early-stop requested — the trainer will finish the current "
+                                   "step, save + upload the model, then finalize.")
+    # UI hint so the status badge can show "stopping early" until the run finalizes.
+    async with session_factory()() as s:
+        r2 = await s.get(TrainingRun, run_id)
+        if r2 is not None:
+            rj = dict(r2.result_json or {})
+            rj["stopping_early"] = True
+            r2.result_json = rj
+            await s.commit()
+    await session.refresh(row)
     u = await session.get(User, row.owner_id)
     return _to_record(row, u.username if u else "?")
 
