@@ -2058,18 +2058,17 @@ export function AnalyticsView() {
               </div>
             ) : (
               <div className="overflow-hidden rounded-md border">
-                {/* Hour axis */}
-                <div className="flex border-b bg-muted/30 text-[10px] text-muted-foreground">
-                  <div className="w-28 shrink-0 border-r px-2 py-1 font-medium">Day</div>
-                  <div className="relative h-6 flex-1">
-                    {Array.from({ length: 13 }, (_, i) => i * 2).map((h) => (
-                      <span
+                {/* Hour axis — one labelled cell per hour */}
+                <div className="flex border-b bg-muted/30 text-[9px] text-muted-foreground">
+                  <div className="w-28 shrink-0 border-r px-2 py-1 text-[10px] font-medium">Day</div>
+                  <div className="flex flex-1">
+                    {Array.from({ length: 24 }, (_, h) => (
+                      <div
                         key={h}
-                        className="absolute top-1 -translate-x-1/2 tabular-nums"
-                        style={{ left: `${(h / 24) * 100}%` }}
+                        className="flex-1 border-r border-border/60 px-1 py-1 tabular-nums last:border-r-0"
                       >
                         {h === 0 ? "12a" : h === 12 ? "12p" : h < 12 ? `${h}a` : `${h - 12}p`}
-                      </span>
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -2087,12 +2086,17 @@ export function AnalyticsView() {
                       </div>
                       <div
                         className="relative flex-1"
-                        style={{
-                          height: `${day.lanes * LANE + 6}px`,
-                          backgroundImage:
-                            "repeating-linear-gradient(to right, hsl(var(--border)) 0 1px, transparent 1px calc(100% / 24))",
-                        }}
+                        style={{ height: `${day.lanes * LANE + 6}px` }}
                       >
+                        {/* per-hour gridlines */}
+                        <div className="pointer-events-none absolute inset-0 flex">
+                          {Array.from({ length: 24 }, (_, h) => (
+                            <div
+                              key={h}
+                              className="flex-1 border-r border-border/40 last:border-r-0"
+                            />
+                          ))}
+                        </div>
                         {day.blocks.map((b, i) => {
                           const left = ((b.start - dayStart) / DAY_MS) * 100;
                           const width = Math.max(((b.end - b.start) / DAY_MS) * 100, 0.7);
