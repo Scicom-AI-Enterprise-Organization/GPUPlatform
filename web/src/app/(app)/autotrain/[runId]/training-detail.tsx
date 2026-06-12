@@ -309,6 +309,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const [labelAxes, setLabelAxes] = useState(
     Array.isArray(lcfg.label_mos_axes) ? (lcfg.label_mos_axes as unknown[]).map(String).join(", ") : "Naturalness, Intelligibility, Noise",
   );
+  const [labelSpeakers, setLabelSpeakers] = useState(
+    Array.isArray(lcfg.label_speakers) ? (lcfg.label_speakers as unknown[]).map(String).join(", ") : "",
+  );
   const [labelBusy, setLabelBusy] = useState(false);
   const [labelErr, setLabelErr] = useState<string | null>(null);
   const [labelDone, setLabelDone] = useState(false);
@@ -334,6 +337,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         project_name: labelProject.trim() || null,
         samples: labelSamples,
         mos_axes: labelAxes.split(",").map((s) => s.trim()).filter(Boolean),
+        speakers: labelSpeakers.split(",").map((s) => s.trim()).filter(Boolean),
       });
       setLabelDone(true);
     } catch (e) {
@@ -972,6 +976,14 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
                 <label className="text-xs uppercase tracking-wide text-muted-foreground">MOS axes</label>
                 <Input value={labelAxes} placeholder="Naturalness, Intelligibility, Noise"
                   onChange={(e) => setLabelAxes(e.target.value)} />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs uppercase tracking-wide text-muted-foreground">Speaker names (optional)</label>
+                <Input value={labelSpeakers} placeholder="speakerA, speakerB"
+                  onChange={(e) => setLabelSpeakers(e.target.value)} />
+                <p className="text-xs text-muted-foreground">
+                  Comma-separated. Balances the clips evenly across these voices (e.g. 2 speakers + {labelSamples} samples → {Math.floor(labelSamples / 2)} each). Blank → the dataset&apos;s original voices.
+                </p>
               </div>
             </div>
           )}

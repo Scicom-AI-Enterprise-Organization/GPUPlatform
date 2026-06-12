@@ -646,6 +646,7 @@ async def _finish_tts_pack(run_id: str, cfg: dict, packed: dict) -> str:
                          f"tokenizer {packed.get('tokenizer')}, splits {list(splits) or ['(flat)']}) "
                          f"of {base}")[:2048],
             kind="tts_packed",
+            format="chinidataset",  # multipacked NeuCodec layout (ChiniDataset parquet shards)
             storage_id=(run.storage_id if run else (src.storage_id if src else None)),
             s3_metadata_uri=packed.get("s3_uri"),
             num_rows=packed.get("samples"),
@@ -1736,6 +1737,9 @@ class CreateTrainingRunRequest(BaseModel):
     label_project_name: Optional[str] = None     # defaults to "<run name>-eval"
     label_samples: int = 32
     label_mos_axes: list[str] = ["Naturalness", "Intelligibility", "Noise"]
+    # Balance the synthesized eval clips across these speaker names (round-robin),
+    # e.g. ["A","B"] + 32 samples → 16 each. Empty → original packed voices.
+    label_speakers: list[str] = []
     precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
@@ -2027,6 +2031,7 @@ async def create_training_run(
         "label_project_name": (body.label_project_name or "").strip() or None,
         "label_samples": int(body.label_samples or 32),
         "label_mos_axes": [a.strip() for a in (body.label_mos_axes or []) if str(a).strip()],
+        "label_speakers": [str(s).strip() for s in (body.label_speakers or []) if str(s).strip()],
         "precision": body.precision, "language": body.language, "task": body.task,
         "base_model": body.base_model,
         # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab
@@ -2163,6 +2168,7 @@ class LabelExportRequest(BaseModel):
     project_name: Optional[str] = None
     samples: Optional[int] = None
     mos_axes: Optional[list[str]] = None
+    speakers: Optional[list[str]] = None  # balance clips across these speaker names
 
 
 @router.post("/{run_id}/label-export")
@@ -2216,6 +2222,8 @@ async def retry_label_export(
         cfg["label_samples"] = max(1, int(body.samples))
     if body.mos_axes is not None:
         cfg["label_mos_axes"] = [a.strip() for a in body.mos_axes if str(a).strip()]
+    if body.speakers is not None:
+        cfg["label_speakers"] = [s.strip() for s in body.speakers if str(s).strip()]
     cfg["label_export"] = True
 
     has_url = bool((cfg.get("label_base_url_secret") or "").strip() or (cfg.get("label_base_url") or "").strip())
@@ -2233,7 +2241,7 @@ async def retry_label_export(
             merged = dict(r2.config_json or {})
             for k in ("label_export", "label_base_url", "label_base_url_secret",
                       "label_token_secret", "label_token_enc", "label_project_name",
-                      "label_samples", "label_mos_axes"):
+                      "label_samples", "label_mos_axes", "label_speakers"):
                 merged[k] = cfg.get(k)
             r2.config_json = merged
             await s.commit()
@@ -3335,6 +3343,9 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
             "random": bool(is_random), "n_samples": int(n_samples), "seed": 42,
             "speaker": speaker or "", "gpu": gpu or "auto", "max_new_tokens": 1024,
             "upload_bucket": upload_bucket, "upload_prefix": upload_prefix,
+            # Balance the synthesized clips round-robin across these speaker names
+            # (e.g. 2 speakers + 32 samples → 16 each). Empty → original packed voices.
+            "label_speakers": [str(s).strip() for s in (cfg.get("label_speakers") or []) if str(s).strip()],
         }
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(tconf))

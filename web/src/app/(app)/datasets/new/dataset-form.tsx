@@ -24,6 +24,7 @@ const KINDS: { value: DatasetKind; label: string; description: string }[] = [
   { value: "s3", label: "Existing S3 metadata", description: "Reference a metadata file that already lives in S3 (s3://bucket/key)." },
   { value: "hf", label: "HuggingFace dataset", description: "Reference an existing HuggingFace dataset repo by id (owner/name)." },
   { value: "label", label: "Labeling platform", description: "Import {audio, transcription} from a labeling-platform project using its API token." },
+  { value: "tts_packed", label: "TTS packed (existing S3 shards)", description: "Register ChiniDataset parquet shards (NeuCodec multipack) already in S3 by their prefix." },
 ];
 
 // Pull the base URL + project id out of a pasted project URL like
@@ -49,6 +50,10 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
   const [audioPrefix, setAudioPrefix] = useState("");
   const [s3MetadataUri, setS3MetadataUri] = useState("");
   const [hfRepo, setHfRepo] = useState("");
+  const [hfRevision, setHfRevision] = useState("");
+  // tts_packed: the tokenizer + multipack sequence length the shards were packed with
+  const [packTokenizer, setPackTokenizer] = useState("Scicom-intl/Multilingual-Expressive-TTS-1.7B");
+  const [packSeqLen, setPackSeqLen] = useState(4096);
   // label: paste the project URL + a token (typed, or from a global secret)
   const [labelProjectUrl, setLabelProjectUrl] = useState("");
   const [labelToken, setLabelToken] = useState("");
@@ -78,9 +83,10 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
 
   const validate = (): string | null => {
     if (!name.trim()) return "Name is required.";
-    if (kind === "upload" || kind === "s3") {
+    if (kind === "upload" || kind === "s3" || kind === "tts_packed") {
       if (!storageId) return "Pick an S3 storage backend.";
       if (kind === "s3" && !s3MetadataUri.trim()) return "S3 metadata URI is required.";
+      if (kind === "tts_packed" && !s3MetadataUri.trim()) return "S3 shards prefix is required.";
     }
     if (kind === "hf" && !hfRepo.trim()) return "HuggingFace repo (owner/name) is required.";
     if (kind === "label") {
@@ -108,8 +114,11 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
         storage_id: storageId || null,
         description: description.trim() || null,
         audio_prefix: audioPrefix.trim() || null,
-        s3_metadata_uri: kind === "s3" ? s3MetadataUri.trim() : null,
+        s3_metadata_uri: kind === "s3" || kind === "tts_packed" ? s3MetadataUri.trim() : null,
+        tokenizer: kind === "tts_packed" ? packTokenizer.trim() || null : null,
+        sequence_length: kind === "tts_packed" ? packSeqLen : null,
         hf_repo: kind === "hf" ? hfRepo.trim() : null,
+        hf_revision: kind === "hf" ? hfRevision.trim() || null : null,
         label_base_url: labelParsed?.base ?? null,
         label_project_id: labelParsed?.id ?? null,
         label_token: kind === "label" && tokenMode === "paste" ? labelToken.trim() : null,
@@ -230,6 +239,64 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
             </div>
           )}
 
+          {kind === "tts_packed" && (
+            <div className="grid items-start gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">S3 storage</Label>
+                <Select value={storageId} onValueChange={setStorageId}>
+                  <SelectTrigger>
+                    <SelectValue placeholder={storageOptions.length ? "Choose a storage" : "No S3 storage configured"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {storageOptions.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>
+                        {s.name}
+                        {s.bucket ? ` — s3://${s.bucket}${s.prefix ? "/" + s.prefix.replace(/^\/+|\/+$/g, "") : ""}` : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {storageOptions.length === 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    Add an S3 storage under <a href="/storage/new" className="underline">Storage</a> first.
+                  </p>
+                )}
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="ds-packprefix" className="text-xs uppercase tracking-wide text-muted-foreground">S3 shards prefix</Label>
+                <Input
+                  id="ds-packprefix"
+                  value={s3MetadataUri}
+                  onChange={(e) => setS3MetadataUri(e.target.value)}
+                  placeholder="s3://my-bucket/path/packed/"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Folder holding the ChiniDataset parquet shards (with <code>train/</code> + <code>test/</code> subdirs).
+                  Splits, row counts and size are read from it.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="ds-tok" className="text-xs uppercase tracking-wide text-muted-foreground">Tokenizer</Label>
+                <Input
+                  id="ds-tok"
+                  value={packTokenizer}
+                  onChange={(e) => setPackTokenizer(e.target.value)}
+                  placeholder="owner/model"
+                />
+                <p className="text-xs text-muted-foreground">The speech-token tokenizer the shards were packed with (decodes rows to text).</p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="ds-seqlen" className="text-xs uppercase tracking-wide text-muted-foreground">Sequence length</Label>
+                <Input
+                  id="ds-seqlen"
+                  type="number"
+                  value={packSeqLen}
+                  onChange={(e) => setPackSeqLen(Number.parseInt(e.target.value, 10) || 4096)}
+                />
+              </div>
+            </div>
+          )}
+
           {kind === "hf" && (
             <div className="grid items-start gap-4 sm:grid-cols-2">
               <div className="space-y-2">
@@ -253,6 +320,18 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="ds-hfrev" className="text-xs uppercase tracking-wide text-muted-foreground">Revision (optional)</Label>
+                <Input
+                  id="ds-hfrev"
+                  value={hfRevision}
+                  onChange={(e) => setHfRevision(e.target.value)}
+                  placeholder="main, v1.0.0, or a commit SHA"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Git branch, tag, or commit hash to pin. Blank → the repo&apos;s default branch.
+                </p>
               </div>
             </div>
           )}

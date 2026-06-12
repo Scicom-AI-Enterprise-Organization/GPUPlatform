@@ -197,6 +197,7 @@ async def _run(
                 return
             kind = d.kind
             src_repo = d.hf_repo
+            src_revision = d.hf_revision  # commit/branch/tag to fetch (None → default)
             audio_field, transcription_field = d.audio_field, d.transcription_field
             split_fields = dict(d.split_fields or {})  # {split: transcription_column}
             hf_store = (
@@ -236,8 +237,9 @@ async def _run(
                 await _finish(dataset_id, "failed", "no tasks with downloadable audio in the label export (check the status filter / token)")
                 return
         else:
-            await _log(dataset_id, f"downloading {src_repo} … (reuses cached files on re-run)")
-            await run_in_threadpool(_download, src_repo, token, work, progress)
+            rev_note = f" @ {src_revision}" if src_revision else ""
+            await _log(dataset_id, f"downloading {src_repo}{rev_note} … (reuses cached files on re-run)")
+            await run_in_threadpool(_download, src_repo, token, work, progress, src_revision)
 
             await _log(dataset_id, "extracting audio archives …")
             n_audio = await run_in_threadpool(_extract_archives, work)
@@ -304,11 +306,13 @@ def _download(
     token: Optional[str],
     dest: str,
     progress: Optional[Callable[[str, int, int], None]] = None,
+    revision: Optional[str] = None,
 ) -> str:
     """snapshot_download the dataset repo into the STABLE `dest` — re-runs skip
     files already present (no network re-fetch). Emits a byte-based `download`
     progress marker (snapshot_download itself is opaque, so the UI otherwise
-    shows no %) by polling the on-disk size against the repo's total size."""
+    shows no %) by polling the on-disk size against the repo's total size.
+    `revision` (commit/branch/tag) pins which ref to fetch (None → default)."""
     import threading
     from huggingface_hub import HfApi, snapshot_download
 
@@ -329,7 +333,7 @@ def _download(
     os.makedirs(dest, exist_ok=True)
     total_bytes = 0
     try:
-        info = HfApi(token=token).repo_info(repo, repo_type="dataset", files_metadata=True)
+        info = HfApi(token=token).repo_info(repo, repo_type="dataset", revision=revision, files_metadata=True)
         total_bytes = sum(int(getattr(s, "size", 0) or 0) for s in (info.siblings or []))
     except Exception:  # noqa: BLE001 — size lookup is best-effort (just disables %)
         logger.warning("repo_info size lookup failed for %s; download %% unavailable", repo)
@@ -366,7 +370,7 @@ def _download(
     poller = threading.Thread(target=_poll, daemon=True)
     poller.start()
     try:
-        snapshot_download(repo_id=repo, repo_type="dataset", local_dir=dest, token=token)
+        snapshot_download(repo_id=repo, repo_type="dataset", local_dir=dest, token=token, revision=revision)
     finally:
         stop.set()
         poller.join(timeout=3.0)

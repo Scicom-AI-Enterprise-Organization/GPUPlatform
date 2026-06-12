@@ -307,6 +307,7 @@ export function TrainingForm() {
   const [secrets, setSecrets] = useState<GlobalEnvRecord[]>([]);
   const [labelProjectName, setLabelProjectName] = useState("");
   const [labelSamples, setLabelSamples] = useState(32);
+  const [labelSpeakers, setLabelSpeakers] = useState("");
   const [labelMosAxes, setLabelMosAxes] = useState("Naturalness, Intelligibility, Noise");
   // experiment tracking — named credentials from the Secrets page (picked per run)
   const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
@@ -438,6 +439,8 @@ export function TrainingForm() {
         if (c.label_samples != null) setLabelSamples(num(c.label_samples, 32));
         if (Array.isArray(c.label_mos_axes) && c.label_mos_axes.length)
           setLabelMosAxes(arr(c.label_mos_axes).map(String).join(", "));
+        if (Array.isArray(c.label_speakers) && c.label_speakers.length)
+          setLabelSpeakers(arr(c.label_speakers).map(String).join(", "));
         // run on
         if (r.provider_kind === "vm") { setTarget("vm"); setProviderId(r.provider_id || ""); }
         else if (r.provider_id) { setTarget("cloud"); setRunpodProviderId(r.provider_id); }
@@ -722,6 +725,7 @@ export function TrainingForm() {
             label_project_name: labelProjectName.trim() || null,
             label_samples: labelSamples,
             label_mos_axes: labelMosAxes.split(",").map((s) => s.trim()).filter(Boolean),
+            label_speakers: labelSpeakers.split(",").map((s) => s.trim()).filter(Boolean),
           }
         : {}),
       ...(sweepOn && Object.keys(sweepGrid).length
@@ -1294,6 +1298,12 @@ export function TrainingForm() {
                   <FieldWrap label="MOS axes" hint="Comma-separated 1–5 rating axes for the recording project.">
                     <Input value={labelMosAxes} placeholder="Naturalness, Intelligibility, Noise"
                       onChange={(e) => setLabelMosAxes(e.target.value)} />
+                  </FieldWrap>
+                </div>
+                <div className="sm:col-span-2">
+                  <FieldWrap label="Speaker names (optional)" hint="Comma-separated. Balances the clips evenly across these voices — e.g. 2 speakers + 32 samples → 16 each. Blank → the dataset's original voices.">
+                    <Input value={labelSpeakers} placeholder="speakerA, speakerB"
+                      onChange={(e) => setLabelSpeakers(e.target.value)} />
                   </FieldWrap>
                 </div>
               </div>

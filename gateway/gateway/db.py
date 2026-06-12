@@ -298,7 +298,7 @@ class Dataset(Base):
     s3_metadata_uri: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     metadata_filename: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-    format: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # csv|json|jsonl
+    format: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # csv|json|jsonl|chinidataset
     num_rows: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     audio_field: Mapped[str] = mapped_column(String(128), default="audio", server_default="audio", nullable=False)
     transcription_field: Mapped[str] = mapped_column(String(128), default="transcription", server_default="transcription", nullable=False)
@@ -496,6 +496,11 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS volume_gb INTEGER"
+        ))
+        # Widen datasets.format (was VARCHAR(8), sized for csv/json/jsonl) so the
+        # packed format label "chinidataset" fits. Idempotent: widening only.
+        await conn.execute(text(
+            "ALTER TABLE datasets ALTER COLUMN format TYPE VARCHAR(32)"
         ))
         # Per-app cloud-account selection — API surface; autoscaler still
         # uses the global env-driven provider for now.

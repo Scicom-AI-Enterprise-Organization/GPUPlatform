@@ -229,7 +229,7 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
                 </p>
               )}
               <p className="mt-3 text-[11px] text-muted-foreground">
-                Shown with your session token. For scripts/CI, use a long-lived key from <Link href="/api-keys" className="underline underline-offset-2 hover:text-foreground">API keys</Link>.
+                Shown with your session token. For scripts/CI, use a long-lived key from <Link href="/api-keys" className="underline underline-offset-2 hover:text-foreground">API tokens</Link>.
               </p>
             </CardContent>
           </Card>

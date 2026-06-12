@@ -44,7 +44,7 @@ logger = logging.getLogger("gateway.datasets")
 
 router = APIRouter(prefix="/v1/datasets", tags=["datasets"])
 
-KINDS = ("upload", "s3", "hf", "label")
+KINDS = ("upload", "s3", "hf", "label", "tts_packed")
 _UPLOAD_EXTS = (".csv", ".json", ".jsonl", ".ndjson")
 
 
@@ -53,12 +53,18 @@ _UPLOAD_EXTS = (".csv", ".json", ".jsonl", ".ndjson")
 
 class CreateDatasetRequest(BaseModel):
     name: str
-    kind: str = "upload"  # upload | s3 | hf | label
+    kind: str = "upload"  # upload | s3 | hf | label | tts_packed
     storage_id: Optional[str] = None
     description: Optional[str] = None
     audio_prefix: Optional[str] = None
-    s3_metadata_uri: Optional[str] = None  # kind=s3
+    s3_metadata_uri: Optional[str] = None  # kind=s3 (metadata file) / kind=tts_packed (shards prefix)
+    # kind=tts_packed — register existing ChiniDataset parquet shards already in S3.
+    tokenizer: Optional[str] = None        # speech-token tokenizer used when packing
+    sequence_length: Optional[int] = None  # multipack sequence length
     hf_repo: Optional[str] = None  # kind=hf
+    # kind=hf — git revision to pin: a commit SHA (full/short), branch ("main",
+    # "dev"), or tag ("v1.0.0"). Blank → the repo's default branch.
+    hf_revision: Optional[str] = None
     # kind=label — live import from a labeling-platform project's export API.
     label_base_url: Optional[str] = None     # e.g. http://localhost:3002
     label_project_id: Optional[str] = None   # project UUID
@@ -277,6 +283,60 @@ async def _s3_folder_size(storage: Storage, s3_metadata_uri: str) -> Optional[in
         return None
 
 
+async def _tts_pack_prefix_size(storage: Storage, s3_uri: str) -> Optional[int]:
+    """Total bytes under a packed dataset's S3 PREFIX (s3_metadata_uri is the dir
+    holding the parquet shards, incl. per-split subdirs) — not the parent folder.
+    Best-effort: returns None on any S3 error."""
+    try:
+        target, _ = _s3_target_and_prefix(storage)
+        u = urlparse(s3_uri)
+        if u.scheme == "s3":
+            target = dataclasses.replace(target, bucket=u.netloc)
+            key = u.path.lstrip("/")
+        else:
+            key = s3_uri
+        prefix = key.rstrip("/") + "/"
+        objs = await _run_sync(bench.s3_list, prefix, target)
+        return sum(int(o.get("size") or 0) for o in objs)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("packed prefix-size compute failed for %s: %s", s3_uri, e)
+        return None
+
+
+def _introspect_packed_s3(target: "S3Target", prefix: str) -> dict:
+    """Inspect existing ChiniDataset shards under `prefix` for registering them as a
+    tts_packed dataset: per-split record counts (from the <prefix>/<split>/*.parquet
+    layout; flat shards → no split dimension) + total bytes. Counts come from each
+    shard's parquet footer (num_rows) — no row data loaded. Sync; call via _run_sync."""
+    import io as _io
+    import pyarrow.parquet as pq
+
+    objs = bench.s3_list(prefix, target)
+    if not objs:
+        raise RuntimeError("no objects found under the prefix")
+    size = sum(int(o.get("size") or 0) for o in objs)
+    shards = sorted(o["key"] for o in objs if o["key"].endswith(".parquet"))
+    if not shards:
+        raise RuntimeError("no .parquet shards under the prefix — is this a packed (ChiniDataset) folder?")
+    cli = bench._s3_client(target)
+    splits: dict[str, int] = {}
+    flat_total = 0
+    for key in shards:
+        rel = key[len(prefix):] if key.startswith(prefix) else key
+        split = rel.split("/", 1)[0] if "/" in rel else None
+        body = cli.get_object(Bucket=target.bucket, Key=key)["Body"].read()
+        n = int(pq.read_metadata(_io.BytesIO(body)).num_rows)
+        if split:
+            splits[split] = splits.get(split, 0) + n
+        else:
+            flat_total += n
+    # When split subdirs exist they're authoritative (preview/training read
+    # <prefix>/<split>/); any flat top-level shards are a combined/duplicate copy,
+    # so don't double-count them. Flat-only datasets fall back to the flat total.
+    total = sum(splits.values()) if splits else flat_total
+    return {"splits": splits, "total_rows": total, "size_bytes": size}
+
+
 async def _owner_map(session: AsyncSession, rows: list[Dataset]) -> dict[int, str]:
     ids = {d.owner_id for d in rows}
     out: dict[int, str] = {}
@@ -412,15 +472,18 @@ async def create_dataset(
     label_token_secret_val: Optional[str] = None
     label_status_val: Optional[str] = None
     label_num_rows: Optional[int] = None
-    if req.kind in ("upload", "s3"):
+    if req.kind in ("upload", "s3", "tts_packed"):
         if not req.storage_id:
             raise HTTPException(status_code=400, detail="storage_id (an S3 storage) is required")
         storage = await _load_storage(session, req.storage_id)
         if storage.kind != "s3":
-            raise HTTPException(status_code=400, detail="storage must be kind=s3 for upload/s3 datasets")
+            raise HTTPException(status_code=400, detail="storage must be kind=s3 for upload / s3 / tts_packed datasets")
         storage_name = storage.name
-        if req.kind == "s3" and not (req.s3_metadata_uri or "").strip():
-            raise HTTPException(status_code=400, detail="s3_metadata_uri is required for kind=s3")
+        if req.kind in ("s3", "tts_packed") and not (req.s3_metadata_uri or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="s3_metadata_uri is required (the metadata file for s3, the shards prefix for tts_packed)",
+            )
     elif req.kind == "hf":
         if not (req.hf_repo or "").strip():
             raise HTTPException(status_code=400, detail="hf_repo (owner/name) is required for kind=hf")
@@ -476,6 +539,7 @@ async def create_dataset(
         audio_prefix=(req.audio_prefix or "").strip() or None,
         s3_metadata_uri=(req.s3_metadata_uri or "").strip() or None,
         hf_repo=(req.hf_repo or "").strip() or None,
+        hf_revision=(req.hf_revision or "").strip() or None if req.kind == "hf" else None,
         label_base_url=label_base_url,
         label_project_id=label_project_id,
         label_token_enc=label_token_enc,
@@ -509,6 +573,33 @@ async def create_dataset(
                 _stamp_detected_fields(row, cols, len(all_rows), fmt)
         except Exception as e:  # noqa: BLE001 — best-effort; preview re-heals
             logger.warning("s3 metadata introspect failed for new dataset %s: %s", did, e)
+    elif req.kind == "tts_packed":
+        # Register existing ChiniDataset shards: introspect the prefix for splits +
+        # per-split counts + total size, and stamp the _tts_pack metadata so preview
+        # / decode / training treat it exactly like a packed dataset the pack job
+        # produced. Fail loudly if the prefix has no shards — a broken packed dataset
+        # is worse than a clear error.
+        try:
+            target, _base = _s3_target_and_prefix(storage)
+            u = urlparse(row.s3_metadata_uri or "")
+            t = dataclasses.replace(target, bucket=u.netloc) if u.scheme == "s3" else target
+            prefix = (u.path.lstrip("/") if u.scheme == "s3" else (row.s3_metadata_uri or "")).rstrip("/") + "/"
+            info = await _run_sync(_introspect_packed_s3, t, prefix)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"could not read packed shards at {row.s3_metadata_uri}: {e}",
+            )
+        row.format = "chinidataset"
+        row.num_rows = info["total_rows"]
+        row.size_bytes = info["size_bytes"]
+        row.audio_field = "audio"
+        row.transcription_field = "text"
+        row.split_fields = {"_tts_pack": {
+            "tokenizer": (req.tokenizer or "").strip() or _DEFAULT_TTS_TOKENIZER,
+            "sequence_length": int(req.sequence_length or 4096),
+            "splits": info["splits"],
+        }}
     session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -536,6 +627,24 @@ async def get_dataset(
         size = await _s3_folder_size(storage, d.s3_metadata_uri)
         if size:
             d.size_bytes = size
+            await session.commit()
+            await session.refresh(d)
+
+    # Packed datasets: the pack job records rows + the s3 prefix but not the format
+    # or on-disk size. Backfill both once — format is always "chinidataset" (the
+    # multipacked NeuCodec layout); size = sum of the parquet shards under the
+    # prefix (train/ + test/ subdirs included).
+    if d.kind == "tts_packed" and d.s3_metadata_uri and storage and d.transform_status != "running":
+        _changed = False
+        if not d.format:
+            d.format = "chinidataset"
+            _changed = True
+        if d.size_bytes is None:
+            size = await _tts_pack_prefix_size(storage, d.s3_metadata_uri)
+            if size:
+                d.size_bytes = size
+                _changed = True
+        if _changed:
             await session.commit()
             await session.refresh(d)
 
@@ -925,15 +1034,18 @@ def _hf_split_ident(splits: list[dict[str, Any]]):
 
 def _hf_preview_rows(
     hf_repo: str, token: Optional[str], limit: int, offset: int = 0, split: Optional[str] = None,
+    revision: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], Optional[int], Optional[str], list[str]]:
     """Fetch a page of rows for one split via the HF datasets-server API.
     Returns (rows, total_rows, used_split, all_split_names). `split` selects which
-    split to read (default: the first); a split's full row count drives paging."""
+    split to read (default: the first); a split's full row count drives paging.
+    `revision` (commit/branch/tag) pins the source ref when set."""
     headers = {"Authorization": f"Bearer {token}"} if token else {}
+    rev = {"revision": revision} if revision else {}
     with httpx.Client(timeout=20.0) as cli:
         sp = cli.get(
             "https://datasets-server.huggingface.co/splits",
-            params={"dataset": hf_repo}, headers=headers,
+            params={"dataset": hf_repo, **rev}, headers=headers,
         )
         sp.raise_for_status()
         splits = sp.json().get("splits", [])
@@ -946,7 +1058,7 @@ def _hf_preview_rows(
             "https://datasets-server.huggingface.co/rows",
             params={
                 "dataset": hf_repo, "config": chosen["config"], "split": chosen["split"],
-                "offset": max(0, offset), "length": min(limit, 100),
+                "offset": max(0, offset), "length": min(limit, 100), **rev,
             },
             headers=headers,
         )
@@ -956,18 +1068,19 @@ def _hf_preview_rows(
         return [r.get("row", {}) for r in body.get("rows", [])], total, ident(chosen), names
 
 
-def _hf_split_columns(hf_repo: str, token: Optional[str]) -> list[dict[str, Any]]:
+def _hf_split_columns(hf_repo: str, token: Optional[str], revision: Optional[str] = None) -> list[dict[str, Any]]:
     """Per-split column names + row counts for an HF dataset, from the HF
     datasets-server: `/splits` for the authoritative config/split list and
     `/info` for each config's feature columns and per-split row counts. The UI
     uses this to offer a transcription/speaker column picker per split, so the
     labels MUST match `_hf_preview_rows` (train/test, …) — not the parquet
-    directory names. Returns [{split, columns, num_rows}]."""
+    directory names. `revision` pins the source ref. Returns [{split, columns, num_rows}]."""
     headers = {"Authorization": f"Bearer {token}"} if token else {}
+    rev = {"revision": revision} if revision else {}
     with httpx.Client(timeout=20.0) as cli:
         sp = cli.get(
             "https://datasets-server.huggingface.co/splits",
-            params={"dataset": hf_repo}, headers=headers,
+            params={"dataset": hf_repo, **rev}, headers=headers,
         )
         sp.raise_for_status()
         splits = sp.json().get("splits", [])
@@ -976,7 +1089,7 @@ def _hf_split_columns(hf_repo: str, token: Optional[str]) -> list[dict[str, Any]
         ident = _hf_split_ident(splits)
         info = cli.get(
             "https://datasets-server.huggingface.co/info",
-            params={"dataset": hf_repo}, headers=headers,
+            params={"dataset": hf_repo, **rev}, headers=headers,
         )
         info.raise_for_status()
         # dataset_info maps config → {features: {col: …}, splits: {split: {num_examples}}}.
@@ -1241,6 +1354,7 @@ async def preview_dataset(
                 return _resp(rows=[], error="no hf_repo set")
             raw, total, used_split, names = await _run_sync(
                 _hf_preview_rows, d.hf_repo, await _hf_token(storage, session), limit, offset, split,
+                d.hf_revision,
             )
             # Honour the per-split transcription mapping (e.g. test→after) so rows
             # aren't blank when a split uses a different column than the default.
@@ -1634,7 +1748,7 @@ async def dataset_splits(
     try:
         storage = await session.get(Storage, d.storage_id) if d.storage_id else None
         token = await _hf_token(storage, session)
-        splits = await _run_sync(_hf_split_columns, d.hf_repo, token)
+        splits = await _run_sync(_hf_split_columns, d.hf_repo, token, d.hf_revision)
         return SplitsResponse(splits=[SplitInfo(**s) for s in splits])
     except Exception as e:  # noqa: BLE001
         logger.warning("splits lookup failed for %s: %s", dataset_id, e)

@@ -320,6 +320,7 @@ export const gateway = {
       project_name?: string | null;
       samples?: number;
       mos_axes?: string[];
+      speakers?: string[];
     },
   ) =>
     request<{ status: string }>(

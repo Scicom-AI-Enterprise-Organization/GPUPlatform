@@ -59,10 +59,12 @@ def _upload_client(cfg: dict):
     )
 
 
-def _collect_texts(cfg: dict) -> list[tuple[str, str]]:
-    """Download the chosen packed split + decode utterances → [(prompt_text, ref_text)].
+def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
+    """Download the chosen packed split + decode utterances → [(prompt_text, ref_text, speaker)].
     For the train split a random sample of N is taken (scanning a bounded pool);
-    for the test split the first N well-formed utterances are used."""
+    for the test split the first N well-formed utterances are used. When
+    cfg["label_speakers"] is given, the N clips are balanced round-robin across
+    those speaker names (speaker is "" otherwise)."""
     import random as _random
 
     from transformers import AutoTokenizer
@@ -120,8 +122,27 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str]]:
         return []
     if is_random:
         _random.seed(int(cfg.get("seed") or 42))
-        return _random.sample(pool, min(n, len(pool)))
-    return pool[:n]
+        selected = _random.sample(pool, min(n, len(pool)))
+    else:
+        selected = pool[:n]
+
+    # Balance the generation across named speakers: reassign each clip's voice
+    # round-robin so e.g. 2 speakers + 32 samples → 16 each. The model is
+    # speaker-name-conditioned (prompt "<|im_start|>{speaker}: {text}<|speech_start|>",
+    # mirrors pack_stage1.py / tts_infer), so we keep each clip's transcript but
+    # swap in the chosen speaker name. No speakers given → original packed voices.
+    speakers = [str(s).strip() for s in (cfg.get("label_speakers") or []) if str(s).strip()]
+    if speakers:
+        from tts_eval import _IM_START, _SPEECH_START
+        out = []
+        for i, (_pt, ref_text) in enumerate(selected):
+            spk = speakers[i % len(speakers)]
+            out.append((f"{_IM_START}{spk}: {ref_text}{_SPEECH_START}", ref_text, spk))
+        from collections import Counter
+        bal = ", ".join(f"{s}×{c}" for s, c in sorted(Counter(s for _, _, s in out).items()))
+        log(f"balancing {len(out)} clip(s) across {len(speakers)} speaker(s): {bal}")
+        return out
+    return [(pt, rt, "") for (pt, rt) in selected]
 
 
 def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
@@ -149,11 +170,13 @@ def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
     max_new = int(cfg.get("max_new_tokens") or 1024)
     log(f"loaded in {time.time() - _t:.1f}s; synthesizing {len(utts)} clip(s) …")
 
+    import re as _re
+
     cli = _upload_client(cfg)
     bucket = cfg["upload_bucket"]
     base_key = cfg["upload_prefix"].strip("/")
     items: list[dict] = []
-    for idx, (prompt_text, ref_text) in enumerate(utts):
+    for idx, (prompt_text, ref_text, speaker) in enumerate(utts):
         try:
             ids = tok(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids
             if use_cuda:
@@ -169,10 +192,14 @@ def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
             wav, sr = _decode_neucodec(neu, codes)
             buf = io.BytesIO()
             sf.write(buf, wav, int(sr), format="WAV", subtype="PCM_16")
-            key = f"{base_key}/{idx:04d}.wav"
+            # Tag the filename with the (sanitised) speaker so the balance is
+            # visible/traceable in the Label project; key stays S3-safe.
+            safe = _re.sub(r"[^A-Za-z0-9._-]+", "-", speaker).strip("-") if speaker else ""
+            key = f"{base_key}/{idx:04d}{('_' + safe) if safe else ''}.wav"
             cli.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
-            items.append({"key": key, "text": ref_text})
-            log(f"clip {idx + 1}/{len(utts)}: {len(wav) / int(sr):.2f}s → s3://{bucket}/{key}")
+            items.append({"key": key, "text": ref_text, "speaker": speaker})
+            tag = f" [{speaker}]" if speaker else ""
+            log(f"clip {idx + 1}/{len(utts)}{tag}: {len(wav) / int(sr):.2f}s → s3://{bucket}/{key}")
         except Exception as e:  # noqa: BLE001
             log(f"clip {idx + 1}/{len(utts)} failed: {e}")
     return items

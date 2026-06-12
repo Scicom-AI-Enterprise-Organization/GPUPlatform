@@ -434,6 +434,7 @@ export type CreateTrainingRunRequest = {
   label_project_name?: string | null;
   label_samples?: number;
   label_mos_axes?: string[];
+  label_speakers?: string[]; // balance synthesized eval clips across these speaker names
 };
 
 export type TrainingFile = {
@@ -697,7 +698,11 @@ export type CreateDatasetRequest = {
   description?: string | null;
   audio_prefix?: string | null;
   s3_metadata_uri?: string | null;
+  // kind=tts_packed — register existing ChiniDataset shards already in S3
+  tokenizer?: string | null;
+  sequence_length?: number | null;
   hf_repo?: string | null;
+  hf_revision?: string | null; // kind=hf — commit/branch/tag to pin
   // kind=label — import from a labeling-platform project
   label_base_url?: string | null;
   label_project_id?: string | null;

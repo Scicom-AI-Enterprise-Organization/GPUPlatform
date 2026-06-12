@@ -253,8 +253,11 @@ export function DatasetDetail({
                     )
                   }
                 />
-                {dataset.kind === "s3" && (
-                  <Row label="S3 metadata URI" value={<span className="font-mono text-xs">{dataset.s3_metadata_uri ?? "—"}</span>} />
+                {(dataset.kind === "s3" || dataset.kind === "tts_packed") && (
+                  <Row
+                    label={dataset.kind === "tts_packed" ? "Packed shards (S3)" : "S3 metadata URI"}
+                    value={<span className="font-mono text-xs break-all">{dataset.s3_metadata_uri ?? "—"}</span>}
+                  />
                 )}
                 {dataset.kind === "label" && (
                   <Row
