@@ -281,6 +281,14 @@ export type TrainingResult = {
     status: "running" | "done" | "failed";
     error?: string | null;
   } | null;
+  // On-demand "Export to Hugging Face" (pushes the best/final model). status +
+  // resulting repo/url; surfaced on the run page.
+  hf_export?: {
+    status: "running" | "done" | "failed" | "cancelled";
+    repo?: string | null;
+    url?: string | null;
+    error?: string | null;
+  } | null;
   error?: string;
 };
 

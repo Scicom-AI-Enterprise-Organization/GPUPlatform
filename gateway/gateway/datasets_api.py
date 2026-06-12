@@ -1406,6 +1406,172 @@ async def packed_row(
     return {"index": index, "tokenizer": repo_id, **decoded}
 
 
+# ---------- persistent NeuCodec decoder (play a packed utterance as audio) ------
+# A `tts_packed` row is speech codes, not waveform. To hear it you load NeuCodec
+# on a GPU and decode codes→WAV. Rather than a one-shot job per click, we keep the
+# codec RESIDENT on a chosen VM (idle auto-unloads) so each "play utt N" is instant.
+# Reuses the run try-it's persistent-server machinery (see training_api).
+
+_DECODER_DEFAULT_VENV = "/share/autotrain-tts"
+
+
+class DecoderLoadRequest(BaseModel):
+    target: str = "vm"                  # "vm" (registered box) | "cloud" (spawn a RunPod pod)
+    provider_id: Optional[str] = None   # vm provider (target=vm); runpod account or null=default (target=cloud)
+    gpu: Optional[str] = None           # "auto" (default) | "cpu" | a GPU index — VM only
+    gpu_type: Optional[str] = None      # cloud GPU type
+    gpu_count: int = 1                  # cloud GPU count
+    secure_cloud: bool = True           # cloud tier
+    idle_timeout_s: int = 600           # auto-unload after this many idle seconds (0 = never)
+    venv_path: Optional[str] = None
+
+
+class DecoderDecodeRequest(BaseModel):
+    provider_id: str
+    index: int                     # packed record index (within the split)
+    utt: int = 0                   # which utterance within that record to decode
+    split: Optional[str] = None
+    venv_path: Optional[str] = None
+
+
+class DecoderActionRequest(BaseModel):
+    provider_id: str
+    venv_path: Optional[str] = None
+
+
+async def _resolve_vm_ssh(session: AsyncSession, provider_id: str) -> tuple[str, int, str, str]:
+    """(host, port, user, key_file) for a kind=vm provider — decrypt its stored key
+    to a 600 temp file. The decoder runs on a registered VM (always-on, no spawn)."""
+    from .db import Provider
+    prov = await session.get(Provider, provider_id)
+    if prov is None or prov.kind != "vm":
+        raise HTTPException(status_code=400, detail="decoder needs a kind=vm provider")
+    pc = prov.config or {}
+    host, enc = pc.get("host"), pc.get("private_key_enc")
+    if not (host and enc):
+        raise HTTPException(status_code=400, detail="VM provider is missing host / SSH key")
+    keyp = f"/tmp/sgpu_dsdec_key_{provider_id}"
+    if not os.path.exists(keyp):
+        with open(keyp, "w") as f:
+            f.write(crypto.decrypt(enc))
+        os.chmod(keyp, 0o600)
+    return host, int(pc.get("port") or 22), pc.get("user") or "root", keyp
+
+
+def _require_packed(d: Dataset) -> None:
+    if d.kind != "tts_packed":
+        raise HTTPException(status_code=400, detail="audio decode is only for tts_packed datasets")
+
+
+@router.post("/{dataset_id}/decoder/load")
+async def decoder_load(
+    dataset_id: str,
+    req: DecoderLoadRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Load NeuCodec persistently on the chosen compute (idle-unloads). Poll status."""
+    d = await _require_dataset(session, dataset_id, user)
+    _require_packed(d)
+    if (req.target or "vm").lower() != "vm":
+        # A *resident* RunPod decoder = a pod kept alive (spawn + cold-install the
+        # codec + idle-teardown) = the serverless-pod lifecycle. Not wired yet — a
+        # registered VM (always-on, TTS venv present) is the supported persistent box.
+        raise HTTPException(
+            status_code=400,
+            detail="the resident audio decoder runs on a registered VM for now — pick a VM under 'Run on'. "
+                   "(A kept-alive RunPod pod is a heavier follow-up.)",
+        )
+    if not req.provider_id:
+        raise HTTPException(status_code=400, detail="pick a VM provider under 'Run on'")
+    host, port, suser, key = await _resolve_vm_ssh(session, req.provider_id)
+    venv = (req.venv_path or "").strip() or _DECODER_DEFAULT_VENV
+    from .training_api import dataset_decoder_start_ssh
+    try:
+        st = await _run_sync(dataset_decoder_start_ssh, host, port, suser, key, dataset_id, venv,
+                             req.gpu, int(req.idle_timeout_s), {})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"could not start decoder on the VM: {e}")
+    return st
+
+
+@router.get("/{dataset_id}/decoder/status")
+async def decoder_status(
+    dataset_id: str,
+    provider_id: str = Query(...),
+    venv_path: Optional[str] = Query(None),
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    d = await _require_dataset(session, dataset_id, user)
+    _require_packed(d)
+    host, port, suser, key = await _resolve_vm_ssh(session, provider_id)
+    venv = (venv_path or "").strip() or _DECODER_DEFAULT_VENV
+    from .training_api import dataset_decoder_status_ssh
+    try:
+        return await _run_sync(dataset_decoder_status_ssh, host, port, suser, key, dataset_id, venv)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"could not reach the VM: {e}")
+
+
+@router.post("/{dataset_id}/decoder/decode")
+async def decoder_decode(
+    dataset_id: str,
+    req: DecoderDecodeRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Decode one packed utterance's speech codes → WAV on the resident decoder."""
+    d = await _require_dataset(session, dataset_id, user)
+    _require_packed(d)
+    if not (d.storage_id and d.s3_metadata_uri):
+        raise HTTPException(status_code=400, detail="packed dataset has no storage / shards")
+    storage = await _load_storage(session, d.storage_id)
+    target, _base = _s3_target_and_prefix(storage)
+    pack_splits = list((((d.split_fields or {}).get("_tts_pack") or {}).get("splits") or {}).keys())
+    used_split = (req.split if (req.split and req.split in pack_splits) else (pack_splits[0] if pack_splits else None))
+    recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
+    if req.index >= len(recs):
+        raise HTTPException(status_code=404, detail=f"index {req.index} out of range (have {len(recs)})")
+    repo_id = ((d.split_fields or {}).get("_tts_pack") or {}).get("tokenizer") or _DEFAULT_TTS_TOKENIZER
+    from .global_env_api import load_global_env
+    hf_token = (await load_global_env(session)).get("HF_TOKEN") or os.environ.get("HF_TOKEN")
+    decoded = await _run_sync(_decode_packed_record, repo_id, hf_token, recs[req.index])
+    utts = decoded.get("utterances") or []
+    if req.utt >= len(utts):
+        raise HTTPException(status_code=404, detail=f"utterance {req.utt} out of range (record has {len(utts)})")
+    text = utts[req.utt].get("text") or ""
+
+    host, port, suser, key = await _resolve_vm_ssh(session, req.provider_id)
+    venv = (req.venv_path or "").strip() or _DECODER_DEFAULT_VENV
+    from .training_api import dataset_decoder_decode_ssh
+    try:
+        resp = await _run_sync(dataset_decoder_decode_ssh, host, port, suser, key, dataset_id, venv, text)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"decode failed (is the decoder loaded?): {e}")
+    if not resp or resp.get("error"):
+        raise HTTPException(status_code=502, detail=(resp or {}).get("error") or "decoder returned no audio")
+    return {"index": req.index, "utt": req.utt, "split": used_split, **resp}
+
+
+@router.post("/{dataset_id}/decoder/unload")
+async def decoder_unload(
+    dataset_id: str,
+    req: DecoderActionRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    d = await _require_dataset(session, dataset_id, user)
+    _require_packed(d)
+    host, port, suser, key = await _resolve_vm_ssh(session, req.provider_id)
+    venv = (req.venv_path or "").strip() or _DECODER_DEFAULT_VENV
+    from .training_api import dataset_decoder_stop_ssh
+    try:
+        return await _run_sync(dataset_decoder_stop_ssh, host, port, suser, key, dataset_id, venv)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"could not stop the decoder: {e}")
+
+
 @router.get("/{dataset_id}/audio")
 async def dataset_audio(
     dataset_id: str,

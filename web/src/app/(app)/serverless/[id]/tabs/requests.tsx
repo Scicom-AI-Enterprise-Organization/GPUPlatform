@@ -62,6 +62,45 @@ const STORAGE_KEY = (appId: string) => `serverless-ui:requests:${appId}`;
 const POLL_MS = 4_000;
 const MAX_HISTORY = 100;
 
+// Coerce a pasted tools JSON into the OpenAI `tools` shape vLLM expects:
+// `[{type:"function", function:{name, description, parameters}}]`. We accept a
+// few friendlier shapes people paste — a bare array of function definitions
+// (`[{name, description, parameters, ...}]`, the most common), `{tools:[...]}`,
+// `{functions:[...]}`, or a single function object — and wrap each entry,
+// keeping only the OpenAI-recognised fields (extras like `stage`/`returns` are
+// dropped; `parameters` is forwarded verbatim, so any `$ref`s must already
+// resolve within that schema). Returns null only when the JSON isn't usable.
+function normalizeToolsInput(parsed: unknown): unknown[] | null {
+  let arr: unknown[];
+  if (Array.isArray(parsed)) {
+    arr = parsed;
+  } else if (parsed && typeof parsed === "object") {
+    const o = parsed as Record<string, unknown>;
+    if (Array.isArray(o.tools)) arr = o.tools;
+    else if (Array.isArray(o.functions)) arr = o.functions;
+    else arr = [parsed]; // a single tool/function object
+  } else {
+    return null;
+  }
+  return arr.map((t) => {
+    if (!t || typeof t !== "object") return t;
+    const o = t as Record<string, unknown>;
+    // Already OpenAI-shaped → leave as-is.
+    if (o.type === "function" && o.function && typeof o.function === "object") return o;
+    // `{function:{...}}` missing the `type` wrapper.
+    if (o.function && typeof o.function === "object") return { type: "function", function: o.function };
+    // Bare function def: wrap it, keeping only name/description/parameters.
+    if (typeof o.name === "string") {
+      const fn: Record<string, unknown> = { name: o.name };
+      if (typeof o.description === "string") fn.description = o.description;
+      fn.parameters =
+        o.parameters && typeof o.parameters === "object" ? o.parameters : { type: "object", properties: {} };
+      return { type: "function", function: fn };
+    }
+    return o; // unknown shape — forward and let the server decide
+  });
+}
+
 export function RequestsTab({ app, appId }: { app?: AppRecord; appId?: string } = {}) {
   // Prefer the passed-in app (gives us the model list for the dropdown); fall
   // back to app_id from props or the URL. Hook is called unconditionally.
@@ -257,11 +296,13 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   // Derived (not stored) so a model arriving after first render still selects.
   const selectedModel = model || models[0] || "";
 
-  // Parse the tools JSON once per edit; null = invalid (don't send it).
+  // Parse + normalize the tools JSON once per edit; null = invalid (don't send
+  // it). Accepts the OpenAI `tools` shape AND a bare array of function defs
+  // (`[{name, description, parameters, ...}]`) / `{tools|functions:[...]}` — all
+  // coerced to what vLLM expects.
   const parsedTools = useMemo<unknown[] | null>(() => {
     try {
-      const p = JSON.parse(toolsText);
-      return Array.isArray(p) ? p : null;
+      return normalizeToolsInput(JSON.parse(toolsText));
     } catch {
       return null;
     }

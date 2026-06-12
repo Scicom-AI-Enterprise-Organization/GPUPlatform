@@ -90,20 +90,50 @@ def _download_model(cfg: dict) -> str:
     )
     dest = cfg["model_dir"]
     os.makedirs(dest, exist_ok=True)
-    n = fetched = total = 0
+
+    # Enumerate first so we can report overall + per-file progress (and skip
+    # already-cached files) — the big safetensors shards are GBs, so the bare
+    # "fetching …" step used to sit silent for minutes.
+    objs: list[tuple[str, str, int]] = []
     for page in cli.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
-            key = obj["Key"]; rel = key[len(prefix):]
-            if not rel:
-                continue
-            fp = os.path.join(dest, rel)
-            os.makedirs(os.path.dirname(fp) or dest, exist_ok=True)
-            if not (os.path.exists(fp) and os.path.getsize(fp) == obj["Size"]):
-                cli.download_file(bucket, key, fp); fetched += 1
-            n += 1; total += obj["Size"]
-    if n == 0:
+            rel = obj["Key"][len(prefix):]
+            if rel:
+                objs.append((obj["Key"], rel, int(obj["Size"])))
+    if not objs:
         raise RuntimeError(f"no model files under {s3}")
-    log(f"model: {n} files · {total / 1e6:.0f} MB · {fetched} fetched / {n - fetched} cached")
+    total = sum(s for _, _, s in objs)
+    to_fetch = [
+        (k, r, s) for (k, r, s) in objs
+        if not (os.path.exists(os.path.join(dest, r)) and os.path.getsize(os.path.join(dest, r)) == s)
+    ]
+    fetch_bytes = sum(s for _, _, s in to_fetch)
+    log(f"  · {len(objs)} files · {total / 1e6:.0f} MB total — {len(to_fetch)} to download "
+        f"({fetch_bytes / 1e6:.0f} MB), {len(objs) - len(to_fetch)} already cached")
+
+    done = 0
+    for i, (key, rel, size) in enumerate(to_fetch, 1):
+        fp = os.path.join(dest, rel)
+        os.makedirs(os.path.dirname(fp) or dest, exist_ok=True)
+        log(f"  ↓ [{i}/{len(to_fetch)}] {rel} ({size / 1e6:.0f} MB)")
+        if size > 200 * 1e6:  # big shard → stream in-file % so it's not a silent multi-minute wait
+            prog = {"b": 0, "next": 0.2}
+            lock = threading.Lock()
+
+            def _cb(chunk: int, _rel=rel, _size=size, _p=prog, _lk=lock) -> None:
+                with _lk:
+                    _p["b"] += chunk
+                    frac = _p["b"] / max(_size, 1)
+                    if frac >= _p["next"] and frac < 1.0:
+                        log(f"      {_rel}: {frac * 100:.0f}%  ({_p['b'] / 1e6:.0f}/{_size / 1e6:.0f} MB)")
+                        _p["next"] += 0.2
+            cli.download_file(bucket, key, fp, Callback=_cb)
+        else:
+            cli.download_file(bucket, key, fp)
+        done += size
+        log(f"      ✓ {rel}  [{done / 1e6:.0f}/{fetch_bytes / 1e6:.0f} MB · "
+            f"{done / max(fetch_bytes, 1) * 100:.0f}% of download]")
+    log(f"model: {len(objs)} files · {total / 1e6:.0f} MB · {len(to_fetch)} fetched / {len(objs) - len(to_fetch)} cached")
     return dest
 
 
@@ -141,6 +171,12 @@ class TTSEngine:
         step(f"moving NeuCodec to {self.device}")
         self.neu = neu.cuda() if use_cuda else neu
         self.im_end = self.tok.convert_tokens_to_ids("<|im_end|>")
+        if use_cuda:
+            try:
+                gb = torch.cuda.memory_allocated() / 1024 ** 3
+                log(f"  · resident on {torch.cuda.get_device_name(0)} — {gb:.1f} GiB GPU memory in use")
+            except Exception:
+                pass
 
     def infer(self, req: dict) -> dict:
         torch = self.torch
@@ -176,6 +212,59 @@ class TTSEngine:
         self.sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
         return {"wav_b64": base64.b64encode(buf.getvalue()).decode(), "sample_rate": sr,
                 "device": self.device, "n_codes": len(codes), "prompt": prompt, "gen_text": gen_text[:8000]}
+
+
+class DecodeEngine:
+    """Persistent NeuCodec decoder for inspecting a `tts_packed` dataset: given the
+    speech codes of one packed utterance, decode them straight back to audio — no
+    language model, just the codec. Loads only NeuCodec (seconds, not the multi-GB
+    LM) and stays resident, so each "play utt N" click is instant until idle-unload."""
+
+    def __init__(self, cfg: dict, use_cuda: bool):
+        step("importing torch + neucodec")
+        import soundfile
+        import torch
+        from neucodec import NeuCodec
+
+        self.torch = torch
+        self.sf = soundfile
+        self.use_cuda = use_cuda
+        self.device = "cuda" if use_cuda else "cpu"
+
+        step("loading NeuCodec audio decoder (neuphonic/neucodec)")
+        neu = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
+        step(f"moving NeuCodec to {self.device}")
+        self.neu = neu.cuda() if use_cuda else neu
+        if use_cuda:
+            try:
+                gb = torch.cuda.memory_allocated() / 1024 ** 3
+                log(f"  · resident on {torch.cuda.get_device_name(0)} — {gb:.1f} GiB GPU memory in use")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def infer(self, req: dict) -> dict:
+        torch = self.torch
+        codes = req.get("codes")
+        if not codes:  # also accept the raw decoded text and pull <|s_N|> out of it
+            codes = [int(n) for n in _SPEECH_TOK.findall(req.get("gen_text") or req.get("text") or "")]
+        try:
+            codes = [int(c) for c in (codes or [])]
+        except (TypeError, ValueError):
+            return {"error": "codes must be a list of integers"}
+        if not codes:
+            return {"error": "no speech codes to decode for this utterance"}
+        t = time.time()
+        with torch.no_grad():
+            fsq = torch.tensor(codes, dtype=torch.long).reshape(1, 1, -1)
+            if self.use_cuda:
+                fsq = fsq.cuda()
+            wav = self.neu.decode_code(fsq).squeeze().detach().cpu().float().numpy()
+        sr = int(getattr(self.neu, "sample_rate", 24000))
+        buf = io.BytesIO()
+        self.sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
+        log(f"decoded {len(codes)} codes → {len(wav) / sr:.2f}s @ {sr}Hz in {time.time() - t:.2f}s")
+        return {"wav_b64": base64.b64encode(buf.getvalue()).decode(), "sample_rate": sr,
+                "device": self.device, "n_codes": len(codes)}
 
 
 class ASREngine:
@@ -234,7 +323,12 @@ def main() -> int:
     kind = cfg["kind"]
     log(f"loading {kind} model on {'cuda' if use_cuda else 'cpu'} …")
     t0 = time.time()
-    engine = TTSEngine(cfg, use_cuda) if kind == "tts" else ASREngine(cfg, use_cuda)
+    if kind == "tts":
+        engine = TTSEngine(cfg, use_cuda)
+    elif kind == "tts_decode":
+        engine = DecodeEngine(cfg, use_cuda)
+    else:
+        engine = ASREngine(cfg, use_cuda)
     step_done()
     log(f"loaded {kind} model in {time.time() - t0:.1f}s — ready on {engine.device}")
 

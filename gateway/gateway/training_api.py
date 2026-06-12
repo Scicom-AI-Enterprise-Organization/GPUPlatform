@@ -89,6 +89,9 @@ _RUN_STATE: dict[str, dict] = {}
 # background task. Re-clicking "Export to Label" cancels a stuck attempt and starts
 # fresh (the cancelled task's project-creation step never runs, so no duplicate).
 _active_label_exports: dict[str, asyncio.Task] = {}
+# On-demand "Export to Hugging Face" pushes in flight (per run id → task), so a
+# re-click supersedes a stuck attempt rather than running two pushes at once.
+_active_hf_exports: dict[str, asyncio.Task] = {}
 # Cached SSH client per run for the live GPU-util poll (reused across polls).
 _GPU_SSH: dict[str, Any] = {}
 
@@ -1505,19 +1508,55 @@ def _parse_remote_log(text: str) -> tuple[Optional[int], dict]:
     return rc, result
 
 
+async def _redispatch_run(redis, run_id: str, reason: str) -> str:
+    """A VM run whose gateway-side launch was cut short by a restart — queued, or
+    'running' with no remote log (i.e. interrupted during the config-ship / uv-deps /
+    launch phases, which run over a live SSH channel BEFORE the trainer detaches) —
+    is re-queued + re-run rather than failed, so a gateway restart is transparent.
+    Bounded (≤3) to avoid a crash-loop. Non-VM (RunPod) runs are failed instead:
+    re-running would silently spawn a new billed pod and the old pod's state is gone."""
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None or row.status in ("done", "cancelled"):
+            return row.status if row else "gone"
+        prov = await s.get(Provider, row.provider_id) if row.provider_id else None
+        rj = dict(row.result_json or {})
+        attempts = int(rj.get("restart_relaunches") or 0)
+        if prov is None or prov.kind != "vm" or attempts >= 3:
+            row.status = "failed"
+            row.error_text = (f"orphaned by gateway restart ({reason})"
+                              + (f" — gave up after {attempts} relaunch(es)" if attempts else ""))[:4000]
+            row.ended_at = datetime.now(timezone.utc)
+            await s.commit()
+            return "failed"
+        rj["restart_relaunches"] = attempts + 1
+        row.result_json = rj
+        row.status = "queued"
+        row.ended_at = None
+        await s.commit()
+    await _push_log(redis, run_id, f"[gateway] re-queued after gateway restart ({reason}); relaunch {attempts + 1}/3")
+    task = asyncio.create_task(_safe_run(redis, run_id))
+    _active_runners[run_id] = task
+    task.add_done_callback(lambda _t: _active_runners.pop(run_id, None))
+    return "requeued"
+
+
 async def _reconcile_orphan(row, redis) -> str:
     """Reconcile one orphaned (gateway-untracked) training run over SSH: the
     detached trainer survives a gateway restart, so check its pid — still alive →
-    leave it running (finalized later when it exits); exited → finalize from its
-    log; VM unreachable / no log → mark failed. Returns the resulting state."""
+    leave it running (finalized later when it exits); exited with a log → finalize
+    from it; interrupted before it detached (no log) → re-queue + relaunch; box
+    transiently unreachable → leave running for the janitor to re-probe."""
     rlog, rpid, _sh = _remote_run_paths(row.id)
     try:
         ssh = await _resolve_run_ssh(row)
     except Exception:  # noqa: BLE001
         ssh = None
     if ssh is None:
-        await _finalize(row.id, "failed", None, "orphaned by gateway restart (box unreachable)")
-        return "failed"
+        # Can't reach the box right now (e.g. SSH/tunnel not up yet just after a
+        # restart). Don't fail — leave it running so the janitor re-probes; a truly
+        # dead box stays 'running' until it returns or the user terminates.
+        return "running"
     host, port, user, key = ssh
 
     def _probe() -> tuple[bool, str]:
@@ -1532,14 +1571,14 @@ async def _reconcile_orphan(row, redis) -> str:
                 pass
     try:
         alive, log = await asyncio.to_thread(_probe)
-    except Exception as e:  # noqa: BLE001
-        await _finalize(row.id, "failed", None, f"orphaned (probe failed: {e})")
-        return "failed"
+    except Exception:  # noqa: BLE001 — transient SSH error → retry next janitor tick
+        return "running"
     if alive:
         return "running"  # detached trainer survived; finalize when it exits
     if not (log or "").strip():
-        await _finalize(row.id, "failed", None, "orphaned by gateway restart (process gone, no log)")
-        return "failed"
+        # No process AND no log → the run was cut short before the trainer detached
+        # (during config/deps/launch). Re-run it instead of losing it.
+        return await _redispatch_run(redis, row.id, "process gone, no log")
     rc, result = _parse_remote_log(log)
     # @@DONE (best) or @@ARTIFACT means the trainer finished + uploaded → treat as
     # done even if the exit code wasn't captured (e.g. a tail race on a detached run).
@@ -1564,12 +1603,13 @@ async def cleanup_orphaned_running(redis) -> int:
         )).scalars().all()
     n = 0
     for row in rows:
-        # queued rows never launched a detached process → just fail them.
+        # Queued rows never launched a detached process → re-run them (a restart
+        # mid-queue shouldn't drop the run). _redispatch_run is bounded + VM-only.
         if row.status == "queued":
-            await _finalize(row.id, "failed", None, "orphaned by gateway restart (never started)")
+            await _redispatch_run(redis, row.id, "never started")
             n += 1
             continue
-        if (await _reconcile_orphan(row, redis)) != "running":
+        if (await _reconcile_orphan(row, redis)) not in ("running", "requeued"):
             n += 1
     return n
 
@@ -1586,8 +1626,8 @@ async def training_janitor_loop(redis, interval: int = 90) -> None:
                     select(TrainingRun).where(TrainingRun.status == "running")
                 )).scalars().all()
             for row in rows:
-                if row.id in _RUN_STATE:
-                    continue  # actively streamed by this gateway → it finalizes itself
+                if row.id in _active_runners:
+                    continue  # actively run by THIS gateway (VM or pod) → it finalizes
                 await _reconcile_orphan(row, redis)
         except asyncio.CancelledError:
             raise
@@ -2220,6 +2260,204 @@ async def retry_label_export(
     return {"status": "started"}
 
 
+async def _set_hf_export_state(run_id: str, state: dict) -> None:
+    """Merge an hf-export status object into result_json.hf_export so the UI can
+    show 'pushing to Hugging Face' + the resulting link even on an already-done run."""
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None or row.status == "cancelled":
+            return
+        rj = dict(row.result_json or {})
+        cur = dict(rj.get("hf_export") or {})
+        cur.update(state)
+        rj["hf_export"] = cur
+        row.result_json = rj
+        await s.commit()
+
+
+async def _hf_token_for_storage(storage_id: Optional[str], session: AsyncSession) -> Optional[str]:
+    """HF token from a kind=huggingface Storage: a referenced global secret
+    (config.hf_token_secret) wins, else the storage's own encrypted token."""
+    st = await session.get(Storage, storage_id) if storage_id else None
+    if st is None:
+        return None
+    cfg = st.config or {}
+    ref = cfg.get("hf_token_secret")
+    if ref:
+        from .global_env_api import load_global_env
+        tok = (await load_global_env(session)).get(ref)
+        if tok:
+            return tok
+    enc = cfg.get("credentials_enc")
+    if enc:
+        try:
+            return json.loads(crypto.decrypt(enc)).get("token")
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+class HfExportRequest(BaseModel):
+    repo: str
+    storage_id: Optional[str] = None   # a kind=huggingface Storage (provides the token)
+    private: bool = False
+
+
+@router.post("/{run_id}/hf-export")
+async def export_to_huggingface(
+    run_id: str,
+    body: HfExportRequest,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Push this run's BEST/final model to a Hugging Face repo on demand. The model
+    artifact (result_json.artifact.s3_uri) is the best checkpoint — the trainer only
+    uploads the final/best model to S3, never the intermediate checkpoint-N dirs — so
+    this pushes exactly that. The HF token comes from the selected kind=huggingface
+    Storage (else the platform HF_TOKEN secret). Runs in the background; status +
+    link land in result_json.hf_export. VM-provider runs only."""
+    row = await _owned(run_id, user, session)
+    if row.status != "done":
+        raise HTTPException(status_code=400, detail="the run must finish successfully first")
+    model_s3 = (((row.result_json or {}).get("artifact") or {}).get("s3_uri"))
+    if not model_s3:
+        raise HTTPException(status_code=400, detail="no trained model artifact for this run")
+    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+    if prov is None or prov.kind != "vm":
+        raise HTTPException(status_code=400, detail=("HF export runs on a VM provider; this run used a "
+                            "cloud pod (gone after training). Re-run on a VM."))
+    repo = (body.repo or "").strip()
+    if not repo:
+        raise HTTPException(status_code=400, detail="a target repo (org/name) is required")
+    token = await _hf_token_for_storage(body.storage_id, session)
+    if not token:
+        token = (await _resolve_global_env()).get("HF_TOKEN")
+    if not token:
+        raise HTTPException(status_code=400, detail=("no Hugging Face token — pick a HuggingFace storage "
+                            "or set HF_TOKEN in Secrets"))
+    creds = _s3_creds_from_storage(await session.get(Storage, row.storage_id) if row.storage_id else None)
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
+    cfg = dict(row.config_json or {})
+    private = bool(body.private)
+    redis = request.app.state.redis
+
+    # Re-click supersedes a stuck push (the orphaned upload just finishes + is discarded).
+    prev = _active_hf_exports.pop(run_id, None)
+    if prev is not None and not prev.done():
+        prev.cancel()
+        await _push_log(redis, run_id, "[gateway] HF export: superseded by a new request — restarting")
+    await _set_hf_export_state(run_id, {"status": "running", "repo": repo, "url": None, "error": None})
+
+    async def _bg() -> None:
+        # Stream the VM-side download/upload lines to the run's logs (the script runs
+        # in a thread; it appends to this buffer and an async pump mirrors to Redis)
+        # so a multi-minute push isn't silent.
+        export_lines: list[str] = []
+        _sent = {"n": 0}
+
+        async def _pump() -> None:
+            while True:
+                await asyncio.sleep(0.5)
+                while _sent["n"] < len(export_lines):
+                    await _push_log(redis, run_id, export_lines[_sent["n"]])
+                    _sent["n"] += 1
+
+        pump_task = asyncio.create_task(_pump())
+        try:
+            await _push_log(redis, run_id, f"[gateway] exporting best model to Hugging Face → {repo} …")
+            res = await asyncio.to_thread(
+                _run_hf_export_ssh, *ssh, run_id, model_s3, creds, repo, token, private, cfg,
+                export_lines.append)
+            async with session_factory()() as s:
+                r2 = await s.get(TrainingRun, run_id)
+                if r2 is not None:
+                    rj = dict(r2.result_json or {})
+                    rj["hf_export"] = {"status": "done", "repo": res.get("repo", repo), "url": res.get("url")}
+                    art = dict(rj.get("artifact") or {})
+                    art["hf_repo"] = res.get("repo", repo)
+                    rj["artifact"] = art
+                    r2.result_json = rj
+                    await s.commit()
+            await _push_log(redis, run_id, f"[gateway] pushed to Hugging Face: {res.get('url')}")
+        except asyncio.CancelledError:
+            await _push_log(redis, run_id, "[gateway] HF export: cancelled (superseded)")
+            raise
+        except Exception as e:  # noqa: BLE001
+            await _set_hf_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
+            await _push_log(redis, run_id, f"[gateway] HF export failed: {e}")
+        finally:
+            pump_task.cancel()
+            try:
+                await pump_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            while _sent["n"] < len(export_lines):
+                try:
+                    await _push_log(redis, run_id, export_lines[_sent["n"]])
+                except Exception:  # noqa: BLE001
+                    pass
+                _sent["n"] += 1
+            if _active_hf_exports.get(run_id) is asyncio.current_task():
+                _active_hf_exports.pop(run_id, None)
+
+    task = asyncio.create_task(_bg())
+    _active_hf_exports[run_id] = task
+    return {"status": "started"}
+
+
+@router.post("/{run_id}/hf-export/cancel")
+async def cancel_huggingface_export(
+    run_id: str,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stop a stuck/running HF export. Cancels the in-memory task AND kills the VM-side
+    download/upload process (it runs over SSH, outliving the task — and a gateway restart
+    leaves it orphaned with status stuck on "running"). Killing by the uniquely-named
+    per-run script is precise: it can't touch another run's export."""
+    row = await _owned(run_id, user, session)
+    redis = request.app.state.redis
+
+    # 1. Cancel the in-memory background task, if this gateway still owns one.
+    t = _active_hf_exports.pop(run_id, None)
+    if t is not None and not t.done():
+        t.cancel()
+
+    # 2. Kill the VM-side process by its unique script name (handles the orphaned case
+    #    where no in-memory task exists because the gateway restarted mid-push).
+    killed = False
+    ssh = await _resolve_run_ssh(row)
+    if ssh is not None:
+        host, port, suser, key = ssh
+        work_dir = ((row.config_json or {}).get("work_dir") or "/share").rstrip("/")
+
+        def _kill() -> bool:
+            cli = _ssh_connect(host, int(port), suser, key)
+            try:
+                out = _ssh_capture(
+                    cli,
+                    f"pkill -9 -f sgpu_hf_export_{run_id} 2>/dev/null; sleep 1; "
+                    f"if pgrep -f sgpu_hf_export_{run_id}.py >/dev/null; then echo ALIVE; else echo DEAD; fi; "
+                    f"rm -rf /tmp/sgpu_hf_export_{run_id}.* {work_dir}/sgpu-hf-export/{run_id} 2>/dev/null || true",
+                )
+                return "DEAD" in out
+            finally:
+                cli.close()
+
+        try:
+            killed = await asyncio.to_thread(_kill)
+        except Exception as e:  # noqa: BLE001
+            await _push_log(redis, run_id, f"[gateway] HF export: VM kill attempt failed: {e}")
+
+    await _set_hf_export_state(run_id, {"status": "cancelled", "error": "stopped by user"})
+    await _push_log(redis, run_id, "[gateway] HF export stopped by user.")
+    return {"status": "cancelled", "vm_process_killed": killed}
+
+
 @router.get("/{run_id}/metrics")
 async def training_metrics(
     run_id: str,
@@ -2660,6 +2898,110 @@ def _playground_status_ssh(host, port, user, key_filename, run_id, cfg, kind):
             pass
 
 
+# ---------- persistent NeuCodec decoder for a tts_packed DATASET ---------------
+# A small sibling of the run try-it server: keeps NeuCodec resident on a chosen VM
+# so each "play utt N" click on a packed dataset decodes that utterance's speech
+# codes straight to audio (no LM, no S3 model — NeuCodec is pulled from HF). Reuses
+# the same persistent-server machinery; only the cfg (kind=tts_decode, no model_s3)
+# and the dataset-scoped paths differ.
+
+
+def _dataset_decoder_paths(dataset_id: str, venv: str) -> dict:
+    v = (venv or "/share/autotrain-tts").rstrip("/")
+    return {
+        "sock": f"/tmp/sgpu_dsdec_{dataset_id}.sock",
+        "ready": f"/tmp/sgpu_dsdec_{dataset_id}.sock.ready",
+        "pid": f"/tmp/sgpu_dsdec_{dataset_id}.pid",
+        "log": f"/tmp/sgpu_dsdec_{dataset_id}.server.log",
+        "cfg": f"/tmp/sgpu_dsdec_{dataset_id}.server.json",
+        "venv": v,
+        "py": f"{v}/bin/python",
+    }
+
+
+def dataset_decoder_start_ssh(host, port, user, key_filename, dataset_id, venv,
+                              gpu=None, idle_timeout=600, env_vars=None):
+    """Launch the persistent NeuCodec decoder on the VM (nohup, own session); idle
+    auto-unload after idle_timeout s. Returns the status after launch (loading)."""
+    import shlex
+    import tempfile
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        paths = _dataset_decoder_paths(dataset_id, venv)
+        st = _persistent_status(cli, paths)
+        if st["running"]:
+            return st
+        base = _trainer_script_path().parent
+        _ssh_put(cli, str(base / "tryit_server.py"), "/tmp/sgpu_tryit_server.py")
+        _ssh_put(cli, str(base / "tryit_client.py"), "/tmp/sgpu_tryit_client.py")
+        sconf = {"kind": "tts_decode", "sock": paths["sock"], "gpu": gpu or "auto",
+                 "idle_timeout": idle_timeout, "pid": paths["pid"]}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(sconf)); local_cfg = f.name
+        try:
+            _ssh_put(cli, local_cfg, paths["cfg"])
+        finally:
+            try:
+                os.unlink(local_cfg)
+            except OSError:
+                pass
+        user_env = _render_env_exports(env_vars or {})
+        cmd = (f'{user_env}rm -f {paths["ready"]}; PY="{paths["py"]}"; '
+               f'if [ ! -x "$PY" ]; then echo "venv python not found at $PY — the TTS venv ({venv}) must exist on this box" > {paths["log"]}; exit 1; fi; '
+               f'setsid nohup "$PY" -u /tmp/sgpu_tryit_server.py --config {shlex.quote(paths["cfg"])} '
+               f'> {paths["log"]} 2>&1 & echo $! > {paths["pid"]}; sleep 0.3; cat {paths["pid"]}')
+        _ssh_capture(cli, cmd)
+        return _persistent_status(cli, paths)
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def dataset_decoder_status_ssh(host, port, user, key_filename, dataset_id, venv):
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        return _persistent_status(cli, _dataset_decoder_paths(dataset_id, venv))
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def dataset_decoder_decode_ssh(host, port, user, key_filename, dataset_id, venv, text):
+    """Send one utterance's text (with its <|s_N|> codes) to the resident decoder
+    and return its {wav_b64, sample_rate, …} response."""
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        resp, _tail = _persistent_request(cli, _dataset_decoder_paths(dataset_id, venv), {"text": text})
+        return resp
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def dataset_decoder_stop_ssh(host, port, user, key_filename, dataset_id, venv):
+    import shlex
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        paths = _dataset_decoder_paths(dataset_id, venv)
+        cmd = (f'P="$(cat {paths["pid"]} 2>/dev/null)"; '
+               f'if [ -n "$P" ]; then kill -TERM -"$P" 2>/dev/null || kill -TERM "$P" 2>/dev/null; sleep 1; '
+               f'kill -KILL -"$P" 2>/dev/null || true; fi; '
+               f'rm -f {paths["sock"]} {paths["ready"]} {paths["pid"]}; echo stopped')
+        _ssh_capture(cli, cmd)
+        return {"running": False, "ready": False}
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
                         run_id: str, model_s3: str, creds: dict, audio: bytes,
                         filename: str, cfg: dict, gpu: Optional[str] = None) -> tuple[str, Optional[str]]:
@@ -3039,6 +3381,84 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
             tail = "\n".join(out["lines"][-15:])
             raise RuntimeError(f"label export produced no manifest (rc={rc}):\n{tail}")
         return out["manifest"]
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _run_hf_export_ssh(host: str, port: int, user: str, key_filename: str,
+                       run_id: str, model_s3: str, creds: dict, repo: str,
+                       token: str, private: bool, cfg: dict, line_sink=None) -> dict:
+    """SSH to the run's VM, ship hf_export.py, download the model from S3 + push it
+    to a Hugging Face repo, and return the parsed @@HF {repo, url}. Blocking — call
+    via to_thread. `line_sink(str)` (if given) gets every VM-side line so the caller
+    can stream the multi-minute download/upload to the run's logs (else it looks
+    stuck)."""
+    import tempfile
+
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        remote_py = f"/tmp/sgpu_hf_export_{run_id}.py"
+        remote_cfg = f"/tmp/sgpu_hf_export_{run_id}.json"
+        _ssh_put(cli, str(base / "hf_export.py"), remote_py)
+        work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
+        tconf = {
+            "model_s3": model_s3,
+            "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+            "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+            "model_dir": f"{work_dir}/sgpu-hf-export/{run_id}/model",
+            "repo": repo, "token": token, "private": bool(private),
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(tconf))
+            local_cfg = f.name
+        try:
+            _ssh_put(cli, local_cfg, remote_cfg)
+        finally:
+            try:
+                os.unlink(local_cfg)
+            except OSError:
+                pass
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        venv = (cfg.get("venv_path") or "/share/autotrain-tts").rstrip("/")
+        py = f"{venv}/bin/python"
+        out: dict = {"result": None, "error": None, "lines": []}
+
+        def on_line(line: str) -> None:
+            j = line.find("@@HF ")
+            if j < 0:
+                if line_sink is not None:
+                    try:
+                        line_sink(line)  # stream download/upload progress to the run's logs
+                    except Exception:  # noqa: BLE001
+                        pass
+                if len(out["lines"]) < 400:
+                    out["lines"].append(line)
+                return
+            try:
+                obj = json.loads(line[j + len("@@HF "):])
+            except Exception:  # noqa: BLE001
+                return
+            if obj.get("error"):
+                out["error"] = obj["error"]
+            else:
+                out["result"] = obj
+
+        # 2>&1 merges the HF upload's progress bars (stderr) into the stream so they
+        # show in the logs too, alongside the script's own download/upload lines.
+        cmd = (f'{user_env}PY="{py}"; '
+               f'if [ ! -x "$PY" ]; then echo "venv python not found at $PY — train this run first"; exit 1; fi; '
+               f'"$PY" -u {remote_py} --config {remote_cfg} 2>&1; rm -f {remote_py} {remote_cfg}')
+        rc = _ssh_run_stream(cli, cmd, on_line)
+        if out["error"]:
+            raise RuntimeError(out["error"])
+        if not out["result"]:
+            tail = "\n".join(out["lines"][-15:])
+            raise RuntimeError(f"HF export produced no result (rc={rc}):\n{tail}")
+        return out["result"]
     finally:
         try:
             cli.close()

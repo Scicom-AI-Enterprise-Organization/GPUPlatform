@@ -46,9 +46,7 @@ export default async function DatasetsPage({
             <h1 className="text-2xl font-semibold tracking-tight">Datasets</h1>
             <p className="mt-1 text-sm text-muted-foreground">
               Register <span className="font-mono text-xs">{`{audio, transcription}`}</span>{" "}
-              datasets for Autotrain. Upload a CSV / JSON / JSONL metadata file to
-              a storage backend, preview the rows with inline audio, and push to a
-              HuggingFace dataset repo.
+              datasets for Autotrain — upload metadata to storage, preview rows with inline audio, sync to HuggingFace.
             </p>
           </div>
           {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}

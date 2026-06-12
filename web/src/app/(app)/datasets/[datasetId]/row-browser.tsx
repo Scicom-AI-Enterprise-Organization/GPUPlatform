@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Mic, Volume2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Mic, Play, Volume2 } from "lucide-react";
+import type { DecoderState } from "./decoder-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -154,11 +155,13 @@ function PackedRowItem({
   index,
   row,
   split,
+  decoder,
 }: {
   datasetId: string;
   index: number;
   row: DatasetPreviewRow;
   split?: string | null;
+  decoder?: DecoderState | null;
 }) {
   const [open, setOpen] = useState(false);
   const [data, setData] = useState<PackedDecode | null>(null);
@@ -166,6 +169,34 @@ function PackedRowItem({
   const [err, setErr] = useState<string | null>(null);
   const tokens = typeof row.tokens === "number" ? row.tokens : undefined;
   const utts = typeof row.utterances === "number" ? row.utterances : undefined;
+  // Per-utterance audio decode (NeuCodec on the resident decoder). `decoding` is
+  // the utterance index currently being decoded; `audioUrls` holds each decoded
+  // clip as a data: URL so it gets a full WaveformPlayer (like an audio dataset).
+  const [decoding, setDecoding] = useState<number | null>(null);
+  const [audioUrls, setAudioUrls] = useState<Record<number, string>>({});
+  const [playErr, setPlayErr] = useState<string | null>(null);
+
+  async function decodeUtt(j: number) {
+    if (!decoder?.ready) return;
+    setDecoding(j);
+    setPlayErr(null);
+    try {
+      const r = await fetch(`/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/decoder/decode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider_id: decoder.providerId, index, utt: j, split: split ?? null }),
+      });
+      const audioJson = await r.json();
+      if (!r.ok || !audioJson?.wav_b64) {
+        throw new Error((audioJson && (audioJson.detail || audioJson.error)) || `decode failed (${r.status})`);
+      }
+      setAudioUrls((m) => ({ ...m, [j]: `data:audio/wav;base64,${audioJson.wav_b64}` }));
+    } catch (e) {
+      setPlayErr(`utt ${j + 1}: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDecoding(null);
+    }
+  }
 
   async function toggle() {
     const next = !open;
@@ -218,11 +249,30 @@ function PackedRowItem({
               <ol className="space-y-1.5">
                 {data.utterances.map((u, j) => (
                   <li key={j} className="rounded border border-border/60 bg-muted/30 p-2">
-                    <div className="mb-0.5 font-mono text-[10px] text-muted-foreground">utt {j + 1} · {u.tokens} tokens</div>
+                    <div className="mb-0.5 flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
+                      {decoder?.ready && (
+                        <button
+                          type="button"
+                          onClick={() => decodeUtt(j)}
+                          disabled={decoding !== null}
+                          title={audioUrls[j] ? "Re-decode this utterance" : "Decode this utterance to audio"}
+                          className="inline-flex h-5 w-5 items-center justify-center rounded text-primary hover:bg-primary/10 disabled:opacity-50"
+                        >
+                          {decoding === j ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
+                        </button>
+                      )}
+                      <span>utt {j + 1} · {u.tokens} tokens</span>
+                    </div>
                     <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed scrollbar-thin">{u.text}</pre>
+                    {audioUrls[j] && (
+                      <div className="mt-2">
+                        <WaveformPlayer key={audioUrls[j]} src={audioUrls[j]} />
+                      </div>
+                    )}
                   </li>
                 ))}
               </ol>
+              {playErr && <p className="text-destructive">{playErr}</p>}
             </>
           )}
         </div>
@@ -240,10 +290,12 @@ export function RowBrowser({
   datasetId,
   initial,
   speakerField,
+  decoder,
 }: {
   datasetId: string;
   initial: DatasetPreview;
   speakerField?: string | null;
+  decoder?: DecoderState | null;
 }) {
   const [limit, setLimit] = useState(initial.limit && initial.limit > 0 ? initial.limit : 20);
   const [offset, setOffset] = useState(initial.offset ?? 0);
@@ -448,7 +500,7 @@ export function RowBrowser({
             )}
             {rows.map((r, i) =>
               r.packed === true ? (
-                <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} split={split} />
+                <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} split={split} decoder={decoder} />
               ) : (
                 <RowItem key={offset + i} index={offset + i} row={r} onToggle={setIncluded} speakerField={speakerField} />
               ),

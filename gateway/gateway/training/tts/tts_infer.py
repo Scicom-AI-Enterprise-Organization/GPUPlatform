@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 _SPEECH_TOK = re.compile(r"<\|s_(\d+)\|>")
@@ -85,8 +86,22 @@ def _download_model(cfg: dict) -> str:
             fp = os.path.join(dest, rel)
             os.makedirs(os.path.dirname(fp) or dest, exist_ok=True)
             if not (os.path.exists(fp) and os.path.getsize(fp) == obj["Size"]):
-                log(f"  ↓ {rel} ({obj['Size'] / 1e6:.0f} MB)")
-                cli.download_file(bucket, key, fp)
+                size = int(obj["Size"])
+                log(f"  ↓ {rel} ({size / 1e6:.0f} MB)")
+                if size > 200 * 1e6:  # big shard → stream in-file % (else minutes of silence)
+                    prog = {"b": 0, "next": 0.2}
+                    lk = threading.Lock()
+
+                    def _cb(chunk: int, _rel=rel, _size=size, _p=prog, _lk=lk) -> None:
+                        with _lk:
+                            _p["b"] += chunk
+                            frac = _p["b"] / max(_size, 1)
+                            if frac >= _p["next"] and frac < 1.0:
+                                log(f"      {_rel}: {frac * 100:.0f}%  ({_p['b'] / 1e6:.0f}/{_size / 1e6:.0f} MB)")
+                                _p["next"] += 0.2
+                    cli.download_file(bucket, key, fp, Callback=_cb)
+                else:
+                    cli.download_file(bucket, key, fp)
                 fetched += 1
             n += 1
             total += obj["Size"]

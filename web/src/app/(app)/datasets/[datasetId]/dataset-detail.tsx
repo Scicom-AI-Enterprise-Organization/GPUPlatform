@@ -10,6 +10,7 @@ import { DeleteButton } from "./delete-button";
 import { ColumnsCard } from "./columns-card";
 import { TransformationCard } from "./transformation-card";
 import { RowBrowser } from "./row-browser";
+import { DecoderCard, type DecoderState } from "./decoder-card";
 import { UploadCard } from "./upload-card";
 import { SyncCard } from "./sync-card";
 import { DatasetFilesCard } from "./files-card";
@@ -97,12 +98,25 @@ export function DatasetDetail({
   const [tab, setTabState] = useState(() =>
     initialView && valid.includes(initialView) ? initialView : defaultTab,
   );
+  // Persistent NeuCodec decoder state (packed datasets) — set by DecoderCard when
+  // a decoder is loaded + ready, so the row browser knows where to send decode calls.
+  const [decoder, setDecoder] = useState<DecoderState | null>(null);
   const setTab = (v: string) => {
     setTabState(v);
     if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
     params.set("view", v);
     window.history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
+  };
+  // Href for each tab so right/middle/⌘-click opens it in a new browser tab. Built
+  // from props (not window) so it's SSR-stable — no hydration mismatch — and keeps
+  // the current split. A plain left-click is intercepted → in-place setTab (no
+  // server re-fetch of the dataset/preview).
+  const viewHref = (v: string) => {
+    const params = new URLSearchParams();
+    if (initialSplit) params.set("split", initialSplit);
+    params.set("view", v);
+    return `?${params.toString()}`;
   };
 
   // The HF repo this dataset lives at, or — for a transformed dataset — the
@@ -155,8 +169,19 @@ export function DatasetDetail({
         <Tabs value={tab} onValueChange={setTab} className="mt-4">
           <TabsList variant="line" className="bg-transparent">
             {tabs.map((t) => (
-              <TabsTrigger key={t.value} value={t.value}>
-                {t.label}
+              <TabsTrigger key={t.value} value={t.value} asChild>
+                <a
+                  href={viewHref(t.value)}
+                  onClick={(e) => {
+                    // Modifier/middle clicks → let the browser open a new tab;
+                    // plain left-click switches in place (no server re-fetch).
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                    e.preventDefault();
+                    setTab(t.value);
+                  }}
+                >
+                  {t.label}
+                </a>
               </TabsTrigger>
             ))}
           </TabsList>
@@ -166,8 +191,16 @@ export function DatasetDetail({
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         <Tabs value={tab} onValueChange={setTab} className="!block">
           {showRows && preview && (
-            <TabsContent value="rows" className="!flex-none">
-              <RowBrowser datasetId={dataset.id} initial={preview} speakerField={dataset.speaker_field} />
+            <TabsContent value="rows" className="!flex-none space-y-4">
+              {dataset.kind === "tts_packed" && (
+                <DecoderCard datasetId={dataset.id} onState={setDecoder} />
+              )}
+              <RowBrowser
+                datasetId={dataset.id}
+                initial={preview}
+                speakerField={dataset.speaker_field}
+                decoder={decoder}
+              />
             </TabsContent>
           )}
 

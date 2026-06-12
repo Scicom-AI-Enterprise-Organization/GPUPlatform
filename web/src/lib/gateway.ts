@@ -326,6 +326,25 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/label-export`,
       { method: "POST", body: JSON.stringify(body) },
     ),
+  /** Push a finished run's best/final model to a Hugging Face repo. Token comes
+   * from the selected kind=huggingface storage (or the platform HF_TOKEN). Runs in
+   * the background; status + link land in result_json.hf_export. */
+  exportToHuggingFace: (
+    id: string,
+    body: { repo: string; storage_id?: string | null; private?: boolean },
+  ) =>
+    request<{ status: string }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/hf-export`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  /** Stop a stuck/running HF export: cancels the gateway task and kills the VM-side
+   * download/upload process. Use when an export looks stuck (or was orphaned by a
+   * gateway restart, which leaves the status pinned at "running"). */
+  cancelHuggingFaceExport: (id: string) =>
+    request<{ status: string; vm_process_killed?: boolean }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/hf-export/cancel`,
+      { method: "POST" },
+    ),
   /** Clone a run's config into a fresh queued run and launch it. */
   restartTrainingRun: (id: string) =>
     request<TrainingRunRecord>(

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { AudioLines, Check, ChevronDown, Copy, Download, ExternalLink, Loader2, Pencil, RotateCcw, Trash2, Upload, X, XCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -43,7 +44,7 @@ import { formatCostUSD, formatRateUSD, useLiveCost } from "@/lib/cost";
 import { BurnFlame } from "@/components/burn-flame";
 import { JsonView } from "@/components/json-view";
 import { cn } from "@/lib/utils";
-import type { DatasetRecord, GlobalEnvRecord, TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
+import type { DatasetRecord, GlobalEnvRecord, StorageRecord, TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
 
 // Distinct colours for per-trial sweep loss curves.
 const TRIAL_COLORS = ["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9", "#ec4899", "#84cc16"];
@@ -137,13 +138,23 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const [run, setRun] = useState<TrainingRunRecord>(initial);
   const [busy, setBusy] = useState(false);
   const terminal = ["done", "failed", "cancelled"].includes(run.status);
-  // A post-train Label export is running in the background — the run itself is
-  // already "done", so show "exporting to Label" instead and keep polling.
-  const exporting = run.result_json?.label_export?.status === "running";
+  // A post-train Label export OR a Hugging Face push is running in the background —
+  // the run itself is already "done", so keep polling so the status/link refresh.
+  const exportingLabel =
+    run.result_json?.hf_export?.status === "running" ? "exporting to HF"
+    : run.result_json?.label_export?.status === "running" ? "exporting to Label"
+    : null;
+  const exporting = exportingLabel != null;
 
   // Tab reflected in the URL (?tab=…) so it's deep-linkable + survives refresh.
   const tab = searchParams.get("tab") || "metrics";
-  const onTab = (v: string) => router.replace(`${pathname}?tab=${v}`, { scroll: false });
+  // Each tab trigger is a real <Link> (so right/middle/⌘-click opens it in a new
+  // tab); a plain click still switches in place because `tab` derives from the URL.
+  const tabHref = (v: string) => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("tab", v);
+    return `${pathname}?${params.toString()}`;
+  };
 
   // Live per-GPU utilisation (only the run's GPUs) — poll while running.
   const [gpus, setGpus] = useState<TrainingGpu[]>([]);
@@ -332,6 +343,56 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     }
   }
 
+  // On-demand "Export to Hugging Face" — pushes the run's best/final model to a HF
+  // repo, with the token taken from a selected kind=huggingface storage.
+  const [hfOpen, setHfOpen] = useState(false);
+  const [hfStorages, setHfStorages] = useState<StorageRecord[]>([]);
+  const [hfStorageId, setHfStorageId] = useState("");
+  const [hfRepo, setHfRepo] = useState(typeof lcfg.hf_push_repo === "string" ? lcfg.hf_push_repo : "");
+  const [hfPrivate, setHfPrivate] = useState(true);  // default private
+  const [hfBusy, setHfBusy] = useState(false);
+  const [hfErr, setHfErr] = useState<string | null>(null);
+  const [hfDone, setHfDone] = useState(false);
+
+  useEffect(() => {
+    if (!hfOpen || hfStorages.length) return;
+    gateway
+      .listStorage()
+      .then((rows) => setHfStorages(rows.filter((s) => s.kind === "huggingface")))
+      .catch(() => {});
+  }, [hfOpen, hfStorages.length]);
+
+  async function submitHfExport() {
+    setHfBusy(true);
+    setHfErr(null);
+    try {
+      await gateway.exportToHuggingFace(run.id, {
+        repo: hfRepo.trim(),
+        storage_id: hfStorageId || null,
+        private: hfPrivate,
+      });
+      setHfDone(true);
+    } catch (e) {
+      setHfErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setHfBusy(false);
+    }
+  }
+
+  // Stop a stuck/running HF export (also kills the VM-side process; clears a status
+  // left stuck on "running" by a gateway restart).
+  const [hfStopping, setHfStopping] = useState(false);
+  async function stopHfExport() {
+    setHfStopping(true);
+    try {
+      await gateway.cancelHuggingFaceExport(run.id);
+    } catch {
+      // best-effort; the next poll reflects the real state
+    } finally {
+      setHfStopping(false);
+    }
+  }
+
   function onTerminate() {
     setConfirmError(null);
     setConfirmOpts({
@@ -442,7 +503,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
             )}
             {exporting ? (
               <Badge variant="outline" className={STATUS_STYLES.running}>
-                <Loader2 className="mr-1 h-3 w-3 animate-spin" /> exporting to Label
+                <Loader2 className="mr-1 h-3 w-3 animate-spin" /> {exportingLabel}
               </Badge>
             ) : (
               <Badge variant="outline" className={STATUS_STYLES[run.status] ?? ""}>{run.status}</Badge>
@@ -490,6 +551,16 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               <Upload className="h-4 w-4" /> Export to Label
             </Button>
           )}
+          {canTryIt && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => { setHfErr(null); setHfDone(false); setHfOpen(true); }}
+              title="Push the best/final model to a Hugging Face repo"
+            >
+              <Upload className="h-4 w-4" /> Export to HF
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={onDelete} disabled={busy}>
             <Trash2 className="h-4 w-4" /> Delete
           </Button>
@@ -497,7 +568,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       </div>
 
         <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-5">
-          <Kpi label="Status" value={exporting ? "exporting to Label" : run.status} />
+          <Kpi label="Status" value={exporting ? exportingLabel! : run.status} />
           <Kpi
             label="GPU"
             value={run.gpu_type ? `${run.gpu_type}${run.gpu_count > 1 ? ` ×${run.gpu_count}` : ""}` : "—"}
@@ -510,13 +581,13 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           {isSweep && <Kpi label="Trials" value={String(trials.length)} />}
         </div>
 
-        <Tabs value={tab} onValueChange={onTab} className="mt-4">
+        <Tabs value={tab} className="mt-4">
           <TabsList variant="line" className="bg-transparent">
-            <TabsTrigger value="metrics">Metrics</TabsTrigger>
-            <TabsTrigger value="logs">Logs</TabsTrigger>
-            <TabsTrigger value="files">Files</TabsTrigger>
-            <TabsTrigger value="config">Config</TabsTrigger>
-            {canTryIt && <TabsTrigger value="tryit">Try it</TabsTrigger>}
+            <TabsTrigger value="metrics" asChild><Link href={tabHref("metrics")} scroll={false}>Metrics</Link></TabsTrigger>
+            <TabsTrigger value="logs" asChild><Link href={tabHref("logs")} scroll={false}>Logs</Link></TabsTrigger>
+            <TabsTrigger value="files" asChild><Link href={tabHref("files")} scroll={false}>Files</Link></TabsTrigger>
+            <TabsTrigger value="config" asChild><Link href={tabHref("config")} scroll={false}>Config</Link></TabsTrigger>
+            {canTryIt && <TabsTrigger value="tryit" asChild><Link href={tabHref("tryit")} scroll={false}>Try it</Link></TabsTrigger>}
           </TabsList>
         </Tabs>
       </div>
@@ -589,6 +660,46 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </Card>
       )}
 
+      {run.result_json?.hf_export && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">Hugging Face export</CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
+            {run.result_json.hf_export.status === "running" && (
+              <>
+                <span className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> pushing {run.result_json.hf_export.repo} …
+                </span>
+                <Button variant="outline" size="sm" onClick={stopHfExport} disabled={hfStopping}>
+                  {hfStopping ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}
+                  Stop
+                </Button>
+              </>
+            )}
+            {run.result_json.hf_export.status === "cancelled" && (
+              <span className="flex items-center gap-x-3 text-muted-foreground">
+                push stopped{run.result_json.hf_export.error ? ` — ${run.result_json.hf_export.error}` : ""}
+              </span>
+            )}
+            {run.result_json.hf_export.status === "done" && run.result_json.hf_export.url && (
+              <a
+                href={run.result_json.hf_export.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 font-medium text-primary hover:underline"
+              >
+                Open on Hugging Face — {run.result_json.hf_export.repo}
+                <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+            )}
+            {run.result_json.hf_export.status === "failed" && (
+              <span className="text-destructive">push failed: {run.result_json.hf_export.error}</span>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       {isSweep && (
         <Card>
           <CardHeader className="pb-2">
@@ -636,7 +747,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       )}
       </div>)}
 
-      <Tabs value={tab} onValueChange={onTab} className="!block">
+      <Tabs value={tab} className="!block">
         <TabsContent value="metrics" className="!flex-none space-y-4">
           {!packOnly && <LossCurve steps={steps} epochs={epochs} live={!terminal} sweep={isSweep} trials={trials} />}
           <EvalCurve epochs={epochs} sweep={isSweep} trials={trials} />
@@ -873,6 +984,65 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               <Button onClick={submitLabelExport} disabled={labelBusy || !labelUrlOk || !labelTokenOk}>
                 {labelBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
                 Start export
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={hfOpen} onOpenChange={(o) => { if (!hfBusy) setHfOpen(o); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Export to Hugging Face</DialogTitle>
+            <DialogDescription>
+              Push this run&apos;s <span className="font-medium">best (final) checkpoint</span> to a Hugging Face
+              model repo. Runs in the background — watch the Logs tab; the link appears on this page when it finishes.
+            </DialogDescription>
+          </DialogHeader>
+          {hfDone ? (
+            <p className="flex items-center gap-2 py-2 text-sm text-emerald-600 dark:text-emerald-400">
+              <Check className="h-4 w-4" /> Push started — the model downloads from S3 then uploads to HF; the
+              status shows “pushing to Hugging Face” and an “Open on HF” link appears on this page when done.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <label className="text-xs uppercase tracking-wide text-muted-foreground">Repo name</label>
+                <Input className="font-mono" value={hfRepo} placeholder="org/model-name"
+                  onChange={(e) => setHfRepo(e.target.value)} />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs uppercase tracking-wide text-muted-foreground">Hugging Face storage</label>
+                <Select value={hfStorageId} onValueChange={setHfStorageId}>
+                  <SelectTrigger>
+                    <SelectValue placeholder={hfStorages.length ? "Choose a HuggingFace storage" : "None configured"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {hfStorages.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">
+                  Its token is used to push.{hfStorages.length === 0 ? " No HuggingFace storage configured — the platform HF_TOKEN secret is used instead, if set." : ""}
+                </p>
+              </div>
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={hfPrivate} onChange={(e) => setHfPrivate(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span>Private repo</span>
+              </label>
+            </div>
+          )}
+          <DialogFooter>
+            {hfErr && <p className="mr-auto text-sm text-destructive">{hfErr}</p>}
+            <Button variant="outline" onClick={() => setHfOpen(false)} disabled={hfBusy}>
+              {hfDone ? "Close" : "Cancel"}
+            </Button>
+            {!hfDone && (
+              <Button onClick={submitHfExport} disabled={hfBusy || !hfRepo.trim()}>
+                {hfBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                Push to HF
               </Button>
             )}
           </DialogFooter>
