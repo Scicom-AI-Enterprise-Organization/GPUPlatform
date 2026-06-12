@@ -190,6 +190,7 @@ const PERIODS = [
   { value: "7d", label: "Last 7 Days" },
   { value: "thisMonth", label: "This Month" },
   { value: "lastMonth", label: "Last Month" },
+  { value: "custom", label: "Custom range" },
 ] as const;
 type Period = (typeof PERIODS)[number]["value"];
 
@@ -226,9 +227,21 @@ const KIND_TO_APP: Record<string, string> = {
   compute: "compute",
 };
 
-function periodRange(period: Period): { from: Date; to: Date } {
+function periodRange(
+  period: Period,
+  custom?: { from: string; to: string },
+): { from: Date; to: Date } {
   const now = new Date();
   const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  if (period === "custom") {
+    const parse = (s: string) => {
+      const [y, m, d] = s.split("-").map(Number);
+      return new Date(y, (m ?? 1) - 1, d ?? 1);
+    };
+    const from = custom?.from ? startOfDay(parse(custom.from)) : startOfDay(new Date(now.getTime() - 6 * 86400 * 1000));
+    const to = custom?.to ? new Date(parse(custom.to).getFullYear(), parse(custom.to).getMonth(), parse(custom.to).getDate(), 23, 59, 59) : now;
+    return { from, to };
+  }
   if (period === "7d") {
     const from = startOfDay(new Date(now.getTime() - 6 * 86400 * 1000));
     return { from, to: now };
@@ -641,6 +654,10 @@ type SortKey =
 
 export function AnalyticsView() {
   const [period, setPeriod] = useState<Period>("7d");
+  const todayStr = localDate(new Date());
+  const weekAgoStr = localDate(new Date(Date.now() - 6 * 86400 * 1000));
+  const [customFrom, setCustomFrom] = useState<string>(weekAgoStr);
+  const [customTo, setCustomTo] = useState<string>(todayStr);
   const [platforms, setPlatforms] = useState<Set<string>>(
     new Set(["gpuplatform", "slurmui"]),
   );
@@ -674,7 +691,10 @@ export function AnalyticsView() {
   const [detailRec, setDetailRec] = useState<Rec | null>(null);
   const PAGE_SIZE = 50;
 
-  const { from, to } = useMemo(() => periodRange(period), [period]);
+  const { from, to } = useMemo(
+    () => periodRange(period, { from: customFrom, to: customTo }),
+    [period, customFrom, customTo],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1233,6 +1253,26 @@ export function AnalyticsView() {
           <Button variant="outline" size="sm" onClick={exportCsv} disabled={loading}>
             <Download className="mr-1.5 h-3.5 w-3.5" /> Export CSV
           </Button>
+          {period === "custom" && (
+            <div className="flex items-center gap-1.5">
+              <input
+                type="date"
+                value={customFrom}
+                max={customTo || todayStr}
+                onChange={(e) => setCustomFrom(e.target.value)}
+                className="h-8 rounded-md border bg-background px-2 text-xs text-foreground"
+              />
+              <span className="text-xs text-muted-foreground">to</span>
+              <input
+                type="date"
+                value={customTo}
+                min={customFrom}
+                max={todayStr}
+                onChange={(e) => setCustomTo(e.target.value)}
+                className="h-8 rounded-md border bg-background px-2 text-xs text-foreground"
+              />
+            </div>
+          )}
           <Select value={period} onValueChange={(v) => setPeriod(v as Period)}>
             <SelectTrigger className="w-[150px]" size="sm">
               <SelectValue />
