@@ -2359,6 +2359,67 @@ async def list_worker_events(
     }
 
 
+@app.get("/admin/worker-events")
+async def admin_list_worker_events(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    app_id: Optional[str] = None,
+    limit: int = 5000,
+):
+    """Cross-endpoint worker lifecycle feed for the admin GPU Timeline. Same
+    durable `worker_events` rows as the per-app endpoint, but spanning every
+    inference endpoint so the analytics page can lay out on/off spans per
+    endpoint/worker. Admin only. `since`/`until` accept ISO-8601 or unix epoch;
+    rows come back oldest-first."""
+    from sqlalchemy import select, and_
+    if limit < 1 or limit > 20000:
+        raise HTTPException(status_code=400, detail="limit must be 1..20000")
+
+    def _parse_ts(v: str) -> datetime:
+        v = v.strip()
+        try:
+            return datetime.fromtimestamp(float(v), tz=timezone.utc)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"bad timestamp: {v!r}")
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    conds = []
+    if app_id:
+        conds.append(WorkerEvent.app_id == app_id)
+    if since:
+        conds.append(WorkerEvent.created_at >= _parse_ts(since))
+    if until:
+        conds.append(WorkerEvent.created_at <= _parse_ts(until))
+    stmt = select(WorkerEvent)
+    if conds:
+        stmt = stmt.where(and_(*conds))
+    stmt = stmt.order_by(WorkerEvent.created_at.desc()).limit(limit)
+    rows = list((await session.execute(stmt)).scalars().all())
+    rows.reverse()
+    return {
+        "count": len(rows),
+        "events": [
+            {
+                "id": r.id,
+                "app_id": r.app_id,
+                "machine_id": r.machine_id,
+                "event": r.event,
+                "level": r.level,
+                "message": r.message,
+                "actor": r.actor_username,
+                "ts": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
 # ── Stress-test run history: persisted per endpoint so runs / models can be
 # compared and the comparison shared by link. Access mirrors the endpoint
 # (owner/admin via _load_owned_app), so a shared link works for anyone who can

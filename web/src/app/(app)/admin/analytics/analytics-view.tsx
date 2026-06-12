@@ -632,6 +632,70 @@ const fmtTime = (d: Date | null): string =>
     ? `${localDate(d)} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`
     : "—";
 
+// ── GPU Timeline (inference worker on/off spans) ─────────────────────────────
+// Raw durable worker lifecycle events from /admin/worker-events, paired into
+// serving spans per worker so the timeline can draw one bar per worker life.
+type WorkerEvt = {
+  app_id: string;
+  machine_id: string;
+  event: string;
+  level: string;
+  message: string | null;
+  actor: string | null;
+  ts: string; // ISO
+};
+type WorkerSpan = {
+  mid: string;
+  start: number; // epoch ms
+  end: number | null; // null = still serving (no terminate event seen)
+  endReason: string | null; // event key that closed the span
+  actor: string | null; // who triggered the teardown (or brought it up)
+  running: boolean;
+};
+type GpuTimelineRow = { app: string; spans: WorkerSpan[] };
+
+const WORKER_ON = new Set(["provisioned", "registered", "scaled_up"]);
+const WORKER_OFF = new Set(["terminated", "idle_terminated", "terminate_failed"]);
+
+/** Group raw events by endpoint → worker, then collapse each worker's events
+ *  into a single [first on → last off] serving span. A worker with no off event
+ *  in the window is treated as still running (open-ended). */
+function buildGpuTimeline(events: WorkerEvt[]): GpuTimelineRow[] {
+  const byApp = new Map<string, Map<string, WorkerEvt[]>>();
+  for (const ev of events) {
+    if (!byApp.has(ev.app_id)) byApp.set(ev.app_id, new Map());
+    const machines = byApp.get(ev.app_id)!;
+    if (!machines.has(ev.machine_id)) machines.set(ev.machine_id, []);
+    machines.get(ev.machine_id)!.push(ev);
+  }
+  const rows: GpuTimelineRow[] = [];
+  for (const [app, machines] of byApp) {
+    const spans: WorkerSpan[] = [];
+    for (const [mid, evs] of machines) {
+      evs.sort((a, b) => a.ts.localeCompare(b.ts));
+      const startEv = evs.find((e) => WORKER_ON.has(e.event)) ?? evs[0];
+      const offEv = [...evs].reverse().find((e) => WORKER_OFF.has(e.event)) ?? null;
+      spans.push({
+        mid,
+        start: new Date(startEv.ts).getTime(),
+        end: offEv ? new Date(offEv.ts).getTime() : null,
+        endReason: offEv?.event ?? null,
+        actor: offEv?.actor ?? startEv.actor ?? null,
+        running: !offEv,
+      });
+    }
+    spans.sort((a, b) => a.start - b.start);
+    rows.push({ app, spans });
+  }
+  // Endpoints with the most recent activity first.
+  rows.sort((a, b) => {
+    const la = Math.max(...a.spans.map((s) => s.end ?? s.start));
+    const lb = Math.max(...b.spans.map((s) => s.end ?? s.start));
+    return lb - la;
+  });
+  return rows;
+}
+
 const STATUS_COLOR = (s: string) =>
   /complet|succe|done|finish|stopped|created/.test(s)
     ? "text-emerald-600 dark:text-emerald-400"
@@ -683,6 +747,8 @@ export function AnalyticsView() {
   const [nowTs, setNowTs] = useState(0);
   const [slurmState, setSlurmState] = useState<"ok" | "unconfigured" | "error">("ok");
   const [truncated, setTruncated] = useState<string[]>([]);
+  // GPU Timeline: durable inference worker on/off events for the period.
+  const [workerEvents, setWorkerEvents] = useState<WorkerEvt[]>([]);
 
   // Jobs explorer state
   const [sortKey, setSortKey] = useState<SortKey>("start");
@@ -696,11 +762,13 @@ export function AnalyticsView() {
     [period, customFrom, customTo],
   );
 
+  const gpuTimeline = useMemo(() => buildGpuTimeline(workerEvents), [workerEvents]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setNowTs(Date.now());
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
-    const [gpu, slurm, aliasRes] = await Promise.allSettled([
+    const [gpu, slurm, aliasRes, workerEv] = await Promise.allSettled([
       fetch(
         `/api/analytics/gpuplatform?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}&tz=${encodeURIComponent(tz)}`,
         { cache: "no-store" },
@@ -712,7 +780,15 @@ export function AnalyticsView() {
       fetch("/api/analytics/aliases", { cache: "no-store" }).then(
         (r) => r.json() as Promise<{ aliases: SourceAlias[] | null }>,
       ),
+      fetch(
+        `/api/analytics/worker-events?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}`,
+        { cache: "no-store" },
+      ).then((r) => (r.ok ? (r.json() as Promise<{ events: WorkerEvt[] }>) : Promise.reject(r.status))),
     ]);
+
+    setWorkerEvents(
+      workerEv.status === "fulfilled" ? (workerEv.value.events ?? []) : [],
+    );
 
     if (aliasRes.status === "fulfilled" && aliasRes.value.aliases) {
       setAliases(aliasRes.value.aliases);
@@ -1597,6 +1673,7 @@ export function AnalyticsView() {
           <TabsTrigger value="jobs">Jobs</TabsTrigger>
           <TabsTrigger value="gpuhours">GPU hours</TabsTrigger>
           <TabsTrigger value="timeline">Node timeline</TabsTrigger>
+          <TabsTrigger value="gputimeline">GPU Timeline</TabsTrigger>
           <TabsTrigger value="nodes">Nodes</TabsTrigger>
         </TabsList>
 
@@ -1847,6 +1924,81 @@ export function AnalyticsView() {
                               }}
                               title={`${APP_LABEL(r.app)} · ${r.user}\n${fmtTime(r.start)} → ${fmtTime(r.end)} (${fmtDur(r.durationS)})\nGPU: ${r.gpuModel ?? "?"}${r.devices != null ? ` (devices ${r.devices})` : ""}\nstatus: ${r.status}`}
                               onClick={() => setDetailRec(r)}
+                            />
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+                <div className="flex items-center gap-3 pt-1">
+                  <div className="w-44 shrink-0" />
+                  <div className="flex flex-1 justify-between text-[10px] text-muted-foreground">
+                    <span>{fmtTime(from)}</span>
+                    <span>{fmtTime(to)}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </TabsContent>
+
+        {/* GPU Timeline — inference worker on/off spans, grouped by endpoint */}
+        <TabsContent value="gputimeline">
+          <div className="rounded-lg border bg-card p-4">
+            <h2 className="mb-1 text-sm font-semibold">GPU Timeline</h2>
+            <p className="mb-3 text-xs text-muted-foreground">
+              When each inference endpoint was actually serving — one bar per worker life
+              (provisioned → terminated). Green = still running, indigo = stopped. Hover for
+              who stopped it and why. Sourced from the durable worker-events log.
+            </p>
+            <div className="mb-3 flex items-center gap-4 text-[10px] text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" /> running
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-indigo-500" /> stopped
+              </span>
+            </div>
+            {gpuTimeline.length === 0 && !loading ? (
+              <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
+                No inference worker activity in the selected period.
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                {gpuTimeline.map((row) => {
+                  const t0 = from.getTime();
+                  const span = Math.max(to.getTime() - t0, 1);
+                  const nowClamp = Math.min(nowTs || to.getTime(), to.getTime());
+                  return (
+                    <div key={row.app} className="flex items-center gap-3">
+                      <div
+                        className="w-44 shrink-0 truncate text-right font-mono text-[11px] text-muted-foreground"
+                        title={row.app}
+                      >
+                        {row.app}
+                      </div>
+                      <div className="relative h-6 flex-1 overflow-hidden rounded bg-muted/40">
+                        {row.spans.map((sp, i) => {
+                          const e = Math.min(sp.end ?? nowClamp, to.getTime());
+                          const left = Math.max(((sp.start - t0) / span) * 100, 0);
+                          const width = Math.max(((e - sp.start) / span) * 100, 0.4);
+                          const durS = Math.max(0, (e - sp.start) / 1000);
+                          return (
+                            <div
+                              key={i}
+                              className={`absolute top-0.5 bottom-0.5 rounded-sm opacity-80 hover:opacity-100 ${sp.running ? "bg-emerald-500" : "bg-indigo-500"}`}
+                              style={{
+                                left: `${left}%`,
+                                width: `${Math.min(width, 100 - left)}%`,
+                              }}
+                              title={
+                                `worker ${sp.mid}\n` +
+                                `${fmtTime(new Date(sp.start))} → ${sp.running ? "running" : fmtTime(new Date(e))} (${fmtDur(durS)})\n` +
+                                (sp.running
+                                  ? "still serving"
+                                  : `stopped: ${sp.endReason ?? "?"}${sp.actor ? ` by ${sp.actor}` : ""}`)
+                              }
                             />
                           );
                         })}
