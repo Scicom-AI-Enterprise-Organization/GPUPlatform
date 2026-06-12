@@ -28,7 +28,7 @@ const RESOURCES: Item[] = [
   { label: "LLM API Proxy", href: "/proxy", icon: Network },
 ];
 const ACCOUNT: Item[] = [
-  { label: "API tokens", href: "/api-keys", icon: KeyRound },
+  { label: "API keys", href: "/api-keys", icon: KeyRound },
   { label: "API docs", href: "/api-docs", icon: BookOpen },
   { label: "Settings", href: "/settings", icon: Settings },
 ];

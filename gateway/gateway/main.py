@@ -398,9 +398,23 @@ async def lifespan(app: FastAPI):
     accesslog.init_access_logging()  # idempotent; also covers the uvicorn reload subprocess
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
     logger.info("connecting to redis at %s", redis_url)
-    app.state.redis = redis_async.from_url(redis_url, decode_responses=True)
+    # Keepalive matters: prod Redis sits behind a public ELB with a ~60s idle
+    # timeout. Without health checks, the SSE relay's pubsub connection (gen()
+    # in _openai_endpoint) gets silently dropped by the ELB during a brief lull
+    # in publishing; with no socket_timeout, pubsub.listen() then hangs on the
+    # dead socket for ~60s before recovery — surfacing as a mid-stream SSE stall
+    # that "resumes" after ~60s. health_check_interval sends periodic PINGs that
+    # keep the connection under the idle timeout AND detect a dropped socket
+    # fast; TCP keepalive is a second line of defence. (Tunable via env.)
+    _redis_hc = int(os.environ.get("REDIS_HEALTH_CHECK_INTERVAL_S", "30") or "30")
+    app.state.redis = redis_async.from_url(
+        redis_url,
+        decode_responses=True,
+        health_check_interval=_redis_hc,
+        socket_keepalive=True,
+    )
     await app.state.redis.ping()
-    logger.info("redis ready")
+    logger.info("redis ready (health_check_interval=%ss, socket_keepalive=on)", _redis_hc)
 
     logger.info("initializing postgres")
     await init_db()
@@ -3074,6 +3088,15 @@ async def _openai_endpoint(
                 "request_id": request_id,
             },
         )
+
+    # Release the request-scoped DB connection BEFORE streaming. With
+    # Depends(get_session) FastAPI keeps the dependency (and its pooled
+    # connection) checked out until the streamed body finishes — but gen()
+    # below talks only to Redis, never the DB. Holding it pins a pool slot for
+    # the whole (often minute-plus) stream; under concurrent streams the async
+    # pool exhausts and new requests block on connection checkout. Closing now
+    # is safe (idempotent; the get_session ctx-exit will close again as a noop).
+    await db_session.close()
 
     channel = f"stream:{request_id}"
     pubsub = rdb.pubsub()

@@ -50,7 +50,7 @@ export async function GET() {
     type: "http",
     scheme: "bearer",
     description:
-      "API key (prefix `sgpu_`) from the API tokens page. Send it as `Authorization: Bearer <key>`.",
+      "API key (prefix `sgpu_`) from the API keys page. Send it as `Authorization: Bearer <key>`.",
   };
   schema.security = [{ bearerAuth: [] }];
 

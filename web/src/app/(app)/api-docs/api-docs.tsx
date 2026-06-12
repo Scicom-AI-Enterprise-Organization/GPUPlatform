@@ -2000,7 +2000,7 @@ export SGPU_API_KEY="sgpu_…"`}
           </div>
           <p className="text-xs text-muted-foreground">
             Create a token at{" "}
-            <Link href="/api-keys" className="underline underline-offset-2">API tokens</Link>. You can hold multiple tokens.
+            <Link href="/api-keys" className="underline underline-offset-2">API keys</Link>. You can hold multiple keys.
             {" "}Machine-readable schema (no auth):{" "}
             <a href="/openapi.json" target="_blank" rel="noreferrer" className="font-mono underline underline-offset-2">
               /openapi.json
