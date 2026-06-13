@@ -2368,11 +2368,12 @@ async def admin_list_worker_events(
     app_id: Optional[str] = None,
     limit: int = 5000,
 ):
-    """Cross-endpoint worker lifecycle feed for the admin GPU Timeline. Same
-    durable `worker_events` rows as the per-app endpoint, but spanning every
-    inference endpoint so the analytics page can lay out on/off spans per
-    endpoint/worker. Admin only. `since`/`until` accept ISO-8601 or unix epoch;
-    rows come back oldest-first."""
+    """Cross-endpoint workload feed for the admin GPU Timeline. Returns the
+    durable `worker_events` rows (inference on/off spans) AND benchmark runs
+    (started/ended spans) across every endpoint, each resolved to its node +
+    GPU ids, so the analytics page can lay out a unified per-node/per-GPU
+    occupancy calendar. Admin only. `since`/`until` accept ISO-8601 or unix
+    epoch; worker-event rows come back oldest-first."""
     from sqlalchemy import select, and_
     if limit < 1 or limit > 20000:
         raise HTTPException(status_code=400, detail="limit must be 1..20000")

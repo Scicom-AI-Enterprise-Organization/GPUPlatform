@@ -2163,7 +2163,8 @@ export function AnalyticsView() {
               What occupied each GPU, laid out like a calendar — one row per day, time left→right,
               a lane per node + GPU. A block spans all the GPUs its workload held. Inference and
               benchmarks share the same nodes, so both are shown. Sourced from the durable
-              worker-events log + benchmark runs.
+              worker-events log + benchmark runs. Note: inference spans only go back to when
+              durable worker-event logging was enabled; benchmarks reach further back.
             </p>
             <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] text-muted-foreground">
               <span className="font-medium uppercase tracking-wide">Inference</span>
