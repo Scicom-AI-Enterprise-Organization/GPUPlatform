@@ -725,7 +725,7 @@ async def metrics_endpoint(request: Request):
 
 
 @app.get("/metrics/resources")
-async def resource_metrics_endpoint():
+async def resource_metrics_endpoint(request: Request):
     """Prometheus exporter for platform resources (serverless apps, benchmarks,
     storage, datasets, GPU providers, GitOps) sampled from Postgres — separate
     from the infra `/metrics` target. The web app re-exposes this at
@@ -735,7 +735,7 @@ async def resource_metrics_endpoint():
     `increase(platform_autotrain_runs_finished_total{status="failed"}[10m]) > 0`.
     Auth-exempt like /metrics — gate via ingress/network if needed."""
     async with session_factory()() as session:
-        body, ctype = await metrics.render_resources(session)
+        body, ctype = await metrics.render_resources(session, request.app.state.redis)
     return Response(content=body, media_type=ctype)
 
 
@@ -2389,13 +2389,21 @@ async def admin_list_worker_events(
             raise HTTPException(status_code=400, detail=f"bad timestamp: {v!r}")
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
+    since_dt = _parse_ts(since) if since else None
+    until_dt = _parse_ts(until) if until else None
+
+    # NOTE: we deliberately do NOT apply a `created_at >= since` lower bound here.
+    # Worker events are lifecycle transitions only (no heartbeat rows), so a worker
+    # that registered BEFORE the window and is still serving has its single ON event
+    # older than `since`. Filtering it out would drop a currently-occupied GPU from
+    # the window — the opposite of the benchmark span-overlap filter below. Instead
+    # we fetch up to `until` (newest `limit` rows) and let the client pair events
+    # into spans and clip to the window, matching the benchmark semantics.
     conds = []
     if app_id:
         conds.append(WorkerEvent.app_id == app_id)
-    if since:
-        conds.append(WorkerEvent.created_at >= _parse_ts(since))
-    if until:
-        conds.append(WorkerEvent.created_at <= _parse_ts(until))
+    if until_dt is not None:
+        conds.append(WorkerEvent.created_at <= until_dt)
     stmt = select(WorkerEvent)
     if conds:
         stmt = stmt.where(and_(*conds))
@@ -2403,36 +2411,78 @@ async def admin_list_worker_events(
     rows = list((await session.execute(stmt)).scalars().all())
     rows.reverse()
 
-    # Resolve node (the provider the endpoint is bound to) + the GPU ids each
-    # endpoint occupies, by joining App → Provider. Done here at read time so
-    # the timeline gets node/GPU columns without a worker_events schema change
-    # and works for rows logged before this existed.
+    def _parse_gpu_ids(vd: "str | None") -> list[int]:
+        vd = (vd or "").strip()
+        if not vd:
+            return []
+        try:
+            return [int(x.strip()) for x in vd.split(",") if x.strip() != ""]
+        except ValueError:
+            return []
+
+    # Benchmarks are GPU workloads on the same nodes as inference, so the unified
+    # GPU Timeline shows them too. A benchmark = one span [started_at, ended_at]
+    # (ended_at NULL → still running). Only started runs have a span. Filter to
+    # the window: started before `until` AND not ended before `since`.
+    from .bench import Benchmark
+    bconds = [Benchmark.started_at.isnot(None)]
+    if app_id:
+        bconds.append(Benchmark.id == app_id)  # allow targeting a single run too
+    if until_dt is not None:
+        bconds.append(Benchmark.started_at <= until_dt)
+    if since_dt is not None:
+        bconds.append((Benchmark.ended_at.is_(None)) | (Benchmark.ended_at >= since_dt))
+    brows = (
+        await session.execute(
+            select(Benchmark).where(and_(*bconds)).order_by(Benchmark.started_at.desc()).limit(limit)
+        )
+    ).scalars().all()
+
+    # Resolve node (the provider the workload is bound to) + GPU ids, by joining
+    # App/Benchmark → Provider. Done here at read time so the timeline gets
+    # node/GPU columns without a schema change and works for old rows.
     from .db import Provider
     app_ids = {r.app_id for r in rows if r.app_id}
-    apps_meta: dict[str, dict] = {}
+    prov_ids = set()
+    arows = []
     if app_ids:
         arows = (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all()
-        prov_ids = {a.provider_id for a in arows if a.provider_id}
-        pname: dict[str, str] = {}
-        if prov_ids:
-            prows = (await session.execute(select(Provider).where(Provider.id.in_(prov_ids)))).scalars().all()
-            pname = {p.id: p.name for p in prows}
-        for a in arows:
-            vd = (getattr(a, "visible_devices", None) or "").strip()
-            if vd:
-                try:
-                    gpu_ids = [int(x.strip()) for x in vd.split(",") if x.strip() != ""]
-                except ValueError:
-                    gpu_ids = list(range(int(a.gpu_count or 1)))
-            else:
-                gpu_ids = list(range(int(a.gpu_count or 1)))
-            node = (pname.get(a.provider_id) if a.provider_id else None) or (a.gpu or "shared")
-            apps_meta[a.app_id] = {
-                "name": a.name,
-                "node": node,
-                "gpu": a.gpu,
-                "gpu_ids": gpu_ids,
-            }
+        prov_ids |= {a.provider_id for a in arows if a.provider_id}
+    prov_ids |= {b.provider_id for b in brows if b.provider_id}
+    pname: dict[str, str] = {}
+    if prov_ids:
+        prows = (await session.execute(select(Provider).where(Provider.id.in_(prov_ids)))).scalars().all()
+        pname = {p.id: p.name for p in prows}
+
+    apps_meta: dict[str, dict] = {}
+    for a in arows:
+        gpu_ids = _parse_gpu_ids(getattr(a, "visible_devices", None)) or list(range(int(a.gpu_count or 1)))
+        node = (pname.get(a.provider_id) if a.provider_id else None) or (a.gpu or "shared")
+        apps_meta[a.app_id] = {"name": a.name, "node": node, "gpu": a.gpu, "gpu_ids": gpu_ids}
+
+    # Owner usernames for benchmark attribution.
+    owner_ids = {b.owner_id for b in brows}
+    onames: dict[int, str] = {}
+    if owner_ids:
+        ures = await session.execute(select(User.id, User.username).where(User.id.in_(owner_ids)))
+        onames = {uid: uname for uid, uname in ures.all()}
+
+    benchmarks = []
+    for b in brows:
+        node = (
+            (pname.get(b.provider_id) if b.provider_id else None)
+            or ("runpod" if b.runpod_pod_id else "shared")
+        )
+        benchmarks.append({
+            "id": b.id,
+            "name": b.name,
+            "node": node,
+            "gpu_ids": _parse_gpu_ids(b.visible_devices),
+            "status": b.status,
+            "owner": onames.get(b.owner_id),
+            "started": b.started_at.isoformat() if b.started_at else None,
+            "ended": b.ended_at.isoformat() if b.ended_at else None,
+        })
 
     return {
         "count": len(rows),
@@ -2450,6 +2500,7 @@ async def admin_list_worker_events(
             }
             for r in rows
         ],
+        "benchmarks": benchmarks,
     }
 
 

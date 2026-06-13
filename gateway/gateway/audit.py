@@ -57,6 +57,8 @@ ACTIONS = {
     "inference.update_models",
     "benchmark.create",
     "benchmark.delete",
+    "benchmark.terminate",
+    "benchmark.rename",
     "compute.create",
     "compute.delete",
     "compute.request",
