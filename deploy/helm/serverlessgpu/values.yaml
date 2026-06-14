@@ -32,6 +32,14 @@ gateway:
   autoscaler: true
   provider: primeintellect       # "fake" for staging without burning GPU $$, "primeintellect" for prod
 
+  # Disable cloud GPU providers (RunPod / Prime Intellect) platform-wide. When
+  # true, the gateway refuses to build / select / credential them, and the
+  # providers, compute and benchmark APIs reject cloud kinds — only physical
+  # `vm` (and `fake`) workers are allowed. Use in locked-down clusters (e.g.
+  # CAE / CCE) where workers run only on private VMs over a tailnet and Redis
+  # is svc-only. Set gateway.provider to `vm` or `fake` when this is true.
+  disableCloudProviders: false
+
   # Public URL workers dial back to. Must be reachable from PI's network.
   # If left empty AND ingress.enabled, this is auto-derived from ingress.host
   # (with the right scheme based on ingress.tls.enabled). Set explicitly only
