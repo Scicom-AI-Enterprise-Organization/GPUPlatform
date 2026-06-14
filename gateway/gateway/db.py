@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
-from sqlalchemy import BigInteger, JSON, Boolean, ForeignKey, String, DateTime, Integer, select, text
+from sqlalchemy import BigInteger, JSON, Boolean, ForeignKey, String, DateTime, Integer, UniqueConstraint, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -339,6 +339,52 @@ class Dataset(Base):
     # Alternatively the lpat token can come from a named global secret instead of
     # being stored per-dataset; resolved via load_global_env() at use time.
     label_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class CatalogRepo(Base):
+    """A self-hosted HuggingFace repo (model or dataset) served over the HF Hub
+    protocol (`hf_mirror_api.py`) and managed via the catalog UI (`catalog_api.py`).
+
+    Clients set `HF_ENDPOINT=<gateway>/hf` + `HF_TOKEN=sgpu_…` and then
+    `from_pretrained`/`hf download` (read) and `push_to_hub`/`hf upload` (write)
+    hit GPUPlatform instead of huggingface.co. The bytes live in a `Storage`
+    backend (s3 / local / sftp) under `prefix`:
+    - regular (git) files at `{prefix}/{path}`
+    - LFS blobs (content-addressed) at `{prefix}/.hf-lfs/{oid}` — `manifest` maps
+      each repo path → its oid/size/etag so a resolve can find the blob.
+
+    `manifest` is the file list of the single `main` revision:
+        [{ "path": str, "size": int, "oid": str, "lfs": bool, "etag": str }]
+    `sha` is a synthetic commit id (sha1 of the sorted manifest), bumped on every
+    commit. We keep only `main` — no branches/tags/history (basic mirror).
+    """
+    __tablename__ = "catalog_repos"
+    __table_args__ = (
+        UniqueConstraint("repo_type", "namespace", "name", name="uq_catalog_repo_id"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # repo-<hex8>
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    repo_type: Mapped[str] = mapped_column(String(16), default="model", server_default="model", nullable=False, index=True)  # model|dataset
+    namespace: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    full_id: Mapped[str] = mapped_column(String(255), index=True, nullable=False)  # "namespace/name"
+    # Storage row (kind=s3|local|sftp). Soft string ref (not a hard FK) so deleting
+    # a storage doesn't cascade-delete repo rows — matches the Dataset model.
+    storage_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    prefix: Mapped[str] = mapped_column(String(1024), nullable=False)  # key prefix within the storage
+    sha: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    private: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    manifest: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    num_files: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

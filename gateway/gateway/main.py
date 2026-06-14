@@ -52,6 +52,8 @@ from . import tracking_creds_api as tracking_creds_module
 from . import gitops_api as gitops_module
 from . import proxy_api as proxy_module
 from . import history_api as history_module
+from . import catalog_api as catalog_module
+from . import hf_mirror_api as hf_mirror_module
 
 logger = logging.getLogger("gateway")
 
@@ -580,6 +582,8 @@ app.include_router(gitops_module.router)
 app.include_router(proxy_module.router)
 app.include_router(proxy_module.data_router)
 app.include_router(history_module.router)
+app.include_router(catalog_module.router)
+app.include_router(hf_mirror_module.router)
 
 
 @app.middleware("http")

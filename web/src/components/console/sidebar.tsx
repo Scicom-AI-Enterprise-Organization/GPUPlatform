@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
+import { BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, Package, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebarState } from "./sidebar-state";
 
@@ -14,13 +14,14 @@ type Item = {
   locked?: boolean;
   // If set, this item is dropped from the nav when the section is turned off
   // platform-wide via DISABLED_SECTIONS.
-  section?: "inference" | "benchmark" | "compute" | "datasets";
+  section?: "inference" | "benchmark" | "compute" | "datasets" | "catalog";
 };
 
 const RESOURCES: Item[] = [
   { label: "Serverless Inference", href: "/serverless", icon: Boxes, section: "inference" },
   { label: "Benchmark", href: "/benchmark", icon: FlaskConical, section: "benchmark" },
   { label: "Storage", href: "/storage", icon: Database },
+  { label: "Models", href: "/models", icon: Package, section: "catalog" },
   { label: "Datasets", href: "/datasets", icon: Library, section: "datasets" },
   { label: "Autotrain", href: "/autotrain", icon: Sparkles },
   { label: "Compute", href: "/compute", icon: Box, section: "compute" },
@@ -87,6 +88,9 @@ export function ConsoleSidebar({
     }
     if (href === "/datasets") {
       return pathname === "/datasets" || pathname.startsWith("/datasets/");
+    }
+    if (href === "/models") {
+      return pathname === "/models" || pathname.startsWith("/models/");
     }
     if (href === "/autotrain") {
       return pathname === "/autotrain" || pathname.startsWith("/autotrain/");

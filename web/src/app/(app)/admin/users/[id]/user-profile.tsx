@@ -28,6 +28,7 @@ const SECTION_LABEL: Record<SectionKey, string> = {
   benchmark: "Benchmark",
   compute: "Compute",
   datasets: "Datasets",
+  catalog: "Models",
 };
 
 const NO_ROLE = "__none__";

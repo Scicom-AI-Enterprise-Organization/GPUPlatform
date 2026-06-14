@@ -636,7 +636,7 @@ export type ProviderBalance = {
 };
 
 // ---- Storage backends (S3 / HuggingFace destinations the platform writes to) ----
-export type StorageKind = "s3" | "huggingface";
+export type StorageKind = "s3" | "huggingface" | "local" | "sftp";
 
 export type StorageRecord = {
   id: string;
@@ -648,6 +648,13 @@ export type StorageRecord = {
   endpoint?: string | null;
   has_credentials: boolean;
   hf_token_secret?: string | null;
+  // local
+  path?: string | null;
+  // sftp (non-secret fields)
+  host?: string | null;
+  port?: number | null;
+  username?: string | null;
+  base_path?: string | null;
   enabled: boolean;
   notes?: string | null;
   created_at: string;
@@ -811,6 +818,15 @@ export type CreateStorageRequest = {
   hf_token?: string | null;
   // Reference a global secret (admin Secrets) by key instead of a pasted token.
   hf_token_secret?: string | null;
+  // local
+  path?: string | null;
+  // sftp
+  host?: string | null;
+  port?: number | null;
+  username?: string | null;
+  password?: string | null;
+  private_key?: string | null;
+  base_path?: string | null;
   notes?: string | null;
   enabled?: boolean;
 };
@@ -826,6 +842,13 @@ export type TestStorageRequest = {
   secret_access_key?: string | null;
   hf_token?: string | null;
   hf_token_secret?: string | null;
+  path?: string | null;
+  host?: string | null;
+  port?: number | null;
+  username?: string | null;
+  password?: string | null;
+  private_key?: string | null;
+  base_path?: string | null;
 };
 
 export type TestStorageResponse = {
@@ -910,7 +933,55 @@ export type ProviderMetrics = {
 
 // ---- Admin: roles + audit ----
 
-export type SectionKey = "inference" | "benchmark" | "compute" | "datasets";
+export type SectionKey = "inference" | "benchmark" | "compute" | "datasets" | "catalog";
+
+// ---- Model/Dataset catalog (self-hosted HuggingFace mirror) ----
+
+export type CatalogRepoType = "model" | "dataset";
+
+export type CatalogFile = {
+  path: string;
+  size?: number | null;
+  lfs: boolean;
+  oid?: string | null;
+};
+
+export type CatalogRecord = {
+  id: string;
+  repo_type: CatalogRepoType;
+  namespace: string;
+  name: string;
+  full_id: string;
+  storage_id?: string | null;
+  storage_name?: string | null;
+  prefix: string;
+  sha?: string | null;
+  private: boolean;
+  description?: string | null;
+  size_bytes?: number | null;
+  num_files?: number | null;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  files?: CatalogFile[] | null;
+};
+
+export type CreateCatalogRequest = {
+  repo_type: CatalogRepoType;
+  namespace: string;
+  name: string;
+  storage_id: string;
+  prefix?: string | null;
+  private?: boolean;
+  description?: string | null;
+};
+
+export type UpdateCatalogRequest = {
+  private?: boolean;
+  description?: string | null;
+  storage_id?: string | null;
+  prefix?: string | null;
+};
 
 export type AdminUserRecord = {
   id: number;

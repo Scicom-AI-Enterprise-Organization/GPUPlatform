@@ -44,7 +44,7 @@ logger = logging.getLogger("gateway.storage")
 
 router = APIRouter(prefix="/v1/storage", tags=["storage"])
 
-SUPPORTED_KINDS = ("s3", "huggingface")
+SUPPORTED_KINDS = ("s3", "huggingface", "local", "sftp")
 
 
 # ---------- request / response models ----------------------------------
@@ -52,7 +52,7 @@ SUPPORTED_KINDS = ("s3", "huggingface")
 
 class CreateStorageRequest(BaseModel):
     name: str
-    kind: str  # "s3" | "huggingface"
+    kind: str  # "s3" | "huggingface" | "local" | "sftp"
     # s3 fields
     bucket: Optional[str] = None
     prefix: Optional[str] = None
@@ -66,6 +66,15 @@ class CreateStorageRequest(BaseModel):
     # Reference a global secret (admin Secrets) by key instead of pasting a token;
     # resolved at use-time. Takes precedence over `hf_token` when set.
     hf_token_secret: Optional[str] = None
+    # local fields
+    path: Optional[str] = None
+    # sftp fields (credentials: password OR private_key)
+    host: Optional[str] = None
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    private_key: Optional[str] = None
+    base_path: Optional[str] = None
     notes: Optional[str] = None
     enabled: bool = True
 
@@ -82,6 +91,13 @@ class UpdateStorageRequest(BaseModel):
     secret_access_key: Optional[str] = None
     hf_token: Optional[str] = None
     hf_token_secret: Optional[str] = None
+    path: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    private_key: Optional[str] = None
+    base_path: Optional[str] = None
     notes: Optional[str] = None
     enabled: Optional[bool] = None
 
@@ -98,6 +114,13 @@ class TestStorageRequest(BaseModel):
     secret_access_key: Optional[str] = None
     hf_token: Optional[str] = None
     hf_token_secret: Optional[str] = None
+    path: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    private_key: Optional[str] = None
+    base_path: Optional[str] = None
 
 
 class TestStorageResponse(BaseModel):
@@ -117,6 +140,13 @@ class StorageRecord(BaseModel):
     has_credentials: bool = False
     # For huggingface: the global-secret key its token is resolved from (if any).
     hf_token_secret: Optional[str] = None
+    # local
+    path: Optional[str] = None
+    # sftp (non-secret fields only)
+    host: Optional[str] = None
+    port: Optional[int] = None
+    username: Optional[str] = None
+    base_path: Optional[str] = None
     enabled: bool = True
     notes: Optional[str] = None
     created_at: str
@@ -138,11 +168,31 @@ def _to_record(s: Storage, owner_username: str) -> StorageRecord:
         endpoint=cfg.get("endpoint"),
         has_credentials=bool(cfg.get("credentials_enc")) or bool(cfg.get("hf_token_secret")),
         hf_token_secret=cfg.get("hf_token_secret"),
+        path=cfg.get("path"),
+        host=cfg.get("host"),
+        port=cfg.get("port"),
+        username=cfg.get("username"),
+        base_path=cfg.get("base_path"),
         enabled=bool(s.enabled),
         notes=s.description,
         created_at=s.created_at.isoformat() if s.created_at else "",
         created_by=owner_username,
     )
+
+
+def _encrypt_sftp_creds(password: Optional[str], private_key: Optional[str]) -> Optional[str]:
+    """Encrypt whichever sftp credential was supplied (password or private key).
+    Returns None if neither given (keeps an existing blob on update)."""
+    pw = (password or "").strip()
+    pk = (private_key or "").strip()
+    if not pw and not pk:
+        return None
+    blob: dict = {}
+    if pw:
+        blob["password"] = pw
+    if pk:
+        blob["privateKey"] = pk
+    return crypto.encrypt(json.dumps(blob))
 
 
 def _encrypt_s3_creds(access_key_id: Optional[str], secret_access_key: Optional[str]) -> Optional[str]:
@@ -238,6 +288,35 @@ def _s3_error_message(e: Exception) -> str:
     return str(e)
 
 
+def _test_local_sync(path: str) -> None:
+    """Ensure the local path exists (create it) and is writable. Raises on failure."""
+    path = os.path.abspath(os.path.expanduser((path or "").strip()))
+    os.makedirs(path, exist_ok=True)
+    if not os.path.isdir(path):
+        raise RuntimeError(f"{path} is not a directory")
+    probe = os.path.join(path, ".sgpu-write-test")
+    with open(probe, "w") as f:
+        f.write("ok")
+    os.remove(probe)
+
+
+def _test_sftp_sync(
+    host: str, port: Optional[int], username: str, base_path: Optional[str],
+    password: Optional[str], private_key: Optional[str],
+) -> None:
+    """Connect over SFTP and stat the base path. Raises on any failure."""
+    from .storage_backends import SFTPBackend
+    enc = _encrypt_sftp_creds(password, private_key)
+    cfg = {
+        "host": host, "port": port or 22, "username": username,
+        # rstrip only — keep a leading slash so an absolute base_path stays absolute.
+        "base_path": (base_path or "").strip().rstrip("/"),
+    }
+    if enc:
+        cfg["credentials_enc"] = enc
+    SFTPBackend(cfg).ping()  # raises StorageError on connect / base-path failure
+
+
 async def _test_hf(token: Optional[str]) -> tuple[bool, str]:
     token = (token or "").strip() or os.environ.get("HF_TOKEN", "").strip()
     if not token:
@@ -298,6 +377,28 @@ async def test_storage(
         except Exception as e:  # botocore ClientError / endpoint / network
             return TestStorageResponse(ok=False, message=_s3_error_message(e))
         return TestStorageResponse(ok=True, message=f"reached bucket {bucket}")
+    if req.kind == "local":
+        path = (req.path or "").strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="path is required to test")
+        try:
+            await run_in_threadpool(_test_local_sync, path)
+        except Exception as e:  # noqa: BLE001
+            return TestStorageResponse(ok=False, message=str(e))
+        return TestStorageResponse(ok=True, message=f"{path} is writable")
+    if req.kind == "sftp":
+        host = (req.host or "").strip()
+        username = (req.username or "").strip()
+        if not host or not username:
+            raise HTTPException(status_code=400, detail="host and username are required to test")
+        try:
+            await run_in_threadpool(
+                _test_sftp_sync, host, req.port, username, req.base_path,
+                req.password, req.private_key,
+            )
+        except Exception as e:  # noqa: BLE001
+            return TestStorageResponse(ok=False, message=str(e))
+        return TestStorageResponse(ok=True, message=f"reached {username}@{host}")
     # huggingface — resolve a global-secret reference to its value before testing.
     token = req.hf_token
     ref = (req.hf_token_secret or "").strip()
@@ -336,6 +437,25 @@ async def create_storage(
             "endpoint": (req.endpoint or "").strip() or None,
         }
         enc = _encrypt_s3_creds(req.access_key_id, req.secret_access_key)
+        if enc:
+            config["credentials_enc"] = enc
+    elif req.kind == "local":
+        path = (req.path or "").strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="path is required for kind=local")
+        config = {"path": path}
+    elif req.kind == "sftp":
+        host = (req.host or "").strip()
+        username = (req.username or "").strip()
+        if not host or not username:
+            raise HTTPException(status_code=400, detail="host and username are required for kind=sftp")
+        config = {
+            "host": host,
+            "port": int(req.port or 22),
+            "username": username,
+            "base_path": (req.base_path or "").strip().rstrip("/"),
+        }
+        enc = _encrypt_sftp_creds(req.password, req.private_key)
         if enc:
             config["credentials_enc"] = enc
     else:  # huggingface
@@ -412,6 +532,30 @@ async def update_storage(
             cfg["endpoint"] = req.endpoint.strip() or None
         enc = _encrypt_s3_creds(req.access_key_id, req.secret_access_key)
         if enc:  # only replace when new creds supplied; omit keeps existing
+            cfg["credentials_enc"] = enc
+    elif row.kind == "local":
+        if req.path is not None:
+            p = req.path.strip()
+            if not p:
+                raise HTTPException(status_code=400, detail="path cannot be blank for local")
+            cfg["path"] = p
+    elif row.kind == "sftp":
+        if req.host is not None:
+            h = req.host.strip()
+            if not h:
+                raise HTTPException(status_code=400, detail="host cannot be blank for sftp")
+            cfg["host"] = h
+        if req.port is not None:
+            cfg["port"] = int(req.port)
+        if req.username is not None:
+            u = req.username.strip()
+            if not u:
+                raise HTTPException(status_code=400, detail="username cannot be blank for sftp")
+            cfg["username"] = u
+        if req.base_path is not None:
+            cfg["base_path"] = req.base_path.strip().rstrip("/")
+        enc = _encrypt_sftp_creds(req.password, req.private_key)
+        if enc:  # only replace when new creds supplied
             cfg["credentials_enc"] = enc
     else:  # huggingface
         # Switching to a global-secret reference clears any stored token, and

@@ -26,6 +26,8 @@ import type { StorageKind, StorageRecord } from "@/lib/types";
 const KIND_LABEL: Record<StorageKind, string> = {
   s3: "s3",
   huggingface: "huggingface",
+  local: "local",
+  sftp: "sftp",
 };
 
 function searchableText(s: StorageRecord): string {

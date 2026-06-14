@@ -44,6 +44,18 @@ export function StorageForm() {
   const [hfTokenSecret, setHfTokenSecret] = useState("");
   const [secretKeys, setSecretKeys] = useState<string[]>([]);
 
+  // local
+  const [localPath, setLocalPath] = useState("");
+
+  // sftp
+  const [sftpHost, setSftpHost] = useState("");
+  const [sftpPort, setSftpPort] = useState("22");
+  const [sftpUser, setSftpUser] = useState("");
+  const [sftpAuth, setSftpAuth] = useState<"password" | "key">("password");
+  const [sftpPassword, setSftpPassword] = useState("");
+  const [sftpKey, setSftpKey] = useState("");
+  const [sftpBasePath, setSftpBasePath] = useState("");
+
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [test, setTest] = useState<TestState>({ status: "idle" });
@@ -79,7 +91,42 @@ export function StorageForm() {
         return "Provide both Access key ID and Secret access key, or leave both blank.";
       }
     }
+    if (kind === "local" && !localPath.trim()) return "Path is required.";
+    if (kind === "sftp") {
+      if (!sftpHost.trim()) return "Host is required.";
+      if (!sftpUser.trim()) return "Username is required.";
+    }
     return null;
+  };
+
+  // Build the kind-specific payload shared by Test + Create.
+  const kindPayload = () => {
+    if (kind === "s3") {
+      return {
+        bucket: bucket.trim(),
+        prefix: prefix.trim() || null,
+        region: region.trim() || null,
+        endpoint: endpoint.trim() || null,
+        access_key_id: accessKeyId.trim() || null,
+        secret_access_key: secretAccessKey.trim() || null,
+      };
+    }
+    if (kind === "local") {
+      return { path: localPath.trim() };
+    }
+    if (kind === "sftp") {
+      return {
+        host: sftpHost.trim(),
+        port: Number(sftpPort) || 22,
+        username: sftpUser.trim(),
+        base_path: sftpBasePath.trim() || null,
+        password: sftpAuth === "password" ? sftpPassword || null : null,
+        private_key: sftpAuth === "key" ? sftpKey || null : null,
+      };
+    }
+    return hfSource === "secret"
+      ? { hf_token_secret: hfTokenSecret || null }
+      : { hf_token: hfToken.trim() || null };
   };
 
   const onTest = async () => {
@@ -91,20 +138,7 @@ export function StorageForm() {
     }
     setTest({ status: "running" });
     try {
-      const r = await gateway.testStorage(
-        kind === "s3"
-          ? {
-              kind,
-              bucket: bucket.trim(),
-              region: region.trim() || null,
-              endpoint: endpoint.trim() || null,
-              access_key_id: accessKeyId.trim() || null,
-              secret_access_key: secretAccessKey.trim() || null,
-            }
-          : hfSource === "secret"
-            ? { kind, hf_token_secret: hfTokenSecret || null }
-            : { kind, hf_token: hfToken.trim() || null },
-      );
+      const r = await gateway.testStorage({ kind, ...kindPayload() });
       setTest(r.ok ? { status: "ok", message: r.message } : { status: "fail", message: r.message });
     } catch (e) {
       setTest({ status: "fail", message: e instanceof Error ? e.message : String(e) });
@@ -125,18 +159,7 @@ export function StorageForm() {
         name: name.trim(),
         kind,
         notes: notes.trim() || null,
-        ...(kind === "s3"
-          ? {
-              bucket: bucket.trim(),
-              prefix: prefix.trim() || null,
-              region: region.trim() || null,
-              endpoint: endpoint.trim() || null,
-              access_key_id: accessKeyId.trim() || null,
-              secret_access_key: secretAccessKey.trim() || null,
-            }
-          : hfSource === "secret"
-            ? { hf_token_secret: hfTokenSecret || null }
-            : { hf_token: hfToken.trim() || null }),
+        ...kindPayload(),
       });
       router.push("/storage");
       router.refresh();
@@ -155,7 +178,11 @@ export function StorageForm() {
           <p className="mt-0.5 text-xs text-muted-foreground">
             {kind === "s3"
               ? "An S3 (or S3-compatible: R2, MinIO) bucket the platform writes to."
-              : "A HuggingFace token holder for pushing datasets / models to the Hub."}
+              : kind === "local"
+                ? "A local filesystem path on the gateway host — for hosting catalog repos."
+                : kind === "sftp"
+                  ? "A remote server reached over SFTP — for hosting catalog repos."
+                  : "A HuggingFace token holder for pushing datasets / models to the Hub."}
           </p>
         </div>
 
@@ -174,6 +201,8 @@ export function StorageForm() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="s3">S3 (or S3-compatible)</SelectItem>
+                <SelectItem value="local">Local filesystem</SelectItem>
+                <SelectItem value="sftp">SFTP</SelectItem>
                 <SelectItem value="huggingface">HuggingFace</SelectItem>
               </SelectContent>
             </Select>
@@ -287,6 +316,133 @@ export function StorageForm() {
                 />
               </div>
             </div>
+          </div>
+        </section>
+      )}
+
+      {kind === "local" && (
+        <section className="rounded-lg border border-border bg-card p-5">
+          <h2 className="mb-4 text-base font-medium">Local path</h2>
+          <Label htmlFor="local-path" className="text-xs uppercase tracking-wide text-muted-foreground">Path</Label>
+          <Input
+            id="local-path"
+            value={localPath}
+            onChange={(e) => {
+              setLocalPath(e.target.value);
+              invalidateTest();
+            }}
+            placeholder="/var/lib/gpuplatform/catalog"
+            className="mt-1.5 font-mono text-xs"
+          />
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            An absolute directory on the gateway host. Created if it doesn&apos;t exist; must be writable.
+          </p>
+        </section>
+      )}
+
+      {kind === "sftp" && (
+        <section className="rounded-lg border border-border bg-card p-5">
+          <h2 className="mb-4 text-base font-medium">SFTP server</h2>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="md:col-span-2">
+              <Label htmlFor="sftp-host" className="text-xs uppercase tracking-wide text-muted-foreground">Host</Label>
+              <Input
+                id="sftp-host"
+                value={sftpHost}
+                onChange={(e) => {
+                  setSftpHost(e.target.value);
+                  invalidateTest();
+                }}
+                placeholder="files.example.com"
+                className="mt-1.5"
+              />
+            </div>
+            <div>
+              <Label htmlFor="sftp-port" className="text-xs uppercase tracking-wide text-muted-foreground">Port</Label>
+              <Input
+                id="sftp-port"
+                value={sftpPort}
+                onChange={(e) => {
+                  setSftpPort(e.target.value);
+                  invalidateTest();
+                }}
+                placeholder="22"
+                className="mt-1.5"
+              />
+            </div>
+            <div>
+              <Label htmlFor="sftp-user" className="text-xs uppercase tracking-wide text-muted-foreground">Username</Label>
+              <Input
+                id="sftp-user"
+                value={sftpUser}
+                onChange={(e) => {
+                  setSftpUser(e.target.value);
+                  invalidateTest();
+                }}
+                placeholder="ubuntu"
+                className="mt-1.5"
+              />
+            </div>
+            <div className="md:col-span-2">
+              <Label htmlFor="sftp-base" className="text-xs uppercase tracking-wide text-muted-foreground">Base path (optional)</Label>
+              <Input
+                id="sftp-base"
+                value={sftpBasePath}
+                onChange={(e) => {
+                  setSftpBasePath(e.target.value);
+                  invalidateTest();
+                }}
+                placeholder="/home/ubuntu/catalog"
+                className="mt-1.5 font-mono text-xs"
+              />
+            </div>
+          </div>
+
+          <div className="mt-4 rounded-md border border-border p-3">
+            <div className="mb-2 text-sm font-medium">Credentials</div>
+            <div className="mb-3 inline-flex rounded-md border border-border p-0.5 text-xs">
+              {(["password", "key"] as const).map((a) => (
+                <button
+                  key={a}
+                  type="button"
+                  onClick={() => {
+                    setSftpAuth(a);
+                    invalidateTest();
+                  }}
+                  className={
+                    "rounded px-2.5 py-1 transition-colors " +
+                    (sftpAuth === a ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                  }
+                >
+                  {a === "password" ? "Password" : "Private key"}
+                </button>
+              ))}
+            </div>
+            {sftpAuth === "password" ? (
+              <Input
+                type="password"
+                autoComplete="off"
+                value={sftpPassword}
+                onChange={(e) => {
+                  setSftpPassword(e.target.value);
+                  invalidateTest();
+                }}
+                placeholder="password"
+                className="font-mono text-xs"
+              />
+            ) : (
+              <Textarea
+                value={sftpKey}
+                onChange={(e) => {
+                  setSftpKey(e.target.value);
+                  invalidateTest();
+                }}
+                rows={4}
+                placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+                className="font-mono text-xs"
+              />
+            )}
+            <p className="mt-2 text-xs text-muted-foreground">Stored encrypted at rest with Fernet.</p>
           </div>
         </section>
       )}

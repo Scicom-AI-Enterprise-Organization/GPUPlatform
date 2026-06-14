@@ -29,6 +29,10 @@ import type {
   CreateComputeRequest,
   CreateProviderRequest,
   CreateStorageRequest,
+  CatalogRecord,
+  CreateCatalogRequest,
+  UpdateCatalogRequest,
+  CatalogRepoType,
   CreateDatasetRequest,
   UpdateDatasetRequest,
   TransformDatasetRequest,
@@ -632,6 +636,34 @@ export const gateway = {
   deleteDataset: (id: string) =>
     request<{ ok: boolean; id: string }>(
       `/v1/datasets/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+
+  // ---- Model/Dataset catalog (self-hosted HuggingFace mirror) ----
+  listCatalog: (scope: "mine" | "all" = "mine", repoType?: CatalogRepoType) => {
+    const q = new URLSearchParams({ scope });
+    if (repoType) q.set("repo_type", repoType);
+    return request<CatalogRecord[]>(`/v1/catalog?${q.toString()}`);
+  },
+  getCatalogRepo: (id: string) =>
+    request<CatalogRecord>(`/v1/catalog/${encodeURIComponent(id)}`),
+  createCatalogRepo: (body: CreateCatalogRequest) =>
+    request<CatalogRecord>("/v1/catalog", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateCatalogRepo: (id: string, body: UpdateCatalogRequest) =>
+    request<CatalogRecord>(`/v1/catalog/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  reindexCatalogRepo: (id: string) =>
+    request<CatalogRecord>(`/v1/catalog/${encodeURIComponent(id)}/reindex`, {
+      method: "POST",
+    }),
+  deleteCatalogRepo: (id: string, wipe = false) =>
+    request<{ ok: boolean; id: string }>(
+      `/v1/catalog/${encodeURIComponent(id)}${wipe ? "?wipe=true" : ""}`,
       { method: "DELETE" },
     ),
   /** S3 objects backing a dataset (Files tab). `split` narrows a split-aware

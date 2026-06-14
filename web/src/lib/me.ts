@@ -7,7 +7,7 @@ import { disabledSections } from "./sections";
 
 const GATEWAY = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
-export type Section = "inference" | "benchmark" | "compute" | "datasets";
+export type Section = "inference" | "benchmark" | "compute" | "datasets" | "catalog";
 
 export type Me = {
   user_id: number;
