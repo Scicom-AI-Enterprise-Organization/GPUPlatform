@@ -48,7 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import storage_backends as sb
 from .auth import current_user
-from .db import CatalogRepo, Storage, User, get_session
+from .db import CatalogRepo, CatalogRevision, Storage, User, get_session
 
 logger = logging.getLogger("gateway.hf_mirror")
 
@@ -157,18 +157,55 @@ def _manifest(repo: CatalogRepo) -> list[dict]:
     return list(repo.manifest or [])
 
 
-def _find(repo: CatalogRepo, path: str) -> Optional[dict]:
-    for e in repo.manifest or []:
+def _find(manifest: list[dict], path: str) -> Optional[dict]:
+    for e in manifest or []:
         if e.get("path") == path:
             return e
     return None
 
 
 def _blob_key(repo: CatalogRepo, entry: dict) -> str:
-    """Storage key for a manifest entry (lfs → content-addressed, else by path)."""
+    """Storage key for a manifest entry.
+    - LFS: content-addressed at `{prefix}/.hf-lfs/{oid}` (always).
+    - versioned repo: content-addressed at `{prefix}/blobs/{oid}` so different
+      branches' same-named files don't collide.
+    - flat repo: path-addressed at `{prefix}/{path}` (legacy / published data)."""
     if entry.get("lfs"):
         return f"{repo.prefix}/.hf-lfs/{entry['oid']}"
+    if getattr(repo, "versioned", False):
+        return f"{repo.prefix}/blobs/{entry['oid']}"
     return f"{repo.prefix}/{entry['path']}"
+
+
+async def _resolve_revision(session: AsyncSession, repo: CatalogRepo,
+                            revision: Optional[str]) -> tuple[list[dict], str]:
+    """Resolve a revision → (manifest, sha) for the requested ref.
+
+    Flat repos ignore the revision and always return the single head. Versioned
+    repos resolve: main/default/empty → the head (denormalized on the repo); else a
+    `CatalogRevision` branch by NAME, or by sha (full/short). 404 RevisionNotFound
+    if a non-default name/sha doesn't exist."""
+    head_manifest = _manifest(repo)
+    head_sha = repo.sha or _compute_sha(head_manifest)
+    if not getattr(repo, "versioned", False):
+        return head_manifest, head_sha
+    rev = (revision or "").strip()
+    if rev in ("", "main", repo.default_branch or "main") or rev == head_sha:
+        return head_manifest, head_sha
+    row = (await session.execute(
+        select(CatalogRevision).where(
+            CatalogRevision.repo_id == repo.id, CatalogRevision.name == rev)
+    )).scalar_one_or_none()
+    if row is None:  # try resolving by commit sha (full or abbreviated)
+        rows = (await session.execute(
+            select(CatalogRevision).where(CatalogRevision.repo_id == repo.id)
+        )).scalars().all()
+        row = next((r for r in rows if r.sha == rev or (r.sha or "").startswith(rev)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"revision {revision} not found",
+                            headers={"X-Error-Code": "RevisionNotFound"})
+    m = list(row.manifest or [])
+    return m, (row.sha or _compute_sha(m))
 
 
 async def _get_repo(session: AsyncSession, repo_type: str, ns: str, name: str) -> Optional[CatalogRepo]:
@@ -203,8 +240,12 @@ def _require_owner(repo: CatalogRepo, user: User) -> None:
 
 
 def _repo_not_found(repo_type: str, ns: str, name: str):
-    # 404 shape HF maps to RepositoryNotFoundError.
-    return HTTPException(status_code=404, detail=f"{repo_type} {ns}/{name} not found")
+    # 404 + `X-Error-Code: RepoNotFound` is what huggingface_hub maps to
+    # RepositoryNotFoundError — without the header it's a generic HfHubHTTPError,
+    # so `push_to_hub`/`create_repo(exist_ok=True)` won't recognise "repo missing"
+    # and create it (they'd just fail).
+    return HTTPException(status_code=404, detail=f"{repo_type} {ns}/{name} not found",
+                         headers={"X-Error-Code": "RepoNotFound"})
 
 
 # ---------- whoami ------------------------------------------------------
@@ -237,13 +278,13 @@ async def validate_yaml(payload: dict, user: User = Depends(current_user)):  # n
 # ---------- repo info (enumerate files for download) --------------------
 
 
-async def _repo_info_impl(rtype: str, ns: str, name: str, user: User, session: AsyncSession):
+async def _repo_info_impl(rtype: str, ns: str, name: str, user: User, session: AsyncSession,
+                          revision: Optional[str] = None):
     repo_type = _rt(rtype)
     repo = await _get_repo(session, repo_type, ns, name)
     if repo is None or not _can_read(repo, user):
         raise _repo_not_found(repo_type, ns, name)
-    manifest = _manifest(repo)
-    sha = repo.sha or _compute_sha(manifest)
+    manifest, sha = await _resolve_revision(session, repo, revision)
     last = _hf_dt(repo.updated_at)
     siblings = [{"rfilename": e["path"], "size": e.get("size")} for e in manifest]
     info = {
@@ -274,11 +315,35 @@ async def repo_info(rtype: str, ns: str, name: str,
     return await _repo_info_impl(rtype, ns, name, user, session)
 
 
+@router.get("/api/{rtype}/{ns}/{name}/refs")
+async def repo_refs(rtype: str, ns: str, name: str,
+                    user: User = Depends(current_user),
+                    session: AsyncSession = Depends(get_session)):
+    """List branches (+ tags) — `huggingface_hub.list_repo_refs`. Flat repos expose
+    just the synthesized `main`; versioned repos add each `CatalogRevision` branch.
+    Shape: {"branches":[{name,ref,targetCommit}], "tags":[], "converts":[]}."""
+    repo_type = _rt(rtype)
+    repo = await _get_repo(session, repo_type, ns, name)
+    if repo is None or not _can_read(repo, user):
+        raise _repo_not_found(repo_type, ns, name)
+    default = repo.default_branch or "main"
+    head_sha = repo.sha or _compute_sha(_manifest(repo))
+    branches = [{"name": default, "ref": f"refs/heads/{default}", "targetCommit": head_sha}]
+    if getattr(repo, "versioned", False):
+        rows = (await session.execute(
+            select(CatalogRevision).where(CatalogRevision.repo_id == repo.id)
+        )).scalars().all()
+        for r in rows:
+            branches.append({"name": r.name, "ref": f"refs/heads/{r.name}",
+                             "targetCommit": r.sha or ""})
+    return {"branches": branches, "tags": [], "converts": []}
+
+
 @router.get("/api/{rtype}/{ns}/{name}/revision/{revision:path}")
-async def repo_info_rev(rtype: str, ns: str, name: str, revision: str,  # noqa: ARG001 — single revision
+async def repo_info_rev(rtype: str, ns: str, name: str, revision: str,
                         user: User = Depends(current_user),
                         session: AsyncSession = Depends(get_session)):
-    return await _repo_info_impl(rtype, ns, name, user, session)
+    return await _repo_info_impl(rtype, ns, name, user, session, revision=revision)
 
 
 # ---------- tree (list files under a path) — used by Dataset.push_to_hub ------
@@ -294,13 +359,13 @@ def _tree_file_entry(e: dict) -> dict:
 
 
 async def _tree_impl(rtype: str, ns: str, name: str, path: str, recursive: bool,
-                     user: User, session: AsyncSession):
+                     user: User, session: AsyncSession, revision: Optional[str] = None):
     repo_type = _rt(rtype)
     repo = await _get_repo(session, repo_type, ns, name)
     if repo is None or not _can_read(repo, user):
         raise _repo_not_found(repo_type, ns, name)
     prefix = (path or "").strip("/")
-    manifest = _manifest(repo)
+    manifest, _sha = await _resolve_revision(session, repo, revision)
     # A non-root path that matches no file/dir must 404 with EntryNotFound — HF
     # clients (HfFileSystem.find → glob) rely on that to treat it as "empty".
     if prefix and not any(p == prefix or p.startswith(prefix + "/") for p in (e["path"] for e in manifest)):
@@ -329,32 +394,33 @@ async def _tree_impl(rtype: str, ns: str, name: str, path: str, recursive: bool,
 
 
 @router.get("/api/{rtype}/{ns}/{name}/tree/{revision}/{path:path}")
-async def repo_tree(rtype: str, ns: str, name: str, revision: str, path: str,  # noqa: ARG001
+async def repo_tree(rtype: str, ns: str, name: str, revision: str, path: str,
                     recursive: bool = False, expand: bool = False,  # noqa: ARG001 — expand ignored
                     user: User = Depends(current_user),
                     session: AsyncSession = Depends(get_session)):
-    return await _tree_impl(rtype, ns, name, path, recursive, user, session)
+    return await _tree_impl(rtype, ns, name, path, recursive, user, session, revision=revision)
 
 
 @router.get("/api/{rtype}/{ns}/{name}/tree/{revision}")
-async def repo_tree_root(rtype: str, ns: str, name: str, revision: str,  # noqa: ARG001
+async def repo_tree_root(rtype: str, ns: str, name: str, revision: str,
                          recursive: bool = False, expand: bool = False,  # noqa: ARG001
                          user: User = Depends(current_user),
                          session: AsyncSession = Depends(get_session)):
-    return await _tree_impl(rtype, ns, name, "", recursive, user, session)
+    return await _tree_impl(rtype, ns, name, "", recursive, user, session, revision=revision)
 
 
 # ---------- paths-info — stat specific paths (HfFileSystem; push_to_hub/load_dataset) ----
 
 
 @router.post("/api/{rtype}/{ns}/{name}/paths-info/{revision:path}")
-async def paths_info(rtype: str, ns: str, name: str, revision: str, request: Request,  # noqa: ARG001
+async def paths_info(rtype: str, ns: str, name: str, revision: str, request: Request,
                      user: User = Depends(current_user),
                      session: AsyncSession = Depends(get_session)):
     repo_type = _rt(rtype)
     repo = await _get_repo(session, repo_type, ns, name)
     if repo is None or not _can_read(repo, user):
         raise _repo_not_found(repo_type, ns, name)
+    rev_manifest, rev_sha = await _resolve_revision(session, repo, revision)
     # `HfApi.get_paths_info` sends form-encoded `paths` (repeated key); some
     # callers send JSON — accept both.
     paths: list[str] = []
@@ -370,12 +436,12 @@ async def paths_info(rtype: str, ns: str, name: str, revision: str, request: Req
         except Exception:  # noqa: BLE001
             paths = []
 
-    by_path = {e["path"]: e for e in _manifest(repo)}
+    by_path = {e["path"]: e for e in rev_manifest}
     out: list[dict] = []
     for raw in paths:
         p = (raw or "").strip("/")
         if p == "":  # repo root → directory
-            out.append({"type": "directory", "path": "", "oid": repo.sha or ""})
+            out.append({"type": "directory", "path": "", "oid": rev_sha})
         elif p in by_path:
             out.append(_tree_file_entry(by_path[p]))
         elif any(mp == p or mp.startswith(p + "/") for mp in by_path):
@@ -387,11 +453,10 @@ async def paths_info(rtype: str, ns: str, name: str, revision: str, request: Req
 # ---------- file resolve (HEAD metadata + GET bytes) --------------------
 
 
-def _meta_headers(repo: CatalogRepo, entry: dict) -> dict:
-    sha = repo.sha or ""
+def _meta_headers(sha: str, entry: dict) -> dict:
     etag = entry.get("etag") or entry.get("oid") or ""
     return {
-        "X-Repo-Commit": sha,
+        "X-Repo-Commit": sha or "",
         "ETag": f'"{etag}"',
         "Content-Length": str(int(entry.get("size") or 0)),
         "Accept-Ranges": "bytes",
@@ -400,15 +465,17 @@ def _meta_headers(repo: CatalogRepo, entry: dict) -> dict:
 
 
 async def _resolve_head_impl(repo_type: str, ns: str, name: str, path: str,
-                             user: User, session: AsyncSession) -> Response:
+                             user: User, session: AsyncSession,
+                             revision: Optional[str] = None) -> Response:
     repo = await _get_repo(session, repo_type, ns, name)
     if repo is None or not _can_read(repo, user):
         raise _repo_not_found(repo_type, ns, name)
-    entry = _find(repo, path)
+    manifest, sha = await _resolve_revision(session, repo, revision)
+    entry = _find(manifest, path)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"{path} not found in {ns}/{name}")
     # lowercase key so Starlette keeps our Content-Length on the empty HEAD body.
-    h = _meta_headers(repo, entry)
+    h = _meta_headers(sha, entry)
     headers = {k.lower(): v for k, v in h.items()}
     return Response(status_code=200, headers=headers)
 
@@ -430,11 +497,13 @@ def _parse_range(range_header: Optional[str], size: int) -> Optional[tuple[int, 
 
 
 async def _resolve_get_impl(repo_type: str, ns: str, name: str, path: str,
-                            request: Request, user: User, session: AsyncSession):
+                            request: Request, user: User, session: AsyncSession,
+                            revision: Optional[str] = None):
     repo = await _get_repo(session, repo_type, ns, name)
     if repo is None or not _can_read(repo, user):
         raise _repo_not_found(repo_type, ns, name)
-    entry = _find(repo, path)
+    manifest, sha = await _resolve_revision(session, repo, revision)
+    entry = _find(manifest, path)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"{path} not found in {ns}/{name}")
     backend = await _backend_for(session, repo)
@@ -470,7 +539,7 @@ async def _resolve_get_impl(repo_type: str, ns: str, name: str, path: str,
             await run_in_threadpool(reader.close)
 
     headers = {
-        "X-Repo-Commit": repo.sha or "",
+        "X-Repo-Commit": sha or "",
         "ETag": f'"{entry.get("etag") or entry.get("oid") or ""}"',
         "Accept-Ranges": "bytes",
         "Content-Length": str(length),
@@ -483,32 +552,32 @@ async def _resolve_get_impl(repo_type: str, ns: str, name: str, path: str,
 
 # model resolve
 @router.head("/{ns}/{name}/resolve/{revision}/{path:path}")
-async def model_resolve_head(ns: str, name: str, revision: str, path: str,  # noqa: ARG001
+async def model_resolve_head(ns: str, name: str, revision: str, path: str,
                              user: User = Depends(current_user),
                              session: AsyncSession = Depends(get_session)):
-    return await _resolve_head_impl("model", ns, name, path, user, session)
+    return await _resolve_head_impl("model", ns, name, path, user, session, revision=revision)
 
 
 @router.get("/{ns}/{name}/resolve/{revision}/{path:path}")
-async def model_resolve_get(ns: str, name: str, revision: str, path: str, request: Request,  # noqa: ARG001
+async def model_resolve_get(ns: str, name: str, revision: str, path: str, request: Request,
                             user: User = Depends(current_user),
                             session: AsyncSession = Depends(get_session)):
-    return await _resolve_get_impl("model", ns, name, path, request, user, session)
+    return await _resolve_get_impl("model", ns, name, path, request, user, session, revision=revision)
 
 
 # dataset resolve
 @router.head("/datasets/{ns}/{name}/resolve/{revision}/{path:path}")
-async def dataset_resolve_head(ns: str, name: str, revision: str, path: str,  # noqa: ARG001
+async def dataset_resolve_head(ns: str, name: str, revision: str, path: str,
                                user: User = Depends(current_user),
                                session: AsyncSession = Depends(get_session)):
-    return await _resolve_head_impl("dataset", ns, name, path, user, session)
+    return await _resolve_head_impl("dataset", ns, name, path, user, session, revision=revision)
 
 
 @router.get("/datasets/{ns}/{name}/resolve/{revision}/{path:path}")
-async def dataset_resolve_get(ns: str, name: str, revision: str, path: str, request: Request,  # noqa: ARG001
+async def dataset_resolve_get(ns: str, name: str, revision: str, path: str, request: Request,
                               user: User = Depends(current_user),
                               session: AsyncSession = Depends(get_session)):
-    return await _resolve_get_impl("dataset", ns, name, path, request, user, session)
+    return await _resolve_get_impl("dataset", ns, name, path, request, user, session, revision=revision)
 
 
 # ---------- write: create / delete repo ---------------------------------
@@ -564,6 +633,10 @@ async def repos_create(payload: dict, request: Request,
             manifest=[],
             size_bytes=0,
             num_files=0,
+            # Mirror-native repos get content-addressed blobs + named overwriteable
+            # branches (push to main / checkpoint-v1 / …). Repos registered over
+            # existing data (catalog_api / dataset publish) stay flat (versioned=False).
+            versioned=True,
         )
         session.add(repo)
         await session.commit()
@@ -731,16 +804,38 @@ async def dataset_lfs_put(ns: str, name: str, oid: str, request: Request,  # noq
 
 
 async def _commit_impl(rtype: str, ns: str, name: str, request: Request,
-                       user: User, session: AsyncSession):
+                       user: User, session: AsyncSession, revision: Optional[str] = None):
     repo_type = _rt(rtype)
     repo = await _get_repo(session, repo_type, ns, name)
     if repo is None:
         raise _repo_not_found(repo_type, ns, name)
     _require_owner(repo, user)
     backend = await _backend_for(session, repo)
+    versioned = bool(getattr(repo, "versioned", False))
+
+    # Target branch: main/default (and ALL flat repos) operate on the head; any
+    # other name on a versioned repo is a named, overwriteable branch (created on
+    # first push). The starting file set is the TARGET branch's current manifest —
+    # so a commit to checkpoint-v1 builds on checkpoint-v1, not on main.
+    rev = (revision or "").strip()
+    default = repo.default_branch or "main"
+    to_main = (not versioned) or rev in ("", "main", default)
+    rowrev: Optional[CatalogRevision] = None
+    if to_main:
+        start_manifest = _manifest(repo)
+    else:
+        rowrev = (await session.execute(
+            select(CatalogRevision).where(
+                CatalogRevision.repo_id == repo.id, CatalogRevision.name == rev)
+        )).scalar_one_or_none()
+        start_manifest = list(rowrev.manifest or []) if rowrev else []
+
+    def _reg_key(path: str, oid: str) -> str:
+        # versioned: content-addressed (shared across branches); flat: by path.
+        return f"{repo.prefix}/blobs/{oid}" if versioned else f"{repo.prefix}/{path}"
 
     raw = await request.body()
-    by_path: dict[str, dict] = {e["path"]: e for e in _manifest(repo)}
+    by_path: dict[str, dict] = {e["path"]: e for e in start_manifest}
 
     for line in raw.split(b"\n"):
         line = line.strip()
@@ -758,8 +853,15 @@ async def _commit_impl(rtype: str, ns: str, name: str, request: Request,
             path = val.get("path")
             content_b64 = val.get("content") or ""
             data = base64.b64decode(content_b64) if val.get("encoding") == "base64" else content_b64.encode()
-            await run_in_threadpool(backend.put_bytes, f"{repo.prefix}/{path}", data)
             etag = hashlib.sha256(data).hexdigest()
+            blob_key = _reg_key(path, etag)
+            # Content-addressed reuse: skip the write if this exact blob already
+            # exists (another branch/commit wrote it). Flat repos write by path
+            # every time (the path IS the identity).
+            if versioned and (await run_in_threadpool(backend.stat, blob_key)) == len(data):
+                pass
+            else:
+                await run_in_threadpool(backend.put_bytes, blob_key, data)
             by_path[path] = {"path": path, "size": len(data), "oid": etag, "lfs": False, "etag": etag}
         elif key == "lfsFile":
             path = val.get("path")
@@ -771,21 +873,33 @@ async def _commit_impl(rtype: str, ns: str, name: str, request: Request,
         elif key == "deletedFile":
             path = val.get("path")
             old = by_path.pop(path, None)
-            if old and not old.get("lfs"):
+            # Only flat repos delete bytes — versioned blobs are content-addressed
+            # and may be referenced by other branches/files (GC is a Tier-2 job).
+            if old and not old.get("lfs") and not versioned:
                 await run_in_threadpool(backend.delete, f"{repo.prefix}/{path}")
         elif key == "deletedFolder":
             folder = (val.get("path") or "").rstrip("/") + "/"
             for p in [p for p in by_path if p.startswith(folder)]:
                 old = by_path.pop(p, None)
-                if old and not old.get("lfs"):
+                if old and not old.get("lfs") and not versioned:
                     await run_in_threadpool(backend.delete, f"{repo.prefix}/{p}")
 
     manifest = sorted(by_path.values(), key=lambda e: e["path"])
     sha = _compute_sha(manifest)
-    repo.manifest = manifest
-    repo.sha = sha
-    repo.size_bytes = sum(int(e.get("size") or 0) for e in manifest)
-    repo.num_files = len(manifest)
+    total = sum(int(e.get("size") or 0) for e in manifest)
+    if to_main:
+        repo.manifest = manifest
+        repo.sha = sha
+        repo.size_bytes = total
+        repo.num_files = len(manifest)
+    else:
+        if rowrev is None:
+            rowrev = CatalogRevision(id=f"rev-{secrets.token_hex(4)}", repo_id=repo.id, name=rev)
+            session.add(rowrev)
+        rowrev.manifest = manifest
+        rowrev.sha = sha
+        rowrev.size_bytes = total
+        rowrev.num_files = len(manifest)
     await session.commit()
 
     return {
@@ -796,7 +910,65 @@ async def _commit_impl(rtype: str, ns: str, name: str, request: Request,
 
 
 @router.post("/api/{rtype}/{ns}/{name}/commit/{revision:path}")
-async def commit(rtype: str, ns: str, name: str, revision: str, request: Request,  # noqa: ARG001
+async def commit(rtype: str, ns: str, name: str, revision: str, request: Request,
                  user: User = Depends(current_user),
                  session: AsyncSession = Depends(get_session)):
-    return await _commit_impl(rtype, ns, name, request, user, session)
+    return await _commit_impl(rtype, ns, name, request, user, session, revision=revision)
+
+
+# ---------- write: branches (named overwriteable revisions) -------------
+
+
+@router.post("/api/{rtype}/{ns}/{name}/branch/{branch:path}")
+async def create_branch(rtype: str, ns: str, name: str, branch: str, request: Request,
+                        user: User = Depends(current_user),
+                        session: AsyncSession = Depends(get_session)):
+    """`huggingface_hub.create_branch` — make a new named branch (a `CatalogRevision`)
+    seeded from `?startingPoint=` (default the head). Only on versioned repos.
+    409 if it already exists (the client's `exist_ok` tolerates that)."""
+    repo_type = _rt(rtype)
+    repo = await _get_repo(session, repo_type, ns, name)
+    if repo is None:
+        raise _repo_not_found(repo_type, ns, name)
+    _require_owner(repo, user)
+    if not getattr(repo, "versioned", False):
+        raise HTTPException(status_code=400,
+                            detail="this repo is flat (main-only); branches need a mirror-native repo")
+    b = (branch or "").strip().strip("/")
+    default = repo.default_branch or "main"
+    if b in ("", "main", default):
+        raise HTTPException(status_code=409, detail="branch already exists")
+    existing = (await session.execute(
+        select(CatalogRevision).where(CatalogRevision.repo_id == repo.id, CatalogRevision.name == b)
+    )).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="branch already exists")
+    start = request.query_params.get("startingPoint") or default
+    start_manifest, start_sha = await _resolve_revision(session, repo, start)
+    session.add(CatalogRevision(
+        id=f"rev-{secrets.token_hex(4)}", repo_id=repo.id, name=b,
+        manifest=start_manifest, sha=start_sha,
+        size_bytes=sum(int(e.get("size") or 0) for e in start_manifest),
+        num_files=len(start_manifest),
+    ))
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.delete("/api/{rtype}/{ns}/{name}/branch/{branch:path}")
+async def delete_branch(rtype: str, ns: str, name: str, branch: str,
+                        user: User = Depends(current_user),
+                        session: AsyncSession = Depends(get_session)):
+    repo_type = _rt(rtype)
+    repo = await _get_repo(session, repo_type, ns, name)
+    if repo is None:
+        raise _repo_not_found(repo_type, ns, name)
+    _require_owner(repo, user)
+    b = (branch or "").strip().strip("/")
+    row = (await session.execute(
+        select(CatalogRevision).where(CatalogRevision.repo_id == repo.id, CatalogRevision.name == b)
+    )).scalar_one_or_none()
+    if row is not None:
+        await session.delete(row)
+        await session.commit()
+    return Response(status_code=204)

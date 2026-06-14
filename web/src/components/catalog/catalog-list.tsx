@@ -18,6 +18,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Checkbox } from "@/components/ui/checkbox";
+import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-select";
 
 export function fmtBytes(n?: number | null): string {
   if (!n && n !== 0) return "—";
@@ -47,6 +48,7 @@ export function CatalogList({
 }) {
   const router = useRouter();
   const [q, setQ] = useState("");
+  const [sort, setSort] = useState<SortDir>("newest");
   const [view, setView] = useState<View>("grid");
   const [deleteTarget, setDeleteTarget] = useState<CatalogRecord | null>(null);
   const [wipe, setWipe] = useState(false);
@@ -56,6 +58,8 @@ export function CatalogList({
   // Hydrate the saved view post-mount (start from the default so SSR matches).
   useEffect(() => {
     const v = window.localStorage.getItem("sgpu_catalog_view");
+    // Reading client-only localStorage post-mount avoids an SSR/CSR mismatch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "rows" || v === "grid") setView(v);
   }, []);
   const setViewPersist = (v: View) => {
@@ -65,15 +69,17 @@ export function CatalogList({
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    if (!needle) return items;
-    return items.filter((r) =>
-      [r.full_id, r.id, r.storage_name, r.description, r.created_by]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-        .includes(needle),
-    );
-  }, [items, q]);
+    const matched = !needle
+      ? items
+      : items.filter((r) =>
+          [r.full_id, r.id, r.storage_name, r.description, r.created_by]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase()
+            .includes(needle),
+        );
+    return sortByCreated(matched, sort);
+  }, [items, q, sort]);
 
   async function confirmDelete() {
     if (!deleteTarget) return;
@@ -99,20 +105,21 @@ export function CatalogList({
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="relative max-w-sm flex-1">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder={`Search ${noun}s…`}
-            className="h-9 w-full rounded-md border border-input bg-transparent pl-8 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+            className="h-10 w-full rounded-md border border-input bg-background pl-9 pr-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
           />
         </div>
-        <div className="flex items-center gap-1 rounded-md border border-border p-0.5">
+        <SortSelect value={sort} onValueChange={setSort} />
+        <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
           <button
             onClick={() => setViewPersist("rows")}
-            className={cn("rounded p-1.5 transition-colors", view === "rows" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50")}
+            className={cn("inline-flex items-center justify-center px-2.5 transition-colors", view === "rows" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50")}
             title="List view"
             aria-label="List view"
             aria-pressed={view === "rows"}
@@ -121,7 +128,7 @@ export function CatalogList({
           </button>
           <button
             onClick={() => setViewPersist("grid")}
-            className={cn("rounded p-1.5 transition-colors", view === "grid" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50")}
+            className={cn("inline-flex items-center justify-center border-l border-input px-2.5 transition-colors", view === "grid" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50")}
             title="Grid view"
             aria-label="Grid view"
             aria-pressed={view === "grid"}

@@ -663,7 +663,9 @@ export type StorageRecord = {
 
 // ---- Datasets (Autotrain) ----
 
-export type DatasetKind = "upload" | "s3" | "hf" | "label" | "tts_packed";
+// "hosted" = a HuggingFace-mirror dataset repo pushed directly (hf upload /
+// push_to_hub), surfaced in the Datasets list alongside Autotrain datasets.
+export type DatasetKind = "upload" | "s3" | "hf" | "label" | "tts_packed" | "hosted";
 
 export type DatasetRecord = {
   id: string;
@@ -965,6 +967,19 @@ export type CatalogRecord = {
   updated_at: string;
   created_by: string;
   files?: CatalogFile[] | null;
+  // Versioned repos (mirror-native pushes) have named overwriteable branches;
+  // flat repos (registered/published) are single-`main`. `revision` echoes which
+  // branch the files/sha reflect.
+  versioned?: boolean;
+  default_branch?: string;
+  revision?: string | null;
+};
+
+export type CatalogRef = {
+  name: string;
+  sha?: string | null;
+  num_files?: number | null;
+  size_bytes?: number | null;
 };
 
 export type CreateCatalogRequest = {
@@ -982,6 +997,18 @@ export type UpdateCatalogRequest = {
   description?: string | null;
   storage_id?: string | null;
   prefix?: string | null;
+};
+
+export type CatalogDataPreview = {
+  configs: string[];
+  config: string;
+  splits: string[];
+  split: string;
+  columns: string[];
+  rows: Record<string, unknown>[];
+  num_rows: number; // rows in the previewed shard
+  shards: number;
+  error?: string | null;
 };
 
 export type AdminUserRecord = {

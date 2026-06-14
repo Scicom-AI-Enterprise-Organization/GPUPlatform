@@ -43,6 +43,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-select";
 
 // Status pill — soft tint + matching text + neutral border (matches Benchmark).
 const STATUS_PILL: Record<string, string> = {
@@ -100,6 +101,7 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
   const router = useRouter();
   const [q, setQ] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
+  const [sort, setSort] = useState<SortDir>("newest");
   const [view, setView] = useState<"rows" | "grid">("grid");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
@@ -140,13 +142,15 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
       .map(({ run }) => run);
   }, [haystacks, q, status]);
 
+  const sorted = useMemo(() => sortByCreated(filtered, sort), [filtered, sort]);
+
   const hasFilter = q.trim().length > 0 || status !== "all";
 
-  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
   // Clamp in render so a shrinking result set never strands an empty page; the
   // search/filter handlers reset to page 1 directly.
   const currentPage = Math.min(page, pageCount);
-  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const paged = sorted.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   const onRename = async () => {
     if (!renameTarget) return;
@@ -236,6 +240,7 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
             ))}
           </SelectContent>
         </Select>
+        <SortSelect value={sort} onValueChange={setSort} />
         <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
           <button
             type="button"

@@ -30,6 +30,8 @@ import type {
   CreateProviderRequest,
   CreateStorageRequest,
   CatalogRecord,
+  CatalogRef,
+  CatalogDataPreview,
   CreateCatalogRequest,
   UpdateCatalogRequest,
   CatalogRepoType,
@@ -670,11 +672,29 @@ export const gateway = {
     if (repoType) q.set("repo_type", repoType);
     return request<CatalogRecord[]>(`/v1/catalog?${q.toString()}`);
   },
-  getCatalogRepo: (id: string) =>
-    request<CatalogRecord>(`/v1/catalog/${encodeURIComponent(id)}`),
+  getCatalogRepo: (id: string, revision?: string) => {
+    const q = revision ? `?revision=${encodeURIComponent(revision)}` : "";
+    return request<CatalogRecord>(`/v1/catalog/${encodeURIComponent(id)}${q}`);
+  },
+  /** Branches of a versioned repo (head `main` + each named revision). */
+  listCatalogRefs: (id: string) =>
+    request<{ branches: CatalogRef[] }>(`/v1/catalog/${encodeURIComponent(id)}/refs`),
+  /** Parquet row preview for a hosted dataset repo (config/subset + split). */
+  getCatalogData: (
+    id: string,
+    params: { config?: string; split?: string; offset?: number; limit?: number } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (params.config) q.set("config", params.config);
+    if (params.split) q.set("split", params.split);
+    if (params.offset != null) q.set("offset", String(params.offset));
+    if (params.limit != null) q.set("limit", String(params.limit));
+    return request<CatalogDataPreview>(`/v1/catalog/${encodeURIComponent(id)}/data?${q.toString()}`);
+  },
   /** Resolve a repo by its HF id (repo_type + namespace/name) for name-based URLs. */
-  lookupCatalogRepo: (repoType: CatalogRepoType, namespace: string, name: string) => {
+  lookupCatalogRepo: (repoType: CatalogRepoType, namespace: string, name: string, revision?: string) => {
     const q = new URLSearchParams({ repo_type: repoType, namespace, name });
+    if (revision) q.set("revision", revision);
     return request<CatalogRecord>(`/v1/catalog/lookup?${q.toString()}`);
   },
   createCatalogRepo: (body: CreateCatalogRequest) =>

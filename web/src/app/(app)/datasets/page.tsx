@@ -5,7 +5,7 @@ import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
 import { ScopeToggle } from "@/components/scope-toggle";
 import { gateway } from "@/lib/gateway";
-import type { DatasetRecord } from "@/lib/types";
+import type { CatalogRecord, DatasetRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { DatasetsList } from "./datasets-list";
@@ -21,6 +21,35 @@ async function loadDatasets(
   }
 }
 
+async function loadHosted(scope: "mine" | "all"): Promise<CatalogRecord[]> {
+  try {
+    return await gateway.listCatalog(scope, "dataset");
+  } catch {
+    return [];
+  }
+}
+
+/** Adapt a HF-mirror dataset repo into a DatasetRecord so it lives in the one
+ * Datasets list (kind="hosted" → card links to /datasets/hosted/<ns>/<name>). */
+function hostedToDataset(r: CatalogRecord): DatasetRecord {
+  return {
+    id: r.id,
+    name: r.full_id, // "ns/name" — the card splits this for the hosted detail URL
+    kind: "hosted",
+    storage_id: r.storage_id ?? null,
+    storage_name: r.storage_name ?? null,
+    size_bytes: r.size_bytes ?? null,
+    num_rows: null, // it's files, not rows — don't show a misleading rows count
+    audio_field: "",
+    transcription_field: "",
+    description: r.description ?? null,
+    catalog_repo_id: r.id,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    created_by: r.created_by,
+  };
+}
+
 export default async function DatasetsPage({
   searchParams,
 }: {
@@ -32,10 +61,17 @@ export default async function DatasetsPage({
   const scope: "mine" | "all" =
     me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
-  const [{ items, error }, username] = await Promise.all([
+  const hasCatalog = !!me?.sections?.catalog;
+  const [{ items: autotrain, error }, hostedAll, username] = await Promise.all([
     noAccess ? Promise.resolve({ items: [], error: null }) : loadDatasets(scope),
+    !noAccess && hasCatalog ? loadHosted(scope) : Promise.resolve<CatalogRecord[]>([]),
     currentUsername(),
   ]);
+  // Merge HF-mirror dataset repos into the one list, EXCLUDING those already
+  // shown as a published Autotrain dataset (dedup on catalog_repo_id).
+  const linkedRepoIds = new Set(autotrain.map((d) => d.catalog_repo_id).filter(Boolean));
+  const standaloneHosted = hostedAll.filter((h) => !linkedRepoIds.has(h.id)).map(hostedToDataset);
+  const items = [...autotrain, ...standaloneHosted];
 
   return (
     <div className="flex h-full flex-col">

@@ -420,6 +420,41 @@ class CatalogRepo(Base):
     manifest: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     num_files: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Revisioned repos (mirror-native pushes) keep extra named branches in
+    # `CatalogRevision` and store file bytes CONTENT-ADDRESSED at `{prefix}/blobs/{oid}`
+    # (so two branches' same-named files don't collide). Flat repos (False — the
+    # default; published/registered-over-existing-data repos) keep the single
+    # `manifest`/`sha` "main" at path-addressed `{prefix}/{path}` (unchanged). The
+    # `manifest`/`sha` above are ALWAYS the head of `default_branch` (main).
+    versioned: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    default_branch: Mapped[str] = mapped_column(String(255), default="main", server_default="main", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class CatalogRevision(Base):
+    """A named, OVERWRITEABLE revision (branch) of a versioned `CatalogRepo` other
+    than the default `main` branch. Each row is a branch's CURRENT file set — a
+    push to that revision overwrites this row's `manifest`/`sha` (not an immutable
+    commit history; main lives denormalized on `CatalogRepo.manifest`). Pulling
+    `revision=<name>` (or its sha) resolves to this manifest; bytes are
+    content-addressed under the repo's `{prefix}/blobs/{oid}` shared with main."""
+    __tablename__ = "catalog_revisions"
+    __table_args__ = (
+        UniqueConstraint("repo_id", "name", name="uq_catalog_revision"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # rev-<hex8>
+    repo_id: Mapped[str] = mapped_column(ForeignKey("catalog_repos.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)  # branch name, e.g. "checkpoint-v1"
+    sha: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    manifest: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    num_files: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -559,6 +594,15 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS catalog_repo_id VARCHAR(64)"
+        ))
+        # Catalog revisions: existing repos stay flat (versioned=false) → no behaviour
+        # change; only mirror-native pushes set versioned=true. catalog_revisions
+        # itself is created by create_all above.
+        await conn.execute(text(
+            "ALTER TABLE catalog_repos ADD COLUMN IF NOT EXISTS versioned BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE catalog_repos ADD COLUMN IF NOT EXISTS default_branch VARCHAR(255) NOT NULL DEFAULT 'main'"
         ))
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)"

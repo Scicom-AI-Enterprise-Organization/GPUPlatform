@@ -30,10 +30,11 @@ export const KIND_LABEL: Record<DatasetKind, string> = {
   hf: "huggingface",
   label: "labeling",
   tts_packed: "tts-packed",
+  hosted: "hf repo",
 };
 
 export function KindIcon({ kind, className }: { kind: DatasetKind; className?: string }) {
-  if (kind === "hf") return <Database className={className} />;
+  if (kind === "hf" || kind === "hosted") return <Database className={className} />;
   if (kind === "s3") return <CloudUpload className={className} />;
   if (kind === "label") return <Tags className={className} />;
   return <FileAudio className={className} />;
@@ -58,10 +59,13 @@ export function DatasetCard({
 }) {
   const avatar = avatarFor(d.name);
   const detail = sourceDetail(d);
+  // A hosted HF-mirror repo (name = "ns/name") links to its name-based detail.
+  const hosted = d.kind === "hosted";
+  const href = hosted ? `/datasets/hosted/${d.name}` : `/datasets/${encodeURIComponent(d.id)}`;
 
   return (
     <Link
-      href={`/datasets/${encodeURIComponent(d.id)}`}
+      href={href}
       className="group block rounded-xl border border-border bg-card p-4 transition-all hover:border-primary/40 hover:bg-card/80 hover:shadow-md"
     >
       <div className="flex items-start justify-between gap-3">
@@ -103,7 +107,7 @@ export function DatasetCard({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-              {onRename && (
+              {onRename && !hosted && (
                 <DropdownMenuItem onSelect={(e) => { e.preventDefault(); onRename(d); }}>
                   <Pencil className="h-4 w-4" />
                   Rename
@@ -112,7 +116,7 @@ export function DatasetCard({
               {onDelete && (
                 <DropdownMenuItem variant="destructive" onSelect={(e) => { e.preventDefault(); onDelete(d); }}>
                   <Trash2 className="h-4 w-4" />
-                  Delete dataset
+                  {hosted ? "Delete repo" : "Delete dataset"}
                 </DropdownMenuItem>
               )}
             </DropdownMenuContent>

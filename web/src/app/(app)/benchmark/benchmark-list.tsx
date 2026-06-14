@@ -24,6 +24,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-select";
 import { BenchmarkRow } from "./benchmark-row";
 
 /** Pre-compute a flat searchable string per benchmark. Includes name, id,
@@ -63,6 +64,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const router = useRouter();
   const [q, setQ] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
+  const [sort, setSort] = useState<SortDir>("newest");
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
@@ -179,13 +181,15 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
       .map(({ bench }) => bench);
   }, [haystacks, q, status]);
 
+  const sorted = useMemo(() => sortByCreated(filtered, sort), [filtered, sort]);
+
   const hasFilter = q.trim().length > 0 || status !== "all";
 
-  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
   // Clamp in render so a shrinking result set never strands an empty page; the
   // search/filter handlers reset to page 1 directly.
   const currentPage = Math.min(page, pageCount);
-  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const paged = sorted.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   return (
     <div>
@@ -234,6 +238,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
             ))}
           </SelectContent>
         </Select>
+        <SortSelect value={sort} onValueChange={setSort} />
         <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
           <button
             type="button"

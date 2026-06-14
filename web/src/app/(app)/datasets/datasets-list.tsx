@@ -23,6 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-select";
 import { DatasetCard, KIND_LABEL } from "./dataset-card";
 
 /** Flat searchable string per dataset — name, id, kind, source ref, storage,
@@ -52,12 +53,14 @@ const SOURCE_OPTIONS: Array<{ value: "all" | DatasetKind; label: string }> = [
   { value: "s3", label: "S3" },
   { value: "hf", label: "HuggingFace" },
   { value: "label", label: "Labeling" },
+  { value: "hosted", label: "HF repo" },
 ];
 
 export function DatasetsList({ items }: { items: DatasetRecord[] }) {
   const router = useRouter();
   const [q, setQ] = useState("");
   const [source, setSource] = useState<"all" | DatasetKind>("all");
+  const [sort, setSort] = useState<SortDir>("newest");
   const [view, setView] = useState<"rows" | "grid">("grid");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
@@ -94,19 +97,26 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
       .map(({ d }) => d);
   }, [haystacks, q, source]);
 
+  const sorted = useMemo(() => sortByCreated(filtered, sort), [filtered, sort]);
+
   const hasFilter = q.trim().length > 0 || source !== "all";
-  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
   // Clamp in render so a shrinking result set can't strand us on an empty page;
   // searching/filtering resets to page 1 via the change handlers below.
   const currentPage = Math.min(page, pageCount);
-  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const paged = sorted.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   const onDelete = async () => {
     if (!deleteTarget) return;
     setDeleteError(null);
     setDeleting(true);
     try {
-      await gateway.deleteDataset(deleteTarget.id);
+      // A "hosted" item is a HF-mirror catalog repo, not an Autotrain dataset.
+      if (deleteTarget.kind === "hosted") {
+        await gateway.deleteCatalogRepo(deleteTarget.id);
+      } else {
+        await gateway.deleteDataset(deleteTarget.id);
+      }
       setDeleteTarget(null);
       router.refresh();
     } catch (e) {
@@ -183,6 +193,7 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
             ))}
           </SelectContent>
         </Select>
+        <SortSelect value={sort} onValueChange={setSort} />
         <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
           <button
             type="button"

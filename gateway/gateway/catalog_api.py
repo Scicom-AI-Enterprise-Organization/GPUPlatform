@@ -25,8 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import storage_backends as sb
 from .auth import require_section
-from .db import CatalogRepo, Storage, User, get_session
-from .hf_mirror_api import _compute_sha, _is_lfs
+from .db import CatalogRepo, CatalogRevision, Storage, User, get_session
+from .hf_mirror_api import _blob_key, _compute_sha, _is_lfs
 
 logger = logging.getLogger("gateway.catalog")
 
@@ -82,19 +82,28 @@ class CatalogRecord(BaseModel):
     updated_at: str
     created_by: str
     files: Optional[list[CatalogFile]] = None
+    # Versioned repos (mirror-native pushes) have named overwriteable branches;
+    # flat repos (registered/published) are single-`main`. `revision` echoes which
+    # branch the `files`/`sha` below reflect.
+    versioned: bool = False
+    default_branch: str = "main"
+    revision: Optional[str] = None
 
 
 # ---------- helpers -----------------------------------------------------
 
 
 def _to_record(r: CatalogRepo, owner: str, storage_name: Optional[str],
-               with_files: bool = False) -> CatalogRecord:
+               with_files: bool = False, manifest: Optional[list] = None,
+               revision: Optional[str] = None, sha: Optional[str] = None) -> CatalogRecord:
+    # `manifest`/`sha` override the head when a specific revision is requested.
+    use_manifest = manifest if manifest is not None else (r.manifest or [])
     files = None
     if with_files:
         files = [
             CatalogFile(path=e.get("path"), size=e.get("size"),
                         lfs=bool(e.get("lfs")), oid=e.get("oid"))
-            for e in (r.manifest or [])
+            for e in use_manifest
         ]
     return CatalogRecord(
         id=r.id,
@@ -105,16 +114,40 @@ def _to_record(r: CatalogRepo, owner: str, storage_name: Optional[str],
         storage_id=r.storage_id,
         storage_name=storage_name,
         prefix=r.prefix,
-        sha=r.sha,
+        sha=(sha if sha is not None else r.sha),
         private=bool(r.private),
         description=r.description,
         size_bytes=r.size_bytes,
-        num_files=r.num_files,
+        num_files=(len(use_manifest) if manifest is not None else r.num_files),
         created_at=r.created_at.isoformat() if r.created_at else "",
         updated_at=r.updated_at.isoformat() if r.updated_at else "",
         created_by=owner,
         files=files,
+        versioned=bool(getattr(r, "versioned", False)),
+        default_branch=getattr(r, "default_branch", None) or "main",
+        revision=revision,
     )
+
+
+async def _resolve_rev(session: AsyncSession, repo: CatalogRepo,
+                       revision: Optional[str]) -> tuple[Optional[list], Optional[str]]:
+    """(manifest, sha) for a revision, or (None, None) to mean "use the head".
+    main/default/empty → head; else a `CatalogRevision` branch by name or sha; a
+    versioned repo with an unknown revision → 404."""
+    rev = (revision or "").strip()
+    if not getattr(repo, "versioned", False) or rev in ("", "main", repo.default_branch or "main"):
+        return None, None
+    row = (await session.execute(
+        select(CatalogRevision).where(CatalogRevision.repo_id == repo.id, CatalogRevision.name == rev)
+    )).scalar_one_or_none()
+    if row is None:
+        rows = (await session.execute(
+            select(CatalogRevision).where(CatalogRevision.repo_id == repo.id)
+        )).scalars().all()
+        row = next((r for r in rows if r.sha == rev or (r.sha or "").startswith(rev)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"revision {revision} not found")
+    return list(row.manifest or []), row.sha
 
 
 async def _name_maps(session: AsyncSession, rows: list[CatalogRepo]) -> tuple[dict, dict]:
@@ -243,11 +276,13 @@ async def lookup_catalog(
     repo_type: str,
     namespace: str,
     name: str,
+    revision: Optional[str] = None,
     user: User = Depends(_catalog),
     session: AsyncSession = Depends(get_session),
 ):
     """Resolve a repo by its HF id (repo_type + namespace/name) — backs the
-    name-based detail URLs (/models/<ns>/<name>, /datasets/hosted/<ns>/<name>)."""
+    name-based detail URLs (/models/<ns>/<name>, /datasets/hosted/<ns>/<name>).
+    `revision` (a branch name or sha) selects which revision's files to return."""
     res = await session.execute(select(CatalogRepo).where(
         CatalogRepo.repo_type == repo_type,
         CatalogRepo.namespace == namespace,
@@ -256,13 +291,42 @@ async def lookup_catalog(
     repo = res.scalar_one_or_none()
     if repo is None or (repo.owner_id != user.id and not user.is_admin and repo.private):
         raise HTTPException(status_code=404, detail="repo not found")
+    manifest, sha = await _resolve_rev(session, repo, revision)
     owners, stores = await _name_maps(session, [repo])
-    return _to_record(repo, owners.get(repo.owner_id, "?"), stores.get(repo.storage_id), with_files=True)
+    return _to_record(repo, owners.get(repo.owner_id, "?"), stores.get(repo.storage_id),
+                      with_files=True, manifest=manifest, sha=sha,
+                      revision=(revision or None))
+
+
+@router.get("/{repo_id}/refs")
+async def catalog_refs(
+    repo_id: str,
+    user: User = Depends(_catalog),
+    session: AsyncSession = Depends(get_session),
+):
+    """Branches of a versioned repo (the `main`/default head + each `CatalogRevision`).
+    Flat repos return just `main`. Backs the web revision selector."""
+    repo = await session.get(CatalogRepo, repo_id)
+    if repo is None or (repo.owner_id != user.id and not user.is_admin and repo.private):
+        raise HTTPException(status_code=404, detail="repo not found")
+    default = getattr(repo, "default_branch", None) or "main"
+    branches = [{"name": default, "sha": repo.sha, "num_files": repo.num_files,
+                 "size_bytes": repo.size_bytes}]
+    if getattr(repo, "versioned", False):
+        rows = (await session.execute(
+            select(CatalogRevision).where(CatalogRevision.repo_id == repo.id)
+            .order_by(CatalogRevision.name.asc())
+        )).scalars().all()
+        for r in rows:
+            branches.append({"name": r.name, "sha": r.sha, "num_files": r.num_files,
+                             "size_bytes": r.size_bytes})
+    return {"branches": branches}
 
 
 @router.get("/{repo_id}", response_model=CatalogRecord)
 async def get_catalog(
     repo_id: str,
+    revision: Optional[str] = None,
     user: User = Depends(_catalog),
     session: AsyncSession = Depends(get_session),
 ):
@@ -271,8 +335,130 @@ async def get_catalog(
         raise HTTPException(status_code=404, detail="repo not found")
     if repo.owner_id != user.id and not user.is_admin and repo.private:
         raise HTTPException(status_code=404, detail="repo not found")
+    manifest, sha = await _resolve_rev(session, repo, revision)
     owners, stores = await _name_maps(session, [repo])
-    return _to_record(repo, owners.get(repo.owner_id, "?"), stores.get(repo.storage_id), with_files=True)
+    return _to_record(repo, owners.get(repo.owner_id, "?"), stores.get(repo.storage_id),
+                      with_files=True, manifest=manifest, sha=sha,
+                      revision=(revision or None))
+
+
+_SHARD_RE = re.compile(r"^(?P<split>.+?)-\d+-of-\d+\.parquet$")
+
+
+class CatalogDataPreview(BaseModel):
+    configs: list[str]
+    config: str
+    splits: list[str]
+    split: str
+    columns: list[str]
+    rows: list[dict]
+    num_rows: int      # rows in the previewed shard
+    shards: int        # shards for the selected config+split
+    error: Optional[str] = None
+
+
+def _parquet_layout(manifest: list[dict]) -> dict[str, dict[str, list[str]]]:
+    """Group parquet files → {config: {split: [paths]}}. HF push_to_hub writes
+    the default config under `data/` and named configs (subsets) under `{config}/`;
+    the split is the filename prefix (`train-00000-of-00001.parquet`)."""
+    layout: dict[str, dict[str, list[str]]] = {}
+    for e in manifest:
+        p = e.get("path") or ""
+        if not p.endswith(".parquet"):
+            continue
+        parts = p.split("/")
+        fname = parts[-1]
+        config = "default" if (len(parts) < 2 or parts[0] == "data") else parts[0]
+        m = _SHARD_RE.match(fname)
+        split = m.group("split") if m else fname[: -len(".parquet")]
+        layout.setdefault(config, {}).setdefault(split, []).append(p)
+    return layout
+
+
+def _jsonable(v):
+    if isinstance(v, bytes):
+        return f"<{len(v)} bytes>"
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items()}
+    return str(v)
+
+
+def _read_parquet_preview(backend: sb.StorageBackend, key: str, offset: int, limit: int):
+    import io
+    import pyarrow.parquet as pq
+
+    reader = backend.open_reader(key)
+    try:
+        data = reader.read()
+    finally:
+        try:
+            reader.close()
+        except Exception:  # noqa: BLE001
+            pass
+    pf = pq.ParquetFile(io.BytesIO(data))
+    need = max(offset + limit, 1)
+    collected: list[dict] = []
+    for batch in pf.iter_batches(batch_size=min(1000, need)):
+        collected.extend(batch.to_pylist())
+        if len(collected) >= need:
+            break
+    page = collected[offset: offset + limit]
+    rows = [{k: _jsonable(v) for k, v in r.items()} for r in page]
+    return list(pf.schema_arrow.names), rows, int(pf.metadata.num_rows)
+
+
+@router.get("/{repo_id}/data", response_model=CatalogDataPreview)
+async def catalog_data(
+    repo_id: str,
+    config: Optional[str] = None,
+    split: Optional[str] = None,
+    offset: int = 0,
+    limit: int = 20,
+    user: User = Depends(_catalog),
+    session: AsyncSession = Depends(get_session),
+):
+    """Preview the parquet rows of a hosted dataset repo (with subset/config +
+    split selection, HuggingFace-style)."""
+    repo = await session.get(CatalogRepo, repo_id)
+    if repo is None or (repo.owner_id != user.id and not user.is_admin and repo.private):
+        raise HTTPException(status_code=404, detail="repo not found")
+    if repo.repo_type != "dataset":
+        raise HTTPException(status_code=400, detail="data preview is only for dataset repos")
+
+    layout = _parquet_layout(repo.manifest or [])
+    if not layout:
+        return CatalogDataPreview(configs=[], config="", splits=[], split="", columns=[],
+                                  rows=[], num_rows=0, shards=0,
+                                  error="no parquet files found in this repo")
+    configs = sorted(layout)
+    cfg = config if (config and config in layout) else configs[0]
+    splits = sorted(layout[cfg])
+    spl = split if (split and split in layout[cfg]) else splits[0]
+    shards = layout[cfg][spl]
+
+    store = await session.get(Storage, repo.storage_id) if repo.storage_id else None
+    if store is None:
+        raise HTTPException(status_code=400, detail="repo has no storage")
+    # parquet files are LFS-tracked → resolve the real storage key (.hf-lfs/<oid>
+    # or blobs/<oid> for versioned repos) from the manifest entry, not the path.
+    entry = next((e for e in (repo.manifest or []) if e.get("path") == shards[0]), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="shard not found in manifest")
+    try:
+        backend = await run_in_threadpool(sb.resolve_backend, store)
+        columns, rows, nrows = await run_in_threadpool(
+            _read_parquet_preview, backend, _blob_key(repo, entry), max(0, offset), max(1, min(limit, 200)),
+        )
+    except Exception as e:  # noqa: BLE001
+        return CatalogDataPreview(configs=configs, config=cfg, splits=splits, split=spl, columns=[],
+                                  rows=[], num_rows=0, shards=len(shards),
+                                  error=f"could not read parquet: {e}")
+    return CatalogDataPreview(configs=configs, config=cfg, splits=splits, split=spl,
+                              columns=columns, rows=rows, num_rows=nrows, shards=len(shards))
 
 
 @router.patch("/{repo_id}", response_model=CatalogRecord)

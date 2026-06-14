@@ -32,6 +32,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Pagination } from "@/components/ui/pagination";
+import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-select";
 import type { AppRecord } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
@@ -50,6 +51,7 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
   const [deleting, setDeleting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [sort, setSort] = useState<SortDir>("newest");
   const [view, setView] = useState<"rows" | "grid">("grid");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
@@ -88,11 +90,13 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
     });
   }, [apps, q]);
 
-  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const sorted = useMemo(() => sortByCreated(filtered, sort), [filtered, sort]);
+
+  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
   // Clamp in render so a shrinking result set never strands an empty page; the
   // search handlers reset to page 1 directly.
   const currentPage = Math.min(page, pageCount);
-  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const paged = sorted.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   const onDeleteSelected = async () => {
     if (selected.size === 0) return;
@@ -154,6 +158,7 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
             </button>
           )}
         </div>
+        <SortSelect value={sort} onValueChange={setSort} />
         <div className="inline-flex h-10 items-stretch overflow-hidden rounded-md border border-input bg-background shadow-xs">
           <button
             type="button"

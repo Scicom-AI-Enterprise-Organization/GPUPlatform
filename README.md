@@ -268,12 +268,23 @@ export HF_ENDPOINT=http://<gateway>:8080/hf
 export HF_TOKEN=sgpu_...                               # a platform API key
 huggingface_hub.snapshot_download("ns/name")           # read
 from_pretrained("ns/name")  /  load_dataset("ns/name") # read (model / dataset)
-model.push_to_hub("ns/name")  /  hf upload ns/name .   # write (overwrites main)
+model.push_to_hub("ns/name")  /  hf upload ns/name .   # write (overwrites the branch)
 ```
 
-The bytes live in a `Storage` backend; the file list is the repo's `manifest`. Regular files are stored at `{prefix}/{path}`, large files content-addressed via Git-LFS at `{prefix}/.hf-lfs/{oid}`.
+The bytes live in a `Storage` backend; the file list is the repo's `manifest`. Large files are content-addressed via Git-LFS at `{prefix}/.hf-lfs/{oid}`; regular files are stored content-addressed at `{prefix}/blobs/{oid}` (versioned repos) or at `{prefix}/{path}` (flat repos — see below).
 
-**Revision — always `main`.** The catalog is deliberately single-revision: there are **no branches, tags, commits, or PRs**. Every request that carries a revision — `from_pretrained("ns/name", revision="v1.0")`, `snapshot_download(..., revision="abc123")`, an `@branch` ref, `--revision …` — is **accepted and resolves to `main`** (it won't 404), so existing tooling/configs that pin a revision keep working; the revision is simply ignored. To "publish a new version", **push again** — it overwrites `main`. (If you need true versioning/pinning, use real `huggingface.co` for that repo instead.) The API reports a synthetic `sha` (sha1 over the sorted file manifest) so HF clients have a stable commit id to cache against, but it always points at the one stored snapshot.
+**Revisions — named, overwriteable branches.** A repo **created by pushing through the mirror** is *versioned*: it supports multiple named branches, each an independent **overwriteable** snapshot (no immutable commit history / PRs — this isn't full git):
+
+```bash
+hf_api.create_branch("ns/name", branch="checkpoint-v1")
+hf_api.upload_folder("ns/name", folder_path=".", revision="checkpoint-v1")  # write that branch
+snapshot_download("ns/name", revision="checkpoint-v1")                       # or revision=<sha> / "main"
+huggingface_hub.list_repo_refs("ns/name")                                    # branches + tags
+```
+
+Pushing to `main` overwrites `main`; pushing to `checkpoint-v1` overwrites that branch — each is independent (same-named files don't collide; bytes are content-addressed + shared across branches by content hash). Resolve a revision by **branch name or commit sha** (full or abbreviated); an unknown revision 404s `RevisionNotFound`.
+
+A repo **registered over existing data** — via `POST /v1/catalog` or **Publish an Autotrain dataset** (its prefix *is* the dataset's real S3 layout) — stays *flat*: single `main`, path-addressed at `{prefix}/{path}`, and any `revision` you pass resolves to `main` (it won't 404). Flat repos can't have branches. *(Garbage collection of blobs orphaned by branch overwrites/deletes is not yet implemented — storage grows; a follow-up.)*
 
 ## Benchmark
 

@@ -1,15 +1,22 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  Check, Copy, Database, FileText, Lock, Package, RefreshCw, Search, Trash2,
+  Check, Copy, Database, FileText, Loader2, Lock, Package, RefreshCw, Search, Trash2,
 } from "lucide-react";
 import { gateway } from "@/lib/gateway";
-import type { CatalogRecord } from "@/lib/types";
+import type { CatalogDataPreview, CatalogFile, CatalogRecord, CatalogRef } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Pagination } from "@/components/ui/pagination";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Dialog,
@@ -75,10 +82,25 @@ export function CatalogDetail({
 
   const endpoint = `${gatewayUrl.replace(/\/$/, "")}/hf`;
   const isDataset = repo.repo_type === "dataset";
-  const files = repo.files ?? [];
+
+  // Revision selector (versioned repos only): the page server-fetches the head;
+  // switching a branch client-fetches that revision's files. Flat repos have just
+  // `main` and no selector.
+  const defaultBranch = repo.default_branch || "main";
+  const [revision, setRevision] = useState(repo.revision || defaultBranch);
+  const [files, setFiles] = useState<CatalogFile[]>(repo.files ?? []);
+  const [sha, setSha] = useState<string | null | undefined>(repo.sha);
+  const [branches, setBranches] = useState<CatalogRef[]>([]);
+  const [revBusy, setRevBusy] = useState(false);
+
+  useEffect(() => {
+    if (!repo.versioned) return;
+    gateway.listCatalogRefs(repo.id).then((r) => setBranches(r.branches)).catch(() => {});
+  }, [repo.id, repo.versioned]);
 
   const tabs = [
     { value: "overview", label: "Overview" },
+    ...(isDataset ? [{ value: "data", label: "Data" }] : []),
     { value: "files", label: "Files" },
   ];
   const valid = tabs.map((t) => t.value);
@@ -103,6 +125,21 @@ export function CatalogDetail({
   const [fileQ, setFileQ] = useState("");
   const [filePage, setFilePage] = useState(1);
   const [filePageSize, setFilePageSize] = useState(50);
+
+  async function selectRevision(rev: string) {
+    setRevision(rev);
+    setRevBusy(true);
+    try {
+      const r = await gateway.getCatalogRepo(repo.id, rev);
+      setFiles(r.files ?? []);
+      setSha(r.sha);
+      setFilePage(1);
+    } catch {
+      /* keep the current view on error */
+    } finally {
+      setRevBusy(false);
+    }
+  }
   const filteredFiles = useMemo(() => {
     const q = fileQ.trim().toLowerCase();
     return q ? files.filter((f) => f.path.toLowerCase().includes(q)) : files;
@@ -195,10 +232,29 @@ export function CatalogDetail({
         )}
 
         <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
-          <Kpi label="Files" value={String(repo.num_files ?? files.length)} />
+          <Kpi label="Files" value={String(files.length)} />
           <Kpi label="Size" value={fmtBytes(repo.size_bytes)} />
           <Kpi label="Storage" value={repo.storage_name ?? repo.storage_id ?? "—"} />
-          <Kpi label="Revision" value={<span className="font-mono text-base">{(repo.sha ?? "").slice(0, 12) || "—"}</span>} />
+          {repo.versioned && branches.length > 1 ? (
+            <Kpi label="Revision" value={
+              <Select value={revision} onValueChange={selectRevision} disabled={revBusy}>
+                <SelectTrigger className="h-7 w-full font-mono text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {branches.map((b) => (
+                    <SelectItem key={b.name} value={b.name} className="font-mono text-xs">
+                      {b.name}{b.name === defaultBranch ? " (default)" : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            } />
+          ) : (
+            <Kpi label={repo.versioned ? "Branch · commit" : "Revision"} value={
+              <span className="font-mono text-base">
+                {(repo.versioned ? `${revision} · ` : "") + ((sha ?? "").slice(0, 12) || "—")}
+              </span>
+            } />
+          )}
         </div>
 
         <Tabs value={tab} onValueChange={setTab} className="mt-4">
@@ -244,6 +300,12 @@ export function CatalogDetail({
               </div>
             </section>
           </TabsContent>
+
+          {isDataset && (
+            <TabsContent value="data" className="!flex-none">
+              <DataPreview repoId={repo.id} />
+            </TabsContent>
+          )}
 
           <TabsContent value="files" className="!flex-none space-y-3">
             <div className="flex items-baseline gap-3 border-b border-border pb-2">
@@ -329,5 +391,154 @@ export function CatalogDetail({
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+function cellText(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
+/** Parquet row preview for a dataset repo, with subset (config) + split pickers. */
+function DataPreview({ repoId }: { repoId: string }) {
+  const LIMIT = 20;
+  // undefined = "let the server pick the default"; a value = user-selected.
+  const [config, setConfig] = useState<string | undefined>(undefined);
+  const [split, setSplit] = useState<string | undefined>(undefined);
+  const [offset, setOffset] = useState(0);
+  const [data, setData] = useState<CatalogDataPreview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancel = false;
+    setLoading(true);
+    setError(null);
+    gateway
+      .getCatalogData(repoId, { config, split, offset, limit: LIMIT })
+      .then((d) => {
+        if (cancel) return;
+        setData(d);
+        if (d.error) setError(d.error);
+      })
+      .catch((e) => !cancel && setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => !cancel && setLoading(false));
+    return () => {
+      cancel = true;
+    };
+  }, [repoId, config, split, offset]);
+
+  const curConfig = config ?? data?.config ?? "";
+  const curSplit = split ?? data?.split ?? "";
+  const columns = data?.columns ?? [];
+  const rows = data?.rows ?? [];
+  const total = data?.num_rows ?? 0;
+  const start = total === 0 ? 0 : offset + 1;
+  const end = Math.min(offset + LIMIT, total);
+
+  return (
+    <section className="space-y-3">
+      {loading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" /> loading rows…
+        </div>
+      ) : error ? (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            {(data?.configs?.length ?? 0) > 1 && (
+              <Select
+                value={curConfig}
+                onValueChange={(v) => {
+                  setConfig(v);
+                  setSplit(undefined);
+                  setOffset(0);
+                }}
+              >
+                <SelectTrigger className="h-9 w-[180px]" title="Subset (config)">
+                  <SelectValue placeholder="Subset" />
+                </SelectTrigger>
+                <SelectContent>
+                  {data!.configs.map((c) => (
+                    <SelectItem key={c} value={c}>{c}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            {(data?.splits?.length ?? 0) > 1 && (
+              <Select
+                value={curSplit}
+                onValueChange={(v) => {
+                  setSplit(v);
+                  setOffset(0);
+                }}
+              >
+                <SelectTrigger className="h-9 w-[150px]" title="Split">
+                  <SelectValue placeholder="Split" />
+                </SelectTrigger>
+                <SelectContent>
+                  {data!.splits.map((s) => (
+                    <SelectItem key={s} value={s}>{s}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            <span className="text-xs text-muted-foreground">
+              <span className="font-mono">{curConfig}</span> / <span className="font-mono">{curSplit}</span>
+              {(data?.shards ?? 0) > 1 && <> · {data!.shards} shards (previewing the first)</>}
+            </span>
+          </div>
+          {columns.length === 0 ? (
+            <p className="py-10 text-center text-sm text-muted-foreground">No rows.</p>
+          ) : (
+            <>
+          <div className="overflow-x-auto rounded-lg border border-border scrollbar-thin">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-border bg-muted/40 text-left">
+                  <th className="px-3 py-2 text-xs font-medium text-muted-foreground">#</th>
+                  {columns.map((c) => (
+                    <th key={c} className="px-3 py-2 font-mono text-xs font-medium">{c}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, i) => (
+                  <tr key={offset + i} className="border-b border-border/60 last:border-0 align-top">
+                    <td className="px-3 py-2 text-xs tabular-nums text-muted-foreground">{offset + i}</td>
+                    {columns.map((c) => (
+                      <td key={c} className="max-w-[28rem] truncate px-3 py-2 font-mono text-xs" title={cellText(row[c])}>
+                        {cellText(row[c])}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              Showing <span className="font-medium text-foreground">{start}</span>–
+              <span className="font-medium text-foreground">{end}</span> of{" "}
+              <span className="font-medium text-foreground">{total.toLocaleString()}</span> rows
+            </span>
+            <div className="flex gap-1">
+              <Button variant="outline" size="sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - LIMIT))}>
+                Prev
+              </Button>
+              <Button variant="outline" size="sm" disabled={end >= total} onClick={() => setOffset(offset + LIMIT)}>
+                Next
+              </Button>
+            </div>
+          </div>
+            </>
+          )}
+        </>
+      )}
+    </section>
   );
 }

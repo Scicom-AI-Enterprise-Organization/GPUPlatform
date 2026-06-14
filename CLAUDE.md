@@ -94,13 +94,18 @@ the gateway: a Hub-compatible mirror at **`/hf`** (`hf_mirror_api.py`) + a manag
 `/models/{ns}/{name}`). `export HF_ENDPOINT=<gw>/hf` + `HF_TOKEN=sgpu_…`, then `snapshot_download` /
 `from_pretrained` / `load_dataset` / `push_to_hub` just work.
 
-⚠️ **The catalog is single-revision: always `main`.** No branches/tags/commits/PRs. Every mirror
-route takes a `{revision}` path param but **ignores it** (`# noqa: ARG001 — single revision`) and
-serves the one stored `main` manifest — so a client passing `revision=…`/`@ref`/`--revision`
-won't 404, it just always gets `main`. To "version", push again (overwrites `main`). This is
-**different from a `kind=hf` Dataset's `hf_revision`**, which pins a real commit/branch/tag on
-`huggingface.co`. Don't conflate them. (Adding real versioning to the catalog = a big feature;
-don't assume it exists.)
+**Revisions (added 2026-06-14).** A repo **created by pushing through the mirror** is *versioned*
+(`CatalogRepo.versioned=True`): named, **overwriteable** branches (push to `main` / `checkpoint-v1`
+— each independent, NOT immutable commit history), content-addressed blobs at `{prefix}/blobs/{oid}`,
+extra branches in the `CatalogRevision` table (`main` stays denormalized on `CatalogRepo.manifest`).
+Resolve a revision by branch name OR commit sha; `list_repo_refs`/`create_branch`/`delete_branch` work.
+A repo **registered over existing data** (`/v1/catalog` or **Publish dataset** — prefix is the real
+S3 layout) stays *flat* (`versioned=False`): single `main`, path-addressed `{prefix}/{path}`, any
+`revision` resolves to `main`. The `versioned` flag branches every read/write path in
+`hf_mirror_api.py` (`_resolve_revision`, `_blob_key`, `_commit_impl`). Verified via the real `hf`
+client (huggingface_hub 1.17.0). Blob GC (orphans from overwrites/deletes) is NOT implemented yet.
+⚠️ Still **different from a `kind=hf` Dataset's `hf_revision`**, which pins a real commit/branch/tag
+on `huggingface.co` — don't conflate.
 
 ### Testing the gateway locally (current `.env` reality)
 
