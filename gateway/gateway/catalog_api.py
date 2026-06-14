@@ -263,6 +263,11 @@ async def create_catalog(
         manifest=manifest,
         size_bytes=total,
         num_files=len(manifest),
+        # A brand-new EMPTY repo is mirror-native → versioned (supports named
+        # overwriteable branches: main / checkpoint-v1 / …). Registering over a
+        # prefix that ALREADY holds files (manifest non-empty) is real path-addressed
+        # data → stays flat (main-only).
+        versioned=(len(manifest) == 0),
     )
     session.add(repo)
     await session.commit()

@@ -9,6 +9,7 @@ import type { CatalogRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { CatalogList } from "@/components/catalog/catalog-list";
+import { PushHint } from "@/components/catalog/push-hint";
 
 async function loadRepos(
   scope: "mine" | "all",
@@ -36,6 +37,7 @@ export default async function ModelsPage({
     noAccess ? Promise.resolve({ items: [], error: null }) : loadRepos(scope),
     currentUsername(),
   ]);
+  const gatewayUrl = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
   return (
     <div className="flex h-full flex-col">
@@ -49,13 +51,14 @@ export default async function ModelsPage({
               standard <span className="font-mono text-xs">huggingface_hub</span> /{" "}
               <span className="font-mono text-xs">hf</span> CLI by pointing{" "}
               <span className="font-mono text-xs">HF_ENDPOINT</span> at this gateway.
-              Datasets live under <span className="font-mono text-xs">Datasets</span>.
             </p>
           </div>
           {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
+
+        {!noAccess && <PushHint gatewayUrl={gatewayUrl} repoType="model" />}
 
         {error && !noAccess && (
           <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">

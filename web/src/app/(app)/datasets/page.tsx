@@ -9,6 +9,7 @@ import type { CatalogRecord, DatasetRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { DatasetsList } from "./datasets-list";
+import { PushHint } from "@/components/catalog/push-hint";
 
 async function loadDatasets(
   scope: "mine" | "all",
@@ -72,6 +73,7 @@ export default async function DatasetsPage({
   const linkedRepoIds = new Set(autotrain.map((d) => d.catalog_repo_id).filter(Boolean));
   const standaloneHosted = hostedAll.filter((h) => !linkedRepoIds.has(h.id)).map(hostedToDataset);
   const items = [...autotrain, ...standaloneHosted];
+  const gatewayUrl = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
   return (
     <div className="flex h-full flex-col">
@@ -89,6 +91,8 @@ export default async function DatasetsPage({
         </div>
 
         {noAccess && <NoAccessAlert />}
+
+        {!noAccess && hasCatalog && <PushHint gatewayUrl={gatewayUrl} repoType="dataset" />}
 
         {error && !noAccess && (
           <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -109,7 +113,7 @@ export default async function DatasetsPage({
               <Button asChild size="sm">
                 <Link href="/datasets/new">
                   <Plus className="h-4 w-4" />
-                  Register dataset
+                  New dataset
                 </Link>
               </Button>
             </div>
@@ -119,7 +123,7 @@ export default async function DatasetsPage({
                 <Inbox className="h-6 w-6 text-muted-foreground/60" />
                 <p className="text-sm text-muted-foreground">
                   No datasets yet. Click{" "}
-                  <span className="font-medium text-foreground">Register dataset</span>{" "}
+                  <span className="font-medium text-foreground">New dataset</span>{" "}
                   to add one.
                 </p>
               </div>

@@ -90,7 +90,11 @@ export function CatalogDetail({
   const [revision, setRevision] = useState(repo.revision || defaultBranch);
   const [files, setFiles] = useState<CatalogFile[]>(repo.files ?? []);
   const [sha, setSha] = useState<string | null | undefined>(repo.sha);
-  const [branches, setBranches] = useState<CatalogRef[]>([]);
+  // Seed with the default branch so a fresh versioned repo shows "main" in the
+  // picker immediately (the full list loads from /refs just after).
+  const [branches, setBranches] = useState<CatalogRef[]>(
+    repo.versioned ? [{ name: defaultBranch, sha: repo.sha }] : [],
+  );
   const [revBusy, setRevBusy] = useState(false);
 
   useEffect(() => {
@@ -235,7 +239,7 @@ export function CatalogDetail({
           <Kpi label="Files" value={String(files.length)} />
           <Kpi label="Size" value={fmtBytes(repo.size_bytes)} />
           <Kpi label="Storage" value={repo.storage_name ?? repo.storage_id ?? "—"} />
-          {repo.versioned && branches.length > 1 ? (
+          {repo.versioned && branches.length > 0 ? (
             <Kpi label="Revision" value={
               <Select value={revision} onValueChange={selectRevision} disabled={revBusy}>
                 <SelectTrigger className="h-7 w-full font-mono text-xs"><SelectValue /></SelectTrigger>

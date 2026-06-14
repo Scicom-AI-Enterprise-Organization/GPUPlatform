@@ -67,7 +67,9 @@ export function CatalogForm({
         private: isPrivate,
         description: description.trim() || null,
       });
-      router.push(`${detailBase}/${repo.id}`);
+      // Detail routes are name-based (/models/{ns}/{name}), NOT by repo id —
+      // pushing `${detailBase}/${repo.id}` 404s.
+      router.push(`${detailBase}/${repo.full_id}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setSubmitting(false);
