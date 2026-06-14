@@ -90,6 +90,37 @@ class AuditLog(Base):
     )
 
 
+class WorkerEvent(Base):
+    """Durable per-worker lifecycle timeline — the persistent twin of the Redis
+    `worker_events:{mid}` ring (which has a 1h TTL and vanishes once the worker
+    stops heartbeating). One row per lifecycle transition so analytics can
+    reconstruct when an endpoint was *actually serving* (provisioned →
+    terminated spans) long after the worker is gone — e.g. a calendar-style
+    on/off canvas per endpoint.
+
+    `event` is a short stable key (see `_classify_worker_event`); `message` is
+    the human string mirrored from the Redis ring. System-driven events
+    (autoscaler scale-up / idle-teardown) have a NULL `actor_username`;
+    user-triggered ones (kill / purge / redeploy / delete) stamp the actor.
+    Grows fast under churn, hence a BigInteger PK and indexed (app_id,
+    created_at) for range scans.
+    """
+    __tablename__ = "worker_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    app_id: Mapped[str] = mapped_column(String(64), index=True)
+    machine_id: Mapped[str] = mapped_column(String(128), index=True)
+    # Stable key: "provisioned" | "registered" | "scaled_up" | "scaled_down"
+    # | "idle_terminated" | "drained" | "terminated" | "terminate_failed" | …
+    event: Mapped[str] = mapped_column(String(48), index=True)
+    level: Mapped[str] = mapped_column(String(16), default="info")
+    message: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    actor_username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    details: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
 class App(Base):
     __tablename__ = "apps"
     app_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -749,6 +780,13 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_token_secret VARCHAR(128)"
+        ))
+        # Worker lifecycle timeline: the calendar/analytics query is always
+        # "events for app X between t0 and t1", so a composite (app_id,
+        # created_at) index serves it without scanning the whole table.
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_events_app_created "
+            "ON worker_events(app_id, created_at)"
         ))
         # GitOps: one ledger row per (repo, kind, manifest name). Tables are
         # created fresh by create_all above; the unique index is what the

@@ -632,6 +632,130 @@ const fmtTime = (d: Date | null): string =>
     ? `${localDate(d)} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`
     : "—";
 
+// ── GPU Timeline (inference worker on/off spans) ─────────────────────────────
+// Raw durable worker lifecycle events from /admin/worker-events, paired into
+// serving spans per worker so the timeline can draw one bar per worker life.
+type WorkerEvt = {
+  app_id: string;
+  machine_id: string;
+  event: string;
+  level: string;
+  message: string | null;
+  actor: string | null;
+  ts: string; // ISO
+};
+type WorkerSpan = {
+  mid: string;
+  start: number; // epoch ms
+  end: number | null; // null = still serving (no terminate event seen)
+  endReason: string | null; // event key that closed the span
+  actor: string | null; // who triggered the teardown (or brought it up)
+  running: boolean;
+};
+type GpuTimelineRow = { app: string; spans: WorkerSpan[] };
+type AppMeta = { name: string; node: string; gpu: string | null; gpu_ids: number[] };
+// A benchmark run = one GPU workload with a [started, ended] span.
+type BenchSpan = {
+  id: string;
+  name: string;
+  node: string;
+  gpu_ids: number[];
+  status: string; // queued | running | done | failed | cancelled
+  owner: string | null;
+  started: string | null; // ISO
+  ended: string | null; // ISO, null = still running
+};
+type WorkloadKind = "inference" | "benchmark";
+// A GPU lane = one horizontal row for a single (node, GPU) within a day.
+type GpuLane = { node: string; gpu: number };
+// One calendar event block = a workload's span clipped to a single day,
+// spanning the contiguous GPU lanes it occupies (laneStart .. laneStart+laneSpan).
+type CalBlock = {
+  label: string; // endpoint or benchmark name
+  node: string;
+  ref: string; // worker machine_id (inference) or benchmark id
+  kind: WorkloadKind;
+  status: string; // running/served (inference) or run status (benchmark)
+  start: number; // epoch ms, clipped to [day 00:00, day 24:00]
+  end: number; // epoch ms
+  running: boolean;
+  laneStart: number; // index into the day's lane list
+  laneSpan: number; // how many GPU lanes the block covers
+  gpuLabel: string; // e.g. "0–3" or "4" or "all"
+};
+type CalDay = { date: string; lanes: GpuLane[]; blocks: CalBlock[] };
+
+// Block colour by workload type + status. Inference: green=running, indigo=served.
+// Benchmark: amber=running, sky=done, rose=failed, slate=cancelled/other.
+function blockClass(b: { kind: WorkloadKind; status: string; running: boolean }): string {
+  if (b.kind === "benchmark") {
+    switch (b.status) {
+      case "running":
+        return "border-amber-400/40 bg-amber-500";
+      case "done":
+        return "border-teal-400/40 bg-teal-600";
+      case "failed":
+        return "border-rose-400/40 bg-rose-600";
+      default: // cancelled / queued / anything else
+        return "border-slate-400/40 bg-slate-500";
+    }
+  }
+  return b.running ? "border-emerald-400/40 bg-emerald-600" : "border-indigo-400/40 bg-indigo-600";
+}
+
+// 12-hour clock like Google Calendar — "6:12pm", "5am".
+const fmt12 = (ms: number): string => {
+  const d = new Date(ms);
+  let h = d.getHours();
+  const m = d.getMinutes();
+  const ap = h < 12 ? "am" : "pm";
+  h = h % 12 || 12;
+  return m === 0 ? `${h}${ap}` : `${h}:${String(m).padStart(2, "0")}${ap}`;
+};
+const DAY_MS = 86_400_000;
+
+const WORKER_ON = new Set(["provisioned", "registered", "scaled_up"]);
+const WORKER_OFF = new Set(["terminated", "idle_terminated", "terminate_failed"]);
+
+/** Group raw events by endpoint → worker, then collapse each worker's events
+ *  into a single [first on → last off] serving span. A worker with no off event
+ *  in the window is treated as still running (open-ended). */
+function buildGpuTimeline(events: WorkerEvt[]): GpuTimelineRow[] {
+  const byApp = new Map<string, Map<string, WorkerEvt[]>>();
+  for (const ev of events) {
+    if (!byApp.has(ev.app_id)) byApp.set(ev.app_id, new Map());
+    const machines = byApp.get(ev.app_id)!;
+    if (!machines.has(ev.machine_id)) machines.set(ev.machine_id, []);
+    machines.get(ev.machine_id)!.push(ev);
+  }
+  const rows: GpuTimelineRow[] = [];
+  for (const [app, machines] of byApp) {
+    const spans: WorkerSpan[] = [];
+    for (const [mid, evs] of machines) {
+      evs.sort((a, b) => a.ts.localeCompare(b.ts));
+      const startEv = evs.find((e) => WORKER_ON.has(e.event)) ?? evs[0];
+      const offEv = [...evs].reverse().find((e) => WORKER_OFF.has(e.event)) ?? null;
+      spans.push({
+        mid,
+        start: new Date(startEv.ts).getTime(),
+        end: offEv ? new Date(offEv.ts).getTime() : null,
+        endReason: offEv?.event ?? null,
+        actor: offEv?.actor ?? startEv.actor ?? null,
+        running: !offEv,
+      });
+    }
+    spans.sort((a, b) => a.start - b.start);
+    rows.push({ app, spans });
+  }
+  // Endpoints with the most recent activity first.
+  rows.sort((a, b) => {
+    const la = Math.max(...a.spans.map((s) => s.end ?? s.start));
+    const lb = Math.max(...b.spans.map((s) => s.end ?? s.start));
+    return lb - la;
+  });
+  return rows;
+}
+
 const STATUS_COLOR = (s: string) =>
   /complet|succe|done|finish|stopped|created/.test(s)
     ? "text-emerald-600 dark:text-emerald-400"
@@ -683,6 +807,11 @@ export function AnalyticsView() {
   const [nowTs, setNowTs] = useState(0);
   const [slurmState, setSlurmState] = useState<"ok" | "unconfigured" | "error">("ok");
   const [truncated, setTruncated] = useState<string[]>([]);
+  // GPU Timeline: durable inference worker on/off events for the period, plus
+  // per-endpoint node + GPU-id metadata resolved server-side.
+  const [workerEvents, setWorkerEvents] = useState<WorkerEvt[]>([]);
+  const [workerApps, setWorkerApps] = useState<Record<string, AppMeta>>({});
+  const [workerBenchmarks, setWorkerBenchmarks] = useState<BenchSpan[]>([]);
 
   // Jobs explorer state
   const [sortKey, setSortKey] = useState<SortKey>("start");
@@ -696,11 +825,154 @@ export function AnalyticsView() {
     [period, customFrom, customTo],
   );
 
+  const gpuTimeline = useMemo(() => buildGpuTimeline(workerEvents), [workerEvents]);
+
+  // Calendar: one row per day, sub-divided into a lane per (node, GPU). Both
+  // inference worker-spans AND benchmark runs are unified into one item shape,
+  // clipped per day; one merged block spans all the contiguous GPU lanes the
+  // workload occupies (so a 4-GPU endpoint = 1 tall block).
+  const gpuDays = useMemo<CalDay[]>(() => {
+    const t0 = from.getTime();
+    const t1 = to.getTime();
+    const nowClamp = Math.min(nowTs || t1, t1);
+
+    type Item = {
+      label: string;
+      node: string;
+      ref: string;
+      kind: WorkloadKind;
+      status: string;
+      start: number;
+      end: number | null; // null = still running
+      running: boolean;
+      gpus: number[]; // -1 = no device pin ("all")
+    };
+    const items: Item[] = [];
+    for (const { app, spans } of gpuTimeline) {
+      const meta = workerApps[app];
+      const node = meta?.node ?? "—";
+      const gpus = meta?.gpu_ids?.length ? meta.gpu_ids : [0];
+      for (const sp of spans) {
+        items.push({
+          label: app,
+          node,
+          ref: sp.mid,
+          kind: "inference",
+          status: sp.running ? "running" : "served",
+          start: sp.start,
+          end: sp.end,
+          running: sp.running,
+          gpus,
+        });
+      }
+    }
+    for (const b of workerBenchmarks) {
+      if (!b.started) continue;
+      items.push({
+        label: b.name,
+        node: b.node,
+        ref: b.id,
+        kind: "benchmark",
+        status: b.status,
+        start: new Date(b.started).getTime(),
+        end: b.ended ? new Date(b.ended).getTime() : null,
+        running: b.status === "running",
+        gpus: b.gpu_ids.length ? b.gpu_ids : [-1],
+      });
+    }
+
+    type Raw = Omit<Item, "end"> & { end: number };
+    // date → { lane keys seen, raw per-day blocks }
+    const byDate = new Map<string, { laneKeys: Set<string>; raw: Raw[] }>();
+    const bucket = (date: string) => {
+      let b = byDate.get(date);
+      if (!b) {
+        b = { laneKeys: new Set(), raw: [] };
+        byDate.set(date, b);
+      }
+      return b;
+    };
+    for (const it of items) {
+      const s = Math.max(it.start, t0);
+      const e = Math.min(it.end ?? nowClamp, t1);
+      if (e <= s) continue;
+      const cur = new Date(s);
+      cur.setHours(0, 0, 0, 0);
+      while (cur.getTime() < e) {
+        const dayStart = cur.getTime();
+        const dayEnd = dayStart + DAY_MS;
+        const bs = Math.max(s, dayStart);
+        const be = Math.min(e, dayEnd);
+        if (be > bs) {
+          const bk = bucket(localDate(new Date(dayStart)));
+          for (const g of it.gpus) bk.laneKeys.add(`${it.node}|${g}`);
+          bk.raw.push({ ...it, start: bs, end: be, running: it.running && be >= e });
+        }
+        cur.setTime(dayEnd);
+        cur.setHours(0, 0, 0, 0); // re-align (DST-safe)
+      }
+    }
+    const days: CalDay[] = [];
+    for (const [date, { laneKeys, raw }] of byDate) {
+      // Stable lane ordering: node, then GPU id (−1 / "all" sorts first).
+      const lanes: GpuLane[] = [...laneKeys]
+        .map((k) => {
+          // Split on the LAST "|" — node names are free text and may contain "|".
+          const i = k.lastIndexOf("|");
+          return { node: k.slice(0, i), gpu: Number(k.slice(i + 1)) };
+        })
+        .sort((a, b) => a.node.localeCompare(b.node) || a.gpu - b.gpu);
+      const laneIndex = new Map(lanes.map((l, i) => [`${l.node}|${l.gpu}`, i]));
+      const gpuLabel = (g: number) => (g < 0 ? "all" : `${g}`);
+      const blocks: CalBlock[] = [];
+      for (const r of raw) {
+        const idx = r.gpus
+          .map((g) => laneIndex.get(`${r.node}|${g}`))
+          .filter((v): v is number => v != null)
+          .sort((a, b) => a - b);
+        if (!idx.length) continue;
+        // Split into consecutive runs so a block only spans contiguous lanes.
+        let run: number[] = [idx[0]];
+        const flush = () => {
+          const gids = run.map((i) => lanes[i].gpu);
+          blocks.push({
+            label: r.label,
+            node: r.node,
+            ref: r.ref,
+            kind: r.kind,
+            status: r.status,
+            start: r.start,
+            end: r.end,
+            running: r.running,
+            laneStart: run[0],
+            laneSpan: run.length,
+            gpuLabel:
+              gids.length > 1
+                ? `${gpuLabel(gids[0])}–${gpuLabel(gids[gids.length - 1])}`
+                : gpuLabel(gids[0]),
+          });
+        };
+        for (let i = 1; i < idx.length; i++) {
+          if (idx[i] === run[run.length - 1] + 1) run.push(idx[i]);
+          else {
+            flush();
+            run = [idx[i]];
+          }
+        }
+        flush();
+      }
+      blocks.sort((a, b) => a.start - b.start);
+      days.push({ date, lanes, blocks });
+    }
+    days.sort((a, b) => b.date.localeCompare(a.date)); // newest day first
+    return days;
+  }, [gpuTimeline, workerApps, workerBenchmarks, from, to, nowTs]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setNowTs(Date.now());
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
-    const [gpu, slurm, aliasRes] = await Promise.allSettled([
+    const [gpu, slurm, aliasRes, workerEv] = await Promise.allSettled([
       fetch(
         `/api/analytics/gpuplatform?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}&tz=${encodeURIComponent(tz)}`,
         { cache: "no-store" },
@@ -712,7 +984,23 @@ export function AnalyticsView() {
       fetch("/api/analytics/aliases", { cache: "no-store" }).then(
         (r) => r.json() as Promise<{ aliases: SourceAlias[] | null }>,
       ),
+      fetch(
+        `/api/analytics/worker-events?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}`,
+        { cache: "no-store" },
+      ).then((r) =>
+        r.ok
+          ? (r.json() as Promise<{
+              events: WorkerEvt[];
+              apps: Record<string, AppMeta>;
+              benchmarks: BenchSpan[];
+            }>)
+          : Promise.reject(r.status),
+      ),
     ]);
+
+    setWorkerEvents(workerEv.status === "fulfilled" ? (workerEv.value.events ?? []) : []);
+    setWorkerApps(workerEv.status === "fulfilled" ? (workerEv.value.apps ?? {}) : {});
+    setWorkerBenchmarks(workerEv.status === "fulfilled" ? (workerEv.value.benchmarks ?? []) : []);
 
     if (aliasRes.status === "fulfilled" && aliasRes.value.aliases) {
       setAliases(aliasRes.value.aliases);
@@ -1597,6 +1885,7 @@ export function AnalyticsView() {
           <TabsTrigger value="jobs">Jobs</TabsTrigger>
           <TabsTrigger value="gpuhours">GPU hours</TabsTrigger>
           <TabsTrigger value="timeline">Node timeline</TabsTrigger>
+          <TabsTrigger value="gputimeline">GPU Timeline</TabsTrigger>
           <TabsTrigger value="nodes">Nodes</TabsTrigger>
         </TabsList>
 
@@ -1861,6 +2150,149 @@ export function AnalyticsView() {
                     <span>{fmtTime(to)}</span>
                   </div>
                 </div>
+              </div>
+            )}
+          </div>
+        </TabsContent>
+
+        {/* GPU Timeline — calendar: one row per day, fluid event blocks per endpoint */}
+        <TabsContent value="gputimeline">
+          <div className="rounded-lg border bg-card p-4">
+            <h2 className="mb-1 text-sm font-semibold">GPU Timeline</h2>
+            <p className="mb-3 text-xs text-muted-foreground">
+              What occupied each GPU, laid out like a calendar — one row per day, time left→right,
+              a lane per node + GPU. A block spans all the GPUs its workload held. Inference and
+              benchmarks share the same nodes, so both are shown. Sourced from the durable
+              worker-events log + benchmark runs. Note: inference spans only go back to when
+              durable worker-event logging was enabled; benchmarks reach further back.
+            </p>
+            <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] text-muted-foreground">
+              <span className="font-medium uppercase tracking-wide">Inference</span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-600" /> running
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-indigo-600" /> served
+              </span>
+              <span className="ml-2 font-medium uppercase tracking-wide">Benchmark</span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-500" /> running
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-teal-600" /> done
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-rose-600" /> failed
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-slate-500" /> cancelled
+              </span>
+            </div>
+            {gpuDays.length === 0 && !loading ? (
+              <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
+                No GPU activity in the selected period.
+              </div>
+            ) : (
+              <div className="overflow-hidden rounded-md border text-xs">
+                {/* Hour axis — one labelled cell per hour */}
+                <div className="flex border-b bg-muted/30 text-[11px] font-medium text-muted-foreground">
+                  <div className="w-32 shrink-0 border-r px-3 py-2">Day</div>
+                  <div className="w-16 shrink-0 border-r px-2 py-2 text-right">GPU</div>
+                  <div className="flex flex-1">
+                    {Array.from({ length: 24 }, (_, h) => (
+                      <div
+                        key={h}
+                        className="flex-1 border-r border-border/60 px-1.5 py-2 tabular-nums last:border-r-0"
+                      >
+                        {h === 0 ? "12a" : h === 12 ? "12p" : h < 12 ? `${h}a` : `${h - 12}p`}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {/* Day rows — GPU column + a single timeline canvas where a
+                    block spans the GPU lanes its endpoint occupies */}
+                {gpuDays.map((day) => {
+                  const dayStart = new Date(`${day.date}T00:00:00`).getTime();
+                  const LANE = 44; // px per GPU lane — spacious
+                  const total = day.lanes.length * LANE;
+                  const d = new Date(`${day.date}T00:00:00`);
+                  const weekday = d.toLocaleDateString(undefined, { weekday: "short" });
+                  return (
+                    <div key={day.date} className="flex border-b last:border-b-0">
+                      {/* Day label spans all of the day's GPU lanes */}
+                      <div
+                        className="flex w-32 shrink-0 flex-col justify-center border-r px-3 font-mono"
+                        style={{ height: `${total}px` }}
+                      >
+                        <div className="tabular-nums">{day.date}</div>
+                        <div className="text-[11px] text-muted-foreground">{weekday}</div>
+                      </div>
+                      {/* GPU id column */}
+                      <div className="w-16 shrink-0 border-r" style={{ height: `${total}px` }}>
+                        {day.lanes.map((lane, li) => (
+                          <div
+                            key={li}
+                            className="flex items-center justify-end border-b border-border/30 px-2 font-mono tabular-nums text-muted-foreground last:border-b-0"
+                            style={{ height: `${LANE}px` }}
+                            title={`${lane.node} · GPU ${lane.gpu < 0 ? "all" : lane.gpu}`}
+                          >
+                            {lane.gpu < 0 ? "all" : lane.gpu}
+                          </div>
+                        ))}
+                      </div>
+                      {/* Timeline canvas */}
+                      <div className="relative flex-1" style={{ height: `${total}px` }}>
+                        {/* horizontal lane gridlines */}
+                        <div className="pointer-events-none absolute inset-0 flex flex-col">
+                          {day.lanes.map((_, li) => (
+                            <div
+                              key={li}
+                              className="border-b border-border/30 last:border-b-0"
+                              style={{ height: `${LANE}px` }}
+                            />
+                          ))}
+                        </div>
+                        {/* vertical hour gridlines */}
+                        <div className="pointer-events-none absolute inset-0 flex">
+                          {Array.from({ length: 24 }, (_, h) => (
+                            <div
+                              key={h}
+                              className="flex-1 border-r border-border/40 last:border-r-0"
+                            />
+                          ))}
+                        </div>
+                        {day.blocks.map((b, i) => {
+                          const left = ((b.start - dayStart) / DAY_MS) * 100;
+                          const width = Math.max(((b.end - b.start) / DAY_MS) * 100, 0.8);
+                          return (
+                            <div
+                              key={i}
+                              className={`absolute overflow-hidden rounded-md border px-1.5 py-1 leading-tight text-white shadow-sm ${blockClass(b)}`}
+                              style={{
+                                left: `${Math.min(left, 99)}%`,
+                                width: `${Math.min(width, 100 - left)}%`,
+                                minWidth: "18px", // keep short benchmark runs visible/hoverable
+                                top: `${b.laneStart * LANE + 4}px`,
+                                height: `${b.laneSpan * LANE - 8}px`,
+                              }}
+                              title={
+                                `${b.kind === "benchmark" ? "benchmark " : ""}${b.label}  ·  ${b.node} GPU ${b.gpuLabel}\n` +
+                                `${fmt12(b.start)} – ${b.running ? "now" : fmt12(b.end)}\n` +
+                                (b.kind === "benchmark" ? `status: ${b.status}` : `worker ${b.ref}`)
+                              }
+                            >
+                              <div className="truncate font-medium">{b.label}</div>
+                              <div className="truncate text-[11px] text-white/80">
+                                {fmt12(b.start)}–{b.running ? "now" : fmt12(b.end)}
+                                {b.kind === "benchmark" && b.status !== "running" ? ` · ${b.status}` : ""}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

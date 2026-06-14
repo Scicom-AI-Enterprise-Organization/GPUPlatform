@@ -290,6 +290,17 @@ RES_USERS = Gauge(
 RES_BENCH = Gauge(
     "platform_benchmarks", "Benchmarks by status", ["status"], registry=_resource_registry
 )
+# Live GPU occupancy: one series per (node, GPU) currently busy (value 1), with
+# the workload type + name as labels. Lets Grafana render a per-GPU "what's
+# running" heatmap from VictoriaMetrics alongside the DCGM utilization, and
+# `sum by (node) (platform_gpu_busy)` gives busy-GPU counts per node. `gpu="all"`
+# means the workload didn't pin specific devices (no CUDA_VISIBLE_DEVICES).
+RES_GPU_BUSY = Gauge(
+    "platform_gpu_busy",
+    "One series per occupied (node, GPU) at scrape time (value 1); workload + name as labels",
+    ["node", "gpu", "workload", "name"],
+    registry=_resource_registry,
+)
 RES_RUNS = Gauge(
     "platform_autotrain_runs", "Autotrain training runs by status and task", ["status", "task"], registry=_resource_registry
 )
@@ -446,10 +457,71 @@ async def sample_resources(session) -> None:
             RES_GITOPS_RESOURCES.labels(kind=kind or "unknown", status=status or "unknown").set(int(n))
 
 
-async def render_resources(session) -> tuple[bytes, str]:
-    """Sample Postgres resources, then serialize the resource registry. Backs
-    GET /api/metrics."""
+def _parse_gpu_ids(vd: "str | None") -> list[int]:
+    vd = (vd or "").strip()
+    if not vd:
+        return []
+    try:
+        return [int(x.strip()) for x in vd.split(",") if x.strip() != ""]
+    except ValueError:
+        return []
+
+
+async def sample_gpu_busy(session, rdb) -> None:
+    """Sample live per-GPU occupancy into `platform_gpu_busy`. Inference: any
+    endpoint with ≥1 live worker (Redis) marks its GPU ids busy. Benchmark: any
+    run with status=running marks its pinned GPUs. Node is the bound provider's
+    name (falls back to the GPU type / 'runpod' / 'shared')."""
+    from sqlalchemy import select
+
+    from .bench import Benchmark
+    from .db import App, Provider
+
+    RES_GPU_BUSY.clear()
+    provs = {p.id: p.name for p in (await session.execute(select(Provider))).scalars().all()}
+
+    # Benchmarks currently running.
+    for b in (await session.execute(
+        select(Benchmark).where(Benchmark.status == "running")
+    )).scalars().all():
+        node = (provs.get(b.provider_id) if b.provider_id else None) or (
+            "runpod" if b.runpod_pod_id else "shared"
+        )
+        gpus = _parse_gpu_ids(b.visible_devices) or [-1]
+        for g in gpus:
+            RES_GPU_BUSY.labels(
+                node=node, gpu=("all" if g < 0 else str(g)),
+                workload="benchmark", name=(b.name or b.id),
+            ).set(1)
+
+    # Inference endpoints with at least one live worker registered in Redis.
+    if rdb is not None:
+        for a in (await session.execute(select(App))).scalars().all():
+            members = await rdb.smembers(f"worker_index:{a.app_id}")
+            live = False
+            for mid in members:
+                if await rdb.exists(f"worker:{mid}"):
+                    live = True
+                    break
+            if not live:
+                continue
+            node = (provs.get(a.provider_id) if a.provider_id else None) or (a.gpu or "shared")
+            gpus = _parse_gpu_ids(getattr(a, "visible_devices", None)) or list(range(int(a.gpu_count or 1)))
+            for g in gpus:
+                RES_GPU_BUSY.labels(
+                    node=node, gpu=str(g), workload="inference", name=(a.name or a.app_id),
+                ).set(1)
+
+
+async def render_resources(session, rdb=None) -> tuple[bytes, str]:
+    """Sample Postgres resources (+ live GPU occupancy when a Redis handle is
+    given), then serialize the resource registry. Backs GET /metrics/resources."""
     await sample_resources(session)
+    if rdb is not None:
+        try:
+            await sample_gpu_busy(session, rdb)
+        except Exception:  # best-effort — never break the scrape over occupancy
+            pass
     return generate_latest(_resource_registry), CONTENT_TYPE_LATEST
 
 

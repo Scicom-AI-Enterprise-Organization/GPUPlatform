@@ -39,7 +39,7 @@ from .auth import (
     revoke_session,
     verify_password,
 )
-from .db import ApiKey, App, AuditLog, PolicyRole, Request as ReqRow, StressRun, User, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
+from .db import ApiKey, App, AuditLog, PolicyRole, Request as ReqRow, StressRun, User, WorkerEvent, get_session, init_db, get_user_by_username, list_all_apps, seed_admin_user, session_factory, shutdown_db
 from . import audit as audit_module
 from . import bench as bench_module
 from . import compute as compute_module
@@ -729,7 +729,7 @@ async def metrics_endpoint(request: Request):
 
 
 @app.get("/metrics/resources")
-async def resource_metrics_endpoint():
+async def resource_metrics_endpoint(request: Request):
     """Prometheus exporter for platform resources (serverless apps, benchmarks,
     storage, datasets, GPU providers, GitOps) sampled from Postgres — separate
     from the infra `/metrics` target. The web app re-exposes this at
@@ -739,7 +739,7 @@ async def resource_metrics_endpoint():
     `increase(platform_autotrain_runs_finished_total{status="failed"}[10m]) > 0`.
     Auth-exempt like /metrics — gate via ingress/network if needed."""
     async with session_factory()() as session:
-        body, ctype = await metrics.render_resources(session)
+        body, ctype = await metrics.render_resources(session, request.app.state.redis)
     return Response(content=body, media_type=ctype)
 
 
@@ -1904,6 +1904,10 @@ async def app_model_action(
     if action == "sleep_all":
         await rdb.rpush(f"app:{app_id}:model_cmds", json.dumps({"model": "*", "action": "sleep_all"}))
         await rdb.expire(f"app:{app_id}:model_cmds", 300)
+        await audit_module.record(
+            user, "inference.model_action", "app", app_id, app_id,
+            details={"action": "sleep_all", "model": "*"},
+        )
         return {"ok": True, "queued": action}
     members = [m.get("model") for m in (app.models or [])]
     if req.model not in members:
@@ -1913,6 +1917,10 @@ async def app_model_action(
         )
     await rdb.rpush(f"app:{app_id}:model_cmds", json.dumps({"model": req.model, "action": action}))
     await rdb.expire(f"app:{app_id}:model_cmds", 300)
+    await audit_module.record(
+        user, "inference.model_action", "app", app_id, app_id,
+        details={"action": action, "model": req.model},
+    )
     return {"ok": True, "queued": action, "model": req.model}
 
 
@@ -1957,6 +1965,10 @@ async def update_app_autoscaler(
             f"app:{app_id}:last_request_ts", str(time.time())
         )
     logger.info("autoscaler updated app=%s by user=%s: %s", app_id, user.username, updates)
+    await audit_module.record(
+        user, "inference.update_autoscaler", "app", app_id, target.name,
+        details={"changes": updates},
+    )
     return _to_app_record(target)
 
 
@@ -1972,7 +1984,8 @@ async def _reprovision_workers(rdb, session, app_id: str, user: User, app_state)
     tracked = set(await rdb.smembers(f"worker_index:{app_id}"))
     for mid in tracked:
         await rdb.set(f"worker:{mid}:drain", "1", ex=600)
-        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (reprovision)")
+        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (reprovision)",
+                                actor=getattr(user, "username", None))
 
     provider = await _provider_for_app(session, app_id, user, app_state)
     all_machines = set(tracked)
@@ -1987,10 +2000,12 @@ async def _reprovision_workers(rdb, session, app_id: str, user: User, app_state)
         for mid in all_machines:
             try:
                 await provider.terminate(mid)
-                await emit_worker_event(rdb, mid, app_id, "info", "terminated (reprovision)")
+                await emit_worker_event(rdb, mid, app_id, "info", "terminated (reprovision)",
+                                        actor=getattr(user, "username", None))
             except Exception:
                 logger.exception("reprovision app %s: provider.terminate(%s) failed", app_id, mid)
-                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (reprovision)")
+                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (reprovision)",
+                                        actor=getattr(user, "username", None))
 
     for mid in all_machines:
         await rdb.delete(f"worker:{mid}", f"register_token:{mid}", f"worker:{mid}:models")
@@ -2274,7 +2289,224 @@ async def update_app_models(
     n = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
     logger.info("models updated app=%s by user=%s: %d models, reprovisioned %d worker(s)",
                 app_id, user.username, len(req.models), n)
+    await audit_module.record(
+        user, "inference.update_models", "app", app_id, target.name,
+        details={"models": [m.model for m in req.models], "reprovisioned_workers": n},
+    )
     return _to_app_record(target)
+
+
+@app.get("/apps/{app_id}/worker-events")
+async def list_worker_events(
+    app_id: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 2000,
+):
+    """Durable worker lifecycle timeline for one endpoint — survives the Redis
+    ring's 1h TTL, so this is what an on/off calendar/analytics view reads.
+
+    Returns rows **oldest-first** (natural for a left-to-right timeline). `since`
+    / `until` accept ISO-8601 or a unix epoch (seconds); both optional. Pair
+    `provisioned`/`registered` with `terminated`/`idle_terminated` per
+    `machine_id` to reconstruct serving spans."""
+    from sqlalchemy import select, and_
+    await _load_owned_app(session, app_id, user)  # owner/admin authorization
+    if limit < 1 or limit > 10000:
+        raise HTTPException(status_code=400, detail="limit must be 1..10000")
+
+    def _parse_ts(v: str) -> datetime:
+        v = v.strip()
+        try:
+            return datetime.fromtimestamp(float(v), tz=timezone.utc)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"bad timestamp: {v!r}")
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    conds = [WorkerEvent.app_id == app_id]
+    if since:
+        conds.append(WorkerEvent.created_at >= _parse_ts(since))
+    if until:
+        conds.append(WorkerEvent.created_at <= _parse_ts(until))
+    # Take the newest `limit` rows for the window, then flip to chronological —
+    # so a tight cap keeps the most recent activity rather than the oldest.
+    stmt = (
+        select(WorkerEvent)
+        .where(and_(*conds))
+        .order_by(WorkerEvent.created_at.desc())
+        .limit(limit)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    rows.reverse()
+    return {
+        "app_id": app_id,
+        "count": len(rows),
+        "events": [
+            {
+                "id": r.id,
+                "machine_id": r.machine_id,
+                "event": r.event,
+                "level": r.level,
+                "message": r.message,
+                "actor": r.actor_username,
+                "details": r.details,
+                "ts": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/admin/worker-events")
+async def admin_list_worker_events(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    app_id: Optional[str] = None,
+    limit: int = 5000,
+):
+    """Cross-endpoint workload feed for the admin GPU Timeline. Returns the
+    durable `worker_events` rows (inference on/off spans) AND benchmark runs
+    (started/ended spans) across every endpoint, each resolved to its node +
+    GPU ids, so the analytics page can lay out a unified per-node/per-GPU
+    occupancy calendar. Admin only. `since`/`until` accept ISO-8601 or unix
+    epoch; worker-event rows come back oldest-first."""
+    from sqlalchemy import select, and_
+    if limit < 1 or limit > 20000:
+        raise HTTPException(status_code=400, detail="limit must be 1..20000")
+
+    def _parse_ts(v: str) -> datetime:
+        v = v.strip()
+        try:
+            return datetime.fromtimestamp(float(v), tz=timezone.utc)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"bad timestamp: {v!r}")
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    since_dt = _parse_ts(since) if since else None
+    until_dt = _parse_ts(until) if until else None
+
+    # NOTE: we deliberately do NOT apply a `created_at >= since` lower bound here.
+    # Worker events are lifecycle transitions only (no heartbeat rows), so a worker
+    # that registered BEFORE the window and is still serving has its single ON event
+    # older than `since`. Filtering it out would drop a currently-occupied GPU from
+    # the window — the opposite of the benchmark span-overlap filter below. Instead
+    # we fetch up to `until` (newest `limit` rows) and let the client pair events
+    # into spans and clip to the window, matching the benchmark semantics.
+    conds = []
+    if app_id:
+        conds.append(WorkerEvent.app_id == app_id)
+    if until_dt is not None:
+        conds.append(WorkerEvent.created_at <= until_dt)
+    stmt = select(WorkerEvent)
+    if conds:
+        stmt = stmt.where(and_(*conds))
+    stmt = stmt.order_by(WorkerEvent.created_at.desc()).limit(limit)
+    rows = list((await session.execute(stmt)).scalars().all())
+    rows.reverse()
+
+    def _parse_gpu_ids(vd: "str | None") -> list[int]:
+        vd = (vd or "").strip()
+        if not vd:
+            return []
+        try:
+            return [int(x.strip()) for x in vd.split(",") if x.strip() != ""]
+        except ValueError:
+            return []
+
+    # Benchmarks are GPU workloads on the same nodes as inference, so the unified
+    # GPU Timeline shows them too. A benchmark = one span [started_at, ended_at]
+    # (ended_at NULL → still running). Only started runs have a span. Filter to
+    # the window: started before `until` AND not ended before `since`.
+    from .bench import Benchmark
+    bconds = [Benchmark.started_at.isnot(None)]
+    if app_id:
+        bconds.append(Benchmark.id == app_id)  # allow targeting a single run too
+    if until_dt is not None:
+        bconds.append(Benchmark.started_at <= until_dt)
+    if since_dt is not None:
+        bconds.append((Benchmark.ended_at.is_(None)) | (Benchmark.ended_at >= since_dt))
+    brows = (
+        await session.execute(
+            select(Benchmark).where(and_(*bconds)).order_by(Benchmark.started_at.desc()).limit(limit)
+        )
+    ).scalars().all()
+
+    # Resolve node (the provider the workload is bound to) + GPU ids, by joining
+    # App/Benchmark → Provider. Done here at read time so the timeline gets
+    # node/GPU columns without a schema change and works for old rows.
+    from .db import Provider
+    app_ids = {r.app_id for r in rows if r.app_id}
+    prov_ids = set()
+    arows = []
+    if app_ids:
+        arows = (await session.execute(select(App).where(App.app_id.in_(app_ids)))).scalars().all()
+        prov_ids |= {a.provider_id for a in arows if a.provider_id}
+    prov_ids |= {b.provider_id for b in brows if b.provider_id}
+    pname: dict[str, str] = {}
+    if prov_ids:
+        prows = (await session.execute(select(Provider).where(Provider.id.in_(prov_ids)))).scalars().all()
+        pname = {p.id: p.name for p in prows}
+
+    apps_meta: dict[str, dict] = {}
+    for a in arows:
+        gpu_ids = _parse_gpu_ids(getattr(a, "visible_devices", None)) or list(range(int(a.gpu_count or 1)))
+        node = (pname.get(a.provider_id) if a.provider_id else None) or (a.gpu or "shared")
+        apps_meta[a.app_id] = {"name": a.name, "node": node, "gpu": a.gpu, "gpu_ids": gpu_ids}
+
+    # Owner usernames for benchmark attribution.
+    owner_ids = {b.owner_id for b in brows}
+    onames: dict[int, str] = {}
+    if owner_ids:
+        ures = await session.execute(select(User.id, User.username).where(User.id.in_(owner_ids)))
+        onames = {uid: uname for uid, uname in ures.all()}
+
+    benchmarks = []
+    for b in brows:
+        node = (
+            (pname.get(b.provider_id) if b.provider_id else None)
+            or ("runpod" if b.runpod_pod_id else "shared")
+        )
+        benchmarks.append({
+            "id": b.id,
+            "name": b.name,
+            "node": node,
+            "gpu_ids": _parse_gpu_ids(b.visible_devices),
+            "status": b.status,
+            "owner": onames.get(b.owner_id),
+            "started": b.started_at.isoformat() if b.started_at else None,
+            "ended": b.ended_at.isoformat() if b.ended_at else None,
+        })
+
+    return {
+        "count": len(rows),
+        "apps": apps_meta,
+        "events": [
+            {
+                "id": r.id,
+                "app_id": r.app_id,
+                "machine_id": r.machine_id,
+                "event": r.event,
+                "level": r.level,
+                "message": r.message,
+                "actor": r.actor_username,
+                "ts": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+        "benchmarks": benchmarks,
+    }
 
 
 # ── Stress-test run history: persisted per endpoint so runs / models can be
@@ -2414,7 +2646,8 @@ async def delete_app(
     tracked = set(await rdb.smembers(f"worker_index:{app_id}"))
     for mid in tracked:
         await rdb.set(f"worker:{mid}:drain", "1", ex=600)
-        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (app deleted)")
+        await emit_worker_event(rdb, mid, app_id, "warning", "drain signal sent (app deleted)",
+                                actor=getattr(user, "username", None))
     logger.info("delete app %s: marked %d tracked workers for drain", app_id, len(tracked))
 
     provider = await _provider_for_app(session, app_id, user, request.app.state)
@@ -2430,10 +2663,12 @@ async def delete_app(
         for mid in all_machines:
             try:
                 await provider.terminate(mid)
-                await emit_worker_event(rdb, mid, app_id, "info", "terminated (app deleted)")
+                await emit_worker_event(rdb, mid, app_id, "info", "terminated (app deleted)",
+                                        actor=getattr(user, "username", None))
             except Exception:
                 logger.exception("delete app %s: provider.terminate(%s) failed", app_id, mid)
-                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (app delete)")
+                await emit_worker_event(rdb, mid, app_id, "error", "terminate failed (app delete)",
+                                        actor=getattr(user, "username", None))
 
     for mid in all_machines:
         await rdb.delete(f"worker:{mid}", f"register_token:{mid}", f"worker:{mid}:models")
