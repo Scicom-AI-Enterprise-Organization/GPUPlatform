@@ -8,22 +8,36 @@ import { CatalogDetail } from "@/components/catalog/catalog-detail";
 
 export default async function HostedDatasetDetailPage({
   params,
+  searchParams,
 }: {
-  params: Promise<{ repoId: string }>;
+  params: Promise<{ namespace: string; name: string }>;
+  searchParams: Promise<{ view?: string }>;
 }) {
   const me = await getMe();
   if (!me) redirect("/login");
   if (!me.sections?.catalog) redirect("/datasets");
 
-  const { repoId } = await params;
+  const { namespace, name } = await params;
+  const sp = await searchParams;
   let repo: CatalogRecord;
   try {
-    repo = await gateway.getCatalogRepo(repoId);
+    repo = await gateway.lookupCatalogRepo("dataset", namespace, name);
   } catch {
     notFound();
   }
-  // This route is for dataset repos — models live under /models.
-  if (repo.repo_type === "model") redirect(`/models/${repo.id}`);
+
+  // If this repo was published from an Autotrain dataset, they're "one" — send
+  // the user to the dataset's page (which carries the HF card) instead.
+  // (redirect() must be OUTSIDE the try — it throws NEXT_REDIRECT.)
+  let linkedDatasetId: string | null = null;
+  try {
+    const datasets = await gateway.listDatasets(me.is_admin ? "all" : "mine");
+    linkedDatasetId = datasets.find((d) => d.catalog_repo_id === repo.id)?.id ?? null;
+  } catch {
+    /* if the lookup fails, just show the hosted repo page */
+  }
+  if (linkedDatasetId) redirect(`/datasets/${linkedDatasetId}`);
+
   const username = await currentUsername();
   const gatewayUrl = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
@@ -33,9 +47,7 @@ export default async function HostedDatasetDetailPage({
         crumbs={[{ label: "Datasets", href: "/datasets" }, { label: repo.full_id }]}
         username={username}
       />
-      <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
-        <CatalogDetail repo={repo} gatewayUrl={gatewayUrl} backHref="/datasets" />
-      </div>
+      <CatalogDetail repo={repo} gatewayUrl={gatewayUrl} backHref="/datasets" initialView={sp.view} />
     </div>
   );
 }

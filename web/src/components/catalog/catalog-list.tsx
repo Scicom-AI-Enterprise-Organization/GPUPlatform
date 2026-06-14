@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Boxes, Database, Files, Loader2, Lock, Package, Search, Trash2 } from "lucide-react";
+import { Boxes, Database, Files, LayoutGrid, List, Loader2, Lock, Package, Search, Trash2 } from "lucide-react";
+import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { CatalogRecord } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
@@ -31,7 +32,9 @@ export function fmtBytes(n?: number | null): string {
   return `${v.toFixed(1)} ${u[i]}`;
 }
 
-/** A single-type catalog list (models on /models, datasets on /datasets/hosted).
+type View = "rows" | "grid";
+
+/** A single-type catalog list with search + grid/list view (mirrors Datasets).
  * `detailBase` is the route a card links to, e.g. "/models" or "/datasets/hosted". */
 export function CatalogList({
   items,
@@ -44,10 +47,21 @@ export function CatalogList({
 }) {
   const router = useRouter();
   const [q, setQ] = useState("");
+  const [view, setView] = useState<View>("grid");
   const [deleteTarget, setDeleteTarget] = useState<CatalogRecord | null>(null);
   const [wipe, setWipe] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Hydrate the saved view post-mount (start from the default so SSR matches).
+  useEffect(() => {
+    const v = window.localStorage.getItem("sgpu_catalog_view");
+    if (v === "rows" || v === "grid") setView(v);
+  }, []);
+  const setViewPersist = (v: View) => {
+    setView(v);
+    window.localStorage.setItem("sgpu_catalog_view", v);
+  };
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -77,10 +91,16 @@ export function CatalogList({
     }
   }
 
+  const askDelete = (r: CatalogRecord) => {
+    setDeleteTarget(r);
+    setWipe(false);
+    setDeleteError(null);
+  };
+
   return (
     <div className="space-y-3">
-      {items.length > 6 && (
-        <div className="relative max-w-sm">
+      <div className="flex items-center justify-between gap-2">
+        <div className="relative max-w-sm flex-1">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <input
             value={q}
@@ -89,56 +109,37 @@ export function CatalogList({
             className="h-9 w-full rounded-md border border-input bg-transparent pl-8 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           />
         </div>
-      )}
+        <div className="flex items-center gap-1 rounded-md border border-border p-0.5">
+          <button
+            onClick={() => setViewPersist("rows")}
+            className={cn("rounded p-1.5 transition-colors", view === "rows" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50")}
+            title="List view"
+            aria-label="List view"
+            aria-pressed={view === "rows"}
+          >
+            <List className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => setViewPersist("grid")}
+            className={cn("rounded p-1.5 transition-colors", view === "grid" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50")}
+            title="Grid view"
+            aria-label="Grid view"
+            aria-pressed={view === "grid"}
+          >
+            <LayoutGrid className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
 
-      <ul className="space-y-2">
-        {filtered.map((r) => (
-          <li key={r.id}>
-            <div className="group flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3 transition-colors hover:border-foreground/20">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-                {r.repo_type === "dataset" ? <Database className="h-4 w-4" /> : <Package className="h-4 w-4" />}
-              </div>
-              <Link href={`${detailBase}/${r.id}`} className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="truncate font-mono text-sm font-medium">{r.full_id}</span>
-                  {r.private && (
-                    <Badge variant="secondary" className="shrink-0">
-                      <Lock className="h-3 w-3" /> private
-                    </Badge>
-                  )}
-                </div>
-                <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
-                  <span className="inline-flex items-center gap-1">
-                    <Files className="h-3 w-3" /> {r.num_files ?? 0} files · {fmtBytes(r.size_bytes)}
-                  </span>
-                  {r.storage_name && (
-                    <span className="inline-flex items-center gap-1">
-                      <Boxes className="h-3 w-3" /> {r.storage_name}
-                    </span>
-                  )}
-                  <span>by {r.created_by}</span>
-                </div>
-              </Link>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="shrink-0 text-muted-foreground hover:text-destructive"
-                onClick={() => {
-                  setDeleteTarget(r);
-                  setWipe(false);
-                  setDeleteError(null);
-                }}
-                title={`Delete ${noun}`}
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </div>
-          </li>
-        ))}
-        {filtered.length === 0 && (
-          <li className="px-2 py-8 text-center text-sm text-muted-foreground">No {noun}s match.</li>
-        )}
-      </ul>
+      {filtered.length === 0 ? (
+        <div className="px-2 py-10 text-center text-sm text-muted-foreground">No {noun}s match.</div>
+      ) : (
+        <div className={cn(view === "grid" ? "grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3" : "flex flex-col gap-2")}>
+          {filtered.map((r) => (
+            <RepoTile key={r.id} r={r} view={view} detailBase={detailBase} noun={noun} onDelete={askDelete} />
+          ))}
+        </div>
+      )}
 
       <Dialog open={!!deleteTarget} onOpenChange={(o) => !o && setDeleteTarget(null)}>
         <DialogContent>
@@ -167,6 +168,86 @@ export function CatalogList({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+function RepoTile({
+  r,
+  view,
+  detailBase,
+  noun,
+  onDelete,
+}: {
+  r: CatalogRecord;
+  view: View;
+  detailBase: string;
+  noun: string;
+  onDelete: (r: CatalogRecord) => void;
+}) {
+  const href = `${detailBase}/${r.namespace}/${r.name}`;
+  const Icon = r.repo_type === "dataset" ? Database : Package;
+  const meta = (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+      <span className="inline-flex items-center gap-1">
+        <Files className="h-3 w-3" /> {r.num_files ?? 0} files · {fmtBytes(r.size_bytes)}
+      </span>
+      {r.storage_name && (
+        <span className="inline-flex items-center gap-1">
+          <Boxes className="h-3 w-3" /> {r.storage_name}
+        </span>
+      )}
+      <span>by {r.created_by}</span>
+    </div>
+  );
+  const title = (
+    <div className="flex items-center gap-2">
+      <span className="truncate font-mono text-sm font-medium">{r.full_id}</span>
+      {r.private && (
+        <Badge variant="secondary" className="shrink-0">
+          <Lock className="h-3 w-3" /> private
+        </Badge>
+      )}
+    </div>
+  );
+  const del = (
+    <Button
+      variant="ghost"
+      size="icon"
+      className="shrink-0 text-muted-foreground hover:text-destructive"
+      onClick={() => onDelete(r)}
+      title={`Delete ${noun}`}
+    >
+      <Trash2 className="h-4 w-4" />
+    </Button>
+  );
+
+  if (view === "grid") {
+    return (
+      <div className="group flex flex-col gap-2 rounded-lg border border-border bg-card p-4 transition-colors hover:border-foreground/20">
+        <div className="flex items-start gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+            <Icon className="h-4 w-4" />
+          </div>
+          <Link href={href} className="min-w-0 flex-1">
+            {title}
+          </Link>
+          {del}
+        </div>
+        <Link href={href}>{meta}</Link>
+      </div>
+    );
+  }
+  return (
+    <div className="group flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3 transition-colors hover:border-foreground/20">
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+        <Icon className="h-4 w-4" />
+      </div>
+      <Link href={href} className="min-w-0 flex-1">
+        {title}
+        <div className="mt-0.5">{meta}</div>
+      </Link>
+      {del}
     </div>
   );
 }

@@ -86,6 +86,22 @@ reference + the audio-filename↔storage prefix gotcha: **`docs/LABEL_PLATFORM.m
 integration lives in `datasets_api.py` (read) and `training_api.py` `_create_label_project_for_run`
 + `training/tts/tts_label_export.py` (write, VM-only — synthesis needs the box).
 
+### Self-hosted HuggingFace catalog (the "Models" section)
+
+Users host their own models/datasets on Storage backends and use standard HF tooling against
+the gateway: a Hub-compatible mirror at **`/hf`** (`hf_mirror_api.py`) + a management API at
+**`/v1/catalog`** (`catalog_api.py`) + the web **Models** section (`/models`, detail at
+`/models/{ns}/{name}`). `export HF_ENDPOINT=<gw>/hf` + `HF_TOKEN=sgpu_…`, then `snapshot_download` /
+`from_pretrained` / `load_dataset` / `push_to_hub` just work.
+
+⚠️ **The catalog is single-revision: always `main`.** No branches/tags/commits/PRs. Every mirror
+route takes a `{revision}` path param but **ignores it** (`# noqa: ARG001 — single revision`) and
+serves the one stored `main` manifest — so a client passing `revision=…`/`@ref`/`--revision`
+won't 404, it just always gets `main`. To "version", push again (overwrites `main`). This is
+**different from a `kind=hf` Dataset's `hf_revision`**, which pins a real commit/branch/tag on
+`huggingface.co`. Don't conflate them. (Adding real versioning to the catalog = a big feature;
+don't assume it exists.)
+
 ### Testing the gateway locally (current `.env` reality)
 
 `gateway/.env` is currently `AUTH_DISABLED=0` + `GATEWAY_RELOAD=0` (despite older notes saying

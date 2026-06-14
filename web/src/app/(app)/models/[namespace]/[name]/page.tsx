@@ -8,22 +8,23 @@ import { CatalogDetail } from "@/components/catalog/catalog-detail";
 
 export default async function ModelDetailPage({
   params,
+  searchParams,
 }: {
-  params: Promise<{ repoId: string }>;
+  params: Promise<{ namespace: string; name: string }>;
+  searchParams: Promise<{ view?: string }>;
 }) {
   const me = await getMe();
   if (!me) redirect("/login");
   if (!me.sections?.catalog) redirect("/models");
 
-  const { repoId } = await params;
+  const { namespace, name } = await params;
+  const sp = await searchParams;
   let repo: CatalogRecord;
   try {
-    repo = await gateway.getCatalogRepo(repoId);
+    repo = await gateway.lookupCatalogRepo("model", namespace, name);
   } catch {
     notFound();
   }
-  // /models is models-only — dataset repos live under /datasets/hosted.
-  if (repo.repo_type === "dataset") redirect(`/datasets/hosted/${repo.id}`);
   const username = await currentUsername();
   const gatewayUrl = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
@@ -33,9 +34,7 @@ export default async function ModelDetailPage({
         crumbs={[{ label: "Models", href: "/models" }, { label: repo.full_id }]}
         username={username}
       />
-      <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
-        <CatalogDetail repo={repo} gatewayUrl={gatewayUrl} backHref="/models" />
-      </div>
+      <CatalogDetail repo={repo} gatewayUrl={gatewayUrl} backHref="/models" initialView={sp.view} />
     </div>
   );
 }

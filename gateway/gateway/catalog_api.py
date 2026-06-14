@@ -238,6 +238,28 @@ async def create_catalog(
     return _to_record(repo, user.username, store.name, with_files=True)
 
 
+@router.get("/lookup", response_model=CatalogRecord)
+async def lookup_catalog(
+    repo_type: str,
+    namespace: str,
+    name: str,
+    user: User = Depends(_catalog),
+    session: AsyncSession = Depends(get_session),
+):
+    """Resolve a repo by its HF id (repo_type + namespace/name) — backs the
+    name-based detail URLs (/models/<ns>/<name>, /datasets/hosted/<ns>/<name>)."""
+    res = await session.execute(select(CatalogRepo).where(
+        CatalogRepo.repo_type == repo_type,
+        CatalogRepo.namespace == namespace,
+        CatalogRepo.name == name,
+    ))
+    repo = res.scalar_one_or_none()
+    if repo is None or (repo.owner_id != user.id and not user.is_admin and repo.private):
+        raise HTTPException(status_code=404, detail="repo not found")
+    owners, stores = await _name_maps(session, [repo])
+    return _to_record(repo, owners.get(repo.owner_id, "?"), stores.get(repo.storage_id), with_files=True)
+
+
 @router.get("/{repo_id}", response_model=CatalogRecord)
 async def get_catalog(
     repo_id: str,

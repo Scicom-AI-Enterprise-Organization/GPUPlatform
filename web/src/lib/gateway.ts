@@ -117,7 +117,7 @@ export class GatewayError extends Error {
   body: string;
   parsed: unknown;
   constructor(status: number, body: string) {
-    super(`gateway ${status}: ${body || "<empty>"}`);
+    super(GatewayError.humanMessage(status, body));
     this.status = status;
     this.body = body;
     try {
@@ -125,6 +125,25 @@ export class GatewayError extends Error {
     } catch {
       this.parsed = null;
     }
+  }
+
+  /** A clean, user-facing message: prefer FastAPI's `detail` (string, or an
+   * object with an `error` field) over the raw `gateway <status>: {json}` dump. */
+  private static humanMessage(status: number, body: string): string {
+    if (body) {
+      try {
+        const p = JSON.parse(body) as { detail?: unknown; error?: unknown };
+        const d = p?.detail ?? p?.error;
+        if (typeof d === "string" && d.trim()) return d;
+        if (d && typeof d === "object" && typeof (d as { error?: unknown }).error === "string") {
+          return (d as { error: string }).error;
+        }
+      } catch {
+        /* not JSON — fall through to the raw body */
+      }
+      return body;
+    }
+    return `gateway error ${status}`;
   }
 }
 
@@ -638,6 +657,12 @@ export const gateway = {
       `/v1/datasets/${encodeURIComponent(id)}`,
       { method: "DELETE" },
     ),
+  /** Publish an S3-backed dataset to the HF mirror as a hosted dataset repo. */
+  publishDataset: (id: string) =>
+    request<{ repo_id: string; full_id: string; repo_type: string; num_files: number; size_bytes: number }>(
+      `/v1/datasets/${encodeURIComponent(id)}/publish`,
+      { method: "POST" },
+    ),
 
   // ---- Model/Dataset catalog (self-hosted HuggingFace mirror) ----
   listCatalog: (scope: "mine" | "all" = "mine", repoType?: CatalogRepoType) => {
@@ -647,6 +672,11 @@ export const gateway = {
   },
   getCatalogRepo: (id: string) =>
     request<CatalogRecord>(`/v1/catalog/${encodeURIComponent(id)}`),
+  /** Resolve a repo by its HF id (repo_type + namespace/name) for name-based URLs. */
+  lookupCatalogRepo: (repoType: CatalogRepoType, namespace: string, name: string) => {
+    const q = new URLSearchParams({ repo_type: repoType, namespace, name });
+    return request<CatalogRecord>(`/v1/catalog/lookup?${q.toString()}`);
+  },
   createCatalogRepo: (body: CreateCatalogRequest) =>
     request<CatalogRecord>("/v1/catalog", {
       method: "POST",

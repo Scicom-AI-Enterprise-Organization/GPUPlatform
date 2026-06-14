@@ -4,9 +4,8 @@ import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
 import { ScopeToggle } from "@/components/scope-toggle";
-import { CatalogList } from "@/components/catalog/catalog-list";
 import { gateway } from "@/lib/gateway";
-import type { CatalogRecord, DatasetRecord } from "@/lib/types";
+import type { DatasetRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { DatasetsList } from "./datasets-list";
@@ -22,14 +21,6 @@ async function loadDatasets(
   }
 }
 
-async function loadHosted(scope: "mine" | "all"): Promise<CatalogRecord[]> {
-  try {
-    return await gateway.listCatalog(scope, "dataset");
-  } catch {
-    return [];
-  }
-}
-
 export default async function DatasetsPage({
   searchParams,
 }: {
@@ -41,10 +32,8 @@ export default async function DatasetsPage({
   const scope: "mine" | "all" =
     me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
-  const hasCatalog = !!me?.sections?.catalog;
-  const [{ items, error }, hosted, username] = await Promise.all([
+  const [{ items, error }, username] = await Promise.all([
     noAccess ? Promise.resolve({ items: [], error: null }) : loadDatasets(scope),
-    !noAccess && hasCatalog ? loadHosted(scope) : Promise.resolve<CatalogRecord[]>([]),
     currentUsername(),
   ]);
 
@@ -100,39 +89,6 @@ export default async function DatasetsPage({
               </div>
             ) : (
               <DatasetsList items={items} />
-            )}
-          </section>
-        )}
-
-        {!noAccess && hasCatalog && (
-          <section className="mt-10">
-            <div className="mb-3 flex items-center justify-between border-b border-border pb-2">
-              <div className="flex items-baseline gap-3">
-                <h2 className="text-base font-medium">Hosted datasets</h2>
-                <span className="text-xs text-muted-foreground">
-                  {hosted.length} {hosted.length === 1 ? "repo" : "repos"} · push/pull with{" "}
-                  <span className="font-mono">hf</span>
-                  {me?.is_admin && scope === "all" && " · all users"}
-                </span>
-              </div>
-              <Button asChild size="sm" variant="outline">
-                <Link href="/datasets/hosted/new">
-                  <Plus className="h-4 w-4" />
-                  New hosted dataset
-                </Link>
-              </Button>
-            </div>
-
-            {hosted.length === 0 ? (
-              <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center">
-                <Inbox className="h-6 w-6 text-muted-foreground/60" />
-                <p className="text-sm text-muted-foreground">
-                  No hosted dataset repos yet — register one, or{" "}
-                  <span className="font-mono text-xs">hf upload ns/name ./dir --repo-type dataset</span>.
-                </p>
-              </div>
-            ) : (
-              <CatalogList items={hosted} detailBase="/datasets/hosted" noun="dataset" />
             )}
           </section>
         )}

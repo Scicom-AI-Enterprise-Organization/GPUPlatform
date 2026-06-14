@@ -167,6 +167,9 @@ class DatasetRecord(BaseModel):
     label_token_secret: Optional[str] = None  # global-secret key (if used instead of a stored token)
     transform_status: Optional[str] = None  # "" | running | done | failed
     transform_log: Optional[str] = None     # short tail of progress lines
+    # When published to the self-hosted HF mirror: the CatalogRepo id serving it
+    # over /hf (None = not published). The dataset page links + shows pull snippets.
+    catalog_repo_id: Optional[str] = None
     created_at: str
     updated_at: str
     created_by: str
@@ -258,6 +261,7 @@ def _to_record(
         label_token_secret=getattr(d, "label_token_secret", None),
         transform_status=getattr(d, "transform_status", None),
         transform_log=getattr(d, "transform_log", None),
+        catalog_repo_id=getattr(d, "catalog_repo_id", None),
         created_at=_iso(d.created_at) or "",
         updated_at=_iso(d.updated_at) or "",
         created_by=owner_username,
@@ -789,6 +793,150 @@ async def delete_dataset(
     await session.commit()
     await audit_module.record(user, "dataset.delete", "dataset", dataset_id, name)
     return {"ok": True, "id": dataset_id}
+
+
+# ---------- publish to the self-hosted HF mirror -----------------------
+
+
+class PublishResult(BaseModel):
+    repo_id: str       # CatalogRepo id (repo-…)
+    full_id: str       # "ns/name"
+    repo_type: str     # always "dataset"
+    num_files: int
+    size_bytes: int
+
+
+def _sanitize_repo_part(s: str) -> str:
+    """Coerce a string into a valid HF repo namespace/name segment
+    (`[A-Za-z0-9][A-Za-z0-9._-]*`)."""
+    out = "".join(c if (c.isalnum() or c in "._-") else "-" for c in (s or "").strip())
+    while out and not out[0].isalnum():
+        out = out[1:]
+    return out or "x"
+
+
+@router.post("/{dataset_id}/publish", response_model=PublishResult)
+async def publish_dataset(
+    dataset_id: str,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Expose an S3-backed Autotrain dataset over the HF mirror as a hosted
+    dataset repo (a CatalogRepo over its S3 prefix), so it's pullable with
+    `hf download <ns>/<name> --repo-type dataset`. Idempotent."""
+    from fastapi.concurrency import run_in_threadpool
+    from sqlalchemy import select as _select
+    from . import storage_backends as sb
+    from .catalog_api import _reindex_manifest
+    from .db import CatalogRepo
+    from .hf_mirror_api import _compute_sha
+
+    PUBLISHABLE = ("s3", "upload", "tts_packed")
+    d = await _require_dataset(session, dataset_id, user)
+
+    # Resolve which dataset's S3 files we actually serve. An hf/label dataset
+    # holds only an external reference, but if it's been materialised to S3
+    # (audio_dataset_id), publish that twin and link BOTH back to the same repo.
+    target = d
+    if d.kind not in PUBLISHABLE:
+        twin = await session.get(Dataset, d.audio_dataset_id) if d.audio_dataset_id else None
+        if twin is not None and twin.kind in PUBLISHABLE and twin.storage_id and twin.s3_metadata_uri:
+            target = twin
+        else:
+            hint = (f" — its data lives on huggingface.co ({d.hf_repo}); use that directly"
+                    if d.hf_repo else " — materialise it to S3 first (Transform → S3)")
+            raise HTTPException(status_code=400,
+                                detail=f"a '{d.kind}' dataset has no files in your storage to serve{hint}.")
+    if not target.storage_id or not target.s3_metadata_uri:
+        raise HTTPException(status_code=400, detail="dataset has no S3 storage/location to publish")
+    storage = await _load_storage(session, target.storage_id)
+    if storage.kind != "s3":
+        raise HTTPException(status_code=400, detail="dataset storage is not S3-backed")
+
+    def _link(repo: "CatalogRepo") -> None:
+        d.catalog_repo_id = repo.id
+        target.catalog_repo_id = repo.id
+
+    # Idempotent — if the requested dataset OR its target twin is already published.
+    existing_id = d.catalog_repo_id or target.catalog_repo_id
+    if existing_id:
+        existing = await session.get(CatalogRepo, existing_id)
+        if existing is not None:
+            _link(existing)
+            await session.commit()
+            return PublishResult(repo_id=existing.id, full_id=existing.full_id,
+                                 repo_type=existing.repo_type, num_files=existing.num_files or 0,
+                                 size_bytes=existing.size_bytes or 0)
+
+    # Derive the repo prefix = the metadata file's S3 dir, relative to the
+    # storage's base prefix (the S3 backend roots keys at storage.config.prefix).
+    uri = target.s3_metadata_uri
+    if uri.startswith("s3://"):
+        bucket, _, key = uri[5:].partition("/")
+        st_bucket = (storage.config or {}).get("bucket")
+        if st_bucket and bucket and bucket != st_bucket:
+            raise HTTPException(status_code=400,
+                                detail=f"dataset files are in bucket '{bucket}' but its storage points at '{st_bucket}'")
+    else:
+        key = uri.lstrip("/")
+    keydir = "/".join(key.split("/")[:-1])
+    base = ((storage.config or {}).get("prefix") or "").strip().strip("/")
+    if not base:
+        repo_prefix = keydir
+    elif keydir == base:
+        repo_prefix = ""
+    elif keydir.startswith(base + "/"):
+        repo_prefix = keydir[len(base) + 1:]
+    else:
+        raise HTTPException(status_code=400,
+                            detail=f"dataset files ({keydir}) aren't under the storage base prefix ({base})")
+    if not repo_prefix:
+        raise HTTPException(status_code=400, detail="could not derive a repo prefix for this dataset")
+
+    owner = await session.get(User, target.owner_id)
+    ns = _sanitize_repo_part(owner.username if owner else "user")
+    name = _sanitize_repo_part(target.name) or target.id
+    # Avoid colliding with a different repo of the same id.
+    clash = (await session.execute(_select(CatalogRepo).where(
+        CatalogRepo.repo_type == "dataset", CatalogRepo.namespace == ns, CatalogRepo.name == name,
+    ))).scalar_one_or_none()
+    if clash is not None:
+        name = f"{name}-{target.id.split('-')[-1]}"
+    full_id = f"{ns}/{name}"
+
+    try:
+        backend = await run_in_threadpool(sb.resolve_backend, storage)
+        manifest, total = await run_in_threadpool(_reindex_manifest, backend, repo_prefix)
+    except sb.StorageError as e:
+        raise HTTPException(status_code=400, detail=f"storage error: {e}") from e
+    if not manifest:
+        raise HTTPException(status_code=400, detail=f"no files found under '{repo_prefix}' to publish")
+
+    repo = CatalogRepo(
+        id=f"repo-{secrets.token_hex(4)}",
+        owner_id=target.owner_id,
+        repo_type="dataset",
+        namespace=ns,
+        name=name,
+        full_id=full_id,
+        storage_id=storage.id,
+        prefix=repo_prefix,
+        sha=_compute_sha(manifest),
+        private=True,
+        description=f"Published from Autotrain dataset “{target.name}” ({target.id})",
+        manifest=manifest,
+        size_bytes=total,
+        num_files=len(manifest),
+    )
+    session.add(repo)
+    _link(repo)
+    await session.commit()
+    await audit_module.record(user, "dataset.publish", "dataset", dataset_id, d.name,
+                              details={"repo": full_id, "served_from": target.id})
+    logger.info("dataset %s published to HF mirror as %s (%d files, served from %s)",
+                dataset_id, full_id, len(manifest), target.id)
+    return PublishResult(repo_id=repo.id, full_id=full_id, repo_type="dataset",
+                         num_files=len(manifest), size_bytes=total)
 
 
 # ---------- upload / preview / sync ------------------------------------

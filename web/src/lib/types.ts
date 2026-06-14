@@ -697,6 +697,7 @@ export type DatasetRecord = {
   label_token_secret?: string | null; // global-secret key (if used instead of a stored token)
   transform_status?: string | null; // "" | running | done | failed
   transform_log?: string | null;
+  catalog_repo_id?: string | null; // hosted HF-mirror dataset repo (if published)
   created_at: string;
   updated_at: string;
   created_by: string;

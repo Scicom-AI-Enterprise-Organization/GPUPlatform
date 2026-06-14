@@ -13,6 +13,7 @@ import { RowBrowser } from "./row-browser";
 import { DecoderCard, type DecoderState } from "./decoder-card";
 import { UploadCard } from "./upload-card";
 import { SyncCard } from "./sync-card";
+import { HfMirrorCard } from "./hf-mirror-card";
 import { DatasetFilesCard } from "./files-card";
 
 function fmtBytes(n?: number | null): string {
@@ -311,6 +312,7 @@ export function DatasetDetail({
             {isUpload && (
               <SyncCard datasetId={dataset.id} canSync={!!dataset.metadata_filename} currentRepo={dataset.hf_repo} />
             )}
+            <HfMirrorCard dataset={dataset} />
           </TabsContent>
         </Tabs>
       </div>

@@ -85,10 +85,21 @@ def _url_prefix(repo_type: str) -> str:
     return "datasets/" if repo_type == "dataset" else ""
 
 
-def _public_base(request: Request) -> str:
-    """The base the client is already talking to (its HF_ENDPOINT minus `/hf`).
-    Building hrefs from this guarantees reachability + survives a custom host."""
-    return str(request.base_url).rstrip("/")
+# huggingface_hub's `fix_hf_endpoint_in_url` rewrites this exact host in any URL
+# we return to the client's configured HF_ENDPOINT. Emitting client-facing URLs
+# (LFS upload href, commit/repo URLs) with this host means they resolve correctly
+# whether the client hits the gateway directly OR through the web proxy
+# (`<origin>/api/proxy/hf`) — the gateway never needs to know its external URL.
+HF_DEFAULT_HOST = "https://huggingface.co"
+
+
+def _client_url(repo_type: str, suffix: str) -> str:
+    """Build a client-facing URL rooted at the HF default host (NOT our `/hf`
+    mount). `fix_hf_endpoint_in_url` swaps the host for the client's HF_ENDPOINT
+    — which already includes the `/hf` mount (direct) or `/api/proxy/hf` (web
+    proxy) — so we must NOT add `/hf` here or it doubles up. `suffix` is the
+    huggingface.co-style path, e.g. `ns/name.git/lfs/<oid>`."""
+    return f"{HF_DEFAULT_HOST}/{_url_prefix(repo_type)}{suffix}"
 
 
 def _secret() -> bytes:
@@ -268,6 +279,109 @@ async def repo_info_rev(rtype: str, ns: str, name: str, revision: str,  # noqa: 
                         user: User = Depends(current_user),
                         session: AsyncSession = Depends(get_session)):
     return await _repo_info_impl(rtype, ns, name, user, session)
+
+
+# ---------- tree (list files under a path) — used by Dataset.push_to_hub ------
+
+
+def _tree_file_entry(e: dict) -> dict:
+    """A tree `file` entry in the shape huggingface_hub's RepoFile(**) expects."""
+    entry = {"type": "file", "path": e["path"], "size": int(e.get("size") or 0),
+             "oid": e.get("oid") or ""}
+    if e.get("lfs"):
+        entry["lfs"] = {"size": int(e.get("size") or 0), "oid": e.get("oid") or "", "pointerSize": 0}
+    return entry
+
+
+async def _tree_impl(rtype: str, ns: str, name: str, path: str, recursive: bool,
+                     user: User, session: AsyncSession):
+    repo_type = _rt(rtype)
+    repo = await _get_repo(session, repo_type, ns, name)
+    if repo is None or not _can_read(repo, user):
+        raise _repo_not_found(repo_type, ns, name)
+    prefix = (path or "").strip("/")
+    manifest = _manifest(repo)
+    # A non-root path that matches no file/dir must 404 with EntryNotFound — HF
+    # clients (HfFileSystem.find → glob) rely on that to treat it as "empty".
+    if prefix and not any(p == prefix or p.startswith(prefix + "/") for p in (e["path"] for e in manifest)):
+        raise HTTPException(status_code=404, detail=f"{path} not found",
+                            headers={"X-Error-Code": "EntryNotFound"})
+    out: list[dict] = []
+    dirs: set[str] = set()
+    for e in manifest:
+        p = e["path"]
+        if prefix:
+            if p != prefix and not p.startswith(prefix + "/"):
+                continue
+            rel = p[len(prefix) + 1:] if p.startswith(prefix + "/") else ""
+        else:
+            rel = p
+        if not rel:
+            continue
+        if recursive or "/" not in rel:
+            out.append(_tree_file_entry(e))
+        else:  # non-recursive: surface the immediate subdirectory once
+            child = f"{prefix}/{rel.split('/', 1)[0]}" if prefix else rel.split("/", 1)[0]
+            if child not in dirs:
+                dirs.add(child)
+                out.append({"type": "directory", "path": child, "oid": ""})
+    return JSONResponse(out)
+
+
+@router.get("/api/{rtype}/{ns}/{name}/tree/{revision}/{path:path}")
+async def repo_tree(rtype: str, ns: str, name: str, revision: str, path: str,  # noqa: ARG001
+                    recursive: bool = False, expand: bool = False,  # noqa: ARG001 — expand ignored
+                    user: User = Depends(current_user),
+                    session: AsyncSession = Depends(get_session)):
+    return await _tree_impl(rtype, ns, name, path, recursive, user, session)
+
+
+@router.get("/api/{rtype}/{ns}/{name}/tree/{revision}")
+async def repo_tree_root(rtype: str, ns: str, name: str, revision: str,  # noqa: ARG001
+                         recursive: bool = False, expand: bool = False,  # noqa: ARG001
+                         user: User = Depends(current_user),
+                         session: AsyncSession = Depends(get_session)):
+    return await _tree_impl(rtype, ns, name, "", recursive, user, session)
+
+
+# ---------- paths-info — stat specific paths (HfFileSystem; push_to_hub/load_dataset) ----
+
+
+@router.post("/api/{rtype}/{ns}/{name}/paths-info/{revision:path}")
+async def paths_info(rtype: str, ns: str, name: str, revision: str, request: Request,  # noqa: ARG001
+                     user: User = Depends(current_user),
+                     session: AsyncSession = Depends(get_session)):
+    repo_type = _rt(rtype)
+    repo = await _get_repo(session, repo_type, ns, name)
+    if repo is None or not _can_read(repo, user):
+        raise _repo_not_found(repo_type, ns, name)
+    # `HfApi.get_paths_info` sends form-encoded `paths` (repeated key); some
+    # callers send JSON — accept both.
+    paths: list[str] = []
+    try:
+        form = await request.form()
+        paths = [str(p) for p in form.getlist("paths")]
+    except Exception:  # noqa: BLE001
+        paths = []
+    if not paths:
+        try:
+            body = await request.json()
+            paths = body.get("paths") or []
+        except Exception:  # noqa: BLE001
+            paths = []
+
+    by_path = {e["path"]: e for e in _manifest(repo)}
+    out: list[dict] = []
+    for raw in paths:
+        p = (raw or "").strip("/")
+        if p == "":  # repo root → directory
+            out.append({"type": "directory", "path": "", "oid": repo.sha or ""})
+        elif p in by_path:
+            out.append(_tree_file_entry(by_path[p]))
+        elif any(mp == p or mp.startswith(p + "/") for mp in by_path):
+            out.append({"type": "directory", "path": p, "oid": ""})
+        # else: path doesn't exist → omit (HF returns it absent)
+    return JSONResponse(out)
 
 
 # ---------- file resolve (HEAD metadata + GET bytes) --------------------
@@ -454,9 +568,8 @@ async def repos_create(payload: dict, request: Request,
         session.add(repo)
         await session.commit()
         logger.info("hf: created %s repo %s/%s (storage=%s)", repo_type, ns, name, store.id)
-    base = _public_base(request)
     return {
-        "url": f"{base}/hf/{_url_prefix(repo_type)}{ns}/{name}",
+        "url": _client_url(repo_type, f"{ns}/{name}"),
         "name": f"{ns}/{name}",
         "id": repo.id,
         "type": repo_type,
@@ -527,7 +640,6 @@ async def _batch_impl(repo_type: str, ns: str, name: str, payload: dict, request
         raise _repo_not_found(repo_type, ns, name)
     _require_owner(repo, user)
     backend = await _backend_for(session, repo)
-    base = _public_base(request)
     operation = payload.get("operation", "upload")
     objects = []
     for obj in (payload.get("objects") or []):
@@ -540,7 +652,8 @@ async def _batch_impl(repo_type: str, ns: str, name: str, payload: dict, request
                 objects.append({"oid": oid, "size": size})  # already present → skip
                 continue
             token = _sign_lfs(repo.id, oid)
-            href = f"{base}/hf/{_url_prefix(repo_type)}{ns}/{name}.git/lfs/{oid}?token={token}"
+            # Use the repo's canonical name (the route captured it as "<name>.git").
+            href = _client_url(repo_type, f"{repo.namespace}/{repo.name}.git/lfs/{oid}?token={token}")
             objects.append({"oid": oid, "size": size, "actions": {"upload": {"href": href}}})
         else:
             objects.append({"oid": oid, "size": size})
@@ -675,9 +788,8 @@ async def _commit_impl(rtype: str, ns: str, name: str, request: Request,
     repo.num_files = len(manifest)
     await session.commit()
 
-    base = _public_base(request)
     return {
-        "commitUrl": f"{base}/hf/{_url_prefix(repo_type)}{ns}/{name}/commit/{sha}",
+        "commitUrl": _client_url(repo_type, f"{ns}/{name}/commit/{sha}"),
         "commitOid": sha,
         "pullRequestUrl": None,
     }

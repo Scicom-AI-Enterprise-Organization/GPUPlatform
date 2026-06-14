@@ -370,6 +370,10 @@ class Dataset(Base):
     # Alternatively the lpat token can come from a named global secret instead of
     # being stored per-dataset; resolved via load_global_env() at use time.
     label_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # When this (s3-backed) dataset has been published to the self-hosted HF mirror
+    # — the id of the CatalogRepo (repo_type=dataset) serving its files over /hf, so
+    # the dataset page can show pull snippets + link to it. NULL = not published.
+    catalog_repo_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -552,6 +556,9 @@ async def init_db() -> None:
         # only creates missing tables, not missing columns on existing ones.
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS catalog_repo_id VARCHAR(64)"
         ))
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)"
