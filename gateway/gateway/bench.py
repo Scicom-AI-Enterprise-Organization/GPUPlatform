@@ -1608,15 +1608,20 @@ async def create_benchmark(
 
     # Resolve the storage backend for logs + result files. Precedence:
     #   1. the explicit storage_id field (web form path), else
-    #   2. a top-level `storage:` key inside the config_yaml — a backend id or
-    #      name — so a full YAML config (pasted in, or POSTed via the API) can
-    #      name its own s3 storage without the separate field, else
+    #   2. a `storage:` key on a benchmark item inside config_yaml — a backend
+    #      id or name — so a full YAML config (pasted in, or POSTed via the API)
+    #      can name its own s3 storage without the separate field, else
     #   3. the env bucket (API/back-compat).
     storage_id = body.storage_id
     if not storage_id:
-        ref = cfg.get("storage")
-        if isinstance(ref, str) and ref.strip():
-            ref = ref.strip()
+        ref = None
+        for item in cfg.get("benchmark") or []:
+            if isinstance(item, dict):
+                sv = item.get("storage")
+                if isinstance(sv, str) and sv.strip():
+                    ref = sv.strip()
+                    break
+        if ref:
             st = await session.get(Storage, ref)  # try id first
             if st is None:
                 # fall back to a name lookup, scoped to the caller's storages.

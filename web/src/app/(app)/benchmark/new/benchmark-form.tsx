@@ -422,18 +422,18 @@ remote:
     - hf_transfer
 `;
 
-  // Storage backend (S3 logs/results target) referenced by name. The gateway
-  // ignores this key — it resolves the backend from the separate `storage_id`
-  // request field — but carrying it here lets the Storage dropdown survive a
-  // round-trip through YAML mode (rendered here, read back in parseYamlToForm).
-  const storageLine = storageName
-    ? `storage: ${JSON.stringify(storageName)}\n\n`
+  // Storage backend (S3 logs/results target) for this run, referenced by name
+  // on the benchmark item. The runner (benchmaq) ignores this key; the gateway
+  // resolves it to a real storage backend at submit, and parseYamlToForm reads
+  // it back so the Form's Storage dropdown survives a YAML round-trip.
+  const benchStorageLine = storageName
+    ? `    storage: ${JSON.stringify(storageName)}\n`
     : "";
 
-  return `${storageLine}${runpodBlock}${remoteBlock}
+  return `${runpodBlock}${remoteBlock}
 benchmark:
   - name: ${s.benchName}
-    engine: vllm
+${benchStorageLine}    engine: vllm
     model:
       repo_id: "${s.model_repo_id}"
       local_dir: "${modelToLocalDir(s.model_repo_id, target === "vm" ? s.vm_base_dir : "/workspace")}"
@@ -635,9 +635,18 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
     }
   }
 
-  // ---- top-level storage: backend name (resolved to an id by the caller).
-  const storageRef =
-    typeof d.storage === "string" && d.storage.trim() ? d.storage.trim() : null;
+  // ---- benchmark[].storage: backend name on a bench item (resolved to an id
+  // by the caller). Use the first item that names one.
+  let storageRef: string | null = null;
+  for (const b of benches) {
+    if (b && typeof b === "object") {
+      const sv = (b as Record<string, unknown>).storage;
+      if (typeof sv === "string" && sv.trim()) {
+        storageRef = sv.trim();
+        break;
+      }
+    }
+  }
 
   return { state: next, unknownKeys: unknown, parseError: null, storageRef };
 }
