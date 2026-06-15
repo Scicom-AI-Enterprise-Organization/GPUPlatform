@@ -1,0 +1,169 @@
+name: "[CAE] CD - Dev"
+
+# Builds the GPUPlatform images and pushes them to Huawei SWR for the CAE CCE
+# cluster (cce-ucc-devl). Self-contained: builds locally then `skopeo copy`s to
+# SWR — does NOT depend on the ECR images from ci.yml.
+#
+# Three ways to publish:
+#   1. workflow_run  — after `ci` goes green on main → auto-publish main's HEAD
+#      (tag <short-sha> + latest). The hands-off dev path.
+#   2. push to cae-dev — the "SWR publish branch": push any commit there and its
+#      image lands in SWR (tag <short-sha>). Ship a branch to CAE without merging
+#      to main.
+#   3. workflow_dispatch — manual; optionally pass a ref (branch/tag/SHA) to build
+#      an arbitrary commit. Requires this file on the default branch. e.g. build
+#      the disable-cloud-providers branch: ref=feat/disable-cloud-providers.
+#
+# In all cases the image tag is the 7-char SHA of the *built* commit, so it
+# matches what apps/serverlessgpu/values.yaml pins in argocd-cae-dev.
+#
+# Why skopeo (not build-push-action's push): SWR rejects OCI image manifests
+# (what buildx emits when provenance is on). We build with provenance:false +
+# load:true to keep a Docker v2s2 image in the local daemon, then
+# `skopeo copy --format v2s2` re-encodes on the way out so SWR accepts it.
+# Single-arch amd64 — CCE nodes are x86.
+#
+# Required repo config (Settings → Secrets and variables → Actions):
+#   Secrets:  SWR_REGISTRY      swr.my-kualalumpur-1.alphaedge.tmone.com.my
+#             SWR_ORGANIZATION  ucc-devl
+#             SWR_USERNAME      Huawei SWR long-term login user: <region>@<AK>
+#                               e.g. my-kualalumpur-1@AKIA...
+#             SWR_PASSWORD      SWR long-term login key:
+#                               printf '<AK>' | openssl dgst -binary -sha256 -hmac '<SK>' \
+#                                 | od -An -vtx1 | tr -d ' \n'
+#   Variables (optional — override the CAE defaults below):
+#             CAE_PUBLIC_GATEWAY_URL    baked into the web image (NEXT_PUBLIC_*)
+#             CAE_INTERNAL_GATEWAY_URL
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  push:
+    branches: [cae-dev]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to build & push (default: the ref this runs on)"
+        required: false
+        default: ""
+
+# Cancel older in-flight runs for the same target commit/ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || github.event.inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read   # read the triggering workflow_run
+
+# CAE defaults for the web image's build-time NEXT_PUBLIC_* bake (the web image
+# hard-codes these at build time). Point at the CAE gateway, not the AWS prod
+# URL; override with the CAE_* GitHub Variables.
+env:
+  PUBLIC_GATEWAY_URL: https://serverlessgpu.cae.scicom.dev
+  INTERNAL_GATEWAY_URL: http://serverlessgpu-gateway.serverlessgpu.svc.cluster.local
+
+jobs:
+  build-and-push:
+    name: build & push ${{ matrix.component }} to SWR
+    runs-on: ubuntu-latest
+    # workflow_run only when ci passed; push / dispatch always run.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # context = repo root so gateway/Dockerfile can COPY the sibling
+          # worker-agent/ source it ships to VM fleets on provision.
+          - component: gateway
+            repo: serverlessgpu-gateway
+            context: .
+            dockerfile: ./gateway/Dockerfile
+          - component: web
+            repo: serverlessgpu-web
+            context: ./web
+            dockerfile: ./web/Dockerfile
+          # pi-worker context = repo root (Dockerfile.pi COPYs worker-agent/...
+          # and entrypoint-pi.sh). vLLM is x86-only, so amd64 is correct anyway.
+          - component: pi-worker
+            repo: serverlessgpu-pi-worker
+            context: .
+            dockerfile: ./worker-agent/Dockerfile.pi
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # workflow_run → the commit ci ran on; dispatch → the ref input (or the
+          # branch it was dispatched on); push → the pushed branch.
+          ref: ${{ github.event.workflow_run.head_sha || github.event.inputs.ref || github.ref }}
+
+      - name: Compute image tag
+        id: meta
+        # 7-char SHA of the actually-checked-out commit — event-agnostic, and
+        # matches the tag argocd-cae-dev pins.
+        run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # provenance:false + load:true keeps a Docker v2s2 image in the local
+      # daemon for skopeo. build-args are shared across components (mirrors
+      # ci.yml): gateway consumes APP_VERSION, web consumes all three, pi-worker
+      # ignores them (harmless BuildKit warnings).
+      - name: Build ${{ matrix.component }} image (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          build-args: |
+            NEXT_PUBLIC_GATEWAY_URL=${{ vars.CAE_PUBLIC_GATEWAY_URL || env.PUBLIC_GATEWAY_URL }}
+            NEXT_PUBLIC_GATEWAY_INTERNAL_URL=${{ vars.CAE_INTERNAL_GATEWAY_URL || env.INTERNAL_GATEWAY_URL }}
+            APP_VERSION=${{ steps.meta.outputs.tag }}
+          tags: local-build:${{ matrix.component }}-${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=swr-${{ matrix.component }}
+          cache-to: type=gha,scope=swr-${{ matrix.component }},mode=max
+
+      - name: Install skopeo
+        run: sudo apt-get update -qq && sudo apt-get install -y skopeo
+
+      # Tag <short-sha> always (immutable, what argocd pins). Also tag `latest`
+      # only when publishing main (workflow_run) so a branch build never clobbers
+      # the main `latest`.
+      - name: Push ${{ matrix.component }} to SWR
+        env:
+          IMAGE_NAME: local-build:${{ matrix.component }}-${{ steps.meta.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          REPO: ${{ matrix.repo }}
+          PUSH_LATEST: ${{ github.event_name == 'workflow_run' }}
+          SWR_REGISTRY: ${{ secrets.SWR_REGISTRY }}
+          SWR_ORGANIZATION: ${{ secrets.SWR_ORGANIZATION }}
+          SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+          SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SWR_REGISTRY}" ] || [ -z "${SWR_USERNAME}" ] || [ -z "${SWR_PASSWORD}" ]; then
+            echo "::error::SWR_REGISTRY / SWR_USERNAME / SWR_PASSWORD secrets are not set"
+            exit 1
+          fi
+          dests="${TAG}"
+          [ "${PUSH_LATEST}" = "true" ] && dests="${dests} latest"
+          for DEST in ${dests}; do
+            echo "→ ${SWR_REGISTRY}/${SWR_ORGANIZATION}/${REPO}:${DEST}"
+            skopeo copy --format v2s2 \
+              --dest-creds "${SWR_USERNAME}:${SWR_PASSWORD}" \
+              "docker-daemon:${IMAGE_NAME}" \
+              "docker://${SWR_REGISTRY}/${SWR_ORGANIZATION}/${REPO}:${DEST}"
+          done
+
+      - name: Summary
+        run: |
+          {
+            echo "## Pushed ${{ matrix.component }} to SWR"
+            echo "**Image:** \`${{ secrets.SWR_REGISTRY }}/${{ secrets.SWR_ORGANIZATION }}/${{ matrix.repo }}:${{ steps.meta.outputs.tag }}\`"
+            echo "**Trigger:** \`${{ github.event_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
