@@ -35,13 +35,22 @@ export function StorageForm() {
   const [prefix, setPrefix] = useState("");
   const [region, setRegion] = useState("");
   const [endpoint, setEndpoint] = useState("");
+  // s3 credentials: pasted keys, or picked from global secrets.
+  const [s3CredSource, setS3CredSource] = useState<"paste" | "secret">("paste");
   const [accessKeyId, setAccessKeyId] = useState("");
   const [secretAccessKey, setSecretAccessKey] = useState("");
+  const [accessKeyIdSecret, setAccessKeyIdSecret] = useState("");
+  const [secretAccessKeySecret, setSecretAccessKeySecret] = useState("");
 
   // huggingface — token comes from a global secret (default) or a pasted token.
   const [hfSource, setHfSource] = useState<"secret" | "paste">("secret");
   const [hfToken, setHfToken] = useState("");
   const [hfTokenSecret, setHfTokenSecret] = useState("");
+  // huggingface — optional custom HF_ENDPOINT (default huggingface.co): none, a
+  // pasted URL, or a global secret.
+  const [hfEndpointSource, setHfEndpointSource] = useState<"none" | "paste" | "secret">("none");
+  const [hfEndpoint, setHfEndpoint] = useState("");
+  const [hfEndpointSecret, setHfEndpointSecret] = useState("");
   const [secretKeys, setSecretKeys] = useState<string[]>([]);
 
   // local
@@ -85,10 +94,18 @@ export function StorageForm() {
     if (!name.trim()) return "Name is required.";
     if (kind === "s3") {
       if (!bucket.trim()) return "Bucket is required.";
-      const hasOne = accessKeyId.trim() || secretAccessKey.trim();
-      const hasBoth = accessKeyId.trim() && secretAccessKey.trim();
-      if (hasOne && !hasBoth) {
-        return "Provide both Access key ID and Secret access key, or leave both blank.";
+      if (s3CredSource === "secret") {
+        const hasOne = accessKeyIdSecret || secretAccessKeySecret;
+        const hasBoth = accessKeyIdSecret && secretAccessKeySecret;
+        if (hasOne && !hasBoth) {
+          return "Pick a secret for both Access key ID and Secret access key, or leave both unset.";
+        }
+      } else {
+        const hasOne = accessKeyId.trim() || secretAccessKey.trim();
+        const hasBoth = accessKeyId.trim() && secretAccessKey.trim();
+        if (hasOne && !hasBoth) {
+          return "Provide both Access key ID and Secret access key, or leave both blank.";
+        }
       }
     }
     if (kind === "local" && !localPath.trim()) return "Path is required.";
@@ -102,13 +119,22 @@ export function StorageForm() {
   // Build the kind-specific payload shared by Test + Create.
   const kindPayload = () => {
     if (kind === "s3") {
+      const creds =
+        s3CredSource === "secret"
+          ? {
+              access_key_id_secret: accessKeyIdSecret || null,
+              secret_access_key_secret: secretAccessKeySecret || null,
+            }
+          : {
+              access_key_id: accessKeyId.trim() || null,
+              secret_access_key: secretAccessKey.trim() || null,
+            };
       return {
         bucket: bucket.trim(),
         prefix: prefix.trim() || null,
         region: region.trim() || null,
         endpoint: endpoint.trim() || null,
-        access_key_id: accessKeyId.trim() || null,
-        secret_access_key: secretAccessKey.trim() || null,
+        ...creds,
       };
     }
     if (kind === "local") {
@@ -124,9 +150,18 @@ export function StorageForm() {
         private_key: sftpAuth === "key" ? sftpKey || null : null,
       };
     }
-    return hfSource === "secret"
-      ? { hf_token_secret: hfTokenSecret || null }
-      : { hf_token: hfToken.trim() || null };
+    // huggingface: token (secret/paste) + optional custom endpoint (none/paste/secret).
+    const endpointPart =
+      hfEndpointSource === "secret"
+        ? { endpoint_secret: hfEndpointSecret || null }
+        : hfEndpointSource === "paste"
+          ? { endpoint: hfEndpoint.trim() || null }
+          : {};
+    const tokenPart =
+      hfSource === "secret"
+        ? { hf_token_secret: hfTokenSecret || null }
+        : { hf_token: hfToken.trim() || null };
+    return { ...tokenPart, ...endpointPart };
   };
 
   const onTest = async () => {
@@ -281,41 +316,113 @@ export function StorageForm() {
           <div className="mt-4 rounded-md border border-border p-3">
             <div className="mb-1 text-sm font-medium">Credentials</div>
             <p className="mb-3 text-xs text-muted-foreground">
-              Optional — leave both blank to fall back to{" "}
+              Optional — leave blank to fall back to{" "}
               <span className="font-mono">AWS_ACCESS_KEY_ID</span> /{" "}
               <span className="font-mono">AWS_SECRET_ACCESS_KEY</span> on the gateway.
-              Stored encrypted at rest with Fernet.
+              Paste keys (stored encrypted with Fernet) or reference{" "}
+              <a href="/admin/secrets" className="underline">global secrets</a> (rotate without touching this storage).
             </p>
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <div>
-                <Label htmlFor="s3-akid" className="text-xs uppercase tracking-wide text-muted-foreground">Access key ID</Label>
-                <Input
-                  id="s3-akid"
-                  type="password"
-                  autoComplete="off"
-                  value={accessKeyId}
-                  onChange={(e) => {
-                    setAccessKeyId(e.target.value);
+
+            <div className="mb-3 inline-flex rounded-md border border-border p-0.5 text-xs">
+              {(["paste", "secret"] as const).map((src) => (
+                <button
+                  key={src}
+                  type="button"
+                  onClick={() => {
+                    setS3CredSource(src);
                     invalidateTest();
                   }}
-                  className="mt-1.5 font-mono text-xs"
-                />
-              </div>
-              <div>
-                <Label htmlFor="s3-sak" className="text-xs uppercase tracking-wide text-muted-foreground">Secret access key</Label>
-                <Input
-                  id="s3-sak"
-                  type="password"
-                  autoComplete="off"
-                  value={secretAccessKey}
-                  onChange={(e) => {
-                    setSecretAccessKey(e.target.value);
-                    invalidateTest();
-                  }}
-                  className="mt-1.5 font-mono text-xs"
-                />
-              </div>
+                  className={
+                    "rounded px-2.5 py-1 transition-colors " +
+                    (s3CredSource === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                  }
+                >
+                  {src === "paste" ? "Paste keys" : "Global secrets"}
+                </button>
+              ))}
             </div>
+
+            {s3CredSource === "secret" ? (
+              secretKeys.length > 0 ? (
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <div>
+                    <Label htmlFor="s3-akid-secret" className="text-xs uppercase tracking-wide text-muted-foreground">Access key ID secret</Label>
+                    <Select
+                      value={accessKeyIdSecret}
+                      onValueChange={(v) => {
+                        setAccessKeyIdSecret(v);
+                        invalidateTest();
+                      }}
+                    >
+                      <SelectTrigger id="s3-akid-secret" className="mt-1.5">
+                        <SelectValue placeholder="Select a secret" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {secretKeys.map((k) => (
+                          <SelectItem key={k} value={k} className="font-mono text-xs">{k}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div>
+                    <Label htmlFor="s3-sak-secret" className="text-xs uppercase tracking-wide text-muted-foreground">Secret access key secret</Label>
+                    <Select
+                      value={secretAccessKeySecret}
+                      onValueChange={(v) => {
+                        setSecretAccessKeySecret(v);
+                        invalidateTest();
+                      }}
+                    >
+                      <SelectTrigger id="s3-sak-secret" className="mt-1.5">
+                        <SelectValue placeholder="Select a secret" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {secretKeys.map((k) => (
+                          <SelectItem key={k} value={k} className="font-mono text-xs">{k}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  No global secrets yet. Add them under{" "}
+                  <a href="/admin/secrets" className="underline">Secrets</a>, then pick them here — or switch to{" "}
+                  <span className="font-medium">Paste keys</span>.
+                </p>
+              )
+            ) : (
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div>
+                  <Label htmlFor="s3-akid" className="text-xs uppercase tracking-wide text-muted-foreground">Access key ID</Label>
+                  <Input
+                    id="s3-akid"
+                    type="password"
+                    autoComplete="off"
+                    value={accessKeyId}
+                    onChange={(e) => {
+                      setAccessKeyId(e.target.value);
+                      invalidateTest();
+                    }}
+                    className="mt-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="s3-sak" className="text-xs uppercase tracking-wide text-muted-foreground">Secret access key</Label>
+                  <Input
+                    id="s3-sak"
+                    type="password"
+                    autoComplete="off"
+                    value={secretAccessKey}
+                    onChange={(e) => {
+                      setSecretAccessKey(e.target.value);
+                      invalidateTest();
+                    }}
+                    className="mt-1.5 font-mono text-xs"
+                  />
+                </div>
+              </div>
+            )}
           </div>
         </section>
       )}
@@ -533,6 +640,82 @@ export function StorageForm() {
               </p>
             </>
           )}
+
+          <div className="mt-5 border-t border-border pt-4">
+            <div className="mb-1 text-sm font-medium">Custom endpoint (optional)</div>
+            <p className="mb-3 text-xs text-muted-foreground">
+              Point at a self-hosted, HF-compatible Hub (sets{" "}
+              <span className="font-mono">HF_ENDPOINT</span>) instead of{" "}
+              <span className="font-mono">huggingface.co</span>. Leave as{" "}
+              <span className="font-medium">Default</span> for the public Hub.
+            </p>
+
+            <div className="mb-3 inline-flex rounded-md border border-border p-0.5 text-xs">
+              {(["none", "paste", "secret"] as const).map((src) => (
+                <button
+                  key={src}
+                  type="button"
+                  onClick={() => {
+                    setHfEndpointSource(src);
+                    invalidateTest();
+                  }}
+                  className={
+                    "rounded px-2.5 py-1 transition-colors " +
+                    (hfEndpointSource === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                  }
+                >
+                  {src === "none" ? "Default" : src === "paste" ? "Paste a URL" : "Global secret"}
+                </button>
+              ))}
+            </div>
+
+            {hfEndpointSource === "paste" ? (
+              <>
+                <Label htmlFor="hf-endpoint" className="text-xs uppercase tracking-wide text-muted-foreground">Endpoint URL</Label>
+                <Input
+                  id="hf-endpoint"
+                  value={hfEndpoint}
+                  onChange={(e) => {
+                    setHfEndpoint(e.target.value);
+                    invalidateTest();
+                  }}
+                  placeholder="https://hf.internal.example.com"
+                  className="mt-1.5 font-mono text-xs"
+                />
+              </>
+            ) : hfEndpointSource === "secret" ? (
+              secretKeys.length > 0 ? (
+                <>
+                  <Label htmlFor="hf-endpoint-secret" className="text-xs uppercase tracking-wide text-muted-foreground">Endpoint secret</Label>
+                  <Select
+                    value={hfEndpointSecret}
+                    onValueChange={(v) => {
+                      setHfEndpointSecret(v);
+                      invalidateTest();
+                    }}
+                  >
+                    <SelectTrigger id="hf-endpoint-secret" className="mt-1.5">
+                      <SelectValue placeholder="Select a secret (e.g. HF_ENDPOINT)" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {secretKeys.map((k) => (
+                        <SelectItem key={k} value={k} className="font-mono text-xs">{k}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    Resolved from Secrets at use-time.
+                  </p>
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  No global secrets yet. Add one under{" "}
+                  <a href="/admin/secrets" className="underline">Secrets</a>, then pick it here — or switch to{" "}
+                  <span className="font-medium">Paste a URL</span>.
+                </p>
+              )
+            ) : null}
+          </div>
         </section>
       )}
 

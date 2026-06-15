@@ -19,12 +19,12 @@ export function ScopeToggle({ scope }: { scope: "mine" | "all" }) {
   }
 
   return (
-    <div className="inline-flex items-center rounded-md border border-border bg-background p-0.5 text-xs">
+    <div className="inline-flex shrink-0 items-center rounded-md border border-border bg-background p-0.5 text-xs">
       <button
         type="button"
         onClick={() => setScope("mine")}
         className={cn(
-          "inline-flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition-colors",
+          "inline-flex items-center gap-1.5 whitespace-nowrap rounded px-2.5 py-1 font-medium transition-colors",
           scope === "mine"
             ? "bg-foreground text-background"
             : "text-muted-foreground hover:text-foreground",
@@ -37,7 +37,7 @@ export function ScopeToggle({ scope }: { scope: "mine" | "all" }) {
         type="button"
         onClick={() => setScope("all")}
         className={cn(
-          "inline-flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition-colors",
+          "inline-flex items-center gap-1.5 whitespace-nowrap rounded px-2.5 py-1 font-medium transition-colors",
           scope === "all"
             ? "bg-foreground text-background"
             : "text-muted-foreground hover:text-foreground",

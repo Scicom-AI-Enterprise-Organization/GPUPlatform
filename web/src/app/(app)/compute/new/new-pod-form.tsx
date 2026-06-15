@@ -6,7 +6,6 @@ import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { NumberField } from "@/components/ui/number-field";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -15,6 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { SearchableSelect } from "@/components/ui/searchable-select";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
@@ -95,6 +95,16 @@ const PI_GPU_FALLBACK: GpuTypeOption[] = [
   { id: "MI300X_192GB", label: "MI300X", vram_gb: 192, hint: "AMD" },
 ];
 
+// Same count picker as the serverless Pod card.
+const GPU_COUNT_CHOICES = [1, 2, 4, 8] as const;
+
+// Inline GPU hint — total VRAM across the requested count.
+function capacityHint(vramPerGpu: number, count: number): string {
+  const total = vramPerGpu * count;
+  const totalStr = total >= 100 ? `${Math.round(total)} GB` : `${total} GB`;
+  return count === 1 ? `${totalStr} VRAM` : `${totalStr} VRAM · ${count} × ${vramPerGpu} GB`;
+}
+
 export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const router = useRouter();
   const [name, setName] = useState("dev-pod");
@@ -102,8 +112,8 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const [runpodGpus, setRunpodGpus] = useState<GpuTypeOption[]>(RUNPOD_GPU_FALLBACK);
   const [piGpus, setPiGpus] = useState<GpuTypeOption[]>(PI_GPU_FALLBACK);
   const [gpuCount, setGpuCount] = useState(1);
-  const [diskGb, setDiskGb] = useState(40);
-  const [volumeGb, setVolumeGb] = useState(0);
+  const [containerDisk, setContainerDisk] = useState("40");
+  const [volumeGb, setVolumeGb] = useState("0");
   const [templateId, setTemplateId] = useState(
     templates[0]?.id ?? "pytorch-2.4-cuda12.4",
   );
@@ -157,6 +167,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   useEffect(() => {
     if (gpuCatalog.length === 0) return;
     if (!gpuCatalog.some((g) => g.id === gpuType)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setGpuType(gpuCatalog[0].id);
     }
   }, [providerKind, gpuCatalog, gpuType]);
@@ -165,6 +176,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   // supports for the current (gpu, count, tier). Re-runs when those change.
   useEffect(() => {
     if (providerKind !== "pi") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPiImagesFiltered(false);
       return;
     }
@@ -199,6 +211,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   // When switching provider kind, snap template_id back to the kind's default
   // so we don't ship a RunPod image id to PI (or vice versa).
   useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect */
     if (providerKind === "pi") {
       setTemplateId((cur) =>
         piImages.some((i) => i.id === cur)
@@ -212,6 +225,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       );
       setImageOverride(null);
     }
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, [providerKind, piImages, templates]);
 
   const availability = useGpuAvailability(
@@ -222,11 +236,24 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
     { kind: providerKind, id: providerId || null },
   );
 
+  const parsedDisk = Number.parseInt(containerDisk, 10);
+  const diskInvalid = !Number.isFinite(parsedDisk) || parsedDisk < 10 || parsedDisk > 2000;
+  const parsedVolume = Number.parseInt(volumeGb, 10);
+  const volumeInvalid = !Number.isFinite(parsedVolume) || parsedVolume < 0 || parsedVolume > 2000;
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
     if (!name.trim()) {
       setSubmitError("Name is required.");
+      return;
+    }
+    if (diskInvalid) {
+      setSubmitError("Container disk must be between 10 and 2000 GB.");
+      return;
+    }
+    if (volumeInvalid) {
+      setSubmitError("Volume must be between 0 and 2000 GB.");
       return;
     }
     setSubmitting(true);
@@ -235,8 +262,8 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         name: name.trim(),
         gpu_type: gpuType,
         gpu_count: gpuCount,
-        container_disk_gb: diskGb,
-        volume_gb: volumeGb,
+        container_disk_gb: parsedDisk,
+        volume_gb: parsedVolume,
         template_id: templateId,
         image: imageOverride,
         cloud_type: secureCloud ? "SECURE" : "COMMUNITY",
@@ -310,69 +337,51 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
 
       {/* Section: hardware */}
       <Section title="Hardware" description="GPU type, count, and storage.">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-1.5">
-            <Label className="text-xs uppercase tracking-wide text-muted-foreground">GPU</Label>
-            <Select value={gpuType} onValueChange={setGpuType}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {gpuCatalog.map((g) => (
-                  <SelectItem key={g.id} value={g.id}>
-                    <span className="font-medium">{g.label}</span>
-                    <span className="ml-2 text-xs text-muted-foreground">
-                      {g.vram_gb} GB{g.hint ? ` · ${g.hint}` : ""}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <AvailabilityBadge state={availability} count={gpuCount} className="mt-1" />
-          </div>
-
-          <div className="space-y-1.5">
-            <Label htmlFor="cmp-count" className="text-xs uppercase tracking-wide text-muted-foreground">GPU count</Label>
-            <NumberField
-              id="cmp-count"
-              min={1}
-              max={8}
-              value={gpuCount}
-              onChange={setGpuCount}
-            />
-          </div>
-
-          <div className="space-y-1.5">
-            <Label htmlFor="cmp-disk" className="text-xs uppercase tracking-wide text-muted-foreground">Container disk (GB)</Label>
-            <NumberField
-              id="cmp-disk"
-              min={10}
-              max={2000}
-              value={diskGb}
-              onChange={setDiskGb}
-            />
-            <p className="text-xs text-muted-foreground">
-              Working space for the container. Resets on pod stop.
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <Label htmlFor="cmp-volume" className="text-xs uppercase tracking-wide text-muted-foreground">Volume (GB)</Label>
-            <NumberField
-              id="cmp-volume"
-              min={0}
-              max={2000}
-              value={volumeGb}
-              onChange={setVolumeGb}
-            />
-            <p className="text-xs text-muted-foreground">
-              0 = no persistent volume. Volume keeps data across stop/start.
-            </p>
-          </div>
-
-          <div className="space-y-1.5 sm:col-span-2">
-            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Cloud tier</Label>
+        <div className="space-y-5">
+          <Field
+            label="GPU"
+            hint={(() => {
+              const g = gpuCatalog.find((c) => c.id === gpuType);
+              return g ? capacityHint(g.vram_gb, gpuCount) : undefined;
+            })()}
+            extra={<AvailabilityBadge state={availability} count={gpuCount} />}
+          >
             <div className="flex gap-2">
+              <SearchableSelect
+                className="flex-1"
+                value={gpuType}
+                onChange={setGpuType}
+                options={gpuCatalog.map((g) => ({
+                  value: g.id,
+                  label: g.label,
+                  hint: `${g.vram_gb} GB${g.hint ? ` · ${g.hint}` : ""}`,
+                }))}
+                placeholder="Choose a GPU"
+                searchPlaceholder="Search GPUs (e.g. h100, 24gb, ada)…"
+              />
+              <Select
+                value={String(gpuCount)}
+                onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}
+              >
+                <SelectTrigger className="w-24 shrink-0">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {GPU_COUNT_CHOICES.map((n) => (
+                    <SelectItem key={n} value={String(n)}>
+                      ×{n}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </Field>
+
+          <Field
+            label="Cloud tier"
+            hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity."
+          >
+            <div className="grid grid-cols-2 gap-2">
               <TierButton
                 active={!secureCloud}
                 onClick={() => setSecureCloud(false)}
@@ -386,6 +395,35 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
                 hint="vetted hosts, more capacity"
               />
             </div>
+          </Field>
+
+          <div className="grid grid-cols-2 gap-3">
+            <Field
+              label="Container disk (GB)"
+              hint="Working space for the container. Resets on pod stop."
+            >
+              <Input
+                type="text"
+                inputMode="numeric"
+                value={containerDisk}
+                onChange={(e) => setContainerDisk(e.target.value)}
+                placeholder="40"
+                aria-invalid={diskInvalid}
+              />
+            </Field>
+            <Field
+              label="Volume (GB)"
+              hint="0 = no persistent volume. Volume keeps data across stop/start."
+            >
+              <Input
+                type="text"
+                inputMode="numeric"
+                value={volumeGb}
+                onChange={(e) => setVolumeGb(e.target.value)}
+                placeholder="0"
+                aria-invalid={volumeInvalid}
+              />
+            </Field>
           </div>
         </div>
       </Section>
@@ -481,13 +519,38 @@ function TierButton({
       type="button"
       onClick={onClick}
       className={cn(
-        "flex-1 rounded-md border bg-card px-3 py-2 text-left transition-colors hover:border-foreground/40",
-        active ? "border-foreground/60 ring-1 ring-foreground/20" : "border-border",
+        "rounded-md border bg-card p-3 text-left transition-colors",
+        active ? "border-foreground/60 ring-1 ring-foreground/20" : "border-border hover:border-foreground/40",
       )}
     >
       <div className="text-sm font-medium">{label}</div>
-      <div className="text-[11px] text-muted-foreground">{hint}</div>
+      <div className="mt-0.5 text-xs text-muted-foreground">{hint}</div>
     </button>
+  );
+}
+
+// Label + optional inline `extra` (e.g. availability badge) + hint below —
+// mirrors the serverless Pod card's field layout.
+function Field({
+  label,
+  hint,
+  children,
+  extra,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+  extra?: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <Label className="text-xs uppercase tracking-wide text-muted-foreground">{label}</Label>
+        {extra}
+      </div>
+      {children}
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+    </div>
   );
 }
 

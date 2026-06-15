@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 from dataclasses import dataclass, field
 
 import paramiko
@@ -213,6 +214,17 @@ class GpuMetric:
     mem_used_mib: int
     mem_total_mib: int
     temp_c: int
+    # PCIe link (0 = unknown). `cur` is live — GPUs downclock the link when idle,
+    # so a Gen4 card can read Gen1 ×16 at rest and Gen4 ×16 under load.
+    pcie_gen_cur: int = 0
+    pcie_width_cur: int = 0
+    pcie_gen_max: int = 0
+    pcie_width_max: int = 0
+    # NVLink: active link count + aggregate per-direction bandwidth (GB/s).
+    # supported=False on cards/boxes without NVLink (PCIe-only).
+    nvlink_supported: bool = False
+    nvlink_active: int = 0
+    nvlink_gbps: float = 0.0
     processes: list[GpuProc] = field(default_factory=list)
 
 
@@ -234,8 +246,11 @@ class VmMetricsResult:
 _METRICS_CMD = (
     "echo @@CPU1; grep '^cpu' /proc/stat; sleep 0.4; echo @@CPU2; grep '^cpu' /proc/stat; "
     "echo @@MEM; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; echo @@GPU; "
-    "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu "
+    "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,"
+    "pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max "
     "--format=csv,noheader,nounits 2>/dev/null; "
+    # NVLink per-link status (one block per GPU; "<inactive>" links are skipped).
+    "echo @@NVLINK; nvidia-smi nvlink --status 2>/dev/null; "
     # Per-GPU processes by CUDA_VISIBLE_DEVICES (container-namespace pids — the ones
     # ps/kill see; nvidia-smi's compute-apps pids are host-namespace under a
     # container and don't match). One line per GPU process: pid|cvd|comm|cmd.
@@ -290,7 +305,7 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
         cur = None
         for ln in out.splitlines():
             s = ln.strip()
-            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@PROC"):
+            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@NVLINK", "@@PROC"):
                 cur = s
                 sec[cur] = []
             elif cur:
@@ -343,10 +358,44 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
             if len(parts) < 6:
                 continue
             try:
-                gpus.append(GpuMetric(int(parts[0]), parts[1], int(parts[2]),
-                                      int(parts[3]), int(parts[4]), int(parts[5])))
+                g = GpuMetric(int(parts[0]), parts[1], int(parts[2]),
+                              int(parts[3]), int(parts[4]), int(parts[5]))
             except ValueError:
                 continue
+            # PCIe gen/width (current + max). "[N/A]" on unsupported → left at 0.
+            if len(parts) >= 10:
+                try:
+                    g.pcie_gen_cur = int(parts[6])
+                    g.pcie_width_cur = int(parts[7])
+                    g.pcie_gen_max = int(parts[8])
+                    g.pcie_width_max = int(parts[9])
+                except ValueError:
+                    pass
+            gpus.append(g)
+
+        # @@NVLINK: blocks of "GPU N: …" then "Link K: X GB/s" (or "<inactive>").
+        # Aggregate active link count + total per-direction bandwidth per GPU.
+        nvlink: dict[int, tuple[int, float]] = {}
+        cur_idx: int | None = None
+        for ln in sec.get("@@NVLINK", []):
+            s = ln.strip()
+            mg = re.match(r"GPU (\d+):", s)
+            if mg:
+                cur_idx = int(mg.group(1))
+                nvlink.setdefault(cur_idx, (0, 0.0))
+                continue
+            if cur_idx is None:
+                continue
+            ml = re.search(r"Link \d+:\s*([0-9.]+)\s*GB/s", s)
+            if ml:
+                cnt, tot = nvlink[cur_idx]
+                nvlink[cur_idx] = (cnt + 1, tot + float(ml.group(1)))
+        for g in gpus:
+            if g.index in nvlink:
+                cnt, tot = nvlink[g.index]
+                g.nvlink_supported = True
+                g.nvlink_active = cnt
+                g.nvlink_gbps = round(tot, 1)
 
         # @@PROC: pid|CUDA_VISIBLE_DEVICES|comm|cmd → attach to the physical GPUs the
         # process can see (CVD value == physical index). One process can span GPUs (TP).
@@ -376,3 +425,127 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
 
 async def metrics_vm(host: str, port: int, user: str, private_key: str) -> VmMetricsResult:
     return await asyncio.to_thread(_metrics_sync, host, port, user, private_key)
+
+
+# --------------------------------------------------------------------------
+# On-demand bandwidth benchmark (disk read/write, sequential memory, CPU clock).
+# Heavier than the live poll (writes a ~512 MiB temp file), so it's a separate
+# button in the UI — NOT part of the polling loop.
+# --------------------------------------------------------------------------
+BANDWIDTH_TIMEOUT_S = 90
+
+# Disk: write 512 MiB with an end fsync (so the rate includes the flush), then
+# read it back with O_DIRECT when supported (falls back to a cached read). Memory:
+# a /dev/zero→/dev/null sequential copy as a rough RAM/CPU throughput proxy.
+_BANDWIDTH_CMD = (
+    'f="$HOME/.gpf_bw_$$"; '
+    "echo @@DWRITE; dd if=/dev/zero of=\"$f\" bs=1M count=512 conv=fdatasync 2>&1 | tail -1; "
+    # Read back with O_DIRECT (bypasses page cache → real disk read) and keep its
+    # rate on success; only fall back to a cached read if O_DIRECT isn't supported.
+    "echo @@DREAD; { dd if=\"$f\" of=/dev/null bs=1M iflag=direct 2>&1 || "
+    'dd if="$f" of=/dev/null bs=1M 2>&1; } | tail -1; '
+    'rm -f "$f"; '
+    "echo @@MEM; dd if=/dev/zero of=/dev/null bs=1M count=8192 2>&1 | tail -1; "
+    "echo @@CPU; lscpu 2>/dev/null | grep -E 'Model name|CPU max MHz|CPU MHz'; "
+)
+
+
+@dataclass
+class VmBandwidthResult:
+    ok: bool
+    message: str
+    disk_write_mbps: float
+    disk_read_mbps: float
+    mem_mbps: float
+    cpu_model: str
+    cpu_mhz: float
+    checked_at: float
+
+
+def _parse_dd_rate(lines: list[str]) -> float:
+    """MB/s from a `dd` summary line (`… , 2.5 s, 429 MB/s`). 0 if unparseable."""
+    for ln in lines:
+        m = re.search(r"([0-9.]+)\s*(GB|MB|kB)/s", ln)
+        if not m:
+            continue
+        v = float(m.group(1))
+        unit = m.group(2)
+        if unit == "GB":
+            return round(v * 1000, 1)
+        if unit == "kB":
+            return round(v / 1000, 2)
+        return round(v, 1)
+    return 0.0
+
+
+def _bandwidth_sync(host: str, port: int, user: str, private_key: str) -> VmBandwidthResult:
+    import time as _time
+    try:
+        pkey = _load_pkey(private_key)
+    except Exception as e:
+        return VmBandwidthResult(False, f"key parse failed: {e}", 0, 0, 0, "", 0, _time.time())
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host, port=port, username=user, pkey=pkey,
+            timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
+            auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False,
+        )
+    except paramiko.AuthenticationException:
+        return VmBandwidthResult(False, "authentication failed", 0, 0, 0, "", 0, _time.time())
+    except Exception as e:
+        return VmBandwidthResult(False, f"SSH connect failed: {e}", 0, 0, 0, "", 0, _time.time())
+
+    try:
+        _, stdout, _ = client.exec_command(_BANDWIDTH_CMD, timeout=BANDWIDTH_TIMEOUT_S)
+        stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="replace")
+        sec: dict[str, list[str]] = {}
+        cur = None
+        for ln in out.splitlines():
+            s = ln.strip()
+            if s in ("@@DWRITE", "@@DREAD", "@@MEM", "@@CPU"):
+                cur = s
+                sec[cur] = []
+            elif cur:
+                sec[cur].append(ln)
+
+        cpu_model = ""
+        cpu_mhz = 0.0
+        cpu_mhz_cur = 0.0
+        for ln in sec.get("@@CPU", []):
+            k, _, v = ln.partition(":")
+            k, v = k.strip(), v.strip()
+            if k == "Model name":
+                cpu_model = v
+            elif k == "CPU max MHz":
+                try:
+                    cpu_mhz = float(v)
+                except ValueError:
+                    pass
+            elif k == "CPU MHz":
+                try:
+                    cpu_mhz_cur = float(v)
+                except ValueError:
+                    pass
+        cpu_mhz = cpu_mhz or cpu_mhz_cur
+
+        disk_w = _parse_dd_rate(sec.get("@@DWRITE", []))
+        disk_r = _parse_dd_rate(sec.get("@@DREAD", []))
+        mem = _parse_dd_rate(sec.get("@@MEM", []))
+        ok = disk_w > 0 or disk_r > 0 or mem > 0
+        return VmBandwidthResult(
+            ok, "ok" if ok else "benchmark produced no parseable output",
+            disk_w, disk_r, mem, cpu_model, round(cpu_mhz, 0), _time.time(),
+        )
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+async def bandwidth_vm(host: str, port: int, user: str, private_key: str) -> VmBandwidthResult:
+    return await asyncio.to_thread(_bandwidth_sync, host, port, user, private_key)

@@ -33,6 +33,13 @@ import { parseGpuIds, parsePhys, suggestPacking } from "@/lib/gpu-pin";
 import { cleanVllmArgs } from "@/lib/vllm-args";
 import { restartEndpoint, updateAutoscaler } from "../../actions";
 
+// Common pre-launch setup for high-tier (large-MoE) models — builds DeepGEMM.
+const DEEPGEMM_SCRIPT =
+  "bash <(curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm/main/tools/install_deepgemm.sh)";
+// A nightly vLLM install (cu130) — a starting point for the install-args field.
+const VLLM_NIGHTLY_ARGS =
+  "-U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130 --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match";
+
 export function OverviewTab({ app }: { app: AppRecord }) {
   // A multi-model VM endpoint is one fixed, always-on node that time-shares its
   // GPUs via vLLM sleep/wake — the scale/idle knobs don't apply (read-only card).
@@ -112,11 +119,31 @@ function VmServingCard({ app }: { app: AppRecord }) {
         <Row label="Models" value={<code className="font-mono">{models.length}</code>} />
         <Row label="GPUs" value={<code className="font-mono">{gpuIds || `×${app.gpu_count ?? 0}`}</code>} />
         <Row label="Eviction" value={`Sleep/wake · level ${app.sleep_level ?? 1}`} />
-        {app.vllm_version && (
+        {app.vllm_version && !app.vllm_install_args && (
           <Row label="vLLM" value={<code className="font-mono">{app.vllm_version}</code>} />
+        )}
+        {app.vllm_install_args && (
+          <Row
+            label="vLLM install"
+            value={
+              <code className="block max-w-full truncate font-mono text-xs" title={app.vllm_install_args}>
+                {app.vllm_install_args}
+              </code>
+            }
+          />
         )}
         {app.venv_path && (
           <Row label="venv" value={<code className="font-mono text-xs">{app.venv_path}</code>} />
+        )}
+        {app.pre_script && (
+          <Row
+            label="Pre-script"
+            value={
+              <code className="block max-w-full truncate font-mono text-xs" title={app.pre_script}>
+                {app.pre_script}
+              </code>
+            }
+          />
         )}
         <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
           One fixed VM node, always on — no scale-to-zero. Models whose GPUs are
@@ -168,6 +195,8 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
   const [rows, setRows] = useState<ModelRow[]>(() => toRows(app.models));
   const [visibleDevices, setVisibleDevices] = useState(app.visible_devices ?? "");
   const [sleepLevel, setSleepLevel] = useState<number>(app.sleep_level ?? 1);
+  const [preScript, setPreScript] = useState(app.pre_script ?? "");
+  const [vllmInstallArgs, setVllmInstallArgs] = useState(app.vllm_install_args ?? "");
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -182,6 +211,8 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
     setRows(toRows(app.models));
     setVisibleDevices(app.visible_devices ?? "");
     setSleepLevel(app.sleep_level ?? 1);
+    setPreScript(app.pre_script ?? "");
+    setVllmInstallArgs(app.vllm_install_args ?? "");
     setErr(null);
     setMsg(null);
     setEditing(true);
@@ -233,6 +264,9 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
           models: payload,
           sleep_level: sleepLevel,
           ...(visibleDevices.trim() ? { visible_devices: visibleDevices.trim() } : {}),
+          // Always send so clearing the box clears it server-side ("" → null).
+          pre_script: preScript,
+          vllm_install_args: vllmInstallArgs,
         }),
       });
       const text = await r.text();
@@ -435,6 +469,77 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
             <Button variant="outline" size="xs" onClick={addRow} disabled={saving}>
               <Plus className="h-3 w-3" /> Add model
             </Button>
+
+            <div className="flex flex-col gap-1 border-t border-border pt-3">
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                vLLM install args (advanced)
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setVllmInstallArgs(VLLM_NIGHTLY_ARGS)}
+                  disabled={saving}
+                  className="rounded border border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted"
+                >
+                  Insert nightly (cu130)
+                </button>
+                {vllmInstallArgs.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => setVllmInstallArgs("")}
+                    disabled={saving}
+                    className="text-[11px] text-muted-foreground underline hover:text-foreground"
+                  >
+                    clear
+                  </button>
+                )}
+              </div>
+              <Textarea
+                value={vllmInstallArgs}
+                onChange={(e) => setVllmInstallArgs(e.target.value)}
+                placeholder={VLLM_NIGHTLY_ARGS}
+                rows={2}
+                disabled={saving}
+                className="font-mono text-xs"
+              />
+              <span className="text-[10px] text-muted-foreground">
+                Full `uv pip install` args for vLLM, used verbatim (overrides the version). Blank = default install.
+              </span>
+            </div>
+
+            <div className="flex flex-col gap-1 border-t border-border pt-3">
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                pre-launch script (optional)
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setPreScript((s) =>
+                      s.includes(DEEPGEMM_SCRIPT)
+                        ? s
+                        : (s.trim() ? s.trimEnd() + "\n" : "") + DEEPGEMM_SCRIPT,
+                    )
+                  }
+                  disabled={saving}
+                  className="rounded border border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted"
+                >
+                  + Install DeepGEMM
+                </button>
+                <span className="text-[11px] text-muted-foreground">common for high-tier (large-MoE) models</span>
+              </div>
+              <Textarea
+                value={preScript}
+                onChange={(e) => setPreScript(e.target.value)}
+                placeholder={DEEPGEMM_SCRIPT}
+                rows={2}
+                disabled={saving}
+                className="font-mono text-xs"
+              />
+              <span className="text-[10px] text-muted-foreground">
+                Runs once per worker boot, after the venv is ready and before models launch (venv on PATH). Blank clears it.
+              </span>
+            </div>
 
             <div className="flex flex-wrap items-end gap-x-4 gap-y-2 border-t border-border pt-3">
               <div className="flex flex-col gap-1">

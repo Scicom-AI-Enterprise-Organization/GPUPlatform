@@ -6,6 +6,7 @@ import { AlertCircle, AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Load
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -137,6 +138,13 @@ function buildVllmArgs(v: typeof DEFAULT_VLLM_ARGS): string {
 const VLLM_RESERVED_SINGLE = ["--model", "--served-model-name", "--port"];
 const VLLM_RESERVED_MULTI = [...VLLM_RESERVED_SINGLE, "--tensor-parallel-size", "-tp", "--pipeline-parallel-size", "-pp", "--enable-sleep-mode"];
 
+// Common pre-launch setup for high-tier (large-MoE) models — builds DeepGEMM.
+const DEEPGEMM_SCRIPT =
+  "bash <(curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm/main/tools/install_deepgemm.sh)";
+// A nightly vLLM install (cu130) — handy starting point for the install-args field.
+const VLLM_NIGHTLY_ARGS =
+  "-U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130 --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match";
+
 /** Returns an error string for obviously-broken vLLM args (stray line-continuation
  * backslash, unbalanced quotes, platform-reserved flags), else null. */
 function vllmArgsError(args: string, reserved: string[], label: string): string | null {
@@ -197,6 +205,12 @@ export function InferenceForm() {
   // worker fall back to bare `python3` (no vLLM), which silently never launches.
   const [venvPath, setVenvPath] = useState("/share/vllm-venv");
   const [vllmVersion, setVllmVersion] = useState("");
+  // Advanced: a full `uv pip install` arg string for vLLM, used verbatim instead of
+  // the version — e.g. a nightly with extra index URLs. Overrides the version.
+  const [vllmInstallArgs, setVllmInstallArgs] = useState("");
+  // Optional setup script the worker runs once after the venv is ready and before
+  // launching models — e.g. building DeepGEMM. Empty = none.
+  const [preScript, setPreScript] = useState("");
   // HuggingFace cache dir, exported as HF_HOME to every vLLM process. On a
   // mounted volume → downloaded weights persist across (re-)provisions.
   const [hfHome, setHfHome] = useState("/share/huggingface");
@@ -486,6 +500,8 @@ export function InferenceForm() {
             ...(vdRaw ? { visible_devices: vdRaw } : {}),
             ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
             ...(vllmVersion.trim() ? { vllm_version: vllmVersion.trim() } : {}),
+            ...(vllmInstallArgs.trim() ? { vllm_install_args: vllmInstallArgs.trim() } : {}),
+            ...(preScript.trim() ? { pre_script: preScript } : {}),
           }
         : {
             name: slugify(name),
@@ -504,7 +520,12 @@ export function InferenceForm() {
             // The fleet installs vLLM into its venv (a volume path persists across
             // re-provisions); pin the version (default 0.19.1) for reproducibility.
             ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
-            vllm_version: vllmVersion.trim() || "0.19.1",
+            // A custom install-args string owns the whole spec → don't also pin a
+            // default version (let the worker run the args verbatim).
+            ...(vllmInstallArgs.trim()
+              ? { vllm_install_args: vllmInstallArgs.trim() }
+              : { vllm_version: vllmVersion.trim() || "0.19.1" }),
+            ...(preScript.trim() ? { pre_script: preScript } : {}),
           };
       startTransition(async () => applyResult(await deployEndpoint(body)));
       return;
@@ -563,6 +584,8 @@ export function InferenceForm() {
             ...(vdRaw ? { visible_devices: vdRaw } : {}),
             ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
             ...(vllmVersion.trim() ? { vllm_version: vllmVersion.trim() } : {}),
+            ...(vllmInstallArgs.trim() ? { vllm_install_args: vllmInstallArgs.trim() } : {}),
+            ...(preScript.trim() ? { pre_script: preScript } : {}),
           }
         : { cloud_type: cloudType, container_disk_gb: parsedDisk, volume_gb: parsedVolume }),
     };
@@ -909,7 +932,41 @@ export function InferenceForm() {
                   value={vllmVersion}
                   onChange={(e) => setVllmVersion(e.target.value)}
                   placeholder="0.19.1"
+                  disabled={!!vllmInstallArgs.trim()}
                   className="font-mono text-xs"
+                />
+              </Field>
+            )}
+
+            {(isVm || cloudMulti) && (
+              <Field
+                label="vLLM install args (advanced)"
+                hint="Full `uv pip install` args for vLLM, used verbatim (overrides the version above) — for nightly / custom CUDA builds. The worker runs `uv pip install --python {venv}/bin/python <these args>`."
+              >
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setVllmInstallArgs(VLLM_NIGHTLY_ARGS)}
+                    className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted"
+                  >
+                    Insert nightly (cu130)
+                  </button>
+                  {vllmInstallArgs.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => setVllmInstallArgs("")}
+                      className="text-[11px] text-muted-foreground underline hover:text-foreground"
+                    >
+                      clear
+                    </button>
+                  )}
+                </div>
+                <Textarea
+                  value={vllmInstallArgs}
+                  onChange={(e) => setVllmInstallArgs(e.target.value)}
+                  placeholder={VLLM_NIGHTLY_ARGS}
+                  rows={3}
+                  className="mt-2 font-mono text-xs"
                 />
               </Field>
             )}
@@ -928,6 +985,37 @@ export function InferenceForm() {
                   onChange={(e) => setVenvPath(e.target.value)}
                   placeholder="/share/vllm-venv"
                   className="font-mono text-xs"
+                />
+              </Field>
+            )}
+
+            {(isVm || cloudMulti) && (
+              <Field
+                label="Pre-launch script (optional)"
+                hint="Shell run once per worker boot, after the venv is ready and before models launch — with the venv on PATH. For setup that isn't a pip install, e.g. building DeepGEMM. Runs under bash (process substitution works)."
+              >
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setPreScript((s) =>
+                        s.includes(DEEPGEMM_SCRIPT)
+                          ? s
+                          : (s.trim() ? s.trimEnd() + "\n" : "") + DEEPGEMM_SCRIPT,
+                      )
+                    }
+                    className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted"
+                  >
+                    + Install DeepGEMM
+                  </button>
+                  <span className="text-[11px] text-muted-foreground">common for high-tier (large-MoE) models</span>
+                </div>
+                <Textarea
+                  value={preScript}
+                  onChange={(e) => setPreScript(e.target.value)}
+                  placeholder={DEEPGEMM_SCRIPT}
+                  rows={3}
+                  className="mt-2 font-mono text-xs"
                 />
               </Field>
             )}

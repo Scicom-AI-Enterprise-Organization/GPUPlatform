@@ -146,20 +146,38 @@ def _env_s3_target() -> S3Target:
     )
 
 
+def _resolve_s3_creds(cfg: dict) -> tuple[Optional[str], Optional[str]]:
+    """(access_key, secret_key) for a kind=s3 storage config. Precedence per key:
+    a referenced global secret (`access_key_id_secret` / `secret_access_key_secret`
+    — a Secrets key name, resolved from the in-process cache) > the encrypted
+    literal blob (`credentials_enc`) > the AWS_* env vars. Synchronous: the global
+    secret comes from global_env_api's cache (no DB session needed here)."""
+    from .global_env_api import global_secret_sync
+    access_key = global_secret_sync(cfg.get("access_key_id_secret"))
+    secret_key = global_secret_sync(cfg.get("secret_access_key_secret"))
+    if (access_key is None or secret_key is None) and cfg.get("credentials_enc"):
+        try:
+            creds = json.loads(crypto.decrypt(cfg["credentials_enc"]))
+        except Exception:  # noqa: BLE001 — undecryptable blob → fall through to env
+            creds = {}
+        if access_key is None:
+            access_key = creds.get("accessKeyId")
+        if secret_key is None:
+            secret_key = creds.get("secretAccessKey")
+    if access_key is None:
+        access_key = os.environ.get("AWS_ACCESS_KEY_ID") or None
+    if secret_key is None:
+        secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or None
+    return access_key, secret_key
+
+
 def _target_from_storage_row(row: Optional[Storage]) -> S3Target:
     """Build a target from a kind=s3 Storage row, decrypting its credentials.
     Falls back to env for any field the row leaves blank. None → env target."""
     if row is None:
         return _env_s3_target()
     cfg = row.config or {}
-    enc = cfg.get("credentials_enc")
-    if enc:
-        creds = json.loads(crypto.decrypt(enc))
-        access_key = creds.get("accessKeyId")
-        secret_key = creds.get("secretAccessKey")
-    else:
-        access_key = os.environ.get("AWS_ACCESS_KEY_ID") or None
-        secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or None
+    access_key, secret_key = _resolve_s3_creds(cfg)
     prefix = (cfg.get("prefix") or "").strip().strip("/")
     prefix_root = f"{prefix}/benchmarks/" if prefix else "benchmarks/"
     return S3Target(

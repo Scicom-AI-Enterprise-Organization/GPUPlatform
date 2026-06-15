@@ -102,6 +102,7 @@ async def upsert_global_env(
     row.updated_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(row)
+    await load_global_env(session)  # refresh the sync cache so the new value resolves at once
     return _to_record(row)
 
 
@@ -116,7 +117,19 @@ async def delete_global_env(
         raise HTTPException(status_code=404, detail="no such key")
     await session.delete(row)
     await session.commit()
+    await load_global_env(session)  # refresh the sync cache so the deletion takes effect at once
     return {"ok": True, "key": key.strip()}
+
+
+# In-process snapshot of the decrypted global secrets, refreshed on every
+# load_global_env() call and on upsert/delete. It lets SYNCHRONOUS credential
+# resolvers (the S3 access-key/secret-key refs in bench._resolve_s3_creds, which
+# run with no DB session) look a secret up without going async. Async paths (HF
+# token/endpoint) still resolve fresh via load_global_env(session). Caveat: the
+# cache is per-process — with multiple gateway workers a secret rotation only
+# refreshes the worker that served the write until another load_global_env runs
+# elsewhere; warmed at startup (main.lifespan) so it's never cold.
+_CACHE: dict[str, str] = {}
 
 
 async def load_global_env(session: AsyncSession) -> dict[str, str]:
@@ -129,7 +142,17 @@ async def load_global_env(session: AsyncSession) -> dict[str, str]:
             out[r.key] = crypto.decrypt(r.value_enc)
         except Exception:
             continue
+    global _CACHE
+    _CACHE = dict(out)  # keep the sync snapshot fresh
     return out
+
+
+def global_secret_sync(key: Optional[str]) -> Optional[str]:
+    """Best-effort synchronous lookup of a global secret from the in-process
+    cache. Returns None if unknown/empty. See `_CACHE` for the freshness caveat."""
+    if not key:
+        return None
+    return _CACHE.get(key) or None
 
 
 _SECRET_REF = "secret://"

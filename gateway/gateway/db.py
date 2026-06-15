@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
-from sqlalchemy import BigInteger, JSON, Boolean, ForeignKey, String, DateTime, Integer, UniqueConstraint, select, text
+from sqlalchemy import BigInteger, JSON, Boolean, ForeignKey, String, Text, DateTime, Integer, UniqueConstraint, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -176,6 +176,14 @@ class App(Base):
     # VM-only: pin vLLM to this version in venv_path — the worker `uv pip install`s
     # it if missing/mismatched, e.g. "0.19.1". NULL = use whatever's installed.
     vllm_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    # Full `uv pip install` arg string for vLLM, used verbatim by the worker instead
+    # of vllm_version (e.g. a nightly: "-U vllm --pre --extra-index-url …"). NULL =
+    # install vllm[==vllm_version] with --torch-backend=auto.
+    vllm_install_args: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Optional shell snippet the worker runs once per boot, after the venv is ready
+    # and before any model launches — for model-specific setup that isn't a plain
+    # pip install (e.g. building DeepGEMM). NULL = none.
+    pre_script: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -660,6 +668,12 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_version VARCHAR(32)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS pre_script TEXT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_install_args TEXT"
         ))
         await conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users(email) WHERE email IS NOT NULL"

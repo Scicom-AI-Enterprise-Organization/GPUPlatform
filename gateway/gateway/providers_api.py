@@ -27,7 +27,7 @@ from . import crypto
 from .auth import current_user, require_admin
 from .compute import PI_GPU_TYPES, RUNPOD_GPU_TYPES, GpuTypeOption
 from .db import Provider, User, get_session
-from .vm_probe import availability_vm, metrics_vm, probe_vm
+from .vm_probe import availability_vm, bandwidth_vm, metrics_vm, probe_vm
 
 logger = logging.getLogger("gateway.providers")
 
@@ -131,6 +131,13 @@ class GpuMetricInfo(BaseModel):
     mem_used_mib: int
     mem_total_mib: int
     temp_c: int
+    pcie_gen_cur: int = 0
+    pcie_width_cur: int = 0
+    pcie_gen_max: int = 0
+    pcie_width_max: int = 0
+    nvlink_supported: bool = False
+    nvlink_active: int = 0
+    nvlink_gbps: float = 0.0
     processes: list[GpuProcInfo] = []
 
 
@@ -143,6 +150,18 @@ class ProviderMetricsResponse(BaseModel):
     mem_used_mib: int = 0
     mem_total_mib: int = 0
     gpus: list[GpuMetricInfo] = []
+    checked_at: float
+
+
+class ProviderBandwidthResponse(BaseModel):
+    """On-demand disk / memory / CPU bandwidth benchmark (button-triggered)."""
+    ok: bool
+    message: str
+    disk_write_mbps: float = 0.0
+    disk_read_mbps: float = 0.0
+    mem_mbps: float = 0.0
+    cpu_model: str = ""
+    cpu_mhz: float = 0.0
     checked_at: float
 
 
@@ -621,7 +640,47 @@ async def provider_metrics(
         gpus=[GpuMetricInfo(
             index=g.index, name=g.name, util_pct=g.util_pct,
             mem_used_mib=g.mem_used_mib, mem_total_mib=g.mem_total_mib, temp_c=g.temp_c,
+            pcie_gen_cur=g.pcie_gen_cur, pcie_width_cur=g.pcie_width_cur,
+            pcie_gen_max=g.pcie_gen_max, pcie_width_max=g.pcie_width_max,
+            nvlink_supported=g.nvlink_supported, nvlink_active=g.nvlink_active,
+            nvlink_gbps=g.nvlink_gbps,
             processes=[GpuProcInfo(pid=p.pid, comm=p.comm, cmd=p.cmd) for p in g.processes],
         ) for g in result.gpus],
+        checked_at=result.checked_at,
+    )
+
+
+@router.get("/{provider_id}/bandwidth", response_model=ProviderBandwidthResponse)
+async def provider_bandwidth(
+    provider_id: str,
+    user: User = Depends(current_user),  # noqa: ARG001 — auth-only
+    session: AsyncSession = Depends(get_session),
+):
+    """On-demand disk/memory/CPU bandwidth benchmark for a VM provider, over SSH.
+    Heavier than the live metrics poll (writes a ~512 MiB temp file) — the metrics
+    page triggers this from a button, not the polling loop."""
+    row = await session.get(Provider, provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+    if row.kind != "vm":
+        raise HTTPException(status_code=400, detail="bandwidth test is only available for VM providers")
+    cfg = row.config or {}
+    enc = cfg.get("private_key_enc")
+    if not enc:
+        raise HTTPException(status_code=500, detail="provider missing stored key")
+    result = await bandwidth_vm(
+        host=cfg.get("host", ""),
+        port=int(cfg.get("port") or VM_DEFAULT_PORT),
+        user=cfg.get("user", "root"),
+        private_key=crypto.decrypt(enc),
+    )
+    return ProviderBandwidthResponse(
+        ok=result.ok,
+        message=result.message,
+        disk_write_mbps=result.disk_write_mbps,
+        disk_read_mbps=result.disk_read_mbps,
+        mem_mbps=result.mem_mbps,
+        cpu_model=result.cpu_model,
+        cpu_mhz=result.cpu_mhz,
         checked_at=result.checked_at,
     )

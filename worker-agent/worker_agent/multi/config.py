@@ -49,6 +49,12 @@ class MultiModelConfig:
     venv_path: str | None = None
     # vLLM version the worker ensures is installed in venv_path. None → as-is.
     vllm_version: str | None = None
+    # Full `uv pip install` arg string for vLLM, used verbatim instead of the
+    # version (e.g. a nightly with extra index URLs). None → use vllm_version.
+    vllm_install_args: str | None = None
+    # Optional shell snippet run once per worker boot, after the venv is ready and
+    # before any model launches (e.g. building DeepGEMM). None → skip.
+    pre_script: str | None = None
 
 
 def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiModelConfig:
@@ -118,4 +124,6 @@ def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiMo
         members=tuple(members),
         venv_path=((cfg.get("venv_path") or "").strip() or None),
         vllm_version=((cfg.get("vllm_version") or "").strip() or None),
+        vllm_install_args=((cfg.get("vllm_install_args") or "").strip() or None),
+        pre_script=((cfg.get("pre_script") or "").strip() or None),
     )

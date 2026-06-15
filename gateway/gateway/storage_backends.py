@@ -154,14 +154,8 @@ def _s3_target_for_catalog(row: Storage) -> "bench.S3Target":
     prefix_root that bench._target_from_storage_row bakes in (catalog manages its
     own key namespace)."""
     cfg = row.config or {}
-    enc = cfg.get("credentials_enc")
-    if enc:
-        creds = json.loads(crypto.decrypt(enc))
-        access_key = creds.get("accessKeyId")
-        secret_key = creds.get("secretAccessKey")
-    else:
-        access_key = os.environ.get("AWS_ACCESS_KEY_ID") or None
-        secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or None
+    # Same precedence as benchmarks: global-secret refs > encrypted literal > env.
+    access_key, secret_key = bench._resolve_s3_creds(cfg)
     return bench.S3Target(
         bucket=(cfg.get("bucket") or "").strip(),
         region=(cfg.get("region") or os.environ.get("AWS_REGION", "ap-southeast-5")),

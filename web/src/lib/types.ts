@@ -47,6 +47,8 @@ export type AppRecord = {
   visible_devices?: string | null;
   venv_path?: string | null;
   vllm_version?: string | null;
+  vllm_install_args?: string | null;
+  pre_script?: string | null;
   created_at: string;
   owner: string;
 };
@@ -76,6 +78,12 @@ export type CreateAppRequest = {
   venv_path?: string | null;
   // VM-only: pin vLLM to this version in venv_path, e.g. "0.19.1".
   vllm_version?: string | null;
+  // Full `uv pip install` arg string for vLLM, used verbatim instead of the version
+  // (e.g. a nightly with extra index URLs). Overrides vllm_version when set.
+  vllm_install_args?: string | null;
+  // Optional setup script run once per worker boot before launching models, e.g.
+  // `bash <(curl -fsSL …/install_deepgemm.sh)`. VM venv / RunPod multi-model only.
+  pre_script?: string | null;
 };
 
 export type CreateAppResponse = {
@@ -648,6 +656,11 @@ export type StorageRecord = {
   endpoint?: string | null;
   has_credentials: boolean;
   hf_token_secret?: string | null;
+  // huggingface: global-secret key the custom HF_ENDPOINT resolves from (if any).
+  endpoint_secret?: string | null;
+  // s3: global-secret keys the credentials resolve from (if any).
+  access_key_id_secret?: string | null;
+  secret_access_key_secret?: string | null;
   // local
   path?: string | null;
   // sftp (non-secret fields)
@@ -818,9 +831,14 @@ export type CreateStorageRequest = {
   endpoint?: string | null;
   access_key_id?: string | null;
   secret_access_key?: string | null;
+  // s3 credentials by reference: a global-secret key resolved at use-time.
+  access_key_id_secret?: string | null;
+  secret_access_key_secret?: string | null;
   hf_token?: string | null;
   // Reference a global secret (admin Secrets) by key instead of a pasted token.
   hf_token_secret?: string | null;
+  // huggingface: a global-secret key holding a custom HF_ENDPOINT.
+  endpoint_secret?: string | null;
   // local
   path?: string | null;
   // sftp
@@ -843,8 +861,11 @@ export type TestStorageRequest = {
   endpoint?: string | null;
   access_key_id?: string | null;
   secret_access_key?: string | null;
+  access_key_id_secret?: string | null;
+  secret_access_key_secret?: string | null;
   hf_token?: string | null;
   hf_token_secret?: string | null;
+  endpoint_secret?: string | null;
   path?: string | null;
   host?: string | null;
   port?: number | null;
@@ -920,6 +941,15 @@ export type ProviderGpuMetric = {
   mem_used_mib: number;
   mem_total_mib: number;
   temp_c: number;
+  // PCIe link — `cur` is live (GPUs downclock the link at idle), 0 = unknown.
+  pcie_gen_cur?: number;
+  pcie_width_cur?: number;
+  pcie_gen_max?: number;
+  pcie_width_max?: number;
+  // NVLink — active links + aggregate per-direction GB/s. supported=false = PCIe-only.
+  nvlink_supported?: boolean;
+  nvlink_active?: number;
+  nvlink_gbps?: number;
   processes?: ProviderGpuProc[];
 };
 
@@ -931,6 +961,18 @@ export type ProviderMetrics = {
   mem_used_mib: number;
   mem_total_mib: number;
   gpus: ProviderGpuMetric[];
+  checked_at: number;
+};
+
+// On-demand disk/memory/CPU bandwidth benchmark (button-triggered, not polled).
+export type ProviderBandwidth = {
+  ok: boolean;
+  message: string;
+  disk_write_mbps: number;
+  disk_read_mbps: number;
+  mem_mbps: number;
+  cpu_model: string;
+  cpu_mhz: number;
   checked_at: number;
 };
 

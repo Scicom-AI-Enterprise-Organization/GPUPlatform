@@ -234,12 +234,26 @@ class MultiModelScheduler:
         # we haven't launched ours yet, so anything on these ports is an orphan
         # holding GPU memory that would block our launches.
         await self._kill_stale_vllm()
+        # Bootstrap the endpoint's vLLM venv if it doesn't exist yet (install uv,
+        # `uv venv` the path, install vLLM) so an endpoint can name a venv_path the
+        # VM hasn't created — instead of crashing on a missing {venv_path}/bin/python.
+        await launcher.ensure_venv(
+            self.cfg.venv_path, self.cfg.vllm_version, self.cfg.vllm_install_args)
         # Ensure the requested vLLM version is present in the venv before any
-        # model launches (no-op when venv_path/vllm_version aren't set).
-        await launcher.ensure_vllm(self.cfg.venv_path, self.cfg.vllm_version)
+        # model launches (no-op when venv_path/vllm_version aren't set, or when a
+        # custom vllm_install_args spec owns the install).
+        if not self.cfg.vllm_install_args:
+            await launcher.ensure_vllm(self.cfg.venv_path, self.cfg.vllm_version)
+        # vLLM's flashinfer backend JIT-builds kernels at runtime via `ninja` on
+        # Blackwell — make sure ninja/cmake are in the venv (launch puts venv/bin on
+        # PATH so the JIT finds them).
+        await launcher.ensure_build_tools(self.cfg.venv_path)
         # Whisper/ASR members need vLLM's audio-decode deps (librosa, soundfile) or
         # every clip is rejected as "Invalid or unsupported audio file".
         await launcher.ensure_audio_deps(self.cfg.venv_path, self.cfg.members)
+        # Optional operator setup script (e.g. building DeepGEMM) — runs once now,
+        # with the venv ready and on PATH, before any model launches.
+        await launcher.run_pre_script(self.cfg.pre_script, self.cfg.venv_path)
         # Load in WAVES: each wave is a set of mutually NON-overlapping members
         # (disjoint gpu_indices) loaded concurrently; waves run in sequence. On
         # 6 GPUs this loads qwen[0,1] + 35B[2,3] + gemma[4,5] all at once, then

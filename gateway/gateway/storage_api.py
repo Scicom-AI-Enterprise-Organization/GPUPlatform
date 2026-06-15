@@ -61,11 +61,19 @@ class CreateStorageRequest(BaseModel):
     # s3 credentials — both blank → fall back to AWS_* env vars
     access_key_id: Optional[str] = None
     secret_access_key: Optional[str] = None
+    # s3 credentials by reference: a global-secret (admin Secrets) key resolved at
+    # use-time, instead of a pasted key. Take precedence over the pasted values.
+    access_key_id_secret: Optional[str] = None
+    secret_access_key_secret: Optional[str] = None
     # huggingface credentials — blank → fall back to HF_TOKEN env var
     hf_token: Optional[str] = None
     # Reference a global secret (admin Secrets) by key instead of pasting a token;
     # resolved at use-time. Takes precedence over `hf_token` when set.
     hf_token_secret: Optional[str] = None
+    # huggingface: a custom Hub endpoint (HF_ENDPOINT) — blank → huggingface.co.
+    # Either a literal URL (`endpoint`) or a global-secret key (`endpoint_secret`,
+    # resolved at use-time, takes precedence). Note: `endpoint` is reused by s3.
+    endpoint_secret: Optional[str] = None
     # local fields
     path: Optional[str] = None
     # sftp fields (credentials: password OR private_key)
@@ -89,8 +97,11 @@ class UpdateStorageRequest(BaseModel):
     endpoint: Optional[str] = None
     access_key_id: Optional[str] = None
     secret_access_key: Optional[str] = None
+    access_key_id_secret: Optional[str] = None
+    secret_access_key_secret: Optional[str] = None
     hf_token: Optional[str] = None
     hf_token_secret: Optional[str] = None
+    endpoint_secret: Optional[str] = None
     path: Optional[str] = None
     host: Optional[str] = None
     port: Optional[int] = None
@@ -112,8 +123,11 @@ class TestStorageRequest(BaseModel):
     endpoint: Optional[str] = None
     access_key_id: Optional[str] = None
     secret_access_key: Optional[str] = None
+    access_key_id_secret: Optional[str] = None
+    secret_access_key_secret: Optional[str] = None
     hf_token: Optional[str] = None
     hf_token_secret: Optional[str] = None
+    endpoint_secret: Optional[str] = None
     path: Optional[str] = None
     host: Optional[str] = None
     port: Optional[int] = None
@@ -140,6 +154,11 @@ class StorageRecord(BaseModel):
     has_credentials: bool = False
     # For huggingface: the global-secret key its token is resolved from (if any).
     hf_token_secret: Optional[str] = None
+    # For huggingface: the global-secret key its custom HF_ENDPOINT resolves from.
+    endpoint_secret: Optional[str] = None
+    # For s3: the global-secret keys its credentials resolve from (if any).
+    access_key_id_secret: Optional[str] = None
+    secret_access_key_secret: Optional[str] = None
     # local
     path: Optional[str] = None
     # sftp (non-secret fields only)
@@ -166,8 +185,16 @@ def _to_record(s: Storage, owner_username: str) -> StorageRecord:
         prefix=cfg.get("prefix"),
         region=cfg.get("region"),
         endpoint=cfg.get("endpoint"),
-        has_credentials=bool(cfg.get("credentials_enc")) or bool(cfg.get("hf_token_secret")),
+        has_credentials=(
+            bool(cfg.get("credentials_enc"))
+            or bool(cfg.get("hf_token_secret"))
+            or bool(cfg.get("access_key_id_secret"))
+            or bool(cfg.get("secret_access_key_secret"))
+        ),
         hf_token_secret=cfg.get("hf_token_secret"),
+        endpoint_secret=cfg.get("endpoint_secret"),
+        access_key_id_secret=cfg.get("access_key_id_secret"),
+        secret_access_key_secret=cfg.get("secret_access_key_secret"),
         path=cfg.get("path"),
         host=cfg.get("host"),
         port=cfg.get("port"),
@@ -317,14 +344,15 @@ def _test_sftp_sync(
     SFTPBackend(cfg).ping()  # raises StorageError on connect / base-path failure
 
 
-async def _test_hf(token: Optional[str]) -> tuple[bool, str]:
+async def _test_hf(token: Optional[str], endpoint: Optional[str] = None) -> tuple[bool, str]:
     token = (token or "").strip() or os.environ.get("HF_TOKEN", "").strip()
     if not token:
         return False, "no token provided and HF_TOKEN env is empty"
+    base = (endpoint or "").strip().rstrip("/") or "https://huggingface.co"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as cli:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as cli:
             r = await cli.get(
-                "https://huggingface.co/api/whoami-v2",
+                f"{base}/api/whoami-v2",
                 headers={"Authorization": f"Bearer {token}"},
             )
     except httpx.HTTPError as e:
@@ -332,7 +360,8 @@ async def _test_hf(token: Optional[str]) -> tuple[bool, str]:
     if r.status_code == 200:
         data = r.json()
         who = data.get("name") or data.get("fullname") or "ok"
-        return True, f"authenticated as {who}"
+        where = "" if base == "https://huggingface.co" else f" at {base}"
+        return True, f"authenticated as {who}{where}"
     if r.status_code in (401, 403):
         return False, "invalid token"
     return False, f"HTTP {r.status_code}: {r.text[:200]}"
@@ -364,7 +393,24 @@ async def test_storage(
         bucket = (req.bucket or "").strip()
         if not bucket:
             raise HTTPException(status_code=400, detail="bucket is required to test")
-        if bool((req.access_key_id or "").strip()) != bool((req.secret_access_key or "").strip()):
+        # Resolve credentials: a global-secret reference (resolved here) takes
+        # precedence over a pasted key, mirroring runtime (_resolve_s3_creds).
+        akid = (req.access_key_id or "").strip()
+        sak = (req.secret_access_key or "").strip()
+        ak_ref = (req.access_key_id_secret or "").strip()
+        sk_ref = (req.secret_access_key_secret or "").strip()
+        if ak_ref or sk_ref:
+            from .global_env_api import load_global_env
+            ge = await load_global_env(session)
+            if ak_ref:
+                akid = (ge.get(ak_ref) or "").strip()
+                if not akid:
+                    return TestStorageResponse(ok=False, message=f"global secret '{ak_ref}' is not set")
+            if sk_ref:
+                sak = (ge.get(sk_ref) or "").strip()
+                if not sak:
+                    return TestStorageResponse(ok=False, message=f"global secret '{sk_ref}' is not set")
+        if bool(akid) != bool(sak):
             raise HTTPException(
                 status_code=400,
                 detail="provide both access_key_id and secret_access_key, or leave both blank",
@@ -372,7 +418,7 @@ async def test_storage(
         try:
             await run_in_threadpool(
                 _test_s3_sync, bucket, req.region, req.endpoint,
-                req.access_key_id, req.secret_access_key,
+                akid or None, sak or None,
             )
         except Exception as e:  # botocore ClientError / endpoint / network
             return TestStorageResponse(ok=False, message=_s3_error_message(e))
@@ -399,15 +445,24 @@ async def test_storage(
         except Exception as e:  # noqa: BLE001
             return TestStorageResponse(ok=False, message=str(e))
         return TestStorageResponse(ok=True, message=f"reached {username}@{host}")
-    # huggingface — resolve a global-secret reference to its value before testing.
+    # huggingface — resolve global-secret references (token + custom endpoint) to
+    # their values before testing.
     token = req.hf_token
+    endpoint = (req.endpoint or "").strip() or None
     ref = (req.hf_token_secret or "").strip()
-    if ref:
+    ep_ref = (req.endpoint_secret or "").strip()
+    if ref or ep_ref:
         from .global_env_api import load_global_env
-        token = (await load_global_env(session)).get(ref)
-        if not token:
-            return TestStorageResponse(ok=False, message=f"global secret '{ref}' is not set")
-    ok, msg = await _test_hf(token)
+        ge = await load_global_env(session)
+        if ref:
+            token = ge.get(ref)
+            if not token:
+                return TestStorageResponse(ok=False, message=f"global secret '{ref}' is not set")
+        if ep_ref:
+            endpoint = (ge.get(ep_ref) or "").strip() or None
+            if not endpoint:
+                return TestStorageResponse(ok=False, message=f"global secret '{ep_ref}' is not set")
+    ok, msg = await _test_hf(token, endpoint)
     return TestStorageResponse(ok=ok, message=msg)
 
 
@@ -436,9 +491,18 @@ async def create_storage(
             "region": (req.region or "").strip() or None,
             "endpoint": (req.endpoint or "").strip() or None,
         }
-        enc = _encrypt_s3_creds(req.access_key_id, req.secret_access_key)
-        if enc:
-            config["credentials_enc"] = enc
+        ak_ref = (req.access_key_id_secret or "").strip()
+        sk_ref = (req.secret_access_key_secret or "").strip()
+        if ak_ref or sk_ref:
+            # Credentials by global-secret reference — resolved at use-time.
+            if ak_ref:
+                config["access_key_id_secret"] = ak_ref
+            if sk_ref:
+                config["secret_access_key_secret"] = sk_ref
+        else:
+            enc = _encrypt_s3_creds(req.access_key_id, req.secret_access_key)
+            if enc:
+                config["credentials_enc"] = enc
     elif req.kind == "local":
         path = (req.path or "").strip()
         if not path:
@@ -467,6 +531,13 @@ async def create_storage(
             enc = _encrypt_hf_token(req.hf_token)
             if enc:
                 config["credentials_enc"] = enc
+        # Custom HF_ENDPOINT (blank → huggingface.co): a global-secret reference
+        # takes precedence over a pasted URL.
+        ep_ref = (req.endpoint_secret or "").strip()
+        if ep_ref:
+            config["endpoint_secret"] = ep_ref
+        elif (req.endpoint or "").strip():
+            config["endpoint"] = req.endpoint.strip()
 
     sid = f"store-{secrets.token_hex(4)}"
     row = Storage(
@@ -530,9 +601,25 @@ async def update_storage(
             cfg["region"] = req.region.strip() or None
         if req.endpoint is not None:
             cfg["endpoint"] = req.endpoint.strip() or None
+        # Credentials by global-secret reference: a non-None field updates it
+        # (empty string clears it); setting any ref drops the pasted blob.
+        if req.access_key_id_secret is not None:
+            if req.access_key_id_secret.strip():
+                cfg["access_key_id_secret"] = req.access_key_id_secret.strip()
+            else:
+                cfg.pop("access_key_id_secret", None)
+        if req.secret_access_key_secret is not None:
+            if req.secret_access_key_secret.strip():
+                cfg["secret_access_key_secret"] = req.secret_access_key_secret.strip()
+            else:
+                cfg.pop("secret_access_key_secret", None)
+        if cfg.get("access_key_id_secret") or cfg.get("secret_access_key_secret"):
+            cfg.pop("credentials_enc", None)
         enc = _encrypt_s3_creds(req.access_key_id, req.secret_access_key)
-        if enc:  # only replace when new creds supplied; omit keeps existing
+        if enc:  # pasted creds replace the blob AND clear any references
             cfg["credentials_enc"] = enc
+            cfg.pop("access_key_id_secret", None)
+            cfg.pop("secret_access_key_secret", None)
     elif row.kind == "local":
         if req.path is not None:
             p = req.path.strip()
@@ -571,6 +658,20 @@ async def update_storage(
         if enc:
             cfg["credentials_enc"] = enc
             cfg.pop("hf_token_secret", None)
+        # Custom HF_ENDPOINT: a global-secret reference and a literal URL are
+        # mutually exclusive; setting one clears the other. Empty string clears.
+        if req.endpoint_secret is not None:
+            if req.endpoint_secret.strip():
+                cfg["endpoint_secret"] = req.endpoint_secret.strip()
+                cfg.pop("endpoint", None)
+            else:
+                cfg.pop("endpoint_secret", None)
+        if req.endpoint is not None:
+            if req.endpoint.strip():
+                cfg["endpoint"] = req.endpoint.strip()
+                cfg.pop("endpoint_secret", None)
+            else:
+                cfg.pop("endpoint", None)
 
     row.config = cfg
     flag_modified(row, "config")

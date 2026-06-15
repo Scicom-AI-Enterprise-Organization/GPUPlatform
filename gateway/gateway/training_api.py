@@ -2316,6 +2316,24 @@ async def _hf_token_for_storage(storage_id: Optional[str], session: AsyncSession
     return None
 
 
+async def _hf_endpoint_for_storage(storage_id: Optional[str], session: AsyncSession) -> Optional[str]:
+    """Custom HF Hub endpoint (HF_ENDPOINT) from a kind=huggingface Storage, or None
+    for huggingface.co. Precedence: a referenced global secret (config.endpoint_secret)
+    > the storage's literal `endpoint`. Mirrors datasets_api._hf_endpoint."""
+    st = await session.get(Storage, storage_id) if storage_id else None
+    if st is None or st.kind != "huggingface":
+        return None
+    cfg = st.config or {}
+    ref = cfg.get("endpoint_secret")
+    if ref:
+        from .global_env_api import load_global_env
+        val = (await load_global_env(session)).get(ref)
+        if val and val.strip():
+            return val.strip().rstrip("/")
+    ep = (cfg.get("endpoint") or "").strip()
+    return ep.rstrip("/") or None
+
+
 class HfExportRequest(BaseModel):
     repo: str
     storage_id: Optional[str] = None   # a kind=huggingface Storage (provides the token)
@@ -2342,10 +2360,6 @@ async def export_to_huggingface(
     model_s3 = (((row.result_json or {}).get("artifact") or {}).get("s3_uri"))
     if not model_s3:
         raise HTTPException(status_code=400, detail="no trained model artifact for this run")
-    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
-    if prov is None or prov.kind != "vm":
-        raise HTTPException(status_code=400, detail=("HF export runs on a VM provider; this run used a "
-                            "cloud pod (gone after training). Re-run on a VM."))
     repo = (body.repo or "").strip()
     if not repo:
         raise HTTPException(status_code=400, detail="a target repo (org/name) is required")
@@ -2355,10 +2369,24 @@ async def export_to_huggingface(
     if not token:
         raise HTTPException(status_code=400, detail=("no Hugging Face token — pick a HuggingFace storage "
                             "or set HF_TOKEN in Secrets"))
+    # Custom HF_ENDPOINT from the same storage (self-hosted mirror), or None → huggingface.co.
+    hf_endpoint = await _hf_endpoint_for_storage(body.storage_id, session)
+    # A custom endpoint pushes from the GATEWAY (the control plane reaches the mirror
+    # directly + its huggingface_hub handles the `…/hf` path the VM's older client
+    # mis-parses); the model artifact lives on S3 so no VM is involved. The default
+    # huggingface.co path still runs on the VM (avoids large downloads on the laptop).
+    local_export = bool(hf_endpoint)
     creds = _s3_creds_from_storage(await session.get(Storage, row.storage_id) if row.storage_id else None)
-    ssh = await _resolve_run_ssh(row)
-    if ssh is None:
-        raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
+    ssh = None
+    if not local_export:
+        prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+        if prov is None or prov.kind != "vm":
+            raise HTTPException(status_code=400, detail=("HF export runs on a VM provider; this run used a "
+                                "cloud pod (gone after training). Re-run on a VM, or use a HuggingFace "
+                                "storage with a custom endpoint (pushes from the gateway)."))
+        ssh = await _resolve_run_ssh(row)
+        if ssh is None:
+            raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
     cfg = dict(row.config_json or {})
     private = bool(body.private)
     redis = request.app.state.redis
@@ -2386,10 +2414,16 @@ async def export_to_huggingface(
 
         pump_task = asyncio.create_task(_pump())
         try:
-            await _push_log(redis, run_id, f"[gateway] exporting best model to Hugging Face → {repo} …")
-            res = await asyncio.to_thread(
-                _run_hf_export_ssh, *ssh, run_id, model_s3, creds, repo, token, private, cfg,
-                export_lines.append)
+            where = "the gateway" if local_export else "the run's VM"
+            await _push_log(redis, run_id, f"[gateway] exporting best model to Hugging Face → {repo} (from {where}) …")
+            if local_export:
+                res = await asyncio.to_thread(
+                    _run_hf_export_local, run_id, model_s3, creds, repo, token, private,
+                    hf_endpoint, export_lines.append)
+            else:
+                res = await asyncio.to_thread(
+                    _run_hf_export_ssh, *ssh, run_id, model_s3, creds, repo, token, private, cfg,
+                    hf_endpoint, export_lines.append)
             async with session_factory()() as s:
                 r2 = await s.get(TrainingRun, run_id)
                 if r2 is not None:
@@ -3455,9 +3489,79 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
             pass
 
 
+def _run_hf_export_local(run_id: str, model_s3: str, creds: dict, repo: str,
+                         token: str, private: bool, hf_endpoint: Optional[str] = None,
+                         line_sink=None) -> dict:
+    """Run the SAME hf_export.py on the GATEWAY (not the VM) as a subprocess in the
+    gateway venv, streaming its lines to `line_sink`. Used when the target HF storage
+    has a custom endpoint (a self-hosted mirror): the gateway's modern huggingface_hub
+    handles a path-prefixed endpoint (`…/hf`) that the VM's older client mis-parses,
+    and the gateway reaches the mirror directly (no VM tunnel needed). Blocking — call
+    via to_thread. The model is fetched from S3 to a local temp dir."""
+    import subprocess
+    import sys as _sys
+    import tempfile
+
+    script = str(_trainer_script_path().parent / "hf_export.py")
+    model_dir = os.path.join(tempfile.gettempdir(), "sgpu-hf-export", run_id, "model")
+    tconf = {
+        "model_s3": model_s3,
+        "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+        "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+        "model_dir": model_dir,
+        "repo": repo, "token": token, "private": bool(private),
+        "hf_endpoint": hf_endpoint or None,
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(tconf, f)
+        cfg_path = f.name
+    out: dict = {"result": None, "error": None, "lines": []}
+    rc = -1
+    try:
+        # stderr→stdout so HF's upload progress bars stream alongside the script's lines.
+        proc = subprocess.Popen(
+            [_sys.executable, "-u", script, "--config", cfg_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            j = line.find("@@HF ")
+            if j < 0:
+                if line_sink is not None:
+                    try:
+                        line_sink(line)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if len(out["lines"]) < 400:
+                    out["lines"].append(line)
+                continue
+            try:
+                obj = json.loads(line[j + len("@@HF "):])
+            except Exception:  # noqa: BLE001
+                continue
+            if obj.get("error"):
+                out["error"] = obj["error"]
+            else:
+                out["result"] = obj
+        rc = proc.wait()
+    finally:
+        try:
+            os.unlink(cfg_path)
+        except OSError:
+            pass
+    if out["error"]:
+        raise RuntimeError(out["error"])
+    if not out["result"]:
+        tail = "\n".join(out["lines"][-15:])
+        raise RuntimeError(f"HF export produced no result (rc={rc}):\n{tail}")
+    return out["result"]
+
+
 def _run_hf_export_ssh(host: str, port: int, user: str, key_filename: str,
                        run_id: str, model_s3: str, creds: dict, repo: str,
-                       token: str, private: bool, cfg: dict, line_sink=None) -> dict:
+                       token: str, private: bool, cfg: dict,
+                       hf_endpoint: Optional[str] = None, line_sink=None) -> dict:
     """SSH to the run's VM, ship hf_export.py, download the model from S3 + push it
     to a Hugging Face repo, and return the parsed @@HF {repo, url}. Blocking — call
     via to_thread. `line_sink(str)` (if given) gets every VM-side line so the caller
@@ -3478,6 +3582,7 @@ def _run_hf_export_ssh(host: str, port: int, user: str, key_filename: str,
             "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
             "model_dir": f"{work_dir}/sgpu-hf-export/{run_id}/model",
             "repo": repo, "token": token, "private": bool(private),
+            "hf_endpoint": hf_endpoint or None,  # custom Hub (HF_ENDPOINT); None → huggingface.co
         }
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(tconf))

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Activity, Cpu, MemoryStick, AlertCircle } from "lucide-react";
+import { Activity, Cpu, MemoryStick, AlertCircle, Gauge, HardDrive, Loader2 } from "lucide-react";
 import {
   CartesianGrid,
   Line,
@@ -19,9 +19,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
-import type { ProviderMetrics, ProviderRecord } from "@/lib/types";
+import type { ProviderBandwidth, ProviderMetrics, ProviderRecord } from "@/lib/types";
 
 const POLL_CHOICES = [5, 10, 15, 30] as const; // seconds
 const DEFAULT_POLL_S = 10;
@@ -31,6 +32,9 @@ type HostPoint = { i: number; cpu: number; mem: number };
 type GpuPoint = { i: number; util: number; mem: number; temp: number };
 
 const gib = (mib: number) => (mib / 1024).toFixed(1);
+// MB/s → "1.2 GB/s" / "430 MB/s" (0 = "—").
+const mbps = (v: number) =>
+  v <= 0 ? "—" : v >= 1000 ? `${(v / 1000).toFixed(2)} GB/s` : `${v.toFixed(0)} MB/s`;
 // htop-style core load colour: green (idle) → amber (busy) → red (saturated).
 const coreColor = (p: number) => (p >= 85 ? "#ef4444" : p >= 50 ? "#f59e0b" : "#10b981");
 
@@ -71,6 +75,9 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
   const [host, setHost] = useState<HostPoint[]>([]);
   const [gpuSeries, setGpuSeries] = useState<Record<number, GpuPoint[]>>({});
   const [pollSec, setPollSec] = useState<number>(DEFAULT_POLL_S);
+  const [bw, setBw] = useState<ProviderBandwidth | null>(null);
+  const [bwLoading, setBwLoading] = useState(false);
+  const [bwErr, setBwErr] = useState<string | null>(null);
   const tick = useRef(0);
   // The poll loop reads the interval from a ref so changing it takes effect on
   // the next tick without restarting the loop or clearing the graphed history.
@@ -110,6 +117,20 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
       if (timer) clearTimeout(timer);
     };
   }, [id]);
+
+  async function runBandwidth() {
+    setBwLoading(true);
+    setBwErr(null);
+    try {
+      const r = await gateway.getProviderBandwidth(id);
+      setBw(r);
+      if (!r.ok) setBwErr(r.message);
+    } catch (e) {
+      setBwErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBwLoading(false);
+    }
+  }
 
   const memPct = m && m.mem_total_mib > 0 ? (m.mem_used_mib / m.mem_total_mib) * 100 : 0;
   const gpus = m?.gpus ?? [];
@@ -245,6 +266,25 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
                       </span>
                       <span className="text-amber-600 dark:text-amber-400">{g.temp_c}°C</span>
                     </div>
+                    <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted-foreground">
+                      {g.pcie_gen_cur ? (
+                        <span title="PCIe link — current (live; downclocks at idle) vs max">
+                          PCIe{" "}
+                          <span className="text-foreground">Gen{g.pcie_gen_cur} ×{g.pcie_width_cur}</span>
+                          {g.pcie_gen_max ? <> / max Gen{g.pcie_gen_max} ×{g.pcie_width_max}</> : null}
+                        </span>
+                      ) : (
+                        <span title="PCIe link unavailable">PCIe —</span>
+                      )}
+                      {g.nvlink_supported ? (
+                        <span title="NVLink — active links · aggregate per-direction bandwidth">
+                          NVLink{" "}
+                          <span className="text-foreground">{g.nvlink_active}× · {g.nvlink_gbps} GB/s</span>
+                        </span>
+                      ) : (
+                        <span title="No NVLink on this GPU (PCIe-only)">NVLink —</span>
+                      )}
+                    </div>
                     <MiniChart
                       data={gpuSeries[g.index] ?? []}
                       keys={[
@@ -280,6 +320,95 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
           </CardContent>
         </Card>
       )}
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Gauge className="h-4 w-4 text-violet-600 dark:text-violet-400" /> Bandwidth
+            <span className="text-[11px] font-normal text-muted-foreground">· disk · memory · CPU</span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="ml-auto h-7 text-xs"
+              onClick={runBandwidth}
+              disabled={bwLoading}
+            >
+              {bwLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Gauge className="h-3.5 w-3.5" />}
+              {bwLoading ? "Running…" : bw ? "Re-run test" : "Run test"}
+            </Button>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {bwErr && (
+            <div className="mb-3 flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              <AlertCircle className="h-4 w-4 shrink-0" /> {bwErr}
+            </div>
+          )}
+          {!bw && !bwLoading && !bwErr ? (
+            <p className="text-xs text-muted-foreground">
+              One-shot benchmark — writes a ~512&nbsp;MiB temp file (disk read/write),
+              a sequential memory copy, and reads the CPU clock. Takes a few seconds; runs
+              only when you click <span className="font-medium text-foreground">Run test</span>.
+            </p>
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-3">
+              <BwStat
+                icon={<HardDrive className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />}
+                label="Disk"
+                rows={[
+                  ["write", mbps(bw?.disk_write_mbps ?? 0)],
+                  ["read", mbps(bw?.disk_read_mbps ?? 0)],
+                ]}
+              />
+              <BwStat
+                icon={<MemoryStick className="h-3.5 w-3.5 text-sky-600 dark:text-sky-400" />}
+                label="Memory (sequential)"
+                rows={[["copy", mbps(bw?.mem_mbps ?? 0)]]}
+              />
+              <BwStat
+                icon={<Cpu className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />}
+                label="CPU"
+                rows={[
+                  ["clock", bw?.cpu_mhz ? `${(bw.cpu_mhz / 1000).toFixed(2)} GHz` : "—"],
+                  ["model", bw?.cpu_model || "—"],
+                ]}
+              />
+            </div>
+          )}
+          {bw && (
+            <p className="mt-2 text-[10px] text-muted-foreground">
+              Disk read uses O_DIRECT when supported (else cached). Memory figure is a
+              <span className="font-mono"> dd</span> sequential copy — a rough proxy, not STREAM.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function BwStat({
+  icon,
+  label,
+  rows,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  rows: [string, string][];
+}) {
+  return (
+    <div className="rounded-lg border border-border p-3">
+      <div className="flex items-center gap-1.5 text-xs font-medium">
+        {icon} {label}
+      </div>
+      <div className="mt-1.5 space-y-0.5 font-mono text-[11px]">
+        {rows.map(([k, v]) => (
+          <div key={k} className="flex items-baseline justify-between gap-2">
+            <span className="text-muted-foreground">{k}</span>
+            <span className="truncate text-foreground" title={v}>{v}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -55,6 +55,7 @@ import type {
   TestProviderResponse,
   VmAvailability,
   ProviderMetrics,
+  ProviderBandwidth,
   ProviderBalance,
   TrainingRunRecord,
   TrainingGpuResponse,
@@ -551,6 +552,9 @@ export const gateway = {
   // Live VM host metrics (CPU / memory / GPU) — polled by the metrics page.
   getProviderMetrics: (id: string) =>
     request<ProviderMetrics>(`/v1/providers/${encodeURIComponent(id)}/metrics`),
+  // On-demand disk/memory/CPU bandwidth benchmark (button-triggered, not polled).
+  getProviderBandwidth: (id: string) =>
+    request<ProviderBandwidth>(`/v1/providers/${encodeURIComponent(id)}/bandwidth`),
   getProviderBalance: (id: string) =>
     request<ProviderBalance>(`/v1/providers/${encodeURIComponent(id)}/balance`),
 

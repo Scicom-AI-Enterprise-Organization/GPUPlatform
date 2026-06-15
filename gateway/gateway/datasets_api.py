@@ -415,6 +415,21 @@ async def _hf_token(storage: Optional[Storage], session: AsyncSession) -> Option
     return os.environ.get("HF_TOKEN", "").strip() or None
 
 
+async def _hf_endpoint(storage: Optional[Storage], session: AsyncSession) -> Optional[str]:
+    """Custom HF Hub endpoint (HF_ENDPOINT) for a kind=huggingface storage, or
+    None for huggingface.co. Precedence: a referenced global secret
+    (config.endpoint_secret) > the storage's literal `endpoint`."""
+    cfg = (storage.config or {}) if storage is not None else {}
+    ref = cfg.get("endpoint_secret")
+    if ref:
+        from .global_env_api import load_global_env
+        val = (await load_global_env(session)).get(ref)
+        if val and val.strip():
+            return val.strip().rstrip("/")
+    ep = (cfg.get("endpoint") or "").strip()
+    return ep.rstrip("/") or None
+
+
 def _resolve_audio_url(target, base_prefix: str, audio_prefix: Optional[str], value: Any) -> Optional[str]:
     """Turn a row's audio reference into a playable URL: http(s) passthrough;
     `s3://bucket/key` or a relative key → a presigned GET (TTL 1h)."""
@@ -1966,9 +1981,10 @@ async def sync_to_hf(
     token = await _hf_token(hf_store, session)
     if not token:
         raise HTTPException(status_code=400, detail="no HuggingFace token — add a HF storage or set HF_TOKEN")
+    endpoint = await _hf_endpoint(hf_store, session)
 
     try:
-        rev = await _run_sync(_hf_upload, repo, d.metadata_filename, text.encode("utf-8"), token, req.private)
+        rev = await _run_sync(_hf_upload, repo, d.metadata_filename, text.encode("utf-8"), token, req.private, endpoint)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"HuggingFace sync failed: {e}") from e
 
@@ -2107,9 +2123,10 @@ async def cancel_dataset_transform(
     return _to_record(d, owner.username if owner else "", None)
 
 
-def _hf_upload(repo: str, path_in_repo: str, body: bytes, token: str, private: bool) -> Optional[str]:
+def _hf_upload(repo: str, path_in_repo: str, body: bytes, token: str, private: bool,
+               endpoint: Optional[str] = None) -> Optional[str]:
     from huggingface_hub import HfApi
-    api = HfApi(token=token)
+    api = HfApi(token=token, endpoint=endpoint or None)
     api.create_repo(repo_id=repo, repo_type="dataset", private=private, exist_ok=True)
     info = api.upload_file(
         path_or_fileobj=io.BytesIO(body),

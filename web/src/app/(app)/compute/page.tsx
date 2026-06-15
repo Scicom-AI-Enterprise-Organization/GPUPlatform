@@ -27,7 +27,8 @@ export default async function ComputePage({
   searchParams: Promise<{ scope?: string }>;
 }) {
   const me = await getMe();
-  const noAccess = !me?.sections?.compute;
+  const sections = me?.sections as Record<string, boolean> | undefined;
+  const noAccess = me ? !(me.is_admin || sections?.compute) : false;
   const sp = await searchParams;
   const scope: "mine" | "all" =
     me?.is_admin && sp.scope === "all" ? "all" : "mine";

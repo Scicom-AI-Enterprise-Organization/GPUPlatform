@@ -104,6 +104,12 @@ class UpdateModelsRequest(BaseModel):
     models: list[MultiModelMember]
     sleep_level: Optional[int] = None
     visible_devices: Optional[str] = None
+    # Optional setup script run once per worker boot before model launch. None
+    # leaves it unchanged; "" clears it.
+    pre_script: Optional[str] = None
+    # Full `uv pip install` arg string for vLLM (overrides the version). None leaves
+    # it unchanged; "" clears it.
+    vllm_install_args: Optional[str] = None
 
 
 class StressRunCreate(BaseModel):
@@ -162,6 +168,12 @@ class CreateAppRequest(BaseModel):
     venv_path: Optional[str] = None
     # VM-only: pin vLLM to this version in venv_path (e.g. "0.19.1").
     vllm_version: Optional[str] = None
+    # Full `uv pip install` arg string for vLLM, used verbatim instead of the version
+    # (e.g. a nightly with extra index URLs). Overrides vllm_version when set.
+    vllm_install_args: Optional[str] = None
+    # Optional setup script the worker runs once after the venv is ready and before
+    # launching models (e.g. `bash <(curl -fsSL …/install_deepgemm.sh)`).
+    pre_script: Optional[str] = None
 
 
 class CreateAppResponse(BaseModel):
@@ -192,6 +204,8 @@ class AppRecord(BaseModel):
     visible_devices: Optional[str] = None
     venv_path: Optional[str] = None
     vllm_version: Optional[str] = None
+    vllm_install_args: Optional[str] = None
+    pre_script: Optional[str] = None
     created_at: str
     owner: str
 
@@ -390,6 +404,8 @@ def _to_app_record(app: App) -> AppRecord:
         visible_devices=getattr(app, "visible_devices", None) or None,
         venv_path=getattr(app, "venv_path", None) or None,
         vllm_version=getattr(app, "vllm_version", None) or None,
+        vllm_install_args=getattr(app, "vllm_install_args", None) or None,
+        pre_script=getattr(app, "pre_script", None) or None,
         created_at=app.created_at.isoformat() if app.created_at else "",
         owner=app.owner.username if app.owner else "",
     )
@@ -422,6 +438,15 @@ async def lifespan(app: FastAPI):
     await init_db()
     await seed_admin_user()
     logger.info("postgres ready")
+
+    # Warm the global-secret cache so sync credential resolvers (S3 key refs)
+    # never see a cold cache before the first async load_global_env runs.
+    try:
+        from .global_env_api import load_global_env
+        async with session_factory()() as _s:
+            await load_global_env(_s)
+    except Exception:  # noqa: BLE001 — best-effort; refreshed on first use anyway
+        logger.warning("global-secret cache warm-up failed (non-fatal)", exc_info=True)
 
     app.state.provider = None
     app.state.provider_cache = {}
@@ -1543,6 +1568,10 @@ async def create_app(
         # ignored for a single cloud pod (its image brings vLLM).
         venv_path=((req.venv_path or "").strip() or None) if (is_vm or mode == "multi") else None,
         vllm_version=((req.vllm_version or "").strip() or None) if (is_vm or mode == "multi") else None,
+        vllm_install_args=((req.vllm_install_args or "").strip() or None) if (is_vm or mode == "multi") else None,
+        # Pre-script runs on the worker (VM venv or RunPod multi-model pod), not a
+        # single cloud pod.
+        pre_script=((req.pre_script or "").strip() or None) if (is_vm or mode == "multi") else None,
         created_at=datetime.now(timezone.utc),
     )
     session.add(record)
@@ -2281,6 +2310,10 @@ async def update_app_models(
             target.gpu_count = len(vd_ids)
     if req.sleep_level is not None:
         target.sleep_level = req.sleep_level
+    if req.pre_script is not None:
+        target.pre_script = req.pre_script.strip() or None
+    if req.vllm_install_args is not None:
+        target.vllm_install_args = req.vllm_install_args.strip() or None
     await session.commit()
     await session.refresh(target)
 

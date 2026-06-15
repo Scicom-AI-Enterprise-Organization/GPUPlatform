@@ -95,11 +95,11 @@ export function CatalogForm({
       <div className="rounded-lg border border-border bg-card p-6 space-y-5">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="ns">Namespace</Label>
+            <Label htmlFor="ns" className="text-xs uppercase tracking-wide text-muted-foreground">Namespace</Label>
             <Input id="ns" value={namespace} onChange={(e) => setNamespace(e.target.value)} placeholder="my-org" />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="name">Name</Label>
+            <Label htmlFor="name" className="text-xs uppercase tracking-wide text-muted-foreground">Name</Label>
             <Input
               id="name"
               value={name}
@@ -113,7 +113,7 @@ export function CatalogForm({
         </p>
 
         <div className="space-y-2">
-          <Label>Storage</Label>
+          <Label className="text-xs uppercase tracking-wide text-muted-foreground">Storage</Label>
           <Select value={storageId} onValueChange={setStorageId}>
             <SelectTrigger>
               <SelectValue placeholder="Choose a storage" />
@@ -129,8 +129,8 @@ export function CatalogForm({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="prefix">
-            Prefix <span className="text-muted-foreground">(optional)</span>
+          <Label htmlFor="prefix" className="text-xs uppercase tracking-wide text-muted-foreground">
+            Prefix (optional)
           </Label>
           <Input
             id="prefix"
@@ -147,7 +147,7 @@ export function CatalogForm({
 
         <div className="flex items-center justify-between rounded-md border border-border px-3 py-2.5">
           <div>
-            <Label className="cursor-pointer">Private</Label>
+            <Label className="cursor-pointer text-xs uppercase tracking-wide text-muted-foreground">Private</Label>
             <p className="text-xs text-muted-foreground">
               Only you (and admins) can pull this repo with your API key.
             </p>
@@ -156,8 +156,8 @@ export function CatalogForm({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="desc">
-            Description <span className="text-muted-foreground">(optional)</span>
+          <Label htmlFor="desc" className="text-xs uppercase tracking-wide text-muted-foreground">
+            Description (optional)
           </Label>
           <Textarea id="desc" value={description} onChange={(e) => setDescription(e.target.value)} rows={2} />
         </div>

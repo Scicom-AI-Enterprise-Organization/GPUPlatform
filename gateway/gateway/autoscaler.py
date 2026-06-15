@@ -117,6 +117,12 @@ def build_multi_model_config(app) -> dict:
         # worker should ensure is installed there. None → bare python3 on PATH.
         "venv_path": (getattr(app, "venv_path", None) or None),
         "vllm_version": (getattr(app, "vllm_version", None) or None),
+        # Full `uv pip install` arg string for vLLM, used verbatim instead of the
+        # version (e.g. a nightly with extra index URLs).
+        "vllm_install_args": (getattr(app, "vllm_install_args", None) or None),
+        # Optional setup script the worker runs once after the venv is ready and
+        # before launching models (e.g. building DeepGEMM).
+        "pre_script": (getattr(app, "pre_script", None) or None),
         "models": out,
     }
 

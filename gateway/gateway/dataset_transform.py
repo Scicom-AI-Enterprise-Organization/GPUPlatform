@@ -180,7 +180,7 @@ async def _run(
 ) -> None:
     from fastapi.concurrency import run_in_threadpool
     from sqlalchemy import select
-    from .datasets_api import _hf_token, _label_token, _s3_target_and_prefix
+    from .datasets_api import _hf_endpoint, _hf_token, _label_token, _s3_target_and_prefix
 
     # Stable per-dataset scratch dir: a re-run reuses an earlier download +
     # extraction (no re-fetch of a huge repo over a slow link). Kept on
@@ -204,6 +204,7 @@ async def _run(
                 await s.execute(select(Storage).where(Storage.kind == "huggingface").limit(1))
             ).scalars().first()
             token = await _hf_token(hf_store, s)
+            hf_endpoint = await _hf_endpoint(hf_store, s)  # custom Hub endpoint, or None
             out_storage = await s.get(Storage, storage_id) if (target == "s3" and storage_id) else None
             s3_target, s3_prefix = (_s3_target_and_prefix(out_storage) if out_storage else (None, ""))
             # Labeling-platform source (kind="label"): base URL + project + token.
@@ -239,7 +240,7 @@ async def _run(
         else:
             rev_note = f" @ {src_revision}" if src_revision else ""
             await _log(dataset_id, f"downloading {src_repo}{rev_note} … (reuses cached files on re-run)")
-            await run_in_threadpool(_download, src_repo, token, work, progress, src_revision)
+            await run_in_threadpool(_download, src_repo, token, work, progress, src_revision, hf_endpoint)
 
             await _log(dataset_id, "extracting audio archives …")
             n_audio = await run_in_threadpool(_extract_archives, work)
@@ -307,6 +308,7 @@ def _download(
     dest: str,
     progress: Optional[Callable[[str, int, int], None]] = None,
     revision: Optional[str] = None,
+    endpoint: Optional[str] = None,
 ) -> str:
     """snapshot_download the dataset repo into the STABLE `dest` — re-runs skip
     files already present (no network re-fetch). Emits a byte-based `download`
@@ -333,7 +335,7 @@ def _download(
     os.makedirs(dest, exist_ok=True)
     total_bytes = 0
     try:
-        info = HfApi(token=token).repo_info(repo, repo_type="dataset", revision=revision, files_metadata=True)
+        info = HfApi(token=token, endpoint=endpoint or None).repo_info(repo, repo_type="dataset", revision=revision, files_metadata=True)
         total_bytes = sum(int(getattr(s, "size", 0) or 0) for s in (info.siblings or []))
     except Exception:  # noqa: BLE001 — size lookup is best-effort (just disables %)
         logger.warning("repo_info size lookup failed for %s; download %% unavailable", repo)
@@ -370,7 +372,7 @@ def _download(
     poller = threading.Thread(target=_poll, daemon=True)
     poller.start()
     try:
-        snapshot_download(repo_id=repo, repo_type="dataset", local_dir=dest, token=token, revision=revision)
+        snapshot_download(repo_id=repo, repo_type="dataset", local_dir=dest, token=token, revision=revision, endpoint=endpoint or None)
     finally:
         stop.set()
         poller.join(timeout=3.0)

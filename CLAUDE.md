@@ -76,6 +76,31 @@ To add Whisper to an existing fleet: **Overview → Models → Edit → add the 
 Audio, Save** — that re-provisions and re-ships the worker-agent + ensures the audio deps. (A
 member needs a GPU slot; small fleets time-share via sleep/wake. Sleep-mode works fine with Whisper.)
 
+### VM endpoints self-bootstrap their vLLM venv (`venv_path` no longer needs to pre-exist)
+
+A multi-model VM/RunPod worker now **builds its own vLLM venv on boot** — name a `venv_path` that
+doesn't exist and the worker installs `uv` (if absent), `uv venv`s the path (mkdir parents), and
+installs vLLM, *streaming* the install to the `__worker__` log. Logic in
+`worker-agent/.../multi/launcher.py` (`ensure_venv`/`ensure_build_tools`/`run_pre_script`) +
+`scheduler.start()`. Knobs (create form **and** Overview → Models → Edit; stored on `App`):
+- **vLLM version** (`vllm_version`) — `uv pip install vllm==X --torch-backend=auto`.
+- **vLLM install args** (`vllm_install_args`) — a full `uv pip install` arg string used *verbatim*
+  (overrides the version), for nightlies/custom CUDA. The form has an **Insert nightly (cu130)** button.
+- **Pre-launch script** (`pre_script`) — shell run once after the venv is ready, before launch, with
+  `{venv}/bin` on PATH + VIRTUAL_ENV set. The form has a **+ Install DeepGEMM** button. Runs under
+  `bash` so `bash <(curl … install_deepgemm.sh)` works.
+
+A `{venv}/.sgpu_vllm_spec` marker means: skip if the spec is unchanged, reinstall if you change it,
+**never touch a venv with no marker** (hand-built ones like the tm fleet's `/share/vllm-venv`).
+
+Two Blackwell (B300, sm_103) gotchas, both handled: flashinfer JIT-builds kernels at runtime so the
+venv needs `ninja`+`cmake` AND `{venv}/bin` on PATH (`launch_member` prepends it) — else
+`FileNotFoundError: ninja`. And vLLM **0.23.0** ships a `prometheus_fastapi_instrumentator` that 500s
+*every* route incl. `/health` (`'_IncludedRouter' object has no attribute 'path'`) → worker never goes
+healthy; workaround is a `pre_script` `uv pip install -U "prometheus-fastapi-instrumentator>=7"`. After
+repeated re-provisions, free orphaned GPU memory with `POST /apps/{id}/workers/purge` (a self-exited
+vLLM the per-PID cleanup misses → "No available memory for the cache blocks" on the next launch).
+
 ### Label platform (data-labelling app)
 
 A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)

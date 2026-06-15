@@ -10,7 +10,10 @@ uploads it to a HF model repo, then prints ONE structured line the gateway parse
   @@HF {"error": "..."}                                                  on failure
 
 Config (JSON via --config):
-  {model_s3, region, endpoint, access_key, secret_key, model_dir, repo, token, private}
+  {model_s3, region, endpoint, access_key, secret_key, model_dir, repo, token,
+   private, hf_endpoint}
+`endpoint` is the S3 endpoint; `hf_endpoint` (optional) is a custom Hugging Face
+Hub (HF_ENDPOINT) — None/"" → huggingface.co.
 """
 from __future__ import annotations
 
@@ -96,12 +99,15 @@ def main() -> int:
         return 1
     token = (cfg.get("token") or "").strip() or None
     private = bool(cfg.get("private"))
+    # Custom HF_ENDPOINT (a self-hosted, HF-compatible Hub) — None → huggingface.co.
+    hf_endpoint = (cfg.get("hf_endpoint") or "").strip().rstrip("/") or None
+    base_url = hf_endpoint or "https://huggingface.co"
 
     model_dir = _download_model(cfg)
 
     from huggingface_hub import HfApi
-    api = HfApi(token=token)
-    log(f"create_repo {repo} (private={private}) …")
+    api = HfApi(token=token, endpoint=hf_endpoint)
+    log(f"create_repo {repo} (private={private}) at {base_url} …")
     api.create_repo(repo_id=repo, repo_type="model", private=private, exist_ok=True)
     # Count + size the payload so the log shows what's about to upload (the per-file
     # progress bars stream too — the gateway runs this with stderr merged into stdout).
@@ -109,8 +115,8 @@ def main() -> int:
     nbytes = sum(os.path.getsize(p) for p in files)
     log(f"uploading {len(files)} file(s) · {nbytes / 1e6:.0f} MB → {repo} (this can take a few minutes) …")
     api.upload_folder(folder_path=model_dir, repo_id=repo, repo_type="model")
-    log(f"upload complete → https://huggingface.co/{repo}")
-    emit({"repo": repo, "url": f"https://huggingface.co/{repo}"})
+    log(f"upload complete → {base_url}/{repo}")
+    emit({"repo": repo, "url": f"{base_url}/{repo}"})
     return 0
 
 

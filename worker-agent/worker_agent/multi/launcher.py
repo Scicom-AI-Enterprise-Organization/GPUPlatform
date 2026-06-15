@@ -6,6 +6,8 @@ import asyncio
 import logging
 import os
 import re
+import shlex
+import shutil
 import signal
 import time
 
@@ -116,6 +118,14 @@ async def launch_member(
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in member.gpu_indices)
     env["VLLM_SERVER_DEV_MODE"] = "1"  # exposes /sleep, /wake_up, /collective_rpc
+    # Put the venv's bin dir on PATH (running {venv}/bin/python directly does NOT
+    # activate the venv). flashinfer JIT-compiles sampling/attention kernels at
+    # runtime via the `ninja` console script — without {venv}/bin on PATH it dies
+    # with "FileNotFoundError: ninja" on Blackwell. Also exposes the venv's cmake.
+    bindir = os.path.dirname(python_exe)
+    if bindir and os.path.isabs(bindir):
+        env["VIRTUAL_ENV"] = os.path.dirname(bindir)
+        env["PATH"] = bindir + ":" + env.get("PATH", "")
 
     args = [
         python_exe, "-m", "vllm.entrypoints.openai.api_server",
@@ -146,6 +156,243 @@ async def launch_member(
     return proc
 
 
+def _find_uv() -> str | None:
+    """Locate a usable `uv` binary. The worker process PATH may not include the
+    user-local install dirs the standalone installer writes to, so check those
+    explicitly after PATH."""
+    p = shutil.which("uv")
+    if p:
+        return p
+    home = os.path.expanduser("~")
+    for cand in (f"{home}/.local/bin/uv", f"{home}/.cargo/bin/uv",
+                 "/root/.local/bin/uv", "/usr/local/bin/uv"):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+async def _stream_subprocess(proc: asyncio.subprocess.Process, prefix: str = "  ") -> int:
+    """Drain a process's merged stdout line-by-line into the logger so long-running
+    installs stream into the worker's __worker__ log live, instead of going silent
+    until they finish (a `uv pip install vllm` on a fresh venv is several minutes of
+    torch+vLLM download). Returns the exit code."""
+    if proc.stdout is not None:
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", "replace").rstrip()
+            if line:
+                logger.info("%s%s", prefix, line)
+    return await proc.wait()
+
+
+async def ensure_uv() -> str | None:
+    """Return a path to a `uv` binary, installing it via Astral's standalone
+    installer if the VM doesn't already have it. The vLLM-venv bootstrap needs uv
+    and some VMs ship without it. The installer needs no pip/root — it drops a
+    static binary in ~/.local/bin. Best-effort; returns None if uv is unavailable."""
+    uv = _find_uv()
+    if uv:
+        return uv
+    logger.info("uv not found on VM — installing via astral.sh standalone installer")
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            "curl -LsSf https://astral.sh/uv/install.sh | sh",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        rc = await _stream_subprocess(proc)
+        if rc != 0:
+            logger.error("uv install failed rc=%s", rc)
+    except Exception:
+        logger.exception("uv install failed")
+    uv = _find_uv()
+    if not uv:
+        logger.error("uv still not found after install attempt — cannot bootstrap venvs")
+    return uv
+
+
+async def _uv_run(uv: str, args: list[str], what: str) -> bool:
+    """Run `uv <args>`, streaming its output to the log. Returns True on success."""
+    logger.info("%s: uv %s", what, " ".join(args))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            uv, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        rc = await _stream_subprocess(proc)
+        if rc != 0:
+            logger.error("%s failed rc=%s", what, rc)
+            return False
+        logger.info("%s ✓", what)
+        return True
+    except Exception:
+        logger.exception("%s raised", what)
+        return False
+
+
+async def _python_has_module(py: str, mod: str) -> bool:
+    """True if `{py} -c 'import {mod}'` succeeds — used to tell a fully-bootstrapped
+    venv from a half-built one (uv venv made bin/python, but the vLLM install was
+    interrupted), so a re-boot RESUMES the install instead of skipping it."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            py, "-c", f"import {mod}",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        return (await proc.wait()) == 0
+    except Exception:
+        return False
+
+
+async def ensure_venv(
+    venv_path: str | None,
+    vllm_version: str | None,
+    vllm_install_args: str | None = None,
+) -> None:
+    """Bootstrap the endpoint's vLLM venv when it doesn't exist yet, so an endpoint
+    can name a `venv_path` that hasn't been created on the VM and the worker builds
+    it on first boot instead of dying with FileNotFoundError on `{venv_path}/bin/python`.
+
+    No-op when venv_path is unset (bare `python3` on PATH) or the venv already has
+    vLLM importable. Installs uv if the VM lacks it, `uv venv`s the path (creating
+    parent dirs), then installs vLLM. The install is, in priority order:
+      • `vllm_install_args` — a full `uv pip install` argument string, used verbatim
+        (e.g. a nightly: `-U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130
+        --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match`).
+        The operator owns the whole spec, so we DON'T inject --torch-backend.
+      • else `vllm==vllm_version` (or bare `vllm`) with `--torch-backend=auto` so uv
+        picks the PyTorch CUDA build matching the driver.
+    RESUMABLE: a venv with bin/python but no importable vLLM (an interrupted earlier
+    boot) re-runs the install rather than launching a broken venv. Install output
+    streams to the log so a failure (e.g. an unsupported GPU arch) is visible live."""
+    if not venv_path:
+        return
+    py = f"{venv_path}/bin/python"
+    custom = (vllm_install_args or "").strip()
+    # Signature of the requested install — recorded in a marker so a re-boot can tell
+    # "already built to THIS spec" (skip) from "operator changed the build" (reinstall).
+    spec_sig = custom if custom else (f"vllm=={vllm_version}" if vllm_version else "vllm")
+    marker = f"{venv_path}/.sgpu_vllm_spec"
+    have_py = os.path.exists(py)
+    if have_py and await _python_has_module(py, "vllm"):
+        try:
+            recorded = open(marker).read().strip()
+        except OSError:
+            recorded = None
+        if recorded is None:
+            # No marker → a venv WE didn't build (operator-managed, e.g. a shared
+            # /share/vllm-venv). Never touch it.
+            return
+        if recorded == spec_sig:
+            return  # already built to exactly this spec
+        logger.info("venv %s vLLM spec changed (%r → %r) — reinstalling", venv_path, recorded, spec_sig)
+    uv = await ensure_uv()
+    if not uv:
+        logger.error("cannot bootstrap venv %s — uv unavailable on the VM", venv_path)
+        return
+    desc = "custom args" if custom else (f"vllm=={vllm_version}" if vllm_version else "vllm")
+    if not have_py:
+        logger.info("venv %s missing — bootstrapping (uv venv + pip install %s); "
+                    "first install can take several minutes", venv_path, desc)
+        # uv venv doesn't reliably create missing PARENT dirs (e.g. /share2 on a
+        # fresh VM) — make them so `uv venv /share2/vllm-venv2` can't fail on a
+        # missing /share2.
+        parent = os.path.dirname(venv_path.rstrip("/"))
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                logger.exception("could not create parent dir %s for venv", parent)
+        if not await _uv_run(uv, ["venv", venv_path], f"create venv {venv_path}"):
+            return
+    else:
+        logger.info("venv %s exists but vLLM not importable — (re)installing %s", venv_path, desc)
+    if custom:
+        # Operator-provided install command (e.g. a nightly with extra index URLs).
+        # Run verbatim — no --torch-backend injection, no fallback.
+        try:
+            extra = shlex.split(custom)
+        except ValueError as e:
+            logger.error("vllm_install_args is not a valid shell arg string (%s) — skipping install", e)
+            extra = None
+        if extra:
+            await _uv_run(uv, ["pip", "install", "--python", py, *extra],
+                          f"install vLLM (custom) into {venv_path}")
+    else:
+        spec = f"vllm=={vllm_version}" if vllm_version else "vllm"
+        # --torch-backend=auto lets uv pick the PyTorch CUDA build matching the VM's
+        # driver (important on bleeding-edge GPUs); retry without it for older uv
+        # that doesn't recognise the flag.
+        if not await _uv_run(uv, ["pip", "install", "--python", py, "--torch-backend=auto", spec],
+                             f"install {spec} into {venv_path}"):
+            await _uv_run(uv, ["pip", "install", "--python", py, spec],
+                          f"install {spec} into {venv_path} (no torch-backend)")
+    if await _python_has_module(py, "vllm"):
+        try:
+            with open(marker, "w") as fh:
+                fh.write(spec_sig)
+        except OSError:
+            pass  # marker is best-effort (just affects reinstall-on-spec-change)
+        logger.info("bootstrapped venv %s ✓ (spec=%s)", venv_path, spec_sig)
+    else:
+        logger.error("venv %s bootstrap finished but vLLM still not importable", venv_path)
+
+
+async def ensure_build_tools(venv_path: str | None) -> None:
+    """Make sure `ninja` (and `cmake`) are in the venv. vLLM's flashinfer backend
+    JIT-compiles its sampling/attention kernels at runtime on newer GPUs (Blackwell)
+    and shells out to the `ninja` build tool — without it the engine dies at
+    profile_run with `FileNotFoundError: ninja`. These are cheap pure-Python wheels
+    (each bundles a static binary into {venv}/bin); launch_member puts {venv}/bin on
+    PATH so the JIT finds them. No-op when venv_path is unset or ninja is present."""
+    if not venv_path:
+        return
+    if os.path.exists(f"{venv_path}/bin/ninja"):
+        return  # already there
+    py = f"{venv_path}/bin/python"
+    if not os.path.exists(py):
+        return
+    uv = await ensure_uv()
+    if not uv:
+        logger.warning("`uv` unavailable — cannot ensure ninja/cmake; flashinfer JIT may fail")
+        return
+    await _uv_run(uv, ["pip", "install", "--python", py, "ninja", "cmake"],
+                 f"ensure build tools (ninja, cmake) in {venv_path}")
+
+
+async def run_pre_script(pre_script: str | None, venv_path: str | None) -> None:
+    """Run an optional operator-provided setup script once per worker boot, AFTER the
+    vLLM venv is bootstrapped and BEFORE any model launches. Some models need extra
+    build/install steps that don't fit a `pip install` — e.g. DeepGEMM:
+        bash <(curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm/main/tools/install_deepgemm.sh)
+    The script runs under bash (so process substitution `<(…)` works) with the vLLM
+    venv on PATH and VIRTUAL_ENV set, so `pip`/`python` in the script target that
+    venv. Output streams to the worker log. Best-effort: a non-zero exit is logged
+    but doesn't abort the fleet (the model launch surfaces a clearer error if the
+    script was actually required)."""
+    if not pre_script or not pre_script.strip():
+        return
+    env = dict(os.environ)
+    if venv_path:
+        env["VIRTUAL_ENV"] = venv_path
+        env["PATH"] = f"{venv_path}/bin:" + env.get("PATH", "")
+    logger.info("running pre-script (%d chars) before launch", len(pre_script))
+    try:
+        # bash -lc (not sh) — pre-scripts commonly use `bash <(curl …)` process
+        # substitution, which sh doesn't support.
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-lc", pre_script, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        rc = await _stream_subprocess(proc, prefix="  [pre] ")
+        if rc != 0:
+            logger.error("pre-script exited rc=%s (continuing — launch will validate)", rc)
+        else:
+            logger.info("pre-script completed ✓")
+    except Exception:
+        logger.exception("pre-script failed to run")
+
+
 async def ensure_vllm(venv_path: str | None, vllm_version: str | None) -> None:
     """Best-effort: make sure `vllm==vllm_version` is installed in the endpoint's
     uv venv before launching models. No-op unless both are set. Idempotent — uv
@@ -157,21 +404,12 @@ async def ensure_vllm(venv_path: str | None, vllm_version: str | None) -> None:
     if not os.path.exists(py):
         logger.warning("venv_path %s has no bin/python — skipping vllm ensure", venv_path)
         return
-    cmd = ["uv", "pip", "install", "--python", py, f"vllm=={vllm_version}"]
-    logger.info("ensuring vllm==%s in %s", vllm_version, venv_path)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
-        if proc.returncode != 0:
-            logger.warning("vllm ensure rc=%s: %s", proc.returncode, (out or b"").decode("utf-8", "replace")[-500:])
-        else:
-            logger.info("vllm==%s present in %s", vllm_version, venv_path)
-    except FileNotFoundError:
-        logger.warning("`uv` not found on PATH — cannot ensure vllm==%s; relying on venv as-is", vllm_version)
-    except Exception:
-        logger.exception("vllm ensure failed (continuing — launch will validate)")
+    uv = await ensure_uv()
+    if not uv:
+        logger.warning("`uv` unavailable — cannot ensure vllm==%s; relying on venv as-is", vllm_version)
+        return
+    await _uv_run(uv, ["pip", "install", "--python", py, f"vllm=={vllm_version}"],
+                 f"ensure vllm=={vllm_version} in {venv_path}")
 
 
 # Heuristic for "this member is a Whisper/ASR transcription model" — used to pull
@@ -208,21 +446,12 @@ async def ensure_audio_deps(venv_path: str | None, members) -> None:
     if not os.path.exists(py):
         logger.warning("venv_path %s has no bin/python — skipping audio-deps ensure", venv_path)
         return
-    cmd = ["uv", "pip", "install", "--python", py, "librosa", "soundfile", "resampy", "av"]
-    logger.info("ensuring audio deps (librosa, soundfile) in %s for a transcription model", venv_path)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
-        if proc.returncode != 0:
-            logger.warning("audio deps ensure rc=%s: %s", proc.returncode, (out or b"").decode("utf-8", "replace")[-500:])
-        else:
-            logger.info("audio deps present in %s", venv_path)
-    except FileNotFoundError:
-        logger.warning("`uv` not found on PATH — cannot ensure audio deps; whisper members will reject audio")
-    except Exception:
-        logger.exception("audio deps ensure failed (continuing — launch will validate)")
+    uv = await ensure_uv()
+    if not uv:
+        logger.warning("`uv` unavailable — cannot ensure audio deps; whisper members will reject audio")
+        return
+    await _uv_run(uv, ["pip", "install", "--python", py, "librosa", "soundfile", "resampy", "av"],
+                 f"ensure audio deps in {venv_path}")
 
 
 # Definitive "this launch is doomed" markers. Seeing any of these in the log
