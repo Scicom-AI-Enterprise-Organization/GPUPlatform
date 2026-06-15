@@ -516,10 +516,31 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
                     if request_id in live:
                         live[request_id]["upstream"] = u["name"]
                     await _set_started(request_id, upstream=u["name"])
-                    async for chunk in r.aiter_bytes():
-                        if cancel_ev.is_set():
-                            break
-                        yield chunk
+                    sent_any = False
+                    try:
+                        async for chunk in r.aiter_bytes():
+                            if cancel_ev.is_set():
+                                break
+                            sent_any = True
+                            yield chunk
+                    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
+                        # Upstream dropped the socket mid-stream (GPU node cold-start /
+                        # recycle / overload → httpx "incomplete chunked read"). It's an
+                        # infra hiccup, not a client bug. If we haven't yielded a byte yet
+                        # we can still fail over to another upstream; once partial output
+                        # is out we can't retry, so close the SSE cleanly with a terminator
+                        # instead of letting the protocol error break the client's stream.
+                        _mark_health(app, endpoint_id, u["id"], False, error=str(e))
+                        if not sent_any:
+                            last_err = f"{u['name']}: {type(e).__name__} (mid-stream, pre-byte)"
+                            continue
+                        yield b"data: [DONE]\n\n"
+                        finished = True
+                        await _finish(request_id, "completed", status_code=r.status_code,
+                                      latency_ms=int((time.perf_counter() - t0) * 1000),
+                                      upstream=u["name"],
+                                      error=f"upstream closed mid-stream: {type(e).__name__}")
+                        return
                     finished = True
                     await _finish(request_id, "completed", status_code=r.status_code,
                                   latency_ms=int((time.perf_counter() - t0) * 1000), upstream=u["name"])
