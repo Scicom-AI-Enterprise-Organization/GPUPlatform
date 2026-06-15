@@ -453,6 +453,7 @@ async def lifespan(app: FastAPI):
     app.state.autoscaler_task = None
     app.state.reconciler_task = None
     app.state.bench_janitor_task = None
+    app.state.compute_idle_task = None
     app.state.gitops_task = None
     if os.environ.get("BENCHMARK_S3_BUCKET", "").strip():
         # Materialize SSH key from env (prod) before anything else uses it.
@@ -477,6 +478,11 @@ async def lifespan(app: FastAPI):
                 "compute: marked %d previously-creating pod(s) as failed (gateway restart). "
                 "Check RunPod dashboard for any pod still billing.", orphaned,
             )
+        # Idle auto-terminate sweep — tears down pods left idle (no GPU/memory
+        # use) past their per-pod window. No-op for pods with the window unset.
+        app.state.compute_idle_task = asyncio.create_task(
+            compute_module.compute_idle_loop()
+        )
         logger.info("compute enabled")
     # Autotrain: reconcile training runs left 'running'/'queued' by a previous
     # gateway process. Trainers run detached on the VM/pod, so a restart no longer
@@ -583,7 +589,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task_attr in ("autoscaler_task", "reconciler_task", "bench_janitor_task", "gitops_task", "proxy_healthcheck_task"):
+        for task_attr in ("autoscaler_task", "reconciler_task", "bench_janitor_task", "compute_idle_task", "gitops_task", "proxy_healthcheck_task"):
             t = getattr(app.state, task_attr, None)
             if t:
                 t.cancel()

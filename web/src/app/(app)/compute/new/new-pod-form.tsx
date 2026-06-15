@@ -114,6 +114,9 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const [gpuCount, setGpuCount] = useState(1);
   const [containerDisk, setContainerDisk] = useState("40");
   const [volumeGb, setVolumeGb] = useState("0");
+  // Auto-terminate when idle, entered in minutes ("" / 0 = off). The gateway
+  // sweeps every ~30s, so sub-minute precision wouldn't be meaningful.
+  const [idleMinutes, setIdleMinutes] = useState("0");
   const [templateId, setTemplateId] = useState(
     templates[0]?.id ?? "pytorch-2.4-cuda12.4",
   );
@@ -240,6 +243,12 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const diskInvalid = !Number.isFinite(parsedDisk) || parsedDisk < 10 || parsedDisk > 2000;
   const parsedVolume = Number.parseInt(volumeGb, 10);
   const volumeInvalid = !Number.isFinite(parsedVolume) || parsedVolume < 0 || parsedVolume > 2000;
+  const parsedIdleMin = Number.parseInt(idleMinutes, 10);
+  const idleInvalid =
+    idleMinutes.trim() !== "" &&
+    (!Number.isFinite(parsedIdleMin) || parsedIdleMin < 0 || parsedIdleMin > 1440);
+  // Gateway field is in seconds (0 = off, capped at 24h).
+  const idleSeconds = Number.isFinite(parsedIdleMin) && parsedIdleMin > 0 ? parsedIdleMin * 60 : 0;
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -256,6 +265,10 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       setSubmitError("Volume must be between 0 and 2000 GB.");
       return;
     }
+    if (idleInvalid) {
+      setSubmitError("Auto-terminate must be between 0 and 1440 minutes (0 = off).");
+      return;
+    }
     setSubmitting(true);
     try {
       const pod = await gateway.createCompute({
@@ -267,6 +280,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         template_id: templateId,
         image: imageOverride,
         cloud_type: secureCloud ? "SECURE" : "COMMUNITY",
+        idle_terminate_after_s: idleSeconds,
         provider_id: providerId || null,
       });
       toast.success(
@@ -338,6 +352,28 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       {/* Section: hardware */}
       <Section title="Hardware" description="GPU type, count, and storage.">
         <div className="space-y-5">
+          {/* Cloud tier first — it scopes which hosts (and therefore GPU
+              availability) the picker below reflects. */}
+          <Field
+            label="Cloud tier"
+            hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity."
+          >
+            <div className="grid grid-cols-2 gap-2">
+              <TierButton
+                active={!secureCloud}
+                onClick={() => setSecureCloud(false)}
+                label="Community"
+                hint="cheaper, variable hosts"
+              />
+              <TierButton
+                active={secureCloud}
+                onClick={() => setSecureCloud(true)}
+                label="Secure"
+                hint="vetted hosts, more capacity"
+              />
+            </div>
+          </Field>
+
           <Field
             label="GPU"
             hint={(() => {
@@ -377,26 +413,6 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
             </div>
           </Field>
 
-          <Field
-            label="Cloud tier"
-            hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity."
-          >
-            <div className="grid grid-cols-2 gap-2">
-              <TierButton
-                active={!secureCloud}
-                onClick={() => setSecureCloud(false)}
-                label="Community"
-                hint="cheaper, variable hosts"
-              />
-              <TierButton
-                active={secureCloud}
-                onClick={() => setSecureCloud(true)}
-                label="Secure"
-                hint="vetted hosts, more capacity"
-              />
-            </div>
-          </Field>
-
           <div className="grid grid-cols-2 gap-3">
             <Field
               label="Container disk (GB)"
@@ -426,6 +442,37 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
             </Field>
           </div>
         </div>
+      </Section>
+
+      {/* Section: auto-terminate */}
+      <Section
+        title="Auto-terminate"
+        description="Automatically delete this pod once it sits idle — no GPU compute and no GPU memory in use — for the given time. Stops a forgotten pod from billing indefinitely."
+      >
+        <Field
+          label="Terminate after idle (minutes)"
+          hint={
+            idleSeconds > 0
+              ? `Pod is deleted after ${parsedIdleMin} min with no GPU or memory activity. 0 = never.`
+              : "0 = never auto-terminate (delete manually when done)."
+          }
+        >
+          <Input
+            type="text"
+            inputMode="numeric"
+            value={idleMinutes}
+            onChange={(e) => setIdleMinutes(e.target.value)}
+            placeholder="0"
+            aria-invalid={idleInvalid}
+            className="max-w-40"
+          />
+          {providerKind === "pi" && idleSeconds > 0 && (
+            <p className="mt-1.5 text-[11px] text-muted-foreground">
+              Note: idle detection currently works for RunPod pods only — Prime Intellect
+              pods won&apos;t auto-terminate and must be deleted manually.
+            </p>
+          )}
+        </Field>
       </Section>
 
       {/* Section: template / image */}

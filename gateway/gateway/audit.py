@@ -61,6 +61,7 @@ ACTIONS = {
     "benchmark.rename",
     "compute.create",
     "compute.delete",
+    "compute.idle_terminate",
     "compute.request",
     "compute.approve",
     "compute.reject",

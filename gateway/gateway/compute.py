@@ -238,6 +238,13 @@ class ComputePod(Base):
     )
     ready_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     terminated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Auto-terminate after this many seconds with no GPU compute AND no GPU
+    # memory in use. 0 = disabled (the pod runs until manually terminated).
+    idle_terminate_after_s: Mapped[int] = mapped_column(Integer, default=0)
+    # Last time the idle monitor observed the pod busy (or couldn't measure it —
+    # we bump it to "now" then, so an unmeasurable pod is never auto-killed).
+    # Seeded to the ready time so the idle clock starts when SSH lands.
+    last_active_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # Per-pod cloud-account selection. NULL = platform default (env var).
     provider_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     # Persisted Jupyter URL. For RunPod we derive it from runpod_pod_id at
@@ -938,6 +945,7 @@ async def _pi_poll_until_ready(
                     row.ssh_user = ssh_user
                 row.status = "running"
                 row.ready_at = datetime.now(timezone.utc)
+                row.last_active_at = row.ready_at  # start the idle clock at ready
                 row.error_text = None
                 if jurl:
                     row.jupyter_url_override = jurl
@@ -1143,6 +1151,7 @@ async def _runpod_poll_until_ready(
                 row.ssh_port = port
                 row.status = "running"
                 row.ready_at = datetime.now(timezone.utc)
+                row.last_active_at = row.ready_at  # start the idle clock at ready
                 row.error_text = None
                 await s.commit()
             logger.info("compute %s: SSH ready at %s:%s", pod_id, ip, port)
@@ -1183,6 +1192,187 @@ async def _delete_runpod(runpod_id: str, provider_id: Optional[str] = None) -> N
                 )
         except Exception:
             logger.exception("compute: delete request for %s crashed", runpod_id)
+
+
+# ---------- Idle auto-terminate ----------------------------------------
+#
+# A pod with idle_terminate_after_s > 0 is torn down once it has shown no GPU
+# compute AND no GPU memory in use for that many seconds. Detection polls the
+# provider's pod object for per-GPU utilization. It is deliberately FAIL-SAFE:
+# if utilization can't be measured (provider didn't return it, request failed,
+# PI's shape is unknown), we treat the pod as active and never auto-kill it.
+
+# Per-GPU utilization at or below this percent counts as "not in use" — a small
+# floor so measurement jitter on an idle card doesn't look like activity.
+_IDLE_BUSY_PCT = 1.0
+# How often the sweep runs. Small idle windows are still only as precise as this.
+_IDLE_CHECK_INTERVAL_S = 30
+
+
+def _runpod_busy(pod: dict) -> Optional[bool]:
+    """Classify a RunPod pod object as busy / idle / unknown.
+
+    Returns True if any GPU reports compute or memory utilization above the
+    noise floor, False if every measured GPU is at/below it, and None when the
+    object carries no usable utilization fields (→ caller must treat as active).
+    """
+    runtime = pod.get("runtime")
+    if not isinstance(runtime, dict):
+        return None
+    gpus = runtime.get("gpus")
+    if not isinstance(gpus, list) or not gpus:
+        return None
+    measured = False
+    for g in gpus:
+        if not isinstance(g, dict):
+            continue
+        vals = [
+            float(v)
+            for v in (g.get("gpuUtilPercent"), g.get("memoryUtilPercent"))
+            if isinstance(v, (int, float))
+        ]
+        if not vals:
+            continue
+        measured = True
+        if any(v > _IDLE_BUSY_PCT for v in vals):
+            return True
+    return False if measured else None
+
+
+async def _fetch_pod_busy(
+    pod_id: str, runpod_id: str, provider_id: Optional[str]
+) -> Optional[bool]:
+    """Poll the provider for current utilization. None = couldn't determine."""
+    try:
+        kind = await _resolve_pod_kind(pod_id)
+    except Exception:
+        return None
+    # PI's pod object doesn't expose a documented per-GPU utilization shape we
+    # can rely on, so PI pods are left to manual termination (fail-safe None).
+    if kind == "pi":
+        return None
+    try:
+        api_key = await _resolve_api_key(provider_id, "runpod")
+    except Exception:
+        return None
+    try:
+        async with _client(api_key=api_key) as cli:
+            pr = await cli.get(f"/pods/{runpod_id}")
+        if pr.status_code >= 400:
+            return None
+        return _runpod_busy(pr.json() or {})
+    except Exception as e:
+        logger.debug("compute %s: util poll failed: %s", pod_id, e)
+        return None
+
+
+async def _idle_terminate(pod_id: str) -> None:
+    """Tear down a pod the sweep judged idle — mirrors delete_compute's
+    teardown but attributed to the system (logged as compute.idle_terminate)."""
+    async with session_factory()() as s:
+        row = await s.get(ComputePod, pod_id)
+        if row is None or row.status != "running":
+            return  # raced with a manual delete / state change
+        runpod_id = row.runpod_pod_id
+        pod_provider_id = row.provider_id
+        pod_name = row.name
+        owner_id = row.owner_id
+        ready_at = row.ready_at
+        cost_per_hr = row.cost_per_hr
+        timeout_s = row.idle_terminate_after_s
+        row.status = "terminated"
+        row.terminated_at = datetime.now(timezone.utc)
+        terminated_at = row.terminated_at
+        await s.commit()
+
+    kind = await _resolve_pod_kind(pod_id)
+    if runpod_id:
+        if kind == "pi":
+            asyncio.create_task(_delete_pi(runpod_id, provider_id=pod_provider_id))
+        else:
+            asyncio.create_task(_delete_runpod(runpod_id, provider_id=pod_provider_id))
+    logger.info(
+        "compute %s: auto-terminated after %ds idle (no GPU compute or memory in use)",
+        pod_id, timeout_s,
+    )
+
+    # Attribute the audit row to the owner (the system acted on their behalf).
+    try:
+        async with session_factory()() as s:
+            owner = await s.get(User, owner_id)
+            if owner is not None:
+                details: dict[str, Any] = {
+                    "reason": "idle_timeout",
+                    "idle_terminate_after_s": timeout_s,
+                }
+                if runpod_id:
+                    details["runpod_pod_id"] = runpod_id
+                cost = audit.cost_breakdown(ready_at, terminated_at, cost_per_hr)
+                if cost is not None:
+                    details.update(cost)
+                await audit.record(
+                    owner, "compute.idle_terminate", "compute", pod_id, pod_name,
+                    details=details,
+                )
+    except Exception:
+        logger.exception("compute %s: idle-terminate audit failed", pod_id)
+
+
+async def _idle_sweep_once() -> None:
+    """One pass: refresh activity for busy/unmeasurable pods, terminate the
+    ones idle past their window."""
+    async with session_factory()() as s:
+        rows = (
+            await s.execute(
+                select(ComputePod).where(
+                    ComputePod.status == "running",
+                    ComputePod.idle_terminate_after_s > 0,
+                )
+            )
+        ).scalars().all()
+        # Snapshot the fields we need so we don't hold the session during polls.
+        cands = [
+            (r.id, r.runpod_pod_id, r.provider_id, r.idle_terminate_after_s,
+             r.last_active_at, r.ready_at, r.created_at)
+            for r in rows
+            if r.runpod_pod_id
+        ]
+
+    now = datetime.now(timezone.utc)
+    for pod_id, runpod_id, provider_id, timeout_s, last_active, ready_at, created_at in cands:
+        busy = await _fetch_pod_busy(pod_id, runpod_id, provider_id)
+        if busy is None or busy:
+            # Active, or we couldn't measure it — reset the idle clock so an
+            # unmeasurable pod is never auto-killed.
+            async with session_factory()() as s:
+                r = await s.get(ComputePod, pod_id)
+                if r is not None and r.status == "running":
+                    r.last_active_at = now
+                    await s.commit()
+            continue
+        base = last_active or ready_at or created_at
+        if base is None:
+            continue
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        if (now - base).total_seconds() >= timeout_s:
+            await _idle_terminate(pod_id)
+
+
+async def compute_idle_loop() -> None:
+    """Background task: auto-terminate idle compute pods. Started at gateway
+    startup whenever Compute is enabled; runs until the process stops."""
+    logger.info(
+        "compute idle-terminate loop started (poll every %ds)", _IDLE_CHECK_INTERVAL_S
+    )
+    while True:
+        try:
+            await asyncio.sleep(_IDLE_CHECK_INTERVAL_S)
+            await _idle_sweep_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("compute: idle sweep crashed (continuing)")
 
 
 # ---------- Startup hook -----------------------------------------------
@@ -1254,6 +1444,10 @@ class CreateComputeRequest(BaseModel):
     # IS the template id, an enum value).
     image: Optional[str] = Field(default=None, max_length=512)
     cloud_type: str = Field(default="COMMUNITY", pattern=r"^(COMMUNITY|SECURE)$")
+    # Auto-terminate after this many idle seconds (no GPU compute AND no GPU
+    # memory used). 0 = disabled. Capped at 24h so a typo can't strand a pod
+    # billing "forever".
+    idle_terminate_after_s: int = Field(default=0, ge=0, le=86400)
     # NULL = use the gateway-wide RUNPOD_API_KEY env var. When set, must
     # refer to a kind=runpod or kind=pi Provider row.
     provider_id: Optional[str] = None
@@ -1285,6 +1479,8 @@ class ComputeRecord(BaseModel):
     created_at: str
     ready_at: Optional[str] = None
     terminated_at: Optional[str] = None
+    idle_terminate_after_s: int = 0
+    last_active_at: Optional[str] = None
 
 
 class SshInfoResponse(BaseModel):
@@ -1363,6 +1559,8 @@ def _to_record(p: ComputePod, owner_username: str) -> ComputeRecord:
         created_at=p.created_at.isoformat() if p.created_at else "",
         ready_at=p.ready_at.isoformat() if p.ready_at else None,
         terminated_at=p.terminated_at.isoformat() if p.terminated_at else None,
+        idle_terminate_after_s=p.idle_terminate_after_s or 0,
+        last_active_at=p.last_active_at.isoformat() if p.last_active_at else None,
     )
 
 
@@ -1810,6 +2008,7 @@ async def create_compute(
         template_id=template_id_resolved,
         cloud_type=body.cloud_type,
         status="pending_approval" if needs_approval else "creating",
+        idle_terminate_after_s=body.idle_terminate_after_s,
         owner_id=user.id,
         provider_id=body.provider_id,
     )

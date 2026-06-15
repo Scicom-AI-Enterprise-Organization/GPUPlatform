@@ -750,6 +750,14 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS jupyter_url_override VARCHAR(512)"
         ))
+        # Idle auto-terminate: window in seconds (0 = off) + last time the idle
+        # monitor saw the pod busy (seeded to ready time).
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS idle_terminate_after_s INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP WITH TIME ZONE"
+        ))
         # GitHub SSO: column for linking platform accounts to GitHub user IDs.
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS github_id VARCHAR(64)"

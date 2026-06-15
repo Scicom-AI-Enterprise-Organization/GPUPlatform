@@ -2334,6 +2334,26 @@ async def _hf_endpoint_for_storage(storage_id: Optional[str], session: AsyncSess
     return ep.rstrip("/") or None
 
 
+def _loopback_endpoint(endpoint: Optional[str]) -> Optional[str]:
+    """If `endpoint` points at THIS gateway's OWN /hf mirror (its public host, or
+    localhost), rewrite it to a loopback URL (127.0.0.1:<GATEWAY_BIND port>) keeping
+    the path. A gateway-side export then hits the mirror directly — bypassing the
+    nginx ingress (whose `client_max_body_size` caps a single-part LFS PUT, killing
+    multi-GB shards) and TLS. External mirrors (a different host) are left untouched."""
+    if not endpoint:
+        return endpoint
+    from urllib.parse import urlparse
+    ep = urlparse(endpoint)
+    if not ep.hostname:
+        return endpoint
+    pub_host = urlparse(os.environ.get("GATEWAY_PUBLIC_URL", "").strip()).hostname
+    is_own = ep.hostname in ("localhost", "127.0.0.1") or (pub_host and ep.hostname == pub_host)
+    if not is_own:
+        return endpoint  # a different host → external mirror, don't redirect to ourselves
+    port = (os.environ.get("GATEWAY_BIND", "0.0.0.0:8080").rsplit(":", 1)[-1] or "8080").strip()
+    return f"http://127.0.0.1:{port}{ep.path}".rstrip("/")
+
+
 class HfExportRequest(BaseModel):
     repo: str
     storage_id: Optional[str] = None   # a kind=huggingface Storage (provides the token)
@@ -2376,6 +2396,10 @@ async def export_to_huggingface(
     # mis-parses); the model artifact lives on S3 so no VM is involved. The default
     # huggingface.co path still runs on the VM (avoids large downloads on the laptop).
     local_export = bool(hf_endpoint)
+    # For a gateway-side push to our OWN mirror, talk to it over loopback so a
+    # multi-GB LFS PUT bypasses the nginx ingress body-size cap (+ TLS). Keep the
+    # original endpoint for the displayed/stored repo URL.
+    push_endpoint = _loopback_endpoint(hf_endpoint) if local_export else hf_endpoint
     creds = _s3_creds_from_storage(await session.get(Storage, row.storage_id) if row.storage_id else None)
     ssh = None
     if not local_export:
@@ -2417,24 +2441,31 @@ async def export_to_huggingface(
             where = "the gateway" if local_export else "the run's VM"
             await _push_log(redis, run_id, f"[gateway] exporting best model to Hugging Face → {repo} (from {where}) …")
             if local_export:
+                if push_endpoint != hf_endpoint:
+                    await _push_log(redis, run_id, f"[gateway] pushing via {push_endpoint} (loopback, bypassing the ingress) …")
                 res = await asyncio.to_thread(
                     _run_hf_export_local, run_id, model_s3, creds, repo, token, private,
-                    hf_endpoint, export_lines.append)
+                    push_endpoint, export_lines.append)
             else:
                 res = await asyncio.to_thread(
                     _run_hf_export_ssh, *ssh, run_id, model_s3, creds, repo, token, private, cfg,
                     hf_endpoint, export_lines.append)
+            # The script builds the URL from the endpoint it pushed to; show the
+            # public endpoint instead of the loopback one.
+            res_url = res.get("url")
+            if local_export and push_endpoint and push_endpoint != hf_endpoint and res_url:
+                res_url = res_url.replace(push_endpoint, hf_endpoint, 1)
             async with session_factory()() as s:
                 r2 = await s.get(TrainingRun, run_id)
                 if r2 is not None:
                     rj = dict(r2.result_json or {})
-                    rj["hf_export"] = {"status": "done", "repo": res.get("repo", repo), "url": res.get("url")}
+                    rj["hf_export"] = {"status": "done", "repo": res.get("repo", repo), "url": res_url}
                     art = dict(rj.get("artifact") or {})
                     art["hf_repo"] = res.get("repo", repo)
                     rj["artifact"] = art
                     r2.result_json = rj
                     await s.commit()
-            await _push_log(redis, run_id, f"[gateway] pushed to Hugging Face: {res.get('url')}")
+            await _push_log(redis, run_id, f"[gateway] pushed to Hugging Face: {res_url}")
         except asyncio.CancelledError:
             await _push_log(redis, run_id, "[gateway] HF export: cancelled (superseded)")
             raise

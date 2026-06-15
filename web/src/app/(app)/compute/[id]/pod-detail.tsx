@@ -211,6 +211,14 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
           <Field label="Provider" value={providerLabel} />
           <Field label="Template" value={pod.template_id ?? "—"} />
           <Field label="Rate" value={formatRateUSD(pod.cost_per_hr)} />
+          <Field
+            label="Auto-terminate"
+            value={
+              pod.idle_terminate_after_s > 0
+                ? `idle ${formatIdle(pod.idle_terminate_after_s)}`
+                : "off"
+            }
+          />
           <LiveCostField pod={pod} />
           <Field label="Image" value={pod.image} className="col-span-full font-mono text-xs" />
         </dl>
@@ -413,6 +421,15 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
       {children}
     </div>
   );
+}
+
+// Render an idle-timeout (seconds) as a compact human string: "30m", "2h", "1h30m".
+function formatIdle(seconds: number): string {
+  const mins = Math.round(seconds / 60);
+  if (mins < 60) return `${mins}m`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m === 0 ? `${h}h` : `${h}h${m}m`;
 }
 
 function StatusPill({ status }: { status: ComputeStatus }) {

@@ -561,6 +561,10 @@ export type ComputePod = {
   created_at: string;
   ready_at: string | null;
   terminated_at: string | null;
+  // Auto-terminate after this many idle seconds (no GPU compute & no GPU memory
+  // in use). 0 = disabled.
+  idle_terminate_after_s: number;
+  last_active_at: string | null;
 };
 
 export type CreateComputeRequest = {
@@ -574,6 +578,8 @@ export type CreateComputeRequest = {
   // resolved imageName from the RunPod templates search.
   image?: string | null;
   cloud_type?: "COMMUNITY" | "SECURE";
+  // Auto-terminate after this many idle seconds. 0 = off (default).
+  idle_terminate_after_s?: number;
   provider_id?: string | null;
 };
 
