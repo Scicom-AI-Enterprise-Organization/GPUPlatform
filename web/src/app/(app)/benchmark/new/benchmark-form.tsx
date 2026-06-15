@@ -201,7 +201,7 @@ type FormState = {
   vm_base_dir: string;
 };
 
-const DEFAULTS: FormState = {
+export const DEFAULTS: FormState = {
   benchName: "qwen-quick",
   gpu_type: "NVIDIA RTX A4000",
   gpu_count: 1,
@@ -365,7 +365,11 @@ function totalRuns(s: FormState): number {
   return Math.max(1, inputs.length) * Math.max(1, concs.length);
 }
 
-function renderYaml(s: FormState, target: "cloud" | "vm" = "cloud"): string {
+export function renderYaml(
+  s: FormState,
+  target: "cloud" | "vm" = "cloud",
+  storageName?: string,
+): string {
   // RunPod / pod / container blocks only apply when we're provisioning a
   // fresh pod. On a registered VM the hardware is fixed and the gateway
   // injects host/port/username/key_filename into `remote:` at runtime — so
@@ -418,7 +422,15 @@ remote:
     - hf_transfer
 `;
 
-  return `${runpodBlock}${remoteBlock}
+  // Storage backend (S3 logs/results target) referenced by name. The gateway
+  // ignores this key — it resolves the backend from the separate `storage_id`
+  // request field — but carrying it here lets the Storage dropdown survive a
+  // round-trip through YAML mode (rendered here, read back in parseYamlToForm).
+  const storageLine = storageName
+    ? `storage: ${JSON.stringify(storageName)}\n\n`
+    : "";
+
+  return `${storageLine}${runpodBlock}${remoteBlock}
 benchmark:
   - name: ${s.benchName}
     engine: vllm
@@ -457,13 +469,17 @@ type ParseYamlResult = {
   state: FormState;
   unknownKeys: string[];
   parseError: string | null;
+  /** Raw top-level `storage:` value from the YAML (a backend name), if present.
+   * Held separately from FormState because storage selection is its own state;
+   * the caller resolves it to a real storage id against the loaded list. */
+  storageRef: string | null;
 };
 
 /** Parse a benchmaq YAML config back into FormState. Anything the form
  * doesn't represent (extra env vars, multiple bench items, custom engine,
  * etc.) is collected into `unknownKeys` so we can warn the user that
  * round-tripping through Form mode will drop those keys. */
-function parseYamlToForm(src: string, fallback: FormState): ParseYamlResult {
+export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResult {
   let doc: unknown;
   try {
     doc = yaml.load(src);
@@ -472,10 +488,11 @@ function parseYamlToForm(src: string, fallback: FormState): ParseYamlResult {
       state: fallback,
       unknownKeys: [],
       parseError: e instanceof Error ? e.message : String(e),
+      storageRef: null,
     };
   }
   if (!doc || typeof doc !== "object") {
-    return { state: fallback, unknownKeys: [], parseError: "empty config" };
+    return { state: fallback, unknownKeys: [], parseError: "empty config", storageRef: null };
   }
   const d = doc as Record<string, unknown>;
   const next = { ...fallback };
@@ -494,6 +511,14 @@ function parseYamlToForm(src: string, fallback: FormState): ParseYamlResult {
     ?.container ?? {}) as Record<string, unknown>;
   if (typeof container.image === "string") next.container_image = container.image;
   if (typeof container.disk_size === "number") next.disk_size = container.disk_size;
+
+  // ---- runpod.storage — pod volume. renderYaml writes volume_size here, so we
+  // must read it back; otherwise a YAML→Form→YAML round-trip silently resets the
+  // volume to the form default (the "disk reverts to default" bug).
+  const podStorage = ((d.runpod as Record<string, unknown> | undefined)
+    ?.storage ?? {}) as Record<string, unknown>;
+  if (typeof podStorage.volume_size === "number")
+    next.volume_size = podStorage.volume_size;
 
   // ---- runpod.env
   const env = ((d.runpod as Record<string, unknown> | undefined)?.env ?? {}) as
@@ -610,7 +635,11 @@ function parseYamlToForm(src: string, fallback: FormState): ParseYamlResult {
     }
   }
 
-  return { state: next, unknownKeys: unknown, parseError: null };
+  // ---- top-level storage: backend name (resolved to an id by the caller).
+  const storageRef =
+    typeof d.storage === "string" && d.storage.trim() ? d.storage.trim() : null;
+
+  return { state: next, unknownKeys: unknown, parseError: null, storageRef };
 }
 
 export function BenchmarkForm({
@@ -716,9 +745,13 @@ export function BenchmarkForm({
     else setVmAvail({ status: "idle" });
   }, [target, providerId, refreshVmAvail]);
 
+  const selectedStorageName = useMemo(
+    () => storages.find((s) => s.id === storageId)?.name,
+    [storages, storageId],
+  );
   const formYaml = useMemo(
-    () => renderYaml({ ...form, benchName: name || "untitled" }, target),
-    [form, name, target],
+    () => renderYaml({ ...form, benchName: name || "untitled" }, target, selectedStorageName),
+    [form, name, target, selectedStorageName],
   );
 
   const [templates, setTemplates] = useState<BenchmarkTemplate[]>([]);
@@ -814,8 +847,15 @@ export function BenchmarkForm({
       return;
     }
     if (!storageId) {
-      setSubmitError("Pick a storage for the run's logs and metrics.");
-      return;
+      // In YAML mode the backend can be named inside the config (`storage:`),
+      // which the gateway resolves at submit — so don't force a dropdown pick
+      // when the YAML already names one.
+      const yamlNamesStorage =
+        mode === "yaml" && parseYamlToForm(yamlBuf, form).storageRef != null;
+      if (!yamlNamesStorage) {
+        setSubmitError("Pick a storage for the run's logs and metrics.");
+        return;
+      }
     }
     setSubmitting(true);
     try {
@@ -832,7 +872,7 @@ export function BenchmarkForm({
           target === "vm"
             ? providerId
             : runpodProviderId || null,
-        storage_id: storageId,
+        storage_id: storageId || null,
         cleanup_model: target === "vm" ? cleanupModel : undefined,
         ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
         ...(visibleDevices.trim() ? { visible_devices: visibleDevices.trim() } : {}),
@@ -967,6 +1007,26 @@ export function BenchmarkForm({
             }
             setForm(parsed.state);
             setName(parsed.state.benchName);
+            // Resolve the YAML's `storage:` name to a real backend id and
+            // select it, so the dropdown — and the storage_id we submit —
+            // matches what the YAML asked for. Match by name (case-insensitive),
+            // then fall back to id in case the user wrote the raw id. Unmatched
+            // or absent → leave the current selection untouched.
+            if (parsed.storageRef) {
+              const ref = parsed.storageRef.toLowerCase();
+              const match = eligibleStorages.find(
+                (s) => s.name.toLowerCase() === ref || s.id.toLowerCase() === ref,
+              );
+              if (match) {
+                setStorageId(match.id);
+              } else {
+                toast.warning(
+                  `No enabled S3 storage named "${parsed.storageRef}". ` +
+                    `Pick one in the Storage section.`,
+                  { duration: 6000 },
+                );
+              }
+            }
             if (parsed.unknownKeys.length > 0) {
               toast.warning(
                 `Form mode can't represent: ${parsed.unknownKeys.join(", ")}. ` +
