@@ -516,40 +516,55 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("proxy: failed to start health loop")
     if os.environ.get("AUTOSCALER", "0") == "1":
-        from .provider import build_provider
+        from .provider import build_provider, cloud_providers_disabled, CLOUD_PROVIDER_NAMES
         from .autoscaler import autoscaler_loop
         from .reconciler import reconciler_loop
 
         provider_name = os.environ.get("PROVIDER", "fake")
 
-        if provider_name == "primeintellect":
-            missing = []
-            for var in ("PI_API_KEY", "PI_CUSTOM_TEMPLATE_ID", "GATEWAY_PUBLIC_URL"):
-                v = os.environ.get(var, "")
-                if not v or v in ("replace-me", "changeme"):
-                    missing.append(var)
-            if missing:
-                raise RuntimeError(
-                    f"PROVIDER=primeintellect requires {missing} to be set "
-                    f"(or set PROVIDER=fake for local dev with no real GPU)"
-                )
+        # vm-only / cloud-disabled deployments (CAE/CCE) have no global cloud
+        # provider: vm workers are per-app provider rows (resolve_app_provider
+        # builds a VMProvider for each), so the autoscaler's global fallback is
+        # None and every app must reference its own vm provider. build_provider()
+        # has no 'vm' form, so we skip it rather than crash on "unknown provider".
+        if cloud_providers_disabled() and provider_name in CLOUD_PROVIDER_NAMES:
+            raise RuntimeError(
+                f"PROVIDER={provider_name} but DISABLE_CLOUD_PROVIDERS is set — "
+                f"set PROVIDER=vm (per-app providers) or PROVIDER=fake"
+            )
 
-        if provider_name == "runpod":
-            missing = []
-            for var in ("RUNPOD_API_KEY", "RUNPOD_TEMPLATE_ID", "GATEWAY_PUBLIC_URL"):
-                v = os.environ.get(var, "")
-                if not v or v in ("replace-me", "changeme"):
-                    missing.append(var)
-            if missing:
-                raise RuntimeError(
-                    f"PROVIDER=runpod requires {missing} to be set "
-                    f"(or set PROVIDER=fake for local dev with no real GPU)"
-                )
+        if provider_name == "vm":
+            app.state.provider = None
+        else:
+            if provider_name == "primeintellect":
+                missing = []
+                for var in ("PI_API_KEY", "PI_CUSTOM_TEMPLATE_ID", "GATEWAY_PUBLIC_URL"):
+                    v = os.environ.get(var, "")
+                    if not v or v in ("replace-me", "changeme"):
+                        missing.append(var)
+                if missing:
+                    raise RuntimeError(
+                        f"PROVIDER=primeintellect requires {missing} to be set "
+                        f"(or set PROVIDER=fake for local dev with no real GPU)"
+                    )
 
-        app.state.provider = build_provider(provider_name)
+            if provider_name == "runpod":
+                missing = []
+                for var in ("RUNPOD_API_KEY", "RUNPOD_TEMPLATE_ID", "GATEWAY_PUBLIC_URL"):
+                    v = os.environ.get(var, "")
+                    if not v or v in ("replace-me", "changeme"):
+                        missing.append(var)
+                if missing:
+                    raise RuntimeError(
+                        f"PROVIDER=runpod requires {missing} to be set "
+                        f"(or set PROVIDER=fake for local dev with no real GPU)"
+                    )
+
+            app.state.provider = build_provider(provider_name)
         # Per-app provider instances (kind=vm/runpod/pi from a providers row) are
         # cached in app.state.provider_cache (initialised above) and shared by
         # the autoscaler + reconciler so we don't re-decrypt creds every tick.
+        # (provider may be None for PROVIDER=vm — apps then resolve their own row.)
         app.state.autoscaler_task = asyncio.create_task(
             autoscaler_loop(
                 app.state.redis, app.state.provider, session_factory(), app.state.provider_cache
@@ -560,7 +575,10 @@ async def lifespan(app: FastAPI):
                 app.state.redis, app.state.provider, session_factory(), app.state.provider_cache
             )
         )
-        logger.info("autoscaler + reconciler enabled (provider=%s)", app.state.provider.name)
+        logger.info(
+            "autoscaler + reconciler enabled (provider=%s)",
+            app.state.provider.name if app.state.provider else f"{provider_name} (per-app rows)",
+        )
 
     try:
         yield

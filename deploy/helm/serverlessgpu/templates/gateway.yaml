@@ -111,6 +111,8 @@ spec:
               value: "{{ if .Values.gateway.autoscaler }}1{{ else }}0{{ end }}"
             - name: PROVIDER
               value: {{ .Values.gateway.provider | quote }}
+            - name: DISABLE_CLOUD_PROVIDERS
+              value: "{{ if .Values.gateway.disableCloudProviders }}true{{ else }}false{{ end }}"
             {{- /* gateway.publicUrl: prefer explicit value; otherwise derive
                   from ingress.host so a one-line `--set ingress.host=...`
                   install does the right thing. Workers dial this URL to

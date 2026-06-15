@@ -931,6 +931,26 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 return
             provider_kind = prov.kind
 
+    # Cloud-disabled: refuse anything that isn't a physical vm provider before we
+    # reach the `benchmaq runpod bench` path (provider_kind None → that default).
+    # Defense in depth for rows queued/retried from before the flag was set; the
+    # create API rejects these up front too.
+    from .provider import ensure_benchmark_provider_allowed, CloudProviderDisabled
+    try:
+        ensure_benchmark_provider_allowed(provider_kind)
+    except CloudProviderDisabled:
+        msg = ("cloud GPU providers are disabled on this deployment — register a "
+               "physical 'vm' provider and re-run this benchmark")
+        await _push_log(redis, bench_id, f"[gateway] {msg}")
+        async with session_factory()() as s:
+            b2 = await s.get(Benchmark, bench_id)
+            if b2 is not None:
+                b2.status = "failed"
+                b2.error_text = msg
+                b2.ended_at = datetime.now(timezone.utc)
+                await s.commit()
+        return
+
     vm_target: Optional[dict] = None
     runpod_creds = None
     runpod_key_path: Optional[str] = None
@@ -1346,7 +1366,8 @@ async def cleanup_orphaned_running(redis) -> int:
             .where(Benchmark.status.in_(["running", "queued"]))
             .values(
                 status="failed",
-                error_text="orphaned by gateway restart — pod (if any) is still on RunPod, terminate it manually",
+                error_text="orphaned by gateway restart — any worker spawned for this run "
+                           "(VM process or cloud pod) may still be live; check its provider",
                 ended_at=datetime.now(timezone.utc),
             )
             .returning(Benchmark.id)
@@ -1563,16 +1584,57 @@ async def create_benchmark(
     if not isinstance(cfg, dict):
         raise HTTPException(status_code=400, detail={"error": "top-level YAML must be a mapping"})
 
+    prov_kind: Optional[str] = None
     if body.provider_id:
         from .db import Provider
         prov = await session.get(Provider, body.provider_id)
         if prov is None:
             raise HTTPException(status_code=400, detail={"error": "unknown provider_id"})
+        prov_kind = prov.kind
 
-    # Resolve the storage backend for logs + result files. The web form requires
-    # one; if omitted we fall back to the env bucket for API/back-compat.
-    if body.storage_id:
-        st = await session.get(Storage, body.storage_id)
+    # Cloud-disabled deployments (CAE/CCE): a benchmark with no provider — or a
+    # runpod/pi one — defaults to the `benchmaq runpod bench` cloud path and
+    # spawns a pod. Refuse at submit time so the user gets a clear 403 instead of
+    # a cryptic failure deep inside the benchmaq subprocess (no RUNPOD_API_KEY).
+    from .provider import ensure_benchmark_provider_allowed, CloudProviderDisabled
+    try:
+        ensure_benchmark_provider_allowed(prov_kind)
+    except CloudProviderDisabled:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "cloud GPU providers are disabled on this deployment — "
+                             "register and select a physical 'vm' provider for this benchmark"},
+        )
+
+    # Resolve the storage backend for logs + result files. Precedence:
+    #   1. the explicit storage_id field (web form path), else
+    #   2. a top-level `storage:` key inside the config_yaml — a backend id or
+    #      name — so a full YAML config (pasted in, or POSTed via the API) can
+    #      name its own s3 storage without the separate field, else
+    #   3. the env bucket (API/back-compat).
+    storage_id = body.storage_id
+    if not storage_id:
+        ref = cfg.get("storage")
+        if isinstance(ref, str) and ref.strip():
+            ref = ref.strip()
+            st = await session.get(Storage, ref)  # try id first
+            if st is None:
+                # fall back to a name lookup, scoped to the caller's storages.
+                res = await session.execute(
+                    select(Storage).where(
+                        Storage.owner_id == user.id, Storage.name == ref
+                    )
+                )
+                st = res.scalars().first()
+            if st is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": f"unknown storage in config: {ref!r}"},
+                )
+            storage_id = st.id
+
+    if storage_id:
+        st = await session.get(Storage, storage_id)
         if st is None:
             raise HTTPException(status_code=400, detail={"error": "unknown storage_id"})
         if st.kind != "s3":
@@ -1594,7 +1656,7 @@ async def create_benchmark(
         s3_prefix=s3_prefix,
         owner_id=user.id,
         provider_id=body.provider_id,
-        storage_id=body.storage_id,
+        storage_id=storage_id,
         # Only honoured when provider_id is set (VM path). Default True.
         cleanup_model=True if body.cleanup_model is None else bool(body.cleanup_model),
         env_vars={k: str(v) for k, v in (body.env_vars or {}).items()} or None,
