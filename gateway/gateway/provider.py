@@ -50,6 +50,22 @@ def cloud_providers_disabled() -> bool:
     )
 
 
+def ensure_benchmark_provider_allowed(provider_kind: Optional[str]) -> None:
+    """Policy gate for a benchmark run, given its resolved provider kind.
+
+    A benchmark with **no** provider selected (`provider_kind is None`) defaults
+    to the `benchmaq runpod bench` cloud path — so under DISABLE_CLOUD_PROVIDERS a
+    missing provider is refused just like an explicit `runpod`/`pi` one. Only
+    `vm` (physical worker) is allowed. No-op when cloud providers are enabled.
+
+    Raises CloudProviderDisabled so callers can map it to a 4xx (create time) or
+    fail the run (dispatch time) instead of spawning a pod that fails late.
+    """
+    if not cloud_providers_disabled() or provider_kind == "vm":
+        return
+    raise CloudProviderDisabled(provider_kind or "runpod")
+
+
 @dataclass
 class GpuAvailability:
     """Result of a provider availability check.

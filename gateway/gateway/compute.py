@@ -40,6 +40,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from . import audit
 from .auth import current_user, require_admin, require_section
 from .db import Base, User, get_session, session_factory
+from .provider import CloudProviderDisabled, cloud_providers_disabled
 from .runpod_provider import _map_gpu
 
 logger = logging.getLogger("gateway.compute")
@@ -262,6 +263,10 @@ async def _resolve_api_key(
     Falls back to the kind-appropriate gateway env var (`RUNPOD_API_KEY` /
     `PI_API_KEY`) when no provider_id is set so the legacy single-tenant
     path keeps working without a provider registered."""
+    # Central kill-switch — also closes the env-key fallback below, which would
+    # otherwise use a stray RUNPOD_API_KEY/PI_API_KEY even with cloud disabled.
+    if cloud_providers_disabled():
+        raise CloudProviderDisabled(expected_kind)
     if provider_id:
         from .provider_resolve import resolve_cloud_creds
         from .db import session_factory
@@ -278,6 +283,8 @@ async def _resolve_api_key(
 def _api_key() -> str:
     """Synchronous env-only lookup. Retained for the few startup-time call
     sites that don't yet have a provider_id context."""
+    if cloud_providers_disabled():
+        raise CloudProviderDisabled("runpod")
     k = os.environ.get("RUNPOD_API_KEY", "").strip()
     if not k:
         raise RuntimeError("RUNPOD_API_KEY not set — Compute requires a real RunPod account")
@@ -1728,6 +1735,14 @@ async def create_compute(
     user: User = Depends(require_section("compute")),
     session: AsyncSession = Depends(get_session),
 ):
+    # Compute pods are cloud-only (runpod/pi — there is no vm kind here), so the
+    # whole feature is refused when cloud providers are disabled (CAE/CCE).
+    if cloud_providers_disabled():
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "cloud GPU providers (RunPod / Prime Intellect) are disabled on this deployment"},
+        )
+
     # Dispatch on provider kind. NULL provider_id = legacy RunPod env path.
     kind = "runpod"
     if body.provider_id:
