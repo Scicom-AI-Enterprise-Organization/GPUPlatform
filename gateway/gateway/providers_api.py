@@ -27,6 +27,7 @@ from . import crypto
 from .auth import current_user, require_admin
 from .compute import PI_GPU_TYPES, RUNPOD_GPU_TYPES, GpuTypeOption
 from .db import Provider, User, get_session
+from .provider import cloud_providers_disabled
 from .vm_probe import availability_vm, metrics_vm, probe_vm
 
 logger = logging.getLogger("gateway.providers")
@@ -349,6 +350,11 @@ async def create_provider(
 ):
     if req.kind not in SUPPORTED_KINDS:
         raise HTTPException(status_code=400, detail=f"unsupported kind: {req.kind}")
+    if req.kind in API_KEY_KINDS and cloud_providers_disabled():
+        raise HTTPException(
+            status_code=403,
+            detail="cloud GPU providers (RunPod / Prime Intellect) are disabled on this deployment",
+        )
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="name is required")
 
@@ -436,6 +442,11 @@ async def test_provider(
 ):
     if req.kind not in SUPPORTED_KINDS:
         raise HTTPException(status_code=400, detail=f"unsupported kind: {req.kind}")
+    if req.kind in API_KEY_KINDS and cloud_providers_disabled():
+        raise HTTPException(
+            status_code=403,
+            detail="cloud GPU providers (RunPod / Prime Intellect) are disabled on this deployment",
+        )
 
     # ---- API-key kinds: cheap HTTP probe, no SSH ----
     if req.kind in API_KEY_KINDS:

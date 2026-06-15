@@ -53,6 +53,15 @@ async def resolve_cloud_creds(
     if expected_kind not in _ENV_KEY_BY_KIND:
         raise RuntimeError(f"resolve_cloud_creds: unknown kind {expected_kind!r}")
 
+    # Central kill-switch: when cloud providers are disabled (CAE/CCE), no
+    # runpod/pi credentials resolve anywhere — serverless per-app rows, compute,
+    # and benchmarks all route through here. try_resolve_cloud_creds() swallows
+    # this (RuntimeError) and returns None, so best-effort cost lookups degrade
+    # cleanly rather than erroring.
+    from .provider import cloud_providers_disabled, CloudProviderDisabled
+    if cloud_providers_disabled():
+        raise CloudProviderDisabled(expected_kind)
+
     if provider_id:
         row = await session.get(Provider, provider_id)
         if row is None:

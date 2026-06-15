@@ -20,6 +20,52 @@ from typing import Any, Optional
 logger = logging.getLogger("gateway.provider")
 
 
+# Cloud GPU providers spawn workers OUTSIDE the cluster (RunPod / Prime Intellect
+# pods). In locked-down deployments — e.g. CAE / CCE Kubernetes where Redis is
+# svc-only and only physical VM workers on a private network/tailnet are allowed —
+# set DISABLE_CLOUD_PROVIDERS=1 (Helm: gateway.disableCloudProviders) to refuse
+# them everywhere: provider selection, credential resolution, and the
+# providers/compute/benchmark APIs. The `vm` and `fake` providers are unaffected.
+# `runpod`/`primeintellect` are build_provider() names; `runpod`/`pi` are
+# provider-row kinds — both spellings are listed so either entry point is gated.
+CLOUD_PROVIDER_NAMES = frozenset({"runpod", "primeintellect", "pi"})
+
+
+class CloudProviderDisabled(RuntimeError):
+    """Raised when a cloud GPU provider is requested but cloud providers are off."""
+
+    def __init__(self, name: str) -> None:
+        self.provider = name
+        super().__init__(
+            f"cloud GPU provider {name!r} is disabled on this deployment "
+            f"(DISABLE_CLOUD_PROVIDERS) — register a physical 'vm' provider instead"
+        )
+
+
+def cloud_providers_disabled() -> bool:
+    """True when cloud GPU providers (RunPod / Prime Intellect) are turned off
+    via the DISABLE_CLOUD_PROVIDERS env flag."""
+    return os.environ.get("DISABLE_CLOUD_PROVIDERS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def ensure_benchmark_provider_allowed(provider_kind: Optional[str]) -> None:
+    """Policy gate for a benchmark run, given its resolved provider kind.
+
+    A benchmark with **no** provider selected (`provider_kind is None`) defaults
+    to the `benchmaq runpod bench` cloud path — so under DISABLE_CLOUD_PROVIDERS a
+    missing provider is refused just like an explicit `runpod`/`pi` one. Only
+    `vm` (physical worker) is allowed. No-op when cloud providers are enabled.
+
+    Raises CloudProviderDisabled so callers can map it to a 4xx (create time) or
+    fail the run (dispatch time) instead of spawning a pod that fails late.
+    """
+    if not cloud_providers_disabled() or provider_kind == "vm":
+        return
+    raise CloudProviderDisabled(provider_kind or "runpod")
+
+
 @dataclass
 class GpuAvailability:
     """Result of a provider availability check.
@@ -208,6 +254,8 @@ class FakeProvider(Provider):
 
 
 def build_provider(name: str) -> Provider:
+    if name in CLOUD_PROVIDER_NAMES and cloud_providers_disabled():
+        raise CloudProviderDisabled(name)
     if name == "fake":
         return FakeProvider()
     if name == "primeintellect":
