@@ -1588,10 +1588,35 @@ async def create_benchmark(
                              "register and select a physical 'vm' provider for this benchmark"},
         )
 
-    # Resolve the storage backend for logs + result files. The web form requires
-    # one; if omitted we fall back to the env bucket for API/back-compat.
-    if body.storage_id:
-        st = await session.get(Storage, body.storage_id)
+    # Resolve the storage backend for logs + result files. Precedence:
+    #   1. the explicit storage_id field (web form path), else
+    #   2. a top-level `storage:` key inside the config_yaml — a backend id or
+    #      name — so a full YAML config (pasted in, or POSTed via the API) can
+    #      name its own s3 storage without the separate field, else
+    #   3. the env bucket (API/back-compat).
+    storage_id = body.storage_id
+    if not storage_id:
+        ref = cfg.get("storage")
+        if isinstance(ref, str) and ref.strip():
+            ref = ref.strip()
+            st = await session.get(Storage, ref)  # try id first
+            if st is None:
+                # fall back to a name lookup, scoped to the caller's storages.
+                res = await session.execute(
+                    select(Storage).where(
+                        Storage.owner_id == user.id, Storage.name == ref
+                    )
+                )
+                st = res.scalars().first()
+            if st is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": f"unknown storage in config: {ref!r}"},
+                )
+            storage_id = st.id
+
+    if storage_id:
+        st = await session.get(Storage, storage_id)
         if st is None:
             raise HTTPException(status_code=400, detail={"error": "unknown storage_id"})
         if st.kind != "s3":
@@ -1613,7 +1638,7 @@ async def create_benchmark(
         s3_prefix=s3_prefix,
         owner_id=user.id,
         provider_id=body.provider_id,
-        storage_id=body.storage_id,
+        storage_id=storage_id,
         # Only honoured when provider_id is set (VM path). Default True.
         cleanup_model=True if body.cleanup_model is None else bool(body.cleanup_model),
         env_vars={k: str(v) for k, v in (body.env_vars or {}).items()} or None,
