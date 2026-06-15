@@ -318,6 +318,19 @@ def install() -> None:
                 # soon as the server is healthy).
                 f"find {venv_path}/lib -name '*.py' -path '*benchmaq*' "
                 f"-exec sed -i 's/max_attempts=200/max_attempts=900/g' {{}} + || true\n"
+                # …and abort the wait the moment the vLLM process dies, so a serve
+                # that crashes on init (e.g. an unsupported flag / incompatible kernel)
+                # fails fast instead of polling a dead port for the whole 75-min ceiling.
+                f"export SGPU_BENCH_VENV={venv_path}\n"
+                "python3 - <<'SGPU_PATCH_EOF'\n"
+                "import glob, os\n"
+                "needle = '        for attempt in range(max_attempts):\\n'\n"
+                "check = '            if getattr(self, \"process\", None) is not None and self.process.poll() is not None:\\n                print(\"vLLM server process exited -- aborting health wait\"); return False\\n'\n"
+                "for f in glob.glob(os.path.expanduser(os.environ['SGPU_BENCH_VENV']) + '/lib/python*/site-packages/benchmaq/**/server.py', recursive=True):\n"
+                "    s = open(f).read()\n"
+                "    if needle in s and 'aborting health wait' not in s:\n"
+                "        open(f, 'w').write(s.replace(needle, needle + check, 1)); print('[sgpu] health-abort patched', f)\n"
+                "SGPU_PATCH_EOF\n"
             )
             print()
             print("=" * 64)
