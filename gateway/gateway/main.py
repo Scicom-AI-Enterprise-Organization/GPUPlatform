@@ -2137,10 +2137,19 @@ async def flush_app_queue(
     from datetime import timedelta
     from sqlalchemy import select as _select
     live_worker = False
+    degraded = False  # a member reporting a failure reason (e.g. a CUDA-OOM on
+    # /wake_up) can't serve — its pending requests are wedged, not in flight, so
+    # the "leave recent rows on a live worker alone" guard must not apply.
     for _mid in await rdb.smembers(f"worker_index:{app_id}"):
         if await rdb.exists(f"worker:{_mid}"):
             live_worker = True
-            break
+            blob = await rdb.get(f"worker:{_mid}:models")
+            if blob:
+                try:
+                    if any((m or {}).get("reason") for m in json.loads(blob)):
+                        degraded = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
     timeout_s = int(getattr(app, "request_timeout_s", 600) or 600)
     stale_before = now - timedelta(seconds=timeout_s)
     flushed_ids = set(request_ids)
@@ -2150,8 +2159,8 @@ async def flush_app_queue(
     for row in stuck_rows:
         if row.request_id in flushed_ids:
             continue  # already handled via the redis-queue path above
-        if live_worker and row.created_at and row.created_at > stale_before:
-            continue  # could be genuinely in flight on a live worker — leave it
+        if live_worker and not degraded and row.created_at and row.created_at > stale_before:
+            continue  # could be genuinely in flight on a healthy live worker — leave it
         row.status = "cancelled"
         if row.completed_at is None:
             row.completed_at = now

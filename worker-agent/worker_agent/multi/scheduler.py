@@ -364,10 +364,24 @@ class MultiModelScheduler:
                     rt.pgid = None
                     self._dump_pids()
                     return
-                await vllm_ctl.sleep_model(self._client, rt.base_url, rt.member.sleep_level)
-                async with self._cond:
-                    rt.state = ModelState.ASLEEP
-                    self._cond.notify_all()
+                # Only sleep a member whose GPUs ANOTHER member also wants — that's
+                # the only reason to evict it (time-sharing). A member that's the
+                # sole occupant of its GPUs (e.g. a single-model fleet, or GLM-5.1
+                # tp=8 across all 8) has nothing to time-share with, so sleeping it
+                # is pointless AND dangerous: waking a huge model back onto the GPU
+                # can CUDA-OOM (`/wake_up → 500 out of memory`), leaving it flapping
+                # asleep↔waking and wedging every request. Keep it resident (AWAKE).
+                contended = any(r is not rt and (r.gpus & rt.gpus) for r in self._runtimes)
+                if contended:
+                    await vllm_ctl.sleep_model(self._client, rt.base_url, rt.member.sleep_level)
+                    async with self._cond:
+                        rt.state = ModelState.ASLEEP
+                        self._cond.notify_all()
+                else:
+                    async with self._cond:
+                        rt.state = ModelState.AWAKE
+                        rt.last_used = time.time()
+                        self._cond.notify_all()
                 # Re-dump now that the tp workers have spawned, so the recorded
                 # group includes every child.
                 self._dump_pids()
@@ -468,12 +482,16 @@ class MultiModelScheduler:
     async def _swap_to(self, rt: ModelRuntime) -> None:
         try:
             await self._wake(rt)
-        except Exception:
+        except Exception as e:
             logger.exception("swap_to %s failed", rt.member.model)
             async with self._cond:
                 # Leave it asleep so a later request can retry; never strand it.
+                # Surface the cause (e.g. a CUDA-OOM on /wake_up of an oversized
+                # model) in the member status so the UI shows WHY it's not serving
+                # instead of silently flapping asleep↔waking.
                 if rt.state != ModelState.AWAKE:
                     rt.state = ModelState.ASLEEP
+                rt.reason = f"wake failed: {str(e)[:200]}"
                 rt.swapping = False
                 self._cond.notify_all()
 
