@@ -116,15 +116,17 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const [volumeGb, setVolumeGb] = useState("0");
   // Auto-terminate when idle, entered in minutes ("" / 0 = off). The gateway
   // sweeps every ~30s, so sub-minute precision wouldn't be meaningful.
-  const [idleMinutes, setIdleMinutes] = useState("0");
+  // Defaults to 10 min so a forgotten pod doesn't bill indefinitely.
+  const [idleMinutes, setIdleMinutes] = useState("10");
   const [templateId, setTemplateId] = useState(
-    templates[0]?.id ?? "pytorch-2.4-cuda12.4",
+    templates[0]?.id ?? "pytorch-2.8-cuda12.8",
   );
   // For non-curated RunPod templates picked via search we also carry the
   // resolved imageName so the gateway doesn't have to round-trip back to
   // RunPod's templates API at create time.
   const [imageOverride, setImageOverride] = useState<string | null>(null);
-  const [secureCloud, setSecureCloud] = useState(false);
+  // Default to Secure cloud — vetted hosts, more capacity.
+  const [secureCloud, setSecureCloud] = useState(true);
   const [providerId, setProviderId] = useState<string>("");
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [piImages, setPiImages] = useState<PiImageOption[]>([]);
@@ -134,7 +136,18 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   useEffect(() => {
-    gateway.listProviders().then(setProviders).catch(() => {});
+    gateway
+      .listProviders()
+      .then((rows) => {
+        setProviders(rows);
+        // No gateway-default key anymore — preselect the first registered
+        // cloud account so the form is usable without an extra click.
+        const eligible = rows.filter((p) => p.kind === "runpod" || p.kind === "pi");
+        if (eligible.length > 0) {
+          setProviderId((cur) => cur || eligible[0].id);
+        }
+      })
+      .catch(() => {});
     gateway
       .listPiImages()
       .then((rows) => {
@@ -224,7 +237,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       setImageOverride(null);
     } else {
       setTemplateId((cur) =>
-        templates.some((t) => t.id === cur) ? cur : templates[0]?.id ?? "pytorch-2.4-cuda12.4",
+        templates.some((t) => t.id === cur) ? cur : templates[0]?.id ?? "pytorch-2.8-cuda12.8",
       );
       setImageOverride(null);
     }
@@ -257,6 +270,10 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       setSubmitError("Name is required.");
       return;
     }
+    if (!providerId) {
+      setSubmitError("Select a cloud account to bill against.");
+      return;
+    }
     if (diskInvalid) {
       setSubmitError("Container disk must be between 10 and 2000 GB.");
       return;
@@ -281,7 +298,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         image: imageOverride,
         cloud_type: secureCloud ? "SECURE" : "COMMUNITY",
         idle_terminate_after_s: idleSeconds,
-        provider_id: providerId || null,
+        provider_id: providerId,
       });
       toast.success(
         pod.status === "pending_approval"
@@ -316,19 +333,15 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       {/* Section: cloud account */}
       <Section
         title="Cloud account"
-        description="Which API key to bill against. Default = gateway RunPod env key."
+        description="Which registered cloud account (API key) to bill against."
       >
         <div className="space-y-1.5">
           <Label className="text-xs uppercase tracking-wide text-muted-foreground">API key</Label>
-          <Select
-            value={providerId || "__default__"}
-            onValueChange={(v) => setProviderId(v === "__default__" ? "" : v)}
-          >
+          <Select value={providerId} onValueChange={setProviderId}>
             <SelectTrigger>
-              <SelectValue />
+              <SelectValue placeholder="Select a cloud account" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="__default__">Gateway default (RunPod)</SelectItem>
               {providers
                 .filter((p) => p.kind === "runpod" || p.kind === "pi")
                 .map((p) => (
@@ -519,7 +532,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         >
           Cancel
         </Button>
-        <Button type="submit" disabled={submitting}>
+        <Button type="submit" disabled={submitting || !providerId}>
           {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
           {submitting ? "Creating…" : "Create pod"}
         </Button>

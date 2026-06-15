@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from . import audit
+from . import vm_probe
 from .auth import current_user, require_admin, require_section
 from .db import Base, User, get_session, session_factory
 from .provider import CloudProviderDisabled, cloud_providers_disabled
@@ -60,16 +61,16 @@ PI_POLL_TIMEOUT_S = 1500  # 25min — PI's Lambda Labs / hyperstack sub-provider
 # hits /compute/runpod/templates.
 CURATED_TEMPLATES: list[dict[str, str]] = [
     {
+        "id": "pytorch-2.8-cuda12.8",
+        "name": "PyTorch 2.8 + CUDA 12.8",
+        "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
+        "description": "PyTorch 2.8.0, CUDA 12.8.1, Ubuntu 24.04. Newest stack — default for most workloads.",
+    },
+    {
         "id": "pytorch-2.4-cuda12.4",
         "name": "PyTorch 2.4 + CUDA 12.4",
         "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
-        "description": "PyTorch 2.4, Python 3.11, CUDA 12.4. Default for most workloads.",
-    },
-    {
-        "id": "tensorflow-latest",
-        "name": "TensorFlow",
-        "image": "runpod/tensorflow:latest",
-        "description": "Latest TensorFlow GPU build with JupyterLab.",
+        "description": "PyTorch 2.4, Python 3.11, CUDA 12.4. Pick for older-CUDA workloads.",
     },
 ]
 
@@ -218,7 +219,8 @@ class ComputePod(Base):
     image: Mapped[str] = mapped_column(String(255))
     template_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     cloud_type: Mapped[str] = mapped_column(String(16), default="COMMUNITY")
-    # creating | running | failed | terminated | pending_approval | rejected
+    # creating | running | failed | terminated | auto_terminated | pending_approval | rejected
+    # (auto_terminated = killed by the idle sweep; terminated = manual delete)
     status: Mapped[str] = mapped_column(String(20), default="creating", index=True)
     runpod_pod_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     public_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -1197,78 +1199,86 @@ async def _delete_runpod(runpod_id: str, provider_id: Optional[str] = None) -> N
 # ---------- Idle auto-terminate ----------------------------------------
 #
 # A pod with idle_terminate_after_s > 0 is torn down once it has shown no GPU
-# compute AND no GPU memory in use for that many seconds. Detection polls the
-# provider's pod object for per-GPU utilization. It is deliberately FAIL-SAFE:
-# if utilization can't be measured (provider didn't return it, request failed,
-# PI's shape is unknown), we treat the pod as active and never auto-kill it.
+# compute AND no GPU memory in use for that many seconds. We SSH into the pod
+# each sweep and read `nvidia-smi` for live utilization + memory — RunPod's
+# REST API returns an empty `runtime` (no per-GPU stats), so the provider API
+# can't tell us. Works the same for RunPod and Prime Intellect (both give SSH).
+# Deliberately FAIL-SAFE: if the pod is unreachable or nvidia-smi can't be
+# parsed, we treat it as active and never auto-kill it.
 
-# Per-GPU utilization at or below this percent counts as "not in use" — a small
-# floor so measurement jitter on an idle card doesn't look like activity.
-_IDLE_BUSY_PCT = 1.0
-# How often the sweep runs. Small idle windows are still only as precise as this.
+# A GPU counts as "in use" if compute utilization exceeds this percent OR
+# resident GPU memory exceeds this many MiB. The memory floor sits ABOVE the
+# idle driver/runtime baseline — a bare RunPod card with nothing running still
+# reports ~0.5-1 GiB used (observed 767 MiB on an idle A100), while a loaded
+# model occupies many GiB. 2 GiB cleanly separates "nothing running" from
+# "a workload is resident".
+_IDLE_UTIL_PCT = 1
+_IDLE_MEM_MIB = 2048
+# How often the sweep runs. Small idle windows are only as precise as this.
 _IDLE_CHECK_INTERVAL_S = 30
 
 
-def _runpod_busy(pod: dict) -> Optional[bool]:
-    """Classify a RunPod pod object as busy / idle / unknown.
-
-    Returns True if any GPU reports compute or memory utilization above the
-    noise floor, False if every measured GPU is at/below it, and None when the
-    object carries no usable utilization fields (→ caller must treat as active).
-    """
-    runtime = pod.get("runtime")
-    if not isinstance(runtime, dict):
+async def _resolve_pod_private_key(s: AsyncSession, pod: ComputePod) -> Optional[str]:
+    """The private key whose public half is in the pod's authorized_keys: the
+    spawning provider's generated key, else the gateway's file-based key."""
+    if pod.provider_id:
+        from . import crypto
+        from .db import Provider
+        prov = await s.get(Provider, pod.provider_id)
+        if prov is not None:
+            enc = (prov.config or {}).get("ssh_priv_enc")
+            if enc:
+                try:
+                    return crypto.decrypt(enc)
+                except Exception:
+                    pass  # fall through to the file key
+    try:
+        return Path(_ssh_key_path()).read_text()
+    except FileNotFoundError:
         return None
-    gpus = runtime.get("gpus")
-    if not isinstance(gpus, list) or not gpus:
-        return None
-    measured = False
-    for g in gpus:
-        if not isinstance(g, dict):
-            continue
-        vals = [
-            float(v)
-            for v in (g.get("gpuUtilPercent"), g.get("memoryUtilPercent"))
-            if isinstance(v, (int, float))
-        ]
-        if not vals:
-            continue
-        measured = True
-        if any(v > _IDLE_BUSY_PCT for v in vals):
-            return True
-    return False if measured else None
 
 
-async def _fetch_pod_busy(
-    pod_id: str, runpod_id: str, provider_id: Optional[str]
-) -> Optional[bool]:
-    """Poll the provider for current utilization. None = couldn't determine."""
-    try:
-        kind = await _resolve_pod_kind(pod_id)
-    except Exception:
-        return None
-    # PI's pod object doesn't expose a documented per-GPU utilization shape we
-    # can rely on, so PI pods are left to manual termination (fail-safe None).
-    if kind == "pi":
-        return None
-    try:
-        api_key = await _resolve_api_key(provider_id, "runpod")
-    except Exception:
-        return None
-    try:
-        async with _client(api_key=api_key) as cli:
-            pr = await cli.get(f"/pods/{runpod_id}")
-        if pr.status_code >= 400:
+async def _fetch_pod_busy(pod_id: str) -> Optional[bool]:
+    """SSH into the pod, read nvidia-smi. True=busy, False=idle, None=can't tell
+    (unreachable / unparseable → caller treats as active, fail-safe)."""
+    async with session_factory()() as s:
+        pod = await s.get(ComputePod, pod_id)
+        if (
+            pod is None or pod.status != "running"
+            or not pod.public_ip or not pod.ssh_port
+        ):
             return None
-        return _runpod_busy(pr.json() or {})
-    except Exception as e:
-        logger.debug("compute %s: util poll failed: %s", pod_id, e)
+        host, port, user = pod.public_ip, pod.ssh_port, pod.ssh_user
+        key = await _resolve_pod_private_key(s, pod)
+    if not key:
+        logger.info("compute %s: idle-probe no SSH key resolved -> treat as active", pod_id)
         return None
+    try:
+        res = await vm_probe.availability_vm(host, port, user, key)
+    except Exception as e:
+        logger.warning("compute %s: nvidia-smi probe crashed: %s", pod_id, e)
+        return None
+    if not res.ok or not res.gpus:
+        logger.info(
+            "compute %s: idle-probe inconclusive (ok=%s msg=%r gpus=%d) -> treat as active",
+            pod_id, res.ok, res.message, len(res.gpus),
+        )
+        return None
+    busy = False
+    detail = []
+    for g in res.gpus:
+        mem_used_mib = g.mem_total_mib - g.mem_free_mib
+        detail.append(f"gpu{g.index} util={g.util_pct}% mem_used={mem_used_mib}MiB")
+        if g.util_pct > _IDLE_UTIL_PCT or mem_used_mib > _IDLE_MEM_MIB:
+            busy = True
+    logger.info("compute %s: idle-probe busy=%s [%s]", pod_id, busy, "; ".join(detail))
+    return busy
 
 
 async def _idle_terminate(pod_id: str) -> None:
-    """Tear down a pod the sweep judged idle — mirrors delete_compute's
-    teardown but attributed to the system (logged as compute.idle_terminate)."""
+    """Tear down a pod the sweep judged idle. Mirrors delete_compute's teardown,
+    but marks the pod `auto_terminated` (a manual delete stays `terminated`) and
+    attributes the audit row to the owner (logged as compute.idle_terminate)."""
     async with session_factory()() as s:
         row = await s.get(ComputePod, pod_id)
         if row is None or row.status != "running":
@@ -1280,7 +1290,7 @@ async def _idle_terminate(pod_id: str) -> None:
         ready_at = row.ready_at
         cost_per_hr = row.cost_per_hr
         timeout_s = row.idle_terminate_after_s
-        row.status = "terminated"
+        row.status = "auto_terminated"
         row.terminated_at = datetime.now(timezone.utc)
         terminated_at = row.terminated_at
         await s.commit()
@@ -1330,17 +1340,16 @@ async def _idle_sweep_once() -> None:
                 )
             )
         ).scalars().all()
-        # Snapshot the fields we need so we don't hold the session during polls.
+        # Snapshot the fields we need so we don't hold the session during SSH.
         cands = [
-            (r.id, r.runpod_pod_id, r.provider_id, r.idle_terminate_after_s,
-             r.last_active_at, r.ready_at, r.created_at)
+            (r.id, r.idle_terminate_after_s, r.last_active_at, r.ready_at, r.created_at)
             for r in rows
-            if r.runpod_pod_id
+            if r.public_ip and r.ssh_port
         ]
 
     now = datetime.now(timezone.utc)
-    for pod_id, runpod_id, provider_id, timeout_s, last_active, ready_at, created_at in cands:
-        busy = await _fetch_pod_busy(pod_id, runpod_id, provider_id)
+    for pod_id, timeout_s, last_active, ready_at, created_at in cands:
+        busy = await _fetch_pod_busy(pod_id)
         if busy is None or busy:
             # Active, or we couldn't measure it — reset the idle clock so an
             # unmeasurable pod is never auto-killed.
@@ -1437,13 +1446,13 @@ class CreateComputeRequest(BaseModel):
     gpu_count: int = Field(default=1, ge=1, le=8)
     container_disk_gb: int = Field(default=40, ge=10, le=2000)
     volume_gb: int = Field(default=0, ge=0, le=2000)
-    template_id: str = Field(default="pytorch-2.4-cuda12.4", max_length=128)
+    template_id: str = Field(default="pytorch-2.8-cuda12.8", max_length=128)
     # When `template_id` isn't one of the curated favourites the client must
     # pass the resolved image — for RunPod that's the template's `imageName`
     # picked from the search results, for PI it can be omitted (the image
     # IS the template id, an enum value).
     image: Optional[str] = Field(default=None, max_length=512)
-    cloud_type: str = Field(default="COMMUNITY", pattern=r"^(COMMUNITY|SECURE)$")
+    cloud_type: str = Field(default="SECURE", pattern=r"^(COMMUNITY|SECURE)$")
     # Auto-terminate after this many idle seconds (no GPU compute AND no GPU
     # memory used). 0 = disabled. Capped at 24h so a typo can't strand a pod
     # billing "forever".
@@ -2072,6 +2081,9 @@ async def list_compute(
     # Admins default to their own pods; pass ?scope=all to see everyone's.
     # Non-admins are always scoped to own regardless of the param.
     show_all = user.is_admin and scope == "all"
+    # Hide MANUAL terminations (the user did it, knows it's gone) but keep
+    # auto_terminated pods visible — the system killed them, so they're worth
+    # reviewing (and it's why the status is distinct in the first place).
     stmt = (
         select(ComputePod)
         .where(ComputePod.status != "terminated")
@@ -2122,27 +2134,12 @@ async def get_ssh_info(
     # provider's generated private key — it's the one whose public half we
     # injected into the pod's authorized_keys at create time. Falls back to
     # the gateway's default file-based key for legacy / env-spawned pods.
-    private_key: Optional[str] = None
-    if p.provider_id:
-        from . import crypto
-        from .db import Provider
-        prov = await session.get(Provider, p.provider_id)
-        if prov is not None:
-            enc = (prov.config or {}).get("ssh_priv_enc")
-            if enc:
-                try:
-                    private_key = crypto.decrypt(enc)
-                except Exception:
-                    private_key = None
+    private_key = await _resolve_pod_private_key(session, p)
     if private_key is None:
-        key_path = _ssh_key_path()
-        try:
-            private_key = Path(key_path).read_text()
-        except FileNotFoundError:
-            raise HTTPException(
-                status_code=503,
-                detail={"error": f"SSH key not found at {key_path} on gateway"},
-            )
+        raise HTTPException(
+            status_code=503,
+            detail={"error": f"SSH key not found at {_ssh_key_path()} on gateway"},
+        )
     # Suggest a filename that hints at the source so users with multiple
     # providers don't overwrite a stash that points at someone else's pods.
     key_hint = f"sgpu-{p.provider_id}" if p.provider_id else "sgpu-runpod"

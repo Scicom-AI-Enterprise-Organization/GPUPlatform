@@ -34,7 +34,7 @@ const STATUS_OPTIONS = [
   "pending_approval",
   "failed",
   "rejected",
-  "terminated",
+  "auto_terminated",
 ] as const;
 type StatusFilter = (typeof STATUS_OPTIONS)[number];
 
@@ -587,6 +587,7 @@ function StatusPill({ status }: { status: ComputeStatus }) {
     failed: "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400",
     rejected: "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400",
     terminated: "border-border bg-muted text-muted-foreground",
+    auto_terminated: "border-border bg-muted text-muted-foreground",
   };
   const label: Record<ComputeStatus, string> = {
     running: "running",
@@ -595,6 +596,7 @@ function StatusPill({ status }: { status: ComputeStatus }) {
     failed: "failed",
     rejected: "rejected",
     terminated: "terminated",
+    auto_terminated: "auto-terminated",
   };
   return (
     <span

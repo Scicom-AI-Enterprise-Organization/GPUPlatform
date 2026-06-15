@@ -445,6 +445,7 @@ function StatusPill({ status }: { status: ComputeStatus }) {
     rejected:
       "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400",
     terminated: "border-border bg-muted text-muted-foreground",
+    auto_terminated: "border-border bg-muted text-muted-foreground",
   };
   const label: Record<ComputeStatus, string> = {
     running: "running",
@@ -453,6 +454,7 @@ function StatusPill({ status }: { status: ComputeStatus }) {
     failed: "failed",
     rejected: "rejected",
     terminated: "terminated",
+    auto_terminated: "auto-terminated",
   };
   return (
     <span

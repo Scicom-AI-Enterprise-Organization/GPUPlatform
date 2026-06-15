@@ -534,6 +534,7 @@ export type ComputeStatus =
   | "running"
   | "failed"
   | "terminated"
+  | "auto_terminated"
   | "rejected";
 
 export type ComputePod = {
