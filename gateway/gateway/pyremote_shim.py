@@ -310,6 +310,14 @@ def install() -> None:
                 # CLI — same `download <repo> --local-dir <dir>` argument shape.
                 f'printf \'#!/usr/bin/env bash\\nexec hf "$@"\\n\' > {venv_path}/bin/huggingface-cli\n'
                 f"chmod +x {venv_path}/bin/huggingface-cli\n"
+                # A large model (e.g. an 800GB MoE like GLM-5.1-FP8) takes far longer
+                # than benchmaq's default 200×5s=1000s health wait to load + compile +
+                # capture CUDA graphs on its first serve, so the bench would fire
+                # against a not-yet-listening server (ConnectionRefused → 0 tok/s).
+                # Bump benchmaq's health-wait attempts (≈75 min ceiling; it exits as
+                # soon as the server is healthy).
+                f"find {venv_path}/lib -name '*.py' -path '*benchmaq*' "
+                f"-exec sed -i 's/max_attempts=200/max_attempts=900/g' {{}} + || true\n"
             )
             print()
             print("=" * 64)

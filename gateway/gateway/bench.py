@@ -1237,9 +1237,24 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
             error_excerpt = None
         if all_requests_failed:
             # Prepend a clear reason so the UI doesn't just show a metrics wall.
-            _addr = "the vLLM serve port was already in use" if (
-                full_log.exists() and "Address already in use" in (error_excerpt or "")
-            ) else "the vLLM server didn't serve the model (check for 404s / load errors)"
+            # Scan a wider window for the health-wait timeout — the most common cause
+            # for a large model: it never finished loading + compiling + capturing
+            # CUDA graphs before benchmaq's health wait elapsed, so the bench fired
+            # against a not-yet-ready server (ConnectionRefused → 0 successful).
+            _wide = ""
+            try:
+                if full_log.exists():
+                    _wide = "".join(full_log.open("r", encoding="utf-8", errors="replace").readlines()[-2000:])
+            except Exception:
+                _wide = error_excerpt or ""
+            if "failed to become healthy" in _wide:
+                _addr = ("the model didn't become healthy within benchmaq's health wait "
+                         "(a large model's load + torch.compile + CUDA-graph capture can "
+                         "exceed it on the first run) — give it a longer wait or pre-warm the compile cache")
+            elif full_log.exists() and "Address already in use" in (error_excerpt or ""):
+                _addr = "the vLLM serve port was already in use"
+            else:
+                _addr = "the vLLM server didn't serve the model (check for 404s / load errors)"
             error_excerpt = (
                 f"All requests failed — 0 successful across every bench config. Likely {_addr}.\n\n"
                 + (error_excerpt or "")
