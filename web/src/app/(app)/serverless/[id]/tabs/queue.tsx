@@ -14,6 +14,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Pagination } from "@/components/ui/pagination";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -30,6 +31,9 @@ type Item = {
   timeout_s?: number;
   output?: unknown;
   has_result: boolean;
+  created_at?: string;
+  completed_at?: string | null;
+  requested_by?: string | null;
 };
 
 type QueueResponse = {
@@ -80,6 +84,8 @@ export function QueueTab({ app }: { app: AppRecord }) {
   const [loading, setLoading] = useState(false);
   const [flushing, setFlushing] = useState(false);
   const [confirmFlush, setConfirmFlush] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
 
   // The nested filter is URL-driven (?q=queued|running|completed|failed; "all"
   // omits it) so it's shareable + survives back/forward — single source of truth.
@@ -162,6 +168,17 @@ export function QueueTab({ app }: { app: AppRecord }) {
     );
   }, [data, filter]);
 
+  // Reset to page 1 whenever the bucket filter changes (incl. back/forward).
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPage(1);
+  }, [filter]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  // Clamp in render so a shrinking/refreshing result set can't strand an empty page.
+  const currentPage = Math.min(page, pageCount);
+  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
   // Position numbers only make sense within the queued portion. Build a
   // small index so each in-queue row gets its FIFO #.
   const queuePositions = useMemo(() => {
@@ -243,13 +260,15 @@ export function QueueTab({ app }: { app: AppRecord }) {
               <th className="w-6 px-2 py-2"></th>
               <th className="px-3 py-2 font-medium">Pos</th>
               <th className="px-3 py-2 font-medium">Request ID</th>
+              <th className="px-3 py-2 font-medium">Requested</th>
+              <th className="px-3 py-2 font-medium">User</th>
               <th className="px-3 py-2 font-medium">Status</th>
               <th className="px-3 py-2 font-medium">Endpoint</th>
               <th className="px-3 py-2 font-medium">Input → Output</th>
             </tr>
           </thead>
           <tbody>
-            {filtered.map((it) => (
+            {paged.map((it) => (
               <Row
                 key={it.request_id}
                 item={it}
@@ -260,7 +279,7 @@ export function QueueTab({ app }: { app: AppRecord }) {
             ))}
             {data && filtered.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-12 text-center text-sm text-muted-foreground">
+                <td colSpan={8} className="px-4 py-12 text-center text-sm text-muted-foreground">
                   {filter === "all"
                     ? "No jobs — fire a request to populate this view."
                     : `No ${filter} jobs.`}
@@ -269,7 +288,7 @@ export function QueueTab({ app }: { app: AppRecord }) {
             )}
             {!data && !err && (
               <tr>
-                <td colSpan={6} className="px-4 py-12 text-center text-sm text-muted-foreground">
+                <td colSpan={8} className="px-4 py-12 text-center text-sm text-muted-foreground">
                   Loading…
                 </td>
               </tr>
@@ -277,6 +296,21 @@ export function QueueTab({ app }: { app: AppRecord }) {
           </tbody>
         </table>
       </Card>
+
+      {data && filtered.length > 0 && (
+        <Pagination
+          page={currentPage}
+          pageCount={pageCount}
+          total={filtered.length}
+          pageSize={pageSize}
+          onPageChange={setPage}
+          onPageSizeChange={(n) => {
+            setPageSize(n);
+            setPage(1);
+          }}
+          itemLabel="jobs"
+        />
+      )}
 
       <p className="text-xs text-muted-foreground">
         Source: <code className="font-mono">LRANGE queue:{app.app_id}</code> + <code className="font-mono">SCAN result:req-*</code> via <code className="font-mono">kubectl exec</code> on{" "}
@@ -366,6 +400,12 @@ function Row({
             </button>
           </div>
         </td>
+        <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground" title={item.created_at ?? ""}>
+          {formatTs(item.created_at)}
+        </td>
+        <td className="px-3 py-2 text-xs text-muted-foreground">
+          {item.requested_by ?? "—"}
+        </td>
         <td className="px-3 py-2">
           <span
             className={cn(
@@ -393,7 +433,7 @@ function Row({
       </tr>
       {expanded && (
         <tr className="border-b border-border/60 bg-muted/20">
-          <td colSpan={6} className="px-4 py-3">
+          <td colSpan={8} className="px-4 py-3">
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
               <Block title="Input">
                 <Pre>
@@ -487,4 +527,19 @@ function summariseOutput(item: Item): string | null {
 
 function truncate(s: string, n: number) {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+}
+
+// Compact local timestamp for the queue table (e.g. "Jun 16, 14:03:21").
+function formatTs(iso?: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
 }

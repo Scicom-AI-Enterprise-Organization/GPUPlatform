@@ -200,9 +200,11 @@ async def log_shipper_loop(
     gateway_url: str,
     machine_id: str,
     app_id: str,
-    log_path: str,
+    log_path: str | None,
     drain_event: asyncio.Event,
     source: str | None = None,
+    get_log_path: "Callable[[], str | None] | None" = None,
+    fixed_session: str | None = None,
 ) -> None:
     """Tail the vLLM stdout file and ship batches to the gateway.
 
@@ -211,64 +213,100 @@ async def log_shipper_loop(
     best-effort, never block the worker.
 
     `source`, when set (multi-model: one shipper per member), tags the batch so
-    the gateway buckets logs per model and the UI can show each model's tail."""
+    the gateway buckets logs per model and the UI can show each model's tail.
+
+    `get_log_path`, when set, is polled each tick for the member's CURRENT log
+    file (it changes on every (re)launch — a fresh timestamped file). When it
+    changes we reset the offset and start shipping the new file under a new
+    `session` (the file's timestamp), so the gateway keeps each launch's log
+    separately and the UI can open historical logs. The crashing log is never
+    overwritten — it stays its own session."""
     url = f"{gateway_url.rstrip('/')}/workers/logs"
     offset = 0
     leftover = b""
+    cur_path = log_path
+    # `fixed_session` pins the session (the agent's own __worker__ log = one session
+    # per agent launch); otherwise derive it from the rotating per-launch filename.
+    session = fixed_session if fixed_session is not None else _session_of(cur_path)
     BATCH_INTERVAL_S = 3.0
     MAX_BATCH_LINES = 2000          # big batches → a chatty model (vLLM load spam) ships a
     MAX_POST_BYTES = 512 * 1024     # few POSTs per tick, not dozens of 200-line ones
     MAX_LINE_BYTES = 4096
 
     async with httpx.AsyncClient(timeout=10.0) as client:
+        async def drain(path: "str | None", sess: "str | None") -> None:
+            """Ship bytes appended to `path` since `offset` (newline-split) under
+            session `sess`. Mutates offset/leftover. Best-effort: never raises."""
+            nonlocal offset, leftover
+            if not path or not os.path.exists(path):
+                return
+            size = os.path.getsize(path)
+            if size < offset:          # truncated/rotated in place → restart from top
+                offset = 0
+                leftover = b""
+            if size <= offset:
+                return
+            with open(path, "rb") as f:
+                f.seek(offset)
+                chunk = f.read(size - offset)
+            offset = size
+            data = leftover + chunk
+            parts = data.split(b"\n")
+            leftover = parts[-1]
+            new_lines = parts[:-1]
+            # Ship in batches bounded by BOTH line count and byte size, so a backlog
+            # drains in a few large POSTs instead of one-per-200-lines (which floods
+            # the gateway when a model logs heavily / crash-loops).
+            i = 0
+            while i < len(new_lines):
+                batch: list[str] = []
+                nbytes = 0
+                while i < len(new_lines) and len(batch) < MAX_BATCH_LINES and nbytes < MAX_POST_BYTES:
+                    line = new_lines[i][:MAX_LINE_BYTES].decode("utf-8", errors="replace")
+                    batch.append(line)
+                    nbytes += len(line) + 1
+                    i += 1
+                body: dict[str, Any] = {"machine_id": machine_id, "app_id": app_id, "lines": batch}
+                if source is not None:
+                    body["source"] = source
+                if sess is not None:
+                    body["session"] = sess
+                try:
+                    await client.post(url, json=body)
+                except httpx.HTTPError as e:
+                    logger.warning("log shipper post failed: %s", e)
+
         while not drain_event.is_set():
             try:
-                if not os.path.exists(log_path):
-                    # File hasn't been created yet (vLLM still booting).
-                    try:
-                        await asyncio.wait_for(drain_event.wait(), timeout=BATCH_INTERVAL_S)
-                    except asyncio.TimeoutError:
-                        pass
-                    continue
-                size = os.path.getsize(log_path)
-                if size < offset:
-                    # Truncated or rotated — start over from the top.
-                    offset = 0
-                    leftover = b""
-                if size > offset:
-                    with open(log_path, "rb") as f:
-                        f.seek(offset)
-                        chunk = f.read(size - offset)
-                    offset = size
-                    data = leftover + chunk
-                    parts = data.split(b"\n")
-                    leftover = parts[-1]
-                    new_lines = parts[:-1]
-                    # Ship in batches bounded by BOTH line count and byte size, so a
-                    # backlog drains in a few large POSTs instead of one-per-200-lines
-                    # (which floods the gateway when a model logs heavily / crash-loops).
-                    i = 0
-                    while i < len(new_lines):
-                        batch: list[str] = []
-                        nbytes = 0
-                        while i < len(new_lines) and len(batch) < MAX_BATCH_LINES and nbytes < MAX_POST_BYTES:
-                            line = new_lines[i][:MAX_LINE_BYTES].decode("utf-8", errors="replace")
-                            batch.append(line)
-                            nbytes += len(line) + 1
-                            i += 1
-                        body: dict[str, Any] = {"machine_id": machine_id, "app_id": app_id, "lines": batch}
-                        if source is not None:
-                            body["source"] = source
-                        try:
-                            await client.post(url, json=body)
-                        except httpx.HTTPError as e:
-                            logger.warning("log shipper post failed: %s", e)
+                if get_log_path is not None:
+                    latest = get_log_path()
+                    if latest and latest != cur_path:
+                        # Rotated to a fresh per-launch file. FIRST flush the dying
+                        # file's remaining tail (the crash traceback!) under its OWN
+                        # session — else those final, most-important lines are lost
+                        # because we'd jump to the new file — THEN switch.
+                        await drain(cur_path, session)
+                        cur_path = latest
+                        if fixed_session is None:
+                            session = _session_of(cur_path)
+                        offset = 0
+                        leftover = b""
+                await drain(cur_path, session)
             except Exception:
                 logger.exception("log shipper iteration failed")
             try:
                 await asyncio.wait_for(drain_event.wait(), timeout=BATCH_INTERVAL_S)
             except asyncio.TimeoutError:
                 pass
+
+
+def _session_of(log_path: str | None) -> str | None:
+    """Session id (trailing timestamp) of a timestamped log file, else None."""
+    if not log_path:
+        return None
+    import re as _re
+    m = _re.search(r"-(\d{8}-\d{6})\.log$", os.path.basename(log_path))
+    return m.group(1) if m else None
 
 
 async def metrics_shipper_loop(gateway_url, machine_id, app_id, members_fn, drain_event, interval_s: float = 15.0) -> None:
@@ -604,7 +642,6 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     from .multi.config import parse_multi_config
     from .multi.scheduler import MultiModelScheduler
     from .multi.dispatch import multi_poll_loop
-    from .multi.launcher import log_path_for
 
     cfg = parse_multi_config(
         os.environ.get("MULTI_MODEL_CONFIG"),
@@ -639,7 +676,10 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
         asyncio.create_task(
             log_shipper_loop(
                 gateway_url, machine_id, app_id,
-                log_path_for(m, log_dir), drain_event, source=m.served_name,
+                None, drain_event, source=m.served_name,
+                # Follow the member's CURRENT log file — it changes to a fresh
+                # timestamped file on every (re)launch; each becomes its own session.
+                get_log_path=(lambda sn=m.served_name: (sched.resolve(sn).log_path if sched.resolve(sn) else None)),
             )
         )
         for m in cfg.members
@@ -649,8 +689,14 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     # "__worker__" source, so the UI can show the fleet's control-plane log too.
     self_log = os.environ.get("WORKER_SELF_LOG_PATH")
     if self_log:
+        # One worker-log session per agent launch (provision): the agent's own
+        # stdout file isn't timestamped (it's `worker-{mid}.log`, already unique
+        # per provision), so pin a startup-timestamp session explicitly — keeps
+        # historical worker logs across re-provisions, same as the model logs.
+        worker_session = time.strftime("%Y%m%d-%H%M%S")
         log_tasks.append(asyncio.create_task(
-            log_shipper_loop(gateway_url, machine_id, app_id, self_log, drain_event, source="__worker__")
+            log_shipper_loop(gateway_url, machine_id, app_id, self_log, drain_event,
+                             source="__worker__", fixed_session=worker_session)
         ))
     # Ship each member's vLLM /metrics to the gateway's combined scrape target.
     log_tasks.append(asyncio.create_task(

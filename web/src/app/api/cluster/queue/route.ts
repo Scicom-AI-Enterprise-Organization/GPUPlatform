@@ -21,6 +21,7 @@ type Item = {
   has_result: boolean;
   created_at?: string;
   completed_at?: string | null;
+  requested_by?: string | null;
 };
 
 function bucketFor(status: string): Bucket {
@@ -53,6 +54,7 @@ export async function GET(req: NextRequest) {
       has_result: r.output !== null,
       created_at: r.created_at,
       completed_at: r.completed_at,
+      requested_by: r.requested_by,
     }));
 
     return NextResponse.json({

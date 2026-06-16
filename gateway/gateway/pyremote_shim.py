@@ -241,6 +241,13 @@ def install() -> None:
                 "git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@main",
             )
             vllm_version = uv_cfg.get("vllm_version")
+            # Optional full `uv pip install` arg string for vLLM, applied (as an
+            # upgrade) AFTER benchmaq[vllm] installs — for nightlies / custom CUDA
+            # builds, e.g. "vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130 ...".
+            vllm_install_args = (uv_cfg.get("vllm_install_args") or "").strip()
+            _vllm_extra_install = (
+                f"uv pip install -U {vllm_install_args}\n" if vllm_install_args else ""
+            )
 
             if key_filename:
                 key_filename = os.path.expanduser(key_filename)
@@ -304,6 +311,8 @@ def install() -> None:
                 f"uv venv {venv_path} --python {python_version}\n"
                 f"source {venv_path}/bin/activate\n"
                 f'uv pip install "benchmaq[vllm] @ {benchmaq_ref}"{vllm_pin}\n'
+                # Optional: override/upgrade vLLM to a custom spec (e.g. a nightly).
+                f"{_vllm_extra_install}"
                 # huggingface_hub 1.x removed the `huggingface-cli` entrypoint
                 # that benchmaq's model downloader still shells out to ("no
                 # longer works. Use `hf` instead."). Forward it to the new `hf`

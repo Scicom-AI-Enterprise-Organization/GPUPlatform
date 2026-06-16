@@ -248,6 +248,11 @@ class WorkerLogsRequest(BaseModel):
     # Multi-model workers tag each batch with the member's served_name so logs
     # bucket per model (one vLLM process per model). None → single-mode worker.
     source: Optional[str] = None
+    # The member's current log SESSION (per-launch timestamp "YYYYMMDD-HHMMSS").
+    # Changes on every (re)launch; lets the gateway keep each launch's log
+    # separately (keyed by app+model+session, surviving re-provision) so the UI
+    # can open historical logs. None → legacy single live buffer only.
+    session: Optional[str] = None
 
 
 class WorkerMetricsRequest(BaseModel):
@@ -268,6 +273,10 @@ class ModelActionRequest(BaseModel):
 # Per-worker container log retention. The worker-agent ships batches every
 # few seconds; we cap the list so a chatty worker can't blow up Redis.
 WORKER_LOGS_CAP = 5000
+# Historical per-launch log sessions are kept this long (keyed by app+model+
+# session, so they survive a worker re-provision / mid change). Long enough to
+# debug a crash days later, short enough that Redis self-cleans.
+WLOG_SESSION_TTL = int(os.environ.get("WLOG_SESSION_TTL_S", str(7 * 24 * 3600)) or str(7 * 24 * 3600))
 
 
 def _logs_slug(s: str) -> str:
@@ -1907,29 +1916,66 @@ async def get_app_model_logs(
     request: Request,
     model: str,
     tail: int = 400,
+    log_session: Optional[str] = None,
     user: User = Depends(require_section("inference")),
     session: AsyncSession = Depends(get_session),
 ):
     """Per-model vLLM stdout/stderr for a multi-model VM endpoint. The worker
-    ships one log stream per member tagged by served_name; we bucket those under
-    `worker_logs:{mid}:{slug(model)}` and return the live worker's tail here so
-    the fleet UI can show why a specific model failed."""
+    ships one log stream per member tagged by served_name. Without `log_session`
+    we return the LIVE tail (`worker_logs:{mid}:{slug}`). With `log_session` (a
+    per-launch timestamp from /models/log-sessions) we return that historical
+    launch's log (`wlog:{app}:{slug}:{session}`), which survives a re-provision —
+    so a past crash stays openable."""
     if tail < 1 or tail > WORKER_LOGS_CAP:
         raise HTTPException(status_code=400, detail=f"tail must be 1..{WORKER_LOGS_CAP}")
     app = await _load_owned_app(session, app_id, user)
     rdb = request.app.state.redis
     slug = _logs_slug(model)
-    workers = await rdb.smembers(f"worker_index:{app_id}")
     lines: list[str] = []
-    # Take the first worker that still has buffered logs for this model — the
-    # crash log outlives the heartbeat TTL (~1h), so a dead model's reason
-    # remains visible after its worker stops beating.
-    for mid in workers:
-        raw = await rdb.lrange(f"worker_logs:{mid}:{slug}", 0, tail - 1)
-        if raw:
-            lines = list(reversed(raw))  # stored newest-first → chronological
-            break
-    return {"app_id": app.app_id, "model": model, "lines": lines, "count": len(lines)}
+    if log_session:
+        raw = await rdb.lrange(f"wlog:{app_id}:{slug}:{log_session}", 0, tail - 1)
+        lines = list(reversed(raw))
+    else:
+        workers = await rdb.smembers(f"worker_index:{app_id}")
+        # Take the first worker that still has buffered logs for this model — the
+        # crash log outlives the heartbeat TTL (~1h), so a dead model's reason
+        # remains visible after its worker stops beating.
+        for mid in workers:
+            raw = await rdb.lrange(f"worker_logs:{mid}:{slug}", 0, tail - 1)
+            if raw:
+                lines = list(reversed(raw))  # stored newest-first → chronological
+                break
+    return {"app_id": app.app_id, "model": model, "session": log_session, "lines": lines, "count": len(lines)}
+
+
+@app.get("/apps/{app_id}/models/log-sessions")
+async def get_app_model_log_sessions(
+    app_id: str,
+    request: Request,
+    model: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Historical log sessions (one per vLLM launch) for a member, newest first,
+    for the UI's session picker. Each is `{session, started_at, lines}` where
+    `session` is the launch timestamp ("YYYYMMDD-HHMMSS") to pass back as
+    `?log_session=`."""
+    app = await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    slug = _logs_slug(model)
+    raw = await rdb.zrevrange(f"wlog_sessions:{app_id}:{slug}", 0, 199)
+    out = []
+    for s in raw:
+        # "YYYYMMDD-HHMMSS" → ISO for display; best-effort.
+        iso = s
+        try:
+            d = s.split("-")
+            iso = f"{d[0][:4]}-{d[0][4:6]}-{d[0][6:8]}T{d[1][:2]}:{d[1][2:4]}:{d[1][4:6]}"
+        except (IndexError, ValueError):
+            pass
+        n = await rdb.llen(f"wlog:{app_id}:{slug}:{s}")
+        out.append({"session": s, "started_at": iso, "lines": n})
+    return {"app_id": app.app_id, "model": model, "sessions": out}
 
 
 @app.post("/apps/{app_id}/model-action")
@@ -3017,9 +3063,11 @@ class RequestRecord(BaseModel):
     is_stream: bool
     created_at: str
     completed_at: Optional[str] = None
+    # Username of the caller who submitted the request (resolved from owner_id).
+    requested_by: Optional[str] = None
 
 
-def _to_request_record(r: ReqRow) -> RequestRecord:
+def _to_request_record(r: ReqRow, requested_by: Optional[str] = None) -> RequestRecord:
     return RequestRecord(
         request_id=r.request_id,
         app_id=r.app_id,
@@ -3030,6 +3078,7 @@ def _to_request_record(r: ReqRow) -> RequestRecord:
         is_stream=r.is_stream,
         created_at=r.created_at.isoformat() if r.created_at else "",
         completed_at=r.completed_at.isoformat() if r.completed_at else None,
+        requested_by=requested_by,
     )
 
 
@@ -3159,7 +3208,15 @@ async def list_app_requests(
                 r.status = "failed"
                 r.output = out
 
-    return [_to_request_record(r) for r in rows]
+    # Resolve owner_id → username in one query so each row can show who called.
+    owner_ids = {r.owner_id for r in rows}
+    umap: dict[int, str] = {}
+    if owner_ids:
+        from .db import User as _User
+        urows = await session.execute(select(_User).where(_User.id.in_(owner_ids)))
+        umap = {u.id: u.username for u in urows.scalars().all()}
+
+    return [_to_request_record(r, umap.get(r.owner_id)) for r in rows]
 
 
 def _worker_meta_from_result(raw: dict) -> Optional[dict]:
@@ -3817,6 +3874,19 @@ async def ingest_worker_logs(req: WorkerLogsRequest, request: Request):
     await rdb.ltrim(key, 0, WORKER_LOGS_CAP - 1)
     # 1h TTL so logs naturally expire after the worker is gone.
     await rdb.expire(key, 3600)
+    # Historical: also bucket per launch session (app+model+session), kept longer
+    # and surviving re-provision, so the UI can open old logs (incl. a crash).
+    if req.session and req.source:
+        slug = _logs_slug(req.source)
+        skey = f"wlog:{req.app_id}:{slug}:{req.session}"
+        await rdb.lpush(skey, *reversed(truncated))
+        await rdb.ltrim(skey, 0, WORKER_LOGS_CAP - 1)
+        await rdb.expire(skey, WLOG_SESSION_TTL)
+        idx = f"wlog_sessions:{req.app_id}:{slug}"
+        digits = req.session.replace("-", "")
+        score = float(digits) if digits.isdigit() else 0.0  # "YYYYMMDD-HHMMSS" sorts chronologically
+        await rdb.zadd(idx, {req.session: score})
+        await rdb.expire(idx, WLOG_SESSION_TTL)
     return {"ok": True, "stored": len(truncated)}
 
 
@@ -3980,6 +4050,12 @@ async def get_worker_logs(
         raise HTTPException(status_code=404, detail="worker not found or expired")
     target_app = await _load_owned_app(session, app_id, user)
     raw = await rdb.lrange(f"worker_logs:{machine_id}", 0, tail - 1)
+    if not raw:
+        # A multi-model worker ships PER source (one stream per member + a reserved
+        # "__worker__" stream for the agent's own stdout) and never the flat key, so
+        # "container logs" would be empty. The __worker__ stream IS the container's
+        # main process output → use it. (Single-mode workers use the flat key.)
+        raw = await rdb.lrange(f"worker_logs:{machine_id}:__worker__", 0, tail - 1)
     # Stored newest-first; flip to chronological for the UI.
     lines = list(reversed(raw))
     return {

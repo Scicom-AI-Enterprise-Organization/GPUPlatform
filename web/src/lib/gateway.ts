@@ -101,6 +101,7 @@ export type GatewayRequestRecord = {
   is_stream: boolean;
   created_at: string;
   completed_at: string | null;
+  requested_by: string | null;
 };
 
 const PUBLIC_BASE = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";

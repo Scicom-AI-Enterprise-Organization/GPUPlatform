@@ -13,6 +13,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
 import { BurnFlame } from "@/components/burn-flame";
 import type { AppRecord } from "@/lib/types";
@@ -988,15 +995,36 @@ function FleetModelRow({
   );
 }
 
+type LogSession = { session: string; started_at: string; lines: number };
+
 function ModelLogs({ appId, model, onClose, label }: { appId: string; model: string; onClose: () => void; label?: string }) {
   const [lines, setLines] = useState<string[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [autoTail, setAutoTail] = useState(true);
+  // "" = the live tail; otherwise a historical launch session ("YYYYMMDD-HHMMSS").
+  const [sessions, setSessions] = useState<LogSession[]>([]);
+  const [sel, setSel] = useState("");
+
+  const fetchSessions = useCallback(async () => {
+    try {
+      const r = await fetch(
+        `/api/proxy/apps/${encodeURIComponent(appId)}/models/log-sessions?model=${encodeURIComponent(model)}`,
+        { cache: "no-store" },
+      );
+      if (!r.ok) return;
+      const b = (await r.json()) as { sessions?: LogSession[] };
+      setSessions(b.sessions ?? []);
+    } catch {
+      /* best-effort — session picker just won't populate */
+    }
+  }, [appId, model]);
 
   const fetchLogs = useCallback(async () => {
     try {
-      const url = `/api/proxy/apps/${encodeURIComponent(appId)}/models/logs?model=${encodeURIComponent(model)}&tail=400`;
+      const url =
+        `/api/proxy/apps/${encodeURIComponent(appId)}/models/logs?model=${encodeURIComponent(model)}&tail=400` +
+        (sel ? `&log_session=${encodeURIComponent(sel)}` : "");
       const r = await fetch(url, { cache: "no-store" });
       const text = await r.text();
       if (!r.ok) {
@@ -1018,15 +1046,24 @@ function ModelLogs({ appId, model, onClose, label }: { appId: string; model: str
     } finally {
       setLoading(false);
     }
-  }, [appId, model]);
+  }, [appId, model, sel]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchLogs();
-    if (!autoTail) return;
+    // Only the LIVE view tails; a historical session is static.
+    if (!autoTail || sel) return;
     const id = window.setInterval(fetchLogs, 2500);
     return () => window.clearInterval(id);
-  }, [fetchLogs, autoTail]);
+  }, [fetchLogs, autoTail, sel]);
+
+  // Refresh the session list on open + while live (a relaunch adds a new one).
+  useEffect(() => {
+    fetchSessions();
+    if (sel) return;
+    const id = window.setInterval(fetchSessions, 5000);
+    return () => window.clearInterval(id);
+  }, [fetchSessions, sel]);
 
   // Auto-tail: keep pinned to the bottom unless the user scrolled up to read.
   const scrollRef = useRef<HTMLPreElement | null>(null);
@@ -1047,10 +1084,28 @@ function ModelLogs({ appId, model, onClose, label }: { appId: string; model: str
           {loading && <Loader2 className="h-3 w-3 shrink-0 animate-spin" />}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <label className="flex items-center gap-1 text-[10px]">
+          <Select value={sel || "live"} onValueChange={(v) => setSel(v === "live" ? "" : v)}>
+            <SelectTrigger
+              size="sm"
+              title="View the live tail or a past launch's log"
+              className="h-7 gap-1 px-2 text-[11px]"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="max-h-72">
+              <SelectItem value="live" className="text-xs">Live</SelectItem>
+              {sessions.map((s) => (
+                <SelectItem key={s.session} value={s.session} className="text-xs">
+                  {s.started_at} ({s.lines})
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <label className={cn("flex items-center gap-1 text-[10px]", sel && "opacity-40")}>
             <input
               type="checkbox"
-              checked={autoTail}
+              checked={autoTail && !sel}
+              disabled={!!sel}
               onChange={(e) => setAutoTail(e.target.checked)}
               className="h-3 w-3"
             />

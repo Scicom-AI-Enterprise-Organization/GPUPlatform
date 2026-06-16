@@ -32,6 +32,9 @@ logger = logging.getLogger("worker-agent.scheduler")
 # this is ~15s of unresponsiveness — long enough to ride out a transient blip,
 # short enough that a wedged engine doesn't sit "awake" forever.
 HEALTH_FAIL_LIMIT = 3
+# Keep this many timestamped per-launch log files per member on disk (a high
+# safety cap so many relaunches can't fill the VM); oldest beyond it are pruned.
+LOG_RETAIN = int(os.environ.get("VLLM_LOG_RETAIN", "50") or "50")
 
 
 class ModelState(str, enum.Enum):
@@ -342,13 +345,18 @@ class MultiModelScheduler:
     async def _launch_and_sleep(self, rt: ModelRuntime) -> None:
         try:
             rt.reason = None  # clear any stale cause from a prior attempt
+            # Fresh timestamped log file for this attempt — never overwrites the
+            # prior (possibly crashing) log; the shipper follows it + tags the
+            # session so the UI can open historical logs.
+            rt.log_path = launcher.new_log_path(rt.member, self.log_dir)
+            launcher.prune_log_files(rt.member, self.log_dir, LOG_RETAIN)
             async with self._hold_gpus(rt.gpus):
                 # Free rt's GPUs before loading: sleep any AWAKE model that shares
                 # them, or the load OOMs against a resident (e.g. relaunching a
                 # 2,3 model while Mistral holds 0,1,2,3). At initial startup this
                 # is a no-op since nothing is awake yet.
                 await self._evict_overlapping(rt)
-                rt.proc = await launcher.launch_member(rt.member, self.log_dir, self._python_exe)
+                rt.proc = await launcher.launch_member(rt.member, self.log_dir, self._python_exe, log_path=rt.log_path)
                 # Record the engine's process group right away (before health) so a
                 # worker SIGKILL mid-load still leaves a trackable orphan, not a
                 # leak we'd have to pkill box-wide.

@@ -27,11 +27,57 @@ logger = logging.getLogger("worker-agent.launcher")
 LAUNCH_HEALTH_TIMEOUT_S = float(os.environ.get("VLLM_LAUNCH_HEALTH_TIMEOUT_S", "2400"))  # 40 min
 
 
+def _member_slug(member: MemberModel) -> str:
+    return member.served_name.replace("/", "__")
+
+
 def log_path_for(member: MemberModel, log_dir: str) -> str:
-    """Per-model vLLM stdout/stderr file. Stable across launch + read + ship so
-    the scheduler can read its own failure reason and the shipper can tail it."""
-    slug = member.served_name.replace("/", "__")
-    return os.path.join(log_dir, f"vllm-{slug}-{member.port}.log")
+    """Legacy stable per-model vLLM log path (no timestamp). Retained for the
+    rare caller that wants the fixed name; live launches now use a timestamped
+    file via `new_log_path` so a relaunch never overwrites the crashing log."""
+    return os.path.join(log_dir, f"vllm-{_member_slug(member)}-{member.port}.log")
+
+
+# Each (re)launch writes a NEW timestamped file `vllm-{slug}-{port}-{ts}.log` so
+# every attempt's log (crash traceback included) is kept on disk — never
+# truncated/overwritten by the next launch. The shipper follows the current one;
+# the gateway buckets per session so the UI can open historical logs.
+_TS_FMT = "%Y%m%d-%H%M%S"
+
+
+def new_log_path(member: MemberModel, log_dir: str, ts: str | None = None) -> str:
+    ts = ts or time.strftime(_TS_FMT)
+    return os.path.join(log_dir, f"vllm-{_member_slug(member)}-{member.port}-{ts}.log")
+
+
+def session_of(log_path: str | None) -> str | None:
+    """The session id (the trailing timestamp) of a timestamped log file, or None
+    for the legacy fixed file. `vllm-foo__bar-18001-20260616-120701.log` → that ts."""
+    if not log_path:
+        return None
+    base = os.path.basename(log_path)
+    m = re.search(r"-(\d{8}-\d{6})\.log$", base)
+    return m.group(1) if m else None
+
+
+def list_log_files(member: MemberModel, log_dir: str) -> list[str]:
+    """All timestamped log files for a member, NEWEST first (lexical ts sort)."""
+    import glob
+    pat = os.path.join(log_dir, f"vllm-{_member_slug(member)}-{member.port}-*.log")
+    return sorted(glob.glob(pat), reverse=True)
+
+
+def prune_log_files(member: MemberModel, log_dir: str, keep: int) -> None:
+    """Delete the OLDEST timestamped logs beyond `keep` (a high safety cap so the
+    VM disk can't fill across many relaunches). Best-effort."""
+    if keep <= 0:
+        return
+    files = list_log_files(member, log_dir)  # newest first
+    for stale in files[keep:]:
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
 
 
 _LOG_PREFIX_RE = re.compile(
@@ -109,11 +155,14 @@ def read_failure_reason(log_path: str, tail_bytes: int = 65536) -> str | None:
 
 async def launch_member(
     member: MemberModel, log_dir: str, python_exe: str = "python3",
+    log_path: str | None = None,
 ) -> asyncio.subprocess.Process:
     """Spawn `vllm.entrypoints.openai.api_server` for one model. Stdout/stderr
     go to a per-model log file the shipper can tail. `python_exe` is the
     interpreter that has vLLM — a uv venv's bin/python when the endpoint set a
-    venv_path, else bare `python3` on PATH."""
+    venv_path, else bare `python3` on PATH. `log_path` (a fresh timestamped file
+    from `new_log_path`) is where this attempt's output lands; omitted → legacy
+    fixed file."""
     os.makedirs(log_dir, exist_ok=True)
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in member.gpu_indices)
@@ -139,10 +188,10 @@ async def launch_member(
         "--enable-sleep-mode",
         *member.extra_args,
     ]
-    log_path = log_path_for(member, log_dir)
-    # Truncate (not append) per launch: each attempt gets a fresh log so the
-    # health-wait fatal-error scan can't match a PREVIOUS attempt's traceback and
-    # abort instantly. The log shipper detects the size reset and re-tails from 0.
+    log_path = log_path or new_log_path(member, log_dir)
+    # Fresh per-launch file (timestamped) → this attempt's log is self-contained
+    # and a relaunch never overwrites a prior crash. "wb" is safe: the name is
+    # unique per launch. The shipper follows the current file + tags its session.
     logf = open(log_path, "wb", buffering=0)
     logger.info(
         "launching vllm: model=%s gpus=%s tp=%d pp=%d port=%d → %s",
