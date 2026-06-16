@@ -512,6 +512,34 @@ class RunPodProvider(Provider):
             except Exception:  # noqa: BLE001
                 pass
 
+    async def exec_on(self, machine_id: str, cmd: str, timeout: int = 30) -> dict:
+        """Run a shell command on a pod over SSH (the same ephemeral key + coords the
+        reverse tunnel uses). For ops / chaos testing. Returns {rc, stdout, stderr}."""
+        import paramiko  # imported locally — like provision() (paramiko is sync)
+        import shlex
+        from . import vm_probe
+        ep = self._ssh.get(machine_id)
+        if not ep or not self.ssh_priv_pem:
+            raise RuntimeError(f"no SSH coords for {machine_id}")
+        ip, ssh_port = ep
+
+        def _run() -> dict:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(hostname=ip, port=ssh_port, username="root",
+                           pkey=vm_probe._load_pkey(self.ssh_priv_pem),
+                           timeout=20, banner_timeout=20, auth_timeout=20,
+                           look_for_keys=False, allow_agent=False)
+            try:
+                _, out, err = client.exec_command(f"bash -lc {shlex.quote(cmd)}", timeout=timeout)
+                rc = out.channel.recv_exit_status()
+                return {"rc": rc,
+                        "stdout": out.read().decode(errors="replace")[-4000:],
+                        "stderr": err.read().decode(errors="replace")[-2000:]}
+            finally:
+                client.close()
+        return await asyncio.to_thread(_run)
+
     async def _ensure_tunnel_for(self, machine_id: str) -> None:
         ep = self._ssh.get(machine_id)
         if not ep or not self.reverse_tunnel or not self.ssh_priv_pem:

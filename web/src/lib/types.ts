@@ -186,6 +186,7 @@ export type BenchmarkRecord = {
   env_vars?: Record<string, string> | null;
   visible_devices?: string | null;
   hf_token_secret?: string | null;
+  cleanup_model?: boolean | null;
 };
 
 export type CreateBenchmarkRequest = {

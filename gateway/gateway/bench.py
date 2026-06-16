@@ -1476,6 +1476,9 @@ class BenchmarkRecord(BaseModel):
     env_vars: Optional[dict[str, str]] = None
     visible_devices: Optional[str] = None
     hf_token_secret: Optional[str] = None
+    # Exposed so the UI "Re-run" button can faithfully recreate the run — without
+    # it, a re-run would default cleanup_model=true and wipe a pre-downloaded cache.
+    cleanup_model: Optional[bool] = None
 
 
 class FileRecord(BaseModel):
@@ -1564,6 +1567,7 @@ def _to_record(b: Benchmark, owner_username: str) -> BenchmarkRecord:
         env_vars=getattr(b, "env_vars", None) or None,
         visible_devices=getattr(b, "visible_devices", None) or None,
         hf_token_secret=getattr(b, "hf_token_secret", None) or None,
+        cleanup_model=getattr(b, "cleanup_model", None),
     )
 
 

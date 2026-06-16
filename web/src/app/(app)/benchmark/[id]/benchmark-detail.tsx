@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Check, Copy, Octagon, Pencil, Trash2, X } from "lucide-react";
+import { Check, Copy, Octagon, Pencil, RotateCw, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -62,6 +62,7 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
   const [pending, startTransition] = useTransition();
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [terminateError, setTerminateError] = useState<string | null>(null);
+  const [rerunError, setRerunError] = useState<string | null>(null);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(bench.name);
   const [renaming, setRenaming] = useState(false);
@@ -142,6 +143,30 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
         }
       } catch (e) {
         setTerminateError(e instanceof Error ? e.message : String(e));
+      }
+    });
+  }
+
+  // Re-run: recreate this benchmark from its saved config (same provider /
+  // storage / env / cleanup flag) and jump to the new run. Recovers a run that
+  // failed or was orphaned by a gateway restart in one click.
+  function handleRerun() {
+    setRerunError(null);
+    startTransition(async () => {
+      try {
+        const created = await gateway.createBenchmark({
+          name: bench.name,
+          config_yaml: bench.config_yaml,
+          provider_id: bench.provider_id ?? null,
+          storage_id: bench.storage_id ?? null,
+          ...(bench.cleanup_model != null ? { cleanup_model: bench.cleanup_model } : {}),
+          ...(bench.env_vars ? { env_vars: bench.env_vars } : {}),
+          ...(bench.visible_devices ? { visible_devices: bench.visible_devices } : {}),
+          ...(bench.hf_token_secret ? { hf_token_secret: bench.hf_token_secret } : {}),
+        });
+        router.push(`/benchmark/${encodeURIComponent(created.id)}`);
+      } catch (e) {
+        setRerunError(e instanceof Error ? e.message : String(e));
       }
     });
   }
@@ -235,6 +260,19 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
               <Copy className="h-4 w-4" />
               Duplicate
             </Button>
+            {!inFlight && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRerun}
+                disabled={pending}
+                title={rerunError ?? "Re-run this benchmark with the same config"}
+                className={rerunError ? "text-destructive hover:text-destructive" : undefined}
+              >
+                <RotateCw className="h-4 w-4" />
+                {pending ? "Re-running…" : "Re-run"}
+              </Button>
+            )}
             {inFlight && (
               <Button
                 variant="outline"

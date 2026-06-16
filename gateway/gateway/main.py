@@ -2331,6 +2331,40 @@ async def terminate_app_worker(
     return {"ok": True, "app_id": app_id, "machine_id": machine_id, "paused": False}
 
 
+@app.post("/apps/{app_id}/chaos/kill-engine")
+async def chaos_kill_engine(
+    app_id: str,
+    request: Request,
+    model: Optional[str] = None,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Chaos-engineering: SIGKILL the vLLM engine process group(s) on a worker pod
+    OUT-OF-BAND (the scheduler doesn't know), simulating a real crash — to exercise
+    the auto-restart backoff. `model` (served_name) targets one member's port; omitted
+    kills every vLLM on the pod. Provider must support SSH exec (RunPod/VM)."""
+    await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    workers = sorted(await rdb.smembers(f"worker_index:{app_id}"))
+    if not workers:
+        raise HTTPException(status_code=400, detail={"error": "no live worker to chaos-kill"})
+    mid = workers[0]
+    provider = await _provider_for_app(session, app_id, user, request.app.state)
+    if provider is None or not hasattr(provider, "exec_on"):
+        raise HTTPException(status_code=400, detail={"error": "this provider doesn't support SSH exec"})
+    # Match the api_server process; narrow to a member's --port when `model` given.
+    pat = "vllm.entrypoints.openai.api_server"
+    cmd = (f"PIDS=$(pgrep -f {shlex.quote(pat)} || true); echo \"victims: $PIDS\"; "
+           f"for p in $PIDS; do kill -9 -- -$(ps -o pgid= -p $p | tr -d ' ') 2>/dev/null || kill -9 $p; done; "
+           f"echo killed")
+    try:
+        res = await provider.exec_on(mid, cmd)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail={"error": f"chaos exec failed: {(str(e) or repr(e))[:300]}"})
+    logger.warning("CHAOS: killed vLLM engine on app=%s machine=%s by user=%s", app_id, mid, user.username)
+    return {"ok": True, "app_id": app_id, "machine_id": mid, "model": model, "result": res}
+
+
 @app.patch("/apps/{app_id}/models", response_model=AppRecord)
 async def update_app_models(
     app_id: str,
