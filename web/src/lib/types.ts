@@ -4,6 +4,9 @@ export type AutoscalerSpec = {
   max_containers: number;
   tasks_per_container: number;
   idle_timeout_s: number;
+  // Per-app heartbeat liveness TTL (seconds). Optional for back-compat with
+  // apps created before the setting existed; gateway defaults to 3600.
+  worker_ttl_s?: number;
 };
 
 // A model served by a multi-model endpoint. `model` is the HuggingFace id and

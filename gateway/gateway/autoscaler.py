@@ -319,6 +319,11 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
         logger.exception("autoscaler: ensure_connectivity failed for app=%s", app_id)
     autoscaler_cfg = app.autoscaler
     max_containers = int(autoscaler_cfg["max_containers"])
+    # Mirror the per-app heartbeat TTL to a cheap Redis key so the (DB-free)
+    # heartbeat hot path can honour it without a DB hit. Written every tick so
+    # create/update/restart all converge without touching those code paths.
+    worker_ttl_s = int(autoscaler_cfg.get("worker_ttl_s", 3600) or 3600)
+    await rdb.set(f"app:{app_id}:worker_ttl_s", str(worker_ttl_s))
     tasks_per_container = int(autoscaler_cfg["tasks_per_container"])
     idle_timeout_s = int(autoscaler_cfg["idle_timeout_s"])
 
@@ -350,6 +355,20 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
 
     if desired > current:
         from . import metrics as _metrics
+        # Reconcile against the provider before scaling up: `current` is the count
+        # of workers with a live Redis heartbeat key, which can read 0 when a
+        # worker is merely silent (heartbeat gap, Redis reschedule) rather than
+        # dead — and provisioning a replacement then leaves the still-running VM
+        # as an un-reaped duplicate (the split-brain that throws "model is dead").
+        # The provider's own per-app machine list outlives the short heartbeat
+        # key, so if it already accounts for `desired` machines, leave them be.
+        try:
+            provider_machines = len(await provider.list_machines_for_app(app_id))
+        except Exception:
+            provider_machines = 0
+            logger.exception("autoscaler: list_machines_for_app failed for %s", app_id)
+        if max(current, provider_machines) >= desired:
+            return
         # Cooldown: skip the provision attempt entirely if the last try failed
         # recently. Otherwise we spam the upstream provider every tick when
         # there's no inventory or our spec is wrong, which burns API quota

@@ -57,7 +57,29 @@ from . import hf_mirror_api as hf_mirror_module
 
 logger = logging.getLogger("gateway")
 
-WORKER_TTL_S = 30
+# Heartbeat liveness TTL for worker:{mid}. Long (1h) on purpose: a brief
+# heartbeat gap — a Redis pod reschedule (AOF reload preserves a key whose 1h
+# expiry hasn't elapsed), a tunnel blip, an engine stall — must NOT make the
+# autoscaler think the worker died and provision a duplicate. The worker still
+# heartbeats every 5s; this only governs how long a *silent* worker is presumed
+# alive. Trade-off: a genuinely dead VM is presumed alive (and not auto-replaced)
+# for up to this long. Override with WORKER_TTL_S env.
+WORKER_TTL_S = int(os.environ.get("WORKER_TTL_S", "3600"))
+
+
+async def _worker_ttl_s(rdb, app_id: str) -> int:
+    """Per-app heartbeat TTL (set on the autoscaler config, mirrored to Redis by the
+    autoscaler loop). Cheap GET on the heartbeat hot path; falls back to the global
+    WORKER_TTL_S for older apps that predate the per-app setting."""
+    try:
+        raw = await rdb.get(f"app:{app_id}:worker_ttl_s")
+        if raw:
+            v = int(raw)
+            if v > 0:
+                return v
+    except (TypeError, ValueError):
+        pass
+    return WORKER_TTL_S
 # How long a client-disconnect cancel marker (cancel:{request_id}) lives. Must
 # outlast the time a job can sit in the queue before the worker dequeues it —
 # otherwise a 60s marker expires long before a deeply-queued request is picked
@@ -71,12 +93,18 @@ class AutoscalerSpec(BaseModel):
     max_containers: int = 1
     tasks_per_container: int = 30
     idle_timeout_s: int = 300
+    # Heartbeat liveness TTL for this app's workers. Long by default (1h) so a
+    # brief heartbeat gap (Redis reschedule, tunnel blip, engine stall) can't make
+    # the autoscaler presume the worker dead and spawn a duplicate. Falls back to
+    # the global WORKER_TTL_S env default when unset on older apps.
+    worker_ttl_s: int = 3600
 
 
 class UpdateAutoscalerRequest(BaseModel):
     max_containers: Optional[int] = None
     tasks_per_container: Optional[int] = None
     idle_timeout_s: Optional[int] = None
+    worker_ttl_s: Optional[int] = None
     vllm_args: Optional[str] = None
     gpu_count: Optional[int] = None
 
@@ -2043,6 +2071,14 @@ async def update_app_autoscaler(
             if v < 0:
                 raise HTTPException(status_code=400, detail=f"{k} must be >= 0")
             cfg[k] = v
+    if "worker_ttl_s" in updates:
+        ttl = int(updates["worker_ttl_s"])
+        if ttl < 30 or ttl > 86400:
+            raise HTTPException(status_code=400, detail="worker_ttl_s must be 30..86400 seconds")
+        cfg["worker_ttl_s"] = ttl
+        # Mirror immediately so the heartbeat hot path honours it without waiting
+        # for the next autoscaler tick.
+        await request.app.state.redis.set(f"app:{app_id}:worker_ttl_s", str(ttl))
     target.autoscaler = cfg
     flag_modified(target, "autoscaler")
     if "vllm_args" in updates:
@@ -2288,6 +2324,43 @@ async def purge_app_workers(
     logger.info("purge workers app=%s by user=%s: tracked=%d purged=%d", app_id, user.username, tracked, purged)
     await audit_module.record(
         user, "inference.purge", "app", app_id, app_id,
+        details={"terminated": tracked, "purged": purged},
+    )
+    return {"ok": True, "app_id": app_id, "terminated": tracked, "purged": purged}
+
+
+@app.post("/apps/{app_id}/clear-restart")
+async def clear_restart_app_workers(
+    app_id: str,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """One-shot 'Clear & Restart': force-purge every worker remnant on the box
+    (process tree + vLLM engines + on-disk pidfiles/logs/configs + redis state),
+    even a zombie we may be *wrongly* presuming alive under the long heartbeat TTL,
+    then resume the fleet so the autoscaler brings up one clean worker.
+
+    This is the safety valve that makes a long WORKER_TTL_S acceptable: a stale or
+    mis-detected worker is never stranded — the operator force-clears the actual VM
+    (best-effort kill; harmless no-op if it was already dead) and gets a fresh one."""
+    await _load_owned_app(session, app_id, user)
+    rdb = request.app.state.redis
+    tracked = len(await rdb.smembers(f"worker_index:{app_id}"))
+    provider = await _provider_for_app(session, app_id, user, request.app.state)
+    purged = 0
+    if provider is not None:
+        try:
+            purged = await provider.purge_app(app_id)
+        except Exception:
+            logger.exception("clear-restart app=%s: provider.purge_app failed", app_id)
+            raise HTTPException(status_code=502, detail={"error": "clear failed on the provider — see gateway logs"})
+    # Resume AFTER the purge so the autoscaler respawns a clean worker (and so a
+    # previously-killed fleet comes back too).
+    await rdb.delete(f"app:{app_id}:paused")
+    logger.info("clear-restart app=%s by user=%s: tracked=%d purged=%d", app_id, user.username, tracked, purged)
+    await audit_module.record(
+        user, "inference.clear_restart", "app", app_id, app_id,
         details={"terminated": tracked, "purged": purged},
     )
     return {"ok": True, "app_id": app_id, "terminated": tracked, "purged": purged}
@@ -3828,7 +3901,7 @@ async def register_worker(req: WorkerRegisterRequest, request: Request):
         "status": "registered",
         "last_seen": time.time(),
     }
-    await rdb.set(f"worker:{req.machine_id}", json.dumps(state), ex=WORKER_TTL_S)
+    await rdb.set(f"worker:{req.machine_id}", json.dumps(state), ex=await _worker_ttl_s(rdb, req.app_id))
     await rdb.sadd(f"worker_index:{req.app_id}", req.machine_id)
     from .autoscaler import emit_worker_event
     await emit_worker_event(rdb, req.machine_id, req.app_id, "info", "registered with gateway")
@@ -3849,7 +3922,7 @@ async def heartbeat(req: WorkerHeartbeatRequest, request: Request):
         "status": req.status,
         "last_seen": time.time(),
     }
-    await rdb.set(f"worker:{req.machine_id}", json.dumps(state), ex=WORKER_TTL_S)
+    await rdb.set(f"worker:{req.machine_id}", json.dumps(state), ex=await _worker_ttl_s(rdb, req.app_id))
     await rdb.sadd(f"worker_index:{req.app_id}", req.machine_id)
     # Stamp the instant this worker first became servable. The autoscaler uses it
     # to give a freshly-ready worker a full idle window before teardown — a cold

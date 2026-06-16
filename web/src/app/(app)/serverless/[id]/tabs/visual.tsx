@@ -8,10 +8,12 @@ import {
   useRef,
   useState,
 } from "react";
+import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
   Boxes,
   Database,
+  Eraser,
   Loader2,
   Network,
   RefreshCw,
@@ -32,6 +34,7 @@ import {
 } from "@/components/ui/dialog";
 import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { updateAutoscaler } from "../../actions";
 
 const POLL_MS = 10_000;
 
@@ -492,7 +495,7 @@ function WorkerDetail({
   onChanged: () => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [busy, setBusy] = useState<"restart" | "delete" | null>(null);
+  const [busy, setBusy] = useState<"restart" | "clear" | "delete" | null>(null);
   const [note, setNote] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
 
   async function restart() {
@@ -502,6 +505,24 @@ function WorkerDetail({
       const r = await fetch(`/api/proxy/apps/${encodeURIComponent(app.app_id)}/restart`, { method: "POST" });
       if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
       setNote({ tone: "ok", text: "Restart triggered — the worker drains and reprovisions (cold start)." });
+      window.setTimeout(onChanged, 1500);
+    } catch (e) {
+      setNote({ tone: "err", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Clear & Restart: force-purge the actual VM (kills the process tree + vLLM +
+  // sweeps on-disk remnants, even if we're wrongly presuming a dead worker alive
+  // under the long heartbeat TTL), then the autoscaler brings up a clean worker.
+  async function clearRestart() {
+    setBusy("clear");
+    setNote(null);
+    try {
+      const r = await fetch(`/api/proxy/apps/${encodeURIComponent(app.app_id)}/clear-restart`, { method: "POST" });
+      if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
+      setNote({ tone: "ok", text: "Cleared the box (force-purged any stale/zombie worker) — a fresh worker comes up shortly." });
       window.setTimeout(onChanged, 1500);
     } catch (e) {
       setNote({ tone: "err", text: e instanceof Error ? e.message : String(e) });
@@ -551,6 +572,16 @@ function WorkerDetail({
           <Button variant="outline" size="xs" onClick={restart} disabled={busy !== null}>
             {busy === "restart" ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCw className="h-3 w-3" />}
             Restart
+          </Button>
+          <Button
+            variant="outline"
+            size="xs"
+            onClick={clearRestart}
+            disabled={busy !== null}
+            title="Force-purge the actual VM (kills any stale/zombie worker even if wrongly presumed alive), then bring up a fresh one"
+          >
+            {busy === "clear" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Eraser className="h-3 w-3" />}
+            Clear &amp; Restart
           </Button>
           <Button
             variant="outline"
@@ -610,13 +641,67 @@ function WorkerDetail({
   );
 }
 
+function TtlEditor({ app }: { app: AppRecord }) {
+  const current = app.autoscaler.worker_ttl_s ?? 3600;
+  const [val, setVal] = useState(String(current));
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const router = useRouter();
+  const parsed = Number.parseInt(val, 10);
+  const invalid = !/^\d+$/.test(val.trim()) || !Number.isFinite(parsed) || parsed < 30 || parsed > 86400;
+  const dirty = String(current) !== val.trim();
+
+  async function save() {
+    if (invalid || !dirty) return;
+    setBusy(true);
+    setMsg(null);
+    const res = await updateAutoscaler(app.app_id, { worker_ttl_s: parsed });
+    setBusy(false);
+    if (res.ok) {
+      setMsg({ tone: "ok", text: "Saved — applies to new heartbeats immediately." });
+      router.refresh();
+    } else {
+      setMsg({ tone: "err", text: res.error });
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
+      <dt className="text-muted-foreground">
+        Heartbeat TTL (s)
+        <span className="ml-1 text-[10px] opacity-70">worker presumed alive until silent this long</span>
+      </dt>
+      <dd className="flex items-center gap-1.5">
+        {msg && (
+          <span className={cn("text-[10px]", msg.tone === "err" ? "text-status-down" : "text-muted-foreground")}>
+            {msg.text}
+          </span>
+        )}
+        <input
+          type="number"
+          min={30}
+          max={86400}
+          value={val}
+          onChange={(e) => setVal(e.target.value)}
+          className={cn(
+            "h-6 w-20 rounded border bg-background px-1.5 text-right font-mono text-xs",
+            invalid ? "border-status-down" : "border-border",
+          )}
+        />
+        <Button size="xs" variant="outline" onClick={save} disabled={busy || invalid || !dirty}>
+          {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : "Save"}
+        </Button>
+      </dd>
+    </div>
+  );
+}
+
 function WorkerConfig({ app, worker }: { app: AppRecord; worker: WorkerLite }) {
   const rows: [string, React.ReactNode][] = [
     ["Machine ID", <span className="font-mono">{worker.machine_id}</span>],
     ["Gateway status", worker.alive ? worker.status : "no heartbeat (>60s)"],
     ["GPU", `${app.gpu}${app.gpu_count > 1 ? ` × ${app.gpu_count}` : ""}`],
     ["Sleep level", String(app.sleep_level ?? 1)],
-    ["Heartbeat TTL", "30s (worker dropped if no heartbeat for 30s)"],
     ["Idle timeout", app.autoscaler.idle_timeout_s === 0 ? "0 (always-on)" : `${app.autoscaler.idle_timeout_s}s`],
     ["Max workers", String(app.autoscaler.max_containers)],
     ["Tasks / worker", String(app.autoscaler.tasks_per_container)],
@@ -626,6 +711,7 @@ function WorkerConfig({ app, worker }: { app: AppRecord; worker: WorkerLite }) {
     <div className="space-y-3">
       <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Config</h4>
       <dl className="divide-y divide-border/60 rounded-md border border-border">
+        <TtlEditor app={app} />
         {rows.map(([k, v]) => (
           <div key={k} className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
             <dt className="text-muted-foreground">{k}</dt>
