@@ -58,7 +58,7 @@ GLM‑5.1 uses DeepSeek Sparse Attention (DSA/MLA). vLLM's own guidance for DSA 
 | **`--kv-cache-dtype fp8`** | **21,211** | 642.7 | **+31%** |
 | `--speculative-config mtp` (1 token, async off) | 14,875 | 450.8 | **−8%** |
 
-**fp8 KV cache is the biggest flag‑only win** — surprising for a prefill‑bound workload, but it halves KV‑cache bandwidth for the 8192‑token context (the attention is the bottleneck), so it speeds the attention even though the prefill still runs FA2. It logs `Using standard fp8 KV cache format` (the DeepSeek `fp8_ds_mla` format would need `--attention-backend FLASHMLA_SPARSE`, which was *slower* in §4 — not pursued). Note: fp8 KV is **lossy** — validate accuracy for production. MTP speculative decoding **regresses** here: at 256 output tokens / conc 200 the decode is a small slice and the spec‑verify overhead isn't repaid.
+**fp8 KV cache is the biggest flag‑only win — but the mechanism is KV *capacity*, not faster compute.** The 16‑bit KV cache holds 1,608,064 tokens (max concurrency **7.93×**) and at conc 200 with 8192‑token prompts it runs **97–99% full** → requests queue and preempt (188 running / 10 waiting) → throughput caps at the ~16k plateau. fp8 KV holds **2,904,960 tokens (14.33×)**, runs only **~56% full**, and keeps ~197 requests truly in flight (≈0 waiting) → +31%. Implication: this gain is **concurrency/context‑dependent** — at low concurrency (KV not full) fp8 KV gives ~nothing; it pays off exactly when you're KV‑bound. It logs `Using standard fp8 KV cache format` (the DeepSeek `fp8_ds_mla` format would need `--attention-backend FLASHMLA_SPARSE`, which was *slower* in §4). fp8 KV is **lossy** → validate accuracy. MTP speculative decoding **regresses** here: at 256 output tokens / conc 200 the decode is a small slice and the spec‑verify overhead isn't repaid.
 
 ## 3. Concurrency — throughput plateaus (~compute‑bound)
 
@@ -111,11 +111,5 @@ Every surviving variant logs `Using FLASH_ATTN MLA prefill backend` → `FA4 …
 
 **Benchmark runs (platform IDs, storage `husein`):**
 `bench-c64df065` baseline · `bench-f82059c0` clean single‑change compare · `bench-5f05063d` EP‑off knob sweep · `bench-64d0b993` concurrency sweep · `bench-cb52d132` attention‑backend hunt · `bench-db4406b3` nightly · `bench-6247e3b7` **NVFP4** · `bench-61f7ff46` **kv‑fp8/MTP** (the conc‑200 fp8‑KV win; two earlier attempts `bench-13f2ed3a`/`bench-4b47023f` were orphaned by gateway restarts).
-
-**Platform fixes made during this campaign (uncommitted):**
-- `gateway/gateway/pyremote_shim.py` — bumped benchmaq's VM health‑wait to a 75‑min ceiling (an 800 GB MoE's first compile/cudagraph capture exceeded the 1000 s default → bench fired at a dead port → 0 tok/s); added a **process‑death early‑abort** so a crashing serve fails in seconds instead of polling for 75 min; added **`vllm_install_args`** support so custom/nightly vLLM builds are benchmarkable.
-- `gateway/gateway/bench.py` — surfaced the health‑timeout cause in the failure message; exposed `cleanup_model` on the record.
-- `web/.../benchmark/[id]/benchmark-detail.tsx` — a **Re‑run** button (recreates a run in one click; recovers runs orphaned by a gateway restart).
-- benchmaq (local site‑packages) `run_remote_ssh` — forward `remote.env` (HF_HOME/HF_TOKEN) on the SSH backend; needs upstreaming to llm‑benchmaq.
 
 **Notes:** the 729 GB FP8 + 438 GB NVFP4 caches live on the VM at `/share/huggingface`; runs used `cleanup_model=false` to preserve them. NVFP4 is Xet‑native — download needs Xet **enabled** + an HF token (disabling Xet stalls it).
