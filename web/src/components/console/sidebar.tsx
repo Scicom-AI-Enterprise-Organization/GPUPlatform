@@ -5,6 +5,7 @@ import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, Package, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { ScicomLogo } from "@/components/scicom-logo";
 import { useSidebarState } from "./sidebar-state";
 
 type Item = {
@@ -200,7 +201,17 @@ export function ConsoleSidebar({
             width={96}
             height={24}
             priority
-            className={cn("h-6 select-none", collapsed ? "w-6 object-contain" : "w-auto")}
+            className={cn(
+              "h-6 select-none dark:hidden",
+              collapsed ? "w-6 object-contain" : "w-auto",
+            )}
+          />
+          <ScicomLogo
+            aria-hidden="true"
+            className={cn(
+              "hidden h-6 select-none dark:block",
+              collapsed ? "w-6 overflow-visible" : "w-auto",
+            )}
           />
           {!collapsed && (
             <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">

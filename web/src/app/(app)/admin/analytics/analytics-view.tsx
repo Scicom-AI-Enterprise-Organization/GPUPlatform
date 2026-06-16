@@ -681,6 +681,7 @@ type CalBlock = {
   ref: string; // worker machine_id (inference) or benchmark id
   kind: WorkloadKind;
   status: string; // running/served (inference) or run status (benchmark)
+  endReason: string | null;
   start: number; // epoch ms, clipped to [day 00:00, day 24:00]
   end: number; // epoch ms
   running: boolean;
@@ -739,6 +740,12 @@ function statusTone(status: string) {
     dot: "bg-amber-300",
     pill: "bg-amber-500/20 text-amber-200",
   };
+}
+
+function inferenceTimelineStatus(span: WorkerSpan): string {
+  if (span.running) return "running";
+  if (span.endReason === "terminate_failed") return "failed";
+  return "served";
 }
 
 // 12-hour clock like Google Calendar — "6:12pm", "5am".
@@ -921,6 +928,7 @@ export function AnalyticsView() {
       ref: string;
       kind: WorkloadKind;
       status: string;
+      endReason: string | null;
       start: number;
       end: number | null; // null = still running
       running: boolean;
@@ -940,9 +948,10 @@ export function AnalyticsView() {
           node,
           ref: sp.mid,
           kind: "inference",
-          status: sp.running ? "running" : "served",
+          status: inferenceTimelineStatus(sp),
           start: sp.start,
           end: sp.end,
+          endReason: sp.endReason,
           running: sp.running,
           gpus,
           gpuModel: meta?.gpu ?? null,
@@ -961,6 +970,7 @@ export function AnalyticsView() {
         status: b.status,
         start: new Date(b.started).getTime(),
         end: b.ended ? new Date(b.ended).getTime() : null,
+        endReason: null,
         running: b.status === "running",
         gpus: b.gpu_ids.length ? b.gpu_ids : [-1],
         gpuModel: null,
@@ -1029,6 +1039,7 @@ export function AnalyticsView() {
             ref: r.ref,
             kind: r.kind,
             status: r.status,
+            endReason: r.endReason,
             start: r.start,
             end: r.end,
             running: r.running,
@@ -1105,18 +1116,30 @@ export function AnalyticsView() {
   }, [gpuDays, from, to, activeGpuNode]);
 
   const defaultGpuWeekKey = useMemo(() => {
+    const hasBlocks = (week: WeekRow) => week.days.some((d) => d.blocks.length > 0);
     const todayWeek = gpuWeeks.find((week) => week.days.some((d) => d.date === todayStr));
+    if (todayWeek && hasBlocks(todayWeek)) return todayWeek.key;
+
+    const latestPopulatedWeek = [...gpuWeeks].reverse().find(hasBlocks);
+    if (latestPopulatedWeek) return latestPopulatedWeek.key;
+
     return todayWeek?.key ?? gpuWeeks[gpuWeeks.length - 1]?.key ?? "";
   }, [gpuWeeks, todayStr]);
 
-  const activeGpuWeekKey = gpuWeeks.some((week) => week.key === gpuWeekKey)
-    ? gpuWeekKey
+  const gpuWeekContext = `${activeGpuNode}|${from.toISOString()}|${to.toISOString()}`;
+  const selectedGpuWeekKey = gpuWeekKey.startsWith(`${gpuWeekContext}|`)
+    ? gpuWeekKey.slice(gpuWeekContext.length + 1)
+    : "";
+
+  const activeGpuWeekKey = gpuWeeks.some((week) => week.key === selectedGpuWeekKey)
+    ? selectedGpuWeekKey
     : defaultGpuWeekKey;
 
   const activeGpuWeek =
     gpuWeeks.find((week) => week.key === activeGpuWeekKey) ?? null;
 
   const activeGpuWeekIndex = gpuWeeks.findIndex((week) => week.key === activeGpuWeekKey);
+  const selectGpuWeek = (weekKey: string) => setGpuWeekKey(`${gpuWeekContext}|${weekKey}`);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -2410,7 +2433,7 @@ export function AnalyticsView() {
                     disabled={activeGpuWeekIndex <= 0}
                     onClick={() => {
                       const prev = gpuWeeks[activeGpuWeekIndex - 1];
-                      if (prev) setGpuWeekKey(prev.key);
+                      if (prev) selectGpuWeek(prev.key);
                     }}
                   >
                     <ChevronLeft className="h-4 w-4" />
@@ -2425,7 +2448,7 @@ export function AnalyticsView() {
                     disabled={activeGpuWeekIndex < 0 || activeGpuWeekIndex >= gpuWeeks.length - 1}
                     onClick={() => {
                       const next = gpuWeeks[activeGpuWeekIndex + 1];
-                      if (next) setGpuWeekKey(next.key);
+                      if (next) selectGpuWeek(next.key);
                     }}
                   >
                     <ChevronRight className="h-4 w-4" />
@@ -2440,7 +2463,7 @@ export function AnalyticsView() {
                       const match = gpuWeeks.find((week) =>
                         week.days.some((day) => day.date === e.target.value),
                       );
-                      if (match) setGpuWeekKey(match.key);
+                      if (match) selectGpuWeek(match.key);
                     }}
                   />
                 </div>
@@ -2625,6 +2648,12 @@ export function AnalyticsView() {
                     <span className="font-mono text-white">
                       {fmtDur(((gpuHover.block.running ? nowTs || to.getTime() : gpuHover.block.end) - gpuHover.block.start) / 1000)}
                     </span>
+                    {gpuHover.block.endReason && (
+                      <>
+                        <span className="text-white/45">End reason</span>
+                        <span className="font-mono text-white">{gpuHover.block.endReason}</span>
+                      </>
+                    )}
                     <span className="text-white/45">
                       {gpuHover.block.kind === "benchmark" ? "Benchmark id" : "Worker id"}
                     </span>
