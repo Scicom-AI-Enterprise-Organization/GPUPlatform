@@ -47,6 +47,23 @@ const POLL_MS = 4000;
 
 const BUCKET_ORDER: Bucket[] = ["in queue", "in progress", "completed", "failed"];
 
+// URL slug ↔ bucket, so the nested filter is shareable via ?q= without encoded
+// spaces ("in queue" → "queued"). "all" is the default and omits the param.
+const BUCKET_SLUG: Record<Bucket | "all", string> = {
+  all: "all",
+  "in queue": "queued",
+  "in progress": "running",
+  completed: "completed",
+  failed: "failed",
+};
+const SLUG_BUCKET: Record<string, Bucket | "all"> = {
+  all: "all",
+  queued: "in queue",
+  running: "in progress",
+  completed: "completed",
+  failed: "failed",
+};
+
 const BUCKET_TONE: Record<Bucket, string> = {
   "in queue":    "bg-status-init/15 text-status-init",
   "in progress": "bg-status-idle/15 text-status-idle",
@@ -63,7 +80,19 @@ export function QueueTab({ app }: { app: AppRecord }) {
   const [loading, setLoading] = useState(false);
   const [flushing, setFlushing] = useState(false);
   const [confirmFlush, setConfirmFlush] = useState(false);
-  const [filter, setFilter] = useState<Bucket | "all">("all");
+
+  // The nested filter is URL-driven (?q=queued|running|completed|failed; "all"
+  // omits it) so it's shareable + survives back/forward — single source of truth.
+  const filter: Bucket | "all" = SLUG_BUCKET[searchParams.get("q") ?? ""] ?? "all";
+  const selectFilter = useCallback(
+    (b: Bucket | "all") => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (b === "all") params.delete("q");
+      else params.set("q", BUCKET_SLUG[b]);
+      router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+    },
+    [router, pathname, searchParams],
+  );
 
   // Clicking a request id deep-links it via ?req=<id> (shareable). Clicking the
   // same id again clears it.
@@ -184,7 +213,7 @@ export function QueueTab({ app }: { app: AppRecord }) {
           return (
             <button
               key={b}
-              onClick={() => setFilter(b)}
+              onClick={() => selectFilter(b)}
               className={cn(
                 "relative px-3 py-1.5 text-xs transition-colors",
                 filter === b
