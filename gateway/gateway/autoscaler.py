@@ -362,6 +362,31 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
             except (TypeError, ValueError):
                 pass
         n_to_add = desired - current
+        # Cap by the provider's ACTUAL running pods for this app. `current` counts
+        # only heartbeating workers (Redis), so a pod that's still running but has
+        # stopped heartbeating — a worker that never registered (the localhost
+        # gotcha), or a transient blip — would otherwise be *replaced*, overshooting
+        # max_containers in real, billing cloud pods (the runaway: 2+ pods for
+        # max_containers=1). Refuse to spawn past the cap; the reconciler reaps the
+        # stale pod after its grace window. VM providers relaunch on a fixed box
+        # (no per-pod billing) so they're exempt — capping there could block a
+        # legitimate relaunch.
+        from .vm_serverless_provider import VMProvider
+        if not isinstance(provider, VMProvider):
+            try:
+                existing_pods = len(await provider.list_machines_for_app(app_id))
+            except Exception:
+                logger.exception("autoscaler %s: list_machines_for_app failed; skipping pod cap", app_id)
+                existing_pods = current
+            capped = max(0, max_containers - existing_pods)
+            if capped < n_to_add:
+                if existing_pods > current:
+                    logger.warning(
+                        "autoscaler %s: %d provider pod(s) running but only %d heartbeating — "
+                        "capping scale-up %d→%d (max_containers=%d); stale pod(s) get reaped",
+                        app_id, existing_pods, current, n_to_add, capped, max_containers,
+                    )
+                n_to_add = capped
         # Admin global env / secrets, merged into every worker's env (an app env
         # var of the same name overrides). Loaded once per scale-up, not per tick.
         global_env: dict[str, str] = {}
