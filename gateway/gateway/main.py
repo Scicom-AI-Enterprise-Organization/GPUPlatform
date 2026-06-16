@@ -1974,7 +1974,8 @@ async def get_app_model_log_sessions(
         except (IndexError, ValueError):
             pass
         n = await rdb.llen(f"wlog:{app_id}:{slug}:{s}")
-        out.append({"session": s, "started_at": iso, "lines": n})
+        crash = await rdb.get(f"wlog_crash:{app_id}:{slug}:{s}")
+        out.append({"session": s, "started_at": iso, "lines": n, "crash": crash})
     return {"app_id": app.app_id, "model": model, "sessions": out}
 
 
@@ -3834,6 +3835,20 @@ async def heartbeat(req: WorkerHeartbeatRequest, request: Request):
             json.dumps(req.models),
             ex=WORKER_TTL_S * 3,
         )
+        # Persist a member's crash reason (CUDA OOM, …) PER launch session, so the
+        # UI can show WHY a past launch died long after the worker is gone (keyed
+        # by app+model+session, like the historical logs). `reason` is set while a
+        # model is dead/backing-off and points at the crashing session.
+        for m in req.models:
+            reason = m.get("reason")
+            sess = m.get("session")
+            model = m.get("model")
+            if reason and sess and model:
+                await rdb.set(
+                    f"wlog_crash:{req.app_id}:{_logs_slug(model)}:{sess}",
+                    str(reason)[:1024],
+                    ex=WLOG_SESSION_TTL,
+                )
     # Hand back any queued operator commands (kill/restart a member). One worker
     # per multi-model VM endpoint, so app-scoped is unambiguous; we pop them so
     # each command is delivered exactly once.

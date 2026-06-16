@@ -3,7 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import yaml from "js-yaml";
-import { CheckSquare, GitCompare, Inbox, LayoutGrid, List, Search, Trash2, X } from "lucide-react";
+import { CheckSquare, Download, GitCompare, Inbox, LayoutGrid, List, Search, Trash2, X } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkRecord } from "@/lib/types";
@@ -67,6 +68,8 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const [sort, setSort] = useState<SortDir>("newest");
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [exporting, setExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
   const [deleting, setDeleting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -109,6 +112,46 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
     const ids = Array.from(selected);
     if (ids.length < 2) return;
     router.push(`/benchmark/compare?ids=${ids.map(encodeURIComponent).join(",")}`);
+  };
+
+  // Download an export JSON for each selected benchmark, one by one. A small
+  // gap between downloads lets the browser flush each (large) file and avoids
+  // its "multiple downloads" throttle. Import them elsewhere via /benchmark/import.
+  const onExportSelected = async () => {
+    const ids = Array.from(selected);
+    if (ids.length === 0) return;
+    setExporting(true);
+    setExportProgress(0);
+    let ok = 0;
+    const failed: string[] = [];
+    for (const id of ids) {
+      try {
+        const data = await gateway.exportBenchmark(id);
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${id}.benchmark.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        ok += 1;
+      } catch (e) {
+        failed.push(id);
+        // keep going — one bad export shouldn't abort the batch
+        // eslint-disable-next-line no-console
+        console.error(`export ${id} failed`, e);
+      }
+      setExportProgress((p) => p + 1);
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    setExporting(false);
+    if (failed.length === 0) {
+      toast.success(`Downloaded ${ok} export${ok === 1 ? "" : "s"}`, { duration: 3000 });
+    } else {
+      toast.error(`Downloaded ${ok} of ${ids.length} — ${failed.length} failed`, { duration: 4000 });
+    }
   };
 
   const onRename = async () => {
@@ -271,7 +314,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
           <button
             type="button"
             onClick={exitSelect}
-            disabled={deleting}
+            disabled={deleting || exporting}
             className="inline-flex h-10 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm shadow-xs hover:bg-muted disabled:opacity-50"
           >
             <X className="h-4 w-4" /> Cancel
@@ -319,8 +362,20 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
           <div className="flex items-center gap-2">
             <button
               type="button"
+              onClick={onExportSelected}
+              disabled={selected.size === 0 || exporting || deleting}
+              title="Download an export JSON for each selected benchmark"
+              className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium shadow-xs hover:bg-muted disabled:opacity-50"
+            >
+              <Download className="h-3.5 w-3.5" />
+              {exporting
+                ? `Exporting ${exportProgress}/${selected.size}…`
+                : `Export ${selected.size > 0 ? selected.size : ""}`.trim()}
+            </button>
+            <button
+              type="button"
               onClick={onCompare}
-              disabled={selected.size < 2 || deleting}
+              disabled={selected.size < 2 || deleting || exporting}
               title={selected.size < 2 ? "Select 2 or more to compare" : "Compare selected"}
               className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium shadow-xs hover:bg-muted disabled:opacity-50"
             >
@@ -330,7 +385,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
             <button
               type="button"
               onClick={() => setConfirmOpen(true)}
-              disabled={selected.size === 0 || deleting}
+              disabled={selected.size === 0 || deleting || exporting}
               className="inline-flex items-center gap-1.5 rounded-md bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
               <Trash2 className="h-3.5 w-3.5" />

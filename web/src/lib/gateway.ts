@@ -297,6 +297,23 @@ export const gateway = {
     ),
   listBenchmarkFiles: (id: string) =>
     request<BenchmarkFile[]>(`/benchmarks/${encodeURIComponent(id)}/files`),
+  /** Self-contained export (results + config + embedded S3 files as base64) for
+   * moving a finished benchmark to another deployment. Returns the JSON object;
+   * the caller downloads it. Generous timeout — files are inlined. */
+  exportBenchmark: (id: string) =>
+    request<Record<string, unknown>>(
+      `/benchmarks/${encodeURIComponent(id)}/export`,
+      undefined,
+      120_000,
+    ),
+  /** Re-create a benchmark from an exported JSON (see exportBenchmark). Mints a
+   * new id, writes embedded files into this deployment's bucket. */
+  importBenchmark: (body: unknown) =>
+    request<BenchmarkRecord>(
+      "/benchmarks/import",
+      { method: "POST", body: JSON.stringify(body) },
+      180_000,
+    ),
   /** Browser EventSource URL for SSE log stream — proxied through Next so the
    * session cookie is translated to a Bearer token server-side. */
   benchmarkLogsStreamUrl: (id: string) =>

@@ -59,6 +59,8 @@ ACTIONS = {
     "benchmark.delete",
     "benchmark.terminate",
     "benchmark.rename",
+    "benchmark.export",
+    "benchmark.import",
     "compute.create",
     "compute.delete",
     "compute.idle_terminate",

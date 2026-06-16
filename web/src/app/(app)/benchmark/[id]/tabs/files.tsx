@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Download, RefreshCw } from "lucide-react";
+import { Download, Loader2, PackageOpen, RefreshCw } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkFile, BenchmarkRecord } from "@/lib/types";
@@ -9,6 +10,38 @@ import type { BenchmarkFile, BenchmarkRecord } from "@/lib/types";
 export function FilesTab({ bench }: { bench: BenchmarkRecord }) {
   const [files, setFiles] = useState<BenchmarkFile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+
+  // Download a self-contained export (results + config + S3 files) for importing
+  // into another deployment's dashboard via /benchmark/import.
+  async function onExport() {
+    setExporting(true);
+    try {
+      const data = await gateway.exportBenchmark(bench.id);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${bench.id}.benchmark.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      const omitted = Array.isArray((data as { files_omitted?: unknown[] }).files_omitted)
+        ? (data as { files_omitted: unknown[] }).files_omitted.length
+        : 0;
+      toast.success(
+        omitted > 0
+          ? `Exported (${omitted} file${omitted === 1 ? "" : "s"} omitted — over size cap)`
+          : "Benchmark exported",
+        { duration: 3000 },
+      );
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
 
   async function refresh() {
     try {
@@ -42,9 +75,15 @@ export function FilesTab({ bench }: { bench: BenchmarkRecord }) {
             S3 prefix: <span className="font-mono">{bench.s3_prefix}</span>
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={refresh}>
-          <RefreshCw className="h-4 w-4" /> Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" onClick={onExport} disabled={exporting}>
+            {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PackageOpen className="h-4 w-4" />}
+            Export
+          </Button>
+          <Button variant="outline" size="sm" onClick={refresh}>
+            <RefreshCw className="h-4 w-4" /> Refresh
+          </Button>
+        </div>
       </div>
 
       {error && (

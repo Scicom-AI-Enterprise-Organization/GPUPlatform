@@ -44,19 +44,16 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
   const range = req.headers.get("range");
   if (range) headers["Range"] = range;
 
-  const init: RequestInit = { method: req.method, headers };
+  const init: RequestInit & { duplex?: "half" } = { method: req.method, headers };
   if (req.method !== "GET" && req.method !== "HEAD") {
-    // Text bodies (JSON/form/etc.) forward as text; binary bodies (e.g. an
-    // uploaded audio clip) MUST forward as raw bytes — `req.text()` UTF-8-decodes
-    // and corrupts them.
-    const reqCt = (req.headers.get("content-type") ?? "").toLowerCase();
-    const reqIsText =
-      reqCt === "" ||
-      reqCt.startsWith("text/") ||
-      reqCt.includes("json") ||
-      reqCt.includes("xml") ||
-      reqCt.includes("x-www-form-urlencoded");
-    init.body = reqIsText ? await req.text() : await req.arrayBuffer();
+    // Stream the request body straight through instead of buffering it with
+    // req.text()/arrayBuffer(). Buffering truncated large uploads (a ~17MB
+    // benchmark import was cut to ~8MB → "Unterminated string" at the gateway)
+    // and UTF-8-decoding corrupted binary bodies. Forwarding the raw stream is
+    // byte-exact for both text and binary; undici requires duplex:"half" for a
+    // streamed request body.
+    init.body = req.body;
+    init.duplex = "half";
   }
 
   try {

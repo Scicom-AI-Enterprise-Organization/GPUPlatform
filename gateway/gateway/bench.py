@@ -305,6 +305,21 @@ def s3_get_text(key: str, target: Optional[S3Target] = None) -> Optional[str]:
         return None
 
 
+def s3_get_bytes(key: str, target: Optional[S3Target] = None) -> Optional[bytes]:
+    """Read an S3 object's raw bytes. Returns None if the key is missing."""
+    t = target or _env_s3_target()
+    try:
+        return _s3_client(t).get_object(Bucket=t.bucket, Key=key)["Body"].read()
+    except Exception:
+        return None
+
+
+def s3_put_bytes(key: str, data: bytes, target: Optional[S3Target] = None) -> None:
+    """Write raw bytes to S3."""
+    t = target or _env_s3_target()
+    _s3_client(t).put_object(Bucket=t.bucket, Key=key, Body=data)
+
+
 def s3_list(prefix: str, target: Optional[S3Target] = None) -> list[dict]:
     t = target or _env_s3_target()
     cli = _s3_client(t)
@@ -1470,6 +1485,47 @@ class FileRecord(BaseModel):
     download_url: str
 
 
+# ---- Portable export/import (move a finished benchmark between deployments) --
+# The export is a self-contained JSON: the DB row's results + config plus the
+# run's S3 artifacts inlined as base64, so the destination needs no access to
+# the source's bucket. Import re-creates the row + writes the files into the
+# destination's own benchmark bucket.
+
+EXPORT_KIND = "gpuplatform.benchmark.export"
+# Never embed control/secret artifacts (SSH keys, raw config) in the export.
+_EXPORT_SKIP_FILES = {"vm_key", "vm_key.pub", "rp_key", "rp_key.pub", "config.yaml"}
+_EXPORT_PER_FILE_CAP = 25 * 1024 * 1024   # 25 MiB per file
+_EXPORT_TOTAL_CAP = 50 * 1024 * 1024      # 50 MiB total embedded
+
+
+class ImportBenchmarkData(BaseModel):
+    name: str
+    config_yaml: str = ""
+    status: str = "done"
+    exit_code: Optional[int] = None
+    error_text: Optional[str] = None
+    result_json: Optional[dict] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    cost_per_hr: Optional[float] = None
+    env_vars: Optional[dict] = None
+    visible_devices: Optional[str] = None
+
+
+class ImportBenchmarkFile(BaseModel):
+    name: str          # path relative to the benchmark's S3 prefix
+    content_b64: str
+
+
+class ImportBenchmarkBody(BaseModel):
+    kind: str
+    version: int = 1
+    source_bench_id: Optional[str] = None
+    benchmark: ImportBenchmarkData
+    files: list[ImportBenchmarkFile] = []
+
+
 class TemplateRecord(BaseModel):
     id: str
     name: str
@@ -2354,3 +2410,151 @@ async def get_file_content(
         raise HTTPException(status_code=404, detail={"error": "file not found"})
     media = "application/json" if rel.endswith(".json") else "text/plain; charset=utf-8"
     return Response(content=txt, media_type=media)
+
+
+@router.get("/{bench_id}/export")
+async def export_benchmark(
+    bench_id: str,
+    include_files: bool = True,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Download a finished benchmark as a self-contained JSON: the DB row's
+    results + config, plus the run's S3 artifacts inlined as base64 (so the
+    destination needs no access to this instance's bucket). Pair with the
+    /benchmarks/import endpoint on another deployment."""
+    import base64
+
+    b = await session.get(Benchmark, bench_id)
+    if not b:
+        raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
+    if not user.is_admin and b.owner_id != user.id:
+        raise HTTPException(status_code=403, detail={"error": "forbidden"})
+
+    files: list[dict] = []
+    omitted: list[dict] = []
+    if include_files:
+        target = await _bench_s3_target(b.storage_id)
+        total = 0
+        for it in s3_list(b.s3_prefix, target=target):
+            key = it["key"]
+            rel = key[len(b.s3_prefix):] if key.startswith(b.s3_prefix) else key
+            base = rel.rsplit("/", 1)[-1]
+            if not rel or base in _EXPORT_SKIP_FILES:
+                continue
+            size = int(it.get("size") or 0)
+            if size > _EXPORT_PER_FILE_CAP or total + size > _EXPORT_TOTAL_CAP:
+                omitted.append({"name": rel, "size": size, "reason": "exceeds export size cap"})
+                continue
+            data = s3_get_bytes(key, target=target)
+            if data is None:
+                omitted.append({"name": rel, "size": size, "reason": "unreadable"})
+                continue
+            total += len(data)
+            files.append({"name": rel, "content_b64": base64.b64encode(data).decode("ascii")})
+
+    export = {
+        "kind": EXPORT_KIND,
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "source_bench_id": b.id,
+        "benchmark": {
+            "name": b.name,
+            "config_yaml": b.config_yaml,
+            "status": b.status,
+            "exit_code": b.exit_code,
+            "error_text": b.error_text,
+            "result_json": b.result_json,
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+            "started_at": b.started_at.isoformat() if b.started_at else None,
+            "ended_at": b.ended_at.isoformat() if b.ended_at else None,
+            "cost_per_hr": b.cost_per_hr,
+            "env_vars": b.env_vars,
+            "visible_devices": b.visible_devices,
+        },
+        "files": files,
+        "files_omitted": omitted,
+    }
+    await audit.record(
+        user, "benchmark.export", "benchmark", b.id, b.name,
+        details={"files": len(files), "omitted": len(omitted)},
+    )
+    return Response(
+        content=json.dumps(export),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{b.id}.benchmark.json"'},
+    )
+
+
+@router.post("/import", response_model=BenchmarkRecord)
+async def import_benchmark(
+    body: ImportBenchmarkBody,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Re-create a benchmark exported from another deployment. Mints a fresh id,
+    owns it as the importer, writes any embedded files into THIS deployment's
+    benchmark bucket, and stores results/config so the dashboard renders fully.
+    Instance-specific fields (provider/storage/secret) are intentionally dropped."""
+    import base64
+
+    if body.kind != EXPORT_KIND:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"not a benchmark export (kind={body.kind!r})"},
+        )
+    data = body.benchmark
+    new_id = _gen_id()
+    target = _env_s3_target()  # write into this deployment's own bucket
+    prefix = benchmark_s3_prefix(new_id, target)
+
+    written = 0
+    for f in body.files:
+        rel = (f.name or "").lstrip("/")
+        if not rel or ".." in rel:
+            continue
+        try:
+            raw = base64.b64decode(f.content_b64)
+        except Exception:
+            continue
+        try:
+            s3_put_bytes(f"{prefix}{rel}", raw, target=target)
+            written += 1
+        except Exception as e:
+            logger.warning("import %s: failed to write %s: %s", new_id, rel, e)
+
+    def _parse(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    b = Benchmark(
+        id=new_id,
+        name=(data.name or "imported")[:128],
+        config_yaml=data.config_yaml or "",
+        status=data.status or "done",
+        s3_prefix=prefix,
+        exit_code=data.exit_code,
+        error_text=data.error_text,
+        result_json=data.result_json,
+        owner_id=user.id,
+        created_at=_parse(data.created_at) or datetime.now(timezone.utc),
+        started_at=_parse(data.started_at),
+        ended_at=_parse(data.ended_at),
+        cost_per_hr=data.cost_per_hr,
+        provider_id=None,
+        storage_id=None,
+        env_vars=data.env_vars,
+        visible_devices=data.visible_devices,
+        hf_token_secret=None,
+    )
+    session.add(b)
+    await session.commit()
+    await audit.record(
+        user, "benchmark.import", "benchmark", new_id, b.name,
+        details={"source_bench_id": body.source_bench_id, "files_written": written},
+    )
+    return _to_record(b, user.username)

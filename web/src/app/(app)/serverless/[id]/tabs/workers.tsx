@@ -995,7 +995,7 @@ function FleetModelRow({
   );
 }
 
-type LogSession = { session: string; started_at: string; lines: number };
+type LogSession = { session: string; started_at: string; lines: number; crash?: string | null };
 
 function ModelLogs({ appId, model, onClose, label }: { appId: string; model: string; onClose: () => void; label?: string }) {
   const [lines, setLines] = useState<string[]>([]);
@@ -1096,7 +1096,7 @@ function ModelLogs({ appId, model, onClose, label }: { appId: string; model: str
               <SelectItem value="live" className="text-xs">Live</SelectItem>
               {sessions.map((s) => (
                 <SelectItem key={s.session} value={s.session} className="text-xs">
-                  {s.started_at} ({s.lines})
+                  {s.crash ? "⚠ " : ""}{s.started_at} ({s.lines})
                 </SelectItem>
               ))}
             </SelectContent>
@@ -1120,6 +1120,15 @@ function ModelLogs({ appId, model, onClose, label }: { appId: string; model: str
           </Button>
         </div>
       </div>
+
+      {(() => {
+        const crash = sel ? sessions.find((s) => s.session === sel)?.crash : null;
+        return crash ? (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+            <span className="font-medium">⚠ This launch crashed:</span> {crash}
+          </div>
+        ) : null;
+      })()}
 
       {err ? (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">

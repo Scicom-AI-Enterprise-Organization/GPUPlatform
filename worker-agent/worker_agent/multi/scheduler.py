@@ -35,6 +35,15 @@ HEALTH_FAIL_LIMIT = 3
 # Keep this many timestamped per-launch log files per member on disk (a high
 # safety cap so many relaunches can't fill the VM); oldest beyond it are pruned.
 LOG_RETAIN = int(os.environ.get("VLLM_LOG_RETAIN", "50") or "50")
+# Crash auto-recovery: relaunch a dead engine up to MAX_RELAUNCH times, with
+# EXPONENTIAL BACKOFF between attempts (base * 2^n, capped) — so we don't hammer
+# a model that's crash-looping (e.g. a wake-OOM) every tick. After the budget is
+# spent the member is left DEAD with its distilled reason. A model that stays
+# healthy for HEALTHY_RESET_TICKS probes gets its budget reset (fresh incidents).
+MAX_RELAUNCH = int(os.environ.get("VLLM_MAX_RELAUNCH", "6") or "6")
+RELAUNCH_BACKOFF_BASE_S = float(os.environ.get("VLLM_RELAUNCH_BACKOFF_BASE_S", "15") or "15")
+RELAUNCH_BACKOFF_CAP_S = float(os.environ.get("VLLM_RELAUNCH_BACKOFF_CAP_S", "600") or "600")
+HEALTHY_RESET_TICKS = int(os.environ.get("VLLM_HEALTHY_RESET_TICKS", "6") or "6")
 
 
 class ModelState(str, enum.Enum):
@@ -74,6 +83,9 @@ class ModelRuntime:
         self.reason: str | None = None  # human cause when state == DEAD
         self.load_idx = 0  # position in the startup load order (for "in N queue")
         self.health_fail = 0  # consecutive failed /health probes (monitor_loop)
+        self.healthy_streak = 0  # consecutive healthy probes; resets the crash budget
+        self.retry_pending = False  # a crash backoff is in flight (monitor relaunches at next_retry_ts)
+        self.next_retry_ts = 0.0  # monotonic time the next backoff relaunch is due
 
     @property
     def base_url(self) -> str:
@@ -161,6 +173,7 @@ class MultiModelScheduler:
             rt.reason = "stopped by operator (kill)"
             rt.inflight = 0
             rt.swapping = False
+            rt.retry_pending = False  # operator kill is intentional — no auto-relaunch
             self._cond.notify_all()
         await launcher.terminate(old)
 
@@ -179,6 +192,8 @@ class MultiModelScheduler:
             rt.inflight = 0
             rt.swapping = False
             rt.restart_count = 0
+            rt.retry_pending = False  # fresh start — drop any pending backoff
+            rt.healthy_streak = 0
             self._cond.notify_all()
         await launcher.terminate(old)
         await self._launch_and_sleep(rt)
@@ -220,11 +235,47 @@ class MultiModelScheduler:
         """Set DEAD and distill a human reason from the model's vLLM log (best
         effort). Call under the Condition."""
         rt.state = ModelState.DEAD
+        rt.retry_pending = False
         if rt.log_path:
             try:
                 rt.reason = launcher.read_failure_reason(rt.log_path) or rt.reason
             except Exception:
                 logger.exception("reading failure reason for %s", rt.member.model)
+        self._cond.notify_all()
+
+    def _crash_reason(self, rt: ModelRuntime) -> "str | None":
+        """Distill the crashing engine's WHY (CUDA OOM, bad arg, …) from its log."""
+        if not rt.log_path:
+            return None
+        try:
+            return launcher.read_failure_reason(rt.log_path)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _schedule_retry_or_die(self, rt: ModelRuntime, cause: str) -> None:
+        """A launch/engine died. Either schedule a PATIENT (exponential-backoff)
+        relaunch or, once MAX_RELAUNCH is spent, leave it DEAD. Call under the
+        Condition; the corpse must already be terminated. Sets a human `reason`
+        (the distilled crash + the retry plan) for the UI + per-session storage.
+        While waiting it's DEAD so acquire() fails fast — the monitor relaunches
+        it via `retry_pending` when `next_retry_ts` elapses (not a permanent die)."""
+        crash = self._crash_reason(rt)
+        prefix = (crash + " ") if crash else ""
+        rt.inflight = 0
+        rt.swapping = False
+        rt.healthy_streak = 0
+        rt.state = ModelState.DEAD
+        if rt.restart_count >= MAX_RELAUNCH:
+            rt.retry_pending = False
+            rt.reason = f"{prefix}(crashed: {cause}; gave up after {MAX_RELAUNCH} relaunches — restart it from the Workers tab)"
+            logger.error("%s: gave up after %d relaunches (%s)", rt.member.model, MAX_RELAUNCH, cause)
+        else:
+            delay = min(RELAUNCH_BACKOFF_BASE_S * (2 ** rt.restart_count), RELAUNCH_BACKOFF_CAP_S)
+            rt.retry_pending = True
+            rt.next_retry_ts = time.monotonic() + delay
+            rt.reason = f"{prefix}(crashed: {cause}; auto-retry {rt.restart_count + 1}/{MAX_RELAUNCH} in ~{int(delay)}s)"
+            logger.warning("%s died (%s); auto-retry %d/%d in ~%.0fs",
+                           rt.member.model, cause, rt.restart_count + 1, MAX_RELAUNCH, delay)
         self._cond.notify_all()
 
     # ---- lifecycle --------------------------------------------------------
@@ -365,11 +416,12 @@ class MultiModelScheduler:
                 ok = await launcher.wait_health(self._client, rt.member, rt.proc, log_path=rt.log_path)
                 if not ok:
                     # Kill the failed/hung engine so it can't leak and keep holding
-                    # GPU/CPU after we give up on it.
+                    # GPU/CPU, then schedule a patient backoff relaunch (or give up).
                     await launcher.terminate(rt.proc)
-                    async with self._cond:
-                        self._mark_dead(rt)
+                    rt.proc = None
                     rt.pgid = None
+                    async with self._cond:
+                        self._schedule_retry_or_die(rt, "engine did not become healthy on launch")
                     self._dump_pids()
                     return
                 # Only sleep a member whose GPUs ANOTHER member also wants — that's
@@ -393,12 +445,13 @@ class MultiModelScheduler:
                 # Re-dump now that the tp workers have spawned, so the recorded
                 # group includes every child.
                 self._dump_pids()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
             logger.exception("launch_and_sleep failed for %s", rt.member.model)
             await launcher.terminate(rt.proc)
-            async with self._cond:
-                self._mark_dead(rt)
+            rt.proc = None
             rt.pgid = None
+            async with self._cond:
+                self._schedule_retry_or_die(rt, f"launch error: {type(e).__name__}")
             self._dump_pids()
 
     # ---- routing / admission ---------------------------------------------
@@ -534,44 +587,57 @@ class MultiModelScheduler:
         """
         while not drain_event.is_set():
             for rt in self._runtimes:
+                # (0) A crash backoff is pending → relaunch once the patience timer
+                # elapses. Checked BEFORE the DEAD skip: a backing-off model is DEAD
+                # (acquire() fails fast) but is NOT a permanent give-up.
+                if rt.retry_pending:
+                    if time.monotonic() < rt.next_retry_ts:
+                        continue
+                    async with self._cond:
+                        rt.retry_pending = False
+                        rt.state = ModelState.LAUNCHING
+                        rt.reason = None
+                        rt.health_fail = 0
+                        self._cond.notify_all()
+                    rt.restart_count += 1
+                    logger.warning("relaunching %s (backoff attempt %d/%d)",
+                                   rt.member.model, rt.restart_count, MAX_RELAUNCH)
+                    await self._launch_and_sleep(rt)  # success → AWAKE/ASLEEP; fail → schedules next backoff
+                    continue
                 proc = rt.proc
                 if proc is None or rt.state == ModelState.DEAD:
                     continue
                 died = proc.returncode is not None
-                cause = f"rc={proc.returncode}"
+                cause = f"exited rc={proc.returncode}"
                 # Engine-liveness probe — only on settled states (a wake/sleep/
                 # launch in flight is allowed to be briefly unresponsive).
                 if not died and rt.state in (ModelState.AWAKE, ModelState.ASLEEP):
                     if await vllm_ctl.is_healthy(self._client, rt.base_url):
                         rt.health_fail = 0
+                        rt.healthy_streak += 1
+                        # Sustained health → recovered; reset the crash budget so a
+                        # later, unrelated incident gets its own full set of retries.
+                        if rt.restart_count and rt.healthy_streak >= HEALTHY_RESET_TICKS:
+                            rt.restart_count = 0
                     else:
                         rt.health_fail += 1
+                        rt.healthy_streak = 0
                         if rt.health_fail >= HEALTH_FAIL_LIMIT:
                             died = True
                             cause = f"engine unresponsive ({rt.health_fail}× /health)"
                 if not died:
                     continue
-                logger.warning("vllm for %s died (%s); relaunching", rt.member.model, cause)
-                async with self._cond:
-                    rt.state = ModelState.LAUNCHING
-                    rt.inflight = 0
-                    rt.swapping = False
-                    rt.reason = None
-                    rt.health_fail = 0
-                    self._cond.notify_all()
-                # Engine wedged (process alive but unresponsive)? Group-kill it so
-                # it stops holding GPU memory before we reload — else the relaunch
+                # Engine wedged (process alive but unresponsive)? Group-kill it so it
+                # stops holding GPU memory before any relaunch — else the relaunch
                 # OOMs against the corpse. Harmless no-op once the process exited.
                 if proc.returncode is None:
                     await launcher.terminate(proc)
-                    rt.proc = None
-                    rt.pgid = None
-                if rt.restart_count < 5:
-                    rt.restart_count += 1
-                    await self._launch_and_sleep(rt)
-                else:
-                    async with self._cond:
-                        self._mark_dead(rt)
+                rt.proc = None
+                rt.pgid = None
+                # Schedule a PATIENT backoff relaunch (or give up after the budget) —
+                # captures the crash reason (CUDA OOM, …) into rt.reason per session.
+                async with self._cond:
+                    self._schedule_retry_or_die(rt, cause)
             # Refresh the persisted engine groups: picks up tp workers that
             # spawned after launch and drops any engine that has since died.
             self._dump_pids()
@@ -602,6 +668,9 @@ class MultiModelScheduler:
                 "last_used_ts": rt.last_used or None,
                 "reason": rt.reason,
                 "port": rt.member.port,
+                # The launch session `reason` refers to (the crashing log file) so
+                # the gateway can persist the crash reason per session for history.
+                "session": launcher.session_of(rt.log_path),
             }
             for rt in self._runtimes
         ]

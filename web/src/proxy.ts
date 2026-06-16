@@ -41,5 +41,9 @@ export default function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  // Exclude `api` so API requests never traverse the middleware/Edge layer —
+  // that layer caps the request body (~8 MB), which truncated large benchmark
+  // imports through /api/proxy. Middleware only guards page routes (bouncing
+  // signed-in users off /login,/register), so skipping /api is safe.
+  matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"],
 };
