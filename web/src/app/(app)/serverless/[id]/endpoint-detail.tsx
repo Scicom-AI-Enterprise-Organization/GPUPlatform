@@ -23,6 +23,7 @@ import { RequestsTab } from "./tabs/requests";
 import { StressTab } from "./tabs/stress";
 import { QueueTab } from "./tabs/queue";
 import { WorkersTab } from "./tabs/workers";
+import { VisualTab } from "./tabs/visual";
 import { MetricsTab } from "./tabs/metrics";
 
 const TABS = [
@@ -31,6 +32,7 @@ const TABS = [
   { value: "stress", label: "Stress test" },
   { value: "queue", label: "Queue" },
   { value: "workers", label: "Workers" },
+  { value: "visual", label: "Visual" },
   { value: "metrics", label: "Metrics" },
 ] as const;
 
@@ -194,6 +196,7 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
           <TabsContent value="stress"><StressTab app={app} /></TabsContent>
           <TabsContent value="queue"><QueueTab app={app} /></TabsContent>
           <TabsContent value="workers"><WorkersTab app={app} /></TabsContent>
+          <TabsContent value="visual"><VisualTab app={app} /></TabsContent>
           <TabsContent value="metrics"><MetricsTab app={app} /></TabsContent>
         </Tabs>
       </div>
