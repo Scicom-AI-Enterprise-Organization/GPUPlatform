@@ -57,6 +57,13 @@ type Parsed = {
     model?: { repo_id?: string; local_dir?: string };
     serve?: Record<string, unknown>;
     bench?: Array<Record<string, unknown>>;
+    accuracy?: {
+      datasets?: unknown[];
+      limit?: number;
+      concurrency?: number;
+      languages?: string[];
+      max_tokens?: number;
+    };
     results?: Record<string, unknown>;
   }>;
 };
@@ -115,6 +122,9 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
   const serve = (first.serve ?? {}) as Record<string, unknown>;
   const benchEntries = (first.bench ?? []) as Array<Record<string, unknown>>;
   const totalRuns = benchEntries.length;
+  // Accuracy runs carry an `accuracy:` block instead of `bench:` rows.
+  const accuracy = first.accuracy ?? null;
+  const isAccuracy = !!accuracy;
 
   // Sweep dimensions — extract unique values across bench[] for input/output/concurrency.
   const inputLens = uniqueNums(benchEntries, "random_input_len");
@@ -285,6 +295,44 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
         )}
       </ParamsCard>
 
+      {isAccuracy ? (
+        <ParamsCard
+          icon={<Gauge className="h-4 w-4" />}
+          title="Accuracy eval"
+          description="Quality eval — serves the model and scores datasets. No throughput rows."
+          action={
+            <Badge variant="default" className="font-mono text-[10px]">
+              accuracy
+            </Badge>
+          }
+        >
+          <KvGrid>
+            <Kv label="Samples / dataset" value={accuracy?.limit} />
+            <Kv label="Concurrency" value={accuracy?.concurrency} />
+            <Kv label="Max tokens" value={accuracy?.max_tokens} />
+          </KvGrid>
+          <Detail label="Datasets">
+            <div className="flex flex-wrap gap-1">
+              {(accuracy?.datasets ?? []).map((d, i) => (
+                <Badge key={i} variant="secondary" className="font-mono text-[10px]">
+                  {datasetLabel(d)}
+                </Badge>
+              ))}
+            </div>
+          </Detail>
+          {accuracy?.languages && accuracy.languages.length > 0 && (
+            <Detail label="MMLU languages">
+              <div className="flex flex-wrap gap-1">
+                {accuracy.languages.map((l) => (
+                  <Badge key={l} variant="secondary" className="font-mono text-[10px]">
+                    {l}
+                  </Badge>
+                ))}
+              </div>
+            </Detail>
+          )}
+        </ParamsCard>
+      ) : (
       <ParamsCard
         icon={<Gauge className="h-4 w-4" />}
         title="Workload"
@@ -383,6 +431,7 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
           </KvGrid>
         )}
       </ParamsCard>
+      )}
 
       <ParamsCard
         icon={<Settings2 className="h-4 w-4" />}
@@ -409,6 +458,15 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
       <RawYamlBlock yaml={bench.config_yaml} />
     </div>
   );
+}
+
+function datasetLabel(d: unknown): string {
+  if (typeof d === "string") return d;
+  if (d && typeof d === "object" && "name" in d) {
+    const o = d as { name?: unknown; config?: unknown };
+    return o.config ? `${String(o.name)} (${String(o.config)})` : String(o.name);
+  }
+  return String(d);
 }
 
 function uniqueNums(rows: Array<Record<string, unknown>>, key: string): number[] {

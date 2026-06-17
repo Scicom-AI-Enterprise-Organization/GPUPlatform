@@ -35,6 +35,12 @@ const gib = (mib: number) => (mib / 1024).toFixed(1);
 // MB/s → "1.2 GB/s" / "430 MB/s" (0 = "—").
 const mbps = (v: number) =>
   v <= 0 ? "—" : v >= 1000 ? `${(v / 1000).toFixed(2)} GB/s` : `${v.toFixed(0)} MB/s`;
+// bytes → "1.42 TiB" / "729 GiB" / "12 MiB".
+const fmtBytes = (b: number) =>
+  b >= 1_099_511_627_776 ? `${(b / 1_099_511_627_776).toFixed(2)} TiB`
+  : b >= 1_073_741_824 ? `${(b / 1_073_741_824).toFixed(0)} GiB`
+  : b >= 1_048_576 ? `${(b / 1_048_576).toFixed(0)} MiB`
+  : `${b} B`;
 // htop-style core load colour: green (idle) → amber (busy) → red (saturated).
 const coreColor = (p: number) => (p >= 85 ? "#ef4444" : p >= 50 ? "#f59e0b" : "#10b981");
 
@@ -211,6 +217,42 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
             </CardContent>
           </Card>
         </div>
+      )}
+
+      {m && m.disks && m.disks.length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <HardDrive className="h-4 w-4 text-amber-600 dark:text-amber-400" /> Disk
+              <span className="ml-auto text-xs font-normal text-muted-foreground">
+                {m.disks.length} filesystem{m.disks.length === 1 ? "" : "s"}
+              </span>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {m.disks.map((d) => {
+              const pct = d.total_bytes > 0 ? (d.used_bytes / d.total_bytes) * 100 : 0;
+              const full = pct >= 90;
+              return (
+                <div key={d.mount}>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-mono">{d.mount}</span>
+                    <span className="font-mono tabular-nums text-muted-foreground">
+                      {fmtBytes(d.used_bytes)} / {fmtBytes(d.total_bytes)} ·{" "}
+                      <span className={cn(full ? "text-destructive" : "text-foreground")}>{pct.toFixed(0)}%</span>
+                    </span>
+                  </div>
+                  <div className="mt-1 h-2 overflow-hidden rounded bg-muted">
+                    <div
+                      className={cn("h-full rounded", full ? "bg-destructive" : "bg-amber-500")}
+                      style={{ width: `${Math.min(100, pct)}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </CardContent>
+        </Card>
       )}
 
       {m && m.cpu_cores.length > 0 && (

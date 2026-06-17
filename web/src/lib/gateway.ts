@@ -319,6 +319,13 @@ export const gateway = {
       { method: "POST", body: JSON.stringify(body) },
       180_000,
     ),
+  /** Mint a public, no-auth comparison share link for a set of benchmark ids.
+   * Returns the share token; the public page lives at /share/compare/{token}. */
+  createBenchmarkShare: (ids: string[], notes = "", pairing: Record<string, string> = {}) =>
+    request<{ token: string }>("/benchmarks/share", {
+      method: "POST",
+      body: JSON.stringify({ ids, notes, pairing }),
+    }),
   /** Browser EventSource URL for SSE log stream — proxied through Next so the
    * session cookie is translated to a Bearer token server-side. */
   benchmarkLogsStreamUrl: (id: string) =>

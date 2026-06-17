@@ -142,6 +142,12 @@ class GpuMetricInfo(BaseModel):
     processes: list[GpuProcInfo] = []
 
 
+class DiskInfo(BaseModel):
+    mount: str
+    used_bytes: int
+    total_bytes: int
+
+
 class ProviderMetricsResponse(BaseModel):
     """Live VM host metrics for the provider metrics page (polled, not stored)."""
     ok: bool
@@ -151,6 +157,7 @@ class ProviderMetricsResponse(BaseModel):
     mem_used_mib: int = 0
     mem_total_mib: int = 0
     gpus: list[GpuMetricInfo] = []
+    disks: list[DiskInfo] = []     # real filesystems (df), largest first
     checked_at: float
 
 
@@ -657,6 +664,8 @@ async def provider_metrics(
             nvlink_gbps=g.nvlink_gbps,
             processes=[GpuProcInfo(pid=p.pid, comm=p.comm, cmd=p.cmd) for p in g.processes],
         ) for g in result.gpus],
+        disks=[DiskInfo(mount=d.mount, used_bytes=d.used_bytes, total_bytes=d.total_bytes)
+               for d in result.disks],
         checked_at=result.checked_at,
     )
 

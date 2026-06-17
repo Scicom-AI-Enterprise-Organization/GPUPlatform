@@ -55,14 +55,18 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   return (
     <SidebarStateProvider>
       <TerminalThemeInit />
-      <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-        <div className="flex min-h-0 flex-1">
-          <ConsoleSidebar
-            isAdmin={isAdmin}
-            disabled={disabled}
-            counts={counts}
-          />
-          <main className="min-w-0 flex-1 overflow-y-auto scrollbar-thin">
+      <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground print:h-auto print:overflow-visible">
+        <div className="flex min-h-0 flex-1 print:block print:min-h-0">
+          {/* `contents` keeps the sidebar a flex child on screen; `print:hidden`
+              drops it from printed pages / PDF export so only the page prints. */}
+          <div className="contents print:hidden">
+            <ConsoleSidebar
+              isAdmin={isAdmin}
+              disabled={disabled}
+              counts={counts}
+            />
+          </div>
+          <main className="min-w-0 flex-1 overflow-y-auto scrollbar-thin print:overflow-visible">
             {children}
           </main>
         </div>

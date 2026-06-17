@@ -586,3 +586,23 @@
 }
 
 /* (print stylesheet removed with the Usage Reports feature) */
+
+/* ---- Print / "Export to PDF" ---------------------------------------------
+   PDF export uses the browser's own print engine (window.print) so the output
+   matches the page exactly. Keep the dark-theme colours, drop interactive
+   controls, and let content flow across pages. */
+@media print {
+  *,
+  *::before,
+  *::after {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+  .no-print,
+  [data-html2canvas-ignore] {
+    display: none !important;
+  }
+  @page {
+    margin: 10mm;
+  }
+}

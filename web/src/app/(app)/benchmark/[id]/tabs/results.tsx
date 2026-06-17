@@ -11,7 +11,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { ChevronDown, ChevronRight, Loader2, RefreshCw, TrendingUp, Zap, Clock, Activity } from "lucide-react";
+import { ChevronDown, ChevronRight, Loader2, RefreshCw, TrendingUp, Zap, Clock, Activity, Target } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -21,7 +21,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { BenchmarkRecord } from "@/lib/types";
+import type { BenchAccuracyResult, BenchmarkRecord } from "@/lib/types";
 import {
   bestBy,
   fetchBenchRows,
@@ -99,6 +99,17 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bench.id, bench.status]);
 
+  // Accuracy-mode results live on the record (folded in from @@ACCURACY lines),
+  // not in the S3 result.json rows the speed view fetches.
+  const accuracy = useMemo<BenchAccuracyResult[]>(() => {
+    const raw = (bench.result_json as Record<string, unknown> | null | undefined)?.accuracy;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      (a): a is BenchAccuracyResult =>
+        !!a && typeof a === "object" && typeof (a as BenchAccuracyResult).accuracy === "number",
+    );
+  }, [bench.result_json]);
+
   const inputLens = useMemo(() => {
     if (!rows) return [];
     return Array.from(new Set(rows.map((r) => r.input_len))).sort((a, b) => a - b);
@@ -127,6 +138,10 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
   }
 
   if (!rows || rows.length === 0) {
+    // Accuracy runs have no benchmaq result.json rows — show the quality view.
+    if (accuracy.length > 0) {
+      return <AccuracyResults accuracy={accuracy} onRefresh={refresh} loading={loading} />;
+    }
     return (
       <div className="rounded-md border border-dashed border-border px-6 py-12 text-center text-sm text-muted-foreground">
         {bench.status === "done" || bench.status === "failed"
@@ -137,7 +152,7 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
   }
 
   // Best-of cards (always show, single result OR sweep).
-  const bestThroughput = bestBy(rows, (r) => r.output_throughput);
+  const bestThroughput = bestBy(rows, (r) => r.total_token_throughput);
   const bestTtft = bestBy(rows, (r) => r.median_ttft_ms, /*lower=*/ true);
   const bestTpot = bestBy(rows, (r) => r.median_tpot_ms, /*lower=*/ true);
 
@@ -145,6 +160,9 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
 
   return (
     <div className="space-y-6">
+      {accuracy.length > 0 && (
+        <AccuracyResults accuracy={accuracy} onRefresh={refresh} loading={loading} />
+      )}
       <div className="flex items-end justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold">Results</h2>
@@ -172,11 +190,15 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <KpiCard
           icon={<Zap className="h-4 w-4" />}
-          label="Best throughput"
-          value={bestThroughput ? `${bestThroughput.output_throughput!.toFixed(1)} tok/s` : "—"}
+          label="Best throughput (total)"
+          value={
+            bestThroughput?.total_token_throughput != null
+              ? `${Math.round(bestThroughput.total_token_throughput).toLocaleString()} tok/s`
+              : "—"
+          }
           sub={
             bestThroughput
-              ? `c=${bestThroughput.concurrency} · in=${bestThroughput.input_len}`
+              ? `${bestThroughput.output_throughput?.toFixed(1) ?? "—"} out/s · c=${bestThroughput.concurrency} · in=${bestThroughput.input_len}`
               : undefined
           }
         />
@@ -309,6 +331,174 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+// IQ-vs-speed view for accuracy runs. Each point is a (config × dataset):
+// X = decode tok/s (the same speed axis as the throughput bench, measured over
+// the eval requests), Y = accuracy %. Series are coloured by dataset so a
+// multi-config run reads as "lower precision → further right; did quality hold?"
+function AccuracyResults({
+  accuracy,
+  onRefresh,
+  loading,
+}: {
+  accuracy: BenchAccuracyResult[];
+  onRefresh: () => void;
+  loading: boolean;
+}) {
+  const best = bestByAcc(accuracy);
+  const fastest = accuracy.reduce<BenchAccuracyResult | null>(
+    (acc, a) => (a.output_tok_s != null && (!acc || (a.output_tok_s ?? 0) > (acc.output_tok_s ?? 0)) ? a : acc),
+    null,
+  );
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-end justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">Accuracy</h2>
+          <p className="text-xs text-muted-foreground">
+            {accuracy.length} eval{accuracy.length === 1 ? "" : "s"} · quality vs decode speed
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
+          {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          Refresh
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <KpiCard
+          icon={<Target className="h-4 w-4" />}
+          label="Best accuracy"
+          value={best ? `${(best.accuracy * 100).toFixed(1)}%` : "—"}
+          sub={best ? `${best.config} · ${best.dataset}` : undefined}
+        />
+        <KpiCard
+          icon={<Zap className="h-4 w-4" />}
+          label="Fastest config"
+          value={fastest?.output_tok_s != null ? `${fastest.output_tok_s.toFixed(0)} tok/s` : "—"}
+          sub={fastest ? `${fastest.config} · ${(fastest.accuracy * 100).toFixed(1)}%` : undefined}
+        />
+      </div>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm">Accuracy detail</CardTitle>
+          <CardDescription className="text-xs">
+            Per config × dataset. Accuracy is exact-match (GSM8K) / single-letter (MMLU).
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="px-0 pb-0">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-muted/40">
+                <tr>
+                  <th className="px-3 py-2 text-left text-xs uppercase tracking-wide text-muted-foreground">config</th>
+                  <th className="px-3 py-2 text-left text-xs uppercase tracking-wide text-muted-foreground">dataset</th>
+                  <th className="px-3 py-2 text-right text-xs uppercase tracking-wide text-muted-foreground">accuracy</th>
+                  <th className="px-3 py-2 text-right text-xs uppercase tracking-wide text-muted-foreground">correct / n</th>
+                  <th className="px-3 py-2 text-right text-xs uppercase tracking-wide text-muted-foreground">tok/s</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {accuracy.map((a, i) => (
+                  <tr key={`${a.config}-${a.dataset}-${i}`}>
+                    <td className="px-3 py-1.5 font-mono text-xs">{a.config}</td>
+                    <td className="px-3 py-1.5 font-mono text-xs">{a.dataset}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">{(a.accuracy * 100).toFixed(1)}%</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
+                      {a.correct ?? "—"} / {a.n}
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">{fmt(a.output_tok_s ?? null, 0)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Full metric breakdown for evals that report more than a single accuracy
+          (e.g. Function-Call-TaaS). One card per such eval, every metric shown. */}
+      {accuracy
+        .filter((a) => a.metrics && typeof a.metrics === "object")
+        .map((a, i) => (
+          <MetricsCard key={`metrics-${a.config}-${a.dataset}-${i}`} entry={a} />
+        ))}
+    </div>
+  );
+}
+
+// All metrics for a single eval (config × dataset) that emitted a `metrics` bag
+// — surfaces every field (Function-Call-TaaS reports ~14 + a counts breakdown),
+// not just the headline accuracy in the table above.
+function MetricsCard({ entry }: { entry: BenchAccuracyResult }) {
+  const m = (entry.metrics ?? {}) as Record<string, unknown>;
+  const counts =
+    m._counts && typeof m._counts === "object"
+      ? (m._counts as Record<string, unknown>)
+      : null;
+  const rows = Object.entries(m).filter(([k]) => k !== "_counts");
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm">{entry.dataset} — all metrics</CardTitle>
+        <CardDescription className="text-xs">
+          {entry.config} · n={entry.n}
+          {entry.errors ? ` · ${entry.errors} errors` : ""}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3 lg:grid-cols-4">
+          {rows.map(([k, v]) => (
+            <div key={k}>
+              <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                {metricLabel(k)}
+              </div>
+              <div className="text-sm font-semibold tabular-nums">{fmtAccVal(v)}</div>
+            </div>
+          ))}
+        </div>
+        {counts && Object.keys(counts).length > 0 && (
+          <div className="mt-4 border-t border-border pt-3">
+            <div className="mb-1.5 text-[11px] uppercase tracking-wide text-muted-foreground">
+              counts
+            </div>
+            <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
+              {Object.entries(counts).map(([k, v]) => (
+                <span key={k}>
+                  <span className="font-medium tabular-nums text-foreground">{String(v)}</span>{" "}
+                  {metricLabel(k)}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// "tool_call_f1" → "tool call F1"; "json_valid_rate" → "json valid rate".
+function metricLabel(k: string): string {
+  return k.replace(/_/g, " ").replace(/\bf1\b/gi, "F1").trim();
+}
+
+// Rates (0..1) render as a percentage; out-of-range numbers raw; null → "—".
+function fmtAccVal(v: unknown): string {
+  if (v == null) return "—";
+  if (typeof v === "number")
+    return Math.abs(v) <= 1 ? `${(v * 100).toFixed(1)}%` : v.toFixed(2);
+  if (typeof v === "boolean") return v ? "yes" : "no";
+  return String(v);
+}
+
+function bestByAcc(rows: BenchAccuracyResult[]): BenchAccuracyResult | null {
+  return rows.reduce<BenchAccuracyResult | null>(
+    (acc, r) => (!acc || r.accuracy > acc.accuracy ? r : acc),
+    null,
   );
 }
 
@@ -474,6 +664,7 @@ function SweepChart({
 type SortKey =
   | "input_len"
   | "concurrency"
+  | "total_token_throughput"
   | "output_throughput"
   | "ttft"
   | "tpot"
@@ -536,7 +727,7 @@ const METRIC_GROUPS: { title: string; keys: string[] }[] = [
   { title: "End-to-end latency", keys: ["mean_e2el_ms", "median_e2el_ms", "std_e2el_ms", "p99_e2el_ms"] },
 ];
 
-function fmtMetric(key: string, v: number): string {
+function fmtRunMetric(key: string, v: number): string {
   // Token/request counts are integers; everything else gets 2 decimals.
   if (
     key.endsWith("_tokens") ||
@@ -581,7 +772,7 @@ function RunMetricsPanel({ row }: { row: Row }) {
             {g.items.map((it) => (
               <div key={it.key} className="flex items-baseline justify-between gap-3 text-xs">
                 <dt className="text-muted-foreground">{it.label}</dt>
-                <dd className="font-mono tabular-nums">{fmtMetric(it.key, it.value)}</dd>
+                <dd className="font-mono tabular-nums">{fmtRunMetric(it.key, it.value)}</dd>
               </div>
             ))}
           </dl>
@@ -608,6 +799,7 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
       switch (sortKey) {
         case "input_len": return r.input_len;
         case "concurrency": return r.concurrency;
+        case "total_token_throughput": return r.total_token_throughput ?? -Infinity;
         case "output_throughput": return r.output_throughput ?? -Infinity;
         case "ttft": return statPick(r, "ttft", statMode) ?? Infinity;
         case "tpot": return statPick(r, "tpot", statMode) ?? Infinity;
@@ -646,7 +838,8 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
             <th className="w-8 px-2 py-2" />
             {header("input_len", "input_len", "left")}
             {header("concurrency", "concurrency")}
-            {header("throughput (tok/s)", "output_throughput")}
+            {header("total tok/s", "total_token_throughput")}
+            {header("output tok/s", "output_throughput")}
             {header(`TTFT (${statMode})`, "ttft")}
             {header(`TPOT (${statMode})`, "tpot")}
             {header(`ITL (${statMode})`, "itl")}
@@ -674,6 +867,11 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
                   <td className="px-3 py-1.5 font-mono text-xs">in={r.input_len} · out={r.output_len}</td>
                   <td className="px-3 py-1.5 text-right font-mono text-xs">{r.concurrency}</td>
                   <td className="px-3 py-1.5 text-right tabular-nums">
+                    {r.total_token_throughput != null
+                      ? Math.round(r.total_token_throughput).toLocaleString()
+                      : "—"}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">
                     {fmt(r.output_throughput, 1)}
                   </td>
                   <td className="px-3 py-1.5 text-right tabular-nums">
@@ -694,7 +892,7 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
                 </tr>
                 {isOpen && (
                   <tr>
-                    <td colSpan={9} className="p-0">
+                    <td colSpan={10} className="p-0">
                       <RunMetricsPanel row={r} />
                     </td>
                   </tr>

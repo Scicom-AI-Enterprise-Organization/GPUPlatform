@@ -229,6 +229,13 @@ class GpuMetric:
 
 
 @dataclass
+class DiskMetric:
+    mount: str
+    used_bytes: int
+    total_bytes: int
+
+
+@dataclass
 class VmMetricsResult:
     ok: bool
     message: str
@@ -238,6 +245,7 @@ class VmMetricsResult:
     gpus: list[GpuMetric]
     checked_at: float
     cpu_cores: list[float] = field(default_factory=list)  # per-core busy % (htop-style)
+    disks: list[DiskMetric] = field(default_factory=list)  # real filesystems (df), largest first
 
 
 # Two /proc/stat samples (CPU%), /proc/meminfo (RAM), nvidia-smi (GPUs) — one shot.
@@ -262,7 +270,11 @@ _METRICS_CMD = (
     "comm=$(cat /proc/$p/comm 2>/dev/null); "
     "cmd=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-110); "
     "echo \"$p|$cvd|$comm|$cmd\"; "
-    "done 2>/dev/null"
+    "done 2>/dev/null; "
+    # Disk: real filesystems only (skip virtual mounts), bytes used + total.
+    # Columns come out in --output order: <mount> <used> <size>.
+    "echo @@DISK; df -B1 -x tmpfs -x devtmpfs -x overlay -x squashfs "
+    "--output=target,used,size 2>/dev/null"
 )
 
 
@@ -305,7 +317,7 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
         cur = None
         for ln in out.splitlines():
             s = ln.strip()
-            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@NVLINK", "@@PROC"):
+            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@NVLINK", "@@PROC", "@@DISK"):
                 cur = s
                 sec[cur] = []
             elif cur:
@@ -411,10 +423,27 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
         for g in gpus:
             g.processes = [gp for (idxs, gp) in proc_for if g.index in idxs]
 
+        # @@DISK: `df` rows "<mount> <used> <total>" (bytes). First line is the
+        # header (non-numeric) → skipped. Drop sub-1 GiB mounts (boot/efi/…).
+        disks: list[DiskMetric] = []
+        for ln in sec.get("@@DISK", []):
+            parts = ln.split()
+            if len(parts) < 3:
+                continue
+            try:
+                used, total = int(parts[-2]), int(parts[-1])
+            except ValueError:
+                continue
+            mount = " ".join(parts[:-2])
+            if total >= (1 << 30):
+                disks.append(DiskMetric(mount=mount, used_bytes=used, total_bytes=total))
+        disks.sort(key=lambda d: d.total_bytes, reverse=True)
+
         ok = mem_total_mib > 0 or bool(gpus) or cpu_pct >= 0
         return VmMetricsResult(
             ok, "ok" if ok else "no metrics parsed (is this a Linux host with nvidia-smi?)",
-            cpu_pct, mem_used_mib, mem_total_mib, gpus, _time.time(), cpu_cores=cpu_cores,
+            cpu_pct, mem_used_mib, mem_total_mib, gpus, _time.time(),
+            cpu_cores=cpu_cores, disks=disks,
         )
     finally:
         try:

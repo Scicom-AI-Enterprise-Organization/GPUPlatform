@@ -72,6 +72,26 @@ class BenchmarkTemplate(Base):
     )
 
 
+class BenchmarkShare(Base):
+    """A public, no-auth comparison link: a random token → an ordered list of
+    benchmark ids. Minted by an authed owner; resolved by anyone with the token
+    (only explicitly-shared comparisons are world-readable)."""
+    __tablename__ = "benchmark_shares"
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bench_ids: Mapped[list] = mapped_column(JSON)
+    # Optional markdown summary/notes shown above the comparison (e.g. the report
+    # summary + extra text). Captured when the link is minted; shown on the page.
+    notes: Mapped[str] = mapped_column(String(1048576), default="")
+    # Frozen accuracy-run→speed-run pairing (accId→speedId) captured when the link
+    # is minted, so the public IQ-vs-speed chart reproduces exactly what the owner
+    # saw (otherwise it re-auto-pairs, which can differ).
+    pairing: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class Benchmark(Base):
     __tablename__ = "benchmarks"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -1180,6 +1200,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         "input_lens", "output_lens", "errors",
     }
     per_config_results: list[dict] = []
+    _raw_candidates: list[dict] = []
     for path in sorted(work.rglob("*")):
         if not path.is_file() or path.name in _NO_UPLOAD:
             continue
@@ -1194,13 +1215,25 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 with path.open() as f:
                     candidate = json.load(f)
                 if isinstance(candidate, dict):
-                    if result_json is None:  # first wins for the DB column
-                        result_json = candidate
+                    _raw_candidates.append(candidate)
                     per_config_results.append(
                         {"file": rel, **{k: v for k, v in candidate.items() if k not in _DROP_KEYS}}
                     )
             except Exception:
                 pass
+
+    # DB result_json (the single summary column) = the completed config with the
+    # highest throughput. A crashed/failed config reports completed=0 and 0
+    # throughput, so it never shadows a real result; this falls back to the first
+    # candidate only when none completed (max() keeps the first on a tie).
+    if _raw_candidates and result_json is None:
+        def _cand_score(c: dict) -> float:
+            completed = c.get("completed") or 0
+            if not (isinstance(completed, (int, float)) and completed > 0):
+                return -1.0
+            tp = c.get("total_token_throughput") or c.get("output_throughput") or 0
+            return float(tp) if isinstance(tp, (int, float)) else 0.0
+        result_json = max(_raw_candidates, key=_cand_score)
 
     # Build a canonical, aggregate `result.json` (summary across all bench
     # configs, heavy per-request arrays stripped) and put it in storage if one
@@ -1214,6 +1247,47 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 await _push_log(redis, bench_id, f"[gateway] built result.json ({len(per_config_results)} configs)")
         except Exception as e:
             await _push_log(redis, bench_id, f"[gateway] failed to build result.json: {e}")
+
+    # Accuracy mode: accuracy_eval.py emits one `@@ACCURACY {json}` line per
+    # (config, dataset). Scan the full log, collect the result events, and fold
+    # them into result_json so the UI can draw the IQ-vs-speed plot. Provider-
+    # agnostic — the markers ride the streamed log, not S3 result files.
+    accuracy_results: list[dict] = []
+    accuracy_errors: list[dict] = []
+    if full_log.exists():
+        try:
+            _marker = "@@ACCURACY "
+            for line in full_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                idx = line.find(_marker)
+                if idx == -1:
+                    continue
+                try:
+                    obj = json.loads(line[idx + len(_marker):])
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("event") == "result":
+                    accuracy_results.append(obj)
+                elif obj.get("event") == "error":
+                    accuracy_errors.append(obj)
+        except Exception:
+            pass
+    # An accuracy run that produced no results but did emit errors (e.g. the
+    # server never came up) is a failure even though the script returns 0.
+    accuracy_failed = bool(accuracy_errors) and not accuracy_results
+    if accuracy_results:
+        if result_json is None:
+            result_json = {"bench_id": bench_id}
+        result_json["accuracy"] = accuracy_results
+        try:
+            existing = s3_get_text(f"{prefix}result.json", target=target)
+            agg = json.loads(existing) if existing else {"bench_id": bench_id}
+            agg["accuracy"] = accuracy_results
+            s3_put_text(f"{prefix}result.json", json.dumps(agg, indent=2), target=target)
+        except Exception as e:
+            await _push_log(redis, bench_id, f"[gateway] failed to write accuracy to result.json: {e}")
+        await _push_log(redis, bench_id, f"[gateway] parsed {len(accuracy_results)} accuracy result(s)")
 
     # A run where benchmaq exits 0 but EVERY request failed (0 successful across
     # all bench configs) is not a valid result — almost always the vLLM server
@@ -1282,8 +1356,14 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         b = await s.get(Benchmark, bench_id)
         if b is None:
             return
-        b.status = "done" if (rc == 0 and not all_requests_failed) else "failed"
+        b.status = "done" if (rc == 0 and not all_requests_failed and not accuracy_failed) else "failed"
         b.exit_code = rc
+        if accuracy_failed and not error_excerpt:
+            _first_err = (accuracy_errors[0] or {}).get("error", "unknown error")
+            error_excerpt = (
+                "Accuracy eval produced no results — the model never served or "
+                f"every dataset failed to load. First error: {_first_err}"
+            )[:4000]
         b.error_text = error_excerpt
         b.result_json = result_json
         b.ended_at = datetime.now(timezone.utc)
@@ -2610,3 +2690,79 @@ async def import_benchmark(
         details={"source_bench_id": body.source_bench_id, "files_written": written},
     )
     return _to_record(b, user.username)
+
+
+# ---------- Public share (no-auth comparison links) ---------------------
+
+
+class CreateShareBody(BaseModel):
+    ids: list[str]
+    notes: str = ""
+    # Frozen accuracy→speed pairing (accId→speedId) for the public IQ-vs-speed chart.
+    pairing: dict[str, str] = {}
+
+
+class ShareResponse(BaseModel):
+    token: str
+
+
+@router.post("/share", response_model=ShareResponse)
+async def create_share(
+    body: CreateShareBody,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Mint a public comparison link for a set of benchmarks the caller can see.
+    Only explicitly-shared comparisons become world-readable (via the token)."""
+    import uuid
+
+    ids = [i for i in (body.ids or []) if i]
+    if not ids:
+        raise HTTPException(status_code=400, detail={"error": "no benchmark ids"})
+    for bid in ids:
+        b = await session.get(Benchmark, bid)
+        if b is None:
+            raise HTTPException(status_code=404, detail={"error": f"benchmark {bid} not found"})
+        if not user.is_admin and b.owner_id != user.id:
+            raise HTTPException(status_code=403, detail={"error": f"forbidden: {bid}"})
+    token = "cmp_" + uuid.uuid4().hex[:16]
+    session.add(BenchmarkShare(token=token, bench_ids=ids, notes=(body.notes or ""),
+                               pairing=(body.pairing or {}), owner_id=user.id))
+    await session.commit()
+    await audit.record(user, "benchmark.share", "benchmark", token, ",".join(ids), details={"ids": ids})
+    return ShareResponse(token=token)
+
+
+@router.get("/public-compare/{token}")
+async def public_compare(
+    token: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """PUBLIC (no auth): resolve a share token → a self-contained comparison
+    payload (per-bench record + per-config result rows read from S3). Instance/
+    secret fields (provider, storage, env vars, hf token) are NOT included."""
+    share = await session.get(BenchmarkShare, token)
+    if share is None:
+        raise HTTPException(status_code=404, detail={"error": "share link not found"})
+    out: list[dict] = []
+    for bid in (share.bench_ids or []):
+        b = await session.get(Benchmark, bid)
+        if b is None:
+            continue
+        rows: list = []
+        try:
+            target = await _bench_s3_target(b.storage_id)
+            agg = s3_get_text(f"{b.s3_prefix}result.json", target=target)
+            if agg:
+                rows = json.loads(agg).get("results") or []
+        except Exception:
+            rows = []
+        out.append({
+            "id": b.id,
+            "name": b.name,
+            "status": b.status,
+            "config_yaml": b.config_yaml,
+            "result_json": b.result_json,
+            "result_rows": rows,
+        })
+    return {"token": token, "notes": share.notes or "", "pairing": share.pairing or {}, "benchmarks": out}

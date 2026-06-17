@@ -249,6 +249,33 @@ def install() -> None:
                 f"uv pip install -U {vllm_install_args}\n" if vllm_install_args else ""
             )
 
+            # Accuracy mode: any benchmark item carrying an `accuracy:` block is
+            # evaluated by our accuracy_eval.py (shipped + run after benchmaq).
+            # It needs `datasets` (HF dataset loader) in the bench venv; benchmaq
+            # skips these items (no `bench:` rows), so accuracy_eval owns them.
+            _bench_items = config.get("benchmark") or []
+            _has_accuracy = any(
+                isinstance(it, dict) and it.get("accuracy") for it in _bench_items
+            )
+
+            def _is_fc(d):
+                n = d if isinstance(d, str) else (d.get("name") if isinstance(d, dict) else "")
+                return str(n).strip().lower() in {
+                    "function-call", "function_call", "function-calling",
+                    "functioncall", "taas", "scicom-intl/function-call-taas",
+                }
+
+            # The hard multi-turn function-calling benchmark is scored by the
+            # vendored fc_eval.py (SyntheticGen evaluator), which needs `openai`.
+            _has_function_call = any(
+                isinstance(it, dict) and it.get("accuracy")
+                and any(_is_fc(d) for d in (it["accuracy"].get("datasets") or []))
+                for it in _bench_items
+            )
+            _accuracy_install = ""
+            if _has_accuracy:
+                _accuracy_install = "uv pip install -U datasets" + (" openai" if _has_function_call else "") + "\n"
+
             if key_filename:
                 key_filename = os.path.expanduser(key_filename)
 
@@ -313,6 +340,8 @@ def install() -> None:
                 f'uv pip install "benchmaq[vllm] @ {benchmaq_ref}"{vllm_pin}\n'
                 # Optional: override/upgrade vLLM to a custom spec (e.g. a nightly).
                 f"{_vllm_extra_install}"
+                # Accuracy mode needs the HF datasets loader (GSM8K / openai/MMMLU).
+                f"{_accuracy_install}"
                 # huggingface_hub 1.x removed the `huggingface-cli` entrypoint
                 # that benchmaq's model downloader still shells out to ("no
                 # longer works. Use `hf` instead."). Forward it to the new `hf`
@@ -383,6 +412,36 @@ def install() -> None:
             if up_rc != 0:
                 raise RuntimeError(f"Remote config upload failed (exit {up_rc})")
 
+            # Ship accuracy_eval.py when any item runs in accuracy mode. It serves
+            # each such config (benchmaq's VLLMServer) and scores GSM8K /
+            # openai/MMMLU against the local endpoint, emitting @@ACCURACY lines
+            # the gateway folds into result_json. Same base64-over-exec channel
+            # as the config upload (no SFTP on the proxied VMs).
+            remote_accuracy_path = "/tmp/sgpu_accuracy_eval.py"
+            if _has_accuracy:
+                def _ship(local_name, remote_path):
+                    src = os.path.join(os.path.dirname(__file__), local_name)
+                    with open(src, "rb") as _f:
+                        b64 = _base64.b64encode(_f.read()).decode("ascii")
+                    write = f"printf %s {_shlex.quote(b64)} | base64 -d > {remote_path}"
+                    ssh = _connect()
+                    try:
+                        chan = ssh.get_transport().open_session()
+                        chan.exec_command(f"bash -c {_shlex.quote(write)}")
+                        rc = chan.recv_exit_status()
+                    finally:
+                        ssh.close()
+                    if rc != 0:
+                        raise RuntimeError(f"{local_name} upload failed (exit {rc})")
+                    print(f"Uploaded {local_name} → {remote_path}")
+
+                _ship("accuracy_eval.py", remote_accuracy_path)
+                # The function-calling benchmark's scorer (vendored from
+                # SyntheticGen); accuracy_eval.py subprocess-runs it from
+                # /tmp/sgpu_fc_eval.py.
+                if _has_function_call:
+                    _ship("fc_eval.py", "/tmp/sgpu_fc_eval.py")
+
             run_script = (
                 "set -e\n"
                 "export TERM=dumb NO_COLOR=1\n"
@@ -402,6 +461,11 @@ def install() -> None:
                 'export PATH="$HOME/.local/bin:$PATH"\n'
                 f"source {venv_path}/bin/activate\n"
                 f"benchmaq bench {remote_config_path}\n"
+                # Accuracy items have no `bench:` rows so benchmaq skips them;
+                # run the quality eval against a fresh serve of each. Emits
+                # @@ACCURACY lines (parsed by the gateway). Returns 0 on
+                # per-dataset errors, so it never fails an otherwise-good run.
+                + (f"python {remote_accuracy_path} {remote_config_path}\n" if _has_accuracy else "")
             )
             print()
             print("=" * 64)

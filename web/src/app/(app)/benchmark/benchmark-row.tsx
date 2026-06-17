@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import yaml from "js-yaml";
-import { Clock, Cpu, Globe, Layers, Lock, MoreHorizontal, Pencil, Trash2, TrendingUp, User } from "lucide-react";
-import type { BenchmarkRecord } from "@/lib/types";
+import { Clock, Cpu, Globe, Layers, Lock, MoreHorizontal, Pencil, Target, Trash2, TrendingUp, User } from "lucide-react";
+import type { BenchmarkRecord, BenchAccuracyResult } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
 import { BurnFlame } from "@/components/burn-flame";
@@ -42,6 +42,16 @@ function fmtTput(v: number | null | undefined): string | null {
   return `${v.toFixed(0)} tok/s`;
 }
 
+// Mean accuracy across an accuracy run's (config × dataset) evals, as a %.
+function avgAccuracyPct(result: Record<string, unknown>): number | null {
+  const list = Array.isArray(result.accuracy) ? (result.accuracy as BenchAccuracyResult[]) : [];
+  const vals = list
+    .map((a) => (a && typeof a.accuracy === "number" ? a.accuracy : null))
+    .filter((x): x is number => x != null && Number.isFinite(x));
+  if (vals.length === 0) return null;
+  return (vals.reduce((s, x) => s + x, 0) / vals.length) * 100;
+}
+
 function fmtDuration(secs: number | null): string | null {
   if (secs == null) return null;
   if (secs < 60) return `${secs}s`;
@@ -73,7 +83,17 @@ export function BenchmarkRow({
   const owned = bench.is_owner ?? true;
   const avatar = avatarFor(bench.name);
   const result = (bench.result_json ?? {}) as Record<string, unknown>;
-  const tput = typeof result.output_throughput === "number" ? result.output_throughput : null;
+  // Prefer total token throughput (the headline for prefill-heavy runs); fall
+  // back to output throughput. Treat 0 as "no result" — a crashed/failed config
+  // reports 0, and showing "0 tok/s" is misleading.
+  const tputRaw =
+    typeof result.total_token_throughput === "number"
+      ? result.total_token_throughput
+      : typeof result.output_throughput === "number"
+        ? result.output_throughput
+        : null;
+  const tput = tputRaw != null && tputRaw > 0 ? tputRaw : null;
+  const avgAcc = avgAccuracyPct(result);
 
   let model: string | null = null;
   let gpu: string | null = null;
@@ -166,6 +186,16 @@ export function BenchmarkRow({
               </div>
               <div className="font-mono text-sm font-semibold tabular-nums">
                 {fmtTput(tput)}
+              </div>
+            </div>
+          )}
+          {avgAcc != null && (
+            <div className="rounded-md border border-border bg-muted/40 px-2.5 py-1 text-right">
+              <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                <Target className="h-3 w-3" /> Avg accuracy
+              </div>
+              <div className="font-mono text-sm font-semibold tabular-nums">
+                {avgAcc.toFixed(1)}%
               </div>
             </div>
           )}

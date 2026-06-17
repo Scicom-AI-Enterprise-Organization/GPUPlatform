@@ -176,6 +176,18 @@ type FormState = {
   // Cmdline-style flags appended to vLLM. Parsed into snake_case serve: keys
   // at render time. e.g. "--enforce-eager --quantization awq"
   extra_args_raw: string;
+  // What this run measures: throughput/latency ("speed", the classic bench
+  // rows) or model quality ("accuracy", dataset evals). Accuracy runs ALSO
+  // report a decode tok/s, so a multi-config accuracy run draws the
+  // IQ-vs-speed plot on its own.
+  bench_type: "speed" | "accuracy";
+  // Accuracy mode
+  acc_gsm8k: boolean;
+  acc_mmmlu: boolean;
+  acc_funccall: boolean; // hard multi-turn function-calling (Scicom-intl/Function-Call-TaaS)
+  acc_limit: number; // total samples per dataset (split across MMMLU langs)
+  acc_concurrency: number;
+  acc_mmmlu_langs: string; // CSV of openai/MMMLU language configs
   // Workload
   request_rate: string;
   // Per-run warm-up: when on, each measured bench row carries vLLM's native
@@ -222,6 +234,13 @@ export const DEFAULTS: FormState = {
   // numbers). --disable-log-requests was removed in vLLM > 0.15 and now
   // causes the server to refuse to start, so it's no longer in the default.
   extra_args_raw: "--no-enable-prefix-caching",
+  bench_type: "speed",
+  acc_gsm8k: true,
+  acc_mmmlu: true,
+  acc_funccall: true,
+  acc_limit: 200,
+  acc_concurrency: 32,
+  acc_mmmlu_langs: "FR_FR, DE_DE, ES_LA, ZH_CN, JA_JP",
   request_rate: "inf",
   warmup: true,
   sweep_mode: false,
@@ -301,6 +320,27 @@ function renderBenchEntries(s: FormState): string {
       );
     }
   }
+  return lines.join("\n");
+}
+
+/** The `accuracy:` block for an accuracy-mode run. benchmaq skips items with
+ * no `bench:` rows, so only our accuracy_eval.py picks these up. */
+function renderAccuracyBlock(s: FormState): string {
+  const datasets: string[] = [];
+  if (s.acc_gsm8k) datasets.push("gsm8k");
+  if (s.acc_mmmlu) datasets.push("openai/MMMLU");
+  if (s.acc_funccall) datasets.push("function-call");
+  if (datasets.length === 0) datasets.push("gsm8k");
+  const langs = s.acc_mmmlu_langs
+    .split(/[,\s]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const lines = [
+    `      datasets: [${datasets.join(", ")}]`,
+    `      limit: ${s.acc_limit}`,
+    `      concurrency: ${s.acc_concurrency}`,
+  ];
+  if (s.acc_mmmlu && langs.length) lines.push(`      languages: [${langs.join(", ")}]`);
   return lines.join("\n");
 }
 
@@ -430,6 +470,21 @@ remote:
     ? `    storage: ${JSON.stringify(storageName)}\n`
     : "";
 
+  // Accuracy runs measure quality (dataset evals) instead of throughput; they
+  // carry an `accuracy:` block and NO `bench:` rows (benchmaq skips them, our
+  // accuracy_eval.py serves + evaluates them). Speed runs are the classic
+  // throughput/latency bench rows.
+  const workloadBlock = s.bench_type === "accuracy"
+    ? `    accuracy:
+${renderAccuracyBlock(s)}
+`
+    : `    bench:
+${renderBenchEntries(s)}
+    results:
+      save_result: true
+      save_detailed: true
+`;
+
   return `${runpodBlock}${remoteBlock}
 benchmark:
   - name: ${s.benchName}
@@ -439,12 +494,7 @@ ${benchStorageLine}    engine: vllm
       local_dir: "${modelToLocalDir(s.model_repo_id, target === "vm" ? s.vm_base_dir : "/workspace")}"
     serve:
 ${renderServeBlock(s)}
-    bench:
-${renderBenchEntries(s)}
-    results:
-      save_result: true
-      save_detailed: true
-`;
+${workloadBlock}`;
 }
 
 // Serve keys that map 1:1 to a Form field. Everything else under
@@ -633,6 +683,27 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
       if (typeof inLen === "number") next.input_len = inLen;
       if (typeof c === "number") next.max_concurrency = c;
     }
+  }
+
+  // ---- benchmark[0].accuracy — quality-eval mode. Its presence flips the
+  // run type to "accuracy"; benchmaq ignores the block and accuracy_eval.py
+  // serves + evaluates it.
+  const acc = (first.accuracy ?? null) as Record<string, unknown> | null;
+  if (acc && typeof acc === "object") {
+    next.bench_type = "accuracy";
+    const ds = Array.isArray(acc.datasets) ? acc.datasets.map((x) => String(x).toLowerCase()) : [];
+    if (ds.length) {
+      next.acc_gsm8k = ds.some((x) => x.includes("gsm8k"));
+      next.acc_mmmlu = ds.some((x) => x.includes("mmmlu"));
+      next.acc_funccall = ds.some(
+        (x) => x.includes("function-call") || x.includes("function_call") || x.includes("taas"),
+      );
+    }
+    if (typeof acc.limit === "number") next.acc_limit = acc.limit;
+    if (typeof acc.concurrency === "number") next.acc_concurrency = acc.concurrency;
+    if (Array.isArray(acc.languages)) next.acc_mmmlu_langs = acc.languages.map(String).join(", ");
+  } else {
+    next.bench_type = "speed";
   }
 
   // ---- benchmark[].storage: backend name on a bench item (resolved to an id
@@ -1554,16 +1625,105 @@ export function BenchmarkForm({
           {/* Bench */}
           <SectionCard
             icon={<Gauge className="h-4 w-4" />}
-            title="Workload"
-            description="What benchmaq fires at the engine. Use the Sweep pill →  to cross-product input length × concurrency."
+            title={form.bench_type === "accuracy" ? "Accuracy eval" : "Workload"}
+            description={
+              form.bench_type === "accuracy"
+                ? "Serves the model, sends a dataset's questions, scores the answers. Reports accuracy AND a decode tok/s — run several configs to plot IQ vs speed."
+                : "What benchmaq fires at the engine. Use the Sweep pill →  to cross-product input length × concurrency."
+            }
             action={
-              <SweepToggle
-                on={form.sweep_mode}
-                onChange={(v) => field("sweep_mode", v)}
-                runs={totalRuns(form)}
-              />
+              form.bench_type === "speed" ? (
+                <SweepToggle
+                  on={form.sweep_mode}
+                  onChange={(v) => field("sweep_mode", v)}
+                  runs={totalRuns(form)}
+                />
+              ) : null
             }
           >
+            <div className="mb-5">
+              <FieldWrap
+                label="Benchmark type"
+                hint="Speed measures throughput & latency. Accuracy scores the model on GSM8K / multilingual MMLU (and still reports tok/s, so multiple configs plot IQ vs speed)."
+                wide
+              >
+                <div className="inline-flex rounded-lg border border-border p-0.5">
+                  {(["speed", "accuracy"] as const).map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => field("bench_type", t)}
+                      className={cn(
+                        "rounded-md px-4 py-1.5 text-sm font-medium capitalize transition-colors",
+                        form.bench_type === t
+                          ? "bg-foreground text-background"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </FieldWrap>
+            </div>
+            {form.bench_type === "accuracy" ? (
+              <div className="space-y-5">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <ToggleRow
+                    label="GSM8K"
+                    hint="Grade-school math reasoning. Flexible last-number match."
+                    checked={form.acc_gsm8k}
+                    onChange={(v) => field("acc_gsm8k", v)}
+                  />
+                  <ToggleRow
+                    label="Multilingual MMLU"
+                    hint="openai/MMMLU — translated MMLU across languages. Single-letter multiple choice."
+                    checked={form.acc_mmmlu}
+                    onChange={(v) => field("acc_mmmlu", v)}
+                  />
+                  <ToggleRow
+                    label="Function calling (TaaS) — hard"
+                    hint="Scicom-intl/Function-Call-TaaS: 100 multi-turn (14–17 turn) tool-calling conversations, Manglish/Tamil/Chinese. Scored by tool-call F1. Heavy — lower Samples to cap conversations."
+                    checked={form.acc_funccall}
+                    onChange={(v) => field("acc_funccall", v)}
+                  />
+                </div>
+                <Grid>
+                  <FieldWrap
+                    label="Samples"
+                    hint="Questions per dataset (MMLU splits this across its languages). Lower = faster."
+                  >
+                    <NumberField
+                      min={1}
+                      value={form.acc_limit}
+                      onChange={(v) => field("acc_limit", v)}
+                    />
+                  </FieldWrap>
+                  <FieldWrap label="Concurrency" hint="In-flight requests while scoring.">
+                    <NumberField
+                      min={1}
+                      value={form.acc_concurrency}
+                      onChange={(v) => field("acc_concurrency", v)}
+                    />
+                  </FieldWrap>
+                  {form.acc_mmmlu && (
+                    <FieldWrap
+                      label="MMLU languages"
+                      hint="openai/MMMLU config codes, comma-separated."
+                      wide
+                    >
+                      <Input
+                        className="font-mono"
+                        value={form.acc_mmmlu_langs}
+                        onChange={(e) => field("acc_mmmlu_langs", e.target.value)}
+                        placeholder="FR_FR, DE_DE, ZH_CN"
+                      />
+                    </FieldWrap>
+                  )}
+                </Grid>
+              </div>
+            ) : (
+              <>
             <div className="mb-5">
               <ToggleRow
                 label="Warm up each run"
@@ -1672,6 +1832,8 @@ export function BenchmarkForm({
                   />
                 </FieldWrap>
               </Grid>
+            )}
+              </>
             )}
           </SectionCard>
 

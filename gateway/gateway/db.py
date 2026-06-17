@@ -681,6 +681,9 @@ async def init_db() -> None:
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_install_args TEXT"
         ))
         await conn.execute(text(
+            "ALTER TABLE benchmark_shares ADD COLUMN IF NOT EXISTS pairing JSON"
+        ))
+        await conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users(email) WHERE email IS NOT NULL"
         ))
         # Role rollout: only backfill on the migration that first adds the

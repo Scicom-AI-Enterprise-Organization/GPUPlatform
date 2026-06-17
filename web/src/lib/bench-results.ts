@@ -141,6 +141,10 @@ export function bestBy(
   for (const r of rows) {
     const v = pick(r);
     if (v == null) continue;
+    // A 0 / negative value isn't a real measurement — it's an unmeasured or
+    // crashed config reporting 0. Skip it so neither "lowest median TTFT" nor
+    // "best throughput" gets pinned to a dead config's 0.
+    if (v <= 0) continue;
     if (bestV == null || (lower ? v < bestV : v > bestV)) {
       best = r;
       bestV = v;

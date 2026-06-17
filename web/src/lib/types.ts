@@ -170,6 +170,27 @@ export type CreateApiKeyResponse = ApiKeyRecord & { key: string };
 
 // ---- Benchmarks ----
 
+// One accuracy-eval result (a config × dataset), emitted by accuracy_eval.py
+// and folded into BenchmarkRecord.result_json.accuracy. `accuracy` is a
+// fraction 0..1; `output_tok_s` is the decode speed measured over the same
+// requests — the two axes of the IQ-vs-speed plot.
+export type BenchAccuracyResult = {
+  config: string;
+  dataset: string;
+  accuracy: number;
+  n: number;
+  correct?: number;
+  errors?: number;
+  output_tokens?: number;
+  elapsed_s?: number;
+  output_tok_s?: number;
+  // Rich per-eval metric bag for datasets that report more than a single
+  // accuracy (e.g. Function-Call-TaaS: tool-call precision/recall/F1, name
+  // accuracy, json_valid_rate, hallucination_rate, type_accuracy, and a nested
+  // `_counts` breakdown). Absent for plain exact-match evals (GSM8K/MMLU).
+  metrics?: Record<string, unknown> | null;
+};
+
 export type BenchmarkRecord = {
   id: string;
   name: string;
@@ -968,6 +989,12 @@ export type ProviderGpuMetric = {
   processes?: ProviderGpuProc[];
 };
 
+export type ProviderDisk = {
+  mount: string;
+  used_bytes: number;
+  total_bytes: number;
+};
+
 export type ProviderMetrics = {
   ok: boolean;
   message: string;
@@ -976,6 +1003,7 @@ export type ProviderMetrics = {
   mem_used_mib: number;
   mem_total_mib: number;
   gpus: ProviderGpuMetric[];
+  disks: ProviderDisk[]; // real filesystems (df), largest first
   checked_at: number;
 };
 
