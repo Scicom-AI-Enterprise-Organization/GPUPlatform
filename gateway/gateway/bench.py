@@ -1667,6 +1667,39 @@ def _can_read(b: Benchmark, user: User) -> bool:
     return user.is_admin or b.owner_id == user.id or bool(getattr(b, "is_public", False))
 
 
+# Raw per-request arrays that benchmaq dumps into result_json (one entry per prompt
+# × the full ITL trace). They dominate the blob — `itls` + `generated_texts` alone
+# run ~6 MB/run — yet the list/card view only reads scalar throughput + the small
+# `accuracy` summary. Stripping them from the LIST response cuts ~66 MB → ~0.3 MB,
+# so the page loads fast AND serializing it stops blocking the asyncio event loop
+# (the big synchronous json encode was stalling the loop long enough to trip the
+# k8s /health + /ready probes → pod restarts). The detail / results / compare pages
+# fetch each run's full result_json separately, so nothing user-facing loses data.
+_LIST_HEAVY_KEYS = frozenset({
+    "itls", "tpots", "e2els", "ttfts", "start_times", "input_lens", "output_lens",
+    "errors", "generated_texts", "prompt_lens", "generated_token_ids",
+    "output_token_ids", "input_texts", "prompts",
+})
+
+
+def _slim_result_json(rj: Optional[dict]) -> Optional[dict]:
+    """A list-view copy of result_json with the heavy per-request arrays removed.
+    Keeps every scalar metric + the `accuracy` summary (drives the card chips)."""
+    if not isinstance(rj, dict):
+        return rj
+    out: dict = {}
+    for k, v in rj.items():
+        if k == "accuracy":
+            out[k] = v  # small summary the avg-accuracy chip needs — always keep
+        elif k in _LIST_HEAVY_KEYS:
+            continue
+        elif isinstance(v, list) and len(v) > 64:
+            continue  # backstop for any other unanticipated per-request array
+        else:
+            out[k] = v
+    return out
+
+
 # ---------- Templates --------------------------------------------------
 # These come BEFORE the /benchmarks/{id}/* routes so /benchmarks/templates
 # isn't captured by the {bench_id} path parameter.
@@ -1890,10 +1923,23 @@ async def list_benchmarks(
             .where((Benchmark.owner_id == user.id) | (Benchmark.is_public.is_(True)))
             .order_by(Benchmark.created_at.desc())
         )
+    benches = rows.scalars().all()
+    # Resolve all owner usernames in ONE query (was a session.get per row → an N+1
+    # that made the list scale linearly in DB round-trips).
+    owner_ids = {b.owner_id for b in benches}
+    names: dict[str, str] = {}
+    if owner_ids:
+        urows = await session.execute(
+            select(User.id, User.username).where(User.id.in_(owner_ids))
+        )
+        names = {uid: uname for uid, uname in urows.all()}
     out: list[BenchmarkRecord] = []
-    for b in rows.scalars().all():
-        owner = await session.get(User, b.owner_id)
-        out.append(_to_record(b, owner.username if owner else "", is_owner=b.owner_id == user.id))
+    for b in benches:
+        rec = _to_record(b, names.get(b.owner_id, ""), is_owner=b.owner_id == user.id)
+        # The list ships ~66 MB of unused per-request arrays otherwise; slim it so the
+        # response is small + the json encode doesn't block the event loop.
+        rec.result_json = _slim_result_json(rec.result_json)
+        out.append(rec)
     return out
 
 

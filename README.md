@@ -5,7 +5,7 @@ A multi-tenant GPU workload platform. One control plane, four product surfaces:
 - **Serverless** — deploy a model with the `serverlessgpu` Python decorator (or the web UI) and get an autoscaling, OpenAI-compatible HTTP endpoint backed by vLLM — chat / completions / embeddings, plus **Whisper audio** (`/v1/audio/transcriptions`) — that scales to zero when idle. Or stand up a **multi-model fleet** that time-shares its GPUs via vLLM sleep/wake, on your own **SSH VM** or a **cloud RunPod pod** — the cloud fleet scales to zero on idle and re-provisions itself on the next request.
 - **Autotrain** — finetune **Whisper (ASR)** or **Qwen3 + NeuCodec (TTS)** on your own datasets. Hyperparameter sweeps, audio augmentation, live per-step loss + per-epoch WER/CER, GPU telemetry, and W&B / MLflow tracking — orchestrated over SSH on your VM or a RunPod pod, with the model pushed to S3 / Hugging Face.
 - **Benchmark** — SSH-orchestrated [`llm-benchmaq`](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) sweeps on RunPod / Prime Intellect / your own VM, with live log streaming, S3-archived results, and a side-by-side compare view.
-- **Compute** — provision long-lived bare-metal GPU pods with SSH (and JupyterLab on Prime Intellect). Optional admin-approval gate.
+- **Compute** — provision GPU pods with SSH + **JupyterLab** for interactive work. Optional **idle auto-terminate** (the gateway deletes the pod after N minutes with no GPU compute/memory in use) and an optional admin-approval gate.
 
 These sit on shared infrastructure you configure once: **Providers** (BYO RunPod / Prime Intellect / VM SSH credentials), **Storage** (S3 / Hugging Face backends), **Datasets** (audio + transcription corpora for Autotrain), and org-wide **Secrets** (global env vars + W&B / MLflow tracking credentials).
 
@@ -167,7 +167,7 @@ The endpoint detail page (`/serverless/{id}`) has a tab for each operational con
 - **Playground** — a **Chat** ↔ **Audio transcription** toggle. *Chat:* model picker, `reasoning_effort`, `temperature`, "disable thinking" (`chat_template_kwargs.enable_thinking=false`), streaming toggle; live **reasoning + answer** panels, **tokens/sec + TTFT**, and the equivalent **cURL**. *Audio:* upload a clip and transcribe/translate with a Whisper member. All settings deep-link into the URL.
 - **Stress test** — a `vllm bench serve`-style concurrency load against the live endpoint (input/output length, num prompts, concurrency) reporting throughput + TTFT/TPOT/E2E latency percentiles.
 - **Metrics** — live graphs scraped from the endpoint's own Prometheus exporter at `/{app_id}/metrics`: requests over time + errors, requests-by-route, and latency. Gateway-side HTTP metrics (`serverless_http_requests_total` / `_duration_seconds`), not persisted.
-- **Queue** — live request view bucketed **in queue / in progress / completed / failed**; click a request id to deep-link it. **Flush queue** (a styled confirm dialog) drops jobs still waiting *and* clears orphaned/stuck `pending` rows that a worker dequeued but never finalized.
+- **Queue** — paginated request view bucketed **in queue / in progress / completed / failed**, with each request's **timestamp** and the **user** who submitted it (`requested_by`); click a request id to deep-link it. **Flush queue** (a styled confirm dialog) drops jobs still waiting *and* clears orphaned/stuck `pending` rows that a worker dequeued but never finalized.
 - **Workers** — for a fleet, each model's state (awake / asleep / loading / dead, **why** it died), GPUs, TP, in-flight count, and per-model **Sleep / Restart / Kill / Logs**. For a **cloud (RunPod)** endpoint, also a pods table: each container links to the **RunPod console**, an **Alive** column flags whether the worker actually registered + is heartbeating (vs a pod that's "running" but never phoned home), and a per-container **Delete** frees the GPU (the next request re-provisions).
 
 ## Multi-model fleets (VM or cloud RunPod)
@@ -198,7 +198,10 @@ fleet runs on either:
   deleted (no GPU bill); the next request re-provisions it, waits out the cold load, and
   is served. The idle-terminator never kills a pod that's still **loading** or has
   **in-flight** requests, so the waking request isn't stranded mid cold-start.
-  `idle_timeout_s = 0` keeps the fleet always-on.
+  `idle_timeout_s = 0` keeps the fleet always-on. The autoscaler caps real pods at
+  `max_containers` by counting the provider's **actually-running** pods (not just the
+  heartbeating ones), so a worker that's slow to register — or never does — can't be
+  silently duplicated into a runaway of billing pods.
 - **Cancel on disconnect** — if a client times out / disconnects, the gateway marks the
   request cancelled (it shows immediately as `failed` in the Queue tab), removes it from
   the queue, and signals the worker — which skips it *before* waking a model (and stops
@@ -290,16 +293,26 @@ A repo **registered over existing data** — via `POST /v1/catalog` or **Publish
 
 Run [`llm-benchmaq`](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) (which wraps `vllm bench serve`) against a model and archive the results — on a RunPod/PI pod the gateway spins up, or on your own SSH VM (bare-metal).
 
-- **Config** — the benchmaq YAML: one or more `serve` configs × a `bench` sweep matrix (input/output length × concurrency × num prompts). Build it in the form at `/benchmark/new` or paste raw YAML; the gateway validates and rewrites the `remote:` block for the chosen target.
+- **Two modes per `serve` config** — a **speed** `bench:` sweep matrix (input/output length × concurrency × num prompts), and/or an **accuracy** `accuracy:` eval over **GSM8K**, multilingual **MMLU** (`openai/MMMLU`), and tool-use (`Function-Call-TaaS`). Build either in the form at `/benchmark/new` or paste raw YAML; the gateway validates and rewrites the `remote:` block for the chosen target.
 - **VM runs** — pin to specific GPUs with `visible_devices` (→ `CUDA_VISIBLE_DEVICES`; the count is the tensor-parallel size). The gateway delivers the config over SSH, installs benchmaq, runs the sweep, and **never uploads the VM's private key** to S3.
 - **Live + archived** — stream the log tail while it runs; on completion an aggregate `result.json` + per-config files land in your S3 storage.
-- **Results + Compare** — the detail page charts throughput / TTFT / TPOT / E2EL across the sweep; select multiple runs from the list to **compare** them side by side. Runs are renamable, duplicable, and terminable.
+- **Results** — the detail page charts throughput / TTFT / TPOT / E2EL across the sweep; accuracy evals render per config × dataset, and any eval that emits a rich `metrics` bag (e.g. function-calling: tool-call precision/recall/F1, name/type accuracy, json-valid rate, counts) shows all of it.
+- **Compare** — select multiple runs on the list → a dedicated `/benchmark/compare` view overlays their curves and (when both speed + accuracy evals are present) plots an **IQ-vs-speed** scatter (accuracy % vs tok/s) across runs.
+- **Share** — mark a run **public** (per-run, or bulk over a selection) so it appears read-only in everyone's list; owners still rename/duplicate/terminate/delete. A `POST /benchmarks/share` link lets you share a public side-by-side compare by token.
+- **Export / import** — download a run as a **self-contained `.benchmark.json`** (results + config + the S3 artifacts inlined as base64) from the Files tab, or batch-export a selection from the list. Re-create it on another deployment at `/benchmark/import` (drag-and-drop one or many files) — it writes the embedded files into *that* deployment's bucket, so the destination needs no access to the source's storage.
 
 Fire one via the API with a key — see [API keys & the HTTP API](#api-keys--the-http-api) below and [docs/BENCHMARK_PLATFORM_VS_VLLM.md](docs/BENCHMARK_PLATFORM_VS_VLLM.md) (platform vs. direct-vLLM overhead, with numbers).
 
 ## Compute
 
-Raw GPU pods for interactive work, not serving. Provision a long-lived pod (`/compute/new`) with a chosen GPU/count, container disk, and template; get back an **SSH command** (and a **JupyterLab** URL + password on Prime Intellect). Live cost tracking per pod, and an optional **admin-approval gate** — pods land in `pending` until cleared (toggle per role). Terminate from the UI; the gateway tears down the provider pod.
+Raw GPU pods for interactive work, not serving. Provision a pod (`/compute/new`) on a RunPod or Prime Intellect provider with a chosen GPU + count, container disk (10–2000 GB) and optional persistent volume, and an image; get back an **SSH command** plus a **JupyterLab** URL + password (on both RunPod and PI). Live `$/hr` cost tracking per pod.
+
+- **Image** — curated templates (`PyTorch 2.8 + CUDA 12.8` / `PyTorch 2.4 + CUDA 12.4` for RunPod; a fixed set of PI images), or search RunPod's full template catalogue. **Cloud tier** defaults to **SECURE**.
+- **Idle auto-terminate** — an optional per-pod window (create-form default **10 min**, `0` = off, max 24 h). A background sweep SSHes the pod every 30 s and reads `nvidia-smi`; once GPU compute *and* GPU memory have been idle (≤1 % util, < 2 GiB used) for the window, the pod is deleted. Fail-safe: if the pod can't be probed it's treated as active (never wrongly killed). Idle-killed pods get the distinct status **`auto_terminated`** (vs **`terminated`** for a manual delete), so they're reviewable in the list.
+- **Statuses** — `pending_approval` → `creating` → `running`, then `terminated` (manual) / `auto_terminated` (idle) / `failed` / `rejected`.
+- **Admin-approval gate** — non-admin (non-`full-access`) requests land in `pending_approval` and are cleared/denied at `/admin/compute-approvals`; admins and trusted roles bypass it (toggle per role).
+
+Terminate from the UI; the gateway tears down the provider pod.
 
 ## Providers (BYO credentials)
 
@@ -312,7 +325,9 @@ Each user registers their own providers under `/providers`. Supported kinds:
 | `vm` | Your own SSH-reachable box | Serverless (multi-model fleet), Benchmark (bare-metal) |
 | `fake` | In-process dev provider | Local development only |
 
-Credentials are encrypted at rest. Provider resolution per request: explicit `provider_id` → the user's sole provider of that kind → gateway-wide env fallback (`RUNPOD_API_KEY`, `PI_API_KEY`). `GET /v1/providers` also returns each cloud provider's **available GPU catalog** (`available_gpus` — id / label / VRAM), so a client can discover where it can run; `vm` providers report their fixed physical GPUs instead.
+Credentials are encrypted at rest. Provider resolution per request: explicit `provider_id` → the user's sole provider of that kind → gateway-wide env fallback (`RUNPOD_API_KEY`, `PI_API_KEY`). `GET /v1/providers` also returns each cloud provider's **available GPU catalog** (`available_gpus` — id / label / VRAM), so a client can discover where it can run; `vm` providers report their fixed physical GPUs instead. Each record also carries `api_key_last4`, an auto-generated `ssh_pub`, `validated_at`, and `account_email` (from the last `POST /v1/providers/test`). For RunPod, `GET /v1/providers/{id}/balance` reports the account's USD credit.
+
+**Live metrics (VM providers).** `/providers/{id}/metrics` is a polling dashboard of the box over SSH: **CPU** (overall + per-core, htop-style), **memory**, **per-GPU** (util / mem / temp / PCIe gen·width / NVLink / running processes), and **disk** (every real filesystem's used / total, via `df`). A button-triggered **bandwidth** test (`GET /v1/providers/{id}/bandwidth`) measures disk read/write, sequential memory, and CPU clock. Backed by `GET /v1/providers/{id}/metrics`; nothing is persisted.
 
 ## Storage
 
@@ -322,6 +337,8 @@ Where artifacts and datasets live. Register a backend at `/storage` or `POST /v1
 |---|---|---|
 | `s3` | bucket + region + (optional) endpoint + access key — Benchmark `result.json`, trained models, dataset metadata + audio | Benchmark, Autotrain, Datasets |
 | `huggingface` | an HF token (or a reference to a [global secret](#secrets-global-env--tracking)) | Datasets (`hf` source / sync), Autotrain (model push) |
+| `local` | a filesystem path on the gateway/VM | Models catalog, artifacts |
+| `sftp` | host + port + user + password / private key + base path | Models catalog, artifacts |
 
 Credentials are Fernet-encrypted at rest and never returned by the API; `POST /v1/storage/test` validates connectivity before you save. Reads are org-wide; writes are admin-only.
 
@@ -338,12 +355,12 @@ Mint a long-lived bearer token on the **API tokens** page (or `POST /api-keys`).
 
 | Area | Key endpoints |
 |---|---|
-| Serverless | `POST /apps` · `GET /apps` · `GET /apps/{id}/status` · `GET /apps/{id}/workers` · `POST /apps/{id}/workers/{mid}/terminate` · `POST /apps/{id}/queue/flush` · `POST /v1/chat/completions` · `POST /v1/audio/transcriptions` · `GET /v1/models` · `POST /run/{app}` · `GET /result/{id}` · `GET /{app}/metrics` (per-endpoint Prometheus) |
+| Serverless | `POST /apps` · `GET /apps` · `GET /apps/{id}/status` · `PATCH /apps/{id}/autoscaler` · `POST /apps/{id}/restart` · `GET /apps/{id}/workers` · `POST /apps/{id}/workers/{mid}/terminate` · `POST /apps/{id}/workers/kill` · `POST /apps/{id}/workers/purge` · `POST /apps/{id}/model-action` (sleep/restart/kill a fleet model) · `GET /apps/{id}/requests` (with `requested_by`) · `POST /apps/{id}/queue/flush` · `POST /v1/chat/completions` · `POST /v1/audio/transcriptions` · `GET /v1/models` · `POST /run/{app}` · `GET /result/{id}` · `GET /{app}/metrics` (per-endpoint Prometheus) |
 | Autotrain | `POST /v1/training-runs` · `GET /v1/training-runs` · `GET /v1/training-runs/{id}` · `GET /v1/training-runs/{id}/metrics` · `GET /v1/training-runs/{id}/files` · `GET /v1/training-runs/{id}/logs/stream` · `POST /v1/training-runs/{id}/restart` · `POST /v1/training-runs/{id}/terminate` · `POST /v1/training-runs/{id}/transcribe` · `POST /v1/training-runs/{id}/synthesize` |
 | Datasets | `GET /v1/datasets` · `POST /v1/datasets` · `POST /v1/datasets/{id}/upload` · `GET /v1/datasets/{id}/preview` · `POST /v1/datasets/{id}/row-inclusion` · `POST /v1/datasets/{id}/transform` · `POST /v1/datasets/{id}/pack-tts` · `POST /v1/datasets/{id}/sync` |
-| Benchmark | `POST /benchmarks` · `GET /benchmarks/{id}` · `GET /benchmarks/{id}/logs?tail=` · `POST /benchmarks/{id}/duplicate` · `PATCH /benchmarks/{id}` (rename) · `POST /benchmarks/{id}/terminate` |
-| Compute | `POST /compute` · `GET /compute` · `GET /compute/{id}/ssh` |
-| Providers / storage / secrets | `GET /v1/providers` · `GET /v1/storage` · `GET /v1/global-env` · `GET /v1/tracking-credentials` |
+| Benchmark | `POST /benchmarks` · `GET /benchmarks` · `GET /benchmarks/{id}` · `PATCH /benchmarks/{id}` (rename) · `DELETE /benchmarks/{id}` · `GET /benchmarks/{id}/logs?tail=` · `GET /benchmarks/{id}/logs/stream` (SSE) · `GET /benchmarks/{id}/files` · `GET /benchmarks/{id}/files/content?path=` · `GET /benchmarks/{id}/export` · `POST /benchmarks/import` · `POST /benchmarks/{id}/visibility` (public/private) · `POST /benchmarks/{id}/duplicate` · `POST /benchmarks/{id}/terminate` · `GET /benchmarks/_aggregate` · `{GET,POST,DELETE} /benchmarks/templates` · `POST /benchmarks/share` · `GET /benchmarks/public-compare/{token}` |
+| Compute | `POST /compute` · `GET /compute` · `GET /compute/{id}` · `DELETE /compute/{id}` · `GET /compute/{id}/ssh` · `GET /compute/templates` · `GET /compute/{runpod,pi}/gpu-types` · `GET /compute/approvals` · `POST /compute/{id}/{approve,reject}` (admin) |
+| Providers / storage / secrets | `GET /v1/providers` · `POST /v1/providers` · `POST /v1/providers/test` · `GET /v1/providers/{id}/availability` · `GET /v1/providers/{id}/balance` · `GET /v1/providers/{id}/metrics` · `GET /v1/providers/{id}/bandwidth` · `GET /v1/storage` · `POST /v1/storage/test` · `GET /v1/global-env` · `GET /v1/tracking-credentials` |
 | Ops | `GET /health` · `GET /ready` · `GET /metrics` |
 
 ```bash
