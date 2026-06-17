@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Check, Copy, Octagon, Pencil, RotateCw, Trash2, X } from "lucide-react";
+import { Check, Copy, Globe, Lock, Octagon, Pencil, RotateCw, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -50,6 +50,8 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
     return t && BENCH_TAB_VALUES.includes(t) ? (t as BenchTab) : "logs";
   })();
   const [bench, setBench] = useState(initial);
+  // is_owner is undefined on older payloads — treat as owned for back-compat.
+  const owned = bench.is_owner ?? true;
   const [tab, setTabState] = useState<BenchTab>(initialTab);
   const setTab = (v: BenchTab) => {
     setTabState(v);
@@ -147,6 +149,18 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
     });
   }
 
+  function handleTogglePublic() {
+    const next = !bench.is_public;
+    startTransition(async () => {
+      try {
+        const updated = await gateway.setBenchmarkVisibility(bench.id, next);
+        setBench(updated);
+      } catch {
+        // best-effort — the button reflects server state on next load
+      }
+    });
+  }
+
   // Re-run: recreate this benchmark from its saved config (same provider /
   // storage / env / cleanup flag) and jump to the new run. Recovers a run that
   // failed or was orphaned by a gateway restart in one click.
@@ -221,15 +235,17 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
               ) : (
                 <>
                   <h1 className="text-xl font-semibold tracking-tight">{bench.name}</h1>
-                  <button
-                    type="button"
-                    onClick={startRename}
-                    className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                    title="Rename benchmark"
-                    aria-label="Rename benchmark"
-                  >
-                    <Pencil className="h-3.5 w-3.5" />
-                  </button>
+                  {owned && (
+                    <button
+                      type="button"
+                      onClick={startRename}
+                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      title="Rename benchmark"
+                      aria-label="Rename benchmark"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                   <span
                     className={`rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide ${
                       STATUS_STYLES[bench.status] ?? STATUS_STYLES.queued
@@ -237,6 +253,14 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
                   >
                     {bench.status}
                   </span>
+                  {bench.is_public && (
+                    <span
+                      className="inline-flex items-center gap-1 rounded border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-sky-700 dark:text-sky-400"
+                      title="Public — visible to everyone"
+                    >
+                      <Globe className="h-3 w-3" /> Public
+                    </span>
+                  )}
                 </>
               )}
             </div>
@@ -250,6 +274,31 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {owned && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleTogglePublic}
+                disabled={pending}
+                title={
+                  bench.is_public
+                    ? "Make private — hide from other users"
+                    : "Make public — anyone can view (read-only)"
+                }
+              >
+                {bench.is_public ? (
+                  <>
+                    <Lock className="h-4 w-4" />
+                    Make private
+                  </>
+                ) : (
+                  <>
+                    <Globe className="h-4 w-4" />
+                    Make public
+                  </>
+                )}
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"
@@ -273,7 +322,7 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
                 {pending ? "Re-running…" : "Re-run"}
               </Button>
             )}
-            {inFlight && (
+            {inFlight && owned && (
               <Button
                 variant="outline"
                 size="sm"
@@ -284,15 +333,17 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
                 Terminate
               </Button>
             )}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setConfirmDelete(true)}
-              className="text-destructive hover:text-destructive"
-            >
-              <Trash2 className="h-4 w-4" />
-              Delete
-            </Button>
+            {owned && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setConfirmDelete(true)}
+                className="text-destructive hover:text-destructive"
+              >
+                <Trash2 className="h-4 w-4" />
+                Delete
+              </Button>
+            )}
           </div>
         </div>
 

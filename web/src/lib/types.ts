@@ -180,6 +180,10 @@ export type BenchmarkRecord = {
   error_text?: string | null;
   result_json?: Record<string, unknown> | null;
   created_by: string;
+  // Public runs show up (read-only) in every user's list. is_owner is true when
+  // the requesting user owns the run (controls whether edit/delete are offered).
+  is_public?: boolean;
+  is_owner?: boolean | null;
   created_at: string;
   started_at?: string | null;
   ended_at?: string | null;

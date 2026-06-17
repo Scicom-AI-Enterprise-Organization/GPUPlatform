@@ -615,6 +615,11 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)"
         ))
+        # Public benchmarks: an owner can flip a run to public so it shows up
+        # (read-only) in everyone's benchmark list. Existing rows stay private.
+        await conn.execute(text(
+            "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_args VARCHAR(2048) NOT NULL DEFAULT ''"
         ))

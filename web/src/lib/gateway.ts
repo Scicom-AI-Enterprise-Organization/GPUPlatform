@@ -280,6 +280,11 @@ export const gateway = {
       method: "PATCH",
       body: JSON.stringify({ name }),
     }),
+  setBenchmarkVisibility: (id: string, isPublic: boolean) =>
+    request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}/visibility`, {
+      method: "POST",
+      body: JSON.stringify({ is_public: isPublic }),
+    }),
   createBenchmark: (body: CreateBenchmarkRequest) =>
     request<BenchmarkRecord>("/benchmarks", {
       method: "POST",

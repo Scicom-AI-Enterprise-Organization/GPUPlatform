@@ -3,12 +3,19 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import yaml from "js-yaml";
-import { CheckSquare, Download, GitCompare, Inbox, LayoutGrid, List, Search, Trash2, X } from "lucide-react";
+import { CheckSquare, Download, GitCompare, Globe, Inbox, LayoutGrid, List, Lock, MoreHorizontal, Search, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkRecord } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -172,6 +179,45 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
     } finally {
       setRenaming(false);
     }
+  };
+
+  // Flip one benchmark's public flag (owner-only; the row only offers this for
+  // owned runs). Optimistic toast + refresh from the server.
+  const onTogglePublic = async (bench: BenchmarkRecord) => {
+    const next = !bench.is_public;
+    try {
+      await gateway.setBenchmarkVisibility(bench.id, next);
+      toast.success(next ? "Benchmark is now public" : "Benchmark is now private", {
+        duration: 2500,
+      });
+      router.refresh();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e), { duration: 4000 });
+    }
+  };
+
+  // Bulk make public/private over the selected runs the caller owns (others are
+  // skipped — the gateway would 403 them anyway).
+  const onBulkVisibility = async (isPublic: boolean) => {
+    const targets = items.filter((b) => selected.has(b.id) && (b.is_owner ?? true));
+    if (targets.length === 0) {
+      toast.error("None of the selected benchmarks are yours to change", { duration: 3000 });
+      return;
+    }
+    const results = await Promise.allSettled(
+      targets.map((b) => gateway.setBenchmarkVisibility(b.id, isPublic)),
+    );
+    const failures = results.filter((r) => r.status === "rejected").length;
+    if (failures === 0) {
+      toast.success(
+        `${targets.length} benchmark${targets.length === 1 ? "" : "s"} now ${isPublic ? "public" : "private"}`,
+        { duration: 2500 },
+      );
+    } else {
+      toast.error(`${failures} of ${targets.length} failed`, { duration: 4000 });
+    }
+    exitSelect();
+    router.refresh();
   };
 
   const onSingleDelete = async () => {
@@ -382,15 +428,40 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
               <GitCompare className="h-3.5 w-3.5" />
               {`Compare ${selected.size >= 2 ? selected.size : ""}`.trim()}
             </button>
-            <button
-              type="button"
-              onClick={() => setConfirmOpen(true)}
-              disabled={selected.size === 0 || deleting || exporting}
-              className="inline-flex items-center gap-1.5 rounded-md bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              {deleting ? "Deleting…" : `Delete ${selected.size > 0 ? selected.size : ""}`.trim()}
-            </button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  disabled={selected.size === 0 || deleting || exporting}
+                  title="More actions"
+                  aria-label="More actions"
+                  className="inline-flex items-center justify-center rounded-md border border-input bg-background px-2 py-1.5 text-sm shadow-xs hover:bg-muted disabled:opacity-50"
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onSelect={() => onBulkVisibility(true)}>
+                  <Globe className="h-4 w-4" />
+                  Make public
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => onBulkVisibility(false)}>
+                  <Lock className="h-4 w-4" />
+                  Make private
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  variant="destructive"
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    setConfirmOpen(true);
+                  }}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Delete {selected.size > 0 ? selected.size : ""}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
       )}
@@ -426,21 +497,31 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
                 : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
             )}
           >
-            {paged.map((b) => (
-              <BenchmarkRow
-                key={b.id}
-                bench={b}
-                selectMode={selectMode}
-                selected={selected.has(b.id)}
-                onToggle={toggle}
-                onDelete={(bench) => setSingle(bench)}
-                onRename={(bench) => {
-                  setRenameTarget(bench);
-                  setRenameDraft(bench.name);
-                  setRenameError(null);
-                }}
-              />
-            ))}
+            {paged.map((b) => {
+              const owned = b.is_owner ?? true;
+              return (
+                <BenchmarkRow
+                  key={b.id}
+                  bench={b}
+                  selectMode={selectMode}
+                  selected={selected.has(b.id)}
+                  onToggle={toggle}
+                  // Only the owner can mutate a run; public runs from others are
+                  // read-only (no delete/rename/visibility actions offered).
+                  onDelete={owned ? (bench) => setSingle(bench) : undefined}
+                  onRename={
+                    owned
+                      ? (bench) => {
+                          setRenameTarget(bench);
+                          setRenameDraft(bench.name);
+                          setRenameError(null);
+                        }
+                      : undefined
+                  }
+                  onTogglePublic={owned ? onTogglePublic : undefined}
+                />
+              );
+            })}
           </div>
           <Pagination
             page={currentPage}

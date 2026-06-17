@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   CartesianGrid,
   Legend,
@@ -11,7 +11,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { Loader2, RefreshCw, TrendingUp, Zap, Clock, Activity } from "lucide-react";
+import { ChevronDown, ChevronRight, Loader2, RefreshCw, TrendingUp, Zap, Clock, Activity } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -300,7 +300,8 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
         <CardHeader className="pb-2">
           <CardTitle className="text-sm">Summary</CardTitle>
           <CardDescription className="text-xs">
-            All {rows.length} runs. Click a column header to sort.
+            All {rows.length} runs. Click a column header to sort, or a row to see
+            every metric for that run.
           </CardDescription>
         </CardHeader>
         <CardContent className="px-0 pb-0">
@@ -480,9 +481,127 @@ type SortKey =
   | "e2el"
   | "duration_s";
 
+// Known result.json keys we render with friendly labels in the full-metrics
+// panel. Anything numeric NOT in here (or already shown elsewhere) is listed
+// under "Other" so nothing from the raw file is hidden.
+const METRIC_LABELS: Record<string, string> = {
+  completed: "Successful requests",
+  total_input_tokens: "Total input tokens",
+  total_output_tokens: "Total generated tokens",
+  duration: "Benchmark duration (s)",
+  request_throughput: "Request throughput (req/s)",
+  output_throughput: "Output token throughput (tok/s)",
+  total_token_throughput: "Total token throughput (tok/s)",
+  peak_output_token_throughput: "Peak output token throughput (tok/s)",
+  peak_concurrent_requests: "Peak concurrent requests",
+  request_goodput: "Request goodput (req/s)",
+  mean_ttft_ms: "Mean TTFT (ms)",
+  median_ttft_ms: "Median TTFT (ms)",
+  std_ttft_ms: "Std TTFT (ms)",
+  p99_ttft_ms: "P99 TTFT (ms)",
+  mean_tpot_ms: "Mean TPOT (ms)",
+  median_tpot_ms: "Median TPOT (ms)",
+  std_tpot_ms: "Std TPOT (ms)",
+  p99_tpot_ms: "P99 TPOT (ms)",
+  mean_itl_ms: "Mean ITL (ms)",
+  median_itl_ms: "Median ITL (ms)",
+  std_itl_ms: "Std ITL (ms)",
+  p99_itl_ms: "P99 ITL (ms)",
+  mean_e2el_ms: "Mean E2EL (ms)",
+  median_e2el_ms: "Median E2EL (ms)",
+  std_e2el_ms: "Std E2EL (ms)",
+  p99_e2el_ms: "P99 E2EL (ms)",
+};
+
+// Groups define the panel layout; keys not present in a run are skipped.
+const METRIC_GROUPS: { title: string; keys: string[] }[] = [
+  {
+    title: "Requests",
+    keys: ["completed", "total_input_tokens", "total_output_tokens", "duration"],
+  },
+  {
+    title: "Throughput",
+    keys: [
+      "request_throughput",
+      "output_throughput",
+      "total_token_throughput",
+      "peak_output_token_throughput",
+      "peak_concurrent_requests",
+      "request_goodput",
+    ],
+  },
+  { title: "Time to first token", keys: ["mean_ttft_ms", "median_ttft_ms", "std_ttft_ms", "p99_ttft_ms"] },
+  { title: "Time per output token", keys: ["mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms"] },
+  { title: "Inter-token latency", keys: ["mean_itl_ms", "median_itl_ms", "std_itl_ms", "p99_itl_ms"] },
+  { title: "End-to-end latency", keys: ["mean_e2el_ms", "median_e2el_ms", "std_e2el_ms", "p99_e2el_ms"] },
+];
+
+function fmtMetric(key: string, v: number): string {
+  // Token/request counts are integers; everything else gets 2 decimals.
+  if (
+    key.endsWith("_tokens") ||
+    key === "completed" ||
+    key === "peak_concurrent_requests"
+  ) {
+    return v.toLocaleString();
+  }
+  return v.toFixed(2);
+}
+
+function RunMetricsPanel({ row }: { row: Row }) {
+  const shown = new Set<string>(["max_concurrency", "num_prompts", "input_len", "output_len"]);
+  const groups = METRIC_GROUPS.map((g) => ({
+    title: g.title,
+    items: g.keys
+      .filter((k) => {
+        const v = row.raw[k];
+        return typeof v === "number" && Number.isFinite(v);
+      })
+      .map((k) => {
+        shown.add(k);
+        return { key: k, label: METRIC_LABELS[k] ?? k, value: row.raw[k] };
+      }),
+  })).filter((g) => g.items.length > 0);
+
+  // Anything numeric in result.json we didn't place in a group above.
+  const other = Object.keys(row.raw)
+    .filter((k) => !shown.has(k))
+    .sort()
+    .map((k) => ({ key: k, label: METRIC_LABELS[k] ?? k, value: row.raw[k] }));
+  if (other.length > 0) groups.push({ title: "Other", items: other });
+
+  return (
+    <div className="grid grid-cols-1 gap-4 bg-muted/20 px-4 py-3 sm:grid-cols-2 lg:grid-cols-3">
+      {groups.map((g) => (
+        <div key={g.title}>
+          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            {g.title}
+          </div>
+          <dl className="space-y-1">
+            {g.items.map((it) => (
+              <div key={it.key} className="flex items-baseline justify-between gap-3 text-xs">
+                <dt className="text-muted-foreground">{it.label}</dt>
+                <dd className="font-mono tabular-nums">{fmtMetric(it.key, it.value)}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
   const [sortKey, setSortKey] = useState<SortKey>("input_len");
   const [asc, setAsc] = useState(true);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (fn: string) =>
+    setExpanded((prev) => {
+      const n = new Set(prev);
+      if (n.has(fn)) n.delete(fn);
+      else n.add(fn);
+      return n;
+    });
 
   const sorted = useMemo(() => {
     const get = (r: Row): number => {
@@ -524,6 +643,7 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
       <table className="w-full text-sm">
         <thead className="bg-muted/40">
           <tr>
+            <th className="w-8 px-2 py-2" />
             {header("input_len", "input_len", "left")}
             {header("concurrency", "concurrency")}
             {header("throughput (tok/s)", "output_throughput")}
@@ -535,30 +655,53 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
           </tr>
         </thead>
         <tbody className="divide-y divide-border">
-          {sorted.map((r) => (
-            <tr key={r.filename}>
-              <td className="px-3 py-1.5 font-mono text-xs">in={r.input_len} · out={r.output_len}</td>
-              <td className="px-3 py-1.5 text-right font-mono text-xs">{r.concurrency}</td>
-              <td className="px-3 py-1.5 text-right tabular-nums">
-                {fmt(r.output_throughput, 1)}
-              </td>
-              <td className="px-3 py-1.5 text-right tabular-nums">
-                {fmt(statPick(r, "ttft", statMode), 1)}
-              </td>
-              <td className="px-3 py-1.5 text-right tabular-nums">
-                {fmt(statPick(r, "tpot", statMode), 2)}
-              </td>
-              <td className="px-3 py-1.5 text-right tabular-nums">
-                {fmt(statPick(r, "itl", statMode), 2)}
-              </td>
-              <td className="px-3 py-1.5 text-right tabular-nums">
-                {fmt(statPick(r, "e2el", statMode), 1)}
-              </td>
-              <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
-                {fmt(r.duration_s, 1)}
-              </td>
-            </tr>
-          ))}
+          {sorted.map((r) => {
+            const isOpen = expanded.has(r.filename);
+            return (
+              <Fragment key={r.filename}>
+                <tr
+                  className="cursor-pointer hover:bg-muted/30"
+                  onClick={() => toggle(r.filename)}
+                  title="Show all metrics for this run"
+                >
+                  <td className="px-2 py-1.5 text-muted-foreground">
+                    {isOpen ? (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-xs">in={r.input_len} · out={r.output_len}</td>
+                  <td className="px-3 py-1.5 text-right font-mono text-xs">{r.concurrency}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">
+                    {fmt(r.output_throughput, 1)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">
+                    {fmt(statPick(r, "ttft", statMode), 1)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">
+                    {fmt(statPick(r, "tpot", statMode), 2)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">
+                    {fmt(statPick(r, "itl", statMode), 2)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">
+                    {fmt(statPick(r, "e2el", statMode), 1)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
+                    {fmt(r.duration_s, 1)}
+                  </td>
+                </tr>
+                {isOpen && (
+                  <tr>
+                    <td colSpan={9} className="p-0">
+                      <RunMetricsPanel row={r} />
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
     </div>

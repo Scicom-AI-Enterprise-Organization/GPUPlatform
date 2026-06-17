@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import yaml from "js-yaml";
-import { Clock, Cpu, Layers, MoreHorizontal, Pencil, Trash2, TrendingUp, User } from "lucide-react";
+import { Clock, Cpu, Globe, Layers, Lock, MoreHorizontal, Pencil, Trash2, TrendingUp, User } from "lucide-react";
 import type { BenchmarkRecord } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
 import { formatCostUSD, useLiveCost } from "@/lib/cost";
@@ -59,6 +59,7 @@ export function BenchmarkRow({
   onToggle,
   onDelete,
   onRename,
+  onTogglePublic,
 }: {
   bench: BenchmarkRecord;
   selectMode?: boolean;
@@ -66,7 +67,10 @@ export function BenchmarkRow({
   onToggle?: (id: string) => void;
   onDelete?: (bench: BenchmarkRecord) => void;
   onRename?: (bench: BenchmarkRecord) => void;
+  onTogglePublic?: (bench: BenchmarkRecord) => void;
 }) {
+  // is_owner is undefined on older payloads — treat as owned for back-compat.
+  const owned = bench.is_owner ?? true;
   const avatar = avatarFor(bench.name);
   const result = (bench.result_json ?? {}) as Record<string, unknown>;
   const tput = typeof result.output_throughput === "number" ? result.output_throughput : null;
@@ -134,12 +138,22 @@ export function BenchmarkRow({
               >
                 {bench.status}
               </span>
+              {bench.is_public && (
+                <span
+                  className="inline-flex items-center gap-1 rounded-full border border-sky-500/40 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-sky-700 dark:text-sky-400"
+                  title="Public — visible to everyone"
+                >
+                  <Globe className="h-3 w-3" /> Public
+                </span>
+              )}
             </div>
             <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
               <span className="truncate font-mono" title={bench.id}>{bench.id}</span>
               <span>·</span>
               <User className="h-3 w-3" />
-              <span className="truncate">{bench.created_by}</span>
+              <span className="truncate">
+                {owned ? bench.created_by : `owned by ${bench.created_by}`}
+              </span>
             </div>
           </div>
         </div>
@@ -155,7 +169,7 @@ export function BenchmarkRow({
               </div>
             </div>
           )}
-          {!selectMode && (onDelete || onRename) && (
+          {!selectMode && (onDelete || onRename || onTogglePublic) && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -172,6 +186,26 @@ export function BenchmarkRow({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+                {onTogglePublic && (
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      onTogglePublic(bench);
+                    }}
+                  >
+                    {bench.is_public ? (
+                      <>
+                        <Lock className="h-4 w-4" />
+                        Make private
+                      </>
+                    ) : (
+                      <>
+                        <Globe className="h-4 w-4" />
+                        Make public
+                      </>
+                    )}
+                  </DropdownMenuItem>
+                )}
                 {onRename && (
                   <DropdownMenuItem
                     onSelect={(e) => {

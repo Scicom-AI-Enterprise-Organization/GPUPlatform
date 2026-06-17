@@ -83,6 +83,9 @@ class Benchmark(Base):
     error_text: Mapped[Optional[str]] = mapped_column(String(4096), nullable=True)
     result_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # Public runs surface (read-only) in every user's benchmark list. Only the
+    # owner (or an admin) can flip this or mutate the run.
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -1467,6 +1470,10 @@ class BenchmarkRecord(BaseModel):
     error_text: Optional[str] = None
     result_json: Optional[dict] = None
     created_by: str
+    # Whether this run is shared publicly, and whether the requesting user owns
+    # it. is_owner is computed per-request (None when the caller is unknown).
+    is_public: bool = False
+    is_owner: Optional[bool] = None
     created_at: str
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
@@ -1547,7 +1554,9 @@ class CreateTemplateRequest(BaseModel):
 router = APIRouter(prefix="/benchmarks", tags=["benchmarks"])
 
 
-def _to_record(b: Benchmark, owner_username: str) -> BenchmarkRecord:
+def _to_record(
+    b: Benchmark, owner_username: str, is_owner: Optional[bool] = None
+) -> BenchmarkRecord:
     return BenchmarkRecord(
         id=b.id,
         name=b.name,
@@ -1558,6 +1567,8 @@ def _to_record(b: Benchmark, owner_username: str) -> BenchmarkRecord:
         error_text=b.error_text,
         result_json=b.result_json,
         created_by=owner_username,
+        is_public=bool(getattr(b, "is_public", False)),
+        is_owner=is_owner,
         created_at=b.created_at.isoformat() if b.created_at else "",
         started_at=b.started_at.isoformat() if b.started_at else None,
         ended_at=b.ended_at.isoformat() if b.ended_at else None,
@@ -1569,6 +1580,11 @@ def _to_record(b: Benchmark, owner_username: str) -> BenchmarkRecord:
         hf_token_secret=getattr(b, "hf_token_secret", None) or None,
         cleanup_model=getattr(b, "cleanup_model", None),
     )
+
+
+def _can_read(b: Benchmark, user: User) -> bool:
+    """Read access: the owner, an admin, or anyone when the run is public."""
+    return user.is_admin or b.owner_id == user.id or bool(getattr(b, "is_public", False))
 
 
 # ---------- Templates --------------------------------------------------
@@ -1784,18 +1800,20 @@ async def list_benchmarks(
     session: AsyncSession = Depends(get_session),
 ):
     # Admins default to their own runs; pass ?scope=all to see everyone's.
-    # Non-admins are always scoped to own regardless of the param.
+    # Everyone (incl. non-admins) additionally sees public runs shared by others.
     show_all = user.is_admin and scope == "all"
     if show_all:
         rows = await session.execute(select(Benchmark).order_by(Benchmark.created_at.desc()))
     else:
         rows = await session.execute(
-            select(Benchmark).where(Benchmark.owner_id == user.id).order_by(Benchmark.created_at.desc())
+            select(Benchmark)
+            .where((Benchmark.owner_id == user.id) | (Benchmark.is_public.is_(True)))
+            .order_by(Benchmark.created_at.desc())
         )
     out: list[BenchmarkRecord] = []
     for b in rows.scalars().all():
         owner = await session.get(User, b.owner_id)
-        out.append(_to_record(b, owner.username if owner else ""))
+        out.append(_to_record(b, owner.username if owner else "", is_owner=b.owner_id == user.id))
     return out
 
 
@@ -1999,10 +2017,10 @@ async def get_benchmark(
     b = await session.get(Benchmark, bench_id)
     if not b:
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
-    if not user.is_admin and b.owner_id != user.id:
+    if not _can_read(b, user):
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
     owner = await session.get(User, b.owner_id)
-    return _to_record(b, owner.username if owner else "")
+    return _to_record(b, owner.username if owner else "", is_owner=b.owner_id == user.id)
 
 
 @router.patch("/{bench_id}", response_model=BenchmarkRecord)
@@ -2031,7 +2049,35 @@ async def rename_benchmark(
         details={"from": old, "to": name},
     )
     owner = await session.get(User, b.owner_id)
-    return _to_record(b, owner.username if owner else "")
+    return _to_record(b, owner.username if owner else "", is_owner=b.owner_id == user.id)
+
+
+class VisibilityRequest(BaseModel):
+    is_public: bool
+
+
+@router.post("/{bench_id}/visibility", response_model=BenchmarkRecord)
+async def set_benchmark_visibility(
+    bench_id: str,
+    body: VisibilityRequest,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Make a benchmark public (visible read-only to everyone) or private again.
+    Owner (or admin) only."""
+    b = await session.get(Benchmark, bench_id)
+    if not b:
+        raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
+    if not user.is_admin and b.owner_id != user.id:
+        raise HTTPException(status_code=403, detail={"error": "forbidden"})
+    b.is_public = bool(body.is_public)
+    await session.commit()
+    await audit.record(
+        user, "benchmark.visibility", "benchmark", bench_id, b.name,
+        details={"is_public": b.is_public},
+    )
+    owner = await session.get(User, b.owner_id)
+    return _to_record(b, owner.username if owner else "", is_owner=b.owner_id == user.id)
 
 
 @router.get("/{bench_id}/logs")
@@ -2048,7 +2094,7 @@ async def get_benchmark_logs(
     b = await session.get(Benchmark, bench_id)
     if not b:
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
-    if not user.is_admin and b.owner_id != user.id:
+    if not _can_read(b, user):
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
     n = max(1, min(int(tail or 200), 5000))
 
@@ -2091,7 +2137,9 @@ async def duplicate_benchmark(
     src = await session.get(Benchmark, bench_id)
     if not src:
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
-    if not user.is_admin and src.owner_id != user.id:
+    # Re-run mints a new run owned by the caller, so reading a public run to copy
+    # its config is fine — the original is never mutated.
+    if not _can_read(src, user):
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
 
     target = await _bench_s3_target(src.storage_id)
@@ -2282,7 +2330,7 @@ async def stream_logs(
     b = await session.get(Benchmark, bench_id)
     if not b:
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
-    if not user.is_admin and b.owner_id != user.id:
+    if not _can_read(b, user):
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
 
     redis = request.app.state.redis
@@ -2372,7 +2420,7 @@ async def list_files(
     b = await session.get(Benchmark, bench_id)
     if not b:
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
-    if not user.is_admin and b.owner_id != user.id:
+    if not _can_read(b, user):
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
     target = await _bench_s3_target(b.storage_id)
     items = s3_list(b.s3_prefix, target=target)
@@ -2403,7 +2451,7 @@ async def get_file_content(
     b = await session.get(Benchmark, bench_id)
     if not b:
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
-    if not user.is_admin and b.owner_id != user.id:
+    if not _can_read(b, user):
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
     rel = (path or "").lstrip("/")
     if not rel or ".." in rel:
@@ -2432,7 +2480,7 @@ async def export_benchmark(
     b = await session.get(Benchmark, bench_id)
     if not b:
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
-    if not user.is_admin and b.owner_id != user.id:
+    if not _can_read(b, user):
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
 
     files: list[dict] = []

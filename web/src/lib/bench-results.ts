@@ -30,6 +30,19 @@ export type Row = {
   mean_e2el_ms: number | null;
   median_e2el_ms: number | null;
   p99_e2el_ms: number | null;
+  // Counters from vLLM's serving benchmark (the "============ Serving Benchmark
+  // Result ============" block) — surfaced in the per-run full-metrics panel.
+  completed: number | null;          // "Successful requests"
+  total_input_tokens: number | null;
+  total_output_tokens: number | null;
+  std_ttft_ms: number | null;
+  std_tpot_ms: number | null;
+  std_itl_ms: number | null;
+  std_e2el_ms: number | null;
+  // Every other numeric scalar from result.json, kept verbatim so the full
+  // metrics panel can show fields we don't model explicitly (peak throughput,
+  // goodput, etc.) without a parser change.
+  raw: Record<string, number>;
 };
 
 export type StatMode = "median" | "p99" | "mean";
@@ -71,6 +84,10 @@ export function parseFilenameDims(name: string): {
 
 export function rowFromJson(filename: string, json: Record<string, unknown>): Row {
   const dims = parseFilenameDims(filename);
+  const raw: Record<string, number> = {};
+  for (const [k, v] of Object.entries(json)) {
+    if (typeof v === "number" && Number.isFinite(v)) raw[k] = v;
+  }
   return {
     filename,
     input_len: dims.input_len,
@@ -93,6 +110,14 @@ export function rowFromJson(filename: string, json: Record<string, unknown>): Ro
     mean_e2el_ms: num(json.mean_e2el_ms),
     median_e2el_ms: num(json.median_e2el_ms),
     p99_e2el_ms: num(json.p99_e2el_ms),
+    completed: num(json.completed),
+    total_input_tokens: num(json.total_input_tokens),
+    total_output_tokens: num(json.total_output_tokens),
+    std_ttft_ms: num(json.std_ttft_ms),
+    std_tpot_ms: num(json.std_tpot_ms),
+    std_itl_ms: num(json.std_itl_ms),
+    std_e2el_ms: num(json.std_e2el_ms),
+    raw,
   };
 }
 
