@@ -1233,7 +1233,13 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 return -1.0
             tp = c.get("total_token_throughput") or c.get("output_throughput") or 0
             return float(tp) if isinstance(tp, (int, float)) else 0.0
-        result_json = max(_raw_candidates, key=_cand_score)
+        # Strip the heavy per-request arrays before they land in the DB column. The
+        # raw per-config files (with full itls/generated_texts) are already in S3
+        # (uploaded above), so keeping them here just bloats result_json to multi-MB
+        # — which made GET /benchmarks load tens of MB out of Postgres per request
+        # (~1.4s, event-loop block) and embedded NUL bytes (from generated_texts)
+        # that break any SQL-level json access. Keep scalars + the accuracy summary.
+        result_json = _slim_result_json(max(_raw_candidates, key=_cand_score))
 
     # Build a canonical, aggregate `result.json` (summary across all bench
     # configs, heavy per-request arrays stripped) and put it in storage if one
@@ -2016,6 +2022,45 @@ def _parse_config(yaml_text: str) -> dict:
         "model": ((first.get("model") or {}).get("repo_id")),
         "tp": int(serve.get("tensor_parallel_size") or 1),
         "dp": int(serve.get("data_parallel_size") or 1),
+    }
+
+
+@router.post("/_compact")
+async def compact_result_json(
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Admin one-time cleanup: rewrite every benchmark's result_json through the
+    slimmer, dropping the heavy per-request arrays (itls / generated_texts / …) that
+    bloat the column. Those arrays already live in each run's S3 per-config files, so
+    nothing is lost — this just compacts rows finalized BEFORE result_json was slimmed
+    at the source. Idempotent: already-slim rows are skipped. Route name leads with
+    `_` so it's matched before the /{bench_id} path param."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="admin only")
+    rows = (await session.execute(select(Benchmark))).scalars().all()
+    scanned = compacted = 0
+    before = after = 0
+    for b in rows:
+        scanned += 1
+        rj = b.result_json
+        if not isinstance(rj, dict):
+            continue
+        slim = _slim_result_json(rj)
+        if slim is None or slim.keys() == rj.keys():
+            continue  # nothing dropped → already slim (cheap key-set check, no serialize)
+        before += len(json.dumps(rj, default=str))
+        after += len(json.dumps(slim, default=str))
+        b.result_json = slim
+        compacted += 1
+    await session.commit()
+    logger.info("compact: scanned=%d compacted=%d saved=%.1fMB", scanned, compacted, (before - after) / 1e6)
+    return {
+        "scanned": scanned,
+        "compacted": compacted,
+        "bytes_before": before,
+        "bytes_after": after,
+        "saved_mb": round((before - after) / 1e6, 1),
     }
 
 

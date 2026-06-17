@@ -6,7 +6,12 @@ Every 5s:
   3. Compute the diff:
        - in-redis but NOT in-provider  → pod is gone; SREM from index, DEL state key
                                           (this catches manual terminations,
-                                          PI-side crashes, billing kills, ...)
+                                          PI-side crashes, billing kills, ...). But
+                                          if it's STILL heartbeating it's a ZOMBIE
+                                          (the worker process outlived its provider
+                                          record) — GC alone is futile because its
+                                          next heartbeat re-adds it; re-arm `drain`
+                                          so the worker shuts itself down.
        - in-provider but NOT in-redis  → orphan pod; log a warning so the
                                           operator can investigate
   4. Sleep 5s, repeat.
@@ -38,6 +43,12 @@ TICK_S = 5.0
 # STILL unregistered this many seconds later. The grace must exceed worker
 # boot+register time so we never reap a machine that's merely still booting.
 ORPHAN_REAP_GRACE_S = 90.0
+# A machine that's gone from every provider listing but is STILL heartbeating is a
+# zombie. We wait this long (to rule out a one-tick provider-list blip) before
+# re-arming its drain flag so the next heartbeat shuts the worker down. VM providers
+# never blip (their listing is authoritative Redis); this grace guards the RunPod
+# fallback, whose API could momentarily return a stale list.
+ZOMBIE_DRAIN_GRACE_S = 30.0
 
 
 async def reconciler_loop(
@@ -126,12 +137,53 @@ async def tick(
     gone = redis_machines - provider_machines
     orphans = provider_machines - redis_machines
 
-    for machine_id in gone:
-        await _remove_machine(rdb, machine_id)
-        await rdb.delete(f"reconciler:orphan_since:{machine_id}")
-        logger.info("reconciler: %s no longer in provider, GC'd from Redis", machine_id)
-
     now = time.time()
+    # Reset the zombie-watch clock for anything a provider currently lists: a machine
+    # that briefly vanished and came back must start a FRESH grace if it later
+    # disappears for real, else a stale gone_since would drain it instantly.
+    for machine_id in provider_machines:
+        await rdb.delete(
+            f"reconciler:gone_since:{machine_id}", f"reconciler:drain_logged:{machine_id}"
+        )
+    for machine_id in gone:
+        # A machine in our index but absent from every provider's listing. If its
+        # worker process is still alive (heartbeat keeps worker:{id} fresh) it's a
+        # ZOMBIE — terminated/forgotten/purged provider-side, yet never actually
+        # died. GC'ing it is futile: its next heartbeat re-adds it to worker_index
+        # and we churn (+ log-spam) every tick forever. So drain it instead — the
+        # worker-agent already shuts itself down on a `drain` heartbeat reply.
+        alive = await rdb.exists(f"worker:{machine_id}")  # checked BEFORE _remove deletes it
+        await _remove_machine(rdb, machine_id)
+        if not alive:
+            # Truly gone (no recent heartbeat) → clean, one-time GC.
+            await rdb.delete(
+                f"reconciler:orphan_since:{machine_id}",
+                f"reconciler:gone_since:{machine_id}",
+                f"reconciler:drain_logged:{machine_id}",
+            )
+            logger.info("reconciler: %s no longer in provider, GC'd from Redis", machine_id)
+            continue
+        # Still heartbeating. Require the gone-but-alive state to persist past a grace
+        # window first, so a one-tick provider-list blip can't drain a healthy worker.
+        gk = f"reconciler:gone_since:{machine_id}"
+        since = await rdb.get(gk)
+        if since is None:
+            await rdb.set(gk, str(now), ex=3600)
+            logger.warning(
+                "reconciler: %s gone from provider but still heartbeating — watching for zombie",
+                machine_id,
+            )
+        elif now - float(since) >= ZOMBIE_DRAIN_GRACE_S:
+            # Confirmed zombie: re-arm drain (deleted by _remove_machine just above)
+            # so its next heartbeat tells the worker-agent to drain + exit. Log once.
+            await rdb.set(f"worker:{machine_id}:drain", "1", ex=600)
+            if not await rdb.exists(f"reconciler:drain_logged:{machine_id}"):
+                await rdb.set(f"reconciler:drain_logged:{machine_id}", "1", ex=3600)
+                logger.warning(
+                    "reconciler: %s is a zombie (gone from provider, still alive) — sent drain to shut it down",
+                    machine_id,
+                )
+
     for machine_id in orphans:
         since_key = f"reconciler:orphan_since:{machine_id}"
         since = await rdb.get(since_key)

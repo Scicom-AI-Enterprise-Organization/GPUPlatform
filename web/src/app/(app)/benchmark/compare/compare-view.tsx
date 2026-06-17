@@ -205,6 +205,31 @@ export function CompareView({
   const [loading, setLoading] = useState(!initialBenches);
   const [notes, setNotes] = useState(initialNotes);
   const [editingNotes, setEditingNotes] = useState(false);
+
+  // Persist the Summary markdown in localStorage, keyed by the compared run set,
+  // so it survives a refresh. Public shares carry their own notes (initialNotes)
+  // and aren't overwritten.
+  const notesKey = useMemo(() => "sgpu:bench-compare-notes:" + [...ids].sort().join(","), [ids]);
+  useEffect(() => {
+    if (publicMode || initialNotes) return;
+    try {
+      const saved = localStorage.getItem(notesKey);
+      if (saved) setNotes(saved);
+    } catch {
+      /* localStorage unavailable */
+    }
+  }, [notesKey, publicMode, initialNotes]);
+  const persistNotes = useCallback(
+    (v: string) => {
+      if (publicMode || initialNotes) return;
+      try {
+        localStorage.setItem(notesKey, v);
+      } catch {
+        /* ignore quota / unavailable */
+      }
+    },
+    [notesKey, publicMode, initialNotes],
+  );
   const [statMode, setStatMode] = useState<StatMode>("median");
   const [shapeSel, setShapeSel] = useState<string | null>(null);
 
@@ -516,7 +541,10 @@ export function CompareView({
                 size="sm"
                 className="h-7"
                 data-html2canvas-ignore="true"
-                onClick={() => setEditingNotes((v) => !v)}
+                onClick={() => {
+                  persistNotes(notes);
+                  setEditingNotes((v) => !v);
+                }}
               >
                 {editingNotes ? "Preview" : "Edit"}
               </Button>
@@ -526,7 +554,10 @@ export function CompareView({
             {editingNotes ? (
               <textarea
                 value={notes}
-                onChange={(e) => setNotes(e.target.value)}
+                onChange={(e) => {
+                  setNotes(e.target.value);
+                  persistNotes(e.target.value);
+                }}
                 rows={12}
                 spellCheck={false}
                 placeholder="Paste the report summary + extra notes — markdown (headings, **bold**, tables, lists). Saved into the public link + included in the PDF."
