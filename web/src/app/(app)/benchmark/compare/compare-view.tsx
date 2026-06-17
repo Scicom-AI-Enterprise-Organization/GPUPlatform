@@ -720,10 +720,10 @@ function IqScatter({ title, points }: { title: string; points: IqPoint[] }) {
           No paired results for this dataset.
         </div>
       ) : (
-        <div className="h-60 w-full">
+        <div className="h-72 w-full">
           <ResponsiveContainer width="100%" height="100%">
-            <ScatterChart margin={{ top: 16, right: 56, left: 12, bottom: 8 }}>
-              <CartesianGrid stroke="rgba(255,255,255,0.06)" />
+            <ScatterChart margin={{ top: 16, right: 56, left: 12, bottom: 28 }}>
+              <CartesianGrid stroke="currentColor" strokeOpacity={0.12} />
               <XAxis
                 type="number"
                 dataKey="speed"
@@ -732,14 +732,17 @@ function IqScatter({ title, points }: { title: string; points: IqPoint[] }) {
                 className="text-[10px] text-muted-foreground"
                 tickLine={false}
                 axisLine={false}
-                height={40}
+                height={44}
                 tickMargin={6}
                 domain={["dataMin", "dataMax"]}
                 // Pad the plot area so a point's centered label doesn't overlap the
                 // Y-axis (left) or get clipped at the right edge.
                 padding={{ left: 36, right: 36 }}
-                tickFormatter={(v: number) => Number(v).toFixed(2)}
-                label={{ value: "throughput (tok/s)", position: "insideBottom", offset: -16, fontSize: 10, fill: "currentColor" }}
+                // Compact, decimal-free ticks: 16000 → "16k", 642 → "642".
+                tickFormatter={(v: number) =>
+                  Number(v) >= 1000 ? `${Math.round(Number(v) / 1000)}k` : `${Math.round(Number(v))}`
+                }
+                label={{ value: "throughput (tok/s)", position: "insideBottom", offset: -8, fontSize: 11, fill: "currentColor" }}
               />
               <YAxis
                 type="number"
@@ -781,7 +784,7 @@ function IqTooltip({
   const p = payload[0]?.payload;
   if (!p) return null;
   return (
-    <div className="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-[11px] text-zinc-200">
+    <div className="rounded-md border border-border bg-popover px-2.5 py-1.5 text-[11px] text-popover-foreground">
       <div className="font-medium">{p.name}</div>
       <div>accuracy: {p.acc.toFixed(1)}%</div>
       <div>speed: {Math.round(p.speed).toLocaleString()} tok/s{p.paired ? ` (${p.paired})` : ""}</div>
@@ -923,23 +926,23 @@ function CompareChart({
             No {yLabel === "ms" ? title.toLowerCase() : "data"} recorded for these runs.
           </div>
         ) : (
-        <div className="h-64 w-full">
+        <div className="h-72 w-full">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={data} margin={{ top: 8, right: 8, left: 12, bottom: 8 }}>
-              <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+            <LineChart data={data} margin={{ top: 8, right: 8, left: 12, bottom: 28 }}>
+              <CartesianGrid stroke="currentColor" strokeOpacity={0.12} vertical={false} />
               <XAxis
                 dataKey="concurrency"
                 stroke="currentColor"
                 className="text-[10px] text-muted-foreground"
                 tickLine={false}
                 axisLine={false}
-                height={40}
+                height={44}
                 tickMargin={6}
                 label={{
                   value: "concurrency",
                   position: "insideBottom",
-                  offset: -16,
-                  fontSize: 10,
+                  offset: -8,
+                  fontSize: 11,
                   fill: "currentColor",
                 }}
               />
@@ -962,13 +965,14 @@ function CompareChart({
               />
               <Tooltip
                 contentStyle={{
-                  background: "rgb(24 24 27)",
-                  border: "1px solid rgb(63 63 70)",
+                  background: "var(--popover)",
+                  border: "1px solid var(--border)",
                   borderRadius: 6,
                   fontSize: 11,
+                  color: "var(--popover-foreground)",
                 }}
-                labelStyle={{ color: "rgb(244 244 245)" }}
-                itemStyle={{ color: "rgb(228 228 231)" }}
+                labelStyle={{ color: "var(--popover-foreground)" }}
+                itemStyle={{ color: "var(--popover-foreground)" }}
                 formatter={(value, name) => [value as number, nameById[String(name)] ?? String(name)]}
               />
               <Legend

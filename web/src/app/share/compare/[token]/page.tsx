@@ -1,4 +1,5 @@
 import { PublicCompareClient, type PublicComparePayload } from "./public-compare-client";
+import { ThemeToggle } from "@/components/console/theme-toggle";
 
 // Public, no-auth shared comparison. Lives OUTSIDE the (app) route group, so it
 // renders with the bare root layout — no sidebar, no topbar. Data comes from the
@@ -33,7 +34,7 @@ export default async function PublicComparePage({
 
   if (!payload) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-background px-4 text-center">
+      <main className="flex min-h-screen items-center justify-center bg-background px-4 text-center text-foreground">
         <div className="max-w-md">
           <h1 className="text-lg font-semibold">Comparison unavailable</h1>
           <p className="mt-2 text-sm text-muted-foreground">{error ?? "Not found."}</p>
@@ -43,8 +44,11 @@ export default async function PublicComparePage({
   }
 
   return (
-    <main className="min-h-screen bg-background">
-      <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+    <main className="min-h-screen bg-background text-foreground">
+      <div className="no-print flex justify-end px-4 pt-4 sm:px-6" data-html2canvas-ignore="true">
+        <ThemeToggle />
+      </div>
+      <div className="px-4 pb-8 pt-2 sm:px-6">
         <PublicCompareClient payload={payload} />
       </div>
     </main>
