@@ -196,21 +196,21 @@ export function ConsoleSidebar({
           )}
         >
           <Image
-            src="/logos/scicom-logo.png"
+            src="/logos/scicom-logo-light-v2.svg"
             alt="Scicom"
-            width={96}
-            height={24}
+            width={158}
+            height={40}
             priority
             className={cn(
-              "h-6 select-none dark:hidden",
-              collapsed ? "w-6 object-contain" : "w-auto",
+              "select-none object-contain dark:hidden",
+              collapsed ? "h-6 w-6" : "h-6 w-24",
             )}
           />
           <ScicomLogo
             aria-hidden="true"
             className={cn(
-              "hidden h-6 select-none dark:block",
-              collapsed ? "w-6 overflow-visible" : "w-auto",
+              "hidden select-none dark:block",
+              collapsed ? "h-6 w-6" : "h-6 w-24",
             )}
           />
           {!collapsed && (

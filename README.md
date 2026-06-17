@@ -446,7 +446,7 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 - **Secrets** at `/admin/secrets` — org-wide global env vars + W&B / MLflow [tracking credentials](#secrets-global-env--tracking).
 - **Disable a surface** — set `DISABLED_SECTIONS` (comma-separated: `inference,benchmark,compute,datasets`) on the gateway **and** web; the section drops out of the sidebar, its pages 404, and the gateway 403s its routes.
 - **Admin Analytics GPU Timeline** — the GPU Timeline tab is a week-style calendar occupancy view: days across, hours downward, similar to Google Calendar. It has top-level controls to choose a specific GPU node and jump between weeks. Inference uses blue blocks, benchmarks use yellow blocks, and workload status is shown with badges / hover details instead of extra block colours. The week grid now uses responsive day columns so all 7 days fit the panel width on normal desktop screens, with horizontal scrolling only as a narrow-screen fallback. When a node has no blocks in the current week, the UI defaults to the most recent populated week for that node instead of opening on an empty calendar.
-- **Sidebar branding** — the top-left sidebar logo keeps the existing Scicom PNG in light mode and switches to an inline SVG logo in dark mode so the brand remains readable against the darker sidebar.
+- **Sidebar branding** — the top-left sidebar logo uses `/public/logos/scicom-logo-light-v2.svg` in light mode and switches to an inline SVG logo in dark mode so the brand remains readable against the sidebar in both themes.
 
 ## Repo layout
 
