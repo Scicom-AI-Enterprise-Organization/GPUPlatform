@@ -128,6 +128,17 @@ describe("benchmark VM Form<->YAML round-trip (DE-53)", () => {
     expect(parsed.envText).toBeNull();
   });
 
+  it("emits + round-trips the storage backend on the VM template", () => {
+    const out = renderYaml(DEFAULTS, "vm", "s3", { cleanupModel: true });
+    // storage sits on the benchmark item (4-space indent), same as cloud.
+    expect(out).toMatch(/^ {4}storage: "s3"$/m);
+    const parsed = parseYamlToForm(out, DEFAULTS);
+    expect(parsed.parseError).toBeNull();
+    expect(parsed.storageRef).toBe("s3"); // resolvable to the Storage dropdown
+    // render -> parse -> render keeps the storage line stable.
+    expect(renderYaml(parsed.state, "vm", "s3", { cleanupModel: true })).toBe(out);
+  });
+
   it("ships a fillable provider placeholder + guidance comment when none is picked", () => {
     const out = renderYaml(DEFAULTS, "vm", "s3");
     expect(out).toMatch(/^ {2}provider: ""  # STATE THE NAME OF GPU PROVIDER$/m);
