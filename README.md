@@ -82,6 +82,23 @@ cd web && npm install && npm run dev
 
 Open `http://localhost:3000`. With `AUTH_DISABLED=1` in `gateway/.env`, login is `admin / admin`. Deploy from the UI or `serverlessgpu deploy ...` — the fake worker handles requests in-process.
 
+For the admin Analytics GPU Timeline, inference workers come from durable
+worker-lifecycle events rather than request outcome records. Normal worker
+shutdowns render as completed/served spans; `terminate_failed` renders with the
+failed/error status indicator. That red state means worker teardown failed, not
+necessarily that inference requests themselves failed.
+
+If you want the gateway in Docker instead of a local Python process, the repo-root
+compose file now supports that directly:
+
+```bash
+docker compose up -d postgres redis gateway
+```
+
+That compose `gateway` service builds from the repo root (required by
+`gateway/Dockerfile`, which also copies `worker-agent/`) and defaults local auth
+to `admin / admin` via `AUTH_DISABLED=1` unless you override it in your shell.
+
 | Env file | Sets |
 |---|---|
 | `gateway/.env` | `DATABASE_URL`, `REDIS_URL`, `AUTH_DISABLED`, `PROVIDER` (default `fake`), `AUTOSCALER`, optional `RUNPOD_API_KEY` / `PI_API_KEY` |
@@ -445,6 +462,8 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 - **Provisioned** at `/admin/provisioned` — live view of every pod + serverless app across users, with cost tracking.
 - **Secrets** at `/admin/secrets` — org-wide global env vars + W&B / MLflow [tracking credentials](#secrets-global-env--tracking).
 - **Disable a surface** — set `DISABLED_SECTIONS` (comma-separated: `inference,benchmark,compute,datasets`) on the gateway **and** web; the section drops out of the sidebar, its pages 404, and the gateway 403s its routes.
+- **Admin Analytics GPU Timeline** — the GPU Timeline tab is a week-style calendar occupancy view: days across, hours downward, similar to Google Calendar. It has top-level controls to choose a specific GPU node and jump between weeks. Inference uses blue blocks, benchmarks use yellow blocks, and workload status is shown with badges / hover details instead of extra block colours. The week grid now uses responsive day columns so all 7 days fit the panel width on normal desktop screens, with horizontal scrolling only as a narrow-screen fallback. When a node has no blocks in the current week, the UI defaults to the most recent populated week for that node instead of opening on an empty calendar.
+- **Sidebar branding** — the top-left sidebar logo uses `/public/logos/scicom-logo-light-v2.svg` in light mode and switches to an inline SVG logo in dark mode so the brand remains readable against the sidebar in both themes.
 
 ## Repo layout
 

@@ -20,6 +20,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import {
   Bar,
   BarChart,
@@ -35,6 +36,8 @@ import {
 } from "recharts";
 import {
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Download,
   ExternalLink,
   Loader2,
@@ -632,6 +635,8 @@ const fmtTime = (d: Date | null): string =>
     ? `${localDate(d)} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`
     : "—";
 
+const fmtHoverTs = (ms: number): string => `${localDate(new Date(ms))} ${fmt12(ms)}`;
+
 // ── GPU Timeline (inference worker on/off spans) ─────────────────────────────
 // Raw durable worker lifecycle events from /admin/worker-events, paired into
 // serving spans per worker so the timeline can draw one bar per worker life.
@@ -676,31 +681,71 @@ type CalBlock = {
   ref: string; // worker machine_id (inference) or benchmark id
   kind: WorkloadKind;
   status: string; // running/served (inference) or run status (benchmark)
+  endReason: string | null;
   start: number; // epoch ms, clipped to [day 00:00, day 24:00]
   end: number; // epoch ms
   running: boolean;
   laneStart: number; // index into the day's lane list
   laneSpan: number; // how many GPU lanes the block covers
   gpuLabel: string; // e.g. "0–3" or "4" or "all"
+  gpuModel: string | null;
+  owner: string | null;
+  actor: string | null;
 };
 type CalDay = { date: string; lanes: GpuLane[]; blocks: CalBlock[] };
+type GpuHoverState = { block: CalBlock; x: number; y: number };
+type WeekBlock = CalBlock & { col: number; totalCols: number };
+type WeekDay = { date: string; inRange: boolean; blocks: WeekBlock[] };
+type WeekRow = { key: string; days: WeekDay[] };
+const GPU_HOUR_HEIGHT = 56;
+const GPU_DAY_MIN_WIDTH = 112;
+const GPU_WEEK_GUTTER = 60;
+let gpuHoverTimerHandle: ReturnType<typeof window.setTimeout> | null = null;
+const GPU_HOVER_DELAY_MS = 90;
 
-// Block colour by workload type + status. Inference: green=running, indigo=served.
-// Benchmark: amber=running, sky=done, rose=failed, slate=cancelled/other.
+// Block colour by workload kind only — keep the palette simple and surface
+// status via badges / hover content instead of introducing many block colours.
 function blockClass(b: { kind: WorkloadKind; status: string; running: boolean }): string {
-  if (b.kind === "benchmark") {
-    switch (b.status) {
-      case "running":
-        return "border-amber-400/40 bg-amber-500";
-      case "done":
-        return "border-teal-400/40 bg-teal-600";
-      case "failed":
-        return "border-rose-400/40 bg-rose-600";
-      default: // cancelled / queued / anything else
-        return "border-slate-400/40 bg-slate-500";
-    }
+  return b.kind === "benchmark"
+    ? "border-amber-300/45 bg-amber-500"
+    : "border-sky-300/45 bg-sky-600";
+}
+
+function statusTone(status: string) {
+  if (/running/.test(status)) {
+    return {
+      dot: "bg-emerald-400",
+      pill: "bg-emerald-500/20 text-emerald-300",
+    };
   }
-  return b.running ? "border-emerald-400/40 bg-emerald-600" : "border-indigo-400/40 bg-indigo-600";
+  if (/done|served|completed/.test(status)) {
+    return {
+      dot: "bg-slate-200",
+      pill: "bg-white/12 text-white",
+    };
+  }
+  if (/fail|error|timeout/.test(status)) {
+    return {
+      dot: "bg-rose-400",
+      pill: "bg-rose-500/20 text-rose-300",
+    };
+  }
+  if (/cancel/.test(status)) {
+    return {
+      dot: "bg-slate-400",
+      pill: "bg-slate-500/20 text-slate-300",
+    };
+  }
+  return {
+    dot: "bg-amber-300",
+    pill: "bg-amber-500/20 text-amber-200",
+  };
+}
+
+function inferenceTimelineStatus(span: WorkerSpan): string {
+  if (span.running) return "running";
+  if (span.endReason === "terminate_failed") return "failed";
+  return "served";
 }
 
 // 12-hour clock like Google Calendar — "6:12pm", "5am".
@@ -756,6 +801,43 @@ function buildGpuTimeline(events: WorkerEvt[]): GpuTimelineRow[] {
   return rows;
 }
 
+function layoutDayBlocks(blocks: CalBlock[]): WeekBlock[] {
+  const sorted = [...blocks].sort(
+    (a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start),
+  );
+  const laidOut: WeekBlock[] = [];
+  let cluster: CalBlock[] = [];
+  let clusterEnd = -Infinity;
+
+  const flush = () => {
+    if (!cluster.length) return;
+    const colEnds: number[] = [];
+    const clusterLaid: WeekBlock[] = [];
+    for (const block of cluster) {
+      let col = colEnds.findIndex((end) => end <= block.start);
+      if (col === -1) {
+        col = colEnds.length;
+        colEnds.push(block.end);
+      } else {
+        colEnds[col] = block.end;
+      }
+      clusterLaid.push({ ...block, col, totalCols: 1 });
+    }
+    const totalCols = Math.max(colEnds.length, 1);
+    for (const block of clusterLaid) laidOut.push({ ...block, totalCols });
+    cluster = [];
+    clusterEnd = -Infinity;
+  };
+
+  for (const block of sorted) {
+    if (cluster.length && block.start >= clusterEnd) flush();
+    cluster.push(block);
+    clusterEnd = Math.max(clusterEnd, block.end);
+  }
+  flush();
+  return laidOut;
+}
+
 const STATUS_COLOR = (s: string) =>
   /complet|succe|done|finish|stopped|created/.test(s)
     ? "text-emerald-600 dark:text-emerald-400"
@@ -778,8 +860,9 @@ type SortKey =
 
 export function AnalyticsView() {
   const [period, setPeriod] = useState<Period>("7d");
-  const todayStr = localDate(new Date());
-  const weekAgoStr = localDate(new Date(Date.now() - 6 * 86400 * 1000));
+  const initialToday = useMemo(() => new Date(), []);
+  const todayStr = localDate(initialToday);
+  const weekAgoStr = localDate(new Date(initialToday.getTime() - 6 * 86400 * 1000));
   const [customFrom, setCustomFrom] = useState<string>(weekAgoStr);
   const [customTo, setCustomTo] = useState<string>(todayStr);
   const [platforms, setPlatforms] = useState<Set<string>>(
@@ -818,6 +901,9 @@ export function AnalyticsView() {
   const [sortAsc, setSortAsc] = useState(false);
   const [page, setPage] = useState(0);
   const [detailRec, setDetailRec] = useState<Rec | null>(null);
+  const [gpuHover, setGpuHover] = useState<GpuHoverState | null>(null);
+  const [gpuNodeFilter, setGpuNodeFilter] = useState("");
+  const [gpuWeekKey, setGpuWeekKey] = useState("");
   const PAGE_SIZE = 50;
 
   const { from, to } = useMemo(
@@ -842,10 +928,14 @@ export function AnalyticsView() {
       ref: string;
       kind: WorkloadKind;
       status: string;
+      endReason: string | null;
       start: number;
       end: number | null; // null = still running
       running: boolean;
       gpus: number[]; // -1 = no device pin ("all")
+      gpuModel: string | null;
+      owner: string | null;
+      actor: string | null;
     };
     const items: Item[] = [];
     for (const { app, spans } of gpuTimeline) {
@@ -858,11 +948,15 @@ export function AnalyticsView() {
           node,
           ref: sp.mid,
           kind: "inference",
-          status: sp.running ? "running" : "served",
+          status: inferenceTimelineStatus(sp),
           start: sp.start,
           end: sp.end,
+          endReason: sp.endReason,
           running: sp.running,
           gpus,
+          gpuModel: meta?.gpu ?? null,
+          owner: null,
+          actor: sp.actor,
         });
       }
     }
@@ -876,8 +970,12 @@ export function AnalyticsView() {
         status: b.status,
         start: new Date(b.started).getTime(),
         end: b.ended ? new Date(b.ended).getTime() : null,
+        endReason: null,
         running: b.status === "running",
         gpus: b.gpu_ids.length ? b.gpu_ids : [-1],
+        gpuModel: null,
+        owner: b.owner,
+        actor: null,
       });
     }
 
@@ -941,6 +1039,7 @@ export function AnalyticsView() {
             ref: r.ref,
             kind: r.kind,
             status: r.status,
+            endReason: r.endReason,
             start: r.start,
             end: r.end,
             running: r.running,
@@ -950,6 +1049,9 @@ export function AnalyticsView() {
               gids.length > 1
                 ? `${gpuLabel(gids[0])}–${gpuLabel(gids[gids.length - 1])}`
                 : gpuLabel(gids[0]),
+            gpuModel: r.gpuModel,
+            owner: r.owner,
+            actor: r.actor,
           });
         };
         for (let i = 1; i < idx.length; i++) {
@@ -967,6 +1069,77 @@ export function AnalyticsView() {
     days.sort((a, b) => b.date.localeCompare(a.date)); // newest day first
     return days;
   }, [gpuTimeline, workerApps, workerBenchmarks, from, to, nowTs]);
+
+  const gpuTimelineNodes = useMemo(
+    () => [...new Set(gpuDays.flatMap((d) => d.blocks.map((b) => b.node)))].sort(),
+    [gpuDays],
+  );
+
+  const activeGpuNode = gpuTimelineNodes.includes(gpuNodeFilter)
+    ? gpuNodeFilter
+    : (gpuTimelineNodes[0] ?? "");
+
+  const gpuWeeks = useMemo<WeekRow[]>(() => {
+    const byDate = new Map(
+      gpuDays.map((d) => [
+        d.date,
+        layoutDayBlocks(
+          d.blocks.filter((b) => (activeGpuNode ? b.node === activeGpuNode : true)),
+        ),
+      ]),
+    );
+    const rangeFrom = localDate(from);
+    const rangeTo = localDate(to);
+    const start = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+    start.setDate(start.getDate() - start.getDay());
+    const end = new Date(to.getFullYear(), to.getMonth(), to.getDate());
+    end.setDate(end.getDate() + (6 - end.getDay()));
+    const weeks: WeekRow[] = [];
+    const cursor = new Date(start);
+    while (cursor <= end) {
+      const weekStart = new Date(cursor);
+      const days: WeekDay[] = [];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(weekStart);
+        d.setDate(weekStart.getDate() + i);
+        const date = localDate(d);
+        days.push({
+          date,
+          inRange: date >= rangeFrom && date <= rangeTo,
+          blocks: byDate.get(date) ?? [],
+        });
+      }
+      weeks.push({ key: localDate(weekStart), days });
+      cursor.setDate(cursor.getDate() + 7);
+    }
+    return weeks;
+  }, [gpuDays, from, to, activeGpuNode]);
+
+  const defaultGpuWeekKey = useMemo(() => {
+    const hasBlocks = (week: WeekRow) => week.days.some((d) => d.blocks.length > 0);
+    const todayWeek = gpuWeeks.find((week) => week.days.some((d) => d.date === todayStr));
+    if (todayWeek && hasBlocks(todayWeek)) return todayWeek.key;
+
+    const latestPopulatedWeek = [...gpuWeeks].reverse().find(hasBlocks);
+    if (latestPopulatedWeek) return latestPopulatedWeek.key;
+
+    return todayWeek?.key ?? gpuWeeks[gpuWeeks.length - 1]?.key ?? "";
+  }, [gpuWeeks, todayStr]);
+
+  const gpuWeekContext = `${activeGpuNode}|${from.toISOString()}|${to.toISOString()}`;
+  const selectedGpuWeekKey = gpuWeekKey.startsWith(`${gpuWeekContext}|`)
+    ? gpuWeekKey.slice(gpuWeekContext.length + 1)
+    : "";
+
+  const activeGpuWeekKey = gpuWeeks.some((week) => week.key === selectedGpuWeekKey)
+    ? selectedGpuWeekKey
+    : defaultGpuWeekKey;
+
+  const activeGpuWeek =
+    gpuWeeks.find((week) => week.key === activeGpuWeekKey) ?? null;
+
+  const activeGpuWeekIndex = gpuWeeks.findIndex((week) => week.key === activeGpuWeekKey);
+  const selectGpuWeek = (weekKey: string) => setGpuWeekKey(`${gpuWeekContext}|${weekKey}`);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1038,7 +1211,10 @@ export function AnalyticsView() {
   }, [from, to]);
 
   useEffect(() => {
-    void load();
+    const timer = window.setTimeout(() => {
+      void load();
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [load]);
 
   // ── filtered + aggregated views ────────────────────────────────────────────
@@ -1495,6 +1671,51 @@ export function AnalyticsView() {
       {sortKey === key ? (sortAsc ? " ↑" : " ↓") : ""}
     </th>
   );
+
+  const placeGpuHover = useCallback((clientX: number, clientY: number) => {
+    const maxX = typeof window !== "undefined" ? Math.max(window.innerWidth - 336, 16) : clientX;
+    const maxY = typeof window !== "undefined" ? Math.max(window.innerHeight - 220, 16) : clientY;
+    return {
+      x: Math.max(16, Math.min(clientX + 18, maxX)),
+      y: Math.max(16, Math.min(clientY + 18, maxY)),
+    };
+  }, []);
+
+  const scheduleGpuHover = useCallback(
+    (block: CalBlock, clientX: number, clientY: number) => {
+      if (gpuHoverTimerHandle) window.clearTimeout(gpuHoverTimerHandle);
+      const pos = placeGpuHover(clientX, clientY);
+      gpuHoverTimerHandle = window.setTimeout(() => {
+        setGpuHover({ block, ...pos });
+      }, GPU_HOVER_DELAY_MS);
+    },
+    [placeGpuHover],
+  );
+
+  const moveGpuHover = useCallback(
+    (block: CalBlock, clientX: number, clientY: number) => {
+      const pos = placeGpuHover(clientX, clientY);
+      setGpuHover((prev) => (prev ? { block, ...pos } : prev));
+    },
+    [placeGpuHover],
+  );
+
+  const clearGpuHover = useCallback((ref?: string) => {
+    if (gpuHoverTimerHandle) {
+      window.clearTimeout(gpuHoverTimerHandle);
+      gpuHoverTimerHandle = null;
+    }
+    setGpuHover((prev) => (!ref || prev?.block.ref === ref ? null : prev));
+  }, []);
+
+  const fmtWeekRange = useCallback((week: WeekRow | null): string => {
+    if (!week) return "";
+    const start = new Date(`${week.days[0].date}T00:00:00`);
+    const end = new Date(`${week.days[6].date}T00:00:00`);
+    const left = start.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    const right = end.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return `${left} - ${right}`;
+  }, []);
 
   // ── render ────────────────────────────────────────────────────────────────
 
@@ -2157,144 +2378,303 @@ export function AnalyticsView() {
 
         {/* GPU Timeline — calendar: one row per day, fluid event blocks per endpoint */}
         <TabsContent value="gputimeline">
-          <div className="rounded-lg border bg-card p-4">
+          <div className="relative rounded-lg border bg-card p-4">
             <h2 className="mb-1 text-sm font-semibold">GPU Timeline</h2>
             <p className="mb-3 text-xs text-muted-foreground">
-              What occupied each GPU, laid out like a calendar — one row per day, time left→right,
-              a lane per node + GPU. A block spans all the GPUs its workload held. Inference and
-              benchmarks share the same nodes, so both are shown. Sourced from the durable
-              worker-events log + benchmark runs. Note: inference spans only go back to when
-              durable worker-event logging was enabled; benchmarks reach further back.
+              Weekly calendar view: days across, hours downward, similar to Google Calendar.
+              Workloads are placed by time-of-day, and overlapping runs sit side-by-side within
+              the same day. Inference and benchmarks share the same calendar. Sourced from the
+              durable worker-events log + benchmark runs. Note: inference spans only go back to
+              when durable worker-event logging was enabled; benchmarks reach further back.
             </p>
             <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] text-muted-foreground">
               <span className="font-medium uppercase tracking-wide">Inference</span>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-600" /> running
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-indigo-600" /> served
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-sky-600" /> blue blocks
               </span>
               <span className="ml-2 font-medium uppercase tracking-wide">Benchmark</span>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-500" /> running
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-500" /> yellow blocks
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-teal-600" /> done
+                <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" /> status badge = running
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-rose-600" /> failed
+                <span className="inline-block h-2.5 w-2.5 rounded-full bg-rose-400" /> status badge = failed
               </span>
-              <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-slate-500" /> cancelled
-              </span>
+            </div>
+            <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border bg-muted/20 px-3 py-2">
+              <div className="min-w-[220px]">
+                <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  GPU node
+                </div>
+                <Select value={activeGpuNode} onValueChange={setGpuNodeFilter}>
+                  <SelectTrigger className="w-[260px] bg-background" size="sm">
+                    <SelectValue placeholder="Select a node" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {gpuTimelineNodes.map((node) => (
+                      <SelectItem key={node} value={node}>
+                        {node}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="min-w-[260px]">
+                <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Week
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-9 w-9 p-0"
+                    disabled={activeGpuWeekIndex <= 0}
+                    onClick={() => {
+                      const prev = gpuWeeks[activeGpuWeekIndex - 1];
+                      if (prev) selectGpuWeek(prev.key);
+                    }}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <div className="min-w-[150px] rounded-md border bg-background px-3 py-2 text-sm font-medium">
+                    {fmtWeekRange(activeGpuWeek)}
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-9 w-9 p-0"
+                    disabled={activeGpuWeekIndex < 0 || activeGpuWeekIndex >= gpuWeeks.length - 1}
+                    onClick={() => {
+                      const next = gpuWeeks[activeGpuWeekIndex + 1];
+                      if (next) selectGpuWeek(next.key);
+                    }}
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                  <Input
+                    type="date"
+                    className="h-9 w-[150px] bg-background"
+                    value={activeGpuWeek?.days.find((d) => d.inRange)?.date ?? activeGpuWeek?.days[0]?.date ?? ""}
+                    min={gpuWeeks[0]?.days[0]?.date}
+                    max={gpuWeeks[gpuWeeks.length - 1]?.days[6]?.date}
+                    onChange={(e) => {
+                      const match = gpuWeeks.find((week) =>
+                        week.days.some((day) => day.date === e.target.value),
+                      );
+                      if (match) selectGpuWeek(match.key);
+                    }}
+                  />
+                </div>
+              </div>
             </div>
             {gpuDays.length === 0 && !loading ? (
               <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
                 No GPU activity in the selected period.
               </div>
             ) : (
-              <div className="overflow-hidden rounded-md border text-xs">
-                {/* Hour axis — one labelled cell per hour */}
-                <div className="flex border-b bg-muted/30 text-[11px] font-medium text-muted-foreground">
-                  <div className="w-32 shrink-0 border-r px-3 py-2">Day</div>
-                  <div className="w-16 shrink-0 border-r px-2 py-2 text-right">GPU</div>
-                  <div className="flex flex-1">
-                    {Array.from({ length: 24 }, (_, h) => (
-                      <div
-                        key={h}
-                        className="flex-1 border-r border-border/60 px-1.5 py-2 tabular-nums last:border-r-0"
-                      >
-                        {h === 0 ? "12a" : h === 12 ? "12p" : h < 12 ? `${h}a` : `${h - 12}p`}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                {/* Day rows — GPU column + a single timeline canvas where a
-                    block spans the GPU lanes its endpoint occupies */}
-                {gpuDays.map((day) => {
-                  const dayStart = new Date(`${day.date}T00:00:00`).getTime();
-                  const LANE = 44; // px per GPU lane — spacious
-                  const total = day.lanes.length * LANE;
-                  const d = new Date(`${day.date}T00:00:00`);
-                  const weekday = d.toLocaleDateString(undefined, { weekday: "short" });
+              <div className="w-full overflow-x-auto pb-1">
+                {activeGpuWeek ? (() => {
+                  const week = activeGpuWeek;
+                  const totalHeight = GPU_HOUR_HEIGHT * 24;
                   return (
-                    <div key={day.date} className="flex border-b last:border-b-0">
-                      {/* Day label spans all of the day's GPU lanes */}
+                    <div key={week.key} className="w-full min-w-[860px] overflow-hidden rounded-md border text-xs">
                       <div
-                        className="flex w-32 shrink-0 flex-col justify-center border-r px-3 font-mono"
-                        style={{ height: `${total}px` }}
+                        className="grid border-b bg-muted/30 text-[11px] font-medium text-muted-foreground"
+                        style={{
+                          gridTemplateColumns: `${GPU_WEEK_GUTTER}px repeat(7, minmax(${GPU_DAY_MIN_WIDTH}px, 1fr))`,
+                        }}
                       >
-                        <div className="tabular-nums">{day.date}</div>
-                        <div className="text-[11px] text-muted-foreground">{weekday}</div>
-                      </div>
-                      {/* GPU id column */}
-                      <div className="w-16 shrink-0 border-r" style={{ height: `${total}px` }}>
-                        {day.lanes.map((lane, li) => (
-                          <div
-                            key={li}
-                            className="flex items-center justify-end border-b border-border/30 px-2 font-mono tabular-nums text-muted-foreground last:border-b-0"
-                            style={{ height: `${LANE}px` }}
-                            title={`${lane.node} · GPU ${lane.gpu < 0 ? "all" : lane.gpu}`}
-                          >
-                            {lane.gpu < 0 ? "all" : lane.gpu}
-                          </div>
-                        ))}
-                      </div>
-                      {/* Timeline canvas */}
-                      <div className="relative flex-1" style={{ height: `${total}px` }}>
-                        {/* horizontal lane gridlines */}
-                        <div className="pointer-events-none absolute inset-0 flex flex-col">
-                          {day.lanes.map((_, li) => (
+                        <div className="border-r px-2 py-2 text-right">Time</div>
+                        {week.days.map((day) => {
+                          const dateObj = new Date(`${day.date}T00:00:00`);
+                          const weekday = dateObj.toLocaleDateString(undefined, { weekday: "short" });
+                          const isToday = day.date === todayStr;
+                          return (
                             <div
-                              key={li}
-                              className="border-b border-border/30 last:border-b-0"
-                              style={{ height: `${LANE}px` }}
-                            />
-                          ))}
-                        </div>
-                        {/* vertical hour gridlines */}
-                        <div className="pointer-events-none absolute inset-0 flex">
+                              key={day.date}
+                              className={`border-r px-3 py-2 last:border-r-0 ${
+                                day.inRange ? "" : "bg-muted/20 text-muted-foreground/50"
+                              }`}
+                            >
+                              <div className="text-[10px] uppercase tracking-wide">{weekday}</div>
+                              <div className={`mt-0.5 text-sm font-semibold tabular-nums sm:text-base ${isToday ? "text-foreground" : ""}`}>
+                                {dateObj.getDate()}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div
+                        className="grid"
+                        style={{
+                          gridTemplateColumns: `${GPU_WEEK_GUTTER}px repeat(7, minmax(${GPU_DAY_MIN_WIDTH}px, 1fr))`,
+                        }}
+                      >
+                        <div className="relative border-r bg-background" style={{ height: `${totalHeight}px` }}>
                           {Array.from({ length: 24 }, (_, h) => (
                             <div
                               key={h}
-                              className="flex-1 border-r border-border/40 last:border-r-0"
-                            />
+                              className="absolute right-2 translate-y-[-50%] font-mono text-[10px] text-muted-foreground"
+                              style={{ top: `${h * GPU_HOUR_HEIGHT}px` }}
+                            >
+                              {h === 0 ? "12am" : h === 12 ? "12pm" : h < 12 ? `${h}am` : `${h - 12}pm`}
+                            </div>
                           ))}
                         </div>
-                        {day.blocks.map((b, i) => {
-                          const left = ((b.start - dayStart) / DAY_MS) * 100;
-                          const width = Math.max(((b.end - b.start) / DAY_MS) * 100, 0.8);
+                        {week.days.map((day) => {
+                          const dayStart = new Date(`${day.date}T00:00:00`).getTime();
                           return (
                             <div
-                              key={i}
-                              className={`absolute overflow-hidden rounded-md border px-1.5 py-1 leading-tight text-white shadow-sm ${blockClass(b)}`}
-                              style={{
-                                left: `${Math.min(left, 99)}%`,
-                                width: `${Math.min(width, 100 - left)}%`,
-                                minWidth: "18px", // keep short benchmark runs visible/hoverable
-                                top: `${b.laneStart * LANE + 4}px`,
-                                height: `${b.laneSpan * LANE - 8}px`,
-                              }}
-                              title={
-                                `${b.kind === "benchmark" ? "benchmark " : ""}${b.label}  ·  ${b.node} GPU ${b.gpuLabel}\n` +
-                                `${fmt12(b.start)} – ${b.running ? "now" : fmt12(b.end)}\n` +
-                                (b.kind === "benchmark" ? `status: ${b.status}` : `worker ${b.ref}`)
-                              }
+                              key={day.date}
+                              className={`relative border-r last:border-r-0 ${
+                                day.inRange ? "bg-background" : "bg-muted/10"
+                              }`}
+                              style={{ height: `${totalHeight}px` }}
                             >
-                              <div className="truncate font-medium">{b.label}</div>
-                              <div className="truncate text-[11px] text-white/80">
-                                {fmt12(b.start)}–{b.running ? "now" : fmt12(b.end)}
-                                {b.kind === "benchmark" && b.status !== "running" ? ` · ${b.status}` : ""}
-                              </div>
+                              {Array.from({ length: 25 }, (_, h) => (
+                                <div
+                                  key={h}
+                                  className="absolute inset-x-0 border-t border-border/40"
+                                  style={{ top: `${Math.min(h * GPU_HOUR_HEIGHT, totalHeight)}px` }}
+                                />
+                              ))}
+                              {day.blocks.map((b, i) => {
+                                const blockTop = ((b.start - dayStart) / DAY_MS) * totalHeight;
+                                const blockHeight = Math.max(((b.end - b.start) / DAY_MS) * totalHeight, 28);
+                                const blockWidth = `calc(${100 / b.totalCols}% - 6px)`;
+                                const blockLeft = `calc(${(b.col / b.totalCols) * 100}% + 3px)`;
+                                const tone = statusTone(b.status);
+                                return (
+                                  <div
+                                    key={`${day.date}-${b.ref}-${i}`}
+                                    className={`absolute overflow-hidden rounded-lg border px-1.5 py-1.5 leading-tight text-white shadow-sm transition-transform duration-100 hover:z-10 hover:scale-[1.02] focus:z-10 focus:scale-[1.02] sm:px-2 ${blockClass(b)}`}
+                                    style={{
+                                      left: blockLeft,
+                                      width: blockWidth,
+                                      top: `${Math.max(blockTop, 2)}px`,
+                                      height: `${Math.min(blockHeight, totalHeight - blockTop - 2)}px`,
+                                    }}
+                                    tabIndex={0}
+                                    onMouseEnter={(e) => {
+                                      scheduleGpuHover(b, e.clientX, e.clientY);
+                                    }}
+                                    onMouseMove={(e) => {
+                                      moveGpuHover(b, e.clientX, e.clientY);
+                                    }}
+                                    onMouseLeave={() => clearGpuHover(b.ref)}
+                                    onFocus={(e) => {
+                                      const rect = e.currentTarget.getBoundingClientRect();
+                                      scheduleGpuHover(b, rect.right, rect.top + rect.height / 2);
+                                    }}
+                                    onBlur={() => clearGpuHover(b.ref)}
+                                    aria-label={`${b.kind} ${b.label} on ${b.node} GPU ${b.gpuLabel}`}
+                                  >
+                                    <div className="mb-0.5 flex items-start justify-between gap-2">
+                                      <div className="truncate text-[12px] font-medium sm:text-[13px]">{b.label}</div>
+                                      <span
+                                        className={`mt-0.5 inline-block h-2 w-2 shrink-0 rounded-full ${tone.dot}`}
+                                        aria-hidden="true"
+                                      />
+                                    </div>
+                                    <div className="truncate text-[9px] text-white/80 sm:text-[10px]">
+                                      {fmt12(b.start)}–{b.running ? "now" : fmt12(b.end)}
+                                    </div>
+                                    <div className="truncate text-[9px] text-white/70 sm:text-[10px]">
+                                      {b.node} · GPU {b.gpuLabel}
+                                    </div>
+                                  </div>
+                                );
+                              })}
                             </div>
                           );
                         })}
                       </div>
                     </div>
                   );
-                })}
+                })() : (
+                  <div className="flex h-32 items-center justify-center rounded-md border text-sm text-muted-foreground">
+                    No week available for this node in the selected period.
+                  </div>
+                )}
               </div>
             )}
+            <AnimatePresence>
+              {gpuHover && (() => {
+                const tone = statusTone(gpuHover.block.status);
+                return (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.94, y: 8 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: 6 }}
+                  transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+                  className="pointer-events-none fixed z-50 w-80 rounded-xl border p-3 text-white shadow-[0_24px_70px_rgba(0,0,0,0.55)]"
+                  style={{
+                    left: gpuHover.x,
+                    top: gpuHover.y,
+                    backgroundColor: "#050505",
+                    borderColor: "rgba(255,255,255,0.08)",
+                    opacity: 1,
+                  }}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold leading-tight text-white">{gpuHover.block.label}</div>
+                      <div className="mt-0.5 text-[11px] uppercase tracking-wide text-white/55">
+                        {gpuHover.block.kind === "benchmark" ? "Benchmark workload" : "Inference worker"}
+                      </div>
+                    </div>
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${tone.pill}`}
+                    >
+                      {gpuHover.block.status}
+                    </span>
+                  </div>
+                  <div className="mt-3 grid grid-cols-[92px_1fr] gap-x-3 gap-y-1.5 text-[11px]">
+                    <span className="text-white/45">Node</span>
+                    <span className="font-mono text-white">{gpuHover.block.node}</span>
+                    <span className="text-white/45">GPU lanes</span>
+                    <span className="font-mono text-white">GPU {gpuHover.block.gpuLabel}</span>
+                    <span className="text-white/45">GPU model</span>
+                    <span className="font-mono text-white">{gpuHover.block.gpuModel ?? "—"}</span>
+                    <span className="text-white/45">Start</span>
+                    <span className="font-mono text-white">{fmtHoverTs(gpuHover.block.start)}</span>
+                    <span className="text-white/45">End</span>
+                    <span className="font-mono text-white">
+                      {gpuHover.block.running ? "Now" : fmtHoverTs(gpuHover.block.end)}
+                    </span>
+                    <span className="text-white/45">Duration</span>
+                    <span className="font-mono text-white">
+                      {fmtDur(((gpuHover.block.running ? nowTs || to.getTime() : gpuHover.block.end) - gpuHover.block.start) / 1000)}
+                    </span>
+                    {gpuHover.block.endReason && (
+                      <>
+                        <span className="text-white/45">End reason</span>
+                        <span className="font-mono text-white">{gpuHover.block.endReason}</span>
+                      </>
+                    )}
+                    <span className="text-white/45">
+                      {gpuHover.block.kind === "benchmark" ? "Benchmark id" : "Worker id"}
+                    </span>
+                    <span className="truncate font-mono text-white">{gpuHover.block.ref}</span>
+                    {gpuHover.block.owner && (
+                      <>
+                        <span className="text-white/45">Owner</span>
+                        <span className="font-mono text-white">{gpuHover.block.owner}</span>
+                      </>
+                    )}
+                    {gpuHover.block.actor && (
+                      <>
+                        <span className="text-white/45">Actor</span>
+                        <span className="font-mono text-white">{gpuHover.block.actor}</span>
+                      </>
+                    )}
+                  </div>
+                </motion.div>
+                );
+              })()}
+            </AnimatePresence>
           </div>
         </TabsContent>
 
