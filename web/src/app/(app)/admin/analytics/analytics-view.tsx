@@ -700,7 +700,7 @@ type WeekRow = { key: string; days: WeekDay[] };
 const GPU_HOUR_HEIGHT = 56;
 const GPU_DAY_MIN_WIDTH = 112;
 const GPU_WEEK_GUTTER = 60;
-let gpuHoverTimerHandle: ReturnType<typeof window.setTimeout> | null = null;
+let gpuHoverTimerHandle: number | null = null;
 const GPU_HOVER_DELAY_MS = 90;
 
 // Block colour by workload kind only — keep the palette simple and surface
