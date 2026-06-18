@@ -849,15 +849,14 @@ export function BenchmarkForm({
     () => storages.find((s) => s.id === storageId)?.name,
     [storages, storageId],
   );
-  // For the RunPod (cloud) template, pre-fill `storage:` with the first enabled
-  // S3 backend so it ships with a name that actually resolves at submit (a
-  // literal like "s3" would fail unless a backend happened to be named that).
-  // An explicit dropdown pick always wins; VM target stays unset.
+  // For both the RunPod (cloud) and VM templates, pre-fill `storage:` with the
+  // first enabled S3 backend so it ships with a name that actually resolves at
+  // submit (a literal like "s3" would fail unless a backend happened to be named
+  // that). An explicit dropdown pick always wins.
   const defaultStorageName = useMemo(() => {
     if (selectedStorageName) return selectedStorageName;
-    if (target !== "cloud") return undefined;
     return storages.find((s) => s.kind === "s3" && s.enabled)?.name;
-  }, [selectedStorageName, target, storages]);
+  }, [selectedStorageName, storages]);
   const selectedProviderName = useMemo(
     () => providers.find((p) => p.id === providerId)?.name,
     [providers, providerId],
