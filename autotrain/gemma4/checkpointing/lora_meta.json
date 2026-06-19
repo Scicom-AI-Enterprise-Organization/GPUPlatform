@@ -1,0 +1,13 @@
+{
+  "model_id": "google/gemma-4-31B-it",
+  "r": 256,
+  "alpha": 512,
+  "scaling": 2.0,
+  "target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj"
+  ],
+  "wrapped_attr": "linear"
+}

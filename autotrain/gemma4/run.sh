@@ -78,11 +78,20 @@ python test_attention.py
 if [ "$GEMMA_DEPS_ONLY" = "1" ]; then echo ">> GEMMA_DEPS_ONLY=1 — install + test done, skipping train"; exit 0; fi
 
 # ---------- data + model (download ONCE; both ranks then read the shared HF cache) ----------
-rm -rf ./packed_data
-hf download "$DATA_ID" --repo-type dataset --local-dir ./packed_data
+# SKIP_DATA_DOWNLOAD=1 keeps an existing ./packed_data (e.g. one scp'd from the laptop that is
+# newer than / sized differently from the published DATA_ID) instead of re-pulling it.
+if [ "${SKIP_DATA_DOWNLOAD:-0}" = "1" ] && [ -f ./packed_data/index.json ]; then
+  echo ">> SKIP_DATA_DOWNLOAD=1 — reusing existing ./packed_data ($(python3 -c "import json;print(json.load(open('packed_data/index.json'))['shards'][0]['samples'])" 2>/dev/null) bins)"
+else
+  rm -rf ./packed_data
+  hf download "$DATA_ID" --repo-type dataset --local-dir ./packed_data
+fi
 # populate HF cache so the two torchrun ranks don't race the download. Exclude redundant raw
 # formats (original/*.pth, gguf) — from_pretrained only needs the safetensors + config/tokenizer.
-hf download "$MODEL_ID" --exclude "original/*" "*.pth" "*.gguf" "consolidated*"
+# NOTE: `hf download --exclude` takes ONE pattern per flag (huggingface_hub >=1.x). Passing several
+# space-separated patterns makes the CLI treat the extras as explicit FILENAMES → "Fetching 0
+# files" (silent no-op). Repeat --exclude per pattern.
+hf download "$MODEL_ID" --exclude "original/*" --exclude "*.pth" --exclude "*.gguf" --exclude "consolidated*"
 
 # ---------- train ----------
 echo ">> launching training on $NPROC GPUs"

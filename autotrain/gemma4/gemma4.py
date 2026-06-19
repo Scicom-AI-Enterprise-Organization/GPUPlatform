@@ -351,6 +351,11 @@ def main(
                 for k, v in batch.items()
             }
 
+            if rank == 0 and idx == 0:
+                S = batch["input_ids"].shape[-1]
+                alloc_gb = torch.cuda.memory_allocated(rank) / 2**30
+                res_gb   = torch.cuda.memory_reserved(rank)  / 2**30
+                logger.info(f"PRE-FWD: S={S}, allocated={alloc_gb:.2f}GB, reserved={res_gb:.2f}GB")
             output = model(**batch, use_cache=False) # forward pass and calculate losses
             output["loss"].backward() # calculate gradient 
             
