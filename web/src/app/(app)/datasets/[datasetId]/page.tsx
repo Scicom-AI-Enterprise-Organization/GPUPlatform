@@ -53,8 +53,14 @@ export default async function DatasetDetailPage({
   // for datasets that already have a real audio column (s3 / upload). hf / label
   // sources must extract an audio column first, then pack the resulting dataset.
   const canPack = dataset?.kind === "s3" || dataset?.kind === "upload";
+  // Chat → multipack: a chat dataset's messages column → a ChiniDataset
+  // (kind=llm_packed) for LLM finetuning. In-process (CPU tokenization, no GPU).
+  // A kind=llm dataset, OR a kind=hf dataset with a messages column mapped (a chat
+  // dataset registered as plain hf) — the latter is what surfaces a chat preview.
+  const canPackLlm =
+    dataset?.kind === "llm" || (dataset?.kind === "hf" && !!dataset?.messages_field);
   let s3Storages: StorageRecord[] = [];
-  if (canTransform || canPack) {
+  if (canTransform || canPack || canPackLlm) {
     try {
       s3Storages = (await gateway.listStorage()).filter((s) => s.kind === "s3" && s.enabled);
     } catch {
@@ -85,6 +91,7 @@ export default async function DatasetDetailPage({
           hasMetadata={hasMetadata}
           canTransform={canTransform}
           canPack={canPack}
+          canPackLlm={canPackLlm}
           initialView={sp.view}
           initialSplit={split ?? null}
         />

@@ -6,6 +6,7 @@ import {
   Database,
   FileAudio,
   HardDrive,
+  MessagesSquare,
   MoreHorizontal,
   Pencil,
   Rows3,
@@ -32,12 +33,14 @@ export const KIND_LABEL: Record<DatasetKind, string> = {
   tts_packed: "tts-packed",
   hosted: "hf repo",
   llm: "llm",
+  llm_packed: "llm-packed",
 };
 
 export function KindIcon({ kind, className }: { kind: DatasetKind; className?: string }) {
   if (kind === "hf" || kind === "hosted") return <Database className={className} />;
   if (kind === "s3") return <CloudUpload className={className} />;
   if (kind === "label") return <Tags className={className} />;
+  if (kind === "llm" || kind === "llm_packed") return <MessagesSquare className={className} />;
   return <FileAudio className={className} />;
 }
 

@@ -65,8 +65,10 @@ confirms it end-to-end on the actual weights on the pod. Run it before training.
 driver), `NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0`. Full commands + gotchas in each job's
 `CLAUDE.md`. **Billing stops only on `runpodctl pod delete <pod-id>` — always terminate.**
 
-**On the pod, work under `/` (the container disk), NOT `/workspace`.** `/workspace` is the RunPod
-network volume — slow. Put the job dir (e.g. `/root/autotrain-mm2`) and the HF cache
-(`HF_HOME=/root/.cache/huggingface`, the default) on the fast container-disk overlay. Size the pod
-with a big **`--container-disk-in-gb`** (e.g. 600 for MiniMax-M2's ~230GB) rather than a volume.
+**ALWAYS work under `/` (the container disk), NEVER `/workspace`.** This is a hard rule (the user
+has reinforced it). `/workspace` is the RunPod network volume — slow. Put **everything** there:
+the job dir (e.g. `/root/autotrain-mm2`, `/root/eval`) AND the HF cache
+(`HF_HOME=/root/.cache/huggingface`, the default) on the fast container-disk overlay. `scp` job
+files to `/root/...`, not `/workspace/...`. Size the pod with a big **`--container-disk-in-gb`**
+(e.g. 600 for MiniMax-M2's ~230GB) rather than a volume.
 (Auth/download: `runpodctl config --apiKey` + `hf auth login --token` both read from `../.env`.)

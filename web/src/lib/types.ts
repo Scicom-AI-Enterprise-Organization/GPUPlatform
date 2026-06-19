@@ -354,7 +354,7 @@ export type TrainingRunRecord = {
   dataset_id: string;
   test_dataset_id?: string | null;
   base_model: string;
-  task_type?: "asr" | "tts";
+  task_type?: "asr" | "tts" | "llm";
   s3_prefix: string;
   config_json: Record<string, unknown>;
   exit_code?: number | null;
@@ -379,7 +379,7 @@ export type CreateTrainingRunRequest = {
   name: string;
   dataset_id: string;
   base_model: string;
-  task_type?: "asr" | "tts";
+  task_type?: "asr" | "tts" | "llm";
   test_dataset_id?: string | null;
   // TTS-only (Qwen3 + NeuCodec)
   tokenizer?: string | null;
@@ -419,6 +419,9 @@ export type CreateTrainingRunRequest = {
   lora_alpha_ratio?: number;
   lora_alpha?: number;
   lora_dropout?: number;
+  // LLM-only (gemma4): which linear projections get LoRA. Default q/k/v/o; can add
+  // MLP/dense layers (gate_proj, up_proj, down_proj). LLM finetune is always LoRA.
+  lora_target_modules?: string[];
   // Freeze the encoder; train the decoder only.
   freeze_encoder?: boolean;
   // Multi-GPU single run: DDP via torchrun (default) vs DataParallel.
@@ -714,7 +717,17 @@ export type StorageRecord = {
 
 // "hosted" = a HuggingFace-mirror dataset repo pushed directly (hf upload /
 // push_to_hub), surfaced in the Datasets list alongside Autotrain datasets.
-export type DatasetKind = "upload" | "s3" | "hf" | "label" | "tts_packed" | "hosted" | "llm";
+// "llm_packed" = a chat dataset (kind=llm) tokenized + bin-packed into a
+// ChiniDataset for LLM finetuning (the chat-text analogue of "tts_packed").
+export type DatasetKind =
+  | "upload"
+  | "s3"
+  | "hf"
+  | "label"
+  | "tts_packed"
+  | "hosted"
+  | "llm"
+  | "llm_packed";
 
 export type DatasetRecord = {
   id: string;
@@ -762,12 +775,13 @@ export type CreateDatasetRequest = {
   description?: string | null;
   audio_prefix?: string | null;
   s3_metadata_uri?: string | null;
-  // kind=tts_packed — register existing ChiniDataset shards already in S3
+  // kind=tts_packed / llm_packed — register existing ChiniDataset shards already in S3
   tokenizer?: string | null;
   sequence_length?: number | null;
+  subset?: string | null; // kind=llm_packed — source subset that was packed (metadata)
   hf_repo?: string | null;
   hf_revision?: string | null; // kind=hf/llm — commit/branch/tag to pin
-  messages_field?: string | null; // kind=llm — column holding the messages array
+  messages_field?: string | null; // kind=llm / llm_packed — column holding the messages array
   // kind=label — import from a labeling-platform project
   label_base_url?: string | null;
   label_project_id?: string | null;
@@ -845,6 +859,18 @@ export type TtsPackRequest = {
   secure_cloud?: boolean;
   disk_gb?: number;
   volume_gb?: number;
+};
+
+// Chat → multipack a kind=llm dataset's messages column into a ChiniDataset
+// (kind=llm_packed) for LLM finetuning. Mirrors the gateway LlmPackRequest. Runs
+// IN-PROCESS in the gateway (CPU tokenization — no GPU box).
+export type LlmPackRequest = {
+  storage_id: string; // kind=s3 storage for the packed shards
+  tokenizer: string; // HF tokenizer (chat template), e.g. google/gemma-4-31B-it
+  subset?: string | null; // which subset/split to pack (null → first)
+  sequence_length?: number; // multipack bin length (tokens); longer convs dropped
+  tools_field?: string | null; // source tool/function column (blank → no tools)
+  all_reasoning?: boolean; // gemma-4: render every assistant turn's reasoning
 };
 
 // Org-wide env var / secret (admin-managed). Mirrors gateway GlobalEnvRecord.

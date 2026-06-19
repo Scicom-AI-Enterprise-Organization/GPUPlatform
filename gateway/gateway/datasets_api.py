@@ -44,7 +44,7 @@ logger = logging.getLogger("gateway.datasets")
 
 router = APIRouter(prefix="/v1/datasets", tags=["datasets"])
 
-KINDS = ("upload", "s3", "hf", "label", "tts_packed", "llm")
+KINDS = ("upload", "s3", "hf", "label", "tts_packed", "llm", "llm_packed")
 _UPLOAD_EXTS = (".csv", ".json", ".jsonl", ".ndjson")
 
 
@@ -57,15 +57,17 @@ class CreateDatasetRequest(BaseModel):
     storage_id: Optional[str] = None
     description: Optional[str] = None
     audio_prefix: Optional[str] = None
-    s3_metadata_uri: Optional[str] = None  # kind=s3 (metadata file) / kind=tts_packed (shards prefix)
-    # kind=tts_packed — register existing ChiniDataset parquet shards already in S3.
-    tokenizer: Optional[str] = None        # speech-token tokenizer used when packing
+    s3_metadata_uri: Optional[str] = None  # kind=s3 (metadata file) / kind=tts_packed|llm_packed (shards prefix)
+    # kind=tts_packed / llm_packed — register existing ChiniDataset parquet shards already in S3.
+    tokenizer: Optional[str] = None        # tokenizer used when packing
     sequence_length: Optional[int] = None  # multipack sequence length
+    # kind=llm_packed — the source subset/config that was packed (descriptive metadata).
+    subset: Optional[str] = None
     hf_repo: Optional[str] = None  # kind=hf / kind=llm
     # kind=hf / kind=llm — git revision to pin: a commit SHA (full/short), branch
     # ("main", "dev"), or tag ("v1.0.0"). Blank → the repo's default branch.
     hf_revision: Optional[str] = None
-    # kind=llm — which column holds the OpenAI messages array ([{role,content}]).
+    # kind=llm / kind=llm_packed — which column holds the OpenAI messages array ([{role,content}]).
     messages_field: Optional[str] = None
     # kind=label — live import from a labeling-platform project's export API.
     label_base_url: Optional[str] = None     # e.g. http://localhost:3002
@@ -134,6 +136,23 @@ class TtsPackRequest(BaseModel):
     secure_cloud: bool = True
     disk_gb: int = 60
     volume_gb: int = 80
+
+
+class LlmPackRequest(BaseModel):
+    """Chat → multipack a kind=llm dataset (its `messages` column, + an optional
+    tools column) into a ChiniDataset (kind=llm_packed), the SAME layout the
+    gemma4 LLM trainer consumes. Pure CPU tokenization → runs IN-PROCESS in the
+    gateway (no GPU box). The user picks the subset + tokenizer."""
+    storage_id: str                        # kind=s3 storage for the packed shards
+    tokenizer: str                         # HF tokenizer (chat template), e.g. google/gemma-4-31B-it
+    subset: Optional[str] = None           # which subset/split label to pack (None → first)
+    sequence_length: int = 32768           # multipack bin length (tokens); convs longer are dropped
+    # Source column of OpenAI-style tool/function declarations rendered as tools=
+    # into the chat template. Blank/None → no tools. Default "functions".
+    tools_field: Optional[str] = "functions"
+    # gemma-4: render EVERY assistant turn's reasoning (not just last-user tool
+    # calls). No-op on non-gemma templates. See llm_pack.build_chat_template.
+    all_reasoning: bool = True
 
 
 class DatasetRecord(BaseModel):
@@ -498,17 +517,17 @@ async def create_dataset(
     label_token_secret_val: Optional[str] = None
     label_status_val: Optional[str] = None
     label_num_rows: Optional[int] = None
-    if req.kind in ("upload", "s3", "tts_packed"):
+    if req.kind in ("upload", "s3", "tts_packed", "llm_packed"):
         if not req.storage_id:
             raise HTTPException(status_code=400, detail="storage_id (an S3 storage) is required")
         storage = await _load_storage(session, req.storage_id)
         if storage.kind != "s3":
-            raise HTTPException(status_code=400, detail="storage must be kind=s3 for upload / s3 / tts_packed datasets")
+            raise HTTPException(status_code=400, detail="storage must be kind=s3 for upload / s3 / tts_packed / llm_packed datasets")
         storage_name = storage.name
-        if req.kind in ("s3", "tts_packed") and not (req.s3_metadata_uri or "").strip():
+        if req.kind in ("s3", "tts_packed", "llm_packed") and not (req.s3_metadata_uri or "").strip():
             raise HTTPException(
                 status_code=400,
-                detail="s3_metadata_uri is required (the metadata file for s3, the shards prefix for tts_packed)",
+                detail="s3_metadata_uri is required (the metadata file for s3, the shards prefix for tts_packed / llm_packed)",
             )
     elif req.kind in ("hf", "llm"):
         if not (req.hf_repo or "").strip():
@@ -629,6 +648,34 @@ async def create_dataset(
         row.split_fields = {"_tts_pack": {
             "tokenizer": (req.tokenizer or "").strip() or _DEFAULT_TTS_TOKENIZER,
             "sequence_length": int(req.sequence_length or 4096),
+            "splits": info["splits"],
+        }}
+    elif req.kind == "llm_packed":
+        # Register existing chat-multipack ChiniDataset shards already in S3 (the
+        # same layout the LLM pack job produces). Introspect the prefix for counts +
+        # size and stamp the _llm_pack metadata so preview / packed-row / training
+        # treat it like a packed dataset the job made. Fail loudly on an empty prefix.
+        try:
+            target, _base = _s3_target_and_prefix(storage)
+            u = urlparse(row.s3_metadata_uri or "")
+            t = dataclasses.replace(target, bucket=u.netloc) if u.scheme == "s3" else target
+            prefix = (u.path.lstrip("/") if u.scheme == "s3" else (row.s3_metadata_uri or "")).rstrip("/") + "/"
+            info = await _run_sync(_introspect_packed_s3, t, prefix)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"could not read packed shards at {row.s3_metadata_uri}: {e}",
+            )
+        mf = (req.messages_field or "").strip() or "messages"
+        row.format = "chinidataset"
+        row.num_rows = info["total_rows"]
+        row.size_bytes = info["size_bytes"]
+        row.messages_field = mf
+        row.split_fields = {"_llm_pack": {
+            "tokenizer": (req.tokenizer or "").strip() or None,
+            "sequence_length": int(req.sequence_length or 32768),
+            "messages_field": mf,
+            "subset": (req.subset or "").strip() or None,
             "splits": info["splits"],
         }}
     session.add(row)
@@ -1280,6 +1327,48 @@ def _hf_split_columns(hf_repo: str, token: Optional[str], revision: Optional[str
     return out
 
 
+def _resolve_hf_subset(
+    hf_repo: str, token: Optional[str], subset: Optional[str], revision: Optional[str] = None,
+) -> tuple[str, str, str]:
+    """Resolve a UI subset label (as produced by `_hf_split_ident` — the same
+    label the preview/split picker shows) back to the datasets-server (config,
+    split) pair, plus the canonical label. `subset` None/unknown → the first
+    entry. Raises ValueError if the dataset has no splits."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    rev = {"revision": revision} if revision else {}
+    with httpx.Client(timeout=30.0) as cli:
+        sp = cli.get(
+            "https://datasets-server.huggingface.co/splits",
+            params={"dataset": hf_repo, **rev}, headers=headers,
+        )
+        sp.raise_for_status()
+        splits = sp.json().get("splits", [])
+    if not splits:
+        raise ValueError(f"{hf_repo} exposes no splits on the HF datasets-server")
+    ident = _hf_split_ident(splits)
+    chosen = next((s for s in splits if ident(s) == subset), splits[0])
+    return chosen["config"], chosen["split"], ident(chosen)
+
+
+def _hf_parquet_files(
+    hf_repo: str, token: Optional[str], config: str, split: str, revision: Optional[str] = None,
+) -> list[str]:
+    """The parquet file URLs backing one (config, split) on the HF datasets-server
+    — the authoritative file list regardless of the repo's on-disk layout. Used by
+    the in-process LLM pack to read the FULL split (the /rows preview caps at 100)."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    rev = {"revision": revision} if revision else {}
+    with httpx.Client(timeout=60.0) as cli:
+        r = cli.get(
+            "https://datasets-server.huggingface.co/parquet",
+            params={"dataset": hf_repo, **rev}, headers=headers,
+        )
+        r.raise_for_status()
+        files = r.json().get("parquet_files", [])
+    urls = [f["url"] for f in files if f.get("config") == config and f.get("split") == split and f.get("url")]
+    return urls
+
+
 # ---------- labeling-platform source (kind=label) ----------------------
 
 
@@ -1346,6 +1435,18 @@ def _label_export_rows(
 _PACKED_CACHE: dict[str, list[dict]] = {}        # dataset_id → [{input_ids, attention_mask}]
 _TTS_TOKENIZER_CACHE: dict[str, Any] = {}        # repo_id → tokenizers.Tokenizer
 _DEFAULT_TTS_TOKENIZER = "Scicom-intl/Multilingual-Expressive-TTS-1.7B"
+
+
+def _pack_meta(d: Dataset) -> dict:
+    """The pack-metadata blob for a packed dataset — `_tts_pack` (tts_packed) or
+    `_llm_pack` (llm_packed); both stash tokenizer/sequence_length/splits here."""
+    sf = d.split_fields or {}
+    return (sf.get("_tts_pack") or sf.get("_llm_pack") or {})
+
+
+def _pack_tokenizer(d: Dataset) -> str:
+    """The tokenizer repo to decode a packed dataset's blocks back to text."""
+    return _pack_meta(d).get("tokenizer") or _DEFAULT_TTS_TOKENIZER
 
 
 def _read_packed_parquet(target: "S3Target", s3_uri: str, cap: int = 5000) -> list[dict]:
@@ -1471,15 +1572,15 @@ async def preview_dataset(
     def _resp(**kw):
         return PreviewResponse(audio_field=af, transcription_field=tf, offset=offset, limit=limit, **kw)
 
-    if d.kind == "tts_packed":
-        # Packed = multipacked NeuCodec blocks. Show one row per block with its
-        # token/utterance counts; the UI decodes a block to text on expand
-        # (GET /{id}/packed-row?index=N).
+    if d.kind in ("tts_packed", "llm_packed"):
+        # Packed = multipacked token blocks (NeuCodec speech for tts_packed, chat
+        # text for llm_packed). Show one row per block with its token/segment
+        # counts; the UI decodes a block to text on expand (GET /{id}/packed-row).
         if not (d.storage_id and d.s3_metadata_uri):
             return _resp(rows=[], total=d.num_rows or 0, error="packed dataset has no storage / shards")
-        # Split-aware: `_tts_pack.splits` = {split: count}; shards live under
-        # <prefix>/<split>/. Offer a split picker + page within the chosen split.
-        tp = (d.split_fields or {}).get("_tts_pack") or {}
+        # Split-aware: `_*_pack.splits` = {split: count}; tts shards live under
+        # <prefix>/<split>/, llm packs to a single flat prefix. Offer a picker.
+        tp = _pack_meta(d)
         pack_splits = list((tp.get("splits") or {}).keys())
         used_split = (split if (split and split in pack_splits) else (pack_splits[0] if pack_splits else None))
         try:
@@ -1692,19 +1793,19 @@ async def packed_row(
     inspecting what got packed together. Returns per-utterance + full decoded text.
     The datasets UI calls this when a packed row's collapse is opened."""
     d = await _require_dataset(session, dataset_id, user)
-    if d.kind != "tts_packed":
-        raise HTTPException(status_code=400, detail="not a packed (tts_packed) dataset")
+    if d.kind not in ("tts_packed", "llm_packed"):
+        raise HTTPException(status_code=400, detail="not a packed (tts_packed / llm_packed) dataset")
     if not (d.storage_id and d.s3_metadata_uri):
         raise HTTPException(status_code=400, detail="packed dataset has no storage / shards")
     storage = await _load_storage(session, d.storage_id)
     target, _base = _s3_target_and_prefix(storage)
-    pack_splits = list((((d.split_fields or {}).get("_tts_pack") or {}).get("splits") or {}).keys())
+    pack_splits = list((_pack_meta(d).get("splits") or {}).keys())
     used_split = (split if (split and split in pack_splits) else (pack_splits[0] if pack_splits else None))
     recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
     if index >= len(recs):
         raise HTTPException(status_code=404, detail=f"index {index} out of range (have {len(recs)})")
 
-    repo_id = ((d.split_fields or {}).get("_tts_pack") or {}).get("tokenizer") or _DEFAULT_TTS_TOKENIZER
+    repo_id = _pack_tokenizer(d)
     from .global_env_api import load_global_env
     hf_token = (await load_global_env(session)).get("HF_TOKEN") or os.environ.get("HF_TOKEN")
     try:
@@ -2119,6 +2220,53 @@ async def pack_tts_dataset(
     await session.commit()
     await audit_module.record(user, "dataset.pack-tts", "dataset", dataset_id, d.name,
                               details={"run": run.id, "sequence_length": req.sequence_length})
+    await session.refresh(d)
+    return _to_record(d, user.username, None)
+
+
+@router.post("/{dataset_id}/pack-llm", response_model=DatasetRecord)
+async def pack_llm_dataset(
+    dataset_id: str,
+    req: LlmPackRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Tokenize + multipack this chat (kind=llm) dataset's messages column into a
+    ChiniDataset on S3, then create a new kind=llm_packed dataset. Runs IN-PROCESS
+    (CPU tokenization — no GPU box). The source dataset's transform_status /
+    transform_log track progress (poll GET /{id})."""
+    d = await _require_dataset(session, dataset_id, user)
+    # A kind=llm dataset, OR any HF-backed dataset with a messages column mapped.
+    if not (d.kind == "llm" or (d.kind in ("hf",) and getattr(d, "messages_field", None))):
+        raise HTTPException(
+            status_code=400,
+            detail="LLM pack needs a kind=llm dataset (or an hf dataset with a messages column set)",
+        )
+    if not (d.hf_repo and "/" in d.hf_repo):
+        raise HTTPException(status_code=400, detail="LLM pack needs a source HuggingFace repo (owner/name)")
+    if d.transform_status == "running":
+        raise HTTPException(status_code=409, detail="a transform is already running for this dataset")
+    if not (req.tokenizer or "").strip():
+        raise HTTPException(status_code=400, detail="a tokenizer (chat template) is required")
+    if req.sequence_length < 1:
+        raise HTTPException(status_code=400, detail="sequence_length must be >= 1")
+    st = await session.get(Storage, req.storage_id)
+    if st is None or st.kind != "s3":
+        raise HTTPException(status_code=400, detail="storage_id must reference a kind=s3 storage")
+
+    from . import dataset_transform
+    await dataset_transform.start_llm_pack(
+        dataset_id,
+        subset=(req.subset or "").strip() or None,
+        tokenizer=req.tokenizer.strip(),
+        sequence_length=int(req.sequence_length),
+        storage_id=req.storage_id,
+        tools_field=(req.tools_field or "").strip() or None,
+        all_reasoning=bool(req.all_reasoning),
+    )
+    await audit_module.record(user, "dataset.pack-llm", "dataset", dataset_id, d.name,
+                              details={"tokenizer": req.tokenizer, "subset": req.subset,
+                                       "sequence_length": req.sequence_length})
     await session.refresh(d)
     return _to_record(d, user.username, None)
 

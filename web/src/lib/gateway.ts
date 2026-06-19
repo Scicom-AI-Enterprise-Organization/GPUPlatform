@@ -39,6 +39,7 @@ import type {
   UpdateDatasetRequest,
   TransformDatasetRequest,
   TtsPackRequest,
+  LlmPackRequest,
   DatasetRecord,
   DatasetPreview,
   DatasetFile,
@@ -786,6 +787,14 @@ export const gateway = {
   // poll getDataset(id).transform_status / transform_log.
   packTtsDataset: (id: string, body: TtsPackRequest) =>
     request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/pack-tts`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // Tokenize + multipack a chat (kind=llm) dataset's messages column into a
+  // ChiniDataset (kind=llm_packed). In-process background job; poll
+  // getDataset(id).transform_status / transform_log.
+  packLlmDataset: (id: string, body: LlmPackRequest) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/pack-llm`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

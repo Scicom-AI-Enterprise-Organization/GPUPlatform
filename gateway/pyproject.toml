@@ -34,6 +34,13 @@ dependencies = [
     # transitive dep of datasets/huggingface_hub, so it must be declared or the decode
     # fails with "No module named 'tokenizers'" on a clean gateway image.
     "tokenizers>=0.20",
+    # In-process chat → multipack (datasets_api.pack-llm → dataset_transform +
+    # gateway/llm_pack.py): render each conversation via the tokenizer's chat
+    # template (messages + tools) and bin-pack into a ChiniDataset. transformers
+    # is needed for apply_chat_template (jinja); it is imported LAZILY and needs
+    # NO torch (tokenization only), so it doesn't pull a GPU stack onto the gateway.
+    "transformers>=4.45",
+    "jinja2>=3.1",
     # llm-benchmaq is the CLI we shell out to for benchmark runs. Public repo;
     # pulls in paramiko/scp/etc. Tracks @main so benchmaq fixes (e.g. hf download
     # for huggingface_hub>=1.0 / Gemma 4) ship on the next gateway image build.

@@ -75,6 +75,24 @@ const TTS_BASE_MODELS = [
   "Scicom-intl/Multilingual-Expressive-TTS-0.6B",
 ];
 const DEFAULT_TTS_BASE = "Scicom-intl/Multilingual-TTS-1.7B-Base";
+// LLM finetune (gemma-4 FSDP2 + custom dynamic_attention) over a packed chat
+// dataset (kind=llm_packed). The trainer is gemma-4-specific.
+const LLM_BASE_MODELS = [
+  "google/gemma-4-31B-it",
+];
+const DEFAULT_LLM_BASE = "google/gemma-4-31B-it";
+// LLM LoRA target linear projections. q/k/v/o (attention) are the default; the MLP
+// group (gate/up/down) is opt-in. gemma4 warns at train time for any target that
+// wraps no nn.Linear on the loaded arch.
+const LLM_LORA_TARGETS: { id: string; label: string; group: "attn" | "mlp" }[] = [
+  { id: "q_proj", label: "q_proj", group: "attn" },
+  { id: "k_proj", label: "k_proj", group: "attn" },
+  { id: "v_proj", label: "v_proj", group: "attn" },
+  { id: "o_proj", label: "o_proj", group: "attn" },
+  { id: "gate_proj", label: "gate_proj", group: "mlp" },
+  { id: "up_proj", label: "up_proj", group: "mlp" },
+  { id: "down_proj", label: "down_proj", group: "mlp" },
+];
 const CUSTOM = "__custom__";
 const AUTO_SPLIT = "__auto__";
 const NO_TEST = "__none__";   // "No test set" — train on everything, skip eval
@@ -200,9 +218,11 @@ export function TrainingForm() {
   // ?from=<runId> → prefill the form with that run's config ("Edit as new").
   const fromId = searchParams.get("from");
   const [prefilling, setPrefilling] = useState(!!fromId);
-  // ?task=asr|tts decides the initial task (and its defaults) on first render, so
-  // the model dropdown isn't briefly empty while an effect flips asr→tts.
-  const initialTask: "asr" | "tts" = searchParams.get("task") === "tts" ? "tts" : "asr";
+  // ?task=asr|tts|llm decides the initial task (and its defaults) on first render,
+  // so the model dropdown isn't briefly empty while an effect flips the task.
+  const _qtask = searchParams.get("task");
+  const initialTask: "asr" | "tts" | "llm" =
+    _qtask === "tts" ? "tts" : _qtask === "llm" ? "llm" : "asr";
   const [datasets, setDatasets] = useState<DatasetRecord[]>([]);
   const [storages, setStorages] = useState<StorageRecord[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -210,9 +230,13 @@ export function TrainingForm() {
   const [error, setError] = useState<string | null>(null);
 
   // task + model + data
-  const [taskType, setTaskType] = useState<"asr" | "tts">(initialTask);
-  const [name, setName] = useState(initialTask === "tts" ? "tts-finetune" : "whisper-finetune");
-  const [modelChoice, setModelChoice] = useState(initialTask === "tts" ? DEFAULT_TTS_BASE : DEFAULT_WHISPER);
+  const [taskType, setTaskType] = useState<"asr" | "tts" | "llm">(initialTask);
+  const [name, setName] = useState(
+    initialTask === "tts" ? "tts-finetune" : initialTask === "llm" ? "gemma4-finetune" : "whisper-finetune",
+  );
+  const [modelChoice, setModelChoice] = useState(
+    initialTask === "tts" ? DEFAULT_TTS_BASE : initialTask === "llm" ? DEFAULT_LLM_BASE : DEFAULT_WHISPER,
+  );
   const [customModel, setCustomModel] = useState("");
   const [datasetId, setDatasetId] = useState("");
   const [testDatasetId, setTestDatasetId] = useState(AUTO_SPLIT);
@@ -247,6 +271,9 @@ export function TrainingForm() {
   const [loraR, setLoraR] = useState(16);
   const [loraAlphaRatio, setLoraAlphaRatio] = useState(2);
   const [loraDropout, setLoraDropout] = useState(0.05);
+  // LLM-only (gemma4): which linear projections to LoRA. Default = attention q/k/v/o;
+  // user can add MLP/dense layers. LLM finetune is always LoRA.
+  const [loraTargets, setLoraTargets] = useState<string[]>(["q_proj", "k_proj", "v_proj", "o_proj"]);
   const [freezeEncoder, setFreezeEncoder] = useState(false);
   // Multi-GPU single run: DDP (torchrun) vs DataParallel.
   const [useDdp, setUseDdp] = useState(true);
@@ -283,7 +310,10 @@ export function TrainingForm() {
   const [hfPushRepo, setHfPushRepo] = useState("");
   const [workDir, setWorkDir] = useState("/share");
   // Isolated uv venv for the trainer deps (mirrors serverless's vLLM venv_path).
-  const [venvPath, setVenvPath] = useState(initialTask === "tts" ? "/share/autotrain-tts" : "/share/autotrain-whisper");
+  const [venvPath, setVenvPath] = useState(
+    initialTask === "tts" ? "/share/autotrain-tts"
+      : initialTask === "llm" ? "/share/autotrain-llm" : "/share/autotrain-whisper",
+  );
   const [cleanupCheckpoints, setCleanupCheckpoints] = useState(true);
   const [augmentTechniques, setAugmentTechniques] = useState<string[]>([]);
   const [augmentProb, setAugmentProb] = useState(0.5);
@@ -371,12 +401,13 @@ export function TrainingForm() {
         const arr = (v: unknown) => (Array.isArray(v) ? (v as unknown[]) : []);
         const csv = (v: unknown) => arr(v).join(", ");
 
-        const tt: "asr" | "tts" = (r.task_type ?? c.task_type) === "tts" ? "tts" : "asr";
+        const _rtt = (r.task_type ?? c.task_type);
+        const tt: "asr" | "tts" | "llm" = _rtt === "tts" ? "tts" : _rtt === "llm" ? "llm" : "asr";
         setTaskType(tt);
-        const models = tt === "tts" ? TTS_BASE_MODELS : WHISPER_MODELS;
+        const models = tt === "tts" ? TTS_BASE_MODELS : tt === "llm" ? LLM_BASE_MODELS : WHISPER_MODELS;
         if (r.base_model && models.includes(r.base_model)) setModelChoice(r.base_model);
         else if (r.base_model) { setModelChoice(CUSTOM); setCustomModel(r.base_model); }
-        setName(r.name || (tt === "tts" ? "tts-finetune" : "whisper-finetune"));
+        setName(r.name || (tt === "tts" ? "tts-finetune" : tt === "llm" ? "gemma4-finetune" : "whisper-finetune"));
         setDatasetId(r.dataset_id || "");
         setTestDatasetId(c.no_eval ? NO_TEST : (r.test_dataset_id || AUTO_SPLIT));
         if (c.eval_split_pct != null) setEvalSplitPct(num(c.eval_split_pct, 10));
@@ -401,6 +432,8 @@ export function TrainingForm() {
         if (c.lora_r != null) setLoraR(num(c.lora_r, 16));
         if (c.lora_alpha_ratio != null) setLoraAlphaRatio(num(c.lora_alpha_ratio, 2));
         if (c.lora_dropout != null) setLoraDropout(num(c.lora_dropout, 0.05));
+        if (Array.isArray(c.lora_target_modules) && c.lora_target_modules.length)
+          setLoraTargets(c.lora_target_modules as string[]);
         if (c.freeze_encoder != null) setFreezeEncoder(!!c.freeze_encoder);
         if (c.use_ddp != null) setUseDdp(!!c.use_ddp);
         if (c.precision) setPrecision(str(c.precision));
@@ -514,12 +547,15 @@ export function TrainingForm() {
   }, [visibleDevices, gpuBound]);
   const hasStorage = s3Storages.length > 0;
   const isTts = taskType === "tts";
-  const MODELS = isTts ? TTS_BASE_MODELS : WHISPER_MODELS;
-  // TTS trains directly on a pre-packed (tts_packed) dataset; ASR uses raw audio
-  // sources — never a tts_packed dataset (those hold NeuCodec tokens, not audio).
+  const isLlm = taskType === "llm";
+  const MODELS = isTts ? TTS_BASE_MODELS : isLlm ? LLM_BASE_MODELS : WHISPER_MODELS;
+  // TTS/LLM train directly on a pre-packed ChiniDataset (tts_packed / llm_packed);
+  // ASR uses raw audio sources — never a packed dataset.
   const pickDatasets = isTts
     ? datasets.filter((d) => d.kind === "tts_packed")
-    : datasets.filter((d) => d.kind !== "tts_packed");
+    : isLlm
+      ? datasets.filter((d) => d.kind === "llm_packed")
+      : datasets.filter((d) => d.kind !== "tts_packed" && d.kind !== "llm_packed");
 
   // Optimizer steps per epoch ≈ ceil(train_rows / (batch × grad_accum × world_size)).
   // world_size = #GPUs whenever DDP runs: TTS ALWAYS torchruns (nproc = #GPUs), ASR
@@ -544,29 +580,32 @@ export function TrainingForm() {
     const nGpus = visibleDevices.trim()
       ? visibleDevices.split(",").filter((x) => x.trim()).length
       : gpuBound;
-    const worldSize = isTts ? Math.max(1, nGpus) : (useDdp && nGpus > 1 ? nGpus : 1);
-    const effBatch = Math.max(1, batchSize) * Math.max(1, gradAccum) * worldSize;
+    const worldSize = (isTts || isLlm) ? Math.max(1, nGpus) : (useDdp && nGpus > 1 ? nGpus : 1);
+    // LLM (gemma4) packs the whole batch into ONE sequence (batch_size forced to 1)
+    // and doesn't grad-accumulate → one optimizer step per bin per rank.
+    const effBatch = isLlm ? worldSize : Math.max(1, batchSize) * Math.max(1, gradAccum) * worldSize;
     const perEpoch = Math.ceil(trainRows / effBatch);
     if (!Number.isFinite(perEpoch) || perEpoch <= 0) return null;
     return { perEpoch, total: perEpoch * Math.max(1, maxEpochs), trainRows, worldSize };
-  }, [sweepOn, durationMode, datasets, datasetId, isTts, testDatasetId, evalSplitPct,
+  }, [sweepOn, durationMode, datasets, datasetId, isTts, isLlm, testDatasetId, evalSplitPct,
       visibleDevices, gpuBound, useDdp, batchSize, gradAccum, maxEpochs]);
 
-  function pickTask(t: "asr" | "tts") {
+  function pickTask(t: "asr" | "tts" | "llm") {
     setTaskType(t);
-    setModelChoice(t === "tts" ? DEFAULT_TTS_BASE : DEFAULT_WHISPER);
-    // Swap the default uv venv path when the user hasn't customized it.
-    setVenvPath((v) =>
-      t === "tts"
-        ? (v === "/share/autotrain-whisper" ? "/share/autotrain-tts" : v)
-        : (v === "/share/autotrain-tts" ? "/share/autotrain-whisper" : v),
-    );
-    if (t === "tts") {
-      setName((n) => (n === "whisper-finetune" ? "tts-finetune" : n));
-    } else {
-      setName((n) => (n === "tts-finetune" ? "whisper-finetune" : n));
-    }
-    // Reflect the ASR/TTS choice in the URL (?task=) so it's deep-linkable.
+    setModelChoice(t === "tts" ? DEFAULT_TTS_BASE : t === "llm" ? DEFAULT_LLM_BASE : DEFAULT_WHISPER);
+    // Swap the default uv venv path when the user hasn't customized it (i.e. it's
+    // still one of the per-task defaults).
+    const VENVS = ["/share/autotrain-whisper", "/share/autotrain-tts", "/share/autotrain-llm"];
+    const venvFor = t === "tts" ? "/share/autotrain-tts" : t === "llm" ? "/share/autotrain-llm" : "/share/autotrain-whisper";
+    setVenvPath((v) => (VENVS.includes(v) ? venvFor : v));
+    // Swap the default run name when it's still one of the per-task defaults.
+    const NAMES = ["whisper-finetune", "tts-finetune", "gemma4-finetune"];
+    const nameFor = t === "tts" ? "tts-finetune" : t === "llm" ? "gemma4-finetune" : "whisper-finetune";
+    setName((n) => (NAMES.includes(n) ? nameFor : n));
+    // gemma-4's proven LoRA config is r=256, scaling 2.0 (alpha ratio 2); other
+    // tasks default to r=16. Ratio 2 is a good default for all, so only r swaps.
+    setLoraR((r) => (r === 16 || r === 256 ? (t === "llm" ? 256 : 16) : r));
+    // Reflect the task choice in the URL (?task=) so it's deep-linkable.
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       params.set("task", t);
@@ -700,19 +739,21 @@ export function TrainingForm() {
       eval_split_pct: evalSplitPct,
       batch_size: batchSize,
       grad_accum: gradAccum,
-      learning_rate: Number(learningRate) || (isTts ? 2e-5 : 1e-5),
+      learning_rate: Number(learningRate) || (isTts ? 2e-5 : isLlm ? 5e-5 : 1e-5),
       weight_decay: weightDecay,
       warmup_steps: warmupSteps,
       lr_scheduler_type: lrScheduler,
-      use_lora: useLora || (sweepOn && sweepLoraR.trim() !== ""),
+      // LLM finetune is always LoRA; for ASR/TTS it follows the toggle (or a sweep).
+      use_lora: isLlm || useLora || (sweepOn && sweepLoraR.trim() !== ""),
       lora_r: loraR,
       lora_alpha_ratio: loraAlphaRatio,
       lora_dropout: loraDropout,
+      lora_target_modules: loraTargets,
       freeze_encoder: freezeEncoder,
       use_ddp: useDdp,
       logging_steps: loggingSteps,
       precision: precision as CreateTrainingRunRequest["precision"],
-      language: isTts ? null : (language.trim() || null),
+      language: (isTts || isLlm) ? null : (language.trim() || null),
       // TTS: block size + tokenizer are derived server-side from the packed
       // dataset + base model, so they're not sent from the form. The chosen
       // audio-eval methods (CER / MOS / similarity) run on the test set.
@@ -779,7 +820,9 @@ export function TrainingForm() {
         <p className="mt-1 text-sm text-muted-foreground">
           {isTts
             ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM. Eval loss runs on the held-out test split per epoch or every N steps; CER / MOS / speaker-similarity score generated audio at the end."
-            : "Finetune a Whisper model on a dataset. WER + CER are evaluated on a held-out split — per epoch or every N steps — and training stops at the epoch / max-step cap or early on patience."}
+            : isLlm
+              ? "Finetune Gemma-4 (FSDP2 + custom dynamic_attention) on a packed chat dataset (kind=llm_packed). The pre-tokenized bins train directly as a causal LM with a custom LoRA; loss is logged per step."
+              : "Finetune a Whisper model on a dataset. WER + CER are evaluated on a held-out split — per epoch or every N steps — and training stops at the epoch / max-step cap or early on patience."}
         </p>
         {fromId && (
           <p className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground">
@@ -794,10 +837,10 @@ export function TrainingForm() {
       {/* Training type */}
       <Section icon={<Sparkles className="h-4 w-4" />} title="Training type"
         description="What kind of model to finetune.">
-        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
           <button type="button" onClick={() => pickTask("asr")}
             className={cn("flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
-              !isTts ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
+              taskType === "asr" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
             <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
               <div className="font-medium">ASR — Whisper</div>
@@ -813,6 +856,15 @@ export function TrainingForm() {
               <div className="text-xs text-muted-foreground">Text→speech. Tokenize → pack → finetune (loss-only).</div>
             </div>
           </button>
+          <button type="button" onClick={() => pickTask("llm")}
+            className={cn("flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
+              isLlm ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
+            <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+            <div className="min-w-0">
+              <div className="font-medium">LLM — Gemma-4</div>
+              <div className="text-xs text-muted-foreground">Chat finetune. Pack first → FSDP2 LoRA (loss-only).</div>
+            </div>
+          </button>
         </div>
       </Section>
 
@@ -820,9 +872,11 @@ export function TrainingForm() {
       <Section icon={<Sparkles className="h-4 w-4" />} title="Model & data"
         description={isTts
           ? "The base Qwen3 model + the {audio, transcription} dataset to finetune on."
-          : "The base Whisper checkpoint and the dataset to finetune on."}>
+          : isLlm
+            ? "The base Gemma-4 model + the packed chat dataset (kind=llm_packed) to finetune on."
+            : "The base Whisper checkpoint and the dataset to finetune on."}>
         <Grid>
-          <FieldWrap label={isTts ? "Base TTS model" : "Base Whisper model"}>
+          <FieldWrap label={isTts ? "Base TTS model" : isLlm ? "Base Gemma-4 model" : "Base Whisper model"}>
             <Select value={modelChoice} onValueChange={setModelChoice}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -831,7 +885,7 @@ export function TrainingForm() {
               </SelectContent>
             </Select>
             {modelChoice === CUSTOM && (
-              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : "org/whisper-variant"}
+              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-…" : "org/whisper-variant"}
                 value={customModel} onChange={(e) => setCustomModel(e.target.value)} />
             )}
           </FieldWrap>
@@ -839,11 +893,12 @@ export function TrainingForm() {
             <Input className="font-mono" value={name} onChange={(e) => setName(e.target.value)} />
           </FieldWrap>
           <FieldWrap label="Training dataset"
-            hint={isTts ? "A NeuCodec-packed dataset (kind=tts_packed) from the Datasets page." : "From the Datasets page."}>
+            hint={isTts ? "A NeuCodec-packed dataset (kind=tts_packed) from the Datasets page."
+              : isLlm ? "A packed chat dataset (kind=llm_packed) from the Datasets page." : "From the Datasets page."}>
             <Select value={datasetId} onValueChange={setDatasetId}>
               <SelectTrigger className="w-full min-w-0 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate">
                 <SelectValue placeholder={
-                  pickDatasets.length ? "Pick a dataset…" : (isTts ? "No packed datasets — pack one first" : "No datasets yet")
+                  pickDatasets.length ? "Pick a dataset…" : ((isTts || isLlm) ? "No packed datasets — pack one first" : "No datasets yet")
                 } />
               </SelectTrigger>
               <SelectContent>
@@ -854,10 +909,10 @@ export function TrainingForm() {
                 ))}
               </SelectContent>
             </Select>
-            {isTts && pickDatasets.length === 0 && (
+            {(isTts || isLlm) && pickDatasets.length === 0 && (
               <p className="mt-1.5 text-[11px] text-muted-foreground">
-                TTS trains on a packed dataset. Create one with{" "}
-                <span className="font-mono">Pack for TTS</span> on a dataset&apos;s Transformation tab.
+                {isTts ? "TTS" : "LLM"} trains on a packed dataset. Create one with{" "}
+                <span className="font-mono">{isTts ? "Pack for TTS" : "Pack for LLM"}</span> on a dataset&apos;s Transformation tab.
               </p>
             )}
           </FieldWrap>
@@ -924,9 +979,11 @@ export function TrainingForm() {
           ? "Sweep: comma-separate the values to try — the cross-product is the trial grid, run in parallel across your GPUs."
           : (isTts
             ? "Qwen3 + NeuCodec finetune hyperparameters (loss-only; no per-epoch WER/CER)."
-            : "Epochs, early stopping, and core hyperparameters.")}>
+            : isLlm
+              ? "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Batch is forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
+              : "Epochs, early stopping, and core hyperparameters.")}>
         <div className="mb-5 grid max-w-xl grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-2">
-          {!isTts && (
+          {taskType === "asr" && (
             <FieldWrap label="Eval metric" hint={sweepOn ? "Ranks the trials (lower is better)." : "Drives early stopping + best-model selection."}>
               <Select value={evalMetric} onValueChange={(v) => setEvalMetric(v as "wer" | "cer")}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
@@ -940,7 +997,7 @@ export function TrainingForm() {
           <FieldWrap label="Log loss every N steps" hint="Streams a training-loss point every N steps (@@STEP) for the live loss curve. Smaller = smoother, more log lines.">
             <NumberField min={1} value={loggingSteps} onChange={setLoggingSteps} />
           </FieldWrap>
-          {!isTts && (
+          {taskType === "asr" && (
             <FieldWrap label="WER / CER text" hint="Normalize (Whisper-style: lowercase, strip punctuation, spell out numbers) before scoring, or score raw text.">
               <label className="flex cursor-pointer items-center gap-2 text-sm">
                 <input type="checkbox" checked={normalizeText} onChange={(e) => setNormalizeText(e.target.checked)}
@@ -988,7 +1045,7 @@ export function TrainingForm() {
               </Select>
             </FieldWrap>
           )}
-          {!isTts && (
+          {taskType === "asr" && (
             <FieldWrap label="Language" hint="ISO code (e.g. en, ms). Empty = multilingual / model default.">
               <Input className="font-mono" placeholder="en" value={language} onChange={(e) => setLanguage(e.target.value)} />
             </FieldWrap>
@@ -1122,16 +1179,22 @@ export function TrainingForm() {
           </div>
         </div>
 
-        {/* LoRA (ASR + TTS) + freeze-encoder (ASR / Whisper only) */}
+        {/* LoRA — always-on for LLM (gemma4); a toggle for ASR/TTS. Freeze-encoder ASR-only. */}
         <div className="mt-4 space-y-3 border-t border-border pt-4">
           <div className="flex flex-wrap items-center gap-x-8 gap-y-2">
-            <label className="flex cursor-pointer items-center gap-2 text-sm">
-              <input type="checkbox" checked={useLora} onChange={(e) => setUseLora(e.target.checked)}
-                className="h-4 w-4 accent-primary" />
-              <span className="font-medium">Use LoRA</span>
-              <span className="text-xs text-muted-foreground">adapters on all linear layers, merged into the base at save</span>
-            </label>
-            {!isTts && (sweepOn ? (
+            {isLlm ? (
+              <span className="text-sm font-medium">LoRA
+                <span className="ml-2 text-xs font-normal text-muted-foreground">always on for LLM finetune (gemma-4 FSDP2 adapters, merged at save)</span>
+              </span>
+            ) : (
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={useLora} onChange={(e) => setUseLora(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span className="font-medium">Use LoRA</span>
+                <span className="text-xs text-muted-foreground">adapters on all linear layers, merged into the base at save</span>
+              </label>
+            )}
+            {taskType === "asr" && (sweepOn ? (
               <label className="flex cursor-pointer items-center gap-2 text-sm">
                 <input type="checkbox" checked={sweepFreeze} onChange={(e) => setSweepFreeze(e.target.checked)}
                   className="h-4 w-4 accent-primary" />
@@ -1147,7 +1210,7 @@ export function TrainingForm() {
               </label>
             ))}
           </div>
-          {useLora && (
+          {(useLora || isLlm) && (
             <div className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-3">
               {sweepOn ? (
                 <FieldWrap label="LoRA r" hint="e.g. 8, 16, 32">
@@ -1164,10 +1227,41 @@ export function TrainingForm() {
                 <Input className="font-mono" type="number" min={0} step={0.5} value={loraAlphaRatio}
                   onChange={(e) => setLoraAlphaRatio(Math.max(0, Number(e.target.value) || 0))} />
               </FieldWrap>
-              <FieldWrap label="LoRA dropout" hint="0–1, on the adapters.">
-                <Input className="font-mono" type="number" min={0} max={1} step={0.01} value={loraDropout}
-                  onChange={(e) => setLoraDropout(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />
-              </FieldWrap>
+              {/* gemma4's LinearLoRA has no dropout — hide it for LLM. */}
+              {!isLlm && (
+                <FieldWrap label="LoRA dropout" hint="0–1, on the adapters.">
+                  <Input className="font-mono" type="number" min={0} max={1} step={0.01} value={loraDropout}
+                    onChange={(e) => setLoraDropout(Math.max(0, Math.min(1, Number(e.target.value) || 0)))} />
+                </FieldWrap>
+              )}
+            </div>
+          )}
+          {/* LLM-only: choose which linear projections get LoRA (default q/k/v/o). */}
+          {isLlm && (
+            <div className="space-y-2">
+              <div className="text-sm font-medium">LoRA target modules</div>
+              <p className="text-xs text-muted-foreground">
+                Linear projections to adapt. Attention <span className="font-mono">q/k/v/o</span> is the proven default;
+                add the MLP/dense layers to adapt those too. A target that matches no linear layer on the model is
+                skipped (and logged) at train time.
+              </p>
+              <div className="flex flex-wrap gap-x-5 gap-y-2">
+                {LLM_LORA_TARGETS.map((m) => (
+                  <label key={m.id} className="flex cursor-pointer items-center gap-2 text-sm">
+                    <input type="checkbox" className="h-4 w-4 accent-primary"
+                      checked={loraTargets.includes(m.id)}
+                      onChange={(e) => setLoraTargets((prev) =>
+                        e.target.checked ? [...prev, m.id] : prev.filter((x) => x !== m.id))} />
+                    <span className="font-mono">{m.label}</span>
+                    <span className="rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground">{m.group}</span>
+                  </label>
+                ))}
+              </div>
+              {loraTargets.length === 0 && (
+                <p className="text-xs text-amber-600 dark:text-amber-500">
+                  No modules selected — the server will fall back to the q/k/v/o default.
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -1318,7 +1412,7 @@ export function TrainingForm() {
             )}
           </div>
         )}
-        {!isTts && (
+        {taskType === "asr" && (
         <div className="mt-5 space-y-1.5 border-t border-border pt-4">
           <Label className="text-xs uppercase tracking-wide text-muted-foreground">Audio augmentation (training only)</Label>
           <p className="text-xs text-muted-foreground">

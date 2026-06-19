@@ -80,6 +80,11 @@ _AUG_TECHNIQUES = {"telephone", "noise", "dropout", "gain", "pitch", "speed", "r
 # TitaNet speaker similarity. The eval runner is a follow-up; the selection +
 # config plumbing land here so runs record what to evaluate.
 _TTS_EVAL_METHODS = {"cer", "mos", "similarity"}
+# LLM LoRA target linear projections the user may select (gemma4 trainer). The
+# attention q/k/v/o are the default; gate/up/down are the MLP/dense layers. gemma4.py
+# warns for any target that wraps no nn.Linear on the loaded arch.
+_LORA_TARGET_MODULES = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+_LORA_TARGET_DEFAULT = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # Strong refs to in-flight runner tasks (else asyncio may GC them) + per-run
 # teardown state (RunPod id + api key) so terminate can delete the pod.
@@ -280,6 +285,19 @@ async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str
         return {
             "kind": "tts_packed",
             "packed_uri": ds.s3_metadata_uri,
+            "region": creds["region"], "endpoint": creds["endpoint"],
+            "access_key": creds["access_key"], "secret_key": creds["secret_key"],
+        }
+    if ds.kind == "llm_packed":
+        # Pre-packed (chat multipack) ChiniDataset: s3_metadata_uri is the s3://
+        # prefix of the shards (input_ids/labels/position_ids/attention_mask). The
+        # LLM trainer downloads it → ./packed_data and runs gemma4.py directly.
+        pack = (ds.split_fields or {}).get("_llm_pack") or {}
+        return {
+            "kind": "llm_packed",
+            "packed_uri": ds.s3_metadata_uri,
+            "tokenizer": pack.get("tokenizer"),
+            "sequence_length": pack.get("sequence_length"),
             "region": creds["region"], "endpoint": creds["endpoint"],
             "access_key": creds["access_key"], "secret_key": creds["secret_key"],
         }
@@ -1011,7 +1029,9 @@ async def run_training(redis, run_id: str) -> None:
             "access_key": target.access_key, "secret_key": target.secret_key,
             "prefix": s3_prefix.rstrip("/"),
         }
-        if cfg.get("hf_push_repo"):
+        # LLM training downloads the gated gemma-4 base model on the box, so it
+        # always needs the HF token (not just when pushing the result to HF).
+        if cfg.get("hf_push_repo") or (cfg.get("task_type") or "").lower() == "llm":
             cfg["hf_token"] = g("HF_TOKEN")
         # Experiment tracking: non-secret per-run fields from config_json override
         # the global-env value; secrets (WANDB_API_KEY, MLFLOW_TRACKING_USERNAME/
@@ -1239,8 +1259,9 @@ async def run_training(redis, run_id: str) -> None:
         # heavy stack never clobbers the box's system python or another task's
         # deps. The trainer's --deps-only creates/installs it; the run phase
         # launches from {venv}/bin/python.
-        venv_path = (cfg.get("venv_path")
-                     or ("/share/autotrain-tts" if task_type == "tts" else "/share/autotrain-whisper")).rstrip("/")
+        _default_venv = {"tts": "/share/autotrain-tts",
+                         "llm": "/share/autotrain-llm"}.get(task_type, "/share/autotrain-whisper")
+        venv_path = (cfg.get("venv_path") or _default_venv).rstrip("/")
         cfg["venv_path"] = venv_path
         venv_py = shlex.quote(f"{venv_path}/bin/python")
         # Sweep mode: a sweep orchestrator schedules GPU-pinned trials. Resolve
@@ -1253,7 +1274,7 @@ async def run_training(redis, run_id: str) -> None:
                 cfg["sweep_gpus"] = [str(i) for i in range(gpu_count)]
             else:
                 cfg["sweep_gpus"] = []  # VM, no pin → single slot (all GPUs)
-            cfg["sweep_metric"] = "loss" if task_type == "tts" else (cfg.get("eval_metric") or "wer")
+            cfg["sweep_metric"] = "loss" if task_type in ("tts", "llm") else (cfg.get("eval_metric") or "wer")
             # Seed the full trial plan (cross-product) as "pending" so the UI can
             # list every trial up front; on_line flips each to running/done/failed.
             import itertools
@@ -1284,6 +1305,12 @@ async def run_training(redis, run_id: str) -> None:
                 # convert/pack/train scripts; ship it as a sibling of the worker.
                 await asyncio.to_thread(_ssh_put_dir_tar, cli, str(base / "tts"), f"{stage}/tts")
                 worker_remote = f"{stage}/tts_finetune.py"
+            elif task_type == "llm":
+                await asyncio.to_thread(_ssh_put, cli, str(base / "llm_finetune.py"), f"{stage}/llm_finetune.py")
+                # The llm/ dir carries the vendored gemma4 trainer (gemma4.py +
+                # attention.py) + the chinidataset package; ship it as a sibling.
+                await asyncio.to_thread(_ssh_put_dir_tar, cli, str(base / "llm"), f"{stage}/llm")
+                worker_remote = f"{stage}/llm_finetune.py"
             else:
                 await asyncio.to_thread(_ssh_put, cli, str(_trainer_script_path()), f"{stage}/whisper_finetune.py")
                 worker_remote = f"{stage}/whisper_finetune.py"
@@ -1696,7 +1723,7 @@ class CreateTrainingRunRequest(BaseModel):
     name: str
     dataset_id: str
     base_model: str
-    task_type: str = "asr"             # "asr" | "tts"
+    task_type: str = "asr"             # "asr" | "tts" | "llm"
     test_dataset_id: Optional[str] = None
     # ---- TTS-only (Qwen3 + NeuCodec) ----
     tokenizer: Optional[str] = None    # pack tokenizer (speech tokens); default set in runner
@@ -1756,6 +1783,11 @@ class CreateTrainingRunRequest(BaseModel):
     lora_alpha_ratio: Optional[float] = 2.0
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    # LLM-only (gemma4): which linear projections to apply LoRA to. Default is the
+    # attention projections (q/k/v/o); add MLP/dense layers (gate_proj, up_proj,
+    # down_proj) to adapt those too. LLM finetune is always LoRA. Unknown names are
+    # dropped; an empty result falls back to the q/k/v/o default.
+    lora_target_modules: list[str] = ["q_proj", "k_proj", "v_proj", "o_proj"]
     # Freeze the encoder; train the decoder only (faster, less overfit on small data).
     freeze_encoder: bool = False
     # Multi-GPU strategy for a single (non-sweep) run: DDP via torchrun (one
@@ -1988,6 +2020,21 @@ async def create_training_run(
             body.block_size = int(_seq)
         # the trainer tokenizes with the base model's tokenizer; record it.
         body.tokenizer = body.base_model
+    if body.task_type == "llm":
+        # LLM finetune consumes a pre-packed chat ChiniDataset (kind=llm_packed) —
+        # the gemma4 trainer reads the packed ids directly (no re-tokenization).
+        if ds.kind != "llm_packed":
+            raise HTTPException(
+                status_code=400,
+                detail="LLM training needs a packed dataset (kind=llm_packed) — pack it first via 'Pack for LLM'",
+            )
+        if tds is not None and tds.kind != "llm_packed":
+            raise HTTPException(status_code=400, detail="LLM test dataset must also be packed (kind=llm_packed)")
+        _pm = (ds.split_fields or {}).get("_llm_pack") or {}
+        if _pm.get("sequence_length"):
+            body.block_size = int(_pm["sequence_length"])
+        # tokenization already happened at pack time; record the base model.
+        body.tokenizer = body.base_model
     if body.storage_id:
         st = await session.get(Storage, body.storage_id)
         if st is None or st.kind != "s3" or not st.enabled:
@@ -2062,9 +2109,13 @@ async def create_training_run(
         "grad_accum": body.grad_accum, "learning_rate": body.learning_rate,
         "warmup_steps": body.warmup_steps, "lr_scheduler_type": body.lr_scheduler_type,
         "weight_decay": body.weight_decay,
-        "use_lora": body.use_lora, "lora_r": body.lora_r,
+        # LLM finetune (gemma4) is always LoRA — force it on regardless of the toggle.
+        "use_lora": True if body.task_type == "llm" else body.use_lora,
+        "lora_r": body.lora_r,
         "lora_alpha_ratio": body.lora_alpha_ratio,
         "lora_alpha": body.lora_alpha, "lora_dropout": body.lora_dropout,
+        "lora_target_modules": ([m for m in (body.lora_target_modules or [])
+                                 if m in _LORA_TARGET_MODULES] or list(_LORA_TARGET_DEFAULT)),
         "freeze_encoder": body.freeze_encoder, "use_ddp": body.use_ddp,
         "logging_steps": body.logging_steps,
         "augment_techniques": [t for t in (body.augment_techniques or []) if t in _AUG_TECHNIQUES],

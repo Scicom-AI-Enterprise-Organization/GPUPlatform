@@ -60,6 +60,7 @@ export function DatasetDetail({
   hasMetadata,
   canTransform,
   canPack,
+  canPackLlm,
   initialView,
   initialSplit,
 }: {
@@ -69,11 +70,12 @@ export function DatasetDetail({
   hasMetadata: boolean;
   canTransform: boolean;
   canPack: boolean;
+  canPackLlm?: boolean;
   initialView?: string;
   initialSplit?: string | null;
 }) {
   const showRows = hasMetadata && !!preview;
-  const showTransform = canTransform || canPack;
+  const showTransform = canTransform || canPack || !!canPackLlm;
   const isUpload = dataset.kind === "upload";
   // S3-backed datasets get a Files tab listing their objects (presigned downloads).
   // hf / label datasets have no S3 backing → no tab.
@@ -231,6 +233,7 @@ export function DatasetDetail({
                 datasetId={dataset.id}
                 kind={dataset.kind}
                 hfRepo={dataset.hf_repo ?? null}
+                messagesField={dataset.messages_field ?? null}
                 s3Storages={s3Storages}
                 initialStatus={dataset.transform_status ?? null}
                 initialLog={dataset.transform_log ?? null}

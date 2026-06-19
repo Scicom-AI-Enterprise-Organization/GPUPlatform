@@ -81,10 +81,40 @@ async def start_transform(
     task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
 
 
+async def start_llm_pack(
+    dataset_id: str,
+    *,
+    subset: Optional[str],
+    tokenizer: str,
+    sequence_length: int,
+    storage_id: str,
+    tools_field: Optional[str] = None,
+    all_reasoning: bool = True,
+) -> None:
+    """Mark the dataset running and kick off the in-process chat→multipack job
+    (kind=llm → kind=llm_packed ChiniDataset on S3). CPU-only tokenization, so it
+    runs here (no GPU box) — the threadpool steps stay off the event loop."""
+    async with session_factory()() as s:
+        d = await s.get(Dataset, dataset_id)
+        if d is None:
+            return
+        d.transform_status = "running"
+        d.transform_log = _append_log(
+            None, f"LLM pack queued · subset={subset or '(first)'} · tokenizer={tokenizer} "
+                  f"· seq_len {sequence_length}")
+        await s.commit()
+    task = asyncio.create_task(_run_llm_pack(
+        dataset_id, subset=subset, tokenizer=tokenizer, sequence_length=sequence_length,
+        storage_id=storage_id, tools_field=tools_field, all_reasoning=all_reasoning,
+    ))
+    _active[dataset_id] = task
+    task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
+
+
 async def cancel_transform(dataset_id: str) -> bool:
-    """Abort an in-flight audio-extraction transform for this dataset. Returns
-    True if one was running. (Pack-only TTS runs are training runs — cancelled
-    separately via training_api.cancel_pack_run_for_dataset.)"""
+    """Abort an in-flight audio-extraction OR LLM-pack transform for this dataset.
+    Returns True if one was running. (Pack-only TTS runs are training runs —
+    cancelled separately via training_api.cancel_pack_run_for_dataset.)"""
     t = _active.get(dataset_id)
     if t is None or t.done():
         return False
@@ -290,6 +320,253 @@ async def _run(
         # already-downloaded + extracted files; only clean up after success.
         if work and success:
             shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------- LLM chat → multipack (kind=llm → kind=llm_packed) ----------
+
+
+async def _create_llm_packed_output(
+    source_id: str, *, new_id: str, name: str, description: str, storage_id: str,
+    s3_uri: str, num_rows: int, messages_field: str, tokenizer: str,
+    sequence_length: int, subset: Optional[str],
+) -> str:
+    """Create the packed (chat multipack) dataset as a NEW row, leaving the source
+    intact + re-runnable. `_llm_pack` metadata (in split_fields) mirrors tts_packed's
+    `_tts_pack` so the packed-row preview/decode + the trainer can read it. Returns id."""
+    async with session_factory()() as s:
+        src = await s.get(Dataset, source_id)
+        owner_id = src.owner_id if src else None
+        new = Dataset(
+            id=new_id,
+            owner_id=owner_id,
+            name=name[:255],
+            description=description[:2048],
+            kind="llm_packed",
+            format="chinidataset",  # multipacked chat layout (ChiniDataset parquet shards)
+            storage_id=storage_id,
+            s3_metadata_uri=s3_uri,
+            num_rows=num_rows,
+            messages_field=messages_field,
+            # tokenizer + sequence_length live in the _llm_pack blob (mirrors how
+            # tts_packed stashes them under _tts_pack — there are no DB columns).
+            # NB: no `splits` map → the pack is a single FLAT ChiniDataset (shards
+            # at the prefix root), so the packed-row reader doesn't append a split
+            # subdir (unlike tts_packed's <prefix>/<split>/ layout).
+            split_fields={"_llm_pack": {
+                "tokenizer": tokenizer,
+                "sequence_length": sequence_length,
+                "subset": subset,
+                "messages_field": messages_field,
+                "samples": num_rows,
+            }},
+        )
+        s.add(new)
+        await s.commit()
+        return new.id
+
+
+def _read_split_columns(parquet_paths: list[str], cols: list[str]) -> list[dict]:
+    """Read only `cols` from the downloaded parquet shards → list[dict] (blocking).
+    Keeping it to the messages/tools columns keeps memory bounded for big splits."""
+    import pyarrow.parquet as pq
+
+    rows: list[dict] = []
+    for p in parquet_paths:
+        tbl = pq.read_table(p)
+        present = [c for c in cols if c in tbl.column_names]
+        rows.extend(tbl.select(present).to_pylist())
+    return rows
+
+
+def _upload_chinidataset_dir(out_dir: str, target, key_prefix: str,
+                             progress: Optional[Callable[..., None]] = None) -> str:
+    """Upload every file under a local ChiniDataset dir (index.json + shards) to
+    S3 under `key_prefix`, preserving relative paths. Returns the s3:// prefix URI
+    (what the packed-row preview + trainer download)."""
+    from . import bench
+
+    to_upload: list[tuple[str, str]] = []
+    for root, _dirs, files in os.walk(out_dir):
+        for f in files:
+            local = os.path.join(root, f)
+            rel = os.path.relpath(local, out_dir).replace(os.sep, "/")
+            to_upload.append((f"{key_prefix}/{rel}", local))
+    total = len(to_upload)
+    every = max(1, total // 25)
+
+    def _on_done(done: int) -> None:
+        if progress and (done % every == 0 or done == total):
+            progress("upload_s3", done, total)
+
+    bench.s3_put_files(to_upload, target, max_workers=16, on_done=_on_done)
+    bucket = getattr(target, "bucket", "")
+    return f"s3://{bucket}/{key_prefix}"
+
+
+async def _run_llm_pack(
+    dataset_id: str,
+    *,
+    subset: Optional[str],
+    tokenizer: str,
+    sequence_length: int,
+    storage_id: str,
+    tools_field: Optional[str],
+    all_reasoning: bool,
+) -> None:
+    from fastapi.concurrency import run_in_threadpool
+
+    from sqlalchemy import select
+
+    from . import llm_pack
+    from .datasets_api import (
+        _hf_endpoint, _hf_parquet_files, _hf_token, _join_key, _resolve_hf_subset,
+        _s3_target_and_prefix,
+    )
+
+    work = _work_dir(dataset_id) + "-llmpack"
+    success = False
+    progress = _make_progress(dataset_id, asyncio.get_running_loop())
+    try:
+        if os.path.isdir(work):
+            shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+
+        async with session_factory()() as s:
+            d = await s.get(Dataset, dataset_id)
+            if d is None:
+                return
+            src_repo = d.hf_repo
+            src_revision = d.hf_revision
+            src_name = d.name
+            messages_field = (getattr(d, "messages_field", None) or "messages")
+            # HF token + endpoint: prefer the dataset's OWN storage when it's a
+            # huggingface backend (carries the token for a gated repo), else fall
+            # back to any configured huggingface storage (mirrors _run).
+            own = await s.get(Storage, d.storage_id) if d.storage_id else None
+            hf_store = own if (own and own.kind == "huggingface") else (
+                await s.execute(select(Storage).where(Storage.kind == "huggingface").limit(1))
+            ).scalars().first()
+            token = await _hf_token(hf_store, s)
+            hf_endpoint = await _hf_endpoint(hf_store, s)
+            out_storage = await s.get(Storage, storage_id)
+
+        if not (src_repo and "/" in src_repo):
+            await _finish(dataset_id, "failed", "dataset has no source HuggingFace repo (owner/name)")
+            return
+        if out_storage is None or out_storage.kind != "s3":
+            await _finish(dataset_id, "failed", "pick a kind=s3 storage for the packed output")
+            return
+        target, base_prefix = _s3_target_and_prefix(out_storage)
+
+        # 1. Resolve the chosen subset → (config, split) + list its parquet files.
+        await _log(dataset_id, f"resolving subset {subset or '(first)'} on {src_repo} …")
+        config, split, label = await run_in_threadpool(
+            _resolve_hf_subset, src_repo, token, subset, src_revision)
+        urls = await run_in_threadpool(
+            _hf_parquet_files, src_repo, token, config, split, src_revision)
+        if not urls:
+            await _finish(dataset_id, "failed",
+                          f"no parquet files for subset '{label}' (config={config}, split={split}) "
+                          f"on the HF datasets-server")
+            return
+        await _log(dataset_id, f"subset '{label}' → config={config} split={split}; {len(urls)} parquet file(s)")
+
+        # 2. Download the parquet shards (auth via the HF token).
+        await _log(dataset_id, "downloading source parquet …")
+        paths = await run_in_threadpool(_download_parquet_urls, urls, token, work, progress)
+
+        # 3. Read messages (+ tools) columns → rows.
+        cols = [messages_field] + ([tools_field] if tools_field else [])
+        rows = await run_in_threadpool(_read_split_columns, paths, cols)
+        if not rows:
+            await _finish(dataset_id, "failed",
+                          f"no rows read for column '{messages_field}' — check the messages column mapping")
+            return
+        await _log(dataset_id, f"read {len(rows)} rows; tokenizing + multipacking with {tokenizer} …")
+
+        # 4. Tokenize + bin-pack into a ChiniDataset (CPU; threadpool).
+        out_dir = os.path.join(work, "packed")
+
+        def _pack_progress(p: int, t: int) -> None:
+            progress("pack", p, t)
+
+        stats = await run_in_threadpool(
+            llm_pack.pack_rows, rows,
+            tokenizer_name=tokenizer, out_dir=out_dir,
+            messages_field=messages_field, tools_field=(tools_field or ""),
+            max_seq_len=int(sequence_length), hf_token=token, hf_endpoint=hf_endpoint,
+            all_reasoning=all_reasoning, progress=_pack_progress,
+        )
+        n_bins = int(stats.get("n_bins") or 0)
+        if n_bins == 0:
+            await _finish(dataset_id, "failed",
+                          f"packed 0 bins (rows={stats.get('total_rows')}, dropped_long="
+                          f"{stats.get('dropped_long')}, dropped_empty={stats.get('dropped_empty')}) "
+                          f"— is seq_len {sequence_length} too small for every conversation?")
+            return
+        await _log(
+            dataset_id,
+            f"packed {n_bins} bins from {stats.get('docs_packed')} docs "
+            f"(dropped {stats.get('dropped_long')} too-long, {stats.get('dropped_empty')} empty; "
+            f"{stats.get('rows_with_tools')} rows had tools; efficiency "
+            f"{stats.get('efficiency', 0) * 100:.1f}%); uploading shards …")
+
+        # 5. Upload the ChiniDataset dir to S3, then register the packed dataset.
+        # Mint the new dataset id up front so its S3 prefix matches its row id.
+        import secrets as _secrets
+        new_id = f"ds-{_secrets.token_hex(4)}"
+        key_prefix = _join_key(base_prefix, "datasets", new_id, "packed")
+        s3_uri = await run_in_threadpool(_upload_chinidataset_dir, out_dir, target, key_prefix, progress)
+
+        created_id = await _create_llm_packed_output(
+            dataset_id, new_id=new_id,
+            name=f"{src_name}-llm-packed",
+            description=(f"Chat multipack (seq_len {sequence_length}, tokenizer {tokenizer}, "
+                         f"subset {label}) of {src_repo} → {n_bins} bins"),
+            storage_id=storage_id, s3_uri=s3_uri, num_rows=n_bins,
+            messages_field=messages_field, tokenizer=tokenizer,
+            sequence_length=int(sequence_length), subset=label,
+        )
+        await _finish(
+            dataset_id, "done",
+            f"packed → {s3_uri} ({n_bins} bins); created dataset {created_id}")
+        success = True
+    except ModuleNotFoundError as e:
+        await _finish(dataset_id, "failed",
+                      f"missing dependency: {e}. The gateway needs transformers (+ jinja2) for chat templates.")
+        logger.exception("llm pack %s failed (missing dep)", dataset_id)
+    except Exception as e:  # noqa: BLE001
+        await _finish(dataset_id, "failed", f"LLM pack failed: {e}")
+        logger.exception("llm pack %s failed", dataset_id)
+    finally:
+        if work and success:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def _download_parquet_urls(
+    urls: list[str], token: Optional[str], dest: str,
+    progress: Optional[Callable[..., None]] = None,
+) -> list[str]:
+    """Download each parquet URL into `dest` (auth header from the HF token).
+    Returns local paths. Emits a per-file `download` progress marker."""
+    import httpx
+
+    os.makedirs(dest, exist_ok=True)
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    paths: list[str] = []
+    total = len(urls)
+    with httpx.Client(timeout=None, follow_redirects=True, headers=headers) as cli:
+        for i, url in enumerate(urls):
+            local = os.path.join(dest, f"source-{i:05d}.parquet")
+            with cli.stream("GET", url) as r:
+                r.raise_for_status()
+                with open(local, "wb") as f:
+                    for chunk in r.iter_bytes(chunk_size=1 << 20):
+                        f.write(chunk)
+            paths.append(local)
+            if progress:
+                progress("download", i + 1, total)
+    return paths
 
 
 # ---------------- blocking ETL steps (run in threadpool) ----------------
