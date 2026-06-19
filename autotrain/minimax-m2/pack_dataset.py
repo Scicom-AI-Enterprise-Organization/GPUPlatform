@@ -138,6 +138,29 @@ def extract_messages(value):
         # per-turn reasoning under `reasoning`. Map it across so reasoning renders.
         if turn.get("role") in ("assistant", "model") and turn.get("reasoning") and not turn.get("reasoning_content"):
             turn["reasoning_content"] = turn["reasoning"]
+        # The MiniMax-M2 template iterates `tool_call.arguments.items()`, but this dataset (OpenAI
+        # format) stores `arguments` as a JSON STRING -> "'str' object has no attribute 'items'".
+        # Parse it to a dict so the template renders. Handles both `tc.arguments` and the nested
+        # OpenAI `tc.function.arguments`.
+        tcs = turn.get("tool_calls")
+        if isinstance(tcs, (list, tuple)):
+            norm = []
+            for tc in tcs:
+                if isinstance(tc, dict):
+                    tc = dict(tc)
+                    for holder in (tc, tc.get("function") if isinstance(tc.get("function"), dict) else None):
+                        if holder is None:
+                            continue
+                        a = holder.get("arguments")
+                        if isinstance(a, str):
+                            try:
+                                holder["arguments"] = json.loads(a)
+                            except json.JSONDecodeError:
+                                holder["arguments"] = {}
+                    if isinstance(tc.get("function"), dict):
+                        tc["function"] = dict(tc["function"])
+                norm.append(tc)
+            turn["tool_calls"] = norm
         out.append(turn)
     return out or None
 

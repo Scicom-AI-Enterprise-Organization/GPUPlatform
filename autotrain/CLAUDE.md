@@ -65,6 +65,9 @@ confirms it end-to-end on the actual weights on the pod. Run it before training.
 driver), `NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0`. Full commands + gotchas in each job's
 `CLAUDE.md`. **Billing stops only on `runpodctl pod delete <pod-id>` — always terminate.**
 
+**ALWAYS pin the US region: pass `--country-code US` to `runpodctl pod create`** (hard rule, user
+requested). Without it RunPod may place the pod anywhere (e.g. IN), which the user doesn't want.
+
 **ALWAYS work under `/` (the container disk), NEVER `/workspace`.** This is a hard rule (the user
 has reinforced it). `/workspace` is the RunPod network volume — slow. Put **everything** there:
 the job dir (e.g. `/root/autotrain-mm2`, `/root/eval`) AND the HF cache

@@ -107,7 +107,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -1012,7 +1012,53 @@ def main():
                          "~22k-token prompts. With --lora, serve the MERGED model in vLLM.")
     ap.add_argument("--served-model", default=None,
                     help="Model name the vLLM server is serving under (default: --model-id).")
+    ap.add_argument("--cache", default=None,
+                    help="JSONL per-conversation result cache (default: <out>.cache.jsonl). Each "
+                         "finished conversation is appended immediately; on restart, conversations "
+                         "already in the cache are SKIPPED (no re-generation). Delete it to force "
+                         "a fresh run.")
+    ap.add_argument("--metrics-only", action="store_true",
+                    help="Don't generate anything: just aggregate + print metrics over whatever is "
+                         "already in the cache (the rows generated so far).")
     args = ap.parse_args()
+
+    model_label = args.model_id + (f" + LoRA({args.lora})" if args.lora else " (base)")
+    out_path = args.out or (
+        f"{args.model_id.replace('/', '_')}"
+        + ("_lora" if args.lora else "_base")
+        + "_results.json"
+    )
+    cache_path = args.cache or (out_path + ".cache.jsonl")
+
+    # --- load any previously-cached conversations (keyed by conversation_id) ---
+    cache: dict = {}
+    if os.path.exists(cache_path):
+        with open(cache_path) as cf:
+            for line in cf:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                    cache[e["conversation_id"]] = e
+                except Exception:
+                    pass
+        print(f">> cache {cache_path}: {len(cache)} conversations already generated", flush=True)
+
+    def agg_from(entries):
+        atr = [[TurnResult(**d) for d in e["turn_results"]] for e in entries]
+        return aggregate(atr), atr
+
+    # --- metrics-only: report on the rows generated so far, then exit ---
+    if args.metrics_only:
+        if not cache:
+            raise SystemExit(f"[eval_funccall] cache {cache_path} is empty — nothing to aggregate.")
+        m, atr = agg_from(cache.values())
+        n_err = sum(1 for e in cache.values() if e.get("error"))
+        print_summary(m, len(atr), n_err, model_label + " [cache-so-far]")
+        print(f"\n  [cache so far] {len(atr)} convs  tool_call_f1 = {m['tool_call_f1']:.4f}  "
+              f"(precision {m['tool_call_precision']:.4f}, recall {m['tool_call_recall']:.4f})")
+        return
 
     pairs = load_pairs(args.data, args.max_rows)
     if not pairs:
@@ -1021,21 +1067,28 @@ def main():
     lm = LocalModel(args.model_id, args.lora, args.scaling, args.max_new_tokens,
                     vllm_url=args.vllm_url, served_model=args.served_model)
 
-    model_label = args.model_id + (f" + LoRA({args.lora})" if args.lora else " (base)")
-
     conv_results: list[dict] = []
     all_turn_results: list[list[TurnResult]] = []
     n_errors = 0
     t0 = time.time()
 
     for n, (lib, conv) in enumerate(pairs, 1):
-        tools, fn_schema_map, fn_names = build_openai_tools(lib)
         conv_id = conv.get("conversation_id", f"conv-{n}")
+        # skip if this conversation is already cached (resume / no re-generation)
+        if conv_id in cache:
+            e = cache[conv_id]
+            all_turn_results.append([TurnResult(**d) for d in e["turn_results"]])
+            conv_results.append(e["conv_result"])
+            if e.get("error"):
+                n_errors += 1
+            print(f"  [{n}/{len(pairs)}] {conv_id}  CACHED (turns={len(e['turn_results'])})", flush=True)
+            continue
+        tools, fn_schema_map, fn_names = build_openai_tools(lib)
         turn_results, error = evaluate_conversation(lm, conv, tools, fn_names, fn_schema_map)
         if error:
             n_errors += 1
         all_turn_results.append(turn_results)
-        conv_results.append({
+        conv_result = {
             "conversation_id": conv_id,
             "workflow_name": conv.get("workflow_name"),
             "domain": conv.get("domain"),
@@ -1058,7 +1111,17 @@ def main():
                 }
                 for tr in turn_results
             ],
-        })
+        }
+        conv_results.append(conv_result)
+        # append to the durable cache IMMEDIATELY so a crash/restart resumes here
+        with open(cache_path, "a") as cf:
+            cf.write(json.dumps({
+                "conversation_id": conv_id,
+                "error": error,
+                "conv_result": conv_result,
+                "turn_results": [asdict(tr) for tr in turn_results],
+            }) + "\n")
+        cache[conv_id] = True
         err = f" [ERROR: {error}]" if error else ""
         print(f"  [{n}/{len(pairs)}] {conv_id}  turns={len(turn_results)}{err}", flush=True)
 
@@ -1069,11 +1132,6 @@ def main():
           f"recall {metrics['tool_call_recall']:.4f})")
     print(f"  name_set_f1 = {metrics['name_set_f1']:.4f}  |  elapsed {time.time() - t0:.0f}s")
 
-    out_path = args.out or (
-        f"{args.model_id.replace('/', '_')}"
-        + ("_lora" if args.lora else "_base")
-        + "_results.json"
-    )
     # Same shape as SyntheticGen's *_results.json: {model, split, metrics, conversations}.
     Path(out_path).write_text(json.dumps({
         "model": model_label,

@@ -176,9 +176,13 @@ class LinearLoRA(nn.Module):
         dev = base.weight.device
         self.lora_a = nn.Linear(in_features, r, bias=False, dtype=lora_dtype, device=dev)
         self.lora_b = nn.Linear(r, out_features, bias=False, dtype=lora_dtype, device=dev)
-        with torch.no_grad():
-            nn.init.kaiming_uniform_(self.lora_a.weight)
-            nn.init.zeros_(self.lora_b.weight)  # CRITICAL: adapter = identity at init
+        # kaiming_uniform_ needs an RNG fill, which fails on a meta tensor (low-CPU meta-init
+        # path in minimax_m2.py). Skip here when meta — minimax_m2._reinit_lora_ re-inits the
+        # adapters after `to_empty` materializes them on GPU. Non-meta path is unchanged.
+        if not self.lora_a.weight.is_meta:
+            with torch.no_grad():
+                nn.init.kaiming_uniform_(self.lora_a.weight)
+                nn.init.zeros_(self.lora_b.weight)  # CRITICAL: adapter = identity at init
 
         # Cache FP8 metadata once (the base weight stays fp8 + frozen).
         self._fp8 = _is_fp8(base) and getattr(base, "weight_scale_inv", None) is not None
@@ -293,8 +297,8 @@ def add_expert_lora(experts: nn.Module, r: int = 16, alpha: float = 16.0,
 
     def _param(shape, zero):
         t = torch.zeros(*shape, dtype=lora_dtype, device=dev)
-        if not zero:
-            nn.init.kaiming_uniform_(t)  # (E, r, in): init the A factors
+        if not zero and not t.is_meta:  # (E, r, in): init the A factors (skip on meta — see _reinit_lora_)
+            nn.init.kaiming_uniform_(t)
         return nn.Parameter(t, requires_grad=True)
 
     experts.gate_up_lora_a = _param((E, r, H), zero=False)

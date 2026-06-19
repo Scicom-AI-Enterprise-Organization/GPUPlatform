@@ -41,7 +41,7 @@ from transformers import AutoConfig, MiniMaxM2ForCausalLM
 from transformers.models.minimax_m2 import modeling_minimax_m2
 
 from chinidataset import StreamingDataset
-from lora import apply_minimax_lora
+from lora import ATTN_TARGETS, apply_minimax_lora
 
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
 logger = logging.getLogger()
@@ -142,6 +142,94 @@ class CustomMiniMaxM2ForCausalLM(MiniMaxM2ForCausalLM):
         return {"loss": loss}
 
 
+# ---------------------------------------------------------------------------
+# Low-CPU sharded load (--low_cpu_shard_load)
+# ---------------------------------------------------------------------------
+# The DEFAULT path has every rank `from_pretrained` the full ~230GB model to CPU before FSDP2
+# shards it to GPU -> ~230GB x world_size of CPU (≈1.8TB at 8 ranks; the #2 risk in CLAUDE.md).
+# This path instead builds the FP8 module structure on META (no weights) on every rank, shards
+# it, then streams the base weights from rank 0 only (DCP broadcast_from_rank0) straight into each
+# rank's local shard — capping CPU at ~one full copy on rank 0.
+def build_meta_lora_model(config, args):
+    """Meta-init the FP8 structure on EVERY rank (no weights) + apply LoRA (meta, uninitialised).
+
+    The FP8Linear/FP8Experts modules are produced exactly as `from_pretrained` would, by running
+    the HF quantizer's pre-load module swap on a meta-built model. LoRA `kaiming_uniform_` can't run
+    on meta tensors (no RNG fill), so `lora.py` skips it on meta and `_reinit_lora_` does it after
+    `to_empty`. Returns (meta_model, stats)."""
+    from transformers.quantizers import AutoHfQuantizer
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)  # non-fp8 parts (norms/embed/lm_head/router) -> bf16
+    try:
+        with torch.device("meta"):
+            model = CustomMiniMaxM2ForCausalLM(config)
+    finally:
+        torch.set_default_dtype(prev)
+    hf_quantizer = AutoHfQuantizer.from_config(config.quantization_config)
+    hf_quantizer._process_model_before_weight_loading(model)  # Linear->FP8Linear, experts->FP8Experts
+    stats = apply_minimax_lora(
+        model,
+        attn_r=args.attn_r, attn_alpha=args.attn_alpha,
+        moe_r=args.moe_r, moe_alpha=args.moe_alpha,
+        include_moe=not args.no_moe_lora,
+    )
+    return model, stats
+
+
+def _remap_base_keys_for_lora(sd):
+    """Rank-0's `from_pretrained` state_dict uses `...self_attn.{proj}.weight`, but `LinearLoRA`
+    wraps the frozen Linear so the model's FQN is `...self_attn.{proj}.base.weight`. Insert `.base`
+    so DCP matches. Expert (`mlp.experts.*`), norm, embed, lm_head, router keys are unchanged."""
+    out = {}
+    for k, v in sd.items():
+        nk = k
+        for proj in ATTN_TARGETS:
+            tag = f".self_attn.{proj}."
+            if tag in k:
+                nk = k.replace(tag, f".self_attn.{proj}.base.", 1)
+                break
+        out[nk] = v
+    return out
+
+
+def load_base_weights_broadcast(model, rank):
+    """Fill the (materialised, sharded) model's base weights from rank 0's full CPU state_dict via
+    DCP broadcast. Only rank 0 holds the full ~230GB copy; other ranks receive their shard."""
+    from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
+    full_sd = {}
+    if rank == 0:
+        logger.info(f"[Rank0] loading full base state_dict to CPU for broadcast ({MODEL_ID})")
+        src = CustomMiniMaxM2ForCausalLM.from_pretrained(
+            MODEL_ID, dtype=torch.bfloat16, attn_implementation=ATTN_IMPL, low_cpu_mem_usage=True)
+        full_sd = _remap_base_keys_for_lora(src.state_dict())
+        del src
+    set_model_state_dict(
+        model, model_state_dict=full_sd,
+        options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, strict=False),
+    )
+
+
+def _reinit_lora_(model):
+    """Re-initialise LoRA adapters on the materialised (sharded) tensors: A=kaiming, B=0. Operates
+    on the local shard (fan_in is dim-0-shard-invariant, so kaiming is correct)."""
+    from lora import LinearLoRA
+    from torch.distributed.tensor import DTensor
+
+    def loc(t):
+        return t.to_local() if isinstance(t, DTensor) else t
+
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, LinearLoRA):
+                nn.init.kaiming_uniform_(loc(m.lora_a.weight))
+                nn.init.zeros_(loc(m.lora_b.weight))
+            if hasattr(m, "gate_up_lora_a"):  # FP8Experts carrying expert LoRA
+                nn.init.kaiming_uniform_(loc(m.gate_up_lora_a))
+                nn.init.kaiming_uniform_(loc(m.down_lora_a))
+                nn.init.zeros_(loc(m.gate_up_lora_b))
+                nn.init.zeros_(loc(m.down_lora_b))
+
+
 def main(args):
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -154,25 +242,29 @@ def main(args):
     # fused-experts integration. The fp8 quantization_config lives in the model config, so
     # from_pretrained loads q/k/v/o as FP8Linear and the experts as FP8Experts automatically.
     config = AutoConfig.from_pretrained(MODEL_ID)
-    logger.info(f"[Rank{rank}] loading {MODEL_ID} (FP8, frozen base)")
-    model = CustomMiniMaxM2ForCausalLM.from_pretrained(
-        MODEL_ID,
-        config=config,
-        dtype=torch.bfloat16,                 # non-quantized parts (norms, router gate, lm_head)
-        attn_implementation=ATTN_IMPL,
-        low_cpu_mem_usage=True,
-    )
+    if args.low_cpu_shard_load:
+        # META structure on every rank (no weights); base weights stream in from rank 0 after shard.
+        logger.info(f"[Rank{rank}] meta-init {MODEL_ID} (FP8 structure, low-CPU sharded load)")
+        model, stats = build_meta_lora_model(config, args)
+    else:
+        logger.info(f"[Rank{rank}] loading {MODEL_ID} (FP8, frozen base)")
+        model = CustomMiniMaxM2ForCausalLM.from_pretrained(
+            MODEL_ID,
+            config=config,
+            dtype=torch.bfloat16,             # non-quantized parts (norms, router gate, lm_head)
+            attn_implementation=ATTN_IMPL,
+            low_cpu_mem_usage=True,
+        )
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"[Rank{rank}] params: {total_params/1e9:.1f}B")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"[Rank{rank}] params: {total_params/1e9:.1f}B")
-
-    # ---- LoRA: freeze base, wrap attn q/k/v/o + MoE experts -----------------
-    stats = apply_minimax_lora(
-        model,
-        attn_r=args.attn_r, attn_alpha=args.attn_alpha,
-        moe_r=args.moe_r, moe_alpha=args.moe_alpha,
-        include_moe=not args.no_moe_lora,
-    )
+        # ---- LoRA: freeze base, wrap attn q/k/v/o + MoE experts -----------------
+        stats = apply_minimax_lora(
+            model,
+            attn_r=args.attn_r, attn_alpha=args.attn_alpha,
+            moe_r=args.moe_r, moe_alpha=args.moe_alpha,
+            include_moe=not args.no_moe_lora,
+        )
     logger.info(
         f"[Rank{rank}] LoRA: wrapped {stats['attn_modules_wrapped']} attn blocks, "
         f"adapted {stats['moe_blocks_adapted']} MoE blocks | "
@@ -195,6 +287,13 @@ def main(args):
         if isinstance(module, modeling_minimax_m2.MiniMaxM2DecoderLayer):
             fsdp.fully_shard(module, **fsdp_kwargs)
     fsdp.fully_shard(model, **fsdp_kwargs)
+
+    # ---- low-CPU path: materialise the sharded meta model, then stream base weights in ----
+    if args.low_cpu_shard_load:
+        model.to_empty(device=f"cuda:{rank}")          # allocate real (empty) local shards
+        load_base_weights_broadcast(model, rank)        # rank-0 full sd -> broadcast into shards
+        _reinit_lora_(model)                            # A=kaiming, B=0 on the real tensors
+        logger.info(f"[Rank{rank}] low-CPU sharded load complete")
 
     # ---- activation checkpointing (REQUIRED for the dequant memory trick) ----
     # Each decoder layer's forward (incl. the transient bf16 weight dequant) is recomputed in
@@ -325,6 +424,10 @@ if __name__ == "__main__":
     p.add_argument("--data_dir", default="./packed_data")
     p.add_argument("--out_dir", default="./checkpointing")
     p.add_argument("--cpu_offload", action="store_true", help="FSDP2 CPUOffloadPolicy (slow; for tight VRAM).")
+    p.add_argument("--low_cpu_shard_load", action="store_true",
+                   help="Meta-init the FP8 structure on every rank + stream base weights from rank 0 "
+                        "(DCP broadcast) into each shard. Caps CPU at ~one model copy instead of "
+                        "~230GB x world_size. Default path loads the full model on every rank.")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_project", default="minimax-m2-autotrain")
     main(p.parse_args())
