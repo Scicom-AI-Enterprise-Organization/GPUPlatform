@@ -3,19 +3,18 @@ import {
   fetchInferenceSummary,
   fetchKinds,
   getGatewayToken,
-  GPUPLATFORM_ALL_KINDS,
+  GPUPLATFORM_OVERVIEW_KINDS,
 } from "../_gpuplatform";
 
 /**
- * Server-side fan-out to the gateway's admin /v1/history/{kind} endpoints for
- * the Analytics page. Runs on the server so the per-kind pagination happens
- * close to the gateway; auth is the caller's own session token, so the
- * gateway's admin check still applies (non-admins get 403s and an empty
- * result, same as hitting the API directly).
+ * Feature-scoped analytics payload for the summary cards and charts.
  *
- * GET /api/analytics/gpuplatform?since=ISO&until=ISO
- * → { kinds: { benchmark: JobRecord[], training: [...], compute: [...],
- *              inference: [...], proxy: [...] }, truncated: string[] }
+ * It excludes raw inference history because those records are high-volume and
+ * the overview uses the gateway's exact summary endpoint instead.
+ *
+ * GET /api/analytics/gpuplatform-overview?since=ISO&until=ISO&tz=Area/City
+ * → { kinds: { benchmark, training, compute, endpoint }, truncated,
+ *     inference_summary }
  */
 
 export async function GET(req: NextRequest) {
@@ -28,11 +27,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "since and until are required" }, { status: 400 });
   }
 
-  // Exact creation counts for the high-volume inference kind — charts use
-  // these; the raw (capped) inference page only feeds the Jobs explorer.
   const tz = req.nextUrl.searchParams.get("tz") ?? "UTC";
   const [{ kinds, truncated }, inferenceSummary] = await Promise.all([
-    fetchKinds(token, GPUPLATFORM_ALL_KINDS, since, until),
+    fetchKinds(token, GPUPLATFORM_OVERVIEW_KINDS, since, until),
     fetchInferenceSummary(token, since, until, tz),
   ]);
   return NextResponse.json({ kinds, truncated, inference_summary: inferenceSummary });

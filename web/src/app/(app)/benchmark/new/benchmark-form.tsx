@@ -409,6 +409,12 @@ export function renderYaml(
   s: FormState,
   target: "cloud" | "vm" = "cloud",
   storageName?: string,
+  vmExtras?: {
+    providerName?: string;
+    cleanupModel?: boolean;
+    visibleDevices?: string;
+    envText?: string;
+  },
 ): string {
   // RunPod / pod / container blocks only apply when we're provisioning a
   // fresh pod. On a registered VM the hardware is fixed and the gateway
@@ -439,6 +445,32 @@ export function renderYaml(
 `
     : "";
 
+  // VM-only remote extras — provider / workdir / cleanup / env mirror the Pod
+  // and Runtime-environment form sections so the VM YAML round-trips with the
+  // form (parsed back by parseYamlToForm). Cloud keeps its existing shape.
+  const vmEnv: Record<string, string> = { ...parseEnvVars(vmExtras?.envText ?? "") };
+  if ((vmExtras?.visibleDevices ?? "").trim()) {
+    vmEnv.CUDA_VISIBLE_DEVICES = (vmExtras!.visibleDevices as string).trim();
+  }
+  const vmEnvBlock =
+    Object.keys(vmEnv).length > 0
+      ? "  env:\n" +
+        Object.entries(vmEnv)
+          .map(([k, v]) => `    ${k}: ${JSON.stringify(v)}\n`)
+          .join("")
+      : "";
+  // When no VM is picked yet, ship a fillable placeholder + guidance comment so
+  // YAML-mode users know this is where the GPU provider name goes (an empty
+  // value parses back to "no provider", same as omitting it).
+  const vmProviderLine = vmExtras?.providerName
+    ? `  provider: ${JSON.stringify(vmExtras.providerName)}\n`
+    : `  provider: ""  # STATE THE NAME OF GPU PROVIDER\n`;
+  const vmWorkdirLine = `  workdir: ${JSON.stringify(s.vm_base_dir || "~")}\n`;
+  const vmCleanupLine =
+    vmExtras?.cleanupModel !== undefined
+      ? `  cleanup_model: ${vmExtras.cleanupModel}\n`
+      : "";
+
   const remoteBlock = target === "cloud"
     ? `remote:
   key_filename: ""
@@ -453,7 +485,7 @@ export function renderYaml(
     : `# host/port/username/key_filename are injected by the gateway from
 # the selected VM provider at run time.
 remote:
-  uv:
+${vmProviderLine}${vmWorkdirLine}${vmCleanupLine}${vmEnvBlock}  uv:
     path: ~/.benchmark-venv
     python_version: "3.11"
   dependencies:
@@ -465,7 +497,9 @@ remote:
   // Storage backend (S3 logs/results target) for this run, referenced by name
   // on the benchmark item. The runner (benchmaq) ignores this key; the gateway
   // resolves it to a real storage backend at submit, and parseYamlToForm reads
-  // it back so the Form's Storage dropdown survives a YAML round-trip.
+  // it back so the Form's Storage dropdown survives a YAML round-trip. The
+  // caller defaults this to the first enabled S3 backend (cloud target) so the
+  // template ships pre-filled with a name that actually resolves.
   const benchStorageLine = storageName
     ? `    storage: ${JSON.stringify(storageName)}\n`
     : "";
@@ -523,6 +557,13 @@ type ParseYamlResult = {
    * Held separately from FormState because storage selection is its own state;
    * the caller resolves it to a real storage id against the loaded list. */
   storageRef: string | null;
+  /** VM-only `remote.*` controls held outside FormState (their own React
+   * state). The caller resolves providerRef → a provider id and applies the
+   * rest to their setters. `null` = the YAML didn't specify it. */
+  providerRef: string | null;
+  cleanupModel: boolean | null;
+  visibleDevices: string | null;
+  envText: string | null;
 };
 
 /** Parse a benchmaq YAML config back into FormState. Anything the form
@@ -539,10 +580,23 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
       unknownKeys: [],
       parseError: e instanceof Error ? e.message : String(e),
       storageRef: null,
+      providerRef: null,
+      cleanupModel: null,
+      visibleDevices: null,
+      envText: null,
     };
   }
   if (!doc || typeof doc !== "object") {
-    return { state: fallback, unknownKeys: [], parseError: "empty config", storageRef: null };
+    return {
+      state: fallback,
+      unknownKeys: [],
+      parseError: "empty config",
+      storageRef: null,
+      providerRef: null,
+      cleanupModel: null,
+      visibleDevices: null,
+      envText: null,
+    };
   }
   const d = doc as Record<string, unknown>;
   const next = { ...fallback };
@@ -719,7 +773,44 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
     }
   }
 
-  return { state: next, unknownKeys: unknown, parseError: null, storageRef };
+  // ---- remote.* — VM-only controls that live outside FormState. provider →
+  // resolved to an id by the caller; workdir → vm_base_dir (in FormState);
+  // cleanup_model / env (CUDA_VISIBLE_DEVICES + extra vars) → caller setters.
+  const remote = (d.remote ?? {}) as Record<string, unknown>;
+  const providerRef =
+    typeof remote.provider === "string" && remote.provider.trim()
+      ? remote.provider.trim()
+      : null;
+  if (typeof remote.workdir === "string" && remote.workdir.trim()) {
+    next.vm_base_dir = remote.workdir.trim();
+  }
+  const cleanupModel =
+    typeof remote.cleanup_model === "boolean" ? remote.cleanup_model : null;
+  let visibleDevices: string | null = null;
+  let envText: string | null = null;
+  const remoteEnv = remote.env;
+  if (remoteEnv && typeof remoteEnv === "object") {
+    const envLines: string[] = [];
+    for (const [k, v] of Object.entries(remoteEnv as Record<string, unknown>)) {
+      if (k === "CUDA_VISIBLE_DEVICES") {
+        visibleDevices = String(v);
+        continue;
+      }
+      envLines.push(`export ${k}=${String(v)}`);
+    }
+    if (envLines.length > 0) envText = envLines.join("\n");
+  }
+
+  return {
+    state: next,
+    unknownKeys: unknown,
+    parseError: null,
+    storageRef,
+    providerRef,
+    cleanupModel,
+    visibleDevices,
+    envText,
+  };
 }
 
 export function BenchmarkForm({
@@ -829,9 +920,38 @@ export function BenchmarkForm({
     () => storages.find((s) => s.id === storageId)?.name,
     [storages, storageId],
   );
+  // For both the RunPod (cloud) and VM templates, pre-fill `storage:` with the
+  // first enabled S3 backend so it ships with a name that actually resolves at
+  // submit (a literal like "s3" would fail unless a backend happened to be named
+  // that). An explicit dropdown pick always wins.
+  const defaultStorageName = useMemo(() => {
+    if (selectedStorageName) return selectedStorageName;
+    return storages.find((s) => s.kind === "s3" && s.enabled)?.name;
+  }, [selectedStorageName, storages]);
+  const selectedProviderName = useMemo(
+    () => providers.find((p) => p.id === providerId)?.name,
+    [providers, providerId],
+  );
   const formYaml = useMemo(
-    () => renderYaml({ ...form, benchName: name || "untitled" }, target, selectedStorageName),
-    [form, name, target, selectedStorageName],
+    () =>
+      renderYaml(
+        { ...form, benchName: name || "untitled" },
+        target,
+        defaultStorageName,
+        target === "vm"
+          ? { providerName: selectedProviderName, cleanupModel, visibleDevices, envText }
+          : undefined,
+      ),
+    [
+      form,
+      name,
+      target,
+      defaultStorageName,
+      selectedProviderName,
+      cleanupModel,
+      visibleDevices,
+      envText,
+    ],
   );
 
   const [templates, setTemplates] = useState<BenchmarkTemplate[]>([]);
@@ -922,24 +1042,46 @@ export function BenchmarkForm({
       return;
     }
     const config_yaml = mode === "form" ? formYaml : yamlBuf;
-    if (target === "vm" && !providerId) {
-      setSubmitError("Pick a VM provider, or switch back to Default cloud.");
+    // In YAML mode the VM/runtime config lives in the YAML — derive the submit
+    // fields from it (falling back to form state) so a YAML-only edit drives
+    // the run without re-picking everything in the form.
+    const parsedYaml = mode === "yaml" ? parseYamlToForm(yamlBuf, form) : null;
+    let effectiveProviderId = providerId;
+    if (target === "vm" && !effectiveProviderId && parsedYaml?.providerRef) {
+      const pref = parsedYaml.providerRef.toLowerCase();
+      const pmatch = providers.find(
+        (p) =>
+          p.kind === "vm" &&
+          (p.name.toLowerCase() === pref || p.id.toLowerCase() === pref),
+      );
+      if (pmatch) effectiveProviderId = pmatch.id;
+    }
+    if (target === "vm" && !effectiveProviderId) {
+      setSubmitError(
+        "Pick a VM provider, name one in the YAML (remote.provider), or switch back to Default cloud.",
+      );
       return;
     }
     if (!storageId) {
       // In YAML mode the backend can be named inside the config (`storage:`),
       // which the gateway resolves at submit — so don't force a dropdown pick
       // when the YAML already names one.
-      const yamlNamesStorage =
-        mode === "yaml" && parseYamlToForm(yamlBuf, form).storageRef != null;
+      const yamlNamesStorage = parsedYaml?.storageRef != null;
       if (!yamlNamesStorage) {
         setSubmitError("Pick a storage for the run's logs and metrics.");
         return;
       }
     }
+    // GPU pin / env / cleanup: prefer the YAML when in YAML mode, else the form.
+    const effectiveVisibleDevices =
+      parsedYaml?.visibleDevices != null ? parsedYaml.visibleDevices : visibleDevices;
+    const effectiveCleanup =
+      parsedYaml?.cleanupModel != null ? parsedYaml.cleanupModel : cleanupModel;
+    const effectiveEnvText =
+      parsedYaml?.envText != null ? parsedYaml.envText : envText;
     setSubmitting(true);
     try {
-      const envVars = parseEnvVars(envText);
+      const envVars = parseEnvVars(effectiveEnvText);
       // A pasted HF token rides along in env_vars (highest precedence at launch);
       // a chosen global secret is sent as a key ref the gateway aliases to HF_TOKEN.
       if (hfSource === "paste" && hfToken.trim()) {
@@ -950,12 +1092,14 @@ export function BenchmarkForm({
         config_yaml,
         provider_id:
           target === "vm"
-            ? providerId
+            ? effectiveProviderId
             : runpodProviderId || null,
         storage_id: storageId || null,
-        cleanup_model: target === "vm" ? cleanupModel : undefined,
+        cleanup_model: target === "vm" ? effectiveCleanup : undefined,
         ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
-        ...(visibleDevices.trim() ? { visible_devices: visibleDevices.trim() } : {}),
+        ...(effectiveVisibleDevices.trim()
+          ? { visible_devices: effectiveVisibleDevices.trim() }
+          : {}),
         ...(hfSource === "secret" && hfTokenSecret ? { hf_token_secret: hfTokenSecret } : {}),
       });
       toast.success(`Created ${created.id}`, { duration: 4000 });
@@ -1103,6 +1247,27 @@ export function BenchmarkForm({
                 toast.warning(
                   `No enabled S3 storage named "${parsed.storageRef}". ` +
                     `Pick one in the Storage section.`,
+                  { duration: 6000 },
+                );
+              }
+            }
+            // VM-only remote controls — apply to their own state so the Pod +
+            // Runtime-environment form sections reflect what the YAML asked for.
+            if (parsed.cleanupModel !== null) setCleanupModel(parsed.cleanupModel);
+            if (parsed.visibleDevices !== null) setVisibleDevices(parsed.visibleDevices);
+            if (parsed.envText !== null) setEnvText(parsed.envText);
+            if (parsed.providerRef) {
+              const pref = parsed.providerRef.toLowerCase();
+              const pmatch = providers.find(
+                (p) =>
+                  p.kind === "vm" &&
+                  (p.name.toLowerCase() === pref || p.id.toLowerCase() === pref),
+              );
+              if (pmatch) {
+                setProviderId(pmatch.id);
+              } else {
+                toast.warning(
+                  `No VM provider named "${parsed.providerRef}". Pick one in the Pod section.`,
                   { duration: 6000 },
                 );
               }

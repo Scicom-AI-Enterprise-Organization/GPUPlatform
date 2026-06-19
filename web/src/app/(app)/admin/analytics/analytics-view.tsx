@@ -5,10 +5,13 @@
  *
  * Data sources (fetched separately, deliberately NOT SlurmUI's combined
  * endpoint, so each side stays granular and independently filterable):
- *   - GPU Platform: /api/analytics/gpuplatform → gateway /v1/history/{kind}
- *     (benchmark / training / compute / inference / proxy). Cost is computed
- *     here as detail.cost_per_hr × duration; inference/proxy carry no cost —
- *     they contribute activity counts and token totals instead.
+ *   - GPU Platform overview: /api/analytics/gpuplatform-overview →
+ *     gateway /v1/history/{kind} for benchmark / training / compute /
+ *     endpoints, plus /v1/history/summary for exact inference counts.
+ *   - GPU Platform records: /api/analytics/gpuplatform-records →
+ *     gateway /v1/history/{kind} for the record-heavy jobs / node surfaces.
+ *     Cost is computed here as detail.cost_per_hr × duration; inference/proxy
+ *     carry no cost — they contribute activity counts and token totals instead.
  *   - SlurmUI: /api/analytics/slurm → SlurmUI /api/reports (jobs, GPU-hours,
  *     per-day history). No $ cost — Slurm jobs contribute counts + GPU-hours.
  *
@@ -19,7 +22,7 @@
  * CUDA_VISIBLE_DEVICES, …) — records from before that enrichment show "—".
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Bar,
@@ -856,9 +859,12 @@ type SortKey =
   | "duration"
   | "status";
 
+type AnalyticsTab = "jobs" | "gpuhours" | "timeline" | "gputimeline" | "nodes";
+
 // ── component ────────────────────────────────────────────────────────────────
 
 export function AnalyticsView() {
+  const [activeTab, setActiveTab] = useState<AnalyticsTab>("gpuhours");
   const [period, setPeriod] = useState<Period>("7d");
   const initialToday = useMemo(() => new Date(), []);
   const todayStr = localDate(initialToday);
@@ -882,19 +888,27 @@ export function AnalyticsView() {
   const [aliasError, setAliasError] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(true);
-  const [gpuRecs, setGpuRecs] = useState<Rec[]>([]);
+  const [recordsLoading, setRecordsLoading] = useState(false);
+  const [overviewGpuRecs, setOverviewGpuRecs] = useState<Rec[]>([]);
+  const [detailGpuRecs, setDetailGpuRecs] = useState<Rec[]>([]);
   const [summaryRecs, setSummaryRecs] = useState<Rec[]>([]);
   const [slurmRecs, setSlurmRecs] = useState<Rec[]>([]);
   const [slurmRunning, setSlurmRunning] = useState<Rec[]>([]);
   // Snapshot taken at data-load time — elapsed times are display-only.
   const [nowTs, setNowTs] = useState(0);
   const [slurmState, setSlurmState] = useState<"ok" | "unconfigured" | "error">("ok");
-  const [truncated, setTruncated] = useState<string[]>([]);
+  const [overviewTruncated, setOverviewTruncated] = useState<string[]>([]);
+  const [recordsTruncated, setRecordsTruncated] = useState<string[]>([]);
   // GPU Timeline: durable inference worker on/off events for the period, plus
   // per-endpoint node + GPU-id metadata resolved server-side.
   const [workerEvents, setWorkerEvents] = useState<WorkerEvt[]>([]);
   const [workerApps, setWorkerApps] = useState<Record<string, AppMeta>>({});
   const [workerBenchmarks, setWorkerBenchmarks] = useState<BenchSpan[]>([]);
+  const [recordsReadyKey, setRecordsReadyKey] = useState("");
+  const [recordsError, setRecordsError] = useState<string | null>(null);
+  const [workerEventsLoading, setWorkerEventsLoading] = useState(false);
+  const [workerEventsReadyKey, setWorkerEventsReadyKey] = useState("");
+  const [workerEventsError, setWorkerEventsError] = useState<string | null>(null);
 
   // Jobs explorer state
   const [sortKey, setSortKey] = useState<SortKey>("start");
@@ -904,14 +918,39 @@ export function AnalyticsView() {
   const [gpuHover, setGpuHover] = useState<GpuHoverState | null>(null);
   const [gpuNodeFilter, setGpuNodeFilter] = useState("");
   const [gpuWeekKey, setGpuWeekKey] = useState("");
+  const runningNowRef = useRef<HTMLDivElement | null>(null);
+  const [runningNowVisible, setRunningNowVisible] = useState(false);
   const PAGE_SIZE = 50;
 
   const { from, to } = useMemo(
     () => periodRange(period, { from: customFrom, to: customTo }),
     [period, customFrom, customTo],
   );
+  const workerEventsQueryKey = `${from.toISOString()}|${to.toISOString()}`;
+  const workerEventsStale = workerEventsReadyKey !== workerEventsQueryKey;
+  const recordsQueryKey = `${from.toISOString()}|${to.toISOString()}`;
+  const recordsStale = recordsReadyKey !== recordsQueryKey;
+  const timelineWorkerEvents = useMemo(
+    () => (workerEventsStale ? [] : workerEvents),
+    [workerEvents, workerEventsStale],
+  );
+  const timelineWorkerApps = useMemo(
+    () => (workerEventsStale ? {} : workerApps),
+    [workerApps, workerEventsStale],
+  );
+  const timelineWorkerBenchmarks = useMemo(
+    () => (workerEventsStale ? [] : workerBenchmarks),
+    [workerBenchmarks, workerEventsStale],
+  );
+  const detailGpuRecsReady = useMemo(
+    () => (recordsStale ? [] : detailGpuRecs),
+    [detailGpuRecs, recordsStale],
+  );
 
-  const gpuTimeline = useMemo(() => buildGpuTimeline(workerEvents), [workerEvents]);
+  const gpuTimeline = useMemo(
+    () => buildGpuTimeline(timelineWorkerEvents),
+    [timelineWorkerEvents],
+  );
 
   // Calendar: one row per day, sub-divided into a lane per (node, GPU). Both
   // inference worker-spans AND benchmark runs are unified into one item shape,
@@ -939,7 +978,7 @@ export function AnalyticsView() {
     };
     const items: Item[] = [];
     for (const { app, spans } of gpuTimeline) {
-      const meta = workerApps[app];
+      const meta = timelineWorkerApps[app];
       const node = meta?.node ?? "—";
       const gpus = meta?.gpu_ids?.length ? meta.gpu_ids : [0];
       for (const sp of spans) {
@@ -960,7 +999,7 @@ export function AnalyticsView() {
         });
       }
     }
-    for (const b of workerBenchmarks) {
+    for (const b of timelineWorkerBenchmarks) {
       if (!b.started) continue;
       items.push({
         label: b.name,
@@ -1068,7 +1107,7 @@ export function AnalyticsView() {
     }
     days.sort((a, b) => b.date.localeCompare(a.date)); // newest day first
     return days;
-  }, [gpuTimeline, workerApps, workerBenchmarks, from, to, nowTs]);
+  }, [gpuTimeline, timelineWorkerApps, timelineWorkerBenchmarks, from, to, nowTs]);
 
   const gpuTimelineNodes = useMemo(
     () => [...new Set(gpuDays.flatMap((d) => d.blocks.map((b) => b.node)))].sort(),
@@ -1145,9 +1184,9 @@ export function AnalyticsView() {
     setLoading(true);
     setNowTs(Date.now());
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
-    const [gpu, slurm, aliasRes, workerEv] = await Promise.allSettled([
+    const [overview, slurm, aliasRes] = await Promise.allSettled([
       fetch(
-        `/api/analytics/gpuplatform?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}&tz=${encodeURIComponent(tz)}`,
+        `/api/analytics/gpuplatform-overview?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}&tz=${encodeURIComponent(tz)}`,
         { cache: "no-store" },
       ).then((r) => (r.ok ? (r.json() as Promise<GpuPlatformPayload>) : Promise.reject(r.status))),
       fetch(
@@ -1157,39 +1196,24 @@ export function AnalyticsView() {
       fetch("/api/analytics/aliases", { cache: "no-store" }).then(
         (r) => r.json() as Promise<{ aliases: SourceAlias[] | null }>,
       ),
-      fetch(
-        `/api/analytics/worker-events?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}`,
-        { cache: "no-store" },
-      ).then((r) =>
-        r.ok
-          ? (r.json() as Promise<{
-              events: WorkerEvt[];
-              apps: Record<string, AppMeta>;
-              benchmarks: BenchSpan[];
-            }>)
-          : Promise.reject(r.status),
-      ),
     ]);
-
-    setWorkerEvents(workerEv.status === "fulfilled" ? (workerEv.value.events ?? []) : []);
-    setWorkerApps(workerEv.status === "fulfilled" ? (workerEv.value.apps ?? {}) : {});
-    setWorkerBenchmarks(workerEv.status === "fulfilled" ? (workerEv.value.benchmarks ?? []) : []);
 
     if (aliasRes.status === "fulfilled" && aliasRes.value.aliases) {
       setAliases(aliasRes.value.aliases);
     }
 
-    if (gpu.status === "fulfilled") {
-      setGpuRecs(normalizeGpuPlatform(gpu.value));
+    if (overview.status === "fulfilled") {
+      setOverviewGpuRecs(normalizeGpuPlatform(overview.value));
       setSummaryRecs(
-        gpu.value.inference_summary
-          ? normalizeInferenceSummary(gpu.value.inference_summary)
+        overview.value.inference_summary
+          ? normalizeInferenceSummary(overview.value.inference_summary)
           : [],
       );
-      setTruncated(gpu.value.truncated);
+      setOverviewTruncated(overview.value.truncated);
     } else {
-      setGpuRecs([]);
+      setOverviewGpuRecs([]);
       setSummaryRecs([]);
+      setOverviewTruncated([]);
     }
 
     if (slurm.status === "fulfilled" && slurm.value.configured && "report" in slurm.value && slurm.value.report) {
@@ -1210,6 +1234,58 @@ export function AnalyticsView() {
     setLoading(false);
   }, [from, to]);
 
+  const loadRecords = useCallback(async () => {
+    if (recordsLoading || recordsReadyKey === recordsQueryKey) return;
+    setRecordsLoading(true);
+    setRecordsError(null);
+    try {
+      const r = await fetch(
+        `/api/analytics/gpuplatform-records?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}`,
+        { cache: "no-store" },
+      );
+      if (!r.ok) throw new Error(`records failed (${r.status})`);
+      const body = (await r.json()) as GpuPlatformPayload;
+      setDetailGpuRecs(normalizeGpuPlatform(body));
+      setRecordsTruncated(body.truncated ?? []);
+      setRecordsReadyKey(recordsQueryKey);
+    } catch {
+      setDetailGpuRecs([]);
+      setRecordsTruncated([]);
+      setRecordsError("record analytics unavailable");
+    } finally {
+      setRecordsLoading(false);
+    }
+  }, [from, to, recordsLoading, recordsQueryKey, recordsReadyKey]);
+
+  const loadWorkerEvents = useCallback(async () => {
+    if (workerEventsLoading || workerEventsReadyKey === workerEventsQueryKey) return;
+    setWorkerEventsLoading(true);
+    setWorkerEventsError(null);
+    try {
+      const r = await fetch(
+        `/api/analytics/worker-events?since=${from.toISOString()}&until=${new Date(to.getTime() + 1000).toISOString()}`,
+        { cache: "no-store" },
+      );
+      if (!r.ok) throw new Error(`worker-events failed (${r.status})`);
+      const body = (await r.json()) as {
+        events: WorkerEvt[];
+        apps: Record<string, AppMeta>;
+        benchmarks: BenchSpan[];
+      };
+      setWorkerEvents(body.events ?? []);
+      setWorkerApps(body.apps ?? {});
+      setWorkerBenchmarks(body.benchmarks ?? []);
+      setWorkerEventsReadyKey(workerEventsQueryKey);
+    } catch (e) {
+      setWorkerEvents([]);
+      setWorkerApps({});
+      setWorkerBenchmarks([]);
+      setWorkerEventsError(e instanceof Error ? e.message : "worker-events failed");
+    } finally {
+      setWorkerEventsLoading(false);
+    }
+  }, [from, to, workerEventsLoading, workerEventsQueryKey, workerEventsReadyKey]);
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void load();
@@ -1217,14 +1293,46 @@ export function AnalyticsView() {
     return () => window.clearTimeout(timer);
   }, [load]);
 
+  useEffect(() => {
+    const node = runningNowRef.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) setRunningNowVisible(true);
+      },
+      { rootMargin: "240px 0px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const recordTabs = new Set<AnalyticsTab>(["jobs", "timeline", "nodes"]);
+    if (!runningNowVisible && !recordTabs.has(activeTab)) return;
+    if (recordsReadyKey === recordsQueryKey) return;
+    const timer = window.setTimeout(() => {
+      void loadRecords();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, loadRecords, recordsQueryKey, recordsReadyKey, runningNowVisible]);
+
+  useEffect(() => {
+    if (activeTab !== "gputimeline") return;
+    if (workerEventsReadyKey === workerEventsQueryKey) return;
+    const timer = window.setTimeout(() => {
+      void loadWorkerEvents();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, loadWorkerEvents, workerEventsQueryKey, workerEventsReadyKey]);
+
   // ── filtered + aggregated views ────────────────────────────────────────────
 
   // Canonicalize every record's source via the alias map — the node hostname
   // wins over the raw source name (a Slurm "tm" cluster spans two VMs that
   // are separate machines), then fold remaining Slurm sources onto GPU
   // Platform labels case-insensitively ("tm-h20" cluster ↔ "TM-H20" provider).
-  const allRecs = useMemo(() => {
-    const aliased = [...gpuRecs, ...summaryRecs, ...slurmRecs].map((r) => {
+  const aliasRecs = useCallback((records: Rec[]) => {
+    const aliased = records.map((r) => {
       const canon = aliasSource(aliases, r.node) ?? aliasSource(aliases, r.source);
       return canon && canon !== r.source ? { ...r, source: canon } : r;
     });
@@ -1237,11 +1345,21 @@ export function AnalyticsView() {
       const canon = byLower.get(r.source.toLowerCase());
       return canon && canon !== r.source ? { ...r, source: canon } : r;
     });
-  }, [gpuRecs, summaryRecs, slurmRecs, aliases]);
+  }, [aliases]);
+
+  const overviewAllRecs = useMemo(
+    () => aliasRecs([...overviewGpuRecs, ...summaryRecs, ...slurmRecs]),
+    [overviewGpuRecs, summaryRecs, slurmRecs, aliasRecs],
+  );
+
+  const detailAllRecs = useMemo(
+    () => aliasRecs([...detailGpuRecsReady, ...slurmRecs]),
+    [detailGpuRecsReady, slurmRecs, aliasRecs],
+  );
 
   const allSources = useMemo(
-    () => [...new Set(allRecs.map((r) => r.source))].sort(),
-    [allRecs],
+    () => [...new Set([...overviewAllRecs, ...detailAllRecs].map((r) => r.source))].sort(),
+    [overviewAllRecs, detailAllRecs],
   );
 
   const sourceSelected = useMemo(
@@ -1249,15 +1367,26 @@ export function AnalyticsView() {
     [allSources, excludedSources],
   );
 
-  const recs = useMemo(
+  const overviewRecs = useMemo(
     () =>
-      allRecs.filter(
+      overviewAllRecs.filter(
         (r) =>
           platforms.has(r.platform) &&
           apps.has(r.app) &&
           !excludedSources.has(r.source),
       ),
-    [allRecs, platforms, apps, excludedSources],
+    [overviewAllRecs, platforms, apps, excludedSources],
+  );
+
+  const detailRecs = useMemo(
+    () =>
+      detailAllRecs.filter(
+        (r) =>
+          platforms.has(r.platform) &&
+          apps.has(r.app) &&
+          !excludedSources.has(r.source),
+      ),
+    [detailAllRecs, platforms, apps, excludedSources],
   );
 
   const days = useMemo(() => eachDay(from, to), [from, to]);
@@ -1267,10 +1396,17 @@ export function AnalyticsView() {
   // Tables/timeline: real records only, never the synthetic aggregates.
   const hasSummary = summaryRecs.length > 0;
   const chartRecs = useMemo(
-    () => (hasSummary ? recs.filter((r) => r.synthetic || r.app !== "serverless") : recs),
-    [recs, hasSummary],
+    () =>
+      hasSummary
+        ? overviewRecs.filter((r) => r.synthetic || r.app !== "serverless")
+        : overviewRecs,
+    [overviewRecs, hasSummary],
   );
-  const tableRecs = useMemo(() => recs.filter((r) => !r.synthetic), [recs]);
+  const tableRecs = useMemo(() => detailRecs.filter((r) => !r.synthetic), [detailRecs]);
+  const overviewTableRecs = useMemo(
+    () => overviewRecs.filter((r) => !r.synthetic),
+    [overviewRecs],
+  );
   // Jobs explorer: discrete jobs and endpoint lifecycle only — per-request
   // inference rows are noise there (the inference board covers the traffic);
   // the timeline/nodes tabs keep them for node-occupancy.
@@ -1498,7 +1634,7 @@ export function AnalyticsView() {
 
   const gpuHoursByModel = useMemo(() => {
     const m = new Map<string, { gpuHours: number; jobs: number }>();
-    for (const r of tableRecs) {
+    for (const r of overviewTableRecs) {
       const key = r.gpuModel ?? "(not recorded)";
       const e = m.get(key) ?? { gpuHours: 0, jobs: 0 };
       e.gpuHours += r.gpuHours;
@@ -1508,7 +1644,7 @@ export function AnalyticsView() {
     return [...m.entries()]
       .map(([model, v]) => ({ model, ...v }))
       .sort((a, b) => b.gpuHours - a.gpuHours);
-  }, [tableRecs]);
+  }, [overviewTableRecs]);
 
   // Node timeline: only records with real timestamps and a known node.
   const timelineNodes = useMemo(() => {
@@ -1616,7 +1752,7 @@ export function AnalyticsView() {
       e.count += 1;
       seen.set(name, e);
     };
-    for (const r of [...gpuRecs, ...summaryRecs, ...slurmRecs]) {
+    for (const r of [...overviewGpuRecs, ...detailGpuRecs, ...summaryRecs, ...slurmRecs]) {
       const from =
         r.platform === "slurmui"
           ? `SlurmUI (Aura) · cluster ${r.source}${r.gpuModel ? ` · ${r.gpuModel}` : ""}`
@@ -1628,7 +1764,12 @@ export function AnalyticsView() {
       .filter(([name]) => !aliasSource(draftAliases, name))
       .map(([name, v]) => ({ name, origin: [...v.origin].join("; "), count: v.count }))
       .sort((a, b) => b.count - a.count);
-  }, [configOpen, gpuRecs, summaryRecs, slurmRecs, draftAliases]);
+  }, [configOpen, overviewGpuRecs, detailGpuRecs, summaryRecs, slurmRecs, draftAliases]);
+
+  const truncated = useMemo(
+    () => [...new Set([...overviewTruncated, ...recordsTruncated])],
+    [overviewTruncated, recordsTruncated],
+  );
 
   const openConfig = () => {
     setDraftAliases(aliases.map((a) => ({ ...a })));
@@ -1875,7 +2016,7 @@ export function AnalyticsView() {
       </div>
 
       {/* Daily activity chart */}
-      <div className="rounded-lg border bg-card p-4">
+      <div ref={runningNowRef} className="rounded-lg border bg-card p-4">
         <h2 className="mb-1 text-sm font-semibold">Daily activity</h2>
         <p className="mb-3 text-xs text-muted-foreground">
           Jobs per day, by app (serverless inference has its own board below). Hover for the
@@ -1931,7 +2072,7 @@ export function AnalyticsView() {
         </p>
         {runningRows.length === 0 ? (
           <div className="flex h-16 items-center justify-center text-sm text-muted-foreground">
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Nothing running right now."}
+            {recordsLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Nothing running right now."}
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -2101,7 +2242,7 @@ export function AnalyticsView() {
       )}
 
       {/* ── Granular views ─────────────────────────────────────────────────── */}
-      <Tabs defaultValue="jobs">
+      <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as AnalyticsTab)}>
         <TabsList>
           <TabsTrigger value="jobs">Jobs</TabsTrigger>
           <TabsTrigger value="gpuhours">GPU hours</TabsTrigger>
@@ -2123,7 +2264,7 @@ export function AnalyticsView() {
                   for the full record.
                 </p>
               </div>
-              <Button variant="outline" size="sm" onClick={exportJobsCsv} disabled={loading}>
+              <Button variant="outline" size="sm" onClick={exportJobsCsv} disabled={recordsLoading}>
                 <Download className="mr-1.5 h-3.5 w-3.5" /> Export jobs CSV
               </Button>
             </div>
@@ -2145,6 +2286,13 @@ export function AnalyticsView() {
                   </tr>
                 </thead>
                 <tbody>
+                  {recordsError && !recordsLoading && (
+                    <tr>
+                      <td colSpan={11} className="px-3 py-8 text-center text-muted-foreground">
+                        {recordsError}
+                      </td>
+                    </tr>
+                  )}
                   {pageRecs.map((r, i) => (
                     <tr
                       key={`${r.platform}-${r.id}-${i}`}
@@ -2193,7 +2341,7 @@ export function AnalyticsView() {
                       </td>
                     </tr>
                   ))}
-                  {pageRecs.length === 0 && !loading && (
+                  {pageRecs.length === 0 && !recordsLoading && !recordsError && (
                     <tr>
                       <td colSpan={11} className="px-3 py-8 text-center text-muted-foreground">
                         No records match the current filters.
@@ -2320,7 +2468,11 @@ export function AnalyticsView() {
               for details, click for the full record. Busiest 14 nodes shown; records without
               node attribution (old jobs, older SlurmUI versions) are excluded.
             </p>
-            {timelineNodes.length === 0 && !loading ? (
+            {recordsError && !recordsLoading ? (
+              <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
+                {recordsError}
+              </div>
+            ) : timelineNodes.length === 0 && !recordsLoading ? (
               <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
                 No node-attributed records in the selected period.
               </div>
@@ -2469,7 +2621,16 @@ export function AnalyticsView() {
                 </div>
               </div>
             </div>
-            {gpuDays.length === 0 && !loading ? (
+            {workerEventsLoading && workerEventsStale ? (
+              <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Loading GPU timeline...
+              </div>
+            ) : workerEventsError && workerEventsStale ? (
+              <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
+                GPU timeline unavailable: {workerEventsError}
+              </div>
+            ) : gpuDays.length === 0 && !loading ? (
               <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
                 No GPU activity in the selected period.
               </div>
@@ -2725,7 +2886,14 @@ export function AnalyticsView() {
                       </td>
                     </tr>
                   ))}
-                  {nodeRows.length === 0 && !loading && (
+                  {recordsError && !recordsLoading && (
+                    <tr>
+                      <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
+                        {recordsError}
+                      </td>
+                    </tr>
+                  )}
+                  {nodeRows.length === 0 && !recordsLoading && !recordsError && (
                     <tr>
                       <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
                         No node-attributed records in the selected period.

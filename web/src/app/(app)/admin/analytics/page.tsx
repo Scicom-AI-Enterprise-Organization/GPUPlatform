@@ -1,7 +1,20 @@
 import { redirect } from "next/navigation";
+import dynamic from "next/dynamic";
+import { Loader2 } from "lucide-react";
 import { getMe } from "@/lib/me";
 import { ConsoleTopbar } from "@/components/console/topbar";
-import { AnalyticsView } from "./analytics-view";
+
+const AnalyticsView = dynamic(
+  () => import("./analytics-view").then((mod) => mod.AnalyticsView),
+  {
+    loading: () => (
+      <div className="flex h-40 items-center justify-center rounded-lg border bg-card text-sm text-muted-foreground">
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+        Loading analytics...
+      </div>
+    ),
+  },
+);
 
 export default async function AnalyticsPage() {
   const me = await getMe();

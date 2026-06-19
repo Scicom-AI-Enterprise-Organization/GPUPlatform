@@ -57,3 +57,96 @@ describe("benchmark Form<->YAML round-trip", () => {
     expect(parseYamlToForm(out, DEFAULTS).storageRef).toBeNull();
   });
 });
+
+// VM (bare-metal) Form<->YAML sync: provider, working dir, clean-up flag, GPU
+// pin and runtime env must all round-trip through the `remote:` block so the
+// form fills from YAML and flipping Form<->YAML<->Form doesn't drift/reset.
+describe("benchmark VM Form<->YAML round-trip (DE-53)", () => {
+  const vmExtras = {
+    providerName: "TM-H20",
+    cleanupModel: true,
+    visibleDevices: "0,1",
+    envText: "export HF_HOME=/share/huggingface\nexport TRITON_CACHE_DIR=/share/triton",
+  };
+
+  it("emits provider / workdir / cleanup_model / env in the VM remote block", () => {
+    const out = renderYaml(DEFAULTS, "vm", "s3", vmExtras);
+    expect(out).toMatch(/^ {2}provider: "TM-H20"$/m);
+    expect(out).toMatch(/^ {2}workdir: "~"$/m);
+    expect(out).toMatch(/^ {2}cleanup_model: true$/m);
+    expect(out).toMatch(/^ {4}CUDA_VISIBLE_DEVICES: "0,1"$/m);
+    expect(out).toMatch(/^ {4}HF_HOME: "\/share\/huggingface"$/m);
+    expect(out).not.toMatch(/^runpod:/m); // VM template carries no runpod block
+  });
+
+  it("parses every VM remote.* section back out (YAML -> Form)", () => {
+    const parsed = parseYamlToForm(renderYaml(DEFAULTS, "vm", "s3", vmExtras), DEFAULTS);
+    expect(parsed.parseError).toBeNull();
+    expect(parsed.providerRef).toBe("TM-H20");
+    expect(parsed.cleanupModel).toBe(true);
+    expect(parsed.visibleDevices).toBe("0,1");
+    expect(parsed.state.vm_base_dir).toBe("~");
+    expect(parsed.envText).toContain("HF_HOME=/share/huggingface");
+    expect(parsed.envText).toContain("TRITON_CACHE_DIR=/share/triton");
+    expect(parsed.envText).not.toContain("CUDA_VISIBLE_DEVICES"); // its own field
+    expect(parsed.storageRef).toBe("s3");
+  });
+
+  it("is byte-stable across VM render -> parse -> render (no drift / no refresh)", () => {
+    const first = renderYaml(DEFAULTS, "vm", "s3", vmExtras);
+    const parsed = parseYamlToForm(first, DEFAULTS);
+    const second = renderYaml(parsed.state, "vm", "s3", {
+      providerName: parsed.providerRef ?? undefined,
+      cleanupModel: parsed.cleanupModel ?? undefined,
+      visibleDevices: parsed.visibleDevices ?? undefined,
+      envText: parsed.envText ?? undefined,
+    });
+    expect(second).toBe(first);
+  });
+
+  it("round-trips a non-default working directory via remote.workdir", () => {
+    const out = renderYaml({ ...DEFAULTS, vm_base_dir: "/mnt/scratch" }, "vm", undefined, {
+      cleanupModel: true,
+    });
+    expect(out).toMatch(/^ {2}workdir: "\/mnt\/scratch"$/m);
+    expect(parseYamlToForm(out, DEFAULTS).state.vm_base_dir).toBe("/mnt/scratch");
+  });
+
+  it("omits the env block when no GPU pin / env vars are set", () => {
+    const out = renderYaml(DEFAULTS, "vm", undefined, { cleanupModel: true });
+    expect(out).not.toMatch(/^ {2}env:$/m);
+    const parsed = parseYamlToForm(out, DEFAULTS);
+    expect(parsed.visibleDevices).toBeNull();
+    expect(parsed.envText).toBeNull();
+  });
+
+  it("leaves VM-only fields null on the cloud template (no cross-contamination)", () => {
+    const parsed = parseYamlToForm(renderYaml(DEFAULTS, "cloud", "s3"), DEFAULTS);
+    expect(parsed.providerRef).toBeNull();
+    expect(parsed.cleanupModel).toBeNull();
+    expect(parsed.visibleDevices).toBeNull();
+    expect(parsed.envText).toBeNull();
+  });
+
+  it("emits + round-trips the storage backend on the VM template", () => {
+    const out = renderYaml(DEFAULTS, "vm", "s3", { cleanupModel: true });
+    // storage sits on the benchmark item (4-space indent), same as cloud.
+    expect(out).toMatch(/^ {4}storage: "s3"$/m);
+    const parsed = parseYamlToForm(out, DEFAULTS);
+    expect(parsed.parseError).toBeNull();
+    expect(parsed.storageRef).toBe("s3"); // resolvable to the Storage dropdown
+    // render -> parse -> render keeps the storage line stable.
+    expect(renderYaml(parsed.state, "vm", "s3", { cleanupModel: true })).toBe(out);
+  });
+
+  it("ships a fillable provider placeholder + guidance comment when none is picked", () => {
+    const out = renderYaml(DEFAULTS, "vm", "s3");
+    expect(out).toMatch(/^ {2}provider: ""  # STATE THE NAME OF GPU PROVIDER$/m);
+    // The empty placeholder must parse back to "no provider" (not the literal).
+    const parsed = parseYamlToForm(out, DEFAULTS);
+    expect(parsed.parseError).toBeNull();
+    expect(parsed.providerRef).toBeNull();
+    // And the comment survives a render -> parse -> render (no drift).
+    expect(renderYaml(parsed.state, "vm", "s3")).toBe(out);
+  });
+});
