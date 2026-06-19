@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Mic, Play, Volume2 } from "lucide-react";
+import { Bot, ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Mic, Play, Terminal, User, Volume2, Wrench } from "lucide-react";
 import type { DecoderState } from "./decoder-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -136,6 +136,353 @@ function RowItem({
     </div>
   );
 }
+
+// ── LLM / chat row ──────────────────────────────────────────────────────────
+
+type ToolCall = {
+  id: string;
+  type: string;
+  function: { name: string; arguments: string };
+};
+
+type ChatMessage = {
+  role: string;
+  content: unknown;
+  reasoning?: string;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  name?: string; // tool response: the function name
+};
+
+function isChatMessages(v: unknown): v is ChatMessage[] {
+  return (
+    Array.isArray(v) && v.length > 0 &&
+    typeof (v[0] as Record<string, unknown>)?.role === "string"
+  );
+}
+
+function contentStr(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((p) => {
+        if (typeof p === "string") return p;
+        if (p && typeof p === "object") {
+          const part = p as Record<string, unknown>;
+          if (part.type === "text" && typeof part.text === "string") return part.text;
+          if (typeof part.content === "string") return part.content;
+        }
+        return JSON.stringify(p);
+      })
+      .join("\n");
+  }
+  return JSON.stringify(content);
+}
+
+function tryParseJson(s: string): unknown {
+  try { return JSON.parse(s); } catch { return s; }
+}
+
+/** Collapsible reasoning trace block shown inside a bubble.
+ *  `invert` = true when the bubble has a dark/primary background (user messages)
+ *  — use opacity-based colours so the text remains legible against any tint. */
+function ReasoningBlock({ text, invert = false }: { text: string; invert?: boolean }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className={cn("mb-2 rounded border text-[11px]",
+      invert ? "border-white/20" : "border-border/50",
+    )}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className={cn(
+          "flex w-full items-center gap-1 px-2 py-1 text-left",
+          invert ? "text-white/60 hover:text-white/90" : "text-muted-foreground hover:text-foreground",
+        )}
+      >
+        <ChevronDown className={cn("h-3 w-3 shrink-0 transition-transform", !open && "-rotate-90")} />
+        <span className="font-medium">reasoning</span>
+      </button>
+      {open && (
+        <p className={cn(
+          "whitespace-pre-wrap break-words border-t px-2 py-1.5 italic",
+          invert ? "border-white/20 text-white/70" : "border-border/50 text-muted-foreground",
+        )}>
+          {text}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** JSON value with syntax colouring — strings green, numbers amber, booleans/null blue. */
+function JsonValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
+  const [collapsed, setCollapsed] = useState(depth > 0);
+  const indent = "  ".repeat(depth);
+  const innerIndent = "  ".repeat(depth + 1);
+
+  if (value === null) return <span className="text-blue-400">null</span>;
+  if (typeof value === "boolean") return <span className="text-blue-400">{String(value)}</span>;
+  if (typeof value === "number") return <span className="text-amber-400">{String(value)}</span>;
+  if (typeof value === "string") return <span className="text-emerald-400">&quot;{value}&quot;</span>;
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return <span className="text-muted-foreground">[]</span>;
+    return (
+      <span>
+        <button type="button" onClick={() => setCollapsed((c) => !c)} className="text-muted-foreground hover:text-foreground">
+          {collapsed ? `[… ${value.length}]` : "["}
+        </button>
+        {!collapsed && (
+          <>
+            {value.map((item, i) => (
+              <div key={i} style={{ paddingLeft: "1.2em" }}>
+                <JsonValue value={item} depth={depth + 1} />
+                {i < value.length - 1 && <span className="text-muted-foreground">,</span>}
+              </div>
+            ))}
+            <span className="text-muted-foreground">{indent}]</span>
+          </>
+        )}
+      </span>
+    );
+  }
+
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) return <span className="text-muted-foreground">{"{}"}</span>;
+    return (
+      <span>
+        <button type="button" onClick={() => setCollapsed((c) => !c)} className="text-muted-foreground hover:text-foreground">
+          {collapsed ? `{… ${entries.length}}` : "{"}
+        </button>
+        {!collapsed && (
+          <>
+            {entries.map(([k, v], i) => (
+              <div key={k} style={{ paddingLeft: "1.2em" }}>
+                <span className="text-sky-300">&quot;{k}&quot;</span>
+                <span className="text-muted-foreground">: </span>
+                <JsonValue value={v} depth={depth + 1} />
+                {i < entries.length - 1 && <span className="text-muted-foreground">,</span>}
+              </div>
+            ))}
+            <span className="text-muted-foreground">{indent}{"}"}</span>
+          </>
+        )}
+      </span>
+    );
+  }
+
+  return <span>{String(value)}</span>;
+}
+
+/** Renders tool response content: JSON gets a collapsible syntax-coloured tree;
+ *  plain text falls back to a pre block. */
+function ToolContent({ content }: { content: unknown }) {
+  const str = contentStr(content);
+  const [expanded, setExpanded] = useState(false);
+
+  let parsed: unknown = null;
+  let isJson = false;
+  try {
+    parsed = JSON.parse(str);
+    isJson = parsed !== null && typeof parsed === "object";
+  } catch { /* not JSON */ }
+
+  if (!isJson) {
+    return <p className="whitespace-pre-wrap break-words text-sm">{str}</p>;
+  }
+
+  return (
+    <div className="rounded border border-emerald-500/20 bg-emerald-500/5">
+      <button
+        type="button"
+        onClick={() => setExpanded((e) => !e)}
+        className="flex w-full items-center gap-1 px-2 py-1.5 text-left text-xs text-emerald-400/80 hover:text-emerald-300"
+      >
+        <ChevronDown className={cn("h-3 w-3 shrink-0 transition-transform", !expanded && "-rotate-90")} />
+        <span className="font-mono font-medium">{"{}"} JSON response</span>
+        {!expanded && (
+          <span className="ml-auto text-[10px] text-muted-foreground">
+            {Object.keys(parsed as object).join(", ").slice(0, 60)}
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <pre className="overflow-x-auto border-t border-emerald-500/20 px-3 py-2 text-[11px] leading-relaxed">
+          <JsonValue value={parsed} depth={0} />
+        </pre>
+      )}
+    </div>
+  );
+}
+
+/** One tool call inside an assistant bubble — collapsible JSON args, amber theme. */
+function ToolCallArgs({ tc }: { tc: ToolCall }) {
+  const [expanded, setExpanded] = useState(false);
+  const args = typeof tc.function.arguments === "string"
+    ? tryParseJson(tc.function.arguments)
+    : tc.function.arguments;
+  const isObj = args !== null && typeof args === "object";
+
+  return (
+    <div className="rounded border border-amber-500/30 bg-amber-500/5 text-xs">
+      <button
+        type="button"
+        onClick={() => setExpanded((e) => !e)}
+        className="flex w-full items-center gap-1 px-2 py-1.5 text-left font-mono text-amber-400 hover:text-amber-300"
+      >
+        <ChevronDown className={cn("h-3 w-3 shrink-0 transition-transform", !expanded && "-rotate-90")} />
+        <span className="font-semibold">{tc.function.name}</span>
+        {!expanded && isObj && (
+          <span className="ml-1 text-[10px] text-amber-400/60">
+            {Object.keys(args as object).join(", ").slice(0, 60)}
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <pre className="overflow-x-auto border-t border-amber-500/20 px-3 py-2 leading-relaxed">
+          <JsonValue value={args} depth={0} />
+        </pre>
+      )}
+    </div>
+  );
+}
+
+/** One LLM / multimodal row — chat bubbles with per-role colours, reasoning traces, tool calls. */
+function LlmRowItem({
+  index,
+  row,
+  messagesField,
+}: {
+  index: number;
+  row: DatasetPreviewRow;
+  messagesField: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const raw = row[messagesField] ?? row.messages;
+  const msgs = isChatMessages(raw) ? raw : null;
+  const audio = audioOf(row);
+  const preview = msgs ? msgs.slice(0, 1) : null;
+
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      {/* ── collapsed header ── */}
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-start gap-2 p-3 text-left transition-colors hover:bg-muted/40"
+      >
+        <ChevronRight className={cn("mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")} />
+        <span className="mt-0.5 w-9 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
+          #{index + 1}
+        </span>
+        <span className="flex-1 space-y-0.5">
+          {msgs == null ? (
+            <span className="text-sm text-muted-foreground">(no messages)</span>
+          ) : open ? (
+            <span className="text-xs text-muted-foreground">{msgs.length} message{msgs.length !== 1 ? "s" : ""}</span>
+          ) : (
+            preview?.map((m, i) => (
+              <span key={i} className="block truncate text-sm">
+                <span className="mr-1.5 font-medium capitalize text-muted-foreground">{m.role}:</span>
+                {contentStr(m.content).slice(0, 120)}
+              </span>
+            ))
+          )}
+        </span>
+        <div className="mt-0.5 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+          {audio && <Volume2 className="h-3.5 w-3.5" />}
+          {msgs != null && !open && <span>{msgs.length} msg</span>}
+        </div>
+      </button>
+
+      {/* ── expanded body ── */}
+      {open && (
+        <div className="space-y-3 border-t border-border p-3">
+          {audio && <WaveformPlayer src={audio} />}
+          {msgs && (
+            <div className="space-y-2">
+              {msgs.map((m, i) => {
+                const isUser = m.role === "user";
+                const isSystem = m.role === "system";
+                const isTool = m.role === "tool";
+                const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
+
+                // ── avatar ──
+                const avatarCls = cn(
+                  "flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
+                  isUser        ? "bg-primary text-primary-foreground"
+                  : isTool      ? "bg-emerald-600/20 text-emerald-500"
+                  : hasToolCalls? "bg-amber-500/20 text-amber-500"
+                  : isSystem    ? "bg-muted text-muted-foreground"
+                  :               "bg-violet-500/20 text-violet-400",
+                );
+                const AvatarIcon = isUser ? User : isTool ? Terminal : hasToolCalls ? Wrench : Bot;
+
+                // ── bubble ──
+                const bubbleCls = cn(
+                  "max-w-[85%] rounded-lg px-3 py-2 text-sm",
+                  isUser        ? "bg-primary text-primary-foreground"
+                  : isTool      ? "border border-emerald-500/30 bg-emerald-500/10 text-foreground"
+                  : hasToolCalls? "border border-amber-500/30 bg-amber-500/10 text-foreground"
+                  : isSystem    ? "bg-muted/50 text-muted-foreground italic"
+                  :               "border border-violet-500/20 bg-violet-500/10 text-foreground",
+                );
+
+                const roleLabel =
+                  isUser        ? null
+                  : isTool      ? `tool · ${m.name ?? ""}`
+                  : hasToolCalls? "assistant · tool call"
+                  : isSystem    ? "system"
+                  :               "assistant";
+
+                return (
+                  <div key={i} className={cn("flex items-start gap-2", isUser ? "flex-row-reverse" : "flex-row")}>
+                    {/* avatar */}
+                    <div className={avatarCls} title={m.role}>
+                      <AvatarIcon className="h-3 w-3" />
+                    </div>
+
+                    {/* bubble */}
+                    <div className={bubbleCls}>
+                      {roleLabel && (
+                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide opacity-60">
+                          {roleLabel}
+                        </span>
+                      )}
+
+                      {/* reasoning trace (collapsible) */}
+                      {m.reasoning && <ReasoningBlock text={m.reasoning} invert={isUser} />}
+
+                      {/* main content — tool responses get a collapsible JSON tree */}
+                      {isTool ? (
+                        <ToolContent content={m.content} />
+                      ) : contentStr(m.content) ? (
+                        <p className="whitespace-pre-wrap break-words">{contentStr(m.content)}</p>
+                      ) : null}
+
+                      {/* tool calls list */}
+                      {hasToolCalls && (
+                        <div className="mt-2 space-y-1.5">
+                          {m.tool_calls!.map((tc) => (
+                            <ToolCallArgs key={tc.id} tc={tc} />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── TTS packed row ───────────────────────────────────────────────────────────
 
 type PackedDecode = {
   tokenizer: string;
@@ -289,14 +636,20 @@ function PackedRowItem({
 export function RowBrowser({
   datasetId,
   initial,
+  kind,
   speakerField,
+  messagesField,
   decoder,
 }: {
   datasetId: string;
   initial: DatasetPreview;
+  kind?: string | null;
   speakerField?: string | null;
+  messagesField?: string | null;
   decoder?: DecoderState | null;
 }) {
+  // Use chat-bubble view whenever a messages column is configured, regardless of kind.
+  const isLlm = !!(messagesField ?? "").trim();
   const [limit, setLimit] = useState(initial.limit && initial.limit > 0 ? initial.limit : 20);
   const [offset, setOffset] = useState(initial.offset ?? 0);
   const [split, setSplit] = useState<string | null>(initial.split ?? null);
@@ -410,15 +763,17 @@ export function RowBrowser({
           <CardTitle className="text-base">
             Rows{total != null ? ` · ${total.toLocaleString()}` : ""}
           </CardTitle>
-          {excludedCount > 0 ? (
-            <span className="text-xs text-muted-foreground">
-              {excludedCount.toLocaleString()} excluded from training ·{" "}
-              <button type="button" onClick={includeAll} className="underline underline-offset-2 hover:text-foreground">
-                include all
-              </button>
-            </span>
-          ) : (
-            <span className="text-xs text-muted-foreground">Untick a row to exclude it from training.</span>
+          {!isLlm && (
+            excludedCount > 0 ? (
+              <span className="text-xs text-muted-foreground">
+                {excludedCount.toLocaleString()} excluded from training ·{" "}
+                <button type="button" onClick={includeAll} className="underline underline-offset-2 hover:text-foreground">
+                  include all
+                </button>
+              </span>
+            ) : (
+              <span className="text-xs text-muted-foreground">Untick a row to exclude it from training.</span>
+            )
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -501,6 +856,8 @@ export function RowBrowser({
             {rows.map((r, i) =>
               r.packed === true ? (
                 <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} split={split} decoder={decoder} />
+              ) : isLlm ? (
+                <LlmRowItem key={offset + i} index={offset + i} row={r} messagesField={messagesField ?? "messages"} />
               ) : (
                 <RowItem key={offset + i} index={offset + i} row={r} onToggle={setIncluded} speakerField={speakerField} />
               ),

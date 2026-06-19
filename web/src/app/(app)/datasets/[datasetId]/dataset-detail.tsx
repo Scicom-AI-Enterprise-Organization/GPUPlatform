@@ -199,7 +199,9 @@ export function DatasetDetail({
               <RowBrowser
                 datasetId={dataset.id}
                 initial={preview}
+                kind={dataset.kind}
                 speakerField={dataset.speaker_field}
+                messagesField={dataset.messages_field}
                 decoder={decoder}
               />
             </TabsContent>
@@ -213,6 +215,7 @@ export function DatasetDetail({
               transcriptionField={dataset.transcription_field}
               speakerField={dataset.speaker_field}
               splitFields={dataset.split_fields}
+              messagesField={dataset.messages_field}
             />
           </TabsContent>
 

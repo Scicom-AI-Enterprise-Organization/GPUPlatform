@@ -1454,6 +1454,13 @@ async def run_training(redis, run_id: str) -> None:
     if runpod_id and api_key:
         await _terminate_pod(api_key, runpod_id)
         await _push_log(redis, run_id, f"[gateway] pod {runpod_id} torn down")
+    elif is_vm and host and key_filename:
+        # VM box persists between runs, so sweep the detached run's temp files
+        # (runscript/log/pid + the per-run code stage) — else /tmp accrues one set
+        # per run. Safe here: the run is finalized and its full log is already
+        # uploaded to S3 above. (The runscript removes `stage` itself on a clean
+        # exit; this also covers an abnormal exit that left it behind.)
+        await _cleanup_remote_run_files((host, port, user, key_filename), run_id)
     _RUN_STATE.pop(run_id, None)
     try:
         await redis.expire(f"train:logs:{run_id}", LOG_LIST_TTL_S)
@@ -1467,6 +1474,37 @@ async def run_training(redis, run_id: str) -> None:
 def _remote_run_paths(run_id: str) -> tuple[str, str, str]:
     """(log, pidfile, runscript) on the VM/pod for a detached training run."""
     return (f"/tmp/sgpu_train_{run_id}.log", f"/tmp/sgpu_train_{run_id}.pid", f"/tmp/sgpu_train_{run_id}.sh")
+
+
+async def _cleanup_remote_run_files(ssh: Optional[tuple], run_id: str) -> None:
+    """Best-effort sweep of a finished run's detached temp files on the VM: the
+    runscript / log / pidfile (`/tmp/sgpu_train_{id}.{log,pid,sh}`) plus the per-run
+    code-staging dir (`/tmp/sgpu_run_{id}`). The runscript removes its own `stage`
+    on a clean exit, but the log/pid/runscript deliberately outlive it — the log
+    must survive a gateway-down window so a restart can finalize-from-log — and
+    would otherwise pile up in /tmp on a long-lived box, one set per run. So this
+    runs LATE: only AFTER the run is finalized (terminal) and its log persisted to
+    S3. A terminal row is never reconciled, so the remote log is no longer needed.
+    No-op for RunPod runs (the pod teardown takes /tmp with it)."""
+    if not ssh:
+        return
+    rlog, rpid, rsh = _remote_run_paths(run_id)
+    stage = f"/tmp/sgpu_run_{run_id}"
+
+    def _do() -> None:
+        cli = _ssh_connect(ssh[0], int(ssh[1]), ssh[2], ssh[3])
+        try:
+            _ssh_capture(cli, "rm -rf " + " ".join(shlex.quote(t) for t in (rlog, rpid, rsh, stage)))
+        finally:
+            try:
+                cli.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        await asyncio.to_thread(_do)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("training %s: remote temp cleanup failed: %s", run_id, e)
 
 
 def _parse_remote_log(text: str) -> tuple[Optional[int], dict]:
@@ -1595,6 +1633,16 @@ async def _reconcile_orphan(row, redis) -> str:
         err = f"trainer exited with code {rc}" if rc is not None else "trainer process gone (no exit code captured)"
     await _finalize(row.id, status, rc, err, result_json=result)
     await _push_log(redis, row.id, f"[gateway] finalized from log after restart: {status} (rc={rc})")
+    # The live path uploads logs.txt from its local copy, but a restart-finalized
+    # run never streamed the tail — the remote log is the ONLY complete copy. Push
+    # it to S3 before sweeping the run's temp files (best-effort: never block the
+    # finalize/cleanup on it).
+    try:
+        s3_target = await _training_s3_target(row.storage_id)
+        s3_put_text((row.s3_prefix or "") + "logs.txt", log, target=s3_target)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("training %s: restart-finalize log upload failed: %s", row.id, e)
+    await _cleanup_remote_run_files((host, port, user, key), row.id)
     return status
 
 

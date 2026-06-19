@@ -714,7 +714,7 @@ export type StorageRecord = {
 
 // "hosted" = a HuggingFace-mirror dataset repo pushed directly (hf upload /
 // push_to_hub), surfaced in the Datasets list alongside Autotrain datasets.
-export type DatasetKind = "upload" | "s3" | "hf" | "label" | "tts_packed" | "hosted";
+export type DatasetKind = "upload" | "s3" | "hf" | "label" | "tts_packed" | "hosted" | "llm";
 
 export type DatasetRecord = {
   id: string;
@@ -742,6 +742,7 @@ export type DatasetRecord = {
   hf_repo?: string | null;
   hf_revision?: string | null;
   hf_synced_at?: string | null;
+  messages_field?: string | null; // kind=llm: column holding the messages array
   label_base_url?: string | null; // kind=label source (token never returned)
   label_project_id?: string | null;
   label_status?: string | null; // approved | rejected | not_reviewed | all
@@ -765,7 +766,8 @@ export type CreateDatasetRequest = {
   tokenizer?: string | null;
   sequence_length?: number | null;
   hf_repo?: string | null;
-  hf_revision?: string | null; // kind=hf — commit/branch/tag to pin
+  hf_revision?: string | null; // kind=hf/llm — commit/branch/tag to pin
+  messages_field?: string | null; // kind=llm — column holding the messages array
   // kind=label — import from a labeling-platform project
   label_base_url?: string | null;
   label_project_id?: string | null;

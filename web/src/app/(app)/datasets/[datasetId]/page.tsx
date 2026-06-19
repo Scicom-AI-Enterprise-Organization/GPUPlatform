@@ -31,7 +31,7 @@ export default async function DatasetDetailPage({
 
   const hasMetadata =
     !!dataset &&
-    (dataset.kind === "hf"
+    (dataset.kind === "hf" || dataset.kind === "llm"
       ? !!dataset.hf_repo
       : dataset.kind === "label"
         ? !!dataset.label_project_id

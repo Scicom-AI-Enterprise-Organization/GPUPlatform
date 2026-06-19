@@ -378,6 +378,9 @@ class Dataset(Base):
     # Alternatively the lpat token can come from a named global secret instead of
     # being stored per-dataset; resolved via load_global_env() at use time.
     label_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # kind=llm: which column holds the OpenAI-compatible messages array
+    # ([{role,content}]). Default "messages".
+    messages_field: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # When this (s3-backed) dataset has been published to the self-hosted HF mirror
     # — the id of the CatalogRepo (repo_type=dataset) serving its files over /hf, so
     # the dataset page can show pull snippets + link to it. NULL = not published.
@@ -861,6 +864,9 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_token_secret VARCHAR(128)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS messages_field VARCHAR(128)"
         ))
         # Worker lifecycle timeline: the calendar/analytics query is always
         # "events for app X between t0 and t1", so a composite (app_id,

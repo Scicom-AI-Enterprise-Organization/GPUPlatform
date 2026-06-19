@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Check, Loader2, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -41,6 +41,7 @@ export function ColumnsCard({
   transcriptionField,
   speakerField,
   splitFields,
+  messagesField,
 }: {
   datasetId: string;
   kind: string;
@@ -48,11 +49,18 @@ export function ColumnsCard({
   transcriptionField: string;
   speakerField?: string | null;
   splitFields?: Record<string, string> | null;
+  messagesField?: string | null;
 }) {
   const router = useRouter();
+  const isHfLike = kind === "hf" || kind === "llm"; // column list comes from HF splits API
+  const isLlm = kind === "llm";
+  // Any dataset with messages_field set is treated as a chat dataset in the viewer.
+  const hasMessages = !!(messagesField ?? "").trim();
   const [editing, setEditing] = useState(false);
   const [audio, setAudio] = useState(audioField);
   const [transcription, setTranscription] = useState(transcriptionField);
+  // kind=llm primary column
+  const [messages, setMessages] = useState(messagesField ?? "messages");
   // TTS-only speaker column (one global column, like audio). "" → one voice.
   const [speaker, setSpeaker] = useState(speakerField ?? "");
   // Per-split transcription column choices (only when the HF source exposes splits).
@@ -91,7 +99,7 @@ export function ColumnsCard({
   );
 
   const loadSplits = useCallback(async () => {
-    if (kind !== "hf") {
+    if (!isHfLike) {
       setSplits([]);
       return;
     }
@@ -107,29 +115,58 @@ export function ColumnsCard({
     } finally {
       setLoadingSplits(false);
     }
-  }, [datasetId, kind, seedPerSplit]);
+  }, [datasetId, isHfLike, seedPerSplit]);
+
+  // Eagerly load column names for hf/llm so dropdowns are ready when editing.
+  useEffect(() => {
+    if (isHfLike) void loadSplits();
+  }, [isHfLike, loadSplits]);
 
   function startEdit() {
     setAudio(audioField);
     setTranscription(transcriptionField);
+    setMessages(messagesField ?? "messages");
     setSpeaker(speakerField ?? "");
     setErr(null);
     setEditing(true);
-    // Lazily fetch the split columns for the per-split pickers (HF only); the
-    // read-only display already renders the saved map from `splitFields`.
     if (splits) seedPerSplit(splits);
     else void loadSplits();
   }
 
-  const multiSplit = (splits?.length ?? 0) > 1;
-  // Union of all known split columns (HF only), minus the audio column → the
-  // options for the speaker dropdown. Empty for non-HF sources (free-text input).
-  const columnOptions = Array.from(new Set((splits ?? []).flatMap((s) => s.columns))).filter(
-    (c) => c !== audio,
-  );
+  const multiSplit = !isLlm && (splits?.length ?? 0) > 1;
+  // Union of all known columns from the HF splits API, used for all dropdowns.
+  const allColumns = Array.from(new Set((splits ?? []).flatMap((s) => s.columns)));
+  // Options for the speaker dropdown: all columns except the current audio pick.
+  const columnOptions = allColumns.filter((c) => c !== audio);
 
   async function save() {
     setErr(null);
+    if (isLlm) {
+      if (!messages.trim()) {
+        setErr("Messages column is required.");
+        return;
+      }
+      const body = { messages_field: messages.trim() };
+      setSaving(true);
+      try {
+        const r = await fetch(`/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const text = await r.text();
+        let parsed: unknown = text;
+        try { parsed = text ? JSON.parse(text) : null; } catch { /* keep raw */ }
+        if (!r.ok) { setErr(errText(parsed, r.statusText)); return; }
+        setEditing(false);
+        router.refresh();
+      } catch (e) {
+        setErr(e instanceof Error ? e.message : String(e));
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
     if (!audio.trim()) {
       setErr("Audio column is required.");
       return;
@@ -148,6 +185,7 @@ export function ColumnsCard({
         transcription_field: primary,
         speaker_field: speaker.trim(),
         split_fields: perSplit,
+        messages_field: messages.trim() || null,
       };
     } else {
       if (!transcription.trim()) {
@@ -159,6 +197,7 @@ export function ColumnsCard({
         transcription_field: transcription.trim(),
         speaker_field: speaker.trim(),
         split_fields: {}, // clear any stale per-split overrides
+        messages_field: messages.trim() || null,
       };
     }
     setSaving(true);
@@ -209,44 +248,105 @@ export function ColumnsCard({
       <CardContent>
         {!editing ? (
           <div className="divide-y divide-border/60">
-            <div className="flex items-baseline justify-between gap-4 py-1.5">
-              <span className="text-xs text-muted-foreground">Audio column</span>
-              <span className="font-mono text-xs">{audioField}</span>
-            </div>
-            {hasSplitOverrides ? (
-              Object.entries(stringSplitFields).map(([split, col]) => (
-                <div key={split} className="flex items-baseline justify-between gap-4 py-1.5">
-                  <span className="text-xs text-muted-foreground">
-                    Transcription · <span className="font-mono">{split}</span>
-                  </span>
-                  <span className="font-mono text-xs">{col}</span>
+            {!isLlm && (
+              <>
+                <div className="flex items-baseline justify-between gap-4 py-1.5">
+                  <span className="text-xs text-muted-foreground">Audio column</span>
+                  <span className="font-mono text-xs">{audioField}</span>
                 </div>
-              ))
-            ) : (
+                {hasSplitOverrides ? (
+                  Object.entries(stringSplitFields).map(([split, col]) => (
+                    <div key={split} className="flex items-baseline justify-between gap-4 py-1.5">
+                      <span className="text-xs text-muted-foreground">
+                        Transcription · <span className="font-mono">{split}</span>
+                      </span>
+                      <span className="font-mono text-xs">{col}</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="flex items-baseline justify-between gap-4 py-1.5">
+                    <span className="text-xs text-muted-foreground">Transcription column</span>
+                    <span className="font-mono text-xs">{transcriptionField}</span>
+                  </div>
+                )}
+                {speakerField && (
+                  <div className="flex items-baseline justify-between gap-4 py-1.5">
+                    <span className="text-xs text-muted-foreground">Speaker column</span>
+                    <span className="font-mono text-xs">{speakerField}</span>
+                  </div>
+                )}
+              </>
+            )}
+            {(isLlm || isHfLike) && (
               <div className="flex items-baseline justify-between gap-4 py-1.5">
-                <span className="text-xs text-muted-foreground">Transcription column</span>
-                <span className="font-mono text-xs">{transcriptionField}</span>
+                <span className="text-xs text-muted-foreground">
+                  Messages column <span className="text-[10px]">(chat / LLM)</span>
+                </span>
+                <span className="font-mono text-xs">{messagesField || <span className="text-muted-foreground/50">not set</span>}</span>
               </div>
             )}
-            {speakerField && (
-              <div className="flex items-baseline justify-between gap-4 py-1.5">
-                <span className="text-xs text-muted-foreground">Speaker column</span>
-                <span className="font-mono text-xs">{speakerField}</span>
-              </div>
-            )}
+          </div>
+        ) : isLlm ? (
+          // LLM kind: only the messages column matters
+          <div className="space-y-3">
+            <div className="space-y-1 sm:max-w-xs">
+              <Label htmlFor="ds-messages" className="text-xs">Messages column</Label>
+              {loadingSplits ? (
+                <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" /> reading columns…
+                </p>
+              ) : allColumns.length > 0 ? (
+                <Select value={messages} onValueChange={setMessages} disabled={saving}>
+                  <SelectTrigger className="font-mono text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {allColumns.map((c) => (
+                      <SelectItem key={c} value={c} className="font-mono text-xs">{c}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input
+                  id="ds-messages"
+                  value={messages}
+                  onChange={(e) => setMessages(e.target.value)}
+                  placeholder="messages"
+                  disabled={saving}
+                  className="font-mono text-xs"
+                />
+              )}
+            </div>
+            {err && <p className="text-sm text-destructive">{err}</p>}
+            <div className="flex items-center gap-2">
+              <Button size="sm" onClick={save} disabled={saving}>
+                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                Save
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setEditing(false)} disabled={saving}>Cancel</Button>
+            </div>
           </div>
         ) : (
           <div className="space-y-3">
             <div className="space-y-1 sm:max-w-xs">
               <Label htmlFor="ds-audio" className="text-xs">Audio column</Label>
-              <Input
-                id="ds-audio"
-                value={audio}
-                onChange={(e) => setAudio(e.target.value)}
-                placeholder="audio"
-                disabled={saving}
-                className="font-mono text-xs"
-              />
+              {isHfLike && allColumns.length > 0 ? (
+                <Select value={audio} onValueChange={setAudio} disabled={saving}>
+                  <SelectTrigger className="font-mono text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {allColumns.map((c) => (
+                      <SelectItem key={c} value={c} className="font-mono text-xs">{c}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input
+                  id="ds-audio"
+                  value={audio}
+                  onChange={(e) => setAudio(e.target.value)}
+                  placeholder="audio"
+                  disabled={saving}
+                  className="font-mono text-xs"
+                />
+              )}
             </div>
 
             {loadingSplits ? (
@@ -295,14 +395,25 @@ export function ColumnsCard({
             ) : (
               <div className="space-y-1 sm:max-w-xs">
                 <Label htmlFor="ds-transcription" className="text-xs">Transcription column</Label>
-                <Input
-                  id="ds-transcription"
-                  value={transcription}
-                  onChange={(e) => setTranscription(e.target.value)}
-                  placeholder="transcription"
-                  disabled={saving}
-                  className="font-mono text-xs"
-                />
+                {isHfLike && allColumns.length > 0 ? (
+                  <Select value={transcription} onValueChange={setTranscription} disabled={saving}>
+                    <SelectTrigger className="font-mono text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {allColumns.map((c) => (
+                        <SelectItem key={c} value={c} className="font-mono text-xs">{c}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input
+                    id="ds-transcription"
+                    value={transcription}
+                    onChange={(e) => setTranscription(e.target.value)}
+                    placeholder="transcription"
+                    disabled={saving}
+                    className="font-mono text-xs"
+                  />
+                )}
               </div>
             )}
 
@@ -345,6 +456,41 @@ export function ColumnsCard({
                 )}
                 <p className="text-xs text-muted-foreground">
                   Prepended to each line when packing for TTS. Leave empty to train a single voice.
+                </p>
+              </div>
+            )}
+
+            {isHfLike && (
+              <div className="space-y-1 sm:max-w-xs">
+                <Label htmlFor="ds-messages" className="text-xs">
+                  Messages column <span className="text-muted-foreground">(optional · LLM / chat)</span>
+                </Label>
+                {allColumns.length > 0 ? (
+                  <Select
+                    value={messages || "__none__"}
+                    onValueChange={(v) => setMessages(v === "__none__" ? "" : v)}
+                    disabled={saving}
+                  >
+                    <SelectTrigger className="text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__" className="text-xs text-muted-foreground">— none —</SelectItem>
+                      {allColumns.map((c) => (
+                        <SelectItem key={c} value={c} className="font-mono text-xs">{c}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input
+                    id="ds-messages"
+                    value={messages}
+                    onChange={(e) => setMessages(e.target.value)}
+                    placeholder="messages"
+                    disabled={saving}
+                    className="font-mono text-xs"
+                  />
+                )}
+                <p className="text-xs text-muted-foreground">
+                  Set this to switch the row viewer to chat-bubble mode for LLM datasets.
                 </p>
               </div>
             )}

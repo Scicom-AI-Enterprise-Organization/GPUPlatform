@@ -44,7 +44,7 @@ logger = logging.getLogger("gateway.datasets")
 
 router = APIRouter(prefix="/v1/datasets", tags=["datasets"])
 
-KINDS = ("upload", "s3", "hf", "label", "tts_packed")
+KINDS = ("upload", "s3", "hf", "label", "tts_packed", "llm")
 _UPLOAD_EXTS = (".csv", ".json", ".jsonl", ".ndjson")
 
 
@@ -61,10 +61,12 @@ class CreateDatasetRequest(BaseModel):
     # kind=tts_packed — register existing ChiniDataset parquet shards already in S3.
     tokenizer: Optional[str] = None        # speech-token tokenizer used when packing
     sequence_length: Optional[int] = None  # multipack sequence length
-    hf_repo: Optional[str] = None  # kind=hf
-    # kind=hf — git revision to pin: a commit SHA (full/short), branch ("main",
-    # "dev"), or tag ("v1.0.0"). Blank → the repo's default branch.
+    hf_repo: Optional[str] = None  # kind=hf / kind=llm
+    # kind=hf / kind=llm — git revision to pin: a commit SHA (full/short), branch
+    # ("main", "dev"), or tag ("v1.0.0"). Blank → the repo's default branch.
     hf_revision: Optional[str] = None
+    # kind=llm — which column holds the OpenAI messages array ([{role,content}]).
+    messages_field: Optional[str] = None
     # kind=label — live import from a labeling-platform project's export API.
     label_base_url: Optional[str] = None     # e.g. http://localhost:3002
     label_project_id: Optional[str] = None   # project UUID
@@ -84,6 +86,8 @@ class UpdateDatasetRequest(BaseModel):
     # Per-split transcription column overrides, e.g. {"train": "text", "test": "after"}.
     # Pass {} to clear. Splits not listed fall back to transcription_field.
     split_fields: Optional[dict[str, str]] = None
+    # kind=llm — which column holds the messages array. Pass "" to reset to default.
+    messages_field: Optional[str] = None
 
 
 class RowInclusionRequest(BaseModel):
@@ -167,6 +171,8 @@ class DatasetRecord(BaseModel):
     label_token_secret: Optional[str] = None  # global-secret key (if used instead of a stored token)
     transform_status: Optional[str] = None  # "" | running | done | failed
     transform_log: Optional[str] = None     # short tail of progress lines
+    # kind=llm: which column holds the OpenAI messages array
+    messages_field: Optional[str] = None
     # When published to the self-hosted HF mirror: the CatalogRepo id serving it
     # over /hf (None = not published). The dataset page links + shows pull snippets.
     catalog_repo_id: Optional[str] = None
@@ -259,6 +265,7 @@ def _to_record(
         label_project_id=getattr(d, "label_project_id", None),
         label_status=getattr(d, "label_status", None),
         label_token_secret=getattr(d, "label_token_secret", None),
+        messages_field=getattr(d, "messages_field", None) or None,
         transform_status=getattr(d, "transform_status", None),
         transform_log=getattr(d, "transform_log", None),
         catalog_repo_id=getattr(d, "catalog_repo_id", None),
@@ -503,9 +510,9 @@ async def create_dataset(
                 status_code=400,
                 detail="s3_metadata_uri is required (the metadata file for s3, the shards prefix for tts_packed)",
             )
-    elif req.kind == "hf":
+    elif req.kind in ("hf", "llm"):
         if not (req.hf_repo or "").strip():
-            raise HTTPException(status_code=400, detail="hf_repo (owner/name) is required for kind=hf")
+            raise HTTPException(status_code=400, detail="hf_repo (owner/name) is required for kind=hf/llm")
         if req.storage_id:
             storage = await _load_storage(session, req.storage_id)
             storage_name = storage.name
@@ -558,7 +565,7 @@ async def create_dataset(
         audio_prefix=(req.audio_prefix or "").strip() or None,
         s3_metadata_uri=(req.s3_metadata_uri or "").strip() or None,
         hf_repo=(req.hf_repo or "").strip() or None,
-        hf_revision=(req.hf_revision or "").strip() or None if req.kind == "hf" else None,
+        hf_revision=(req.hf_revision or "").strip() or None if req.kind in ("hf", "llm") else None,
         label_base_url=label_base_url,
         label_project_id=label_project_id,
         label_token_enc=label_token_enc,
@@ -592,6 +599,11 @@ async def create_dataset(
                 _stamp_detected_fields(row, cols, len(all_rows), fmt)
         except Exception as e:  # noqa: BLE001 — best-effort; preview re-heals
             logger.warning("s3 metadata introspect failed for new dataset %s: %s", did, e)
+    elif req.kind == "llm":
+        # LLM / chat dataset: the primary column is messages ([{role,content}]).
+        # We don't introspect HF up front (same as kind=hf) — preview does it lazily.
+        mf = (req.messages_field or "").strip() or "messages"
+        row.messages_field = mf
     elif req.kind == "tts_packed":
         # Register existing ChiniDataset shards: introspect the prefix for splits +
         # per-split counts + total size, and stamp the _tts_pack metadata so preview
@@ -788,6 +800,8 @@ async def update_dataset(
             if str(k).strip() and str(v).strip()
         }
         d.split_fields = cleaned or None
+    if req.messages_field is not None:
+        d.messages_field = req.messages_field.strip() or None
     await session.commit()
     await session.refresh(d)
     storage = await session.get(Storage, d.storage_id) if d.storage_id else None
@@ -1511,28 +1525,45 @@ async def preview_dataset(
             ]
             return _resp(rows=rows, total=total)
 
-        if d.kind == "hf":
+        if d.kind in ("hf", "llm"):
             storage = await session.get(Storage, d.storage_id) if d.storage_id else None
             if not d.hf_repo:
                 return _resp(rows=[], error="no hf_repo set")
+            mf = getattr(d, "messages_field", None) or None  # None = not configured
             raw, total, used_split, names = await _run_sync(
                 _hf_preview_rows, d.hf_repo, await _hf_token(storage, session), limit, offset, split,
                 d.hf_revision,
             )
-            # Honour the per-split transcription mapping (e.g. test→after) so rows
-            # aren't blank when a split uses a different column than the default.
+            # Honour the per-split transcription mapping (e.g. test→after).
             tcol = (d.split_fields or {}).get(used_split or "") or tf
             # Source audio lives in a zip (no playable column). If it's been
             # materialised to S3, resolve audio by basename through the proxy.
             resolver = await _source_audio_resolver(session, d)
-            rows = [
-                {
+
+            def _parse_messages(v: Any) -> Any:
+                """HF parquet often stores the messages array as a JSON string.
+                Auto-parse to a list so the viewer always gets a real array."""
+                if isinstance(v, str):
+                    try:
+                        parsed = json.loads(v)
+                        if isinstance(parsed, list):
+                            return parsed
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                return v
+
+            rows = []
+            for r in raw:
+                row: dict[str, Any] = {
                     "audio_url": resolver(r.get(af)) if resolver else _audio_str(r.get(af)),
                     "transcription": r.get(tcol),
                     **r,
                 }
-                for r in raw
-            ]
+                # If messages_field is configured, parse + surface it so the chat
+                # viewer always gets a list regardless of how HF stored it.
+                if mf:
+                    row["messages"] = _parse_messages(r.get(mf))
+                rows.append(row)
             return _resp(rows=rows, total=total, split=used_split, splits=names)
 
         # upload / s3 → read the metadata file from S3
@@ -1906,7 +1937,7 @@ async def dataset_splits(
     """Per-split column names for an HF source, so the UI can offer a
     transcription-column picker per split (splits can differ in schema)."""
     d = await _require_dataset(session, dataset_id, user)
-    if d.kind != "hf" or not d.hf_repo:
+    if d.kind not in ("hf", "llm") or not d.hf_repo:
         return SplitsResponse(splits=[])
     try:
         storage = await session.get(Storage, d.storage_id) if d.storage_id else None

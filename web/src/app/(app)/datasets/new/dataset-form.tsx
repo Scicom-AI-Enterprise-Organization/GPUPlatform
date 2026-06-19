@@ -23,6 +23,7 @@ const KINDS: { value: DatasetKind; label: string; description: string }[] = [
   { value: "upload", label: "Upload metadata", description: "Upload a CSV / JSON / JSONL with {audio, transcription} rows to an S3 storage." },
   { value: "s3", label: "Existing S3 metadata", description: "Reference a metadata file that already lives in S3 (s3://bucket/key)." },
   { value: "hf", label: "HuggingFace dataset", description: "Reference an existing HuggingFace dataset repo by id (owner/name)." },
+  { value: "llm", label: "LLM / chat dataset", description: "HuggingFace dataset whose rows contain a messages column ([{role, content}] — OpenAI chat format)." },
   { value: "label", label: "Labeling platform", description: "Import {audio, transcription} from a labeling-platform project using its API token." },
   { value: "tts_packed", label: "TTS packed (existing S3 shards)", description: "Register ChiniDataset parquet shards (NeuCodec multipack) already in S3 by their prefix." },
 ];
@@ -54,6 +55,8 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
   // tts_packed: the tokenizer + multipack sequence length the shards were packed with
   const [packTokenizer, setPackTokenizer] = useState("Scicom-intl/Multilingual-Expressive-TTS-1.7B");
   const [packSeqLen, setPackSeqLen] = useState(4096);
+  // llm: which column holds the messages array (default "messages")
+  const [messagesField, setMessagesField] = useState("messages");
   // label: paste the project URL + a token (typed, or from a global secret)
   const [labelProjectUrl, setLabelProjectUrl] = useState("");
   const [labelToken, setLabelToken] = useState("");
@@ -72,11 +75,11 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
   }, []);
 
   // s3 storages back upload/s3; huggingface storages (optional, for the token)
-  // back the hf kind.
+  // back the hf / llm kinds.
   const storageOptions = useMemo(
     () =>
       storages.filter((s) =>
-        kind === "hf" ? s.kind === "huggingface" : s.kind === "s3" && s.enabled,
+        kind === "hf" || kind === "llm" ? s.kind === "huggingface" : s.kind === "s3" && s.enabled,
       ),
     [storages, kind],
   );
@@ -88,7 +91,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
       if (kind === "s3" && !s3MetadataUri.trim()) return "S3 metadata URI is required.";
       if (kind === "tts_packed" && !s3MetadataUri.trim()) return "S3 shards prefix is required.";
     }
-    if (kind === "hf" && !hfRepo.trim()) return "HuggingFace repo (owner/name) is required.";
+    if ((kind === "hf" || kind === "llm") && !hfRepo.trim()) return "HuggingFace repo (owner/name) is required.";
     if (kind === "label") {
       if (!parseLabelProjectUrl(labelProjectUrl)) return "Enter a valid project URL (…/projects/<id>).";
       if (tokenMode === "paste" && !labelToken.trim()) return "API token (lpat_…) is required.";
@@ -117,8 +120,9 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
         s3_metadata_uri: kind === "s3" || kind === "tts_packed" ? s3MetadataUri.trim() : null,
         tokenizer: kind === "tts_packed" ? packTokenizer.trim() || null : null,
         sequence_length: kind === "tts_packed" ? packSeqLen : null,
-        hf_repo: kind === "hf" ? hfRepo.trim() : null,
-        hf_revision: kind === "hf" ? hfRevision.trim() || null : null,
+        hf_repo: kind === "hf" || kind === "llm" ? hfRepo.trim() : null,
+        hf_revision: kind === "hf" || kind === "llm" ? hfRevision.trim() || null : null,
+        messages_field: kind === "llm" ? messagesField.trim() || "messages" : null,
         label_base_url: labelParsed?.base ?? null,
         label_project_id: labelParsed?.id ?? null,
         label_token: kind === "label" && tokenMode === "paste" ? labelToken.trim() : null,
@@ -332,6 +336,52 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                 <p className="text-xs text-muted-foreground">
                   Git branch, tag, or commit hash to pin. Blank → the repo&apos;s default branch.
                 </p>
+              </div>
+            </div>
+          )}
+
+          {kind === "llm" && (
+            <div className="grid items-start gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="ds-llm-repo" className="text-xs uppercase tracking-wide text-muted-foreground">HuggingFace repo</Label>
+                <Input
+                  id="ds-llm-repo"
+                  value={hfRepo}
+                  onChange={(e) => setHfRepo(e.target.value)}
+                  placeholder="owner/dataset-name"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="ds-llm-messages" className="text-xs uppercase tracking-wide text-muted-foreground">Messages column</Label>
+                <Input
+                  id="ds-llm-messages"
+                  value={messagesField}
+                  onChange={(e) => setMessagesField(e.target.value)}
+                  placeholder="messages"
+                />
+                <p className="text-xs text-muted-foreground">Column holding the OpenAI-format chat array. Usually <span className="font-mono">messages</span>.</p>
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">HuggingFace storage <span className="normal-case text-muted-foreground">(optional, for private repos)</span></Label>
+                <Select value={storageId} onValueChange={setStorageId}>
+                  <SelectTrigger>
+                    <SelectValue placeholder={storageOptions.length ? "Choose a HuggingFace storage (optional)" : "No HuggingFace storage configured"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {storageOptions.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="ds-llm-rev" className="text-xs uppercase tracking-wide text-muted-foreground">Revision <span className="normal-case text-muted-foreground">(optional)</span></Label>
+                <Input
+                  id="ds-llm-rev"
+                  value={hfRevision}
+                  onChange={(e) => setHfRevision(e.target.value)}
+                  placeholder="main, v1.0.0, or a commit SHA"
+                />
               </div>
             </div>
           )}

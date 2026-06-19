@@ -55,6 +55,13 @@ the *key* axis is never tiled; only key-tiling would force online softmax). Veri
 reference to ~1e-6 (fp32), block-size invariant incl. the partial last block. Tune memory↔speed via
 env `SDPA_QUERY_BLOCK` (0 / ≥S = single call = legacy). This is what lets the 32k pack train.
 
+⚠ **The default `SDPA_QUERY_BLOCK=2048` still OOMs the longest ~32k bins on 2× H100** (verified
+2026-06-19: trained fine through step 4 then OOM'd on backward of a 32k bin, needing ~7.5 GiB more
+than fit, with ~15 GiB lost to allocator fragmentation). Two fixes, use **both**: set
+**`SDPA_QUERY_BLOCK=1024`** (proven-good; 512 also works, ~2× more recompute = slower) AND
+**`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** (reclaims the fragmentation). At 512 there was
+~25 GiB headroom, so 1024 is the sweet spot. torchrun propagates both envs to the workers.
+
 ### Confirm both paths (always run before an expensive job)
 
 ```bash
@@ -214,3 +221,18 @@ base vs finetuned, to test "did the overfit help". Hard-won facts:
   the model: it generates the single token `<|"|>` forever (even on "hi"), 0 tool calls. Low train
   loss (44→6) ≠ usable model. For a real improvement: lr ~1e-5–5e-5, 2–3 epochs, scaling ≤1,
   include MLP, and don't train on 4k-truncated bins while evaluating on 22k prompts.
+
+## Successful re-run + merged model on HF (2026-06-19)
+
+The collapse was traced to two now-fixed bugs (the `scaling` kwarg + non-zero `lora_b` init; see the
+README "Status"), so the corrected pipeline was re-run on the **full-length 32-bin pack** (`packed_data`,
+median 26k / max 32k tokens — NOT the 4k-truncated bins): **lr 5e-5, 3 epochs (48 steps), scaling 2.0,
+q/k/v/o, FSDP2 on 2× H100**, with `SDPA_QUERY_BLOCK=512` + `expandable_segments:True` (see the OOM note
+above). Train loss **7.08 → 0.459**, no collapse, generation coherent. `merge_infer.py --merged-out`
+folded **230/230** adapters and the merged model generates clean text.
+
+The merged model is pushed (private) to **`huseinzolkepliscicom/gemma4-31b-funccall-merged`** for vLLM
+reuse — it includes `processor_config.json` + a `preprocessor_config.json` built from the `image_processor`
+block (so vLLM can load the multimodal dir). Serve: `vllm serve <repo> --tensor-parallel-size 2
+--max-model-len 65536 --gpu-memory-utilization 0.92` (+ pin `prometheus-fastapi-instrumentator>=7` on
+0.23.0). **Function-calling eval (`eval_funccall.py`) vs base 0.7154 not yet run** for this checkpoint.
