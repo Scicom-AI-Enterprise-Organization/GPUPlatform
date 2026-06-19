@@ -106,7 +106,9 @@ import copy
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -1020,6 +1022,11 @@ def main():
     ap.add_argument("--metrics-only", action="store_true",
                     help="Don't generate anything: just aggregate + print metrics over whatever is "
                          "already in the cache (the rows generated so far).")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Number of conversations to evaluate CONCURRENTLY (default 1 = sequential). "
+                         ">1 fires multiple convs at the vLLM server so it batches them — each conv "
+                         "is still replayed sequentially internally; scores are identical, only "
+                         "wall-clock changes. ~12 is a good value for a 2x H100 server.")
     args = ap.parse_args()
 
     model_label = args.model_id + (f" + LoRA({args.lora})" if args.lora else " (base)")
@@ -1071,23 +1078,21 @@ def main():
     all_turn_results: list[list[TurnResult]] = []
     n_errors = 0
     t0 = time.time()
+    io_lock = threading.Lock()  # guards the cache-file append + interleaved prints
 
-    for n, (lib, conv) in enumerate(pairs, 1):
+    def process_one(n, lib, conv):
+        """Replay ONE conversation (sequential internally). Returns (turn_results, conv_result, error).
+        Safe to run in a thread: vLLM API calls are independent HTTP requests; only the cache-file
+        write + print are serialized under io_lock."""
         conv_id = conv.get("conversation_id", f"conv-{n}")
-        # skip if this conversation is already cached (resume / no re-generation)
+        # skip if already cached (resume / no re-generation)
         if conv_id in cache:
             e = cache[conv_id]
-            all_turn_results.append([TurnResult(**d) for d in e["turn_results"]])
-            conv_results.append(e["conv_result"])
-            if e.get("error"):
-                n_errors += 1
-            print(f"  [{n}/{len(pairs)}] {conv_id}  CACHED (turns={len(e['turn_results'])})", flush=True)
-            continue
+            with io_lock:
+                print(f"  [{n}/{len(pairs)}] {conv_id}  CACHED (turns={len(e['turn_results'])})", flush=True)
+            return [TurnResult(**d) for d in e["turn_results"]], e["conv_result"], e.get("error")
         tools, fn_schema_map, fn_names = build_openai_tools(lib)
         turn_results, error = evaluate_conversation(lm, conv, tools, fn_names, fn_schema_map)
-        if error:
-            n_errors += 1
-        all_turn_results.append(turn_results)
         conv_result = {
             "conversation_id": conv_id,
             "workflow_name": conv.get("workflow_name"),
@@ -1112,18 +1117,34 @@ def main():
                 for tr in turn_results
             ],
         }
-        conv_results.append(conv_result)
         # append to the durable cache IMMEDIATELY so a crash/restart resumes here
-        with open(cache_path, "a") as cf:
-            cf.write(json.dumps({
-                "conversation_id": conv_id,
-                "error": error,
-                "conv_result": conv_result,
-                "turn_results": [asdict(tr) for tr in turn_results],
-            }) + "\n")
-        cache[conv_id] = True
-        err = f" [ERROR: {error}]" if error else ""
-        print(f"  [{n}/{len(pairs)}] {conv_id}  turns={len(turn_results)}{err}", flush=True)
+        with io_lock:
+            with open(cache_path, "a") as cf:
+                cf.write(json.dumps({
+                    "conversation_id": conv_id,
+                    "error": error,
+                    "conv_result": conv_result,
+                    "turn_results": [asdict(tr) for tr in turn_results],
+                }) + "\n")
+            err = f" [ERROR: {error}]" if error else ""
+            print(f"  [{n}/{len(pairs)}] {conv_id}  turns={len(turn_results)}{err}", flush=True)
+        return turn_results, conv_result, error
+
+    workers = max(1, args.workers)
+    print(f">> evaluating {len(pairs)} conversations with {workers} concurrent worker(s)", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(process_one, n, lib, conv) for n, (lib, conv) in enumerate(pairs, 1)]
+        for fut in as_completed(futs):
+            try:
+                turn_results, conv_result, error = fut.result()
+            except Exception as e:  # a whole-conversation failure shouldn't abort the run
+                n_errors += 1
+                print(f"  [conv worker crashed] {e}", file=sys.stderr, flush=True)
+                continue
+            all_turn_results.append(turn_results)
+            conv_results.append(conv_result)
+            if error:
+                n_errors += 1
 
     metrics = aggregate(all_turn_results)
     print_summary(metrics, len(conv_results), n_errors, model_label)

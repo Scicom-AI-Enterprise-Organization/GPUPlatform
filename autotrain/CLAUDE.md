@@ -21,15 +21,16 @@ key from there:
 runpodctl config --apiKey "$(grep -E '^RUNPOD_API_KEY=' ../.env | cut -d= -f2-)"
 ```
 
-The **`HF_TOKEN`** (gated/large model downloads) now also lives in **`autotrain/.env`** (i.e.
-`../.env`) alongside `RUNPOD_API_KEY` — source both from there:
+**`HF_TOKEN`** (gated/large downloads) and **`WANDB_API_KEY`** (`--wandb` metrics) now also live in
+**`autotrain/.env`** (i.e. `../.env`) alongside `RUNPOD_API_KEY` — source them all from there:
 
 ```bash
 export HF_TOKEN="$(grep -E '^HF_TOKEN=' ../.env | cut -d= -f2-)"
+export WANDB_API_KEY="$(grep -E '^WANDB_API_KEY=' ../.env | cut -d= -f2-)"
 ```
 
-(It may still be present in `gateway/.env` or the shell env; `../.env` is the canonical place for
-these jobs.)
+(`HF_TOKEN` may still be present in `gateway/.env` or the shell env; `../.env` is the canonical
+place for these jobs. On the pod, `hf auth login --token "$HF_TOKEN"` once deps are installed.)
 
 ## Always compare logits when adding/altering a custom implementation
 

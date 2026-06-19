@@ -7,6 +7,8 @@ with PyTorch **FSDP2** (`fully_shard`) across 4 GPUs.
 ```
 minimax_m2.py    training entrypoint (torchrun, FSDP2, packed varlen, Liger FLCE loss)
 lora.py          the interesting part — LinearLoRA (q/k/v/o) + fused grouped-MoE expert LoRA
+dequant_triton.py  Triton blockwise FP8->bf16 dequant (autograd, ~9x faster) — lora.py's CUDA path
+bench_dequant.py   Triton-vs-PyTorch dequant correctness + speed (fwd & bwd; random fp8 weights)
 test_lora.py     CPU correctness test: fused grouped LoRA-MoE fwd+grads vs a per-expert reference
 compare_logits.py  GPU logits check on the real 230B model: our LoRA(B=0) vs an independent bf16
                  reference (the stock FP8 forward NaNs — see below). POD-VERIFIED 2026-06-19.
@@ -67,6 +69,27 @@ B corrupts the frozen model from the first step — the bug that produced garbag
 layout and `_grouped_linear` helper but on dequantized bf16 weights + bf16 LoRA, so it's
 differentiable. (So for training the `experts_implementation` kwarg is moot — we override the
 experts `forward` entirely; the fast fp8 kernels are only for inference/eval.)
+
+## Triton FP8 dequant (`dequant_triton.py`) — lora.py's CUDA fast path
+
+The block-scaled FP8->bf16 dequant (`out = float32(weight) * scale_inv[block]`) is the hot op in
+the differentiable forward — it runs on every frozen attn proj + every MoE expert tensor, every
+layer, every step. `dequant_triton.dequantize_fp8_blockwise_triton` fuses upcast*scale*downcast
+into one Triton pass (one scale load per 128x128 block, no fp32 HBM temporary). `lora.py`'s
+`dequantize_fp8_blockwise` dispatches to it when `weight.is_cuda` (env `MINIMAX_DEQUANT_TRITON=0`
+to force the PyTorch path); CPU (the unit test) and triton-less boxes fall back to PyTorch via a
+guarded import.
+
+**Benchmarked on 1x H100 (`bench_dequant.py`, random fp8 weights), vs the PyTorch chunked path:**
+- forward is **bit-exact** (max_abs 0.0) and **3.8x** (2D attn) / **~9x** (the 256-expert MoE
+  `gate_up`/`down` tensors) faster; fwd+bwd ~3.2x on MoE.
+- **Backward IS supported** as a `torch.autograd.Function`: the FP8 `weight` is non-differentiable
+  (no grad through fp8 rounding) -> grad `None`; `scale_inv` gets an analytic grad
+  (`sum_block grad_out * float32(weight)`), matching PyTorch autograd to rel ~1e-7. In *our*
+  training both are frozen so backward never fires through dequant — but the op is correct if it does.
+- ⚠ **int64 offsets are load-bearing**: a MoE tensor is `256*3072*3072 ≈ 2.4e9` elems > 2^31, so
+  `row*N` overflows Triton's default int32 indexing -> illegal memory access. Both kernels cast the
+  row offset to `tl.int64`.
 
 ## LoRA targets (as requested: q/k/v/o + the dense MoE layers)
 
@@ -149,14 +172,26 @@ fp8 all-gather risk (#1 below) is still unverified.
   (`MiniMaxM2ForCausalLM`, `MiniMaxM2DecoderLayer`, `fully_shard`, `MixedPrecisionPolicy
   (param_dtype=None)`, `experts_implementation`) exist as used.
 
-**Verified on a real 8× H100 pod (2026-06-19, via `compare_logits.py`):** the FP8 230GB model loads
-across GPUs (`device_map="auto"`), our `lora.py` differentiable dequant forward (LinearLoRA +
-fused expert LoRA) runs end-to-end and its **logits match an independent bf16 reference (top-1 +
-cosine>0.997)**; the stock FP8 inference forward NaNs (see the parity section above). This exercises
-the same dequant path `merge_infer.py` uses — but via `device_map`, **not FSDP**.
+**FULL 32k FINETUNE VERIFIED on 8× H100 (US), 2026-06-19.** End-to-end training works:
+- **FSDP2 all-gather of `float8_e4m3fn` params WORKS** (the old #1 risk): 228.7B params → 28.93B/rank
+  across 8 GPUs, loss decreases (7.4 → ~5.1 over 3 epochs, lr 5e-5, `Function-Call-TaaS`
+  glm5.1-fp8-test packed at 32k), ~10.5k tok/s, peak ~78GB/GPU. LoRA (744 tensors, 5.5GB) saved +
+  pushed to `huseinzolkepliscicom/minimax-m2-funccall-lora-32k`. wandb logs fine.
+- **`--low_cpu_shard_load`** (new): meta-init the FP8 structure on every rank +
+  `set_model_state_dict(..., broadcast_from_rank0=True)` to stream base weights from rank 0 into
+  each shard. **CPU peaked 265GB vs 1840GB** for the default per-rank full load — DCP broadcast of
+  fp8 DTensors works. Default path still loads the full model on every rank (needs a big-RAM box).
+- **`pack_dataset.py` bug fixed:** the MiniMax-M2 template does `tool_call.arguments.items()`, but
+  the dataset stores `arguments` as a JSON STRING → every row failed `'str' has no attribute items`.
+  `extract_messages` now `json.loads`es tool-call arguments. At 32k, **30 of 77** convs pack
+  (47 dropped as >32k — same whole-conversation-no-split behaviour as gemma4).
+
+**Verified earlier on 8× H100 (via `compare_logits.py`):** the FP8 model loads via `device_map`, our
+dequant forward matches an independent bf16 reference (top-1 + cosine>0.997); the stock FP8
+inference forward NaNs (see the parity section above).
 
 **NOT yet run on hardware (validate on the pod):**
-1. **FSDP2 all-gather of `float8_e4m3fn` params.** Sharding/gathering fp8 DTensors across ranks is
+1. ~~**FSDP2 all-gather of `float8_e4m3fn` params.**~~ ✅ DONE (see above). Sharding/gathering fp8 DTensors across ranks is
    the #1 risk. If it errors, fallback options: `device_map="auto"` pipeline-parallel for a frozen
    base (slower, no FSDP), or upcast-to-bf16 + CPU offload (needs ~460GB host RAM).
 2. **CPU RAM at load.** Each rank `from_pretrained`s to CPU (~230GB) before sharding → ~230GB ×
