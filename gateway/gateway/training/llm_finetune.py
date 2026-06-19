@@ -77,6 +77,18 @@ _ARCH = {
         # itself crashes (mandatory LayerRepository version); see minimax CLAUDE.md.
         "deps": ["transformers==5.5.0", "kernels>=0.12.0,<0.13", "accelerate"],
     },
+    "mistral": {
+        "trainer": os.path.join("mistral", "mistral_small.py"),
+        "preflight": "test_lora.py",             # per-tensor+block dequant + fused-MoE LoRA grads (CPU)
+        "preflight_cwd": os.path.join(LLM_DIR, "mistral"),
+        "preflight_env": {"MISTRAL_GROUPED_FALLBACK": "1"},
+        "model_env": "MODEL_ID",
+        "default_model": "mistralai/Mistral-Small-4-119B-2603",
+        # same FP8-MoE stack as minimax (transformers 5.5.0 + kernels pin + accelerate).
+        "deps": ["transformers==5.5.0", "kernels>=0.12.0,<0.13", "accelerate"],
+        # the Triton per-tensor FP8 dequant fast path (bit-identical; 7-13x).
+        "run_env": {"MISTRAL_DEQUANT_TRITON": "1"},
+    },
 }
 
 
@@ -89,15 +101,17 @@ def emit(tag: str, obj: dict) -> None:
 
 
 def detect_arch(model_id: str) -> str:
-    """gemma | minimax from the base model id. Raises on anything else."""
+    """gemma | minimax | mistral from the base model id. Raises on anything else."""
     n = (model_id or "").lower()
     if "minimax" in n:
         return "minimax"
+    if "mistral" in n:
+        return "mistral"
     if "gemma" in n:
         return "gemma"
     raise RuntimeError(
-        f"unsupported LLM base model '{model_id}' — task_type=llm supports gemma-4 and "
-        f"minimax-m2 models (the trainer is chosen by name)")
+        f"unsupported LLM base model '{model_id}' — task_type=llm supports gemma-4, "
+        f"minimax-m2 and mistral-small models (the trainer is chosen by name)")
 
 
 def _venv_path(cfg: dict, arch: str) -> str:
@@ -278,11 +292,14 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     return cmd
 
 
-def _minimax_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str) -> list[str]:
-    r, alpha = _lora_dims(cfg)  # form sends one r/alpha → use for BOTH attn + MoE
+def _moe_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str, arch: str) -> list[str]:
+    """The FP8-MoE trainers (minimax_m2.py / mistral_small.py) share a CLI: separate
+    attention + MoE LoRA ranks, --data_dir/--out_dir, --low_cpu_shard_load. The form
+    sends one r/alpha → used for both attn + MoE."""
+    r, alpha = _lora_dims(cfg)
     cmd = [
         py, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
-        os.path.join(LLM_DIR, _ARCH["minimax"]["trainer"]),
+        os.path.join(LLM_DIR, _ARCH[arch]["trainer"]),
         "--attn_r", str(r), "--attn_alpha", str(float(alpha)),
         "--moe_r", str(r), "--moe_alpha", str(float(alpha)),
         "--batch_size", "1",
@@ -291,13 +308,13 @@ def _minimax_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str) -> list
         "--max_steps", str(int(cfg.get("max_steps") or 0)),
         "--checkpointing_step", str(int(cfg.get("save_steps") or cfg.get("logging_steps") or 100)),
         "--data_dir", packed, "--out_dir", ckpt,
-        # 230B base: stream weights from rank 0 into each shard (caps CPU at ~one
-        # model copy instead of ~230GB × ranks). The default loads on every rank.
+        # Big FP8 base: stream weights from rank 0 into each shard (caps CPU at ~one
+        # model copy instead of ~base × ranks). The default loads on every rank.
         "--low_cpu_shard_load",
     ]
-    # minimax adapts attention (fixed q/k/v/o) + the MoE experts. Map the form's
-    # LoRA-target picker: if the user selected NO MLP/dense target (gate/up/down),
-    # adapt attention only (--no_moe_lora). Explicit cfg flag still wins.
+    # These adapt attention + the MoE experts. Map the form's LoRA-target picker: if
+    # the user selected NO MLP/dense target (gate/up/down), adapt attention only
+    # (--no_moe_lora). Explicit cfg flag still wins.
     targets = set(str(t) for t in (cfg.get("lora_target_modules") or []))
     no_moe = bool(cfg.get("no_moe_lora")) or (bool(targets) and not (targets & _MLP_TARGETS))
     if no_moe:
@@ -353,6 +370,9 @@ def run(cfg: dict) -> None:
     if arch == "gemma":
         # query-tiling block size that lets the 32k pack train (see gemma4 CLAUDE.md).
         env["SDPA_QUERY_BLOCK"] = str(cfg.get("sdpa_query_block") or 1024)
+    # arch-specific run env (e.g. mistral's Triton FP8 dequant fast path).
+    for k, v in (spec.get("run_env") or {}).items():
+        env.setdefault(k, str(v))
     if hf_token:
         env["HF_TOKEN"] = hf_token
         env["HUGGING_FACE_HUB_TOKEN"] = hf_token
@@ -380,8 +400,8 @@ def run(cfg: dict) -> None:
     nproc = _nproc(cfg)
     if arch == "gemma":
         cmd = _gemma_cmd(py, cfg, nproc)
-    else:
-        cmd = _minimax_cmd(py, cfg, nproc, packed, ckpt_dir)
+    else:  # minimax + mistral share the FP8-MoE CLI
+        cmd = _moe_cmd(py, cfg, nproc, packed, ckpt_dir, arch)
     if "wandb" in report_to:
         cmd += ["--wandb"]
         if cfg.get("wandb_project"):

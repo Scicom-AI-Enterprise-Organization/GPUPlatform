@@ -77,27 +77,37 @@ const TTS_BASE_MODELS = [
 const DEFAULT_TTS_BASE = "Scicom-intl/Multilingual-TTS-1.7B-Base";
 // LLM finetune (FSDP2 LoRA) over a packed chat dataset (kind=llm_packed). The
 // trainer is auto-detected from the base model: gemma-4 (custom dual-head_dim
-// attention) or MiniMax-M2 (230B FP8 MoE, QLoRA-style dequant LoRA).
+// attention), MiniMax-M2 (230B FP8 MoE) or Mistral-Small-4 (119B FP8 MoE, MLA) —
+// the latter two use QLoRA-style on-the-fly FP8 dequant LoRA.
 const LLM_BASE_MODELS = [
   "google/gemma-4-31B-it",
   "MiniMaxAI/MiniMax-M2",
+  "mistralai/Mistral-Small-4-119B-2603",
 ];
 const DEFAULT_LLM_BASE = "google/gemma-4-31B-it";
-// Per-arch LoRA defaults (gemma: r=256 scaling 2.0; minimax: r=16 scaling 1.0 —
-// 256 experts × 62 layers make the MoE LoRA huge, see minimax CLAUDE.md).
-function llmLoraDefaults(model: string): { r: number; ratio: number } {
-  return model.toLowerCase().includes("minimax") ? { r: 16, ratio: 1 } : { r: 256, ratio: 2 };
+// LLM base-model arch (mirrors the gateway's detect_arch). Drives the per-arch venv
+// + LoRA defaults.
+function llmArch(model: string): "gemma" | "minimax" | "mistral" {
+  const n = model.toLowerCase();
+  if (n.includes("minimax")) return "minimax";
+  if (n.includes("mistral")) return "mistral";
+  return "gemma";
 }
-// gemma vs minimax need different `kernels` pins → separate uv venvs (matches the
+// Per-arch LoRA defaults (gemma: r=256 scaling 2.0; the FP8-MoE archs: r=16 scaling
+// 1.0 — 100s of experts × dozens of layers make the MoE LoRA huge, see their CLAUDE.md).
+function llmLoraDefaults(model: string): { r: number; ratio: number } {
+  return llmArch(model) === "gemma" ? { r: 256, ratio: 2 } : { r: 16, ratio: 1 };
+}
+// Each arch needs a different `kernels` pin → separate uv venvs (matches the
 // gateway's /share/autotrain-llm-<arch> default).
 function llmVenvFor(model: string): string {
-  return model.toLowerCase().includes("minimax") ? "/share/autotrain-llm-minimax" : "/share/autotrain-llm-gemma4";
+  return `/share/autotrain-llm-${llmArch(model)}`;
 }
 // venv paths that count as "still a per-task default" (safe to auto-swap on a task
 // change); a user-customized path is left untouched.
 const KNOWN_VENVS = [
   "/share/autotrain-whisper", "/share/autotrain-tts", "/share/autotrain-llm",
-  "/share/autotrain-llm-gemma4", "/share/autotrain-llm-minimax",
+  "/share/autotrain-llm-gemma4", "/share/autotrain-llm-minimax", "/share/autotrain-llm-mistral",
 ];
 // LLM LoRA target linear projections. q/k/v/o (attention) are the default; the MLP
 // group (gate/up/down) is opt-in. gemma4 warns at train time for any target that
@@ -856,7 +866,7 @@ export function TrainingForm() {
           {isTts
             ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM. Eval loss runs on the held-out test split per epoch or every N steps; CER / MOS / speaker-similarity score generated audio at the end."
             : isLlm
-              ? "Finetune an LLM (Gemma-4 or MiniMax-M2 — auto-detected from the base model) on a packed chat dataset (kind=llm_packed) with FSDP2 LoRA. The pre-tokenized bins train directly as a causal LM; loss is logged per step."
+              ? "Finetune an LLM (Gemma-4, MiniMax-M2 or Mistral-Small-4 — auto-detected from the base model) on a packed chat dataset (kind=llm_packed) with FSDP2 LoRA. The pre-tokenized bins train directly as a causal LM; loss is logged per step."
               : "Finetune a Whisper model on a dataset. WER + CER are evaluated on a held-out split — per epoch or every N steps — and training stops at the epoch / max-step cap or early on patience."}
         </p>
         {fromId && (
@@ -896,7 +906,7 @@ export function TrainingForm() {
               isLlm ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
             <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
-              <div className="font-medium">LLM — Gemma-4 / MiniMax-M2</div>
+              <div className="font-medium">LLM — Gemma-4 / MiniMax / Mistral</div>
               <div className="text-xs text-muted-foreground">Chat finetune. Pack first → FSDP2 LoRA (loss-only).</div>
             </div>
           </button>
@@ -908,7 +918,7 @@ export function TrainingForm() {
         description={isTts
           ? "The base Qwen3 model + the {audio, transcription} dataset to finetune on."
           : isLlm
-            ? "The base LLM (Gemma-4 or MiniMax-M2) + the packed chat dataset (kind=llm_packed) to finetune on."
+            ? "The base LLM (Gemma-4, MiniMax-M2 or Mistral-Small-4) + the packed chat dataset (kind=llm_packed) to finetune on."
             : "The base Whisper checkpoint and the dataset to finetune on."}>
         <Grid>
           <FieldWrap label={isTts ? "Base TTS model" : isLlm ? "Base LLM model" : "Base Whisper model"}>
@@ -920,7 +930,7 @@ export function TrainingForm() {
               </SelectContent>
             </Select>
             {modelChoice === CUSTOM && (
-              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-… or MiniMaxAI/MiniMax-M2" : "org/whisper-variant"}
+              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-…, MiniMaxAI/MiniMax-M2, mistralai/Mistral-Small-4-…" : "org/whisper-variant"}
                 value={customModel} onChange={(e) => setCustomModel(e.target.value)} />
             )}
           </FieldWrap>
@@ -1015,9 +1025,9 @@ export function TrainingForm() {
           : (isTts
             ? "Qwen3 + NeuCodec finetune hyperparameters (loss-only; no per-epoch WER/CER)."
             : isLlm
-              ? (baseModel.toLowerCase().includes("minimax")
-                  ? "MiniMax-M2 FSDP2 LoRA hyperparameters (FP8 MoE, dequant LoRA; loss-only, no eval). Batch forced to 1. Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large)."
-                  : "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Batch forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256.")
+              ? (llmArch(baseModel) === "gemma"
+                  ? "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Batch forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
+                  : `${llmArch(baseModel) === "mistral" ? "Mistral-Small-4" : "MiniMax-M2"} FSDP2 LoRA hyperparameters (FP8 MoE, on-the-fly dequant LoRA; loss-only, no eval). Batch forced to 1. Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large).`)
               : "Epochs, early stopping, and core hyperparameters.")}>
         <div className="mb-5 grid max-w-xl grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-2">
           {taskType === "asr" && (
