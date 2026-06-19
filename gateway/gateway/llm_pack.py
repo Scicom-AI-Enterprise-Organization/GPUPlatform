@@ -50,19 +50,36 @@ COLUMNS = {
     "attention_mask": "uint32[]",
 }
 
-# --- gemma-4 reasoning rendering (optional; no-op on other templates) ---------
-# The stock gemma-4-31B-it chat template only emits an assistant's `reasoning`
-# (`<|channel>thought ... <channel|>`) on tool-call turns AFTER the last user
-# message — silently dropping most reasoning in a multi-user agentic trajectory.
-# `all_reasoning=True` relaxes that one guard so EVERY assistant turn's reasoning
-# is trained. The swap is a surgical substring replace; if the substring isn't
-# present (a non-gemma template, or an upstream template change) we fall back to
-# the stock template UNCHANGED rather than raising — this packer is generic.
-_REASONING_GUARD_STOCK = (
-    "if thinking_text and loop.index0 > ns_turn.last_user_idx "
-    "and message.get('tool_calls')"
-)
-_REASONING_GUARD_ALL = "if thinking_text and role == 'model'"
+# --- reasoning rendering (optional; arch-specific; no-op on unknown templates) -
+# Several chat templates only emit an assistant's reasoning on tool-call turns
+# AFTER the last user message — silently dropping most reasoning in a multi-user
+# agentic trajectory. `all_reasoning=True` relaxes that one guard so EVERY
+# assistant turn's reasoning is trained. The swap is a surgical substring replace
+# per arch; if no known guard substring is present we fall back to the stock
+# template UNCHANGED rather than raising — this packer is generic.
+# Each entry: arch -> (stock_guard_substring, relaxed_replacement). Mirrors the
+# standalone packers: autotrain/gemma4/pack_dataset.py + autotrain/minimax-m2/pack_dataset.py.
+_REASONING_GUARDS: dict[str, tuple[str, str]] = {
+    "gemma": (
+        "if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
+        "if thinking_text and role == 'model'",
+    ),
+    "minimax": (
+        "if reasoning_content and loop.index0 > ns.last_user_index",
+        "if reasoning_content",
+    ),
+}
+
+
+def detect_arch(tokenizer_name: Optional[str]) -> str:
+    """Map a tokenizer/model id to a packing arch: 'gemma' | 'minimax' | 'generic'.
+    Drives the reasoning-guard relaxation + per-turn message normalization."""
+    n = (tokenizer_name or "").lower()
+    if "minimax" in n:
+        return "minimax"
+    if "gemma" in n:
+        return "gemma"
+    return "generic"
 
 
 def _import_parquet_writer():
@@ -86,22 +103,60 @@ def _import_parquet_writer():
     return ParquetWriter
 
 
-def build_chat_template(tokenizer, all_reasoning: bool) -> Optional[str]:
-    """Return the chat-template string to render with (stock, or gemma reasoning
-    relaxed). Non-fatal: an unrecognised template falls back to stock."""
+def build_chat_template(tokenizer, all_reasoning: bool, arch: str = "generic") -> Optional[str]:
+    """Return the chat-template string to render with (stock, or arch-specific
+    reasoning relaxed). Non-fatal: an unrecognised template falls back to stock."""
     stock = getattr(tokenizer, "chat_template", None)
     if not all_reasoning or not stock:
         return stock
-    if _REASONING_GUARD_STOCK in stock:
-        return stock.replace(_REASONING_GUARD_STOCK, _REASONING_GUARD_ALL)
-    logger.info("llm_pack: all_reasoning requested but the gemma-4 reasoning guard "
-                "was not found in the chat template — using the stock template.")
+    # Prefer this arch's guard; otherwise try any known guard (the arch detection
+    # is a name heuristic — a custom finetune name might not match).
+    candidates = []
+    if arch in _REASONING_GUARDS:
+        candidates.append(_REASONING_GUARDS[arch])
+    candidates += [g for a, g in _REASONING_GUARDS.items() if a != arch]
+    for stock_guard, relaxed in candidates:
+        if stock_guard in stock:
+            return stock.replace(stock_guard, relaxed)
+    logger.info("llm_pack: all_reasoning requested but no known reasoning guard "
+                "matched the chat template (arch=%s) — using the stock template.", arch)
     return stock
 
 
-def extract_messages(value: Any) -> Optional[list]:
+def _normalize_minimax_turn(turn: dict) -> dict:
+    """MiniMax-M2 template quirks (mirrors autotrain/minimax-m2/pack_dataset.py):
+    it reads `reasoning_content` (the dataset stores per-turn `reasoning`), and it
+    iterates `tool_call.arguments.items()` (the dataset stores `arguments` as a
+    JSON STRING → '"str" has no attribute items'). Map + parse so the row renders."""
+    turn = dict(turn)
+    if turn.get("role") in ("assistant", "model") and turn.get("reasoning") and not turn.get("reasoning_content"):
+        turn["reasoning_content"] = turn["reasoning"]
+    tcs = turn.get("tool_calls")
+    if isinstance(tcs, (list, tuple)):
+        norm = []
+        for tc in tcs:
+            if isinstance(tc, dict):
+                tc = dict(tc)
+                holders = [tc]
+                if isinstance(tc.get("function"), dict):
+                    tc["function"] = dict(tc["function"])
+                    holders.append(tc["function"])
+                for holder in holders:
+                    a = holder.get("arguments")
+                    if isinstance(a, str):
+                        try:
+                            holder["arguments"] = json.loads(a)
+                        except (json.JSONDecodeError, ValueError):
+                            holder["arguments"] = {}
+            norm.append(tc)
+        turn["tool_calls"] = norm
+    return turn
+
+
+def extract_messages(value: Any, arch: str = "generic") -> Optional[list]:
     """Normalize a `messages` cell into a list[dict]. HF parquet often stores it
-    as a JSON *string*; also tolerate a list / numpy array of dicts."""
+    as a JSON *string*; also tolerate a list / numpy array of dicts. For
+    arch='minimax' apply the template-specific per-turn normalization."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -116,7 +171,7 @@ def extract_messages(value: Any) -> Optional[list]:
     out = []
     for turn in value:
         if isinstance(turn, dict) and "role" in turn:
-            out.append(dict(turn))
+            out.append(_normalize_minimax_turn(turn) if arch == "minimax" else dict(turn))
     return out or None
 
 
@@ -219,6 +274,7 @@ def pack_rows(
     hf_token: Optional[str] = None,
     hf_endpoint: Optional[str] = None,
     all_reasoning: bool = True,
+    arch: Optional[str] = None,
     progress: Optional[Callable[[int, int], None]] = None,
     progress_every: int = 100,
 ) -> dict:
@@ -237,9 +293,10 @@ def pack_rows(
 
     if hf_endpoint:
         os.environ["HF_ENDPOINT"] = hf_endpoint
-    logger.info("llm_pack: loading tokenizer %s (tokenizer only)", tokenizer_name)
+    arch = arch or detect_arch(tokenizer_name)
+    logger.info("llm_pack: loading tokenizer %s (arch=%s, tokenizer only)", tokenizer_name, arch)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=hf_token or None)
-    chat_template = build_chat_template(tokenizer, all_reasoning)
+    chat_template = build_chat_template(tokenizer, all_reasoning, arch)
 
     ParquetWriter = _import_parquet_writer()
 
@@ -263,7 +320,7 @@ def pack_rows(
     with writer as out:
         for i in range(total_rows):
             row = rows[i]
-            messages = extract_messages(_get(row, messages_field))
+            messages = extract_messages(_get(row, messages_field), arch)
             if not messages:
                 n_dropped_empty += 1
             else:
@@ -330,4 +387,5 @@ def pack_rows(
         "max_seq_len": max_seq_len,
         "efficiency": efficiency,
         "tokenizer": tokenizer_name,
+        "arch": arch,
     }

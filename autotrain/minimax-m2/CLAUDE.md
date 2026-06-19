@@ -91,6 +91,12 @@ guarded import.
   `row*N` overflows Triton's default int32 indexing -> illegal memory access. Both kernels cast the
   row offset to `tl.int64`.
 
+**Validated in a real 8× H100 training run (2026-06-19):** the full 32k finetune with the Triton
+path on (default) ran clean (loss 6.46→5.06, **identical trajectory** to the PyTorch-dequant run
+since the forward is bit-exact) at **~12.4k tok/s vs ~10.3k** with the PyTorch dequant — **~20%
+higher end-to-end throughput** (dequant is one part of the step alongside FA / grouped_mm /
+optimizer / NCCL). torch 2.12 + triton 3.7.0.
+
 ## LoRA targets (as requested: q/k/v/o + the dense MoE layers)
 
 `apply_minimax_lora()` freezes the whole base, wraps attention **q/k/v/o** with `LinearLoRA`, and

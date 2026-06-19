@@ -225,6 +225,17 @@ async def _resolve_global_env() -> dict:
         return {}
 
 
+def _llm_arch(model_id: Optional[str]) -> str:
+    """gemma | minimax from an LLM base model id (mirrors llm_finetune.detect_arch +
+    llm_pack.detect_arch). Drives the per-arch venv + trainer choice. Unknown → gemma
+    (the default LLM base) so the venv path is still well-formed; the trainer raises
+    a clear error on a truly unsupported model."""
+    n = (model_id or "").lower()
+    if "minimax" in n:
+        return "minimax"
+    return "gemma"
+
+
 async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str] = None) -> dict:
     """Turn a Dataset row into the trainer's dataset spec, with creds inlined."""
     label_token = None
@@ -1259,8 +1270,14 @@ async def run_training(redis, run_id: str) -> None:
         # heavy stack never clobbers the box's system python or another task's
         # deps. The trainer's --deps-only creates/installs it; the run phase
         # launches from {venv}/bin/python.
-        _default_venv = {"tts": "/share/autotrain-tts",
-                         "llm": "/share/autotrain-llm"}.get(task_type, "/share/autotrain-whisper")
+        if task_type == "llm":
+            # gemma vs minimax need different `kernels` pins (transformers 5.5.0
+            # import crashes outside each range) → SEPARATE venvs per arch.
+            _default_venv = f"/share/autotrain-llm-{_llm_arch(cfg.get('base_model'))}"
+        elif task_type == "tts":
+            _default_venv = "/share/autotrain-tts"
+        else:
+            _default_venv = "/share/autotrain-whisper"
         venv_path = (cfg.get("venv_path") or _default_venv).rstrip("/")
         cfg["venv_path"] = venv_path
         venv_py = shlex.quote(f"{venv_path}/bin/python")
@@ -2022,7 +2039,8 @@ async def create_training_run(
         body.tokenizer = body.base_model
     if body.task_type == "llm":
         # LLM finetune consumes a pre-packed chat ChiniDataset (kind=llm_packed) —
-        # the gemma4 trainer reads the packed ids directly (no re-tokenization).
+        # the trainer (gemma4.py / minimax_m2.py, chosen by base-model arch) reads
+        # the packed ids directly (no re-tokenization).
         if ds.kind != "llm_packed":
             raise HTTPException(
                 status_code=400,
@@ -2033,6 +2051,18 @@ async def create_training_run(
         _pm = (ds.split_fields or {}).get("_llm_pack") or {}
         if _pm.get("sequence_length"):
             body.block_size = int(_pm["sequence_length"])
+        # The dataset was tokenized at pack time with a specific tokenizer/arch; the
+        # trainer reads those ids verbatim, so the base model's arch MUST match the
+        # pack arch (a gemma-packed dataset trained as minimax = garbage ids).
+        _pack_arch = _pm.get("arch")
+        _model_arch = _llm_arch(body.base_model)
+        if _pack_arch and _pack_arch in ("gemma", "minimax") and _pack_arch != _model_arch:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"base model arch '{_model_arch}' ≠ dataset pack arch '{_pack_arch}'. "
+                        f"This dataset was packed with a {_pack_arch} tokenizer — pick a {_pack_arch} "
+                        f"base model, or re-pack with a {_model_arch} tokenizer."),
+            )
         # tokenization already happened at pack time; record the base model.
         body.tokenizer = body.base_model
     if body.storage_id:
@@ -2970,21 +3000,45 @@ async def _resolve_run_ssh(row: TrainingRun) -> Optional[tuple[str, int, str, st
 # lifecycle managed over SSH — the small sibling of the serverless worker) --------
 
 
+def _llm_tryit_port(run_id: str) -> int:
+    """Deterministic localhost port for a run's vLLM try-it server (stable across
+    gateway processes, so status/chat reach the same port the loader bound)."""
+    import hashlib
+    return 18000 + int(hashlib.md5(run_id.encode()).hexdigest()[:4], 16) % 2000
+
+
 def _playground_paths(cfg: dict, run_id: str, kind: str) -> dict:
     """VM-side paths for a run's persistent Try-it server. model_dir matches the
     one-shot cache dir so the persistent + one-shot paths share the weights."""
     work = (cfg.get("work_dir") or "/share").rstrip("/")
+    base = {
+        "ready": f"/tmp/sgpu_tryit_{run_id}.sock.ready",
+        "pid": f"/tmp/sgpu_tryit_{run_id}.pid",
+        "log": f"/tmp/sgpu_tryit_{run_id}.server.log",
+        "cfg": f"/tmp/sgpu_tryit_{run_id}.server.json",
+    }
+    if kind == "llm":
+        # LLM (gemma-4): merge LoRA → save → serve with vLLM. The training venv runs
+        # the merge; vLLM serves from its own dedicated venv. Merged model is cached.
+        tdir = f"{work}/sgpu-llm-tryit/{run_id}"
+        venv = (cfg.get("venv_path") or "/share/autotrain-llm").rstrip("/")
+        return {
+            **base,
+            "model_dir": f"{tdir}/merged",      # vLLM serves this
+            "ckpt_dir": f"{tdir}/ckpt",          # downloaded lora.pt + meta
+            "vllm_venv": "/share/autotrain-llm-vllm",
+            "port": _llm_tryit_port(run_id),
+            "venv": venv,
+            "py": f"{venv}/bin/python",
+        }
     md = f"{work}/sgpu-tts-tryit/{run_id}" if kind == "tts" else f"{work}/sgpu-tryit/{run_id}"
     # Reuse the run's training uv venv (persisted in config_json by run_training);
     # fall back to the per-task default the trainer also uses. Never machine python.
     venv = (cfg.get("venv_path")
             or ("/share/autotrain-tts" if kind == "tts" else "/share/autotrain-whisper")).rstrip("/")
     return {
+        **base,
         "sock": f"/tmp/sgpu_tryit_{run_id}.sock",
-        "ready": f"/tmp/sgpu_tryit_{run_id}.sock.ready",
-        "pid": f"/tmp/sgpu_tryit_{run_id}.pid",
-        "log": f"/tmp/sgpu_tryit_{run_id}.server.log",
-        "cfg": f"/tmp/sgpu_tryit_{run_id}.server.json",
         "model_dir": md,
         "venv": venv,
         "py": f"{venv}/bin/python",
@@ -3100,10 +3154,11 @@ def _playground_stop_ssh(host, port, user, key_filename, run_id, cfg, kind):
     cli = _ssh_connect(host, int(port), user, key_filename)
     try:
         paths = _playground_paths(cfg, run_id, kind)
+        sock = paths.get("sock", "")  # LLM (vLLM) has no unix socket
         cmd = (f'P="$(cat {paths["pid"]} 2>/dev/null)"; '
                f'if [ -n "$P" ]; then kill -TERM -"$P" 2>/dev/null || kill -TERM "$P" 2>/dev/null; sleep 1; '
                f'kill -KILL -"$P" 2>/dev/null || true; fi; '
-               f'rm -f {paths["sock"]} {paths["ready"]} {paths["pid"]}; echo stopped')
+               f'rm -f {sock} {paths["ready"]} {paths["pid"]}; echo stopped')
         _ssh_capture(cli, cmd)
         return {"running": False, "ready": False}
     finally:
@@ -3117,6 +3172,61 @@ def _playground_status_ssh(host, port, user, key_filename, run_id, cfg, kind):
     cli = _ssh_connect(host, int(port), user, key_filename)
     try:
         return _persistent_status(cli, _playground_paths(cfg, run_id, kind))
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _llm_playground_start_ssh(host, port, user, key_filename, run_id, model_s3, creds, cfg,
+                              base_model, gpus, served_name, max_model_len=16384):
+    """LLM try-it: launch the detached orchestrator (download LoRA → merge → save →
+    vLLM serve eager) on the VM and record its pid. The orchestrator logs every step
+    to paths['log'] (the status tab tails it) and writes paths['ready'] once vLLM is
+    healthy. The merged model is cached so a re-load skips straight to serving."""
+    import shlex
+    import tempfile
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        paths = _playground_paths(cfg, run_id, "llm")
+        st = _persistent_status(cli, paths)
+        if st["running"]:
+            return st
+        # Ship the llm/ trainer dir (merge_infer.py + llm_playground.py + vendored code)
+        # to a stable per-run location the orchestrator runs from.
+        code_dir = f"/tmp/sgpu_llm_code_{run_id}"
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        _ssh_put_dir_tar(cli, str(base / "llm"), code_dir)
+        gpu_list = [g for g in str(gpus or "").split(",") if g.strip()]
+        sconf = {
+            "model_s3": model_s3,
+            "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+            "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+            "base_model": base_model,
+            "merged_dir": paths["model_dir"], "work_dir": paths["ckpt_dir"],
+            "llm_dir": code_dir, "train_py": paths["py"], "vllm_venv": paths["vllm_venv"],
+            "port": paths["port"], "tp": max(1, len(gpu_list)), "gpus": gpus or "",
+            "max_model_len": int(max_model_len), "gpu_mem_util": 0.90,
+            "served_model_name": served_name, "ready_file": paths["ready"],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(sconf)); local_cfg = f.name
+        try:
+            _ssh_put(cli, local_cfg, paths["cfg"])
+        finally:
+            try:
+                os.unlink(local_cfg)
+            except OSError:
+                pass
+        py = paths["py"]  # training venv (transformers 5.5.0 + boto3) runs the merge
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        cmd = (f'{user_env}rm -f {paths["ready"]}; PY="{py}"; '
+               f'if [ ! -x "$PY" ]; then echo "training venv python not found at $PY — train this run first" > {paths["log"]}; exit 1; fi; '
+               f'setsid nohup "$PY" -u {code_dir}/llm_playground.py --config {shlex.quote(paths["cfg"])} '
+               f'> {paths["log"]} 2>&1 & echo $! > {paths["pid"]}; sleep 0.3; cat {paths["pid"]}')
+        _ssh_capture(cli, cmd)
+        return _persistent_status(cli, paths)
     finally:
         try:
             cli.close()
@@ -3843,8 +3953,8 @@ async def _playground_ctx(run_id: str, user: User, session: AsyncSession):
     (row, kind, model_s3, creds, ssh, cfg)."""
     row = await _owned(run_id, user, session)
     kind = (row.task_type or "asr").lower()
-    if kind not in ("asr", "tts"):
-        raise HTTPException(status_code=400, detail="try-it is for ASR/TTS runs")
+    if kind not in ("asr", "tts", "llm"):
+        raise HTTPException(status_code=400, detail="try-it is for ASR/TTS/LLM runs")
     if row.status != "done":
         raise HTTPException(status_code=400, detail="the run must finish training first")
     model_s3 = ((row.result_json or {}).get("artifact") or {}).get("s3_uri")
@@ -3872,8 +3982,23 @@ async def playground_start(
 ):
     """Load the run's model into a persistent worker on its VM (served over a Unix
     socket) so try-it requests skip the per-call model load. Returns immediately;
-    poll …/playground/status until ready. Auto-unloads after idle_minutes idle."""
+    poll …/playground/status until ready. Auto-unloads after idle_minutes idle.
+
+    LLM (gemma-4) runs ignore `gpu` and serve with vLLM (eager) across the GPUs the
+    run trained on (TP = GPU count): download LoRA → merge → save → vLLM serve."""
     row, kind, model_s3, creds, ssh, cfg = await _playground_ctx(run_id, user, session)
+    if kind == "llm":
+        gpus = (row.visible_devices or "").strip()
+        if not gpus:
+            raise HTTPException(status_code=400,
+                                detail="LLM try-it needs the run's GPU pin (visible_devices) to serve with vLLM")
+        try:
+            st = await asyncio.to_thread(_llm_playground_start_ssh, *ssh, run_id, model_s3, creds, cfg,
+                                         (row.base_model or cfg.get("base_model") or "google/gemma-4-31B-it"),
+                                         gpus, run_id, 16384)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"could not start the vLLM server: {e}")
+        return PlaygroundStatus(**st)
     sel = (gpu or "").strip().lower()
     if sel and sel not in ("cpu", "auto") and not sel.isdigit():
         raise HTTPException(status_code=400, detail="gpu must be a GPU index, 'cpu', or 'auto'")
@@ -3912,3 +4037,72 @@ async def playground_stop(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"stop failed: {e}")
     return PlaygroundStatus(**st)
+
+
+@router.post("/{run_id}/playground/chat")
+async def playground_chat(run_id: str, request: Request):
+    """LLM try-it: stream a chat completion from the run's vLLM server (loaded via
+    …/playground/start). Proxies to the VM's vLLM /v1/chat/completions over SSH
+    (`curl -N`) and relays the OpenAI SSE straight to the browser.
+
+    Auth + run/SSH resolution happen in a short-lived DB session that is RELEASED
+    before the stream starts — a StreamingResponse must not hold a pooled DB
+    connection for the whole stream (see the SSE-pool-exhaustion gotcha)."""
+    from . import auth as _auth
+    body = await request.json()
+    async with session_factory()() as s:
+        user = await _auth.current_user(request, s)
+        if not await _auth.has_section(user, "autotrain", s):
+            raise HTTPException(status_code=403, detail="no autotrain access")
+        row, kind, _m, _c, ssh, cfg = await _playground_ctx(run_id, user, s)
+        if kind != "llm":
+            raise HTTPException(status_code=400, detail="chat is for LLM runs")
+        paths = _playground_paths(cfg, run_id, "llm")
+        vport = paths["port"]
+    host, p, suser, key = ssh
+
+    msgs = body.get("messages") or []
+    if not isinstance(msgs, list) or not msgs:
+        raise HTTPException(status_code=400, detail="messages[] required")
+    payload: dict = {"model": run_id, "messages": msgs, "stream": True,
+                     "stream_options": {"include_usage": True}}
+    for k in ("temperature", "top_p", "max_tokens", "seed", "presence_penalty",
+              "frequency_penalty", "stop"):
+        if body.get(k) is not None:
+            payload[k] = body[k]
+    req_bytes = json.dumps(payload).encode()
+    remote_req = f"/tmp/sgpu_llm_chat_{run_id}.json"
+    import shlex
+    curl = (f"curl -sN --no-buffer -X POST http://127.0.0.1:{vport}/v1/chat/completions "
+            f"-H 'Content-Type: application/json' --data @{shlex.quote(remote_req)}")
+
+    async def gen():
+        try:
+            cli = await asyncio.to_thread(_ssh_connect, host, int(p), suser, key)
+        except Exception as e:  # noqa: BLE001
+            yield f"data: {json.dumps({'error': f'ssh failed: {e}'})}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+            return
+        try:
+            await asyncio.to_thread(_ssh_put_bytes, cli, req_bytes, remote_req)
+            chan = cli.get_transport().open_session()
+            chan.settimeout(None)
+            chan.set_combine_stderr(True)
+            await asyncio.to_thread(chan.exec_command, curl)
+            while True:
+                data = await asyncio.to_thread(chan.recv, 8192)
+                if not data:
+                    break
+                yield data
+        except Exception as e:  # noqa: BLE001
+            yield f"data: {json.dumps({'error': str(e)})}\n\n".encode()
+        finally:
+            try:
+                cli.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache, no-transform",
+                                      "Connection": "keep-alive",
+                                      "X-Accel-Buffering": "no"})

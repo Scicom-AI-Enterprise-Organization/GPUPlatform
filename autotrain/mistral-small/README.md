@@ -27,6 +27,8 @@ The interesting part is **LoRA on a frozen FP8 MoE with MLA attention**:
 |------|------|
 | `mistral_small.py` | training entrypoint — run with `torchrun` (FSDP2, packed varlen, Liger FLCE) |
 | `lora.py` | `LinearLoRA` (MLA + shared MLP) + fused grouped-MoE routed-expert LoRA + per-tensor FP8 dequant |
+| `dequant_triton.py` | fused Triton per-tensor FP8→bf16 dequant (~7–13×; `MISTRAL_DEQUANT_TRITON=1`) |
+| `bench_dequant.py` | GPU benchmark: Triton vs torch dequant — fwd/bwd parity + speed + peak memory |
 | `test_lora.py` | CPU correctness: dequant (per-tensor + block), LinearLoRA, fused LoRA-MoE fwd+grads |
 | `compare_logits.py` | GPU parity: our LoRA(B=0) vs an independent bf16 dequant reference |
 | `pack_dataset.py` | build the multipacked ChiniDataset from a chat parquet (Mistral-Small-4 template) |
@@ -77,6 +79,30 @@ python merge_infer.py --prompt "Write a function to reverse a linked list." --ma
 
 Checkpoints (LoRA only) land in `checkpointing/lora.pt` + `checkpointing/lora_meta.json`.
 
+## Triton FP8 dequant — Triton vs PyTorch (measured on H20-3e, 2026-06-19)
+
+`dequant_triton.py` fuses the per-tensor FP8→bf16 dequant into a single pass (no fp32 transient);
+`bench_dequant.py` benchmarks it against the torch reference (`lora.dequantize_fp8`). Enable with
+`MISTRAL_DEQUANT_TRITON=1` (default in `run.sh`).
+
+**Correctness — bit-identical (max abs diff `0.0e+00`):**
+
+| check | result |
+|---|---|
+| forward dequant (2D `o_proj`, 2D `kv_b`, 3D experts) | **0.0e+00** (bit-identical) |
+| LinearLoRA fwd+bwd: output, `d/dx`, `d/d lora_a`, `d/d lora_b` | **0.0e+00** (bit-identical) |
+
+**Speed + peak memory** (mean over 50 iters, CUDA events):
+
+| weight (per-tensor FP8) | elems | torch | Triton | speedup | peak mem |
+|---|---|---|---|---|---|
+| 2D `o_proj` 4096×4096 | 17M | 0.183 ms / 0.29 GB | 0.025 ms / 0.18 GB | **7.4×** | 1.55× less |
+| 3D experts `gate_up` (128, 4096, 4096) | 2147M | 24.696 ms / 17.25 GB | 1.894 ms / 15.10 GB | **13.0×** | 1.14× less |
+| 3D experts `down` (128, 4096, 2048) | 1074M | 12.408 ms / 8.66 GB | 0.921 ms / 7.58 GB | **13.5×** | 1.14× less |
+
+The frozen base needs no gradient (QLoRA), so this is a plain forward op; gradients flow through
+`F.linear` to the activations / adapters. Reproduce: `python bench_dequant.py`.
+
 ## Dataset (multipacking)
 
 `pack_dataset.py` renders each conversation through the **Mistral-Small-4** chat template (tools +
@@ -91,19 +117,21 @@ python pack_dataset.py --out ./packed_data                      # default Functi
 python pack_dataset.py --repo <repo> --file <parquet> --max-rows 10   # any chat parquet / quick test
 ```
 
-## What is verified vs what needs the pod
+## What is verified
 
-**Verified locally (CPU, torch 2.12 + transformers 5.5.0):** the fused grouped LoRA-MoE forward
-**and gradients** vs an independent per-expert reference (`test_lora.py`, ~1e-7); per-tensor + block
-FP8 dequant; **end-to-end B=0 no-op + LoRA wiring on a tiny real `Mistral3ForConditionalGeneration`**
-(MLA + routed MoE + shared MLP); the chat-template reasoning/tools rendering + packing invariants;
-the transformers 5.5.0 `num_experts` load-bug workaround; imports/symbols.
+**On real hardware (4× H20-3e, the `tm` VM, 2026-06-19):** `compare_logits.py` on the real 119B
+model PASSED (LoRA(B=0) matches an independent bf16 ref top-1 + cosine 0.999, "...France is" →
+` Paris`); **FSDP2 fp8 all-gather works** (after reshaping per-tensor scalar scales to `(1,)`);
+end-to-end FSDP2 LoRA training ran 3 epochs, **loss 0.95 → ~0.50**, ~5k tok/s with the Triton
+dequant; the Triton dequant is **bit-identical** to torch on fwd+bwd and **7–13×** faster
+(`bench_dequant.py`). LoRA saved to `checkpointing/lora.pt`.
 
-**Needs validation on a 4× H100 pod (no such hardware here):** FSDP2 all-gather of FP8 params,
-`compare_logits.py` on the real 119B model, CPU RAM at load (~119GB×ranks), end-to-end
-loss/throughput, the FA3 varlen path, and `merge_infer.py` generation. See **CLAUDE.md → "Status"**
-for the full list and fallbacks. Treat the first pod run as a smoke test (`MISTRAL_DEPS_ONLY=1`,
-then `compare_logits.py`, then `--max_steps 20 --limit_samples 4`).
+**Locally (CPU, torch 2.12 + transformers 5.5.0):** the fused grouped LoRA-MoE forward **and
+gradients** vs an independent per-expert reference (`test_lora.py`, ~1e-7); per-tensor + block FP8
+dequant; end-to-end B=0 no-op + LoRA wiring on a tiny real `Mistral3ForConditionalGeneration`.
+
+**Still not verified:** `merge_infer.py` generation on the real model; `--low_cpu_shard_load`. See
+**CLAUDE.md → "Status"** + **"H20 node"** for the exact commands and fallbacks.
 
 ## Deploy a pod from scratch
 

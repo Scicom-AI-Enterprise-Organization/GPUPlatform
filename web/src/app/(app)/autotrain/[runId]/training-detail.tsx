@@ -873,7 +873,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           <TabsContent value="tryit" className="!flex-none">
             {(run.task_type ?? "asr") === "tts"
               ? <TtsPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
-              : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />}
+              : run.task_type === "llm"
+                ? <LlmPlaygroundTab runId={run.id} />
+                : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />}
           </TabsContent>
         )}
       </Tabs>
@@ -1738,6 +1740,208 @@ function PersistentControls({ runId, gpu }: { runId: string; gpu: string }) {
         </div>
       )}
     </div>
+  );
+}
+
+// Try-it playground (LLM, gemma-4) — load the finetuned model via vLLM (eager) on
+// the run's VM (download LoRA → merge → save → serve), then stream chat completions.
+function LlmPlaygroundTab({ runId }: { runId: string }) {
+  type Role = "user" | "assistant" | "tool";
+  type Msg = { role: Role; content: string };
+  const [st, setSt] = useState<{ running: boolean; ready: boolean; device?: string; logs?: string[] } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [ctlErr, setCtlErr] = useState<string | null>(null);
+  const [system, setSystem] = useState("");
+  const [messages, setMessages] = useState<Msg[]>([{ role: "user", content: "" }]);
+  const [streaming, setStreaming] = useState(false);
+  const [temperature, setTemperature] = useState(0.7);
+  const [maxTokens, setMaxTokens] = useState(512);
+  const [chatErr, setChatErr] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  const poll = useCallback(async () => {
+    try { setSt(await gateway.playgroundStatus(runId)); } catch { /* transient */ }
+  }, [runId]);
+  useEffect(() => { poll(); }, [poll]);
+  // The LLM load is long (download + merge + first-time vLLM venv build + serve) —
+  // keep polling the step log while it's running-but-not-ready.
+  useEffect(() => {
+    if (!st?.running || st.ready) return;
+    const t = setInterval(poll, 5000);
+    return () => clearInterval(t);
+  }, [st, poll]);
+  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }); }, [messages]);
+
+  async function ctl(fn: () => Promise<unknown>) {
+    setBusy(true); setCtlErr(null);
+    try { await fn(); await poll(); }
+    catch (e) { setCtlErr(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  }
+
+  const addMsg = () => setMessages((m) => [...m, { role: "user", content: "" }]);
+  const updateMsg = (i: number, patch: Partial<Msg>) =>
+    setMessages((m) => m.map((x, idx) => (idx === i ? { ...x, ...patch } : x)));
+  const removeMsg = (i: number) => setMessages((m) => m.filter((_, idx) => idx !== i));
+
+  // Send the current conversation (system + every non-empty message, with its chosen
+  // role) and stream the model's reply into a freshly-appended assistant message.
+  async function run() {
+    if (streaming) return;
+    const hist: { role: string; content: string }[] = [
+      ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
+      ...messages.filter((m) => m.content.trim()).map((m) => ({ role: m.role, content: m.content })),
+    ];
+    if (hist.length === 0) { setChatErr("add at least one message"); return; }
+    setStreaming(true); setChatErr(null);
+    setMessages((m) => [...m, { role: "assistant", content: "" }]);
+    const ctrl = new AbortController(); abortRef.current = ctrl;
+    const append = (delta: string) => setMessages((m) => {
+      const copy = m.slice(); const last = copy[copy.length - 1];
+      if (last && last.role === "assistant") copy[copy.length - 1] = { ...last, content: last.content + delta };
+      return copy;
+    });
+    try {
+      const res = await gateway.playgroundChatStream(runId,
+        { messages: hist, temperature, max_tokens: maxTokens }, ctrl.signal);
+      if (!res.ok || !res.body) {
+        const t = await res.text().catch(() => "");
+        throw new Error(`chat failed (${res.status})${t ? `: ${t.slice(0, 300)}` : ""}`);
+      }
+      const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (!data || data === "[DONE]") continue;
+            try {
+              const j = JSON.parse(data);
+              if (j.error) { setChatErr(String(j.error)); continue; }
+              const d = j?.choices?.[0]?.delta?.content;
+              if (typeof d === "string" && d) append(d);
+            } catch { /* ignore keepalives / non-JSON */ }
+          }
+        }
+      }
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") setChatErr(e instanceof Error ? e.message : String(e));
+    } finally { setStreaming(false); abortRef.current = null; }
+  }
+
+  function stop() { abortRef.current?.abort(); setStreaming(false); }
+
+  const dot = !st?.running ? "bg-muted-foreground/50" : st.ready ? "bg-emerald-500" : "bg-amber-500 animate-pulse";
+  const label = !st?.running ? "not loaded" : st.ready ? `ready${st.device ? ` · GPU ${st.device}` : ""}` : "loading…";
+
+  return (
+    <Card>
+      <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — chat (vLLM, eager)</CardTitle></CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+          <span className="font-medium">vLLM server</span>
+          <span className={cn("inline-block h-2 w-2 rounded-full", dot)} />
+          <span className="text-muted-foreground">{label}</span>
+          <span className="hidden text-[11px] text-muted-foreground md:inline">— download LoRA → merge → save → serve (first load builds the vLLM venv; ~15–20 min)</span>
+          <div className="ml-auto flex items-center gap-2">
+            {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+            {!st?.running ? (
+              <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
+                onClick={() => ctl(() => gateway.playgroundStart(runId))}>Load model</Button>
+            ) : (
+              <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
+                onClick={() => ctl(() => gateway.playgroundStop(runId))}>Unload</Button>
+            )}
+          </div>
+          {ctlErr && <span className="w-full text-destructive">{ctlErr}</span>}
+          {st?.running && (st.logs?.length ?? 0) > 0 && (
+            <div className="terminal-block max-h-48 w-full overflow-y-auto rounded-md border border-border bg-zinc-950 p-2 font-mono text-[10px] leading-snug text-zinc-300">
+              {st.logs!.map((l, i) => (
+                <div key={i} className={
+                  l.includes("✅") ? "text-emerald-300"
+                    : (l.includes("ERROR") || l.includes("❌")) ? "text-red-300"
+                    : l.includes("[playground]") ? "text-sky-300" : "text-zinc-400"
+                }>{l}</div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="grid gap-2 sm:grid-cols-[1fr_auto_auto] sm:items-end">
+          <div>
+            <label className="text-[11px] text-muted-foreground">System prompt (optional)</label>
+            <Input value={system} onChange={(e) => setSystem(e.target.value)} placeholder="You are a helpful assistant." className="h-8 text-sm" />
+          </div>
+          <div>
+            <label className="pr-3 text-[11px] text-muted-foreground">Temp</label>
+            <Input type="number" min={0} max={2} step={0.1} value={temperature}
+              onChange={(e) => setTemperature(Math.max(0, Math.min(2, Number(e.target.value) || 0)))}
+              className="h-8 w-20 font-mono text-sm" />
+          </div>
+          <div>
+            <label className="pr-3 text-[11px] text-muted-foreground">Max tokens</label>
+            <Input type="number" min={1} max={8192} step={64} value={maxTokens}
+              onChange={(e) => setMaxTokens(Math.max(1, Number(e.target.value) || 1))}
+              className="h-8 w-24 font-mono text-sm" />
+          </div>
+        </div>
+
+        {/* Editable conversation — each message has a role (user / assistant / tool).
+            Run streams the model's reply into a new assistant message you can then keep
+            editing for multi-turn / few-shot / tool-result replay. */}
+        <div ref={scrollRef} className="max-h-[460px] space-y-2 overflow-y-auto rounded-md border border-border p-3">
+          {messages.length === 0 && (
+            <div className="text-xs text-muted-foreground">No messages — add one to start.</div>
+          )}
+          {messages.map((m, i) => {
+            const streamingLast = streaming && i === messages.length - 1 && m.role === "assistant";
+            return (
+              <div key={i} className="flex items-start gap-2">
+                <Select value={m.role} onValueChange={(v) => updateMsg(i, { role: v as Role })} disabled={streaming}>
+                  <SelectTrigger className="h-8 w-28 shrink-0 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="user">user</SelectItem>
+                    <SelectItem value="assistant">assistant</SelectItem>
+                    <SelectItem value="tool">tool</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Textarea value={m.content} onChange={(e) => updateMsg(i, { content: e.target.value })}
+                  rows={2} disabled={streaming}
+                  placeholder={m.role === "tool" ? "tool result…" : m.role === "assistant" ? "assistant message…" : "user message…"}
+                  onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); run(); } }}
+                  className={cn("flex-1 bg-transparent text-sm dark:bg-transparent", streamingLast && "animate-pulse")} />
+                <Button type="button" variant="ghost" className="h-8 shrink-0 px-2" disabled={streaming}
+                  onClick={() => removeMsg(i)} aria-label="remove message"><X className="h-4 w-4" /></Button>
+              </div>
+            );
+          })}
+        </div>
+        {chatErr && <div className="text-xs text-destructive">{chatErr}</div>}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" variant="outline" className="h-8 text-xs" disabled={streaming} onClick={addMsg}>
+            + Add message
+          </Button>
+          <span className="text-[11px] text-muted-foreground">⌘/Ctrl+Enter to run</span>
+          <div className="ml-auto flex items-center gap-2">
+            {!streaming && messages.some((m) => m.content.trim()) && (
+              <Button type="button" variant="ghost" className="h-8"
+                onClick={() => setMessages([{ role: "user", content: "" }])}>Clear</Button>
+            )}
+            {streaming ? (
+              <Button type="button" variant="outline" onClick={stop}>Stop</Button>
+            ) : (
+              <Button type="button" onClick={run} disabled={!st?.ready || !messages.some((m) => m.content.trim())}>Run</Button>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

@@ -29,6 +29,10 @@ MISTRAL_DEPS_ONLY="${MISTRAL_DEPS_ONLY:-0}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 
+# Fused Triton FP8 dequant (bit-exact vs torch, ~7-13x; see dequant_triton.py / bench_dequant.py).
+# Falls back to torch automatically if triton is unavailable or the weight is off-CUDA.
+export MISTRAL_DEQUANT_TRITON="${MISTRAL_DEQUANT_TRITON:-1}"
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd, -)}"
 NPROC="$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)"
 echo ">> GPUs: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES  nproc_per_node=$NPROC"

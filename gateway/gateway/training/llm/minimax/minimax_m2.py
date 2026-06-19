@@ -1,27 +1,19 @@
-"""Mistral-Small-4-119B (FP8 MoE + MLA) LoRA finetune — FSDP2 across 4x H100.
+"""MiniMax-M2 (230B/10B-active FP8 MoE) LoRA finetune — FSDP2 across 4x H100.
 
-Standalone training job (NOT part of the gateway), the Mistral-Small-4 analogue of the
-minimax-m2 sibling. LoRA-finetunes the TEXT model of `mistralai/Mistral-Small-4-119B-2603`
-(a `Mistral3ForConditionalGeneration` multimodal model whose language model is a 119B-total
-`mistral4` MoE: 128 routed experts top-4 + 1 shared expert, 36 layers, MLA attention).
+Standalone training job (NOT part of the gateway), the MiniMax-M2 analogue of `gemma4.py`.
 
-Architecture vs minimax-m2 (see CLAUDE.md for the full table):
-  * MoE: 128 routed experts (top-4) + 1 SHARED expert, 36 layers; routed experts stored as
-    3D fused expert params (FP8Experts). Shared expert is a dense SwiGLU MLP (FP8Linear).
-  * Attention: MLA (DeepSeek-style) — compressed-latent q (q_lora_rank 1024) + kv
-    (kv_lora_rank 256) projections, but a UNIFORM head_dim 128 (qk_head_dim == v_head_dim)
-    so every layer runs stock flash attention with native varlen packing (NO custom attn).
-  * Weights are FP8 PER-TENSOR (`weight_block_size=null`, static activations). We keep the
-    base FROZEN in FP8 and train bf16 LoRA on the MLA projections + routed/shared experts
-    (see `lora.py`), running the frozen base through a DIFFERENTIABLE on-the-fly dequant
-    (transformers' FP8 kernels are inference-only; the fused/grouped/deepgemm experts
-    dispatches even refuse activation_scheme="static"). Activation checkpointing keeps the
+Architecture vs gemma-4 (see CLAUDE.md for the full table):
+  * MoE: 256 experts, top-8, 62 layers; stored as 3D fused expert params (FP8Experts).
+  * Attention: uniform head_dim 128, all full attention, GQA 48/8 -> stock
+    `flash_attention_2` with native varlen packing (NO custom attention needed).
+  * Weights are FP8 block-quantized; we keep the base FROZEN in FP8 and train bf16 LoRA on
+    q/k/v/o + the MoE expert FFNs (see `lora.py`). The frozen base forward is run through a
+    DIFFERENTIABLE on-the-fly dequant (transformers' FP8 Triton/DeepGEMM kernels are
+    inference-only / non-differentiable), with activation checkpointing keeping the
     transient bf16 weights memory-cheap.
-  * Multimodal wrapper: we load the full `Mistral3ForConditionalGeneration`, freeze the
-    vision tower + projector, and run the TEXT-only forward through `model.language_model`.
 
 Launch (run.sh wraps this):
-    NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0 torchrun --nproc_per_node=4 mistral_small.py [flags]
+    NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0 torchrun --nproc_per_node=4 minimax_m2.py [flags]
 """
 import argparse
 import json
@@ -45,35 +37,19 @@ from torch.utils.data import DataLoader, Dataset as TorchDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from transformers import AutoConfig, Mistral3ForConditionalGeneration
-from transformers.models.mistral4 import modeling_mistral4
+from transformers import AutoConfig, MiniMaxM2ForCausalLM
+from transformers.models.minimax_m2 import modeling_minimax_m2
 
 from chinidataset import StreamingDataset
-from lora import ATTN_TARGETS, apply_mistral_lora
+from lora import ATTN_TARGETS, apply_minimax_lora
 
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
 logger = logging.getLogger()
 
-MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Mistral-Small-4-119B-2603")
-# FA3 (Hopper) reuses the proven prebuilt wheel + torch 2.12; head_dim 128 works on FA2 or FA3.
-# transformers routes both to the same varlen integration (consumes cu_seq_lens_q/k).
-ATTN_IMPL = os.environ.get("MISTRAL_ATTN_IMPL", "flash_attention_3")
-
-
-def load_patched_config(model_id: str = MODEL_ID):
-    """AutoConfig for Mistral-Small-4 + the transformers 5.5.0 FP8 workaround.
-
-    transformers 5.5.0's `FP8Experts.__init__` does `getattr(config, "num_local_experts",
-    config.num_experts)`. Python evaluates the *default* `config.num_experts` eagerly, and
-    `Mistral4Config` only exposes `num_local_experts` (via attribute_map) — there is no
-    `num_experts` — so the load crashes with AttributeError before getattr even runs. Set
-    `num_experts` on the text config (== num_local_experts) to dodge the eager default.
-    """
-    config = AutoConfig.from_pretrained(model_id)
-    tc = config.get_text_config()
-    if not hasattr(tc, "num_experts"):
-        tc.num_experts = tc.num_local_experts
-    return config
+MODEL_ID = os.environ.get("MODEL_ID", "MiniMaxAI/MiniMax-M2")
+# FA3 (Hopper) reuses gemma4's proven prebuilt wheel + torch 2.12; head_dim 128 works on FA2 or
+# FA3. transformers routes both to the same varlen integration (consumes cu_seq_lens_q/k).
+ATTN_IMPL = os.environ.get("MINIMAX_ATTN_IMPL", "flash_attention_3")
 
 
 def ddp_setup():
@@ -83,7 +59,7 @@ def ddp_setup():
 
 
 class PackedDataset(TorchDataset):
-    """Reads the multipacked ChiniDataset built by pack_dataset.py (same format as minimax-m2)."""
+    """Reads the multipacked ChiniDataset built by pack_dataset.py (same format as gemma4)."""
 
     def __init__(self, local: str = "./packed_data", limit: int = 0):
         self.dataset = StreamingDataset(local=local)
@@ -105,10 +81,10 @@ class PackedDataset(TorchDataset):
 def collator(batch):
     """Concatenate packed bins into ONE varlen sequence + cu_seqlens (B is always 1).
 
-    Mistral-Small-4's text model is uniform head_dim 128, so there is no custom attention:
-    stock flash attention consumes cu_seq_lens_q/k (+ max_length_q/k) and the per-doc-reset
-    position_ids to keep attention per-document causal over the pack. Use --batch_size 1 so
-    a step is one packed bin (the collator concatenates the whole batch).
+    MiniMax-M2 is text-only with uniform head_dim 128, so there is no mm_token_type_ids and
+    no custom attention: stock flash_attention_2 consumes cu_seq_lens_q/k (+ max_length_q/k)
+    and the per-doc-reset position_ids to keep attention per-document causal over the pack.
+    Use --batch_size 1 so a step is one packed bin (the collator concatenates the whole batch).
     """
     batch = [b for b in batch if b is not None]
     input_ids = np.concatenate([b["input_ids"] for b in batch])
@@ -133,13 +109,12 @@ def collator(batch):
     }
 
 
-class CustomMistral3ForCausalLM(Mistral3ForConditionalGeneration):
-    """Text-only training forward + Liger FusedLinearCrossEntropy loss.
+class CustomMiniMaxM2ForCausalLM(MiniMaxM2ForCausalLM):
+    """Compute the loss with Liger FusedLinearCrossEntropy directly from the hidden states.
 
-    We bypass the vision path entirely (no pixel inputs) by calling the language model
-    submodule directly, and compute the loss with Liger FLCE straight from the hidden
-    states: Mistral-Small-4's vocab is 131,072 — materialising (1, S, 131k) logits OOMs at
-    long S, and FLCE fuses the lm_head matmul + cross-entropy without ever building it.
+    MiniMax-M2's vocab is 200,064 — materializing (1, S, 200k) logits OOMs at long S.
+    Liger FLCE fuses the lm_head matmul + cross-entropy without ever building the full
+    logits tensor (same trick as gemma4's CustomGemma4ForConditionalGeneration).
     """
 
     def __init__(self, config):
@@ -149,11 +124,12 @@ class CustomMistral3ForCausalLM(Mistral3ForConditionalGeneration):
 
     def forward(self, input_ids=None, position_ids=None, attention_mask=None,
                 labels=None, use_cache=False, **kwargs):
-        outputs = self.model.language_model(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
+            return_dict=True,
             **kwargs,  # carries cu_seq_lens_q/k + max_length_q/k through to flash attention
         )
         hidden_states = outputs.last_hidden_state
@@ -169,63 +145,62 @@ class CustomMistral3ForCausalLM(Mistral3ForConditionalGeneration):
 # ---------------------------------------------------------------------------
 # Low-CPU sharded load (--low_cpu_shard_load)
 # ---------------------------------------------------------------------------
-# The DEFAULT path has every rank `from_pretrained` the full ~119GB model to CPU before FSDP2
-# shards it to GPU -> ~119GB x world_size of CPU. This path instead builds the FP8 module
-# structure on META (no weights) on every rank, shards it, then streams the base weights from
-# rank 0 only (DCP broadcast_from_rank0) straight into each rank's local shard.
+# The DEFAULT path has every rank `from_pretrained` the full ~230GB model to CPU before FSDP2
+# shards it to GPU -> ~230GB x world_size of CPU (≈1.8TB at 8 ranks; the #2 risk in CLAUDE.md).
+# This path instead builds the FP8 module structure on META (no weights) on every rank, shards
+# it, then streams the base weights from rank 0 only (DCP broadcast_from_rank0) straight into each
+# rank's local shard — capping CPU at ~one full copy on rank 0.
 def build_meta_lora_model(config, args):
-    """Meta-init the FP8 structure on EVERY rank (no weights) + apply LoRA (meta, uninitialised)."""
+    """Meta-init the FP8 structure on EVERY rank (no weights) + apply LoRA (meta, uninitialised).
+
+    The FP8Linear/FP8Experts modules are produced exactly as `from_pretrained` would, by running
+    the HF quantizer's pre-load module swap on a meta-built model. LoRA `kaiming_uniform_` can't run
+    on meta tensors (no RNG fill), so `lora.py` skips it on meta and `_reinit_lora_` does it after
+    `to_empty`. Returns (meta_model, stats)."""
     from transformers.quantizers import AutoHfQuantizer
     prev = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)  # non-fp8 parts (norms/embed/lm_head/router/vision) -> bf16
+    torch.set_default_dtype(torch.bfloat16)  # non-fp8 parts (norms/embed/lm_head/router) -> bf16
     try:
         with torch.device("meta"):
-            model = CustomMistral3ForCausalLM(config)
+            model = CustomMiniMaxM2ForCausalLM(config)
     finally:
         torch.set_default_dtype(prev)
     hf_quantizer = AutoHfQuantizer.from_config(config.quantization_config)
     hf_quantizer._process_model_before_weight_loading(model)  # Linear->FP8Linear, experts->FP8Experts
-    stats = apply_mistral_lora(
+    stats = apply_minimax_lora(
         model,
         attn_r=args.attn_r, attn_alpha=args.attn_alpha,
         moe_r=args.moe_r, moe_alpha=args.moe_alpha,
-        include_moe=not args.no_moe_lora, include_shared=not args.no_shared_lora,
+        include_moe=not args.no_moe_lora,
     )
     return model, stats
 
 
-# LinearLoRA wraps the frozen Linear, so the model FQN becomes `...{proj}.base.{weight,...}`.
-# Insert `.base` after the wrapped projection segment so the rank-0 state_dict matches. This
-# segment-replace catches weight, weight_scale_inv AND activation_scale in one shot.
-_WRAPPED_SEGMENTS = tuple(f".self_attn.{p}." for p in ATTN_TARGETS) + (
-    ".shared_experts.gate_proj.", ".shared_experts.up_proj.", ".shared_experts.down_proj.",
-)
-
-
 def _remap_base_keys_for_lora(sd):
+    """Rank-0's `from_pretrained` state_dict uses `...self_attn.{proj}.weight`, but `LinearLoRA`
+    wraps the frozen Linear so the model's FQN is `...self_attn.{proj}.base.weight`. Insert `.base`
+    so DCP matches. Expert (`mlp.experts.*`), norm, embed, lm_head, router keys are unchanged."""
     out = {}
     for k, v in sd.items():
         nk = k
-        for seg in _WRAPPED_SEGMENTS:
-            if seg in k:
-                nk = k.replace(seg, seg[:-1] + "base.", 1)
+        for proj in ATTN_TARGETS:
+            tag = f".self_attn.{proj}."
+            if tag in k:
+                nk = k.replace(tag, f".self_attn.{proj}.base.", 1)
                 break
-        # Match _promote_scalar_params: 0-dim scalars (per-tensor weight_scale_inv/activation_scale)
-        # become shape (1,) on the sharded model, so reshape the source tensors too.
-        out[nk] = v.reshape(1) if hasattr(v, "dim") and v.dim() == 0 else v
+        out[nk] = v
     return out
 
 
-def load_base_weights_broadcast(model, config, rank):
+def load_base_weights_broadcast(model, rank):
     """Fill the (materialised, sharded) model's base weights from rank 0's full CPU state_dict via
-    DCP broadcast. Only rank 0 holds the full ~119GB copy; other ranks receive their shard."""
+    DCP broadcast. Only rank 0 holds the full ~230GB copy; other ranks receive their shard."""
     from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
     full_sd = {}
     if rank == 0:
         logger.info(f"[Rank0] loading full base state_dict to CPU for broadcast ({MODEL_ID})")
-        src = CustomMistral3ForCausalLM.from_pretrained(
-            MODEL_ID, config=config, dtype=torch.bfloat16, attn_implementation=ATTN_IMPL,
-            low_cpu_mem_usage=True)
+        src = CustomMiniMaxM2ForCausalLM.from_pretrained(
+            MODEL_ID, dtype=torch.bfloat16, attn_implementation=ATTN_IMPL, low_cpu_mem_usage=True)
         full_sd = _remap_base_keys_for_lora(src.state_dict())
         del src
     set_model_state_dict(
@@ -234,26 +209,9 @@ def load_base_weights_broadcast(model, config, rank):
     )
 
 
-def _promote_scalar_params(model):
-    """FSDP2 `fully_shard` rejects 0-dim (scalar) parameters. Mistral-Small-4 is PER-TENSOR FP8,
-    so each `FP8Linear` stores `weight_scale_inv` (and, with static activations, `activation_scale`)
-    as a *scalar* Parameter -> "fully_shard doesn't support scalar parameters". Reshape every 0-dim
-    param to shape (1,) before sharding. This is numerically transparent: the per-tensor dequant
-    (`w.float() * scale_inv`) and the Triton kernel both broadcast a (1,) scale exactly like a
-    scalar. (minimax-m2 was 128x128 block-scaled, so its scale_inv was already >=2D and never hit
-    this.)"""
-    n = 0
-    for module in model.modules():
-        for name, p in list(module.named_parameters(recurse=False)):
-            if p is not None and p.dim() == 0:
-                new = nn.Parameter(p.detach().reshape(1), requires_grad=p.requires_grad)
-                setattr(module, name, new)
-                n += 1
-    return n
-
-
 def _reinit_lora_(model):
-    """Re-initialise LoRA adapters on the materialised (sharded) tensors: A=kaiming, B=0."""
+    """Re-initialise LoRA adapters on the materialised (sharded) tensors: A=kaiming, B=0. Operates
+    on the local shard (fan_in is dim-0-shard-invariant, so kaiming is correct)."""
     from lora import LinearLoRA
     from torch.distributed.tensor import DTensor
 
@@ -265,7 +223,7 @@ def _reinit_lora_(model):
             if isinstance(m, LinearLoRA):
                 nn.init.kaiming_uniform_(loc(m.lora_a.weight))
                 nn.init.zeros_(loc(m.lora_b.weight))
-            if hasattr(m, "gate_up_lora_a"):  # FP8Experts carrying routed-expert LoRA
+            if hasattr(m, "gate_up_lora_a"):  # FP8Experts carrying expert LoRA
                 nn.init.kaiming_uniform_(loc(m.gate_up_lora_a))
                 nn.init.kaiming_uniform_(loc(m.down_lora_a))
                 nn.init.zeros_(loc(m.gate_up_lora_b))
@@ -280,43 +238,43 @@ def main(args):
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("shard",))
 
     # ---- load the FP8 model (frozen base) -----------------------------------
-    # Native transformers class (NOT trust_remote_code). The fp8 quantization_config lives in
-    # the model config, so from_pretrained loads the MLA q/kv/o + shared expert as FP8Linear
-    # and the routed experts as FP8Experts automatically (after the num_experts workaround).
-    config = load_patched_config(MODEL_ID)
+    # Native transformers class (NOT trust_remote_code) so we get the built-in FP8 +
+    # fused-experts integration. The fp8 quantization_config lives in the model config, so
+    # from_pretrained loads q/k/v/o as FP8Linear and the experts as FP8Experts automatically.
+    config = AutoConfig.from_pretrained(MODEL_ID)
     if args.low_cpu_shard_load:
+        # META structure on every rank (no weights); base weights stream in from rank 0 after shard.
         logger.info(f"[Rank{rank}] meta-init {MODEL_ID} (FP8 structure, low-CPU sharded load)")
         model, stats = build_meta_lora_model(config, args)
     else:
         logger.info(f"[Rank{rank}] loading {MODEL_ID} (FP8, frozen base)")
-        model = CustomMistral3ForCausalLM.from_pretrained(
+        model = CustomMiniMaxM2ForCausalLM.from_pretrained(
             MODEL_ID,
             config=config,
-            dtype=torch.bfloat16,             # non-quantized parts (norms, router, lm_head, vision)
+            dtype=torch.bfloat16,             # non-quantized parts (norms, router gate, lm_head)
             attn_implementation=ATTN_IMPL,
             low_cpu_mem_usage=True,
         )
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(f"[Rank{rank}] params: {total_params/1e9:.1f}B")
 
-        # ---- LoRA: freeze base, wrap MLA attn + routed/shared experts -----------
-        stats = apply_mistral_lora(
+        # ---- LoRA: freeze base, wrap attn q/k/v/o + MoE experts -----------------
+        stats = apply_minimax_lora(
             model,
             attn_r=args.attn_r, attn_alpha=args.attn_alpha,
             moe_r=args.moe_r, moe_alpha=args.moe_alpha,
-            include_moe=not args.no_moe_lora, include_shared=not args.no_shared_lora,
+            include_moe=not args.no_moe_lora,
         )
     logger.info(
-        f"[Rank{rank}] LoRA: wrapped {stats['attn_modules_wrapped']} attn + "
-        f"{stats['shared_modules_wrapped']} shared blocks, adapted {stats['moe_blocks_adapted']} "
-        f"routed-MoE blocks | attn {stats['attn_lora_params']/1e6:.1f}M + moe "
-        f"{stats['moe_lora_params']/1e6:.1f}M + shared {stats['shared_lora_params']/1e6:.1f}M "
+        f"[Rank{rank}] LoRA: wrapped {stats['attn_modules_wrapped']} attn blocks, "
+        f"adapted {stats['moe_blocks_adapted']} MoE blocks | "
+        f"attn {stats['attn_lora_params']/1e6:.1f}M + moe {stats['moe_lora_params']/1e6:.1f}M "
         f"= {stats['trainable_params']/1e6:.1f}M trainable"
     )
 
     # ---- FSDP2: shard each decoder layer + root -----------------------------
     # param_dtype is left at None: FSDP2 must NOT cast the frozen FP8 weights to bf16 (that
-    # would defeat the per-tensor dequant). Each param keeps its storage dtype (fp8 frozen,
+    # would defeat the block-scale dequant). Each param keeps its storage dtype (fp8 frozen,
     # bf16 LoRA/norms, fp32 scales); only gradient reduction is forced to fp32.
     fsdp_kwargs = {
         "mp_policy": fsdp.MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32),
@@ -325,28 +283,26 @@ def main(args):
     if args.cpu_offload:
         fsdp_kwargs["offload_policy"] = fsdp.CPUOffloadPolicy()
 
-    # Per-tensor FP8 stores scalar weight_scale_inv/activation_scale; FSDP2 needs them 1D.
-    n_promoted = _promote_scalar_params(model)
-    logger.info(f"[Rank{rank}] promoted {n_promoted} scalar (0-dim) params to shape (1,) for FSDP2")
-
     for module in model.modules():
-        if isinstance(module, modeling_mistral4.Mistral4DecoderLayer):
+        if isinstance(module, modeling_minimax_m2.MiniMaxM2DecoderLayer):
             fsdp.fully_shard(module, **fsdp_kwargs)
     fsdp.fully_shard(model, **fsdp_kwargs)
 
     # ---- low-CPU path: materialise the sharded meta model, then stream base weights in ----
     if args.low_cpu_shard_load:
         model.to_empty(device=f"cuda:{rank}")          # allocate real (empty) local shards
-        load_base_weights_broadcast(model, config, rank)  # rank-0 full sd -> broadcast into shards
+        load_base_weights_broadcast(model, rank)        # rank-0 full sd -> broadcast into shards
         _reinit_lora_(model)                            # A=kaiming, B=0 on the real tensors
         logger.info(f"[Rank{rank}] low-CPU sharded load complete")
 
     # ---- activation checkpointing (REQUIRED for the dequant memory trick) ----
+    # Each decoder layer's forward (incl. the transient bf16 weight dequant) is recomputed in
+    # the backward instead of retained, so peak memory stays ~ one layer's bf16 weights.
     non_reentrant = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
     apply_activation_checkpointing(
         model,
         checkpoint_wrapper_fn=non_reentrant,
-        check_fn=lambda m: isinstance(m, modeling_mistral4.Mistral4DecoderLayer),
+        check_fn=lambda m: isinstance(m, modeling_minimax_m2.MiniMaxM2DecoderLayer),
     )
 
     model_sd = model.state_dict()
@@ -372,7 +328,6 @@ def main(args):
         wandb_run = wandb.init(project=args.wandb_project, config={
             "model": MODEL_ID, "attn_r": args.attn_r, "attn_alpha": args.attn_alpha,
             "moe_r": args.moe_r, "moe_alpha": args.moe_alpha, "moe_lora": not args.no_moe_lora,
-            "shared_lora": not args.no_shared_lora,
             "lr": args.lr, "batch_size": args.batch_size, "max_epochs": args.max_epochs,
             "max_steps": args.max_steps, "world_size": world_size, "num_bins": len(dataset),
             "trainable_params_M": round(stats["trainable_params"] / 1e6, 2),
@@ -446,24 +401,21 @@ def save_lora(model, args, rank, stats):
                 "moe_r": args.moe_r, "moe_alpha": args.moe_alpha,
                 "moe_scaling": args.moe_alpha / args.moe_r,
                 "moe_lora": not args.no_moe_lora,
-                "shared_lora": not args.no_shared_lora,
-                "attn_targets": list(ATTN_TARGETS),
+                "attn_targets": ["q_proj", "k_proj", "v_proj", "o_proj"],
                 "moe_targets": ["gate_up_proj", "down_proj"],
-                "shared_targets": ["gate_proj", "up_proj", "down_proj"],
             }, f, indent=2)
         logger.info(f"saved LoRA ({len(sd)} tensors) -> {args.out_dir}/lora.pt")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--attn_r", type=int, default=16, help="LoRA rank for MLA q_a/q_b/kv_a/kv_b/o.")
+    p.add_argument("--attn_r", type=int, default=16, help="LoRA rank for attention q/k/v/o.")
     p.add_argument("--attn_alpha", type=float, default=16.0, help="LoRA alpha for attention (scaling=alpha/r).")
-    p.add_argument("--moe_r", type=int, default=16, help="LoRA rank for routed + shared expert FFNs.")
-    p.add_argument("--moe_alpha", type=float, default=16.0, help="LoRA alpha for the expert FFNs.")
-    p.add_argument("--no_moe_lora", action="store_true", help="Adapt attention only (skip all experts).")
-    p.add_argument("--no_shared_lora", action="store_true", help="Skip the shared-expert MLP (keep routed).")
+    p.add_argument("--moe_r", type=int, default=16, help="LoRA rank for MoE expert FFNs.")
+    p.add_argument("--moe_alpha", type=float, default=16.0, help="LoRA alpha for MoE experts.")
+    p.add_argument("--no_moe_lora", action="store_true", help="Adapt attention only (skip MoE experts).")
     p.add_argument("--batch_size", type=int, default=1, help="Packed bins per step (keep 1; collator concatenates).")
-    p.add_argument("--lr", type=float, default=1e-5, help="AdamW LR (LoRA lesson: 1e-5..5e-5, scaling<=1, few epochs).")
+    p.add_argument("--lr", type=float, default=1e-5, help="AdamW LR (gemma4 lesson: 1e-5..5e-5 for LoRA).")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--max_epochs", type=int, default=1)
     p.add_argument("--max_steps", type=int, default=0, help="Hard stop after N steps (0 = all epochs).")
@@ -475,7 +427,7 @@ if __name__ == "__main__":
     p.add_argument("--low_cpu_shard_load", action="store_true",
                    help="Meta-init the FP8 structure on every rank + stream base weights from rank 0 "
                         "(DCP broadcast) into each shard. Caps CPU at ~one model copy instead of "
-                        "~119GB x world_size. Default path loads the full model on every rank.")
+                        "~230GB x world_size. Default path loads the full model on every rank.")
     p.add_argument("--wandb", action="store_true")
-    p.add_argument("--wandb_project", default="mistral-small-4-autotrain")
+    p.add_argument("--wandb_project", default="minimax-m2-autotrain")
     main(p.parse_args())

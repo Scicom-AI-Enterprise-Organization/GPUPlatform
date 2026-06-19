@@ -468,6 +468,25 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/playground/stop`,
       { method: "POST" },
     ),
+  /** LLM try-it: stream a chat completion from the run's vLLM server. Returns the
+   * raw streaming Response (OpenAI SSE) — the caller reads response.body. Client-only
+   * (goes through /api/proxy, which pipes text/event-stream through unbuffered). */
+  playgroundChatStream: (
+    id: string,
+    body: {
+      messages: { role: string; content: string }[];
+      temperature?: number;
+      top_p?: number;
+      max_tokens?: number;
+    },
+    signal?: AbortSignal,
+  ): Promise<Response> =>
+    fetch(`/api/proxy/v1/training-runs/${encodeURIComponent(id)}/playground/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    }),
 
   // ---- Experiment-tracker credentials (Secrets page card) ----
   listTrackingCredentials: (kind?: "wandb" | "mlflow") =>

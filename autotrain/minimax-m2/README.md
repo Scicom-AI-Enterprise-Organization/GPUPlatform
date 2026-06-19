@@ -21,7 +21,10 @@ The interesting part is **LoRA on a frozen FP8 MoE**:
 |------|------|
 | `minimax_m2.py` | training entrypoint — run with `torchrun` (FSDP2, packed varlen, Liger FLCE) |
 | `lora.py` | `LinearLoRA` (q/k/v/o) + fused grouped-MoE expert LoRA + FP8 block dequant |
+| `dequant_triton.py` | Triton blockwise FP8→bf16 dequant (autograd) — `lora.py`'s CUDA fast path |
+| `bench_dequant.py` | Triton-vs-PyTorch dequant correctness + speed (fwd & bwd), random fp8 weights |
 | `test_lora.py` | CPU correctness test: fused LoRA-MoE fwd+grads vs a per-expert reference |
+| `compare_logits.py` | GPU logits check on the real model: LoRA(B=0) vs an independent bf16 reference |
 | `pack_dataset.py` | build the multipacked ChiniDataset from a chat parquet (MiniMax-M2 template) |
 | `merge_infer.py` | attach the trained LoRA to the FP8 base and generate |
 | `run.sh` | one-shot pod bootstrap: deps → LoRA test → pack/download → train |
@@ -79,16 +82,42 @@ python pack_dataset.py --out ./packed_data                      # default Functi
 python pack_dataset.py --repo <repo> --file <parquet> --max-rows 10   # any chat parquet / quick test
 ```
 
+## Triton FP8 dequant — speed (`dequant_triton.py`)
+
+The block-scaled FP8→bf16 dequant runs on every frozen attn proj + every MoE expert tensor, every
+layer, every step — so `lora.py` dispatches it to a Triton kernel on CUDA (fuses upcast·scale·
+downcast in one pass, one scale load per 128×128 block; env `MINIMAX_DEQUANT_TRITON=0` to force the
+PyTorch path; CPU / triton-less boxes fall back automatically). Backward **is** supported as a
+`torch.autograd.Function`: the FP8 weight is non-differentiable → grad `None`; `scale_inv` gets an
+analytic grad. Reproduce with `python bench_dequant.py`.
+
+**Microbenchmark — 1× H100, Triton vs PyTorch (`bench_dequant.py`):**
+
+| tensor | shape | forward | fwd **speedup** | fwd+bwd | fwd+bwd speedup | correctness (vs PyTorch) |
+|--------|-------|---------|-----------------|---------|-----------------|--------------------------|
+| attn proj (2D) | `(3072, 3072)` | 23.7µs / 89.8µs | **3.8×** | 306µs / 367µs | 1.2× | fwd **bit-exact**, bwd rel 8.8e-8 |
+| MoE `gate_up` | `(256, 3072, 3072)` | 2.68ms / 23.8ms | **8.9×** | 44.3ms / 142.3ms | 3.2× | fwd **bit-exact**, bwd rel 1.5e-7 |
+| MoE `down` | `(256, 3072, 1536)` | 1.33ms / 12.0ms | **9.0×** | 22.2ms / 71.6ms | 3.2× | fwd **bit-exact**, bwd rel 1.0e-7 |
+
+(times are `triton / pytorch`; forward is bit-exact so loss is unchanged. backward grad is w.r.t.
+`scale_inv` — matches PyTorch autograd to ~1e-7.)
+
+**End-to-end** (full 32k finetune, 8× H100): **~12.4k tok/s** with Triton vs **~10.3k** with the
+PyTorch dequant → **~20% higher training throughput**, identical loss curve.
+
 ## What is verified vs what needs the pod
 
-**Verified locally (CPU, torch 2.12 + transformers 5.5.0):** the fused grouped LoRA-MoE forward
-**and gradients** vs an independent per-expert reference (`test_lora.py`, ~1e-7); the FP8 block
-dequant; the chat-template reasoning relaxation + packing invariants; imports/symbols.
+**Verified locally (CPU):** the fused grouped LoRA-MoE forward **and gradients** vs an independent
+per-expert reference (`test_lora.py`, ~1e-7); the FP8 block dequant; chat-template packing.
 
-**Needs validation on a 4× H100 pod (no such hardware available here):** FSDP2 all-gather of FP8
-params, CPU RAM at load (~230GB×ranks), end-to-end loss/throughput, and the FA3 varlen path on the
-real model. See **CLAUDE.md → "Status"** for the full list and fallbacks. Treat the first pod run
-as a smoke test (`MINIMAX_DEPS_ONLY=1`, then `--max_steps 20 --limit_samples 4`).
+**Verified on an 8× H100 pod (2026-06-19):** the full **32k finetune runs end-to-end** — FSDP2
+all-gather of FP8 params works, loss decreases (7.4 → ~5.1, lr 5e-5, 3 epochs), LoRA pushed to
+[`huseinzolkepliscicom/minimax-m2-funccall-lora-32k`](https://huggingface.co/huseinzolkepliscicom/minimax-m2-funccall-lora-32k).
+`compare_logits.py` matched our forward to an independent bf16 reference (top-1 + cosine>0.997;
+the stock FP8 *inference* forward NaNs). The Triton dequant gave ~20% more tok/s with no loss
+change. `--low_cpu_shard_load` (meta-init + rank-0 broadcast) caps load-time CPU at ~one model
+copy (265GB) instead of ~230GB×ranks. See **CLAUDE.md → "Status"** for details. First pod run is
+still best treated as a smoke test (`MINIMAX_DEPS_ONLY=1`, then `--max_steps 20 --limit_samples 4`).
 
 ## Deploy a pod from scratch
 

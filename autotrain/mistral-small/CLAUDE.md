@@ -14,6 +14,8 @@ attention**, FP8 per-tensor.
 mistral_small.py   training entrypoint (torchrun, FSDP2, packed varlen, Liger FLCE)
 lora.py            the interesting part — LinearLoRA (MLA q_a/q_b/kv_a/kv_b/o + shared MLP)
                    + fused grouped-MoE routed-expert LoRA + per-tensor FP8 dequant
+dequant_triton.py  fused Triton per-tensor FP8->bf16*scale dequant (7-13x; MISTRAL_DEQUANT_TRITON=1)
+bench_dequant.py   GPU benchmark: Triton vs torch dequant — fwd/bwd parity + speed + peak memory
 test_lora.py       CPU correctness: per-tensor+block dequant, LinearLoRA, fused MoE fwd+grads
 compare_logits.py  GPU logits check on the real model: our LoRA(B=0) vs an independent bf16 ref
 pack_dataset.py    build the multipacked ChiniDataset from a chat parquet (Mistral-Small-4 template)
@@ -82,6 +84,29 @@ stays ~ one layer's bf16 weights. ⚠ Activation checkpointing is **load-bearing
 (`MISTRAL_DEQUANT_EXPERT_CHUNK`, default 16) so the fp32 transient is bounded — only matters for the
 full-model compare/merge paths (under FSDP each rank holds 1/world_size of the experts). The helper
 also handles 128×128 block layouts (for the unit test / block-quantized siblings).
+
+### Triton dequant (`dequant_triton.py`) — the fast path, ~7-13x
+
+The torch dequant materialises a full **fp32 transient** (`w.to(fp32) * scale -> .to(bf16)`, ~3
+passes). `dequant_triton.py` fuses it into one pass (load fp8 → multiply per-expert scale in
+registers → store bf16, no fp32 transient). Set **`MISTRAL_DEQUANT_TRITON=1`** (or assign
+`lora._TRITON_DEQUANT`) and `lora.dequantize_fp8` routes CUDA per-tensor weights through it; CPU/meta
+fall back to torch. **POD-VERIFIED on H20 (`bench_dequant.py`): forward is BIT-IDENTICAL to torch
+(0.0e+00), and the full `LinearLoRA` fwd+bwd (output, d/dx, d/d lora_a, d/d lora_b) is bit-identical
+too — a drop-in for training.** Speed: 2D 4096×4096 = **7.4x** (0.183→0.025ms), 3D experts
+(128,4096,4096) = **13.0x** (24.7→1.9ms), 3D down (128,4096,2048) = **13.5x** (12.4→0.92ms), all with
+lower peak memory. The frozen base needs no grad, so it's a plain (non-autograd) op. `run.sh`/`train.sh`
+export `MISTRAL_DEQUANT_TRITON=1`.
+
+### ⚠ FSDP2 rejects scalar params (per-tensor FP8 gotcha)
+
+Per-tensor `FP8Linear` stores `weight_scale_inv` (and, with `activation_scheme="static"`,
+`activation_scale`) as **0-dim scalar** Parameters. FSDP2 `fully_shard` raises *"fully_shard doesn't
+support scalar parameters. Change weight_scale_inv to a 1D tensor with numel equal to 1."*
+`mistral_small.py._promote_scalar_params()` reshapes every 0-dim param to `(1,)` right before
+sharding (576 of them on the real model — the 2D MLA + shared-expert FP8Linears). Numerically
+transparent: a `(1,)` scale broadcasts in the dequant exactly like a scalar. minimax-m2 was 128×128
+block-scaled (scale_inv ≥2D), so it never hit this — it's unique to the per-tensor layout here.
 
 ### Fused MoE — built into transformers 5.5.0
 
@@ -155,18 +180,56 @@ NOT FSDP — so the FSDP2 fp8 all-gather risk (#1 below) is still unverified.
 - `mistral_small.py` / `compare_logits.py` / `merge_infer.py` import + compile; all
   transformers/FSDP symbols exist as used.
 
-**NOT yet run on hardware (validate on the pod — treat the first run as a smoke test):**
-1. **FSDP2 all-gather of `float8_e4m3fn` params** (the #1 risk, same as minimax-m2). If it errors:
-   `device_map="auto"` pipeline-parallel (slower, no FSDP), or upcast-to-bf16 + CPU offload.
-2. **`compare_logits.py` on the real 119B model** — our LoRA(B=0) vs the independent bf16 ref
-   (top-1 + cosine > 0.997), and whether the native per-tensor-static FP8 forward NaNs/diverges.
-3. **CPU RAM at load.** Default path: every rank `from_pretrained`s ~119GB to CPU → ~119GB × ranks.
-   Use `--low_cpu_shard_load` (meta-init + DCP broadcast from rank 0) on a tight-RAM box (ported
-   from minimax-m2; itself unverified on hardware).
-4. End-to-end loss-decrease, tok/s, the FA3 varlen path, and `merge_infer.py` generation.
+**VERIFIED on real hardware 2026-06-19 (4× H20-3e on the `tm` VM — see the H20 section below):**
+1. **FSDP2 all-gather of `float8_e4m3fn` params WORKS** (the #1 risk). Needed one fix: per-tensor
+   FP8 stores *scalar* `weight_scale_inv`/`activation_scale`, which `fully_shard` rejects →
+   `_promote_scalar_params()` reshapes the 576 scalars to `(1,)` first. Local shard 30.12B/GPU.
+2. **`compare_logits.py` on the real 119B model PASSED** — LoRA(B=0) matches the independent bf16
+   ref top-1 argmax on every prompt (incl. "The capital of France is" → ` Paris`), cosine
+   0.9992–0.9999; all `lora_b` zero at init; B≠0 moves logits. (Ran via `device_map`, NOT FSDP.)
+3. **End-to-end FSDP2 LoRA training runs** — 3 epochs / 21 steps on the Function-Call parquet (26
+   bins @ 32k), **loss 0.95 → ~0.50**, ~5.0–5.6k tok/s on 4× H20 with the Triton dequant; LoRA
+   checkpointed each epoch (`checkpointing/lora.pt`, 720 tensors, 2.17GB). The FA3 varlen path + Liger
+   FLCE work on the real model.
 
-First run: `MISTRAL_DEPS_ONLY=1 bash run.sh`, then `python compare_logits.py`, then
-`bash run.sh -- --max_steps 20 --limit_samples 4` before a full epoch.
+**Still NOT verified:** `merge_infer.py` generation on the real model; `--low_cpu_shard_load` (the
+default full load uses ~119GB×ranks of CPU — fine on the 1006GB H20, so it wasn't needed). On a
+tight-CPU box use `--low_cpu_shard_load` (meta-init + DCP broadcast from rank 0; ported from
+minimax-m2 + the scalar-reshape in `_remap_base_keys_for_lora`, itself unverified).
+
+First run: `MISTRAL_DEPS_ONLY=1 bash run.sh`, then `python compare_logits.py`, then a short
+`--max_steps 3 --limit_samples 8` smoke before a full run.
+
+## H20 node (the `tm` VM) — the VERIFIED training path
+
+Trained + verified here 2026-06-19 (8× **H20-3e**, ~140GB/GPU, driver CUDA 13.0). This box is the
+quickest path because the FP8 model is already cached and the deps install in seconds.
+
+```bash
+ssh -i ../../scicom root@8.222.165.68 -p 1024        # the `scicom` key (autotrain/../../scicom)
+```
+
+- **GPUs**: 0–5 are usually free; **6,7 had ~131GB orphaned** (PIDs 874494/874495 are in another
+  container's PID namespace — `/proc/<pid>` absent, `kill` fails — so they're **not killable from
+  this container**; just use 0–5). It's a **shared box** (other users' tmux sessions exist) — pin
+  `CUDA_VISIBLE_DEVICES` to free GPUs and don't hog all 8.
+- **venv under `/share`** (NOT `--system`): `uv venv /share/mistral-venv --python 3.12`, activate,
+  then `MISTRAL_DEPS_ONLY=1 bash run.sh` (run.sh installs into the active venv). `/share` is a 4.7T
+  shared disk. ⚠ **Never touch `/share/vllm-venv`** (the hand-built fleet venv).
+- **HF cache**: `export HF_HOME=/share/huggingface` (1.3T shared cache; the FP8 model is already
+  there — all 3 `model-*.safetensors` shards). `HF_HUB_DISABLE_XET=1` (Xet stalls big pulls here).
+- **Run it** (job dir `/share/autotrain-mistral`, detach long jobs in `tmux` — survives ssh drop):
+  ```bash
+  scp -i ../../scicom -P 1024 *.py *.sh root@8.222.165.68:/share/autotrain-mistral/
+  # on the box, in the venv:
+  HF_HOME=/share/huggingface MISTRAL_PER_GPU_GIB=60 MISTRAL_RUN_NATIVE=0 \
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python compare_logits.py        # device_map, NOT FSDP
+  python pack_dataset.py --out ./packed_data --max-seq-len 32768
+  CUDA_VISIBLE_DEVICES=0,1,2,3 MISTRAL_DEQUANT_TRITON=1 NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0 \
+    torchrun --nproc_per_node=4 mistral_small.py --max_epochs 3 --lr 1e-5   # FSDP2 training
+  ```
+  (`train.sh` wraps the env + torchrun.) Default full-load uses ~119GB×ranks of CPU; the box has
+  ~1006GB RAM so 4 ranks fit — no `--low_cpu_shard_load` needed.
 
 ## RunPod workflow (use `runpodctl`; `RUNPOD_API_KEY` + `HF_TOKEN` + `WANDB_API_KEY` in `../.env`)
 

@@ -75,12 +75,30 @@ const TTS_BASE_MODELS = [
   "Scicom-intl/Multilingual-Expressive-TTS-0.6B",
 ];
 const DEFAULT_TTS_BASE = "Scicom-intl/Multilingual-TTS-1.7B-Base";
-// LLM finetune (gemma-4 FSDP2 + custom dynamic_attention) over a packed chat
-// dataset (kind=llm_packed). The trainer is gemma-4-specific.
+// LLM finetune (FSDP2 LoRA) over a packed chat dataset (kind=llm_packed). The
+// trainer is auto-detected from the base model: gemma-4 (custom dual-head_dim
+// attention) or MiniMax-M2 (230B FP8 MoE, QLoRA-style dequant LoRA).
 const LLM_BASE_MODELS = [
   "google/gemma-4-31B-it",
+  "MiniMaxAI/MiniMax-M2",
 ];
 const DEFAULT_LLM_BASE = "google/gemma-4-31B-it";
+// Per-arch LoRA defaults (gemma: r=256 scaling 2.0; minimax: r=16 scaling 1.0 —
+// 256 experts × 62 layers make the MoE LoRA huge, see minimax CLAUDE.md).
+function llmLoraDefaults(model: string): { r: number; ratio: number } {
+  return model.toLowerCase().includes("minimax") ? { r: 16, ratio: 1 } : { r: 256, ratio: 2 };
+}
+// gemma vs minimax need different `kernels` pins → separate uv venvs (matches the
+// gateway's /share/autotrain-llm-<arch> default).
+function llmVenvFor(model: string): string {
+  return model.toLowerCase().includes("minimax") ? "/share/autotrain-llm-minimax" : "/share/autotrain-llm-gemma4";
+}
+// venv paths that count as "still a per-task default" (safe to auto-swap on a task
+// change); a user-customized path is left untouched.
+const KNOWN_VENVS = [
+  "/share/autotrain-whisper", "/share/autotrain-tts", "/share/autotrain-llm",
+  "/share/autotrain-llm-gemma4", "/share/autotrain-llm-minimax",
+];
 // LLM LoRA target linear projections. q/k/v/o (attention) are the default; the MLP
 // group (gate/up/down) is opt-in. gemma4 warns at train time for any target that
 // wraps no nn.Linear on the loaded arch.
@@ -312,7 +330,7 @@ export function TrainingForm() {
   // Isolated uv venv for the trainer deps (mirrors serverless's vLLM venv_path).
   const [venvPath, setVenvPath] = useState(
     initialTask === "tts" ? "/share/autotrain-tts"
-      : initialTask === "llm" ? "/share/autotrain-llm" : "/share/autotrain-whisper",
+      : initialTask === "llm" ? "/share/autotrain-llm-gemma4" : "/share/autotrain-whisper",
   );
   const [cleanupCheckpoints, setCleanupCheckpoints] = useState(true);
   const [augmentTechniques, setAugmentTechniques] = useState<string[]>([]);
@@ -590,21 +608,38 @@ export function TrainingForm() {
   }, [sweepOn, durationMode, datasets, datasetId, isTts, isLlm, testDatasetId, evalSplitPct,
       visibleDevices, gpuBound, useDdp, batchSize, gradAccum, maxEpochs]);
 
+  // Switching the LLM base model swaps the arch (gemma↔minimax): update the
+  // arch-specific venv + LoRA defaults when they're still per-arch defaults.
+  function onModelChange(v: string) {
+    setModelChoice(v);
+    if (taskType !== "llm" || v === CUSTOM) return;
+    setVenvPath((cur) => (KNOWN_VENVS.includes(cur) ? llmVenvFor(v) : cur));
+    const d = llmLoraDefaults(v);
+    setLoraR((r) => ([16, 256].includes(r) ? d.r : r));
+    setLoraAlphaRatio((a) => ([1, 2].includes(a) ? d.ratio : a));
+  }
+
   function pickTask(t: "asr" | "tts" | "llm") {
     setTaskType(t);
-    setModelChoice(t === "tts" ? DEFAULT_TTS_BASE : t === "llm" ? DEFAULT_LLM_BASE : DEFAULT_WHISPER);
+    const modelFor = t === "tts" ? DEFAULT_TTS_BASE : t === "llm" ? DEFAULT_LLM_BASE : DEFAULT_WHISPER;
+    setModelChoice(modelFor);
     // Swap the default uv venv path when the user hasn't customized it (i.e. it's
-    // still one of the per-task defaults).
-    const VENVS = ["/share/autotrain-whisper", "/share/autotrain-tts", "/share/autotrain-llm"];
-    const venvFor = t === "tts" ? "/share/autotrain-tts" : t === "llm" ? "/share/autotrain-llm" : "/share/autotrain-whisper";
-    setVenvPath((v) => (VENVS.includes(v) ? venvFor : v));
+    // still one of the per-task defaults). LLM venv is arch-specific.
+    const venvFor = t === "tts" ? "/share/autotrain-tts" : t === "llm" ? llmVenvFor(modelFor) : "/share/autotrain-whisper";
+    setVenvPath((v) => (KNOWN_VENVS.includes(v) ? venvFor : v));
     // Swap the default run name when it's still one of the per-task defaults.
-    const NAMES = ["whisper-finetune", "tts-finetune", "gemma4-finetune"];
+    const NAMES = ["whisper-finetune", "tts-finetune", "gemma4-finetune", "minimax-m2-finetune"];
     const nameFor = t === "tts" ? "tts-finetune" : t === "llm" ? "gemma4-finetune" : "whisper-finetune";
     setName((n) => (NAMES.includes(n) ? nameFor : n));
-    // gemma-4's proven LoRA config is r=256, scaling 2.0 (alpha ratio 2); other
-    // tasks default to r=16. Ratio 2 is a good default for all, so only r swaps.
-    setLoraR((r) => (r === 16 || r === 256 ? (t === "llm" ? 256 : 16) : r));
+    // Apply the arch's LoRA defaults (gemma r=256/ratio2; minimax r=16/ratio1) when
+    // the current values are still per-task defaults; else leave the user's choice.
+    if (t === "llm") {
+      const d = llmLoraDefaults(modelFor);
+      setLoraR((r) => ([16, 256].includes(r) ? d.r : r));
+      setLoraAlphaRatio((a) => ([1, 2].includes(a) ? d.ratio : a));
+    } else {
+      setLoraR((r) => ([16, 256].includes(r) ? 16 : r));
+    }
     // Reflect the task choice in the URL (?task=) so it's deep-linkable.
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
@@ -821,7 +856,7 @@ export function TrainingForm() {
           {isTts
             ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM. Eval loss runs on the held-out test split per epoch or every N steps; CER / MOS / speaker-similarity score generated audio at the end."
             : isLlm
-              ? "Finetune Gemma-4 (FSDP2 + custom dynamic_attention) on a packed chat dataset (kind=llm_packed). The pre-tokenized bins train directly as a causal LM with a custom LoRA; loss is logged per step."
+              ? "Finetune an LLM (Gemma-4 or MiniMax-M2 — auto-detected from the base model) on a packed chat dataset (kind=llm_packed) with FSDP2 LoRA. The pre-tokenized bins train directly as a causal LM; loss is logged per step."
               : "Finetune a Whisper model on a dataset. WER + CER are evaluated on a held-out split — per epoch or every N steps — and training stops at the epoch / max-step cap or early on patience."}
         </p>
         {fromId && (
@@ -861,7 +896,7 @@ export function TrainingForm() {
               isLlm ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
             <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
-              <div className="font-medium">LLM — Gemma-4</div>
+              <div className="font-medium">LLM — Gemma-4 / MiniMax-M2</div>
               <div className="text-xs text-muted-foreground">Chat finetune. Pack first → FSDP2 LoRA (loss-only).</div>
             </div>
           </button>
@@ -873,11 +908,11 @@ export function TrainingForm() {
         description={isTts
           ? "The base Qwen3 model + the {audio, transcription} dataset to finetune on."
           : isLlm
-            ? "The base Gemma-4 model + the packed chat dataset (kind=llm_packed) to finetune on."
+            ? "The base LLM (Gemma-4 or MiniMax-M2) + the packed chat dataset (kind=llm_packed) to finetune on."
             : "The base Whisper checkpoint and the dataset to finetune on."}>
         <Grid>
-          <FieldWrap label={isTts ? "Base TTS model" : isLlm ? "Base Gemma-4 model" : "Base Whisper model"}>
-            <Select value={modelChoice} onValueChange={setModelChoice}>
+          <FieldWrap label={isTts ? "Base TTS model" : isLlm ? "Base LLM model" : "Base Whisper model"}>
+            <Select value={modelChoice} onValueChange={onModelChange}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 {MODELS.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}
@@ -885,7 +920,7 @@ export function TrainingForm() {
               </SelectContent>
             </Select>
             {modelChoice === CUSTOM && (
-              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-…" : "org/whisper-variant"}
+              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-… or MiniMaxAI/MiniMax-M2" : "org/whisper-variant"}
                 value={customModel} onChange={(e) => setCustomModel(e.target.value)} />
             )}
           </FieldWrap>
@@ -980,7 +1015,9 @@ export function TrainingForm() {
           : (isTts
             ? "Qwen3 + NeuCodec finetune hyperparameters (loss-only; no per-epoch WER/CER)."
             : isLlm
-              ? "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Batch is forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
+              ? (baseModel.toLowerCase().includes("minimax")
+                  ? "MiniMax-M2 FSDP2 LoRA hyperparameters (FP8 MoE, dequant LoRA; loss-only, no eval). Batch forced to 1. Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large)."
+                  : "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Batch forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256.")
               : "Epochs, early stopping, and core hyperparameters.")}>
         <div className="mb-5 grid max-w-xl grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-2">
           {taskType === "asr" && (
@@ -1684,7 +1721,7 @@ export function TrainingForm() {
           <p className="text-xs text-muted-foreground">
             Isolated <span className="font-mono">uv</span> venv for the trainer&apos;s deps (like serverless&apos;s vLLM venv) —
             keeps the stack off the box&apos;s system Python so {isTts ? "TTS" : "Whisper"} can&apos;t clobber another task&apos;s
-            torch. Default <span className="font-mono">{isTts ? "/share/autotrain-tts" : "/share/autotrain-whisper"}</span>; reused + cached across runs.
+            torch. Default <span className="font-mono">{isTts ? "/share/autotrain-tts" : isLlm ? llmVenvFor(baseModel) : "/share/autotrain-whisper"}</span>; reused + cached across runs.
           </p>
         </div>
 

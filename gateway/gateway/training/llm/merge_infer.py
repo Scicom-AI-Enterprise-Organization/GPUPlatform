@@ -85,6 +85,8 @@ def main():
     ap.add_argument("--prompt", default="Terangkan konsep AI dalam satu ayat.")
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--merged-out", default=None, help="dir to save_pretrained the merged model")
+    ap.add_argument("--no-generate", action="store_true",
+                    help="merge + save only, skip the sanity-check generation (used by the try-it serve path)")
     args = ap.parse_args()
 
     meta = load_meta(args.lora)
@@ -106,6 +108,29 @@ def main():
         print(f">> saving merged model to {args.merged_out}")
         model.save_pretrained(args.merged_out, safe_serialization=True)
         tok.save_pretrained(args.merged_out)
+        # gemma-4 is multimodal: vLLM refuses to load the served dir without
+        # processor_config.json + preprocessor_config.json, which model.save_pretrained
+        # writes NEITHER. Fetch processor_config.json from the base and derive
+        # preprocessor_config.json from its embedded image_processor block.
+        try:
+            import shutil
+            from huggingface_hub import hf_hub_download
+            dst = os.path.join(args.merged_out, "processor_config.json")
+            if not os.path.exists(dst):
+                shutil.copy(hf_hub_download(model_id, "processor_config.json"), dst)
+            with open(dst) as f:
+                _pj = json.load(f)
+            _img = _pj.get("image_processor")
+            if isinstance(_img, dict):
+                with open(os.path.join(args.merged_out, "preprocessor_config.json"), "w") as f:
+                    json.dump(_img, f, indent=2)
+                print(">> wrote processor_config.json + preprocessor_config.json (gemma-4 multimodal)")
+        except Exception as e:  # noqa: BLE001
+            print(f">> WARN: could not write processor configs (vLLM multimodal load may fail): {e}")
+
+    if args.no_generate:
+        print(">> --no-generate: merge + save done, skipping inference")
+        return
 
     # Chat-format the prompt when a template exists; otherwise feed it raw. apply_chat_template
     # returns a BatchEncoding (dict) in transformers 5.x, so pull out the input_ids tensor.

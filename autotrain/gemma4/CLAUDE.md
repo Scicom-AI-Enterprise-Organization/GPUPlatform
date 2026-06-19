@@ -235,4 +235,12 @@ The merged model is pushed (private) to **`huseinzolkepliscicom/gemma4-31b-funcc
 reuse — it includes `processor_config.json` + a `preprocessor_config.json` built from the `image_processor`
 block (so vLLM can load the multimodal dir). Serve: `vllm serve <repo> --tensor-parallel-size 2
 --max-model-len 65536 --gpu-memory-utilization 0.92` (+ pin `prometheus-fastapi-instrumentator>=7` on
-0.23.0). **Function-calling eval (`eval_funccall.py`) vs base 0.7154 not yet run** for this checkpoint.
+0.23.0). **Eval verdict (2026-06-19): the finetune did NOT improve function-calling.** On the same
+first 25 convs (apples-to-apples) base `tool_call_f1` **0.6975 vs finetuned 0.6485** (Δ −0.049; lower
+precision AND recall — it under-calls tools). ⚠ 6/25 finetuned convs errored on the 65k context limit
+(prompt ≤62k + 16384 max_new > 65536 → vLLM 400), which drags the number down — for a clean re-run
+lower `--max-new-tokens` (≤~3k) or raise `--max-model-len`; even so, no improvement signal. Run it
+parallel + resumable: `eval_funccall.py --vllm-url … --workers 12 --max-rows 25` (new `--workers`
+= ThreadPoolExecutor over convs, identical scores; `--cache` JSONL skip-if-cached resume;
+`--metrics-only` aggregates the cache so far). RunPod: pin `--country-code US` (an IN pod pulled the
+62GB model at ~25 MB/s + Xet stalled; US Xet-turbo did ~212 MB/s with `HF_XET_HIGH_PERFORMANCE=1`).

@@ -328,7 +328,7 @@ async def _run(
 async def _create_llm_packed_output(
     source_id: str, *, new_id: str, name: str, description: str, storage_id: str,
     s3_uri: str, num_rows: int, messages_field: str, tokenizer: str,
-    sequence_length: int, subset: Optional[str],
+    sequence_length: int, subset: Optional[str], arch: Optional[str] = None,
 ) -> str:
     """Create the packed (chat multipack) dataset as a NEW row, leaving the source
     intact + re-runnable. `_llm_pack` metadata (in split_fields) mirrors tts_packed's
@@ -358,6 +358,9 @@ async def _create_llm_packed_output(
                 "subset": subset,
                 "messages_field": messages_field,
                 "samples": num_rows,
+                # Packing arch (gemma|minimax|generic) — drives the trainer choice
+                # and lets a run reject a base-model/dataset arch mismatch.
+                "arch": arch,
             }},
         )
         s.add(new)
@@ -522,10 +525,10 @@ async def _run_llm_pack(
             dataset_id, new_id=new_id,
             name=f"{src_name}-llm-packed",
             description=(f"Chat multipack (seq_len {sequence_length}, tokenizer {tokenizer}, "
-                         f"subset {label}) of {src_repo} → {n_bins} bins"),
+                         f"subset {label}, arch {stats.get('arch')}) of {src_repo} → {n_bins} bins"),
             storage_id=storage_id, s3_uri=s3_uri, num_rows=n_bins,
             messages_field=messages_field, tokenizer=tokenizer,
-            sequence_length=int(sequence_length), subset=label,
+            sequence_length=int(sequence_length), subset=label, arch=stats.get("arch"),
         )
         await _finish(
             dataset_id, "done",
