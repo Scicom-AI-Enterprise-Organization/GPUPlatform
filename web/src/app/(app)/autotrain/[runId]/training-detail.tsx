@@ -1743,11 +1743,37 @@ function PersistentControls({ runId, gpu }: { runId: string; gpu: string }) {
   );
 }
 
+type LlmToolCall = { index: number; id: string | null; name: string; argsBuf: string };
+
+// Merge streamed OpenAI tool_call deltas (fragmented across chunks) into per-index slots.
+function mergeToolCallDeltas(prev: LlmToolCall[], deltas: Array<Record<string, unknown>>): LlmToolCall[] {
+  const next = prev.slice();
+  for (const d of deltas) {
+    const idx = typeof d.index === "number" ? d.index : 0;
+    let slot = next.find((s) => s.index === idx);
+    if (!slot) { slot = { index: idx, id: null, name: "", argsBuf: "" }; next.push(slot); }
+    if (typeof d.id === "string") slot.id = d.id;
+    const fn = d.function as { name?: string; arguments?: string } | undefined;
+    if (fn?.name) slot.name = fn.name;
+    if (typeof fn?.arguments === "string") slot.argsBuf += fn.arguments;
+  }
+  return next.sort((a, b) => a.index - b.index);
+}
+
+// "Sample" button — a couple of OpenAI-shape function specs to exercise tool calling.
+const LLM_SAMPLE_TOOLS = JSON.stringify([
+  { type: "function", function: { name: "get_weather", description: "Get the current weather in a location",
+    parameters: { type: "object", properties: { location: { type: "string", description: "City, e.g. Kuala Lumpur, MY" },
+      unit: { type: "string", enum: ["celsius", "fahrenheit"] } }, required: ["location"] } } },
+  { type: "function", function: { name: "get_stock_price", description: "Latest stock price for a ticker symbol",
+    parameters: { type: "object", properties: { ticker: { type: "string", description: "e.g. AAPL, MAYBANK" } }, required: ["ticker"] } } },
+], null, 2);
+
 // Try-it playground (LLM, gemma-4) — load the finetuned model via vLLM (eager) on
 // the run's VM (download LoRA → merge → save → serve), then stream chat completions.
 function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevices: string | null }) {
   type Role = "user" | "assistant" | "tool";
-  type Msg = { role: Role; content: string };
+  type Msg = { role: Role; content: string; toolCalls?: LlmToolCall[] };
   const [st, setSt] = useState<{ running: boolean; ready: boolean; device?: string; logs?: string[] } | null>(null);
   const [busy, setBusy] = useState(false);
   const [ctlErr, setCtlErr] = useState<string | null>(null);
@@ -1758,6 +1784,8 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
   const [maxTokens, setMaxTokens] = useState(512);
   const [gpus, setGpus] = useState((visibleDevices ?? "").trim());
   const [vllmArgs, setVllmArgs] = useState("");
+  const [toolsJson, setToolsJson] = useState("");
+  const [toolChoice, setToolChoice] = useState("auto");
   const [chatErr, setChatErr] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -1796,17 +1824,27 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
       ...messages.filter((m) => m.content.trim()).map((m) => ({ role: m.role, content: m.content })),
     ];
     if (hist.length === 0) { setChatErr("add at least one message"); return; }
+    // Optional tool catalog (OpenAI-shape JSON array).
+    let tools: unknown[] | undefined;
+    if (toolsJson.trim()) {
+      try {
+        const parsed = JSON.parse(toolsJson);
+        if (!Array.isArray(parsed)) throw new Error("tools must be a JSON array");
+        tools = parsed;
+      } catch (e) { setChatErr(`tools: ${(e as Error).message}`); return; }
+    }
     setStreaming(true); setChatErr(null);
     setMessages((m) => [...m, { role: "assistant", content: "" }]);
     const ctrl = new AbortController(); abortRef.current = ctrl;
-    const append = (delta: string) => setMessages((m) => {
-      const copy = m.slice(); const last = copy[copy.length - 1];
-      if (last && last.role === "assistant") copy[copy.length - 1] = { ...last, content: last.content + delta };
+    const updateLast = (fn: (m: Msg) => Msg) => setMessages((arr) => {
+      const copy = arr.slice(); const last = copy[copy.length - 1];
+      if (last && last.role === "assistant") copy[copy.length - 1] = fn(last);
       return copy;
     });
     try {
       const res = await gateway.playgroundChatStream(runId,
-        { messages: hist, temperature, max_tokens: maxTokens }, ctrl.signal);
+        { messages: hist, temperature, max_tokens: maxTokens,
+          ...(tools ? { tools, tool_choice: toolChoice } : {}) }, ctrl.signal);
       if (!res.ok || !res.body) {
         const t = await res.text().catch(() => "");
         throw new Error(`chat failed (${res.status})${t ? `: ${t.slice(0, 300)}` : ""}`);
@@ -1825,8 +1863,11 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
             try {
               const j = JSON.parse(data);
               if (j.error) { setChatErr(String(j.error)); continue; }
-              const d = j?.choices?.[0]?.delta?.content;
-              if (typeof d === "string" && d) append(d);
+              const delta = j?.choices?.[0]?.delta;
+              if (typeof delta?.content === "string" && delta.content)
+                updateLast((m) => ({ ...m, content: m.content + delta.content }));
+              if (Array.isArray(delta?.tool_calls))
+                updateLast((m) => ({ ...m, toolCalls: mergeToolCallDeltas(m.toolCalls ?? [], delta.tool_calls) }));
             } catch { /* ignore keepalives / non-JSON */ }
           }
         }
@@ -1863,7 +1904,7 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
           {!st?.running && (
             <div className="flex w-full flex-wrap items-end gap-3">
               <div>
-                <label className="text-[11px] text-muted-foreground">GPUs</label>
+                <label className="pr-3 text-[11px] text-muted-foreground">GPUs</label>
                 <Input value={gpus} onChange={(e) => setGpus(e.target.value)} disabled={busy}
                   placeholder="6,7" className="h-8 w-28 font-mono text-xs" />
               </div>
@@ -1901,7 +1942,7 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
 
         <div className="grid gap-2 sm:grid-cols-[1fr_auto_auto] sm:items-end">
           <div>
-            <label className="text-[11px] text-muted-foreground">System prompt (optional)</label>
+            <label className="pr-3 text-[11px] text-muted-foreground">System prompt (optional)</label>
             <Input value={system} onChange={(e) => setSystem(e.target.value)} placeholder="You are a helpful assistant." className="h-8 text-sm" />
           </div>
           <div>
@@ -1918,6 +1959,36 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
           </div>
         </div>
 
+        {/* Tool calling (function specs) — like the SyntheticGen playground. The model
+            emits tool_calls (rendered under the assistant message); add a `tool` message
+            with the result to continue. Needs the server loaded with a tool-call parser. */}
+        <details className="rounded-md border border-border">
+          <summary className="cursor-pointer select-none px-3 py-1.5 text-xs text-muted-foreground">
+            Tools (function calling){toolsJson.trim() ? " · configured" : " · none"}
+          </summary>
+          <div className="space-y-2 border-t border-border p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button type="button" variant="outline" className="h-7 text-xs" onClick={() => setToolsJson(LLM_SAMPLE_TOOLS)}>Sample</Button>
+              <Button type="button" variant="ghost" className="h-7 text-xs" disabled={!toolsJson.trim()} onClick={() => setToolsJson("")}>Clear</Button>
+              <label className="pl-2 text-[11px] text-muted-foreground">tool_choice</label>
+              <Select value={toolChoice} onValueChange={setToolChoice}>
+                <SelectTrigger className="h-7 w-28 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">auto</SelectItem>
+                  <SelectItem value="required">required</SelectItem>
+                  <SelectItem value="none">none</SelectItem>
+                </SelectContent>
+              </Select>
+              <span className="text-[10px] text-muted-foreground">
+                OpenAI tool specs (JSON array). Load with <span className="font-mono">--enable-auto-tool-choice --tool-call-parser …</span>
+              </span>
+            </div>
+            <Textarea value={toolsJson} onChange={(e) => setToolsJson(e.target.value)} rows={6}
+              placeholder={'[{"type":"function","function":{"name":"get_weather","parameters":{...}}}]'}
+              className="bg-transparent font-mono text-[11px] dark:bg-transparent" />
+          </div>
+        </details>
+
         {/* Editable conversation — each message has a role (user / assistant / tool).
             Run streams the model's reply into a new assistant message you can then keep
             editing for multi-turn / few-shot / tool-result replay. */}
@@ -1928,22 +1999,37 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
           {messages.map((m, i) => {
             const streamingLast = streaming && i === messages.length - 1 && m.role === "assistant";
             return (
-              <div key={i} className="flex items-start gap-2">
-                <Select value={m.role} onValueChange={(v) => updateMsg(i, { role: v as Role })} disabled={streaming}>
-                  <SelectTrigger className="h-8 w-28 shrink-0 text-xs"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="user">user</SelectItem>
-                    <SelectItem value="assistant">assistant</SelectItem>
-                    <SelectItem value="tool">tool</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Textarea value={m.content} onChange={(e) => updateMsg(i, { content: e.target.value })}
-                  rows={2} disabled={streaming}
-                  placeholder={m.role === "tool" ? "tool result…" : m.role === "assistant" ? "assistant message…" : "user message…"}
-                  onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); run(); } }}
-                  className={cn("flex-1 bg-transparent text-sm dark:bg-transparent", streamingLast && "animate-pulse")} />
-                <Button type="button" variant="ghost" className="h-8 shrink-0 px-2" disabled={streaming}
-                  onClick={() => removeMsg(i)} aria-label="remove message"><X className="h-4 w-4" /></Button>
+              <div key={i} className="space-y-1">
+                <div className="flex items-start gap-2">
+                  <Select value={m.role} onValueChange={(v) => updateMsg(i, { role: v as Role })} disabled={streaming}>
+                    <SelectTrigger className="h-8 w-28 shrink-0 text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="user">user</SelectItem>
+                      <SelectItem value="assistant">assistant</SelectItem>
+                      <SelectItem value="tool">tool</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Textarea value={m.content} onChange={(e) => updateMsg(i, { content: e.target.value })}
+                    rows={2} disabled={streaming}
+                    placeholder={m.role === "tool" ? "tool result…" : m.role === "assistant" ? "assistant message…" : "user message…"}
+                    onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); run(); } }}
+                    className={cn("flex-1 bg-transparent text-sm dark:bg-transparent", streamingLast && "animate-pulse")} />
+                  <Button type="button" variant="ghost" className="h-8 shrink-0 px-2" disabled={streaming}
+                    onClick={() => removeMsg(i)} aria-label="remove message"><X className="h-4 w-4" /></Button>
+                </div>
+                {m.toolCalls && m.toolCalls.length > 0 && (
+                  <div className="ml-[120px] space-y-1">
+                    {m.toolCalls.map((tc) => (
+                      <div key={tc.index} className="rounded border border-purple-500/30 bg-purple-500/5 p-1.5">
+                        <div className="font-mono text-[10px] font-semibold">
+                          {tc.name || "(no name yet)"}
+                          {tc.id && <span className="ml-2 font-normal text-muted-foreground">id: {tc.id}</span>}
+                        </div>
+                        <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[10px]">{tc.argsBuf || "(no args yet)"}</pre>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             );
           })}

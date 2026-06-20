@@ -4096,6 +4096,26 @@ async def playground_chat(run_id: str, request: Request):
               "frequency_penalty", "stop"):
         if body.get(k) is not None:
             payload[k] = body[k]
+    # Tool calling — forwarded to vLLM verbatim (needs the server launched with
+    # --enable-auto-tool-choice --tool-call-parser <p> via the custom vLLM args).
+    # Accept either the OpenAI-wrapped shape or a bare {name, description, parameters}
+    # (auto-wrapped), like the SyntheticGen playground, so pasted specs Just Work.
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        norm = []
+        for t in tools:
+            if isinstance(t, dict) and t.get("type") == "function" and isinstance(t.get("function"), dict):
+                norm.append(t)
+            elif isinstance(t, dict) and isinstance(t.get("name"), str):
+                norm.append({"type": "function", "function": {
+                    "name": t["name"], "description": t.get("description") or "",
+                    "parameters": t["parameters"] if isinstance(t.get("parameters"), dict)
+                    else {"type": "object", "properties": {}},
+                }})
+            else:
+                norm.append(t)
+        payload["tools"] = norm
+        payload["tool_choice"] = body.get("tool_choice") or "auto"
     req_bytes = json.dumps(payload).encode()
     remote_req = f"/tmp/sgpu_llm_chat_{run_id}.json"
     import shlex

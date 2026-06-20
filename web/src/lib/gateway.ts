@@ -483,6 +483,8 @@ export const gateway = {
       temperature?: number;
       top_p?: number;
       max_tokens?: number;
+      tools?: unknown[];
+      tool_choice?: unknown;
     },
     signal?: AbortSignal,
   ): Promise<Response> =>
