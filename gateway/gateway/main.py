@@ -3526,38 +3526,43 @@ async def _openai_endpoint(
         app_id, target_model = await _resolve_model_to_app(db_session, user, model_field)
 
     is_stream = bool(payload.get("stream"))
-    request_id, _timeout_s = await _admit_and_enqueue(
+    request_id, timeout_s = await _admit_and_enqueue(
         rdb, db_session, app_id, user, payload, stream=is_stream, endpoint=vllm_path,
         target_model=target_model,
     )
 
     if not is_stream:
-        deadline = time.time() + 60
+        # Non-stream: the worker posts result:{id} ONLY when generation FINISHES, so
+        # the wait must cover the whole generation — not just a cold start. The old
+        # hardcoded 60s killed any legit long generation (big max_tokens, a slow/large
+        # model like GLM-5.2-FP8, long reasoning) and mislabelled it "cold-starting".
+        # Honour the endpoint's configured request_timeout_s (the intended per-request
+        # budget; default 600s) instead. Close the DB session first — the poll only
+        # talks to Redis, and holding the Depends(get_session) connection for a minute+
+        # pins a pool slot (the same leak the streaming path below avoids); re-open a
+        # short-lived session only to mirror the terminal status.
+        await db_session.close()
+        deadline = time.time() + timeout_s
         while time.time() < deadline:
             blob = await rdb.get(f"result:{request_id}")
             if blob:
                 raw = json.loads(blob)
                 status = raw.get("status")
                 if status == "completed":
-                    await _mirror_status_to_db(db_session, request_id, "completed", raw.get("output"), worker_meta=_worker_meta_from_result(raw))
+                    async with session_factory()() as s:
+                        await _mirror_status_to_db(s, request_id, "completed", raw.get("output"), worker_meta=_worker_meta_from_result(raw))
                     return raw.get("output", {})
                 if status in ("timeout", "cancelled", "failed"):
-                    await _mirror_status_to_db(db_session, request_id, status, raw.get("output"), worker_meta=_worker_meta_from_result(raw))
+                    async with session_factory()() as s:
+                        await _mirror_status_to_db(s, request_id, status, raw.get("output"), worker_meta=_worker_meta_from_result(raw))
                     raise HTTPException(status_code=504, detail=raw.get("output"))
             await asyncio.sleep(0.2)
-        await _mirror_status_to_db(
-            db_session,
-            request_id,
-            "timeout",
-            {"error": "no completion in 60s — worker probably cold-starting"},
-        )
-        raise HTTPException(
-            status_code=504,
-            detail={
-                "error": "no completion in 60s — worker probably cold-starting; retry or use stream:true",
-                "request_id": request_id,
-            },
-        )
+        msg = (f"no completion in {timeout_s}s (endpoint request_timeout_s). The worker may be "
+               f"cold-starting, OR the generation is taking longer than the timeout — raise "
+               f"request_timeout_s on the endpoint, or use stream:true for long outputs.")
+        async with session_factory()() as s:
+            await _mirror_status_to_db(s, request_id, "timeout", {"error": msg})
+        raise HTTPException(status_code=504, detail={"error": msg, "request_id": request_id})
 
     # Release the request-scoped DB connection BEFORE streaming. With
     # Depends(get_session) FastAPI keeps the dependency (and its pooled

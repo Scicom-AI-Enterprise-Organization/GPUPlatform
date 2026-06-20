@@ -88,10 +88,10 @@ activation-checkpoint memory (O(seq×layers), unshardable) → ~64k context ceil
 
 - **gemma-4-31B FA4** (`ds-512802b5`, 8× H20): ✅ done, exit 0. FA4 cute kernel JIT-compiled +
   trained; loss 7.09 → 4.84; LoRA checkpoint → S3. First step ~114s (JIT), then fast.
-- **MiniMax-M2.7** (`ds-30fa1cce`, 8× H20): ✅ trains end-to-end via the gateway. Full attn+MoE LoRA
-  wraps correctly (248 attn blocks + 62 MoE blocks = **2756.9M trainable**), FSDP2-of-fp8 + the
-  QLoRA-style dequant works, loss moves, the 744-tensor LoRA checkpoint saves per epoch → S3. (Loss
-  is noisy on a 4-bin smoke at lr 1e-5 — expected.)
+- **MiniMax-M2.7** (`ds-30fa1cce`, 8× H20): ✅ done, exit 0, **10 steps**, LoRA checkpoint → S3. Full
+  attn+MoE LoRA wraps correctly (248 attn blocks + 62 MoE blocks = **2756.9M trainable**), FSDP2-of-fp8
+  + the QLoRA-style dequant works, loss moves, 744-tensor LoRA saved per epoch. (Loss is noisy on a
+  4-bin smoke at lr 1e-5 — expected.)
 - **Mistral-Small-4** (`ds-d690354e`): wiring complete + the dataset packs; the live 10-step smoke
   was skipped (user) — its code path is the SAME FP8-MoE stack as MiniMax (which passed), just
   `mistral_small.py` instead of `minimax_m2.py` (+ `--no_shared_lora` available, MLA attention).
