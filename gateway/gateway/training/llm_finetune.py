@@ -314,12 +314,15 @@ def _nproc(cfg: dict) -> int:
 
 
 def _lora_dims(cfg: dict) -> tuple[int, int]:
-    """(r, alpha) from the form: alpha = lora_alpha (absolute) | lora_alpha_ratio*r | 2*r."""
+    """(r, alpha) from the form. The form's LoRA-strength control is lora_alpha_RATIO
+    (the UI shows "alpha = round(r × ratio)"), so it WINS — `lora_alpha` carries a
+    non-null default (e.g. 32) that would otherwise clobber the ratio and collapse
+    scaling (32/256 = 0.125 instead of the intended 2.0)."""
     r = int(cfg.get("lora_r") or 16)
-    if cfg.get("lora_alpha"):
-        alpha = int(cfg["lora_alpha"])
-    elif cfg.get("lora_alpha_ratio"):
+    if cfg.get("lora_alpha_ratio"):
         alpha = int(float(cfg["lora_alpha_ratio"]) * r)
+    elif cfg.get("lora_alpha"):
+        alpha = int(cfg["lora_alpha"])
     else:
         alpha = 2 * r
     return r, alpha
@@ -368,12 +371,11 @@ def _moe_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str, arch: str) 
         # model copy instead of ~base × ranks). The default loads on every rank.
         "--low_cpu_shard_load",
     ]
-    # These adapt attention + the MoE experts. Map the form's LoRA-target picker: if
-    # the user selected NO MLP/dense target (gate/up/down), adapt attention only
-    # (--no_moe_lora). Explicit cfg flag still wins.
-    targets = set(str(t) for t in (cfg.get("lora_target_modules") or []))
-    no_moe = bool(cfg.get("no_moe_lora")) or (bool(targets) and not (targets & _MLP_TARGETS))
-    if no_moe:
+    # These models adapt attention + the MoE experts by DEFAULT (the expert LoRA is
+    # the whole point). Only skip the experts when the run EXPLICITLY asks
+    # (cfg.no_moe_lora) — NOT inferred from the form's default q/k/v/o target list
+    # (that has no MLP entry and would wrongly disable MoE on every run).
+    if cfg.get("no_moe_lora"):
         cmd.append("--no_moe_lora")
     return cmd
 
@@ -447,11 +449,18 @@ def run(cfg: dict) -> None:
         env.setdefault("WANDB_NAME", cfg["run_name"])
 
     # Pre-fetch the base model once (ranks share the HF cache; gemma-4 is gated).
+    # Use an ALLOW-list (HF-format `model-*.safetensors` shards + all configs/tokenizer),
+    # NOT ignore_patterns: some repos (Mistral-Small-4) ship BOTH HF-format `model-*`
+    # AND a mistral-common `consolidated-*` copy, and `ignore_patterns=[consolidated*]`
+    # resolved to 0 files on the box's huggingface_hub (downloaded nothing). The allow
+    # list grabs exactly the HF weights transformers loads + skips the consolidated /
+    # original / gguf / pth dups. Covers gemma / minimax / mistral (all model-* sharded).
     log(f"[model] pre-fetching {model_id} into the HF cache …")
     subprocess.check_call(
         [py, "-c",
          "import sys; from huggingface_hub import snapshot_download; "
-         "snapshot_download(sys.argv[1], ignore_patterns=['original/*','*.pth','*.gguf','consolidated*'])",
+         "snapshot_download(sys.argv[1], allow_patterns=['*.json','*.jinja','*.txt','*.model',"
+         "'model-*.safetensors','model.safetensors'])",
          model_id],
         env=env,
     )
