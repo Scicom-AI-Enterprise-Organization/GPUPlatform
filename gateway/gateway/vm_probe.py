@@ -578,3 +578,58 @@ def _bandwidth_sync(host: str, port: int, user: str, private_key: str) -> VmBand
 
 async def bandwidth_vm(host: str, port: int, user: str, private_key: str) -> VmBandwidthResult:
     return await asyncio.to_thread(_bandwidth_sync, host, port, user, private_key)
+
+
+@dataclass
+class VmKillResult:
+    ok: bool
+    message: str
+
+
+def _kill_pid_sync(host: str, port: int, user: str, private_key: str,
+                   pid: int, sig: int = 9) -> VmKillResult:
+    """SSH onto a VM and kill a process by pid (default SIGKILL — the metrics page
+    "Terminate" button is for freeing a GPU held by a stuck/orphaned process). `pid`
+    is an int (no shell interpolation of untrusted text). Reports the real outcome:
+    a pid in another container's PID namespace (the orphaned-GPU case) isn't visible
+    here, so `kill` reports "No such process" — surfaced so the UI says so plainly."""
+    pid = int(pid)
+    if pid <= 1:
+        return VmKillResult(ok=False, message=f"refusing to kill pid {pid}")
+    try:
+        pkey = _load_pkey(private_key)
+    except Exception as e:
+        return VmKillResult(ok=False, message=f"key parse failed: {e}")
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host, port=port, username=user, pkey=pkey,
+            timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
+            auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False,
+        )
+    except paramiko.AuthenticationException:
+        return VmKillResult(ok=False, message="authentication failed — check user + private key")
+    except Exception as e:
+        return VmKillResult(ok=False, message=f"SSH connect failed: {e}")
+
+    try:
+        cmd = f"kill -{int(sig)} {pid}"
+        _, stdout, stderr = client.exec_command(cmd, timeout=COMMAND_TIMEOUT_S)
+        rc = stdout.channel.recv_exit_status()
+        err = stderr.read().decode(errors="replace").strip()
+        if rc == 0:
+            return VmKillResult(ok=True, message=f"sent SIG{('KILL' if sig == 9 else sig)} to pid {pid}")
+        # kill's stderr is the useful bit ("No such process" / "Operation not permitted").
+        return VmKillResult(ok=False, message=err or f"kill exited {rc}")
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+async def kill_pid_vm(host: str, port: int, user: str, private_key: str,
+                      pid: int, sig: int = 9) -> VmKillResult:
+    return await asyncio.to_thread(_kill_pid_sync, host, port, user, private_key, pid, sig)

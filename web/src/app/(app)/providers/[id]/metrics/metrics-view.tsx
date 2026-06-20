@@ -84,7 +84,27 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
   const [bw, setBw] = useState<ProviderBandwidth | null>(null);
   const [bwLoading, setBwLoading] = useState(false);
   const [bwErr, setBwErr] = useState<string | null>(null);
+  const [killing, setKilling] = useState<Set<number>>(new Set());
+  const [killNote, setKillNote] = useState<string | null>(null);
   const tick = useRef(0);
+
+  // Terminate a process holding a GPU (SIGKILL on the VM over SSH). Confirm first —
+  // it's destructive. On success, refresh metrics so the freed GPU shows immediately.
+  async function killPid(pid: number) {
+    if (!window.confirm(`Terminate (SIGKILL) pid ${pid} on this VM? This frees the GPU it holds.`)) return;
+    setKilling((s) => new Set(s).add(pid));
+    setKillNote(null);
+    try {
+      const r = await gateway.killProviderPid(id, pid);
+      setKillNote(`pid ${pid}: ${r.message}`);
+      try { setM(await gateway.getProviderMetrics(id)); } catch { /* next poll refreshes */ }
+    } catch (e) {
+      setKillNote(`pid ${pid}: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setKilling((s) => { const n = new Set(s); n.delete(pid); return n; });
+    }
+  }
+
   // The poll loop reads the interval from a ref so changing it takes effect on
   // the next tick without restarting the loop or clearing the graphed history.
   const pollMsRef = useRef(DEFAULT_POLL_S * 1000);
@@ -289,6 +309,9 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
             <CardTitle className="text-sm">
               GPUs <span className="text-[11px] font-normal text-muted-foreground">· {gpus.length} × {gpus[0].name.replace(/^NVIDIA\s+/, "")}</span>
             </CardTitle>
+            {killNote && (
+              <p className="mt-1 font-mono text-[11px] text-muted-foreground" title="kill result">{killNote}</p>
+            )}
           </CardHeader>
           <CardContent>
             <div className="grid gap-3 lg:grid-cols-2">
@@ -341,10 +364,20 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
                         <div className="space-y-0.5">
                           {g.processes!.map((p) => {
                             const model = p.cmd.match(/--model[=\s]+(\S+)/)?.[1];
+                            const busy = killing.has(p.pid);
                             return (
                               <div key={p.pid} className="flex items-center justify-between gap-2" title={p.cmd}>
                                 <span className="text-foreground">pid {p.pid}</span>
-                                <span className="truncate text-muted-foreground">{model || p.comm || "?"}</span>
+                                <span className="min-w-0 flex-1 truncate text-muted-foreground">{model || p.comm || "?"}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => killPid(p.pid)}
+                                  disabled={busy}
+                                  title={`SIGKILL pid ${p.pid} to free this GPU`}
+                                  className="shrink-0 rounded border border-destructive/40 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                                >
+                                  {busy ? "…" : "Kill"}
+                                </button>
                               </div>
                             );
                           })}

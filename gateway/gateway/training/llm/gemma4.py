@@ -443,9 +443,14 @@ def main(
 if __name__ == "__main__": 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--r", 
-        type=int, 
-        default=256, 
+        "--r", "--lora_r",
+        dest="r",
+        type=int,
+        default=256,
+        # `--lora_r` alias: torchrun's argparse prefix-matches the bare `--r` against
+        # its OWN options (--rdzv-*, --role, --run-path …) and aborts with "ambiguous
+        # option" on some torch builds (2.12.0). The gateway passes `--lora_r`, which
+        # collides with nothing; the standalone `--r` still works.
         help="LoRA rank"
     )
     parser.add_argument(

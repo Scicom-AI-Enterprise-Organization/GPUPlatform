@@ -340,7 +340,9 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     cmd = [
         py, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
         os.path.join(LLM_DIR, _ARCH["gemma"]["trainer"]),
-        "--r", str(r), "--alpha", str(alpha),
+        # `--lora_r` (not `--r`): torchrun prefix-matches a bare `--r` against its own
+        # options and aborts "ambiguous option" on torch 2.12.0. gemma4.py aliases it.
+        "--lora_r", str(r), "--alpha", str(alpha),
         "--target_modules", ",".join(targets),
         "--batch_size", "1",  # the collator packs the whole batch into ONE sequence → must be 1
         "--lr", str(float(cfg.get("learning_rate") or 5e-5)),

@@ -609,6 +609,13 @@ export const gateway = {
   // Live VM host metrics (CPU / memory / GPU) — polled by the metrics page.
   getProviderMetrics: (id: string) =>
     request<ProviderMetrics>(`/v1/providers/${encodeURIComponent(id)}/metrics`),
+  // Kill a process by pid on a VM provider (metrics page "Terminate" button) to
+  // free a GPU held by a stuck/orphaned process. Owner/admin only.
+  killProviderPid: (id: string, pid: number) =>
+    request<{ ok: boolean; message: string }>(
+      `/v1/providers/${encodeURIComponent(id)}/kill-pid`,
+      { method: "POST", body: JSON.stringify({ pid }) },
+    ),
   // On-demand disk/memory/CPU bandwidth benchmark (button-triggered, not polled).
   getProviderBandwidth: (id: string) =>
     request<ProviderBandwidth>(`/v1/providers/${encodeURIComponent(id)}/bandwidth`),

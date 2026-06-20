@@ -96,6 +96,13 @@ activation-checkpoint memory (O(seq×layers), unshardable) → ~64k context ceil
   was skipped (user) — its code path is the SAME FP8-MoE stack as MiniMax (which passed), just
   `mistral_small.py` instead of `minimax_m2.py` (+ `--no_shared_lora` available, MLA attention).
 
+**Also validated on a freshly-provisioned RunPod pod (2026-06-20)** — the gateway spawns the pod,
+ships the trainer, runs it detached, uploads to S3, and **tears the pod down** (no orphaned billing,
+confirmed `pod … torn down` for every run). TTS (1× H100) ✅, STT/Whisper (1× H100) ✅, gemma-4-31B
+(4× H100) ✅ — gemma ran the **FA3 path** (`gemma_fa4=false`) on the default `cu1281` image, since
+the FA4 cute fork needs a guaranteed CUDA-13 host (`cutlass-dsl[cu13]`) the stock image can't
+promise. The only RunPod-specific break was the `--r`/torchrun collision (below).
+
 To drive a run without the web UI (admin API key as `Authorization: Bearer sgpu_…`):
 `POST /v1/training-runs` with `{task_type:"llm", dataset_id, base_model, provider_id, storage_id,
 gpu_count, visible_devices, max_steps, max_epochs, lora_r, lora_alpha_ratio, no_eval:true,
@@ -118,6 +125,13 @@ env_vars:{HF_HOME, HF_HUB_DISABLE_XET}}`.
   allow-list (`model-*.safetensors` + `*.json/*.jinja/*.txt/*.model`).
 - **`HF_HOME=/share/huggingface`** (via `env_vars`) so runs reuse the box's model cache + persist
   downloads there (root's `~/.cache` would re-download). `HF_HUB_DISABLE_XET=1` avoids Xet stalls.
+- **gemma `--lora_r`, never a bare `--r`** (`_gemma_cmd` + `gemma4.py`). `torchrun`
+  (`torch.distributed.run`) argparse **prefix-matches** a bare `--r` against its OWN options
+  (`--rdzv-backend`, `--role`, `--run-path`, `--redirects`, …) and aborts `ambiguous option: --r`
+  before the script ever runs. Only bites on RunPod's torch **2.12.0** venv — the `tm` VM had
+  2.12.1 which resolved it. Fix: `gemma4.py` adds a `--r/--lora_r` alias (`dest="r"`) and the
+  orchestrator passes the long form `--lora_r`. (minimax/mistral were never affected — their LoRA
+  flags are already `--attn_r/--moe_r`, no bare `--r`.)
 
 **Monitoring gotcha:** the gateway's live log (`/tmp/sgpu-train/<id>/_full.log`, streamed via an SSH
 `tail -F`) can **freeze mid-run on long jobs** when that tail SSH connection drops — but the run is

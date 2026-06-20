@@ -28,7 +28,7 @@ from .auth import current_user, require_admin
 from .compute import PI_GPU_TYPES, RUNPOD_GPU_TYPES, GpuTypeOption
 from .db import Provider, User, get_session
 from .provider import cloud_providers_disabled
-from .vm_probe import availability_vm, bandwidth_vm, metrics_vm, probe_vm
+from .vm_probe import availability_vm, bandwidth_vm, kill_pid_vm, metrics_vm, probe_vm
 
 logger = logging.getLogger("gateway.providers")
 
@@ -668,6 +668,55 @@ async def provider_metrics(
                for d in result.disks],
         checked_at=result.checked_at,
     )
+
+
+class KillPidRequest(BaseModel):
+    pid: int
+    sig: int = 9  # SIGKILL by default — the metrics "Terminate" button frees a stuck GPU
+
+
+class KillPidResponse(BaseModel):
+    ok: bool
+    message: str
+
+
+@router.post("/{provider_id}/kill-pid", response_model=KillPidResponse)
+async def provider_kill_pid(
+    provider_id: str,
+    req: KillPidRequest,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Kill a process by pid on a VM provider over SSH — the metrics page "Terminate"
+    button, to free a GPU held by a stuck/orphaned process. Owner or admin only.
+    Reports the real kill outcome (a pid in another container's PID namespace — the
+    orphaned-GPU case — isn't visible here and reports "No such process")."""
+    row = await session.get(Provider, provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+    if row.owner_id != user.id and not user.is_admin:
+        raise HTTPException(status_code=403, detail="not your provider")
+    if row.kind != "vm":
+        raise HTTPException(status_code=400, detail="kill-pid is only available for VM providers")
+    cfg = row.config or {}
+    enc = cfg.get("private_key_enc")
+    if not enc:
+        raise HTTPException(status_code=500, detail="provider missing stored key")
+    if req.pid <= 1:
+        raise HTTPException(status_code=400, detail=f"refusing to kill pid {req.pid}")
+    result = await kill_pid_vm(
+        host=cfg.get("host", ""),
+        port=int(cfg.get("port") or VM_DEFAULT_PORT),
+        user=cfg.get("user", "root"),
+        private_key=crypto.decrypt(enc),
+        pid=req.pid,
+        sig=req.sig,
+    )
+    await audit_module.record(
+        user, "provider.kill-pid", "provider", provider_id, row.name,
+        details={"pid": req.pid, "sig": req.sig, "ok": result.ok, "message": result.message},
+    )
+    return KillPidResponse(ok=result.ok, message=result.message)
 
 
 @router.get("/{provider_id}/bandwidth", response_model=ProviderBandwidthResponse)

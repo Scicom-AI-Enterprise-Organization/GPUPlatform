@@ -1109,7 +1109,7 @@ async def run_training(redis, run_id: str) -> None:
             await _push_log(redis, run_id,
                             f"[gateway] provisioning RunPod pod ({gpu_type} x{gpu_count}) …")
             runpod_id, host, port, cost = await _provision_pod(
-                api_key, f"sgpu-train-{run_id}", cfg.get("image", DEFAULT_IMAGE),
+                api_key, f"sgpu-train-{run_id}", cfg.get("image") or DEFAULT_IMAGE,
                 gpu_type, gpu_count, bool(cfg.get("secure_cloud", True)),
                 int(cfg.get("disk_gb", 60)), int(cfg.get("volume_gb", 80)), pub,
             )
@@ -1802,6 +1802,10 @@ class CreateTrainingRunRequest(BaseModel):
     lora_alpha_ratio: Optional[float] = 2.0
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    # task_type=llm + gemma only: True = FA4 head_dim-512 cute fork (default, faster,
+    # needs a CUDA-13 host); False = FA3 wheel + dynamic_attention (SDPA-tiled, runs on
+    # the standard cu12.x RunPod host). Ignored by minimax/mistral (always FA3).
+    gemma_fa4: bool = True
     # LLM-only (gemma4): which linear projections to apply LoRA to. Default is the
     # attention projections (q/k/v/o); add MLP/dense layers (gate_proj, up_proj,
     # down_proj) to adapt those too. LLM finetune is always LoRA. Unknown names are
@@ -1856,6 +1860,10 @@ class CreateTrainingRunRequest(BaseModel):
     secure_cloud: bool = True
     disk_gb: int = 60
     volume_gb: int = 80
+    # RunPod pod image. Sets the CUDA host (the allowedCudaVersions filter is parsed
+    # from the image tag): the FA4 gemma stack needs a CUDA-13 image (e.g.
+    # runpod/pytorch:1.0.6-cu1300-torch291-ubuntu2404); blank → DEFAULT_IMAGE (cu1281).
+    image: Optional[str] = None
     visible_devices: Optional[str] = None
     storage_id: Optional[str] = None
     hf_push_repo: Optional[str] = None
@@ -2145,6 +2153,7 @@ async def create_training_run(
         "use_lora": True if body.task_type == "llm" else body.use_lora,
         "lora_r": body.lora_r,
         "lora_alpha_ratio": body.lora_alpha_ratio,
+        "gemma_fa4": body.gemma_fa4,
         "lora_alpha": body.lora_alpha, "lora_dropout": body.lora_dropout,
         "lora_target_modules": ([m for m in (body.lora_target_modules or [])
                                  if m in _LORA_TARGET_MODULES] or list(_LORA_TARGET_DEFAULT)),
@@ -2178,6 +2187,7 @@ async def create_training_run(
         **({} if is_vm_run else {
             "secure_cloud": body.secure_cloud,
             "disk_gb": body.disk_gb, "volume_gb": body.volume_gb,
+            "image": (body.image or "").strip() or None,
         }),
         "hf_push_repo": body.hf_push_repo,
         "work_dir": (body.work_dir or "/share").strip() or "/share",
