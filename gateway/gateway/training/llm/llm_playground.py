@@ -23,6 +23,7 @@ Config (JSON via --config):
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -233,6 +234,13 @@ def main():
     # Put the vLLM venv's bin on PATH so the runtime JIT (flashinfer/triton) finds the
     # `ninja` + `cmake` console scripts installed there — else FileNotFoundError: ninja.
     serve_env["PATH"] = os.path.join(cfg["vllm_venv"], "bin") + os.pathsep + serve_env.get("PATH", "")
+    # User-supplied vLLM CLI args (verbatim), appended LAST so they can override the
+    # soft defaults below (e.g. --max-model-len, --gpu-memory-utilization) and add flags
+    # like --enable-auto-tool-choice / --tool-call-parser. The gateway already rejected
+    # the reserved flags it controls (model/port/served-name/tp/pp).
+    user_args = shlex.split(cfg.get("vllm_args") or "")
+    if user_args:
+        log(f"[playground] custom vLLM args: {user_args}")
     vbin = os.path.join(cfg["vllm_venv"], "bin", "vllm")
     cmd = [vbin, "serve", merged,
            "--enforce-eager",
@@ -241,7 +249,7 @@ def main():
            "--served-model-name", served,
            "--max-model-len", str(int(cfg.get("max_model_len") or 16384)),
            "--gpu-memory-utilization", str(cfg.get("gpu_mem_util") or 0.90),
-           "--trust-remote-code"]
+           "--trust-remote-code"] + user_args
     if not os.path.exists(vbin):
         cmd = [vpy, "-m", "vllm.entrypoints.openai.api_server", "--model", merged] + cmd[3:]
     log(f"[playground] $ {' '.join(cmd)}")

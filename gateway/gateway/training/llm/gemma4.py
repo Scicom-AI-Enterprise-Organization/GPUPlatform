@@ -31,6 +31,7 @@ import mlflow
 from chinidataset import StreamingDataset
 from contextlib import nullcontext
 from attention import dynamic_attention, block_diagonal_concat
+from gemma4_fa4_attention import fa4_attention
 
 logging.basicConfig(
     level=logging.INFO, 
@@ -45,8 +46,15 @@ logger = logging.getLogger()
 MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-31B-it")
 
 
-# dynamic_attention + block_diagonal_concat live in attention.py (torch-only, unit-tested).
+# Two interchangeable packed-attention backends, selected by env GEMMA_ATTN:
+#   "dynamic_attention" (attention.py)  — head_dim-512 via tiled SDPA-math (O(S^2) score → ~32k ceiling, needs FA3)
+#   "fa4_attention" (gemma4_fa4_attention.py) — ALL layers through the FA4 head_dim-512 cute kernel
+#       (flash-attention-512 fork): memory-efficient O(S), lifts the ceiling to 128k. THE FAST PATH.
+# fa4_attention's flash_attn.cute import is lazy (inside the fn), so registering it is safe even if
+# the FA4 package isn't installed; it only fires when that backend is actually used.
 AttentionInterface.register("dynamic_attention", dynamic_attention)
+AttentionInterface.register("fa4_attention", fa4_attention)
+ATTN_IMPL = os.environ.get("GEMMA_ATTN", "fa4_attention")
 
 
 def ddp_setup():
@@ -254,12 +262,14 @@ def main(
     mesh_device = init_device_mesh("cuda", (world_size, ), mesh_dim_names=("shard", ))
     
     config = AutoConfig.from_pretrained(MODEL_ID)
+    if rank == 0:
+        logger.info(f"attention backend: {ATTN_IMPL}")
     # modify the confg
     model = CustomGemma4ForConditionalGeneration.from_pretrained(
         MODEL_ID,
         config=config,
         dtype=torch.bfloat16, # native bf16 training
-        attn_implementation = "dynamic_attention"
+        attn_implementation = ATTN_IMPL
     )
     # tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-31B-it")
     total_params = sum(p.numel() for p in model.parameters())

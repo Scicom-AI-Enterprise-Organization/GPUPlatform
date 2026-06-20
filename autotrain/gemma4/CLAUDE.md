@@ -205,7 +205,7 @@ base vs finetuned, to test "did the overfit help". Hard-won facts:
   backend → O(S²) → 61 GiB OOM at 22k tokens. `device_map="auto"` only splits *weights* (pipeline
   parallel), not the single 61 GiB score tensor. vLLM tensor-parallel (TRITON_ATTN backend, head
   split across GPUs) + paged KV handles it. Serve TP=2, `--max-model-len 65536` (single convs reach
-  ~56k), `--gpu-memory-utilization 0.92`; pin `prometheus-fastapi-instrumentator>=7` (0.23.0 bug).
+  ~56k), `--gpu-memory-utilization 0.85`; pin `prometheus-fastapi-instrumentator>=7` (0.23.0 bug).
 - **Serving a MERGED multimodal model from a local dir** needs `preprocessor_config.json` +
   `processor_config.json` — `save_pretrained()` doesn't write them. gemma-4 ships only
   `processor_config.json` (with an embedded `image_processor` block); build the missing
@@ -234,7 +234,7 @@ folded **230/230** adapters and the merged model generates clean text.
 The merged model is pushed (private) to **`huseinzolkepliscicom/gemma4-31b-funccall-merged`** for vLLM
 reuse — it includes `processor_config.json` + a `preprocessor_config.json` built from the `image_processor`
 block (so vLLM can load the multimodal dir). Serve: `vllm serve <repo> --tensor-parallel-size 2
---max-model-len 65536 --gpu-memory-utilization 0.92` (+ pin `prometheus-fastapi-instrumentator>=7` on
+--max-model-len 65536 --gpu-memory-utilization 0.85` (+ pin `prometheus-fastapi-instrumentator>=7` on
 0.23.0). **Eval verdict (2026-06-19): the finetune did NOT improve function-calling.** On the same
 first 25 convs (apples-to-apples) base `tool_call_f1` **0.6975 vs finetuned 0.6485** (Δ −0.049; lower
 precision AND recall — it under-calls tools). ⚠ 6/25 finetuned convs errored on the 65k context limit
@@ -244,3 +244,67 @@ parallel + resumable: `eval_funccall.py --vllm-url … --workers 12 --max-rows 2
 = ThreadPoolExecutor over convs, identical scores; `--cache` JSONL skip-if-cached resume;
 `--metrics-only` aggregates the cache so far). RunPod: pin `--country-code US` (an IN pod pulled the
 62GB model at ~25 MB/s + Xet stalled; US Xet-turbo did ~212 MB/s with `HF_XET_HIGH_PERFORMANCE=1`).
+
+## FA4 head_dim-512 attention → long-context (128k) training (2026-06-20)
+
+To train at **128k** context, swap the SDPA-tiled head_dim-512 path for the **FlashAttention-4 fork**
+`Scicom-AI-Enterprise-Organization/flash-attention-512` (`dev512/`), which adds **symmetric
+head_dim=512 support on SM90 (Hopper), forward AND backward** (memory-efficient recompute path).
+
+- **`gemma4_fa4_attention.py`** (`fa4_attention`) routes **ALL** layers (512 global + 256 sliding)
+  through `flash_attn.cute.interface.flash_attn_varlen_func` — O(S) memory, no SDPA O(S²) score, no
+  query-tiling. Drop-in for `AttentionInterface`; consumes the same `cu_seq_lens_*` the collator emits.
+- **`gemma4.py`** registers both backends; env **`GEMMA_ATTN`** (default `fa4_attention`) selects it.
+  FA4 replaces FA3 entirely (handles both head dims) → **no FA3 wheel, no torch-2.12 pin**; use the
+  pod's torch (2.9.1+cu130 worked).
+- **Install (CUDA 13)**: **`run.sh` does this when `GEMMA_FA4=1`** — it clones `FA4_FORK_REPO`
+  (`Scicom-AI-Enterprise-Organization/flash-attention-512`, default `./flash-attention-512`; scp the
+  private fork there first or supply a GH token), `uv pip install -e <fork>/flash_attn/cute`, then pins
+  `uv pip install "nvidia-cutlass-dsl[cu13]==4.4.2" "quack-kernels==0.3.10"` (the `>=` bounds pull
+  too-new deps that break — quack 0.5.0 / cutlass-dsl 4.5.x). CuTeDSL JIT-compiles kernels at runtime
+  (`FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` to cache). The cute package installs as the
+  `flash_attn.cute` namespace pkg — **import only works from a dir with NO local `flash_attn/` folder**
+  (else the FA2 top-level `flash_attn/__init__.py` tries `flash_attn_2_cuda` and dies). Run training
+  from the job dir, not inside the fork.
+- **`compare_logits_fa4.py` PASSED on the real model: cosine 0.999646**, argmax+top5 identical to
+  default attention (tighter than the SDPA path's 0.998). FA4 head_dim-512 is numerically correct.
+- **Memory finding (the real ceiling):** FA4 fixes the *attention* O(S²) wall, but the model's
+  **activation-checkpoint-saved layer inputs are O(seq×layers) and FSDP can't shard them** (they're
+  activations, not params) — so on **4× H100 80GB** training OOMs around ~64–90k regardless of context
+  (flat ~73GB live; 64k OOM'd by a mere 0.12GB with plain checkpointing). 128k dataset pack
+  `huseinzolkepliscicom/gemma4-multipack` = 26 bins, median 109k / max 126k tokens. Repack at N with
+  `pack_dataset.py --max-seq-len N` (max single conv = 81k, so <82k drops 1 conv).
+  - **`offload_wrapper(checkpoint_wrapper(...))`** (activation CPU offload to the pod's RAM) WOULD lift
+    this to 100k+, but we chose NOT to use it (keep parity with minimax's plain checkpointing).
+  - **Resolution: run long-context on bigger-VRAM GPUs.** Prod is **8× H20 144GB** (1152GB total,
+    144GB/GPU) — the activation ceiling that capped the 80GB H100s is a non-issue there, so 64k–128k
+    train without offload/repack hacks. The 4× H100 run only *validated the FA4 integration*.
+
+### FA4 128k on the `tm` H20 VM — the run recipe (2026-06-20)
+
+128k trains here because 144 GB/GPU clears the activation ceiling. Setup (see `../CLAUDE.md` "tm H20
+VM" for box access/etiquette — shared box, use GPUs you're given, everything under `/share`):
+
+```bash
+ssh -i ../../scicom root@8.222.165.68 -p 1024
+# stage: scp *.py + the flash-attention-512 fork to /share/autotrain-gemma4 + /share/
+# venv + deps (NO FA3 wheel; FA4 replaces it):
+uv venv /share/gemma4-fa4-venv --python 3.12 && source /share/gemma4-fa4-venv/bin/activate
+uv pip install torch --torch-backend=cu130          # got torch 2.12.1+cu130; FA4 cute is torch-flexible
+uv pip install kernels==0.14.1 "transformers==5.5.0" liger-kernel peft wandb pandas pyarrow \
+  mlflow psutil pynvml "git+…/ChiniDataset.git" -U huggingface_hub hf_transfer
+uv pip install -e /share/flash-attention-512/flash_attn/cute
+uv pip install "nvidia-cutlass-dsl[cu13]==4.4.2" "quack-kernels==0.3.10"   # pin; newer break
+
+export HF_HOME=/share/huggingface HF_HUB_DISABLE_XET=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
+hf download huseinzolkepliscicom/gemma4-multipack --repo-type dataset --local-dir ./packed_data  # 128k pack
+CUDA_VISIBLE_DEVICES=0 python compare_logits_fa4.py     # gate: PASSED, cosine 0.99984
+# train FA4 128k (GEMMA_ATTN=fa4_attention is gemma4.py's default), detach with nohup:
+GEMMA_ATTN=fa4_attention PYTORCH_ALLOC_CONF=expandable_segments:True FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 \
+  NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+  torchrun --nproc_per_node=6 gemma4.py --lr 5e-5 --max_epochs 3 --wandb
+```
+
+`compare_logits_fa4.py` PASSED on the H20 (cosine **0.999843**). gemma-4-31B is pre-cached in
+`/share/huggingface` (no download). Post-train: `merge_infer.py --merged-out` then push/serve/eval
+as for the earlier runs.

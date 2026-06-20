@@ -874,7 +874,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
             {(run.task_type ?? "asr") === "tts"
               ? <TtsPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
               : run.task_type === "llm"
-                ? <LlmPlaygroundTab runId={run.id} />
+                ? <LlmPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
                 : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />}
           </TabsContent>
         )}
@@ -1745,7 +1745,7 @@ function PersistentControls({ runId, gpu }: { runId: string; gpu: string }) {
 
 // Try-it playground (LLM, gemma-4) — load the finetuned model via vLLM (eager) on
 // the run's VM (download LoRA → merge → save → serve), then stream chat completions.
-function LlmPlaygroundTab({ runId }: { runId: string }) {
+function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevices: string | null }) {
   type Role = "user" | "assistant" | "tool";
   type Msg = { role: Role; content: string };
   const [st, setSt] = useState<{ running: boolean; ready: boolean; device?: string; logs?: string[] } | null>(null);
@@ -1756,6 +1756,8 @@ function LlmPlaygroundTab({ runId }: { runId: string }) {
   const [streaming, setStreaming] = useState(false);
   const [temperature, setTemperature] = useState(0.7);
   const [maxTokens, setMaxTokens] = useState(512);
+  const [gpus, setGpus] = useState((visibleDevices ?? "").trim());
+  const [vllmArgs, setVllmArgs] = useState("");
   const [chatErr, setChatErr] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -1851,13 +1853,38 @@ function LlmPlaygroundTab({ runId }: { runId: string }) {
           <div className="ml-auto flex items-center gap-2">
             {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
             {!st?.running ? (
-              <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
-                onClick={() => ctl(() => gateway.playgroundStart(runId))}>Load model</Button>
+              <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy || !gpus.trim()}
+                onClick={() => ctl(() => gateway.playgroundStart(runId, gpus.trim() || undefined, vllmArgs))}>Load model</Button>
             ) : (
               <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
                 onClick={() => ctl(() => gateway.playgroundStop(runId))}>Unload</Button>
             )}
           </div>
+          {!st?.running && (
+            <div className="flex w-full flex-wrap items-end gap-3">
+              <div>
+                <label className="text-[11px] text-muted-foreground">GPUs</label>
+                <Input value={gpus} onChange={(e) => setGpus(e.target.value)} disabled={busy}
+                  placeholder="6,7" className="h-8 w-28 font-mono text-xs" />
+              </div>
+              <span className="pb-1.5 text-[10px] text-muted-foreground">
+                comma-separated indices the vLLM server runs on (tensor-parallel = count);
+                defaults to the GPUs the run trained on.
+              </span>
+            </div>
+          )}
+          {!st?.running && (
+            <div className="w-full">
+              <label className="text-[11px] text-muted-foreground">Custom vLLM args (optional)</label>
+              <Input value={vllmArgs} onChange={(e) => setVllmArgs(e.target.value)} disabled={busy}
+                placeholder="--enable-auto-tool-choice --tool-call-parser hermes --max-model-len 32768"
+                className="h-8 font-mono text-[11px]" />
+              <span className="text-[10px] text-muted-foreground">
+                Appended to <span className="font-mono">vllm serve</span> verbatim (overrides defaults). The
+                platform-set flags (model / port / served-name / tensor-parallel) are rejected.
+              </span>
+            </div>
+          )}
           {ctlErr && <span className="w-full text-destructive">{ctlErr}</span>}
           {st?.running && (st.logs?.length ?? 0) > 0 && (
             <div className="terminal-block max-h-48 w-full overflow-y-auto rounded-md border border-border bg-zinc-950 p-2 font-mono text-[10px] leading-snug text-zinc-300">

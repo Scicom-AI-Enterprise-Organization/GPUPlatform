@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Gemma-4 31B LoRA finetune — 2x H100 SXM on RunPod.
 #
-# Pre-flight: this installs torch 2.12 (the ABI the FA3 wheel is built against) for whatever
-# CUDA the host driver supports, installs FlashAttention-3 + deps, runs the attention
-# correctness test, downloads the model + packed dataset once, then launches torchrun.
+# Pre-flight: installs torch 2.12 (the ABI the FA3 wheel needs) for the host CUDA, installs the
+# attention kernel + deps, runs the correctness test, downloads the model + packed dataset, launches
+# torchrun. Attention backend is chosen by GEMMA_FA4: 0 (default) = FA3 wheel + dynamic_attention
+# (SDPA-tiled head_dim-512, ~32k ceiling); 1 = clone+install the flash-attention-512 FA4 fork and use
+# fa4_attention (head_dim-512 cute kernel, long context — but see the activation-memory ceiling note).
 #
 # Usage on the pod:
 #   export HF_TOKEN=hf_...            # gated google/gemma-4-31B-it
-#   bash run.sh                       # full run
+#   bash run.sh                       # full run (FA3 / dynamic_attention)
+#   GEMMA_FA4=1 bash run.sh           # FA4 path: clone flash-attention-512 + fa4_attention
+#                                     #   (scp the private fork to ./flash-attention-512 first, or
+#                                     #    have a GH token; then run compare_logits_fa4.py as the gate)
 #   GEMMA_DEPS_ONLY=1 bash run.sh     # install + correctness test only (no train)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -21,6 +26,18 @@ FA3_TAG="${FA3_TAG:-v0.9.18}"
 MODEL_ID="${MODEL_ID:-google/gemma-4-31B-it}"
 DATA_ID="${DATA_ID:-huseinzolkepliscicom/gemma4-multipack}"
 GEMMA_DEPS_ONLY="${GEMMA_DEPS_ONLY:-0}"
+
+# ---------- attention backend ----------
+# GEMMA_FA4=1 → install the FlashAttention-4 head_dim-512 fork and train via fa4_attention
+# (memory-efficient O(S), enables long context). GEMMA_FA4=0 (default) → the prebuilt FA3 wheel +
+# the SDPA-tiled dynamic_attention path (FA3 caps head_dim 256, so the 512 global layers use SDPA).
+GEMMA_FA4="${GEMMA_FA4:-0}"
+# The FA4 head_dim-512 fork (adds symmetric head_dim=512 fwd+bwd on SM90 for gemma-4's global layers):
+FA4_FORK_REPO="${FA4_FORK_REPO:-https://github.com/Scicom-AI-Enterprise-Organization/flash-attention-512.git}"
+FA4_FORK_DIR="${FA4_FORK_DIR:-./flash-attention-512}"   # PRIVATE repo — clone needs a GH token, or
+                                                        # scp the fork here first (run.sh reuses it if present).
+# gemma4.py reads GEMMA_ATTN to pick the registered backend:
+export GEMMA_ATTN="${GEMMA_ATTN:-$([ "$GEMMA_FA4" = "1" ] && echo fa4_attention || echo dynamic_attention)}"
 
 # NCCL: disable NVLink-SHARP (NVLS) multicast. Inside RunPod containers the multicast memory
 # bind fails ("Failed to bind NVLink SHARP (NVLS) Multicast memory ... CUDA error 401") and
@@ -56,10 +73,28 @@ PIP="uv pip install $UV_FLAGS"
 # ---------- torch 2.12 matching the host CUDA (FA3 wheel ABI: torch2.12) ----------
 $PIP "torch==${TORCH_VERSION}" --index-url "https://download.pytorch.org/whl/${CU}"
 
-# ---------- FlashAttention-3 (Hopper; prebuilt, no JIT build) ----------
-WHL="flash_attn_3-3.0.0+${CU}torch2.12gite2743ab-cp39-abi3-linux_x86_64.whl"
-wget -nc -q "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/${FA3_TAG}/${WHL}"
-$PIP "$WHL"
+# ---------- attention kernel: FA4 fork (head_dim 512) OR the FA3 prebuilt wheel ----------
+if [ "$GEMMA_FA4" = "1" ]; then
+  echo ">> FA4 head_dim-512 fork → fa4_attention (replaces FA3; no FA3 wheel needed)"
+  # PRIVATE repo: clone with a GH token (gh auth / GH_TOKEN), or scp the fork to $FA4_FORK_DIR first.
+  if [ ! -d "$FA4_FORK_DIR/flash_attn/cute" ]; then
+    echo ">> cloning $FA4_FORK_REPO -> $FA4_FORK_DIR"
+    git clone --depth 1 "$FA4_FORK_REPO" "$FA4_FORK_DIR"
+  else
+    echo ">> reusing existing $FA4_FORK_DIR"
+  fi
+  # CuTeDSL kernels JIT-compile at runtime (FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 caches them).
+  $PIP -e "$FA4_FORK_DIR/flash_attn/cute"
+  # Pin the deps: the >= bounds in cute's pyproject pull too-new builds that break (quack 0.5.0 /
+  # cutlass-dsl 4.5.x). [cu13] = CUDA-13 cutlass libs. Verified combo on H100/H20 cu130.
+  $PIP "nvidia-cutlass-dsl[cu13]==4.4.2" "quack-kernels==0.3.10"
+  python -c "from flash_attn.cute.interface import flash_attn_varlen_func; print('FA4 cute import OK')"
+else
+  echo ">> FlashAttention-3 prebuilt wheel → dynamic_attention (Hopper; no JIT build)"
+  WHL="flash_attn_3-3.0.0+${CU}torch2.12gite2743ab-cp39-abi3-linux_x86_64.whl"
+  wget -nc -q "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/${FA3_TAG}/${WHL}"
+  $PIP "$WHL"
+fi
 
 # ---------- remaining deps ----------
 $PIP kernels==0.14.1                # >=0.15.1 needs an explicit version pin; keep 0.14.1
@@ -71,9 +106,16 @@ $PIP wandb                          # metrics logging (gemma4.py --wandb)
 $PIP "git+https://github.com/Scicom-AI-Enterprise-Organization/ChiniDataset.git"
 $PIP -U huggingface_hub hf_transfer # `hf` CLI + fast download
 
-# ---------- pre-flight: attention correctness (SDPA mask + FA3 cu_seqlens) ----------
-echo ">> attention correctness test"
-python test_attention.py
+# ---------- pre-flight: attention correctness ----------
+# FA3/SDPA path → test_attention.py (kernel-level, no model). FA4 path → compare_logits_fa4.py is the
+# gate, but it needs the model on the GPU, so run it after the model download (not here):
+#   python compare_logits_fa4.py   # asserts fa4_attention logits == default (cosine > 0.99)
+if [ "$GEMMA_FA4" = "1" ]; then
+  echo ">> FA4 backend: skipping test_attention.py (run compare_logits_fa4.py post-download as the gate)"
+else
+  echo ">> attention correctness test"
+  python test_attention.py
+fi
 
 if [ "$GEMMA_DEPS_ONLY" = "1" ]; then echo ">> GEMMA_DEPS_ONLY=1 — install + test done, skipping train"; exit 0; fi
 
@@ -94,5 +136,12 @@ fi
 hf download "$MODEL_ID" --exclude "original/*" --exclude "*.pth" --exclude "*.gguf" --exclude "consolidated*"
 
 # ---------- train ----------
-echo ">> launching training on $NPROC GPUs"
+# FA4: cache the JIT-compiled CuTeDSL kernels + reduce allocator fragmentation. (Activation memory is
+# O(seq*layers) and unshardable, so even with FA4 the no-offload context ceiling is ~64k on 80GB
+# H100 / ~70k on 144GB H20 — pack shorter bins, or add activation offload, for longer context.)
+if [ "$GEMMA_FA4" = "1" ]; then
+  export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED="${FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED:-1}"
+  export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+fi
+echo ">> launching training on $NPROC GPUs (GEMMA_ATTN=$GEMMA_ATTN)"
 torchrun --nproc_per_node="$NPROC" gemma4.py "$@"

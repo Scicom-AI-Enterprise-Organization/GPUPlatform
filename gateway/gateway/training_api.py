@@ -3026,6 +3026,7 @@ def _playground_paths(cfg: dict, run_id: str, kind: str) -> dict:
         venv = (cfg.get("venv_path") or "/share/autotrain-llm").rstrip("/")
         return {
             **base,
+            "tryit_dir": tdir,                   # the whole per-run tree (merged + ckpt) — swept on unload
             "model_dir": f"{tdir}/merged",      # vLLM serves this
             "ckpt_dir": f"{tdir}/ckpt",          # downloaded lora.pt + meta
             "vllm_venv": "/share/autotrain-llm-vllm",
@@ -3157,10 +3158,16 @@ def _playground_stop_ssh(host, port, user, key_filename, run_id, cfg, kind):
     try:
         paths = _playground_paths(cfg, run_id, kind)
         sock = paths.get("sock", "")  # LLM (vLLM) has no unix socket
+        # LLM unload also reclaims the per-run merged model (~59GB) + downloaded ckpt
+        # from /share — KEEPS the shared vLLM venv (/share/autotrain-llm-vllm, reused by
+        # every LLM run). Done AFTER the kill so vLLM's mmap'd safetensors are released.
+        # run_id is `train-<hex>` (no shell metachars), so the controlled path is safe.
+        extra = (f' rm -rf {paths["tryit_dir"]} 2>/dev/null;'
+                 if (kind == "llm" and paths.get("tryit_dir")) else "")
         cmd = (f'P="$(cat {paths["pid"]} 2>/dev/null)"; '
                f'if [ -n "$P" ]; then kill -TERM -"$P" 2>/dev/null || kill -TERM "$P" 2>/dev/null; sleep 1; '
-               f'kill -KILL -"$P" 2>/dev/null || true; fi; '
-               f'rm -f {sock} {paths["ready"]} {paths["pid"]}; echo stopped')
+               f'kill -KILL -"$P" 2>/dev/null || true; fi; sleep 1;'
+               f'rm -f {sock} {paths["ready"]} {paths["pid"]};{extra} echo stopped')
         _ssh_capture(cli, cmd)
         return {"running": False, "ready": False}
     finally:
@@ -3182,7 +3189,7 @@ def _playground_status_ssh(host, port, user, key_filename, run_id, cfg, kind):
 
 
 def _llm_playground_start_ssh(host, port, user, key_filename, run_id, model_s3, creds, cfg,
-                              base_model, gpus, served_name, max_model_len=16384):
+                              base_model, gpus, served_name, max_model_len=16384, vllm_args=""):
     """LLM try-it: launch the detached orchestrator (download LoRA → merge → save →
     vLLM serve eager) on the VM and record its pid. The orchestrator logs every step
     to paths['log'] (the status tab tails it) and writes paths['ready'] once vLLM is
@@ -3211,6 +3218,7 @@ def _llm_playground_start_ssh(host, port, user, key_filename, run_id, model_s3, 
             "port": paths["port"], "tp": max(1, len(gpu_list)), "gpus": gpus or "",
             "max_model_len": int(max_model_len), "gpu_mem_util": 0.90,
             "served_model_name": served_name, "ready_file": paths["ready"],
+            "vllm_args": vllm_args or "",
         }
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(sconf)); local_cfg = f.name
@@ -3979,6 +3987,10 @@ async def playground_start(
     gpu: Optional[str] = Query(None, description="GPU index, 'cpu', or 'auto'"),
     idle_minutes: float = Query(5, ge=0, le=120,
                                 description="auto-unload after this many idle minutes (0 = never)"),
+    vllm_args: Optional[str] = Query(None,
+        description="LLM only: extra vLLM serve CLI args, verbatim (e.g. '--enable-auto-tool-choice "
+                    "--tool-call-parser hermes --max-model-len 32768'). Appended last so they override "
+                    "the defaults; the platform-set flags (model/port/served-name/tp) are rejected."),
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -3986,18 +3998,30 @@ async def playground_start(
     socket) so try-it requests skip the per-call model load. Returns immediately;
     poll …/playground/status until ready. Auto-unloads after idle_minutes idle.
 
-    LLM (gemma-4) runs ignore `gpu` and serve with vLLM (eager) across the GPUs the
-    run trained on (TP = GPU count): download LoRA → merge → save → vLLM serve."""
+    LLM (gemma-4) runs serve with vLLM (eager); `gpu` may be a comma-list (e.g. "6,7")
+    to pick the serve GPUs (TP = count), defaulting to the run's training pin:
+    download LoRA → merge → save → vLLM serve."""
     row, kind, model_s3, creds, ssh, cfg = await _playground_ctx(run_id, user, session)
     if kind == "llm":
-        gpus = (row.visible_devices or "").strip()
-        if not gpus:
+        # Serve GPUs: an explicit `gpu` (comma-list like "6,7") overrides the run's
+        # training pin; tensor-parallel size = the number of GPUs chosen.
+        sel = (gpu or "").strip().lower()
+        gpus = sel if (sel and sel not in ("auto", "cpu")) else (row.visible_devices or "").strip()
+        gpu_ids = [g.strip() for g in gpus.split(",") if g.strip()]
+        if not gpu_ids or not all(g.isdigit() for g in gpu_ids):
             raise HTTPException(status_code=400,
-                                detail="LLM try-it needs the run's GPU pin (visible_devices) to serve with vLLM")
+                detail="LLM try-it needs a comma-separated GPU list (e.g. '6,7') — pass ?gpu=6,7 or set the run's visible_devices")
+        gpus = ",".join(gpu_ids)
+        va = (vllm_args or "").strip()
+        if va:
+            # Reuse the serverless validator (reject pasted backslashes / bad quotes /
+            # the flags the platform sets itself: model/port/served-name/tp/pp/sleep).
+            from .main import _validate_vllm_args, _VLLM_RESERVED_MULTI
+            _validate_vllm_args(va, label="vLLM args", reserved=_VLLM_RESERVED_MULTI)
         try:
             st = await asyncio.to_thread(_llm_playground_start_ssh, *ssh, run_id, model_s3, creds, cfg,
                                          (row.base_model or cfg.get("base_model") or "google/gemma-4-31B-it"),
-                                         gpus, run_id, 16384)
+                                         gpus, run_id, 16384, va)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"could not start the vLLM server: {e}")
         return PlaygroundStatus(**st)

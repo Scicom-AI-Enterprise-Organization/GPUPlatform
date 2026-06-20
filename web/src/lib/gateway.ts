@@ -454,11 +454,16 @@ export const gateway = {
   },
   /** Persistent try-it worker: load the model once on the VM and keep it resident
    * (subsequent transcribe/synthesize skip the per-request model load). */
-  playgroundStart: (id: string, gpu?: string) =>
-    request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
-      `/v1/training-runs/${encodeURIComponent(id)}/playground/start${gpu ? `?gpu=${encodeURIComponent(gpu)}` : ""}`,
+  playgroundStart: (id: string, gpu?: string, vllmArgs?: string) => {
+    const qs = new URLSearchParams();
+    if (gpu) qs.set("gpu", gpu);
+    if (vllmArgs && vllmArgs.trim()) qs.set("vllm_args", vllmArgs.trim());
+    const q = qs.toString();
+    return request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/playground/start${q ? `?${q}` : ""}`,
       { method: "POST" },
-    ),
+    );
+  },
   playgroundStatus: (id: string) =>
     request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
       `/v1/training-runs/${encodeURIComponent(id)}/playground/status`,

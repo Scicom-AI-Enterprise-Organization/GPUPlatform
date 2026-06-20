@@ -31,9 +31,10 @@ import mlflow
 from chinidataset import StreamingDataset
 from contextlib import nullcontext
 from attention import dynamic_attention, block_diagonal_concat
+from gemma4_fa4_attention import fa4_attention
 
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     handlers=[
         logging.StreamHandler()
     ]
@@ -41,8 +42,15 @@ logging.basicConfig(
 logger = logging.getLogger()
 
 
-# dynamic_attention + block_diagonal_concat live in attention.py (torch-only, unit-tested).
+# Two interchangeable packed-attention backends, selected by env GEMMA_ATTN:
+#   "dynamic_attention" (attention.py)  — head_dim-512 via tiled SDPA-math (O(S^2) score → ~32k ceiling)
+#   "fa4_attention" (gemma4_fa4_attention.py) — routes ALL layers through the FA4 head_dim-512 cute
+#       kernel (flash-attention-512 fork): memory-efficient O(S), lifts the ceiling to 128k.
+# fa4_attention's flash_attn.cute import is lazy (inside the fn), so registering it is safe even if
+# the FA4 package isn't installed; it only fires when that backend is actually used.
 AttentionInterface.register("dynamic_attention", dynamic_attention)
+AttentionInterface.register("fa4_attention", fa4_attention)
+ATTN_IMPL = os.environ.get("GEMMA_ATTN", "fa4_attention")
 
 
 def ddp_setup():
@@ -241,11 +249,13 @@ def main(
     
     config = AutoConfig.from_pretrained("google/gemma-4-31B-it")
     # modify the confg
+    if rank == 0:
+        logger.info(f"attention backend: {ATTN_IMPL}")
     model = CustomGemma4ForConditionalGeneration.from_pretrained(
-        "google/gemma-4-31B-it", 
-        config=config, 
+        "google/gemma-4-31B-it",
+        config=config,
         dtype=torch.bfloat16, # native bf16 training
-        attn_implementation = "dynamic_attention"
+        attn_implementation = ATTN_IMPL
     )
     # tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-31B-it")
     total_params = sum(p.numel() for p in model.parameters())
@@ -291,7 +301,7 @@ def main(
         checkpoint_impl=CheckpointImpl.NO_REENTRANT,
     )
     apply_activation_checkpointing(
-        model, 
+        model,
         checkpoint_wrapper_fn = non_reentrant_wrapper,
         check_fn=lambda x: isinstance(x, tuple(checkpointing_modules))
     )

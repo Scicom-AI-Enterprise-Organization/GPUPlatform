@@ -76,3 +76,32 @@ the job dir (e.g. `/root/autotrain-mm2`, `/root/eval`) AND the HF cache
 files to `/root/...`, not `/workspace/...`. Size the pod with a big **`--container-disk-in-gb`**
 (e.g. 600 for MiniMax-M2's ~230GB) rather than a volume.
 (Auth/download: `runpodctl config --apiKey` + `hf auth login --token` both read from `../.env`.)
+
+**ALWAYS serve vLLM with `--gpu-memory-utilization 0.85` (hard rule, user requested).** Never higher
+(no 0.9/0.92) — leaves headroom and, on the shared tm H20, room for other users + avoids tipping
+contended GPUs into OOM. Applies to every `vllm serve` (eval / inference), RunPod or H20.
+
+## The `tm` H20 VM (scicom prod box) — alternative to RunPod, no per-hour billing
+
+A persistent **8× H20-3e** box (~**144 GB/GPU**, ~1 TB RAM, CUDA 13.0) — the quickest path for big
+runs (no pod spin-up, models pre-cached) and it has the **VRAM headroom RunPod H100s (80 GB) lack**.
+The 144 GB/GPU removes the unshardable activation-memory ceiling (O(seq×layers)) that caps
+long-context LoRA training on 80 GB cards — e.g. gemma4 FA4 128k OOMs on 4× H100 but fits here.
+
+```bash
+ssh -i ../../scicom root@8.222.165.68 -p 1024      # the `scicom` key = GPUPlatform/scicom (mode 600)
+```
+
+- **Shared box** (other users' jobs/tmux live here): **GPUs 0–5 usually free; 6,7 have ~131 GB
+  orphaned** (other PID namespace — not killable from our container; don't use them). Pin
+  `CUDA_VISIBLE_DEVICES` to the GPUs you're given and **don't hog all 8**.
+- **Everything under `/share`** (4.7 T shared disk, but watch free space — it runs ~90% full):
+  - venv per job: `uv venv /share/<job>-venv --python 3.12` (NOT `--system`). `uv` is at
+    `/usr/local/bin/uv`. ⚠ **Never touch `/share/vllm-venv`** (hand-built fleet venv).
+  - HF cache: `export HF_HOME=/share/huggingface` (1.3 T; gemma-4-31B, Mistral-Small-4, etc. already
+    cached) + **`HF_HUB_DISABLE_XET=1`** (Xet stalls big pulls here).
+  - job dir `/share/autotrain-<job>`; **detach long jobs** (`nohup`/`tmux`) — survives ssh drop.
+- **Copy in:** `scp -i ../../scicom -P 1024 *.py *.sh root@8.222.165.68:/share/autotrain-<job>/`.
+- Auth: `RUNPOD_API_KEY`/`HF_TOKEN` still come from `../.env`; scp `~/.netrc` to `/root/.netrc` for
+  `--wandb`. Per-job verified recipes: `mistral-small/CLAUDE.md` ("H20 node") and `gemma4/CLAUDE.md`
+  ("FA4 … on the tm H20").

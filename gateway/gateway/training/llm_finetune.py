@@ -49,7 +49,28 @@ TORCH_VERSION = "2.12.0"   # MUST be 2.12.x — the FA3 prebuilt wheel ABI (+ to
 FA3_TAG = "v0.9.18"
 _FA3_BASE = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download"
 
-# Deps shared by both archs (on top of torch 2.12 + the FA3 wheel + transformers 5.5.0).
+# FA4 (gemma, OPT-IN via cfg.gemma_fa4): the flash-attention-512 fork's cute kernel — symmetric
+# head_dim=512 fwd+bwd on Hopper, so it handles BOTH gemma-4 head dims (512 global + 256 sliding),
+# replacing the FA3 wheel + the SDPA-tiled 512 path → O(S) memory, long-context training. torch
+# stays 2.12 (installed for both paths); only the attention kernel differs. Installed from the
+# (PRIVATE) git fork's cute subdir (a `flash_attn.cute` namespace pkg); CuTeDSL JIT-compiles
+# kernels at runtime. The cutlass-dsl/quack pins are load-bearing — the `>=` bounds in cute's
+# pyproject pull too-new versions that break (quack 0.5 / cutlass-dsl 4.5; see gemma4 CLAUDE.md +
+# run.sh). Overridable via cfg (fa4_fork_install / fa4_pins) if the fork URL/branch changes.
+_FA4_FORK_INSTALL = "git+https://github.com/Scicom-AI-Enterprise-Organization/flash-attention-512.git#subdirectory=flash_attn/cute"
+_FA4_PINS = ["nvidia-cutlass-dsl[cu13]==4.4.2", "quack-kernels==0.3.10"]
+
+
+def _fa_mode(arch: str, cfg: dict) -> str:
+    """Which attention stack to install/run: gemma DEFAULTS to 'fa4' (the head_dim-512
+    cute fork — faster, long context) and can opt out with cfg.gemma_fa4=False (→ the
+    FA3 wheel + dynamic_attention SDPA-tiled path). minimax/mistral always 'fa3' (stock
+    FA, head_dim 128)."""
+    if arch == "gemma":
+        return "fa4" if cfg.get("gemma_fa4", True) else "fa3"
+    return "fa3"
+
+# Deps shared by all archs (on top of the per-arch torch + attention stack + transformers 5.5.0).
 _COMMON_DEPS = ["mlflow", "psutil", "pynvml", "liger-kernel", "wandb",
                 "numpy", "tqdm", "boto3", "huggingface_hub", "hf_transfer"]
 
@@ -59,7 +80,12 @@ _COMMON_DEPS = ["mlflow", "psutil", "pynvml", "liger-kernel", "wandb",
 _ARCH = {
     "gemma": {
         "trainer": "gemma4.py",                 # at LLM_DIR root
-        "preflight": "test_attention.py",        # SDPA-mask + FA3 cu_seqlens (needs a GPU)
+        # Default backend = dynamic_attention (FA3 wheel + SDPA-tiled head_dim-512, ~32k ceiling),
+        # matching the standalone run.sh's GEMMA_FA4=0 default. FA4 (head_dim-512 cute fork, long
+        # context, faster) is opt-in via cfg.gemma_fa4 — see _fa_mode / _install_fa4. The FA3 path's
+        # cheap kernel-level gate is test_attention.py; the FA4 gate (compare_logits_fa4.py, shipped
+        # for manual use) loads the real model, so the FA4 path skips the every-run preflight.
+        "preflight": "test_attention.py",        # FA3/SDPA kernel test (no model); skipped on the FA4 path
         "preflight_cwd": LLM_DIR,
         "preflight_env": {},
         "model_env": "GEMMA_MODEL_ID",
@@ -145,18 +171,50 @@ def _pick_cuda_backend() -> str:
     raise RuntimeError(f"host driver CUDA '{host}' too old; need >=12.6 for the FA3 wheel")
 
 
+def _install_fa3_wheel(cu: str, venv: str, _pip) -> None:
+    """The FA3 prebuilt wheel for the host CUDA (head_dim 128 → minimax/mistral, and
+    gemma's dynamic_attention fallback). torch 2.12 is installed separately (common)."""
+    whl = f"flash_attn_3-3.0.0+{cu}torch2.12gite2743ab-cp39-abi3-linux_x86_64.whl"
+    whl_path = os.path.join(venv, whl)
+    if not os.path.exists(whl_path):
+        url = f"{_FA3_BASE}/{FA3_TAG}/{whl}"
+        log(f"[deps] downloading FA3 wheel {whl} …")
+        urllib.request.urlretrieve(url, whl_path)
+    _pip(whl_path)
+
+
+def _install_fa4(cfg: dict, py: str, env: dict, _pip) -> None:
+    """FlashAttention-4 fork (gemma head_dim-512). torch 2.12 is already installed
+    (common); add the cute subdir from the public git fork + the load-bearing
+    cutlass-dsl/quack pins (the cute pyproject's `>=` bounds pull too-new builds that
+    break). Mirrors run.sh's GEMMA_FA4=1 path; verifies the import after install."""
+    log("[deps] FlashAttention-4 cute fork + cutlass/quack pins …")
+    _pip(cfg.get("fa4_fork_install") or _FA4_FORK_INSTALL)
+    _pip(*(cfg.get("fa4_pins") or _FA4_PINS))
+    # Verify the kernel imports (CuTeDSL loads here; it JIT-compiles only at call time).
+    # Run from a dir with NO local flash_attn/ so the namespace pkg resolves.
+    subprocess.check_call(
+        [py, "-c", "from flash_attn.cute.interface import flash_attn_varlen_func; print('FA4 cute import OK')"],
+        cwd="/tmp", env=env,
+    )
+
+
 def _ensure_venv(cfg: dict, arch: str) -> str:
     """Create/reuse an isolated uv venv with the arch's training stack; return its
-    python. Idempotent. torch 2.12 + the FA3 wheel match the host driver CUDA."""
+    python. Idempotent. torch 2.12 is common; the attention kernel is per-mode:
+    gemma defaults to the FA4 cute fork (head_dim-512), else the FA3 wheel."""
     venv = _venv_path(cfg, arch)
     py = os.path.join(venv, "bin", "python")
     env = {**os.environ, "PIP_CONSTRAINT": "", "PIP_REQUIRE_HASHES": "0"}
     pkgs = list(_ARCH[arch]["deps"]) + list(_COMMON_DEPS)
+    fa = _fa_mode(arch, cfg)
+    # FA4 installs as the `flash_attn.cute` namespace pkg; FA3 as `flash_attn_interface`.
+    attn_import = "flash_attn.cute" if fa == "fa4" else "flash_attn_interface"
 
     def _present() -> bool:
         try:
             subprocess.check_call(
-                [py, "-c", "import torch, transformers, flash_attn_interface, liger_kernel, mlflow"],
+                [py, "-c", f"import torch, transformers, liger_kernel, {attn_import}"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             return True
@@ -176,25 +234,23 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
             subprocess.check_call([sys.executable, "-m", "venv", venv], env=env)
             subprocess.check_call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"], env=env)
 
-    cu = _pick_cuda_backend()
-    log(f"[deps] {arch}: CUDA backend {cu}; torch=={TORCH_VERSION} + FlashAttention-3 + stack …")
-
     def _pip(*args: str) -> None:
         if have_uv:
             subprocess.check_call(["uv", "pip", "install", "--python", py, *args], env=env)
         else:
             subprocess.check_call([py, "-m", "pip", "install", "-q", *args], env=env)
 
+    # torch 2.12 is the common base (the FA3-wheel ABI + torch._grouped_mm for MoE; the
+    # FA4 cute fork also runs on it). The attention kernel then differs by mode.
+    cu = _pick_cuda_backend()
+    log(f"[deps] {arch} ({fa}): CUDA backend {cu}; torch=={TORCH_VERSION} …")
     _pip(f"torch=={TORCH_VERSION}", "--index-url", f"https://download.pytorch.org/whl/{cu}")
-    whl = f"flash_attn_3-3.0.0+{cu}torch2.12gite2743ab-cp39-abi3-linux_x86_64.whl"
-    whl_path = os.path.join(venv, whl)
-    if not os.path.exists(whl_path):
-        url = f"{_FA3_BASE}/{FA3_TAG}/{whl}"
-        log(f"[deps] downloading FA3 wheel {whl} …")
-        urllib.request.urlretrieve(url, whl_path)
-    _pip(whl_path)
+    if fa == "fa4":
+        _install_fa4(cfg, py, env, _pip)
+    else:
+        _install_fa3_wheel(cu, venv, _pip)
     _pip(*pkgs)
-    log(f"[deps] {arch} LLM venv ready: {py}")
+    log(f"[deps] {arch} ({fa}) LLM venv ready: {py}")
     return py
 
 
@@ -329,6 +385,7 @@ def run(cfg: dict) -> None:
     model_id = cfg.get("base_model") or ""
     arch = detect_arch(model_id)
     spec = _ARCH[arch]
+    fa = _fa_mode(arch, cfg)  # gemma: fa4 (default) | fa3; minimax/mistral: fa3
 
     _root = os.path.join((cfg.get("work_dir") or "/share").rstrip("/"), "checkpoint-llm")
     try:
@@ -368,8 +425,18 @@ def run(cfg: dict) -> None:
         "HF_HUB_ENABLE_HF_TRANSFER": base_env.get("HF_HUB_ENABLE_HF_TRANSFER", "1"),
     }
     if arch == "gemma":
-        # query-tiling block size that lets the 32k pack train (see gemma4 CLAUDE.md).
-        env["SDPA_QUERY_BLOCK"] = str(cfg.get("sdpa_query_block") or 1024)
+        # gemma4.py picks the registered backend from GEMMA_ATTN (set it explicitly so the
+        # script default doesn't decide). FA4 = the cute head_dim-512 kernel (default, faster,
+        # long context); fa3 = dynamic_attention (SDPA-tiled 512 + FA3 sliding).
+        if fa == "fa4":
+            env["GEMMA_ATTN"] = "fa4_attention"
+            # cache the CuTeDSL JIT kernels across steps/runs + reduce allocator fragmentation.
+            env["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] = base_env.get("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
+            env["PYTORCH_ALLOC_CONF"] = base_env.get("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+        else:
+            env["GEMMA_ATTN"] = "dynamic_attention"
+            # query-tiling block size that lets the 32k pack train (see gemma4 CLAUDE.md).
+            env["SDPA_QUERY_BLOCK"] = str(cfg.get("sdpa_query_block") or 1024)
     # arch-specific run env (e.g. mistral's Triton FP8 dequant fast path).
     for k, v in (spec.get("run_env") or {}).items():
         env.setdefault(k, str(v))
@@ -389,13 +456,23 @@ def run(cfg: dict) -> None:
         env=env,
     )
 
-    # Pre-flight: the arch's correctness test (the "verify the custom forward before
-    # an expensive run" gate). Abort the run if it fails.
-    pf_env = {**env, **spec["preflight_env"]}
-    log(f"[preflight] {arch}: {spec['preflight']} …")
-    rc = subprocess.call([py, spec["preflight"]], cwd=spec["preflight_cwd"], env=pf_env)
-    if rc != 0:
-        raise RuntimeError(f"{arch} correctness pre-flight ({spec['preflight']}) failed (rc={rc}) — refusing to train")
+    # Pre-flight: the arch's correctness test (the "verify the custom forward before an
+    # expensive run" gate). Abort the run if it fails. The FA4 gemma path has no cheap
+    # unit-test gate (test_attention.py only exercises the FA3/SDPA path; the real FA4
+    # gate compare_logits_fa4.py loads the 31B model), so it's skipped — the cute kernel
+    # is pre-validated (cosine 0.9998) and shipped for a manual compare_logits_fa4.py run.
+    preflight = spec.get("preflight")
+    if arch == "gemma" and fa == "fa4":
+        preflight = None
+    if preflight:
+        pf_env = {**env, **spec["preflight_env"]}
+        log(f"[preflight] {arch} ({fa}): {preflight} …")
+        rc = subprocess.call([py, preflight], cwd=spec["preflight_cwd"], env=pf_env)
+        if rc != 0:
+            raise RuntimeError(f"{arch} correctness pre-flight ({preflight}) failed (rc={rc}) — refusing to train")
+    else:
+        log(f"[preflight] {arch} ({fa}): no cheap pre-flight (FA4 cute kernel pre-validated; "
+            f"run compare_logits_fa4.py manually for a full check)")
 
     nproc = _nproc(cfg)
     if arch == "gemma":
