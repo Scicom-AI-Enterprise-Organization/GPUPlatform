@@ -54,7 +54,7 @@ The fleet serves **Whisper** via the OpenAI-compatible **`/v1/audio/transcriptio
 **`/v1/audio/translations`** (global + scoped `/{app_id}/v1/audio/...`). The job queue is
 JSON-only, so the gateway base64s the uploaded clip into the payload and the **worker rebuilds
 the multipart** request for vLLM (`worker-agent/worker_agent/main.py` `handle()`). Use it from an
-endpoint's **Playground → mode: Audio transcription** (a Chat/Audio toggle on the Playground tab —
+endpoint's **Playground → mode: Audio transcription** (a Chat/Embedding/Audio toggle on the Playground tab —
 not a separate tab; its model dropdown lists *every* member so any name works, and it keeps its own
 per-browser transcription history alongside the chat history), or:
 `curl -F file=@clip.mp3 -F model=<model> -H "Authorization: Bearer sgpu_…" $GW/<app_id>/v1/audio/transcriptions`

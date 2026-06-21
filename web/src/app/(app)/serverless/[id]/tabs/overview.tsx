@@ -46,6 +46,10 @@ export function OverviewTab({ app }: { app: AppRecord }) {
   // A multi-model *cloud* endpoint (RunPod, gpu != "vm") still scales the pod and
   // honours idle_timeout_s (idle → delete the pod), so it gets the editable scale
   // card. Each member model has its own vLLM args either way.
+  // proxy = single-model VM endpoint the gateway proxies to directly (no queue, no
+  // sleep). It's stored as a 1-member fleet, so it uses the VM-serving + per-member
+  // args cards like multi, just without the sleep/wake eviction story.
+  const isProxy = app.mode === "proxy";
   const isMulti = app.mode === "multi";
   const isVm = app.gpu === "vm";
   return (
@@ -55,10 +59,10 @@ export function OverviewTab({ app }: { app: AppRecord }) {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <DetailCard app={app} />
-        {isMulti && isVm ? <VmServingCard app={app} /> : <ScaleStrategyCard app={app} />}
+        {(isMulti || isProxy) && isVm ? <VmServingCard app={app} /> : <ScaleStrategyCard app={app} />}
       </div>
 
-      {isMulti ? <MultiModelArgsCard app={app} /> : <EngineArgsCard app={app} />}
+      {isMulti || isProxy ? <MultiModelArgsCard app={app} /> : <EngineArgsCard app={app} />}
 
       <EnvVarsCard app={app} />
     </div>
@@ -109,16 +113,18 @@ function EnvVarsCard({ app }: { app: AppRecord }) {
 function VmServingCard({ app }: { app: AppRecord }) {
   const models = app.models ?? [];
   const gpuIds = (app.visible_devices ?? "").trim();
+  const isProxy = app.mode === "proxy";
   return (
     <Card>
       <CardHeader>
         <CardTitle className="text-sm font-medium">VM serving</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3 text-sm">
-        <Row label="Mode" value="Multi-model (always-on)" />
+        <Row label="Mode" value={isProxy ? "Single model · direct proxy" : "Multi-model (always-on)"} />
         <Row label="Models" value={<code className="font-mono">{models.length}</code>} />
         <Row label="GPUs" value={<code className="font-mono">{gpuIds || `×${app.gpu_count ?? 0}`}</code>} />
-        <Row label="Eviction" value={`Sleep/wake · level ${app.sleep_level ?? 1}`} />
+        {!isProxy && <Row label="Eviction" value={`Sleep/wake · level ${app.sleep_level ?? 1}`} />}
+        {isProxy && <Row label="Routing" value="Forward tunnel · no queue, no sleep" />}
         {app.vllm_version && !app.vllm_install_args && (
           <Row label="vLLM" value={<code className="font-mono">{app.vllm_version}</code>} />
         )}
@@ -146,9 +152,18 @@ function VmServingCard({ app }: { app: AppRecord }) {
           />
         )}
         <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-          One fixed VM node, always on — no scale-to-zero. Models whose GPUs are
-          contended are slept (level {app.sleep_level ?? 1}) and woken on demand; the first
-          request to a sleeping model waits for the swap.
+          {isProxy ? (
+            <>
+              One fixed VM node, always on — no scale-to-zero. The gateway proxies each request
+              straight to the model&apos;s vLLM over a forward tunnel: no queue, no sleep/wake.
+            </>
+          ) : (
+            <>
+              One fixed VM node, always on — no scale-to-zero. Models whose GPUs are
+              contended are slept (level {app.sleep_level ?? 1}) and woken on demand; the first
+              request to a sleeping model waits for the swap.
+            </>
+          )}
         </p>
       </CardContent>
     </Card>

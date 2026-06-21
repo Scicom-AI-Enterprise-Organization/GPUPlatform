@@ -1479,8 +1479,8 @@ async def create_app(
         raise HTTPException(status_code=400, detail="volume_gb must be 0..4000")
 
     mode = (req.mode or "single").lower()
-    if mode not in ("single", "multi"):
-        raise HTTPException(status_code=400, detail="mode must be 'single' or 'multi'")
+    if mode not in ("single", "multi", "proxy"):
+        raise HTTPException(status_code=400, detail="mode must be 'single', 'multi' or 'proxy'")
 
     # Validate the chosen provider row. VM is now allowed for serverless;
     # multi-model REQUIRES a probed VM provider (a fixed multi-GPU node).
@@ -1525,8 +1525,22 @@ async def create_app(
     sleep_level = 1
     autoscaler_dict = req.autoscaler.model_dump()
 
-    if mode == "multi":
-        members = req.models or []
+    if mode in ("multi", "proxy"):
+        members = list(req.models or [])
+        # proxy = a single-model VM endpoint the gateway proxies to directly (no
+        # queue, no sleep). It's modeled as a 1-member fleet so it reuses all the
+        # multi-model packing/validation + worker machinery below. Accept either a
+        # 1-element `models` list or a bare `model`; normalize to exactly one member.
+        if mode == "proxy":
+            if not is_vm:
+                raise HTTPException(status_code=400, detail="mode='proxy' is for VM providers only")
+            if not members and (req.model or "").strip():
+                members = [MultiModelMember(
+                    model=req.model.strip(), tp=1, pp=1,
+                    extra_args=(req.vllm_args or "").strip(),
+                )]
+            if len(members) != 1:
+                raise HTTPException(status_code=400, detail="mode='proxy' requires exactly one model")
         if not members:
             raise HTTPException(status_code=400, detail="multi-model mode requires at least one model in 'models'")
         # Usable GPU universe to pack the fleet onto. Each model needs tp*pp GPUs
@@ -1688,8 +1702,10 @@ async def create_app(
         )
         if req.enable_metrics:
             env.update(build_metrics_env(req.name, provider.name))
-        if mode == "multi":
-            env["WORKER_MODE"] = "multi"
+        if mode in ("multi", "proxy"):
+            # proxy = 1-member fleet served via direct forward-tunnel proxy (no
+            # queue); WORKER_MODE=proxy so the worker skips the queue consumer.
+            env["WORKER_MODE"] = mode
             env["MULTI_MODEL_CONFIG"] = json.dumps(build_multi_model_config(record))
             env["SLEEP_LEVEL"] = str(sleep_level)
             env["TOTAL_GPUS"] = str(gpu_count)
@@ -1862,11 +1878,13 @@ async def get_app_status(
     workers = await rdb.smembers(f"worker_index:{app_id}")
     live_workers = 0
     models_state: list[dict] = []
-    is_multi = (getattr(app, "mode", "single") or "single") == "multi"
+    # proxy is a 1-member fleet — it reports member state the same way, so surface
+    # its model in the status (Workers/Visual tabs) like multi.
+    is_fleet = (getattr(app, "mode", "single") or "single") in ("multi", "proxy")
     for mid in workers:
         if await rdb.exists(f"worker:{mid}"):
             live_workers += 1
-            if is_multi:
+            if is_fleet:
                 blob = await rdb.get(f"worker:{mid}:models")
                 if blob:
                     try:
@@ -1896,7 +1914,7 @@ async def get_app_status(
     # deterministically when it builds the fleet config, so we can recompute
     # them here and surface `localhost:<port>` per model in the Workers tab —
     # no worker change needed.
-    if is_multi and models_state:
+    if is_fleet and models_state:
         try:
             from .autoscaler import build_multi_model_config
             cfg = build_multi_model_config(app)
@@ -2023,11 +2041,16 @@ async def app_model_action(
       sleep_all → sleep every awake model (free all GPUs)
     `sleep_all` ignores `model`; the others target one member."""
     app = await _load_owned_app(session, app_id, user)
-    if (getattr(app, "mode", "single") or "single") != "multi":
-        raise HTTPException(status_code=400, detail="model actions apply only to multi-model endpoints")
+    app_mode = (getattr(app, "mode", "single") or "single")
+    if app_mode not in ("multi", "proxy"):
+        raise HTTPException(status_code=400, detail="model actions apply only to multi-model / proxy endpoints")
     action = (req.action or "").strip().lower()
     if action not in ("kill", "restart", "sleep", "sleep_all"):
         raise HTTPException(status_code=400, detail="action must be one of: kill, restart, sleep, sleep_all")
+    # proxy serves one always-on model directly (no queue/sleep) — sleeping it would
+    # brick the endpoint (nothing wakes it). Only kill/restart make sense.
+    if app_mode == "proxy" and action in ("sleep", "sleep_all"):
+        raise HTTPException(status_code=400, detail="proxy endpoints don't support sleep — only kill/restart")
     rdb = request.app.state.redis
     if action == "sleep_all":
         await rdb.rpush(f"app:{app_id}:model_cmds", json.dumps({"model": "*", "action": "sleep_all"}))
@@ -2451,10 +2474,13 @@ async def update_app_models(
     the new fleet. (Same validation as create.) Single-model endpoints use
     `PATCH /apps/{id}/autoscaler` (vllm_args) instead."""
     target = await _load_owned_app(session, app_id, user)
-    if (getattr(target, "mode", "single") or "single") != "multi":
-        raise HTTPException(status_code=400, detail={"error": "only multi-model endpoints have an editable model list"})
+    target_mode = (getattr(target, "mode", "single") or "single")
+    if target_mode not in ("multi", "proxy"):
+        raise HTTPException(status_code=400, detail={"error": "only multi-model / proxy endpoints have an editable model list"})
     if not req.models:
         raise HTTPException(status_code=400, detail={"error": "models cannot be empty — delete the endpoint instead"})
+    if target_mode == "proxy" and len(req.models) != 1:
+        raise HTTPException(status_code=400, detail={"error": "a proxy endpoint serves exactly one model"})
     if req.sleep_level is not None and req.sleep_level not in (1, 2):
         raise HTTPException(status_code=400, detail={"error": "sleep_level must be 1 or 2"})
 
@@ -2897,6 +2923,13 @@ async def delete_app(
         f"app:{app_id}:last_request_ts",
         f"worker_index:{app_id}",
     )
+    # proxy endpoint: drop the forward-tunnel upstream + the per-provider proxy-app
+    # set, else ensure_connectivity keeps re-opening a tunnel (and re-publishing the
+    # upstream) for a deleted app every autoscaler tick.
+    if (getattr(app, "mode", "single") or "single") == "proxy":
+        await rdb.delete(f"proxy:{app_id}:upstream", f"proxy:{app_id}:vmport")
+        if app.provider_id:
+            await rdb.srem(f"vm_proxy_apps:{app.provider_id}", app_id)
     app_name = app.name
     await session.delete(app)
     await session.commit()
@@ -3504,6 +3537,105 @@ async def _resolve_endpoint_path(
     return app_id, None
 
 
+async def _proxy_to_upstream(
+    request: Request,
+    app_id: str,
+    payload: dict,
+    vllm_path: str,
+    timeout_s: int,
+):
+    """Proxy-mode dispatch: forward the OpenAI request straight to the single
+    model's vLLM over the gateway→VM forward tunnel. No Redis queue, no admission,
+    no sleep/wake — a transparent reverse proxy. The upstream URL
+    (`http://127.0.0.1:{local_forward_port}`) is published by the VM provider when
+    it opens the tunnel (see vm_serverless_provider._wire_proxy_forward)."""
+    rdb = request.app.state.redis
+    upstream = await rdb.get(f"proxy:{app_id}:upstream")
+    if isinstance(upstream, (bytes, bytearray)):
+        upstream = upstream.decode()
+    if not upstream:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "proxy endpoint not ready — the worker is still starting "
+                             "(no upstream tunnel yet). Check the Workers tab."},
+        )
+    cli: httpx.AsyncClient = request.app.state.proxy_http
+    url = upstream.rstrip("/") + vllm_path
+    httpx_to = httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0)
+    is_stream = bool(payload.get("stream"))
+
+    if not is_stream:
+        try:
+            r = await cli.post(url, json=payload, timeout=httpx_to)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail={"error": f"proxy upstream unreachable: {type(e).__name__}: {e}"})
+        if r.status_code >= 400:
+            try:
+                detail = r.json()
+            except Exception:
+                detail = {"error": r.text[:500]}
+            raise HTTPException(status_code=r.status_code, detail=detail)
+        return r.json()
+
+    async def gen():
+        try:
+            async with cli.stream("POST", url, json=payload, timeout=httpx_to) as r:
+                if r.status_code >= 400:
+                    body = (await r.aread()).decode("utf-8", "replace")[:500]
+                    yield f"data: {json.dumps({'error': {'message': body, 'code': r.status_code}})}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
+                    return
+                # vLLM already emits OpenAI SSE framing ("data: {…}\n\n") — pass bytes through.
+                async for chunk in r.aiter_bytes():
+                    yield chunk
+        except httpx.HTTPError as e:
+            yield f"data: {json.dumps({'error': {'message': f'upstream stream error: {type(e).__name__}'}})}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _proxy_audio_to_upstream(
+    request: Request,
+    app_id: str,
+    payload: dict,
+    vllm_path: str,
+    timeout_s: int,
+):
+    """Proxy-mode audio dispatch: rebuild the multipart request from the base64
+    payload and forward it straight to the model's vLLM (which serves
+    /v1/audio/{transcriptions,translations} as native multipart) over the forward
+    tunnel. The queue path base64s + has the worker rebuild multipart; here we
+    rebuild + proxy directly (no queue)."""
+    rdb = request.app.state.redis
+    upstream = await rdb.get(f"proxy:{app_id}:upstream")
+    if isinstance(upstream, (bytes, bytearray)):
+        upstream = upstream.decode()
+    if not upstream:
+        raise HTTPException(status_code=503, detail={"error": "proxy endpoint not ready — the worker is still starting."})
+    audio = base64.b64decode(payload["_audio_b64"])
+    files = {"file": (payload.get("_filename") or "audio.wav", audio)}
+    data = {"model": payload["model"], **{k: str(v) for k, v in (payload.get("_form") or {}).items()}}
+    cli: httpx.AsyncClient = request.app.state.proxy_http
+    url = upstream.rstrip("/") + vllm_path
+    try:
+        r = await cli.post(url, files=files, data=data,
+                           timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail={"error": f"proxy upstream unreachable: {type(e).__name__}: {e}"})
+    if r.status_code >= 400:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = {"error": r.text[:500]}
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    return r.json()
+
+
 async def _openai_endpoint(
     request: Request,
     db_session: AsyncSession,
@@ -3524,6 +3656,18 @@ async def _openai_endpoint(
         if not model_field:
             raise HTTPException(status_code=400, detail={"error": "missing 'model' field in request body"})
         app_id, target_model = await _resolve_model_to_app(db_session, user, model_field)
+
+    # Proxy endpoints (single-model VM): bypass the queue and forward straight to
+    # the model's vLLM over the gateway→VM tunnel. Fetch the App once to branch on
+    # mode, then release the request-scoped DB connection (the proxy path only
+    # talks to Redis + httpx — holding it would pin a pool slot for the stream).
+    app_row = await db_session.get(App, app_id)
+    if app_row is not None and getattr(app_row, "mode", "single") == "proxy":
+        proxy_timeout_s = int(getattr(app_row, "request_timeout_s", 600) or 600)
+        if target_model:
+            payload = {**payload, "model": target_model}
+        await db_session.close()
+        return await _proxy_to_upstream(request, app_id, payload, vllm_path, proxy_timeout_s)
 
     is_stream = bool(payload.get("stream"))
     request_id, timeout_s = await _admit_and_enqueue(
@@ -3777,6 +3921,16 @@ async def _openai_audio_endpoint(
         if not model_field:
             raise HTTPException(status_code=400, detail={"error": "missing 'model' field in request"})
         app_id, target_model = await _resolve_model_to_app(db_session, user, model_field)
+
+    # proxy endpoints: rebuild + forward the multipart straight to the model's vLLM
+    # (no queue), same as the JSON proxy path.
+    app_row = await db_session.get(App, app_id)
+    if app_row is not None and getattr(app_row, "mode", "single") == "proxy":
+        if target_model:
+            payload["model"] = target_model
+        ptimeout = int(getattr(app_row, "request_timeout_s", 600) or 600)
+        await db_session.close()
+        return await _proxy_audio_to_upstream(request, app_id, payload, vllm_path, ptimeout)
 
     request_id, _timeout_s = await _admit_and_enqueue(
         rdb, db_session, app_id, user, payload, stream=False, endpoint=vllm_path,

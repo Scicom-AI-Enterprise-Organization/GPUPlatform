@@ -37,7 +37,6 @@ const TABS = [
 ] as const;
 
 type EndpointTab = (typeof TABS)[number]["value"];
-const ENDPOINT_TAB_VALUES = TABS.map((t) => t.value) as readonly string[];
 
 export function EndpointDetail({ app }: { app: AppRecord }) {
   const router = useRouter();
@@ -46,8 +45,12 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
   // Active tab is derived from the URL (?tab=) and each trigger is a real <Link>,
   // so right-click / middle-click / ⌘-click "open in new tab" works. A normal
   // click still switches in place (useSearchParams is reactive to soft nav).
+  // proxy endpoints (single-model VM, no queue) hide the Queue tab — requests are
+  // forwarded straight to the model, nothing is ever enqueued.
+  const visibleTabs = app.mode === "proxy" ? TABS.filter((t) => t.value !== "queue") : TABS;
+  const visibleValues = visibleTabs.map((t) => t.value) as readonly string[];
   const tabParam = searchParams.get("tab");
-  const tab: EndpointTab = tabParam && ENDPOINT_TAB_VALUES.includes(tabParam) ? (tabParam as EndpointTab) : "overview";
+  const tab: EndpointTab = tabParam && visibleValues.includes(tabParam) ? (tabParam as EndpointTab) : "overview";
   const tabHref = (v: EndpointTab) => {
     const params = new URLSearchParams(searchParams.toString());
     params.set("tab", v);
@@ -180,7 +183,7 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
 
         <Tabs value={tab} className="mt-2">
           <TabsList variant="line" className="bg-transparent">
-            {TABS.map((t) => (
+            {visibleTabs.map((t) => (
               <TabsTrigger key={t.value} value={t.value} asChild>
                 <Link href={tabHref(t.value)} scroll={false}>{t.label}</Link>
               </TabsTrigger>
@@ -194,7 +197,7 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
           <TabsContent value="overview"><OverviewTab app={app} /></TabsContent>
           <TabsContent value="playground"><RequestsTab app={app} /></TabsContent>
           <TabsContent value="stress"><StressTab app={app} /></TabsContent>
-          <TabsContent value="queue"><QueueTab app={app} /></TabsContent>
+          {app.mode !== "proxy" && <TabsContent value="queue"><QueueTab app={app} /></TabsContent>}
           <TabsContent value="workers"><WorkersTab app={app} /></TabsContent>
           <TabsContent value="visual"><VisualTab app={app} /></TabsContent>
           <TabsContent value="metrics"><MetricsTab app={app} /></TabsContent>

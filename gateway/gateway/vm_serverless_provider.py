@@ -162,6 +162,10 @@ class VMProvider(Provider):
         # Track liveness in Redis (authoritative for a host with no cloud API).
         await self._rdb.sadd(f"vm_machines:{self._provider_id}", machine_id)
         await self._rdb.set(f"vm_machine:{machine_id}:app", app_id)
+        # proxy endpoint: open the gateway→VM forward tunnel to the member's vLLM
+        # port and publish the upstream URL the dispatch path proxies to.
+        if worker_env.get("WORKER_MODE") == "proxy":
+            await self._wire_proxy_forward(app_id, worker_env)
         logger.info("vm-provision: app=%s host=%s → %s", app_id, self._host, machine_id)
         return ProvisionResult(machine_id=machine_id, cost_per_hr=None)
 
@@ -210,6 +214,11 @@ class VMProvider(Provider):
             )
         if all_ids:
             await self._rdb.srem(f"worker_index:{app_id}", *all_ids)
+        # Proxy endpoint bookkeeping (forward-tunnel upstream); the in-process
+        # listener thread lingers harmlessly until the next gateway restart, but
+        # the upstream key going away makes the dispatch path return 503 at once.
+        await self._rdb.delete(f"proxy:{app_id}:upstream", f"proxy:{app_id}:vmport")
+        await self._rdb.srem(f"vm_proxy_apps:{self._provider_id}", app_id)
         logger.info("vm-purge: app=%s purged %d remnant(s) on %s", app_id, len(machine_ids), self._host)
         return len(machine_ids)
 
@@ -266,9 +275,11 @@ class VMProvider(Provider):
     async def ensure_connectivity(self) -> None:
         """Called each autoscaler tick. In reverse-tunnel mode, (re)establishes
         the SSH forwards — this is what heals the tunnel after a gateway restart
-        (the tunnel lives in-process and dies with it)."""
+        (the tunnel lives in-process and dies with it). Also re-opens the
+        gateway→VM forward tunnel for any proxy endpoint on this VM."""
         if self._reverse_tunnel:
             await self._ensure_tunnel()
+        await self._ensure_proxy_forwards()
 
     async def _ensure_tunnel(self) -> None:
         if not self._reverse_tunnel:
@@ -283,6 +294,64 @@ class VMProvider(Provider):
         await asyncio.to_thread(
             vm_tunnel.ensure, self._host, self._port, self._user, self._private_key_pem, forwards,
         )
+
+    @staticmethod
+    def _proxy_member_port(worker_env: dict[str, str]) -> Optional[int]:
+        """The vLLM localhost port the lone proxy member binds — read from the
+        MULTI_MODEL_CONFIG the autoscaler built (build_multi_model_config assigns
+        it deterministically from the endpoint's GPU set)."""
+        try:
+            mmc = json.loads(worker_env.get("MULTI_MODEL_CONFIG") or "{}")
+            members = mmc.get("models") or []
+            if members:
+                return int(members[0]["port"])
+        except (ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    async def _wire_proxy_forward(self, app_id: str, worker_env: dict[str, str]) -> None:
+        """Open (or reuse) a gateway→VM forward tunnel to the proxy member's vLLM
+        port and publish `proxy:{app_id}:upstream` for the dispatch path. The
+        member port is also stored durably so ensure_connectivity can re-open the
+        forward (with a fresh local port) after a gateway restart."""
+        import asyncio
+
+        from . import vm_tunnel
+        port = self._proxy_member_port(worker_env)
+        if not port:
+            logger.warning("vm-proxy: app=%s has no member port in MULTI_MODEL_CONFIG", app_id)
+            return
+        local_port = await asyncio.to_thread(
+            vm_tunnel.ensure_forward,
+            self._host, self._port, self._user, self._private_key_pem, port,
+        )
+        upstream = f"http://127.0.0.1:{local_port}"
+        await self._rdb.set(f"proxy:{app_id}:upstream", upstream)
+        await self._rdb.set(f"proxy:{app_id}:vmport", str(port))
+        await self._rdb.sadd(f"vm_proxy_apps:{self._provider_id}", app_id)
+        logger.info("vm-proxy: app=%s upstream=%s (VM vLLM :%d)", app_id, upstream, port)
+
+    async def _ensure_proxy_forwards(self) -> None:
+        """Re-establish forward tunnels for every proxy endpoint on this VM and
+        refresh their published upstream (the in-process tunnel + its local port
+        are lost on a gateway restart)."""
+        import asyncio
+
+        from . import vm_tunnel
+        app_ids = await self._rdb.smembers(f"vm_proxy_apps:{self._provider_id}")
+        for app_id in app_ids:
+            vmport = await self._rdb.get(f"proxy:{app_id}:vmport")
+            if not vmport:
+                continue
+            try:
+                local_port = await asyncio.to_thread(
+                    vm_tunnel.ensure_forward,
+                    self._host, self._port, self._user, self._private_key_pem, int(vmport),
+                )
+            except Exception as e:
+                logger.warning("vm-proxy: app=%s forward re-ensure failed: %s", app_id, e)
+                continue
+            await self._rdb.set(f"proxy:{app_id}:upstream", f"http://127.0.0.1:{local_port}")
 
     # ---- internals --------------------------------------------------------
 

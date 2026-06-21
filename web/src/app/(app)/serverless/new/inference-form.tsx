@@ -188,14 +188,18 @@ export function InferenceForm() {
   const [runpodProviderId, setRunpodProviderId] = useState<string>("");
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [vllm, setVllm] = useState({ ...DEFAULT_VLLM_ARGS });
-  const [members, setMembers] = useState<{ model: string; tp: number; pp: number; extra_args: string; gpus: string; audio: boolean }[]>([
-    { model: "", tp: 1, pp: 1, extra_args: "", gpus: "", audio: false },
+  const [members, setMembers] = useState<{ model: string; tp: number; pp: number; extra_args: string; gpus: string }[]>([
+    { model: "", tp: 1, pp: 1, extra_args: "", gpus: "" },
   ]);
   const [sleepLevel, setSleepLevel] = useState<1 | 2>(1);
   // Cloud (RunPod) can also run a multi-model fleet — same GPU time-sharing as a
   // VM, but billed hourly so it honours the idle timeout (deletes the pod after N
   // idle seconds, re-provisioned on demand). VM fleets are always multi + always-on.
   const [cloudMulti, setCloudMulti] = useState(false);
+  // VM deployment shape: a multi-model fleet (queue + GPU time-share via sleep/wake)
+  // or a single-model "proxy" endpoint — one always-on model the gateway proxies to
+  // directly over a forward tunnel (no queue, no sleep). Only meaningful when isVm.
+  const [vmKind, setVmKind] = useState<"fleet" | "proxy">("fleet");
   const [runpodBalance, setRunpodBalance] = useState<ProviderBalance | null>(null);
   const [runpodBalanceLoading, setRunpodBalanceLoading] = useState(false);
   // VM-only: pin to specific physical GPU ids, e.g. "0,1,2,3". Empty = all GPUs.
@@ -290,7 +294,8 @@ export function InferenceForm() {
   // sleep/wake eviction). Cloud (RunPod) is single-model by default, or a
   // multi-model fleet when the user opts in (cloudMulti) — same time-sharing as
   // VM, plus idle-timeout auto-delete.
-  const mode: "single" | "multi" = isVm || cloudMulti ? "multi" : "single";
+  const mode: "single" | "multi" | "proxy" =
+    isVm ? (vmKind === "proxy" ? "proxy" : "multi") : cloudMulti ? "multi" : "single";
   const selectedProvider = providers.find((p) => p.id === vmProviderId) || null;
   const vmGpuCount = selectedProvider?.gpu_count ?? 0;
   // Optional GPU pin. vdIds = chosen physical ids; vdInvalid flags bad input;
@@ -415,9 +420,13 @@ export function InferenceForm() {
       return;
     }
 
-    if (mode === "multi") {
+    if (mode === "multi" || mode === "proxy") {
       if (cleanedMembers.length === 0) {
         setSubmitError("Add at least one model.");
+        return;
+      }
+      if (mode === "proxy" && cleanedMembers.length !== 1) {
+        setSubmitError("A proxy endpoint serves exactly one model.");
         return;
       }
       const names = cleanedMembers.map((m) => m.model);
@@ -478,7 +487,6 @@ export function InferenceForm() {
           pp,
           extra_args: raw.extra_args.trim(),
           ...(gpu_indices ? { gpu_indices } : {}),
-          ...(raw.audio ? { task: "transcription" } : {}),
         });
       }
       // VM multi-model fleet: always-on (idle 0), the VM's own GPUs, ships a
@@ -491,7 +499,9 @@ export function InferenceForm() {
             gpu: "vm",
             gpu_count: fleetGpus,
             provider_id: providerId || null,
-            mode: "multi",
+            // "proxy" = single-model VM endpoint (no queue, no sleep); "multi" =
+            // fleet. Both ship the same per-member spec; the gateway branches on mode.
+            mode,
             models: modelsPayload,
             sleep_level: sleepLevel,
             autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: 0 },
@@ -1127,8 +1137,49 @@ export function InferenceForm() {
               </Field>
             )}
 
+            {isVm && (
+              <Field
+                label="Deployment"
+                hint="Multi-model fleet = several models time-share the VM's GPUs (queue + sleep/wake). Single model (proxy) = one always-on model the gateway proxies to directly over a forward tunnel — no queue, no sleep."
+              >
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setVmKind("fleet")}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                      vmKind === "fleet" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="font-medium">Multi-model fleet</div>
+                    <div className="text-xs text-muted-foreground">Many models, sleep/wake.</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVmKind("proxy");
+                      setMembers((arr) => arr.slice(0, 1));
+                    }}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                      vmKind === "proxy" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="font-medium">Single model (proxy)</div>
+                    <div className="text-xs text-muted-foreground">One model, no queue/sleep.</div>
+                  </button>
+                </div>
+              </Field>
+            )}
+
             <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-              {isVm ? (
+              {isVm && vmKind === "proxy" ? (
+                <>
+                  <span className="font-medium text-foreground">Single model · direct proxy</span> — one always-on
+                  model on this VM. The gateway forwards each request straight to it over a tunnel: no queue, no
+                  sleep/wake, no scale-to-zero.
+                </>
+              ) : isVm ? (
                 <>
                   <span className="font-medium text-foreground">Multi-model fleet</span> — models share this VM&apos;s
                   GPUs and swap in via sleep/wake. Add one model for a single-model endpoint (you still get the
@@ -1169,7 +1220,7 @@ export function InferenceForm() {
             ) : (
               <div className="space-y-4">
                 <Field
-                  label="Models"
+                  label={mode === "proxy" ? "Model" : "Models"}
                   hint={`Each model has its own TP × PP (set by the dropdowns — don't add --tensor-parallel-size / --pipeline-parallel-size; it uses tp×pp GPUs, e.g. TP=2 × PP=3 = 6), its own GPU ids (pre-filled with a suggestion — edit to pin, e.g. 0,1,2,3 or 3,4,5,6), and its own vLLM args (e.g. --reasoning-parser / --tool-call-parser). Models on disjoint GPUs stay resident together; overlapping ones swap in via sleep/wake. Whisper/ASR models (e.g. openai/whisper-large-v3-turbo) work too — use TP=1; they're served via /v1/audio/transcriptions and get a Transcribe tab.`}
                   required
                 >
@@ -1253,17 +1304,6 @@ export function InferenceForm() {
                                 : `suggested: ${memberSuggestions[i]}`}
                             </span>
                           )}
-                          <label className="ml-auto flex cursor-pointer select-none items-center gap-1.5 text-[11px] text-muted-foreground" title="Marks this as an audio/ASR (Whisper) model so the worker installs audio-decode deps. Set it for ASR finetunes whose name doesn't say 'whisper'.">
-                            <input
-                              type="checkbox"
-                              checked={m.audio}
-                              onChange={(e) =>
-                                setMembers((arr) => arr.map((x, j) => (j === i ? { ...x, audio: e.target.checked } : x)))
-                              }
-                              className="h-3.5 w-3.5 accent-primary"
-                            />
-                            Audio / ASR (Whisper)
-                          </label>
                         </div>
                         <Input
                           className="bg-muted/50 font-mono text-xs"
@@ -1278,13 +1318,15 @@ export function InferenceForm() {
                       </div>
                     ))}
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setMembers((arr) => [...arr, { model: "", tp: 1, pp: 1, extra_args: "", gpus: "", audio: false }])}
-                    className="mt-2 text-xs text-primary hover:underline"
-                  >
-                    + Add model
-                  </button>
+                  {mode !== "proxy" && (
+                    <button
+                      type="button"
+                      onClick={() => setMembers((arr) => [...arr, { model: "", tp: 1, pp: 1, extra_args: "", gpus: "" }])}
+                      className="mt-2 text-xs text-primary hover:underline"
+                    >
+                      + Add model
+                    </button>
+                  )}
                 </Field>
 
                 {oversubscribed && (
@@ -1298,20 +1340,22 @@ export function InferenceForm() {
                   </div>
                 )}
 
-                <Field
-                  label="Sleep level"
-                  hint="How an evicted model frees VRAM. L1 offloads weights to CPU RAM (fast wake, needs RAM); L2 discards them and reloads from disk (minimal RAM, slower wake)."
-                >
-                  <Select value={String(sleepLevel)} onValueChange={(v) => setSleepLevel(Number.parseInt(v, 10) as 1 | 2)}>
-                    <SelectTrigger className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="1">Level 1 — offload to CPU RAM (fast)</SelectItem>
-                      <SelectItem value="2">Level 2 — discard + reload from disk</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </Field>
+                {mode !== "proxy" && (
+                  <Field
+                    label="Sleep level"
+                    hint="How an evicted model frees VRAM. L1 offloads weights to CPU RAM (fast wake, needs RAM); L2 discards them and reloads from disk (minimal RAM, slower wake)."
+                  >
+                    <Select value={String(sleepLevel)} onValueChange={(v) => setSleepLevel(Number.parseInt(v, 10) as 1 | 2)}>
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="1">Level 1 — offload to CPU RAM (fast)</SelectItem>
+                        <SelectItem value="2">Level 2 — discard + reload from disk</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
               </div>
             )}
           </div>
@@ -1319,10 +1363,11 @@ export function InferenceForm() {
 
         <Section title="Engine" description="Scaling behaviour, vLLM args, and metrics.">
           <div className="space-y-5">
-            {mode === "multi" && isVm && (
+            {(mode === "multi" || mode === "proxy") && isVm && (
               <p className="text-xs text-muted-foreground">
-                VM multi-model fleets are always-on (no scale-to-zero); per-model vLLM args
-                are set per model above. Models are evicted via sleep/wake, not torn down.
+                {mode === "proxy"
+                  ? "VM proxy endpoints are always-on; the gateway forwards each request straight to the model over a tunnel — no queue, no sleep/wake, no scale-to-zero."
+                  : "VM multi-model fleets are always-on (no scale-to-zero); per-model vLLM args are set per model above. Models are evicted via sleep/wake, not torn down."}
               </p>
             )}
             {!isVm && (

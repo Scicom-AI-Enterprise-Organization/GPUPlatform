@@ -605,8 +605,15 @@ async def main_async() -> None:
         pass  # add_signal_handler unsupported on this platform — best effort
     log_path = os.environ.get("WORKER_LOG_PATH", "/var/log/vllm.log")
 
-    if mode == "multi":
-        await _run_multi(rdb, app_id, machine_id, gateway_url, drain_event)
+    if mode in ("multi", "proxy"):
+        # proxy = a single-model VM endpoint the gateway proxies to directly over a
+        # forward tunnel: same fleet machinery (launch + per-member log shipping +
+        # auto-restart monitor + registration/heartbeat), but it does NOT consume
+        # the job queue (no queue, no sleep — see _run_multi's queue_poll branch).
+        await _run_multi(
+            rdb, app_id, machine_id, gateway_url, drain_event,
+            queue_poll=(mode == "multi"),
+        )
         return
 
     try:
@@ -636,9 +643,16 @@ async def main_async() -> None:
         await rdb.aclose()
 
 
-async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
+async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event, queue_poll: bool = True) -> None:
     """WORKER_MODE=multi: launch the vLLM fleet, route jobs by model name, and
-    evict idle models via sleep/wake to fit the GPU budget."""
+    evict idle models via sleep/wake to fit the GPU budget.
+
+    `queue_poll=False` is the **proxy** mode (single-model VM endpoint): launch the
+    one member and run all the same side loops (heartbeat, per-member + control-plane
+    log shipping, metrics, the auto-restart monitor), but do NOT consume the job
+    queue — the gateway proxies requests straight to the member's vLLM port over a
+    forward tunnel. With no queue dispatch there's no acquire()/eviction, so the lone
+    member (woken as the resident by sched.start()) simply stays awake → "no sleep"."""
     from .multi.config import parse_multi_config
     from .multi.scheduler import MultiModelScheduler
     from .multi.dispatch import multi_poll_loop
@@ -649,7 +663,8 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     )
     log_dir = os.environ.get("WORKER_LOG_DIR", "/var/log/vllm")
     sched = MultiModelScheduler(cfg, machine_id, log_dir=log_dir)
-    logger.info("multi mode: %d models, %d GPUs", len(cfg.members), cfg.total_gpus)
+    logger.info("%s mode: %d models, %d GPUs", "multi" if queue_poll else "proxy",
+                len(cfg.members), cfg.total_gpus)
 
     def snapshot():
         return sched.states_snapshot(), sched.all_ready()
@@ -706,7 +721,14 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event) -> None:
     try:
         await _redis_ready(rdb)
         await sched.start()
-        await multi_poll_loop(rdb, f"queue:{app_id}", machine_id, sched, drain_event)
+        if queue_poll:
+            await multi_poll_loop(rdb, f"queue:{app_id}", machine_id, sched, drain_event)
+        else:
+            # Proxy mode: the gateway forwards HTTP straight to the member's vLLM
+            # port (no queue consumer here). Stay up until drained; the monitor task
+            # above keeps the lone engine healthy and auto-restarts it on crash.
+            logger.info("proxy mode: model served directly (no queue); idling until drain")
+            await drain_event.wait()
     finally:
         drain_event.set()
         for t in (hb_task, monitor_task, *log_tasks):

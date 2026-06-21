@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { TranscribeTab } from "./transcribe";
+import { EmbeddingTab } from "./embedding";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -106,26 +107,29 @@ export function RequestsTab({ app, appId }: { app?: AppRecord; appId?: string } 
   // back to app_id from props or the URL. Hook is called unconditionally.
   const fromPath = useAppIdFromPath();
   const resolvedAppId = app?.app_id ?? appId ?? fromPath;
-  // Chat vs audio (Whisper) mode. Always offered — model names can be anything
-  // (a custom ASR finetune won't match a "whisper" heuristic), so the audio mode
-  // and its model dropdown list every member; you pick whichever is your ASR model.
-  const [mode, setMode] = useState<"chat" | "audio">("chat");
+  // Chat vs audio (Whisper) vs embedding mode. Always offered — model names can be
+  // anything (a custom ASR/embedding model won't match a name heuristic), so each
+  // mode lists every member; you pick whichever member fits the task. The mode just
+  // selects which OpenAI endpoint the request hits (a chat model errors on
+  // /v1/embeddings and vice-versa).
+  const [mode, setMode] = useState<"chat" | "audio" | "embedding">("chat");
   if (!resolvedAppId) return null;
   const chat = <RequestsTabInner appId={resolvedAppId} app={app} />;
-  if (!app) return chat; // no app record → no member list for the audio dropdown
+  if (!app) return chat; // no app record → no member list for the audio/embedding dropdown
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
         <span className="text-xs text-muted-foreground">mode</span>
-        <Select value={mode} onValueChange={(v) => setMode(v as "chat" | "audio")}>
+        <Select value={mode} onValueChange={(v) => setMode(v as "chat" | "audio" | "embedding")}>
           <SelectTrigger className="h-8 w-[240px] text-xs"><SelectValue /></SelectTrigger>
           <SelectContent>
             <SelectItem value="chat" className="text-xs">Chat / text generation</SelectItem>
+            <SelectItem value="embedding" className="text-xs">Embeddings (/v1/embeddings)</SelectItem>
             <SelectItem value="audio" className="text-xs">Audio transcription (Whisper)</SelectItem>
           </SelectContent>
         </Select>
       </div>
-      {mode === "chat" ? chat : <TranscribeTab app={app} />}
+      {mode === "chat" ? chat : mode === "embedding" ? <EmbeddingTab app={app} /> : <TranscribeTab app={app} />}
     </div>
   );
 }

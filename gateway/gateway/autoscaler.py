@@ -424,9 +424,13 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
                 env["VLLM_EXTRA_ARGS"] = extra
             if bool(getattr(app, "enable_metrics", True)):
                 env.update(build_metrics_env(app_id, provider.name))
-            # Multi-model VM fleet: hand the worker its whole model spec.
-            if getattr(app, "mode", "single") == "multi":
-                env["WORKER_MODE"] = "multi"
+            # Multi-model VM fleet (and the single-model "proxy" endpoint, which is
+            # a 1-member fleet): hand the worker its whole model spec. proxy uses
+            # the SAME config but WORKER_MODE=proxy so the worker skips the queue
+            # consumer (the gateway proxies straight to the member's vLLM port).
+            _mode = getattr(app, "mode", "single")
+            if _mode in ("multi", "proxy"):
+                env["WORKER_MODE"] = _mode
                 env["MULTI_MODEL_CONFIG"] = json.dumps(build_multi_model_config(app))
                 env["SLEEP_LEVEL"] = str(int(getattr(app, "sleep_level", 1) or 1))
                 env["TOTAL_GPUS"] = str(int(getattr(app, "gpu_count", 0) or 0))

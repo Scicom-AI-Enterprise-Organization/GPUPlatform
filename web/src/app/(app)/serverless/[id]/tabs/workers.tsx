@@ -62,7 +62,10 @@ export function WorkersTab({ app }: { app: AppRecord }) {
   // endpoint has no pods, so that's all. A *cloud* (RunPod) multi endpoint also
   // runs on a real pod — show the pods table too (container link + alive status).
   const isVm = app.gpu === "vm";
-  if (app.mode === "multi") {
+  // proxy = a single-model VM endpoint; it runs the same fleet machinery (one
+  // member, with logs + auto-restart), so the MultiModelFleet view is what shows
+  // its worker state. Treat it like a VM multi here.
+  if (app.mode === "multi" || app.mode === "proxy") {
     if (isVm) return <MultiModelFleet app={app} />;
     return (
       <div className="space-y-4">
@@ -656,6 +659,10 @@ function fleetStateLabel(m: FleetModel): string {
 }
 
 function MultiModelFleet({ app }: { app: AppRecord }) {
+  // proxy = single-model VM endpoint served via direct forward-tunnel proxy. It
+  // doesn't use the Redis queue, so there's no in-flight count, and sleeping the
+  // lone model would brick it (nothing wakes it) — hide both for proxy.
+  const isProxy = app.mode === "proxy";
   const [status, setStatus] = useState<FleetStatus | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -842,7 +849,8 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
               <th className="px-4 py-2 font-medium">State</th>
               <th className="px-4 py-2 font-medium">GPUs</th>
               <th className="px-4 py-2 font-medium">TP</th>
-              <th className="px-4 py-2 font-medium">In-flight</th>
+              {/* proxy endpoints serve directly (no Redis queue) → no in-flight count */}
+              {!isProxy && <th className="px-4 py-2 font-medium">In-flight</th>}
               <th className="px-4 py-2 font-medium text-right">Actions</th>
             </tr>
           </thead>
@@ -852,13 +860,14 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
                 key={m.model}
                 appId={app.app_id}
                 m={m}
+                isProxy={isProxy}
                 isOpen={openLogs.has(m.model)}
                 onToggle={() => toggleLog(m.model)}
                 onRefresh={fetchStatus}
               />
             ))}
             {rows.length === 0 && (
-              <tr><td colSpan={6} className="px-4 py-12 text-center text-sm text-muted-foreground">
+              <tr><td colSpan={isProxy ? 5 : 6} className="px-4 py-12 text-center text-sm text-muted-foreground">
                 {loading ? "Loading fleet…" : "No models reported yet."}
               </td></tr>
             )}
@@ -870,9 +879,9 @@ function MultiModelFleet({ app }: { app: AppRecord }) {
 }
 
 function FleetModelRow({
-  appId, m, isOpen, onToggle, onRefresh,
+  appId, m, isProxy, isOpen, onToggle, onRefresh,
 }: {
-  appId: string; m: FleetModel; isOpen: boolean; onToggle: () => void; onRefresh: () => void;
+  appId: string; m: FleetModel; isProxy: boolean; isOpen: boolean; onToggle: () => void; onRefresh: () => void;
 }) {
   const dead = m.state === "dead";
   const awake = m.state === "awake";
@@ -936,17 +945,20 @@ function FleetModelRow({
         </td>
         <td className="px-4 py-3 align-top font-mono text-xs">{m.gpus?.length ? m.gpus.join(",") : "—"}</td>
         <td className="px-4 py-3 align-top font-mono text-xs">{m.tp ?? "—"}</td>
-        <td className="px-4 py-3 align-top font-mono text-xs">{m.inflight ?? 0}</td>
+        {!isProxy && <td className="px-4 py-3 align-top font-mono text-xs">{m.inflight ?? 0}</td>}
         <td className="px-4 py-3 align-top">
           <div className="flex items-center justify-end gap-0.5">
-            <Button
-              variant="ghost" size="icon-xs" onClick={() => doAction("sleep")}
-              disabled={busy !== null || !awake}
-              title="Sleep — drain + put this model to sleep, freeing its GPUs"
-              aria-label="Sleep model"
-            >
-              {busy === "sleep" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Moon className="h-3.5 w-3.5" />}
-            </Button>
+            {/* proxy has no sleep/wake — sleeping the lone model would brick it (nothing wakes it) */}
+            {!isProxy && (
+              <Button
+                variant="ghost" size="icon-xs" onClick={() => doAction("sleep")}
+                disabled={busy !== null || !awake}
+                title="Sleep — drain + put this model to sleep, freeing its GPUs"
+                aria-label="Sleep model"
+              >
+                {busy === "sleep" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Moon className="h-3.5 w-3.5" />}
+              </Button>
+            )}
             <Button
               variant="ghost" size="icon-xs" onClick={() => doAction("restart")}
               disabled={busy !== null}

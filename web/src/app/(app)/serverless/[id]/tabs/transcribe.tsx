@@ -36,6 +36,7 @@ type AudioRun = {
 const STORAGE_KEY = (appId: string) => `serverless-ui:transcribe:${appId}`;
 const MAX_HISTORY = 50;
 
+// Serverless wrapper — derives the member list + data-plane base path from the app.
 export function TranscribeTab({ app }: { app: AppRecord }) {
   // List EVERY member (ASR-looking ones first for convenience) — a custom ASR
   // finetune may have any name, so we never hide a model behind a heuristic; you
@@ -47,7 +48,18 @@ export function TranscribeTab({ app }: { app: AppRecord }) {
     }
     return app.model ? [app.model] : [];
   }, [app]);
+  return (
+    <TranscribePlayground
+      models={models}
+      basePath={`/api/proxy/${encodeURIComponent(app.app_id)}/v1`}
+      storageKey={STORAGE_KEY(app.app_id)}
+    />
+  );
+}
 
+// Generic transcription playground — reused by serverless + the proxy. POSTs the
+// multipart upload to `${basePath}/audio/{transcriptions|translations}`.
+export function TranscribePlayground({ models, basePath, storageKey }: { models: string[]; basePath: string; storageKey: string }) {
   const [model, setModel] = useState(models[0] ?? "");
   const [task, setTask] = useState<"transcriptions" | "translations">("transcriptions");
   const [language, setLanguage] = useState("");
@@ -62,14 +74,14 @@ export function TranscribeTab({ app }: { app: AppRecord }) {
   historyRef.current = history;
   useEffect(() => {
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY(app.app_id));
+      const raw = window.localStorage.getItem(storageKey);
       if (raw) setHistory(JSON.parse(raw));
     } catch { /* ignore corrupt/absent */ }
-  }, [app.app_id]);
+  }, [storageKey]);
   const persist = useCallback((next: AudioRun[]) => {
     setHistory(next);
-    try { window.localStorage.setItem(STORAGE_KEY(app.app_id), JSON.stringify(next)); } catch { /* quota */ }
-  }, [app.app_id]);
+    try { window.localStorage.setItem(storageKey, JSON.stringify(next)); } catch { /* quota */ }
+  }, [storageKey]);
   const removeRun = useCallback((id: string) => persist(historyRef.current.filter((r) => r.id !== id)), [persist]);
   const clearAll = useCallback(() => persist([]), [persist]);
 
@@ -83,7 +95,7 @@ export function TranscribeTab({ app }: { app: AppRecord }) {
       fd.append("response_format", "json");
       if (task === "transcriptions" && language.trim()) fd.append("language", language.trim());
       // No explicit Content-Type — the browser sets multipart/form-data + boundary.
-      const r = await fetch(`/api/proxy/${encodeURIComponent(app.app_id)}/v1/audio/${task}`, {
+      const r = await fetch(`${basePath}/audio/${task}`, {
         method: "POST",
         body: fd,
       });

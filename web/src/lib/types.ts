@@ -25,7 +25,7 @@ export type MultiModelMember = {
   task?: "generate" | "transcription" | null;
 };
 
-export type ServingMode = "single" | "multi";
+export type ServingMode = "single" | "multi" | "proxy";
 
 export type AppRecord = {
   app_id: string;

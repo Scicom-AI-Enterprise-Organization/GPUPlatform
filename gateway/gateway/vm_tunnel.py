@@ -45,6 +45,20 @@ class Forward:
 
 
 @dataclass
+class LocalForward:
+    """One `ssh -L`-style forward: bind a local port on the GATEWAY and pump each
+    accepted connection over a direct-tcpip channel to `vm_host:vm_port` on the VM.
+    Lets the gateway reach a service bound to the VM's loopback (e.g. a proxy
+    endpoint's vLLM on 127.0.0.1:18001). `local_port` is assigned when bound (0 →
+    auto-pick a free port) and then reused across SSH reconnects."""
+    vm_port: int
+    vm_host: str = "127.0.0.1"
+    local_port: int = 0
+    _server: object = None          # bound listening socket (lives across reconnects)
+    _thread: Optional[threading.Thread] = None
+
+
+@dataclass
 class _Tunnel:
     host: str
     port: int
@@ -54,6 +68,8 @@ class _Tunnel:
     client: object = None
     stop: threading.Event = field(default_factory=threading.Event)
     thread: Optional[threading.Thread] = None
+    # ssh -L forwards (gateway → VM service). Mutated under _LOCK by ensure_forward.
+    local_forwards: list = field(default_factory=list)
 
 
 _LOCK = threading.Lock()
@@ -75,18 +91,11 @@ def parse_host_port(url_or_hostport: str, default_port: int) -> tuple[str, int]:
     return (s or "127.0.0.1", default_port)
 
 
-def _pump(chan, target_host: str, target_port: int) -> None:
-    """Bidirectionally copy bytes between a forwarded channel and a fresh socket
-    to the local target. Runs in paramiko's per-connection handler thread."""
-    try:
-        sock = socket.create_connection((target_host, target_port), timeout=10)
-    except Exception as e:
-        logger.warning("vm-tunnel: cannot reach local target %s:%s: %s", target_host, target_port, e)
-        try:
-            chan.close()
-        except Exception:
-            pass
-        return
+def _relay(chan, sock) -> None:
+    """Bidirectionally copy bytes between a paramiko channel and a socket until
+    either side closes; closes both on exit. Shared by the reverse pump (which
+    dials the local target) and the forward listener (which already has the
+    accepted client socket)."""
     try:
         while True:
             r, _, _ = select.select([chan, sock], [], [], 60)
@@ -108,6 +117,22 @@ def _pump(chan, target_host: str, target_port: int) -> None:
                 c.close()
             except Exception:
                 pass
+
+
+def _pump(chan, target_host: str, target_port: int) -> None:
+    """Reverse forward: a forwarded channel arrived from the VM — dial a fresh
+    socket to the local target and relay. Runs in paramiko's per-connection
+    handler thread."""
+    try:
+        sock = socket.create_connection((target_host, target_port), timeout=10)
+    except Exception as e:
+        logger.warning("vm-tunnel: cannot reach local target %s:%s: %s", target_host, target_port, e)
+        try:
+            chan.close()
+        except Exception:
+            pass
+        return
+    _relay(chan, sock)
 
 
 def _run(client, cmd: str, timeout: float = 15.0) -> str:
@@ -204,6 +229,8 @@ def _forwards_alive(t: _Tunnel) -> bool:
     keep hitting a dead port. Cheap `ss` probe over the existing connection."""
     if t.client is None:
         return False
+    if not t.forwards:
+        return True  # forward-only tunnel (ssh -L); nothing reverse-bound to verify
     try:
         alt = "|".join(str(f.vm_port) for f in t.forwards)
         n = _run(t.client, f"ss -ltnH 2>/dev/null | grep -Ec '127.0.0.1:({alt}) '", timeout=10)
@@ -251,10 +278,108 @@ def ensure(host: str, port: int, user: str, pkey_pem: str, forwards: list[Forwar
             t.thread.start()
 
 
+def _forward_listener(t: _Tunnel, fwd: LocalForward) -> None:
+    """Accept on the local bind socket; for each connection open a direct-tcpip
+    channel to the VM target over the CURRENT SSH transport and relay. Survives
+    reconnects (re-reads t.client each accept). Exits when the tunnel is stopped."""
+    srv = fwd._server
+    srv.settimeout(1.0)
+    while not t.stop.is_set():
+        try:
+            client_sock, _peer = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        transport = None
+        try:
+            transport = t.client.get_transport() if t.client is not None else None
+        except Exception:
+            transport = None
+        if transport is None or not transport.is_active():
+            logger.warning("vm-tunnel forward %s: SSH transport down, dropping connection", t.host)
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+            continue
+        try:
+            chan = transport.open_channel(
+                "direct-tcpip", (fwd.vm_host, fwd.vm_port), client_sock.getpeername(),
+            )
+        except Exception as e:
+            logger.warning("vm-tunnel forward %s → %s:%s open_channel failed: %s",
+                           t.host, fwd.vm_host, fwd.vm_port, e)
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+            continue
+        threading.Thread(target=_relay, args=(chan, client_sock), daemon=True).start()
+    try:
+        srv.close()
+    except Exception:
+        pass
+
+
+def ensure_forward(host: str, port: int, user: str, pkey_pem: str,
+                   vm_port: int, vm_host: str = "127.0.0.1") -> int:
+    """Idempotent `ssh -L`: ensure a local listener on the gateway that forwards
+    to `vm_host:vm_port` on the VM over the per-host SSH tunnel. Returns the local
+    port (stable across reconnects). Reuses the host's existing reverse tunnel
+    connection when present, else opens one. Safe to call every autoscaler tick."""
+    with _LOCK:
+        t = _TUNNELS.get(host)
+        if t is None:
+            t = _Tunnel(host=host, port=port, user=user, pkey_pem=pkey_pem, forwards=())
+            _TUNNELS[host] = t
+        # Already forwarding this VM port → return the stable local port.
+        for fwd in t.local_forwards:
+            if fwd.vm_port == vm_port and fwd.vm_host == vm_host:
+                if t.client is None or not _is_up(t):
+                    try:
+                        _safe_close(t)
+                        _connect(t)
+                    except Exception as e:
+                        logger.warning("vm-tunnel %s forward reconnect failed: %s", host, e)
+                return fwd.local_port
+        # Bind a fresh local listener (auto-pick a free port).
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(128)
+        local_port = srv.getsockname()[1]
+        fwd = LocalForward(vm_port=vm_port, vm_host=vm_host, local_port=local_port, _server=srv)
+        t.local_forwards.append(fwd)
+        # Make sure the SSH connection + monitor are up before the listener runs.
+        if t.client is None or not _is_up(t):
+            try:
+                _connect(t)
+            except Exception as e:
+                logger.warning("vm-tunnel %s forward connect failed (monitor will retry): %s", host, e)
+        if t.thread is None or not t.thread.is_alive():
+            t.thread = threading.Thread(target=_monitor, args=(t,), daemon=True, name=f"vm-tunnel-{host}")
+            t.thread.start()
+        fwd._thread = threading.Thread(
+            target=_forward_listener, args=(t, fwd), daemon=True,
+            name=f"vm-fwd-{host}-{vm_port}",
+        )
+        fwd._thread.start()
+        logger.info("vm-tunnel forward up: 127.0.0.1:%d → %s:%s on %s",
+                    local_port, vm_host, vm_port, host)
+        return local_port
+
+
 def close(host: str) -> None:
     with _LOCK:
         t = _TUNNELS.pop(host, None)
     if t is not None:
         t.stop.set()
+        for fwd in t.local_forwards:
+            try:
+                if fwd._server is not None:
+                    fwd._server.close()
+            except Exception:
+                pass
         _safe_close(t)
         logger.info("vm-tunnel closed: %s", host)

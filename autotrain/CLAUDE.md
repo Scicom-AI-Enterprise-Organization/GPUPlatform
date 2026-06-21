@@ -105,3 +105,36 @@ ssh -i ../../scicom root@8.222.165.68 -p 1024      # the `scicom` key = GPUPlatf
 - Auth: `RUNPOD_API_KEY`/`HF_TOKEN` still come from `../.env`; scp `~/.netrc` to `/root/.netrc` for
   `--wandb`. Per-job verified recipes: `mistral-small/CLAUDE.md` ("H20 node") and `gemma4/CLAUDE.md`
   ("FA4 … on the tm H20").
+
+## Network/transfer benchmarks (HF-Xet ↔ S3 ↔ tm) — why tm downloads are slow
+
+S3 creds for staging live in **`../.env`** (added 2026-06-21): `S3_ACCESS_KEY`, `S3_SECRET`,
+`S3_BUCKET_NAME` (`huseinlabel-app-test`), `S3_REGION` (`ap-southeast-5`, AWS **Kuala Lumpur** — IAM
+user `aies-label`). It's a plain AWS S3 bucket near the tm box. The user added these to test whether
+staging models through S3-KL beats the tm VM's slow ~20 MB/s HuggingFace pulls. **Verdict: it does
+NOT — the tm VM's own international uplink (~10–20 MB/s) is the bottleneck, not HF's US location.**
+
+Verified 2026-06-21 (1 GB random file for S3 legs; `Qwen/Qwen3-Embedding-4B` ≈ 8.06 GB, `xetEnabled=True`,
+`hf_xet` 1.5.1 for HF leg). All RunPod pods are US-region, `rclone` v1.58.1; tm `rclone` v1.60.1:
+
+- **HF-Xet download (US instance ← HuggingFace)** — *blazing*, and strongly **CPU/core-bound**:
+  - CPU pod (US-MD-1, 2 vCPU): **288 MiB/s** (8 GB in 27 s)
+  - RTX 5090 (US, 16 vCPU): **1419 MiB/s** (8 GB in 5.4 s)
+  - H100 SXM (US, 24 vCPU): **1093 MiB/s** (8 GB in 7 s)
+  → HF itself is NOT slow; tm's ~20 MB/s is tm's link. A multi-core US box pulls HF fastest.
+- **S3 upload (US instance → S3-KL)** — *path-limited, instance-independent* (~same on CPU/5090/H100):
+  default `rclone` **~20 MiB/s**, tuned (`--s3-upload-concurrency 16 --s3-chunk-size 32M`) **~55 MiB/s** (2.7×).
+- **S3 download (S3-KL → tm VM)** — *the killer*: default `rclone` **4.2 MiB/s**, `--multi-thread-streams 16`
+  **12.3 MiB/s**, 32 streams **5.1 MiB/s** (high variance/congestion). md5 verified. Same ~10–20 MB/s
+  ceiling tm hits against HF, despite KL being geographically adjacent → tm's egress is throttled,
+  not the source/region. The existing `HF_HUB_DISABLE_XET=1` tip (Xet "stalls" on tm) is really this
+  slow link; Xet's chunk negotiation just amplifies it. **Staging via S3 won't rescue tm downloads.**
+
+Gotchas baked into the recipe: `--country-code US` is **ignored for CPU pods** (lands in EUR) and GPU
+`pod create` honors only the **first** `--data-center-ids` entry → loop valid US DCs (`US-KS-2,US-KS-3,
+US-GA-1,US-GA-2,US-NC-1,US-CA-2,US-TX-1,US-TX-3,US-TX-4,US-IL-1,US-WA-1,US-DE-1,US-MD-1`) one-at-a-time
+until one has stock. CPU pods cap container disk at **20 GB**. CPU pod = `runpodctl pod create
+--compute-type cpu --template-id runpod-ubuntu-2204` (`runpod/base`, has `rclone`+sshd, injects account
+SSH keys — `runpodctl ssh add-key` first). Every S3 op needs **`--s3-no-check-bucket`** (IAM user lacks
+`s3:CreateBucket` → 403 otherwise). `mawk`'s `%d` caps at 2147483647 — compute throughput from the
+float byte count, not `%d`.
