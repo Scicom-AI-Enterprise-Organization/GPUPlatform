@@ -679,25 +679,17 @@ function formatAgo(d: Date): string {
 }
 
 function RequestPanel({ app }: { app: AppRecord }) {
-  const [reveal, setReveal] = useState(false);
   const [urlTarget, setUrlTarget] = useState<UrlTarget>("public");
-  const { token, loading: tokenLoading } = useApiToken();
+  const { apiKeyPrefix, loggedIn, loading: tokenLoading } = useApiToken();
   const publicBase = process.env.NEXT_PUBLIC_GATEWAY_URL ?? gateway.baseUrl;
   const internalBase = process.env.NEXT_PUBLIC_GATEWAY_INTERNAL_URL ?? "";
-  // "internal" swaps in the in-cluster Service URL so the copied snippet skips
-  // the public ingress hop; only offered when an internal URL is configured.
   const base = urlTarget === "internal" && internalBase ? internalBase : publicBase;
-  // The OpenAI `model` field. A multi-model endpoint rejects the endpoint name
-  // (you must name a member), so default to the first member; single-mode keeps
-  // using the endpoint name, which resolves back-compat.
   const isMulti = app.mode === "multi";
   const exampleModel =
     isMulti && app.models && app.models.length > 0 ? app.models[0].model : app.app_id;
 
-  // The visible / copyable forms of every snippet. Visible may be masked;
-  // copy always pastes the real key so the user gets a working command.
-  const visibleToken = reveal && token ? token : token ? maskToken(token) : "YOUR_API_KEY";
-  const realToken = token ?? "YOUR_API_KEY";
+  // Show the user's actual sgpu_ key prefix in snippets; if none, show placeholder.
+  const snippetKey = apiKeyPrefix ? `${apiKeyPrefix}...` : "YOUR_SGPU_API_KEY";
 
   return (
     <Card>
@@ -710,19 +702,23 @@ function RequestPanel({ app }: { app: AppRecord }) {
         </div>
         <div className="flex items-center gap-2">
           {internalBase && <BaseUrlToggle value={urlTarget} onChange={setUrlTarget} />}
-          {token ? (
-            <Button variant="outline" size="xs" onClick={() => setReveal((v) => !v)}>
-              {reveal ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-              {reveal ? "Hide" : "Reveal"} key
-            </Button>
-          ) : !tokenLoading ? (
-            <Link
-              href="/login?next=/serverless"
-              className="text-xs text-primary hover:underline"
-            >
-              Sign in to use your key
-            </Link>
-          ) : null}
+          {!tokenLoading && (
+            loggedIn ? (
+              apiKeyPrefix ? (
+                <Link href="/api-keys" className="text-xs text-primary hover:underline">
+                  Manage API keys →
+                </Link>
+              ) : (
+                <Link href="/api-keys" className="text-xs text-primary hover:underline font-medium">
+                  + Create API key
+                </Link>
+              )
+            ) : (
+              <Link href="/login?next=/serverless" className="text-xs text-primary hover:underline">
+                Sign in to use your key
+              </Link>
+            )
+          )}
         </div>
       </CardHeader>
       <CardContent>
@@ -738,8 +734,8 @@ function RequestPanel({ app }: { app: AppRecord }) {
               OpenAI <code className="font-mono">/{app.app_id}/v1/chat/completions</code> — scoped to this endpoint; returns the full completion JSON in one call.
             </p>
             <CodeBlock
-              displayCode={curlChatSnippet(base, visibleToken, exampleModel, app.app_id)}
-              copyCode={curlChatSnippet(base, realToken, exampleModel, app.app_id)}
+              displayCode={curlChatSnippet(base, snippetKey, exampleModel, app.app_id)}
+              copyCode={curlChatSnippet(base, snippetKey, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>
@@ -749,8 +745,8 @@ function RequestPanel({ app }: { app: AppRecord }) {
               Same endpoint with <code className="font-mono">&quot;stream&quot;: true</code> — token-by-token Server-Sent Events.
             </p>
             <CodeBlock
-              displayCode={curlChatStreamSnippet(base, visibleToken, exampleModel, app.app_id)}
-              copyCode={curlChatStreamSnippet(base, realToken, exampleModel, app.app_id)}
+              displayCode={curlChatStreamSnippet(base, snippetKey, exampleModel, app.app_id)}
+              copyCode={curlChatStreamSnippet(base, snippetKey, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>
@@ -763,8 +759,8 @@ function RequestPanel({ app }: { app: AppRecord }) {
                 : "The model field is ignored — this endpoint serves one model."}
             </p>
             <CodeBlock
-              displayCode={openaiSnippet(base, visibleToken, exampleModel, app.app_id)}
-              copyCode={openaiSnippet(base, realToken, exampleModel, app.app_id)}
+              displayCode={openaiSnippet(base, snippetKey, exampleModel, app.app_id)}
+              copyCode={openaiSnippet(base, snippetKey, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>
@@ -780,33 +776,28 @@ function RequestPanel({ app }: { app: AppRecord }) {
 }
 
 function useApiToken() {
-  const [token, setToken] = useState<string | null>(null);
+  const [loggedIn, setLoggedIn] = useState(false);
+  const [apiKeyPrefix, setApiKeyPrefix] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     let abort = false;
-    fetch("/api/auth/token", { cache: "no-store" })
-      .then(async (r) => {
+    Promise.all([
+      fetch("/api/auth/token", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)),
+      fetch("/api/api-keys", { cache: "no-store" }).then((r) => (r.ok ? r.json() : [])),
+    ])
+      .then(([tokenData, keys]) => {
         if (abort) return;
-        if (!r.ok) {
-          setToken(null);
-          return;
-        }
-        const body = (await r.json()) as { token?: string };
-        setToken(body.token ?? null);
+        setLoggedIn(!!tokenData?.token);
+        const first = Array.isArray(keys) && keys.length > 0 ? keys[0] : null;
+        setApiKeyPrefix(first?.prefix ?? null);
       })
-      .catch(() => !abort && setToken(null))
+      .catch(() => {})
       .finally(() => !abort && setLoading(false));
-    return () => {
-      abort = true;
-    };
+    return () => { abort = true; };
   }, []);
-  return { token, loading };
+  return { loggedIn, apiKeyPrefix, loading };
 }
 
-function maskToken(t: string) {
-  if (t.length <= 8) return "•".repeat(t.length);
-  return `${t.slice(0, 4)}${"•".repeat(Math.max(8, t.length - 8))}${t.slice(-4)}`;
-}
 
 function CopyButton({ text }: { text: string }) {
   return (

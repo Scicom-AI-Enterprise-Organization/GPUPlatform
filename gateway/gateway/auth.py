@@ -20,8 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import User, get_session, get_user_by_id
 
-SESSION_TTL_S = 7 * 24 * 3600  # 7 days
-
 # Long-lived API keys: `sgpu_<random>`. Distinguished from session tokens by the
 # prefix so `current_user` can route to the right validation path.
 API_KEY_PREFIX = "sgpu_"
@@ -53,24 +51,26 @@ def new_session_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def create_session(rdb, user_id: int) -> str:
+async def create_session(db: AsyncSession, user_id: int) -> str:
+    from .db import UserSession
     token = new_session_token()
-    await rdb.set(f"session:{token}", str(user_id), ex=SESSION_TTL_S)
+    db.add(UserSession(token=token, user_id=user_id))
+    await db.commit()
     return token
 
 
-async def revoke_session(rdb, token: str) -> None:
-    await rdb.delete(f"session:{token}")
+async def revoke_session(db: AsyncSession, token: str) -> None:
+    from .db import UserSession
+    row = await db.get(UserSession, token)
+    if row is not None:
+        await db.delete(row)
+        await db.commit()
 
 
-async def resolve_session(rdb, token: str) -> Optional[int]:
-    raw = await rdb.get(f"session:{token}")
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+async def resolve_session(db: AsyncSession, token: str) -> Optional[int]:
+    from .db import UserSession
+    row = await db.get(UserSession, token)
+    return row.user_id if row is not None else None
 
 
 async def current_user(
@@ -102,15 +102,13 @@ async def current_user(
     if token.startswith(API_KEY_PREFIX):
         return await _user_from_api_key(session, token)
 
-    rdb = request.app.state.redis
-    user_id = await resolve_session(rdb, token)
+    user_id = await resolve_session(session, token)
     if user_id is None:
         raise HTTPException(status_code=401, detail={"error": "invalid or expired session"})
 
     user = await get_user_by_id(session, user_id)
     if user is None:
-        # Session points at a deleted user; clean up.
-        await revoke_session(rdb, token)
+        await revoke_session(session, token)
         raise HTTPException(status_code=401, detail={"error": "user no longer exists"})
     return user
 

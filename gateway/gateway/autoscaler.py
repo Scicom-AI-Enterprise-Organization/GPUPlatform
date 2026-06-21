@@ -34,6 +34,7 @@ logger = logging.getLogger("gateway.autoscaler")
 TICK_S = 1.0
 REGISTRATION_TOKEN_TTL_S = 1800  # 30 min — covers slow ECR pulls + vLLM model load
 PROVISION_COOLDOWN_S = 60  # back off this long after a provider provision failure
+WATCHDOG_INTERVAL_S = 120  # how often the VM watchdog probes for stale machines
 # A freshly-provisioned worker that hasn't reported `ready` yet is still cold-
 # starting (image pull + vLLM install + model load) — its heartbeat blob can even
 # lapse mid-load. Don't reclaim it as "crashed" within this window; only past it
@@ -644,3 +645,100 @@ async def _live_workers(rdb: "redis_async.Redis", app_id: str) -> list[str]:
         else:
             await rdb.srem(f"worker_index:{app_id}", mid)
     return live
+
+
+async def vm_watchdog_loop(
+    rdb: "redis_async.Redis",
+    sm: "async_sessionmaker[AsyncSession]",
+    provider_cache: dict | None = None,
+) -> None:
+    """Background task: detect VM hosts that have rebooted and clear their stale
+    machine-registry entries so the autoscaler re-provisions workers automatically.
+
+    Every WATCHDOG_INTERVAL_S seconds, for each app using a VMProvider:
+      1. Find machines in vm_machines:{provider_id} that have no live heartbeat.
+      2. SSH-probe the VM host. If reachable (host is up, CUDA ready) but no
+         heartbeat → the worker process died (reboot/crash). Forget the machine.
+      3. If SSH fails → host is still down; keep the entry so the reconciler
+         won't race to provision while the box is mid-boot.
+    After forget, the next autoscaler tick sees provider_machines=0 and provisions
+    a fresh worker automatically.
+    """
+    logger.info("vm_watchdog running (interval=%ds)", WATCHDOG_INTERVAL_S)
+    if provider_cache is None:
+        provider_cache = {}
+    while True:
+        try:
+            await asyncio.sleep(WATCHDOG_INTERVAL_S)
+            await _vm_watchdog_tick(rdb, sm, provider_cache)
+        except asyncio.CancelledError:
+            logger.info("vm_watchdog cancelled")
+            raise
+        except Exception:
+            logger.exception("vm_watchdog tick failed")
+
+
+async def _vm_watchdog_tick(
+    rdb: "redis_async.Redis",
+    sm: "async_sessionmaker[AsyncSession]",
+    provider_cache: dict,
+) -> None:
+    from .provider import resolve_app_provider
+    from .vm_serverless_provider import VMProvider
+
+    async with sm() as session:
+        apps = list((await session.execute(select(App))).scalars().all())
+        resolved: list[tuple[App, "VMProvider"]] = []
+        for app in apps:
+            try:
+                prov = await resolve_app_provider(
+                    session, app, redis=rdb, fallback=None, cache=provider_cache
+                )
+            except Exception:
+                continue
+            if isinstance(prov, VMProvider):
+                resolved.append((app, prov))
+
+    # Deduplicate by provider_id so we SSH-probe each host once per tick even if
+    # multiple apps share the same VM provider row.
+    seen_providers: set[str] = set()
+    for app, prov in resolved:
+        app_id = app.app_id
+        try:
+            machines = await prov.list_machines_for_app(app_id)
+            if not machines:
+                continue
+            stale = [m for m in machines if not await rdb.exists(f"worker:{m}")]
+            if not stale:
+                continue
+            # Only probe each host once per tick; reuse the result across apps.
+            if prov._provider_id not in seen_providers:
+                from . import vm_probe
+                probe = await vm_probe.probe_vm(
+                    prov._host, prov._port, prov._user, prov._private_key_pem
+                )
+                seen_providers.add(prov._provider_id)
+                # Cache the result so sibling apps skip the SSH call.
+                _watchdog_probe_cache[prov._provider_id] = probe.ok
+            host_up = _watchdog_probe_cache.get(prov._provider_id, False)
+            if not host_up:
+                logger.debug(
+                    "vm_watchdog: app=%s host=%s unreachable — keeping stale entries",
+                    app_id, prov._host,
+                )
+                continue
+            for mid in stale:
+                logger.info(
+                    "vm_watchdog: app=%s clearing stale machine %s (host up, no heartbeat → reprovision)",
+                    app_id, mid,
+                )
+                await prov.forget_machine(mid)
+        except Exception:
+            logger.exception("vm_watchdog: error checking app=%s", app_id)
+
+    # Clear the per-tick probe cache so the next tick re-probes fresh.
+    _watchdog_probe_cache.clear()
+
+
+# Scratch dict for deduplicating SSH probes within a single watchdog tick.
+_watchdog_probe_cache: dict[str, bool] = {}

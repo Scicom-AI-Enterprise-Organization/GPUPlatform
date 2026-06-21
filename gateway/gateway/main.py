@@ -560,7 +560,7 @@ async def lifespan(app: FastAPI):
         logger.exception("proxy: failed to start health loop")
     if os.environ.get("AUTOSCALER", "0") == "1":
         from .provider import build_provider, cloud_providers_disabled, CLOUD_PROVIDER_NAMES
-        from .autoscaler import autoscaler_loop
+        from .autoscaler import autoscaler_loop, vm_watchdog_loop
         from .reconciler import reconciler_loop
 
         provider_name = os.environ.get("PROVIDER", "fake")
@@ -618,15 +618,20 @@ async def lifespan(app: FastAPI):
                 app.state.redis, app.state.provider, session_factory(), app.state.provider_cache
             )
         )
+        app.state.vm_watchdog_task = asyncio.create_task(
+            vm_watchdog_loop(
+                app.state.redis, session_factory(), app.state.provider_cache
+            )
+        )
         logger.info(
-            "autoscaler + reconciler enabled (provider=%s)",
+            "autoscaler + reconciler + vm_watchdog enabled (provider=%s)",
             app.state.provider.name if app.state.provider else f"{provider_name} (per-app rows)",
         )
 
     try:
         yield
     finally:
-        for task_attr in ("autoscaler_task", "reconciler_task", "bench_janitor_task", "compute_idle_task", "gitops_task", "proxy_healthcheck_task"):
+        for task_attr in ("autoscaler_task", "reconciler_task", "vm_watchdog_task", "bench_janitor_task", "compute_idle_task", "gitops_task", "proxy_healthcheck_task"):
             t = getattr(app.state, task_attr, None)
             if t:
                 t.cancel()
@@ -845,7 +850,7 @@ async def register(req: RegisterRequest, request: Request, session: AsyncSession
         await session.rollback()
         raise HTTPException(status_code=409, detail={"error": "username or email already taken"})
     await session.refresh(user)
-    token = await create_session(request.app.state.redis, user.id)
+    token = await create_session(session, user.id)
     logger.info("registered user %s (id=%d)", user.username, user.id)
     return TokenResponse(token=token, username=user.username)
 
@@ -863,7 +868,7 @@ async def login(req: LoginRequest, request: Request, session: AsyncSession = Dep
         user = await get_user_by_username(session, req.username)
     if user is None or not verify_password(req.password, user.password_hash):
         raise HTTPException(status_code=401, detail={"error": "invalid credentials"})
-    token = await create_session(request.app.state.redis, user.id)
+    token = await create_session(session, user.id)
     return TokenResponse(token=token, username=user.username)
 
 
@@ -882,7 +887,7 @@ async def change_password(
     header = request.headers.get("authorization", "")
     token = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
     if token:
-        await revoke_session(request.app.state.redis, token)
+        await revoke_session(session, token)
     logger.info("password changed: user=%s", user.username)
     return {"ok": True}
 
@@ -940,16 +945,16 @@ async def github_upsert(
         session.add(user)
     await session.commit()
     await session.refresh(user)
-    token = await create_session(request.app.state.redis, user.id)
+    token = await create_session(session, user.id)
     logger.info("github sso: user=%s id=%d gh=%s", user.username, user.id, req.github_id)
     return TokenResponse(token=token, username=user.username)
 
 
 @app.post("/auth/logout")
-async def logout(request: Request, user: User = Depends(current_user)):
+async def logout(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     header = request.headers.get("authorization", "")
     token = header[len("Bearer "):].strip()
-    await revoke_session(request.app.state.redis, token)
+    await revoke_session(session, token)
     return {"ok": True}
 
 
