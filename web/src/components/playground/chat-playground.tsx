@@ -8,7 +8,7 @@
 // can supply its own transport with the same shape.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Copy, Eye, EyeOff, Loader2, Play, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, Loader2, Play, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -61,7 +61,6 @@ type Stored = {
 
 const MAX_HISTORY = 50;
 const now = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
-const maskToken = (t: string) => (t.length > 12 ? `${t.slice(0, 6)}…${t.slice(-4)}` : "•".repeat(Math.max(4, t.length)));
 
 type ToolAcc = { name: string; args: string };
 function formatToolCalls(calls: ToolAcc[]): string {
@@ -183,13 +182,11 @@ export function ChatPlayground({
   storageKey,
   transport,
   description,
-  tokenEndpoint = "/api/auth/token",
 }: {
   models: string[];
   storageKey: string;
   transport: ChatTransport;
   description?: React.ReactNode;
-  tokenEndpoint?: string;
 }) {
   const [model, setModel] = useState(models[0] ?? "");
   const [prompt, setPrompt] = useState("Hello, world");
@@ -217,20 +214,21 @@ export function ChatPlayground({
   const abortRef = useRef<AbortController | null>(null);
 
   const [history, setHistory] = useState<Stored[]>([]);
-  const [token, setToken] = useState<string | null>(null);
-  const [revealToken, setRevealToken] = useState(false);
+  const [apiKeyPrefix, setApiKeyPrefix] = useState<string | null>(null);
 
   useEffect(() => {
     try { const raw = window.localStorage.getItem(storageKey); if (raw) setHistory(JSON.parse(raw)); } catch { /* ignore */ }
   }, [storageKey]);
   useEffect(() => {
     let abort = false;
-    fetch(tokenEndpoint, { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((b) => { if (!abort) setToken(b?.token ?? null); })
+    fetch("/api/api-keys", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((keys: { prefix: string }[]) => {
+        if (!abort) setApiKeyPrefix(Array.isArray(keys) && keys.length > 0 ? keys[0].prefix : null);
+      })
       .catch(() => {});
     return () => { abort = true; };
-  }, [tokenEndpoint]);
+  }, []);
 
   const persist = useCallback((next: Stored[]) => {
     setHistory(next);
@@ -397,22 +395,15 @@ export function ChatPlayground({
             </div>
           )}
 
-          {sentParams && token !== undefined && (
+          {sentParams && (
             <div className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs text-muted-foreground">cURL for this request</span>
-                {token && (
-                  <Button variant="ghost" size="xs" onClick={() => setRevealToken((v) => !v)}>
-                    {revealToken ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}{revealToken ? "Hide" : "Reveal"} key
-                  </Button>
-                )}
-              </div>
+              <span className="text-xs text-muted-foreground">cURL for this request</span>
               <div className="relative">
                 <pre className="max-h-80 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-thin">
-                  {transport.curl(sentParams, revealToken && token ? token : token ? maskToken(token) : "YOUR_API_KEY")}
+                  {transport.curl(sentParams, apiKeyPrefix ? `${apiKeyPrefix}...` : "YOUR_SGPU_API_KEY")}
                 </pre>
                 <Button variant="outline" size="icon-sm" className="absolute right-2 top-2" aria-label="Copy cURL"
-                        onClick={() => { navigator.clipboard.writeText(transport.curl(sentParams, token ?? "YOUR_API_KEY")); toast.success("cURL copied", { duration: 3000 }); }}>
+                        onClick={() => { navigator.clipboard.writeText(transport.curl(sentParams, apiKeyPrefix ? `${apiKeyPrefix}...` : "YOUR_SGPU_API_KEY")); toast.success("cURL copied", { duration: 3000 }); }}>
                   <Copy className="h-3.5 w-3.5" />
                 </Button>
               </div>
