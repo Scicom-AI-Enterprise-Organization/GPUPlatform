@@ -845,7 +845,7 @@ async def register(req: RegisterRequest, request: Request, session: AsyncSession
         await session.rollback()
         raise HTTPException(status_code=409, detail={"error": "username or email already taken"})
     await session.refresh(user)
-    token = await create_session(request.app.state.redis, user.id)
+    token = await create_session(session, user.id)
     logger.info("registered user %s (id=%d)", user.username, user.id)
     return TokenResponse(token=token, username=user.username)
 
@@ -863,7 +863,7 @@ async def login(req: LoginRequest, request: Request, session: AsyncSession = Dep
         user = await get_user_by_username(session, req.username)
     if user is None or not verify_password(req.password, user.password_hash):
         raise HTTPException(status_code=401, detail={"error": "invalid credentials"})
-    token = await create_session(request.app.state.redis, user.id)
+    token = await create_session(session, user.id)
     return TokenResponse(token=token, username=user.username)
 
 
@@ -882,7 +882,7 @@ async def change_password(
     header = request.headers.get("authorization", "")
     token = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
     if token:
-        await revoke_session(request.app.state.redis, token)
+        await revoke_session(session, token)
     logger.info("password changed: user=%s", user.username)
     return {"ok": True}
 
@@ -940,16 +940,16 @@ async def github_upsert(
         session.add(user)
     await session.commit()
     await session.refresh(user)
-    token = await create_session(request.app.state.redis, user.id)
+    token = await create_session(session, user.id)
     logger.info("github sso: user=%s id=%d gh=%s", user.username, user.id, req.github_id)
     return TokenResponse(token=token, username=user.username)
 
 
 @app.post("/auth/logout")
-async def logout(request: Request, user: User = Depends(current_user)):
+async def logout(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     header = request.headers.get("authorization", "")
     token = header[len("Bearer "):].strip()
-    await revoke_session(request.app.state.redis, token)
+    await revoke_session(session, token)
     return {"ok": True}
 
 
