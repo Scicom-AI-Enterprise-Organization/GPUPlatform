@@ -195,7 +195,7 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="border-b border-border bg-sidebar/40 px-6 pt-4 lg:px-10">
-        <div className="flex items-start justify-between gap-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
           <div>
             <div className="flex items-center gap-2">
               {editingName ? (
@@ -273,7 +273,7 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
               <span>{new Date(bench.created_at).toLocaleString()}</span>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2 sm:shrink-0 sm:justify-end">
             {owned && (
               <Button
                 variant="outline"
