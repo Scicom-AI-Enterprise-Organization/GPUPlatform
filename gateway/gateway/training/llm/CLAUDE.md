@@ -147,6 +147,28 @@ env_vars:{HF_HOME, HF_HUB_DISABLE_XET}}`.
   host and the cute kernel's CUDA-13 JIT fails. Fixed to also parse `cu1300→13.0`, `cu1281→12.8`
   (2-digit major + 1-digit minor). This is what makes a CUDA-13 image actually pin a CUDA-13 host.
 
+### Deps-install resilience on a slow/flaky uplink (the `tm` VM, 2026-06-22)
+
+A clean `/share/autotrain-llm-gemma` rebuild on tm hit a cascade of NON-network-looking failures, all
+now fixed in `_ensure_venv`/`_pip`/`_install_fa4` (they ship per-run, so a re-run picks them up):
+- **CUDA wheel download timeout** (`nvidia-nvshmem-cu13` from pypi.nvidia.com) → `UV_HTTP_TIMEOUT=600`
+  + `_pip` retries the whole command, and a per-attempt **wall-clock cap SIGKILLs a true hang** →
+  retry (so a stalled download can't wedge the run forever).
+- **Stale `uv` git lock**: terminating a run mid-`git+` fetch leaves a lock in `<uv-cache>/git-v0/locks/`;
+  every later FA4 install then waits the lock timeout (300s) and fails *identically*. `_pip` now
+  **clears stale uv git locks before each attempt** + `UV_LOCK_TIMEOUT=60`. (Looks like "no internet" — it isn't.)
+- **uv's internal git hangs** on the `flash-attention-512` clone over a flaky uplink (it ignores
+  `GIT_HTTP_LOW_SPEED`, no timeout/resume). `_install_fa4` now **clones with SYSTEM git** (`--depth 1`,
+  abortable via `GIT_HTTP_LOW_SPEED`, retry + 20-min kill-cap) and `uv pip install`s the local checkout.
+  Plus a **skip-if-present** fast path (`flash_attn.cute` already imports → no re-fetch).
+- **Model pre-fetch**: set `env_vars.HF_HOME=/share/huggingface` (reuse/persist the 62GB cache, NOT
+  root's `~/.cache`) + `HF_HUB_DISABLE_XET=1` AND `HF_HUB_ENABLE_HF_TRANSFER=0` (both Xet *and*
+  hf_transfer stall on tm → plain HTTP is slow ~1.5–3h for 62GB but doesn't hang). The first run caches
+  the model in `/share`; later gemma runs skip the download.
+
+Net: `train-250eeaa2` (gemma-4-31B FA4, 2× H20 GPUs 6,7, `batch_size=2 grad_accum=1`, 64k block) trained
+end-to-end (~73→120GB/GPU, 100% util). `batch_size=2` is what makes 64k context fit on H20s.
+
 **Monitoring gotcha:** the gateway's live log (`/tmp/sgpu-train/<id>/_full.log`, streamed via an SSH
 `tail -F`) can **freeze mid-run on long jobs** when that tail SSH connection drops — but the run is
 detached (`setsid`) on the box and still finishes + **finalizes-from-log** correctly (status flips to

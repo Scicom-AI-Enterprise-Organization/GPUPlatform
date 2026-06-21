@@ -1,0 +1,14 @@
+{
+    "train": [
+        {
+            "language_id": "mixed",
+            "manifest_path": ["data/finetune/tokens/train/data.lst"]
+        }
+    ],
+    "dev": [
+        {
+            "language_id": "mixed",
+            "manifest_path": ["data/finetune/tokens/dev/data.lst"]
+        }
+    ]
+}

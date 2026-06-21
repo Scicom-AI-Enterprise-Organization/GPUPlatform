@@ -14,6 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 
 type SplitInfo = { split: string; columns: string[]; num_rows?: number | null };
 
@@ -54,8 +55,19 @@ export function ColumnsCard({
   const router = useRouter();
   const isHfLike = kind === "hf" || kind === "llm"; // column list comes from HF splits API
   const isLlm = kind === "llm";
+  const isHf = kind === "hf";
   // Any dataset with messages_field set is treated as a chat dataset in the viewer.
   const hasMessages = !!(messagesField ?? "").trim();
+  // A kind=hf dataset can carry BOTH audio (TTS) and a messages column (LLM/chat) —
+  // e.g. a multimodal function-call set. A mode toggle declutters the mapping:
+  //   LLM → messages + audio only;  TTS → everything except messages.
+  // kind=llm is always LLM; audio-only kinds (s3/upload) are always TTS. Saves are
+  // scoped to the visible fields so switching modes never clobbers the other side.
+  const [mode, setMode] = useState<"llm" | "tts">(hasMessages ? "llm" : "tts");
+  const effMode: "llm" | "tts" = isLlm ? "llm" : isHf ? mode : "tts";
+  const showMessages = effMode === "llm";
+  const showAudio = !isLlm;                       // every kind but pure-llm has audio
+  const showTts = effMode === "tts" && !isLlm;    // transcription (per-split) + speaker
   const [editing, setEditing] = useState(false);
   const [audio, setAudio] = useState(audioField);
   const [transcription, setTranscription] = useState(transcriptionField);
@@ -133,7 +145,7 @@ export function ColumnsCard({
     else void loadSplits();
   }
 
-  const multiSplit = !isLlm && (splits?.length ?? 0) > 1;
+  const multiSplit = showTts && (splits?.length ?? 0) > 1;
   // Union of all known columns from the HF splits API, used for all dropdowns.
   const allColumns = Array.from(new Set((splits ?? []).flatMap((s) => s.columns)));
   // Options for the speaker dropdown: all columns except the current audio pick.
@@ -171,8 +183,17 @@ export function ColumnsCard({
       setErr("Audio column is required.");
       return;
     }
+    // Scope the PATCH to the visible modality so switching LLM↔TTS never clobbers
+    // the other side's mapping (a kind=hf dataset can carry both).
     let body: Record<string, unknown>;
-    if (multiSplit) {
+    if (showMessages && !showTts) {
+      // hf · LLM mode: messages + audio only (leave the TTS mapping untouched).
+      if (!messages.trim()) {
+        setErr("Messages column is required.");
+        return;
+      }
+      body = { messages_field: messages.trim(), audio_field: audio.trim() };
+    } else if (multiSplit) {
       const missing = (splits ?? []).filter((s) => !perSplit[s.split]?.trim());
       if (missing.length) {
         setErr(`Pick a transcription column for: ${missing.map((s) => s.split).join(", ")}`);
@@ -185,7 +206,6 @@ export function ColumnsCard({
         transcription_field: primary,
         speaker_field: speaker.trim(),
         split_fields: perSplit,
-        messages_field: messages.trim() || null,
       };
     } else {
       if (!transcription.trim()) {
@@ -197,7 +217,6 @@ export function ColumnsCard({
         transcription_field: transcription.trim(),
         speaker_field: speaker.trim(),
         split_fields: {}, // clear any stale per-split overrides
-        messages_field: messages.trim() || null,
       };
     }
     setSaving(true);
@@ -239,21 +258,42 @@ export function ColumnsCard({
             transcription independently.
           </span>
         </div>
-        {!editing && (
-          <Button variant="outline" size="xs" onClick={startEdit}>
-            <Pencil className="h-3 w-3" /> Edit
-          </Button>
-        )}
+        <div className="flex shrink-0 items-center gap-2">
+          {isHf && (
+            <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5" title="Which modality to map: LLM (messages + audio) or TTS (audio / transcription / speaker)">
+              {(["llm", "tts"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setMode(m)}
+                  className={cn(
+                    "rounded px-2 py-1 text-xs font-medium uppercase tracking-wide transition-colors",
+                    mode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
+          {!editing && (
+            <Button variant="outline" size="xs" onClick={startEdit}>
+              <Pencil className="h-3 w-3" /> Edit
+            </Button>
+          )}
+        </div>
       </CardHeader>
       <CardContent>
         {!editing ? (
           <div className="divide-y divide-border/60">
-            {!isLlm && (
+            {showAudio && (
+              <div className="flex items-baseline justify-between gap-4 py-1.5">
+                <span className="text-xs text-muted-foreground">Audio column</span>
+                <span className="font-mono text-xs">{audioField}</span>
+              </div>
+            )}
+            {showTts && (
               <>
-                <div className="flex items-baseline justify-between gap-4 py-1.5">
-                  <span className="text-xs text-muted-foreground">Audio column</span>
-                  <span className="font-mono text-xs">{audioField}</span>
-                </div>
                 {hasSplitOverrides ? (
                   Object.entries(stringSplitFields).map(([split, col]) => (
                     <div key={split} className="flex items-baseline justify-between gap-4 py-1.5">
@@ -277,7 +317,7 @@ export function ColumnsCard({
                 )}
               </>
             )}
-            {(isLlm || isHfLike) && (
+            {showMessages && (
               <div className="flex items-baseline justify-between gap-4 py-1.5">
                 <span className="text-xs text-muted-foreground">
                   Messages column <span className="text-[10px]">(chat / LLM)</span>
@@ -349,7 +389,7 @@ export function ColumnsCard({
               )}
             </div>
 
-            {loadingSplits ? (
+            {showTts && (loadingSplits ? (
               <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <Loader2 className="h-3 w-3 animate-spin" /> reading splits…
               </p>
@@ -415,9 +455,9 @@ export function ColumnsCard({
                   />
                 )}
               </div>
-            )}
+            ))}
 
-            {!loadingSplits && (
+            {showTts && !loadingSplits && (
               <div className="space-y-1 sm:max-w-xs">
                 <Label htmlFor="ds-speaker" className="text-xs">
                   Speaker column <span className="text-muted-foreground">(optional · TTS)</span>
@@ -460,7 +500,7 @@ export function ColumnsCard({
               </div>
             )}
 
-            {isHfLike && (
+            {showMessages && (
               <div className="space-y-1 sm:max-w-xs">
                 <Label htmlFor="ds-messages" className="text-xs">
                   Messages column <span className="text-muted-foreground">(optional · LLM / chat)</span>

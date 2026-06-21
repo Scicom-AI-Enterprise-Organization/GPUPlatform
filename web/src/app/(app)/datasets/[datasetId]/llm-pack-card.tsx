@@ -297,9 +297,9 @@ export function LlmPackCard({
                   className="mt-0.5"
                 />
                 <span>
-                  <span className="font-medium">Render all assistant reasoning</span> — gemma-4 only:
-                  train on every assistant turn&apos;s reasoning, not just last-user tool calls. No-op on
-                  other chat templates.
+                  <span className="font-medium">Render all assistant reasoning</span> — for templates that
+                  gate reasoning to tool-call turns after the last user message (e.g. gemma-4, MiniMax-M2):
+                  train on every assistant turn&apos;s reasoning. No-op on templates without that guard.
                 </span>
               </label>
             </div>

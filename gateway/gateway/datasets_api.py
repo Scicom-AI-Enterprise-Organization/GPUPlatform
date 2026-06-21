@@ -150,8 +150,9 @@ class LlmPackRequest(BaseModel):
     # Source column of OpenAI-style tool/function declarations rendered as tools=
     # into the chat template. Blank/None → no tools. Default "functions".
     tools_field: Optional[str] = "functions"
-    # gemma-4: render EVERY assistant turn's reasoning (not just last-user tool
-    # calls). No-op on non-gemma templates. See llm_pack.build_chat_template.
+    # For templates that gate reasoning to tool-call turns after the last user
+    # message (gemma-4, MiniMax-M2, …): render EVERY assistant turn's reasoning.
+    # No-op on templates without that guard. See llm_pack.build_chat_template.
     all_reasoning: bool = True
 
 

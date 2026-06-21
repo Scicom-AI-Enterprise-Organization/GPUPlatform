@@ -32,8 +32,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import tempfile
 import sys
+import time
 import traceback
 import urllib.request
 
@@ -188,8 +191,41 @@ def _install_fa4(cfg: dict, py: str, env: dict, _pip) -> None:
     (common); add the cute subdir from the public git fork + the load-bearing
     cutlass-dsl/quack pins (the cute pyproject's `>=` bounds pull too-new builds that
     break). Mirrors run.sh's GEMMA_FA4=1 path; verifies the import after install."""
-    log("[deps] FlashAttention-4 cute fork + cutlass/quack pins …")
-    _pip(cfg.get("fa4_fork_install") or _FA4_FORK_INSTALL)
+    # Fast path: if the cute fork already imports in this venv, skip the (slow,
+    # git-based) reinstall. torch may have been reinstalled around it, but the
+    # `flash_attn.cute` namespace pkg + its cutlass/quack pins persist — so a venv
+    # rebuild (e.g. after a partial install) needn't re-fetch flash-attention-512
+    # over a slow/flaky uplink, which is exactly where the install hangs.
+    try:
+        subprocess.check_call(
+            [py, "-c", "from flash_attn.cute.interface import flash_attn_varlen_func"],
+            cwd="/tmp", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        log("[deps] FA4 cute fork already present — skipping reinstall")
+        return
+    except Exception:
+        pass
+    spec = cfg.get("fa4_fork_install") or _FA4_FORK_INSTALL
+    if spec.startswith("git+"):
+        # Clone with SYSTEM git (shallow + abortable) then install from the local
+        # checkout — uv's internal git hangs on a flaky github uplink (tm VM).
+        # Spec form: git+<url>[@<ref>]#subdirectory=<sub>.
+        rest = spec[len("git+"):]
+        url, _, frag = rest.partition("#")
+        subdir = ""
+        for part in frag.split("&"):
+            if part.startswith("subdirectory="):
+                subdir = part[len("subdirectory="):]
+        ref = None
+        if url.endswith(".git@") is False and "@" in url.split("://", 1)[-1]:
+            url, _, ref = url.rpartition("@")  # url@branch/tag (scheme has no '@')
+        dest = os.path.join(tempfile.gettempdir(), "sgpu_fa4_cute_src")
+        log("[deps] FlashAttention-4: shallow-cloning the cute fork via system git …")
+        _git_clone_resilient(url, dest, env, ref)
+        _pip(os.path.join(dest, subdir) if subdir else dest)
+    else:
+        log("[deps] FlashAttention-4 cute fork + cutlass/quack pins …")
+        _pip(spec)
     _pip(*(cfg.get("fa4_pins") or _FA4_PINS))
     # Verify the kernel imports (CuTeDSL loads here; it JIT-compiles only at call time).
     # Run from a dir with NO local flash_attn/ so the namespace pkg resolves.
@@ -199,13 +235,89 @@ def _install_fa4(cfg: dict, py: str, env: dict, _pip) -> None:
     )
 
 
+def _git_clone_resilient(url: str, dest: str, env: dict, ref: Optional[str] = None) -> None:
+    """Shallow-clone `url` to `dest` with the SYSTEM git, resiliently. uv's internal
+    git client ignores GIT_HTTP_LOW_SPEED and has no timeout/resume, so a `git+`
+    install hangs forever on a flaky uplink (the tm VM → github case). System git
+    honours GIT_HTTP_LOW_SPEED (aborts a stall) and `--depth 1` keeps it tiny; we
+    also retry + hard-cap each attempt (SIGKILL a hang)."""
+    attempts = 4
+    per_attempt_s = 1200  # 20 min — a shallow clone is small; this only kills a true hang
+    for i in range(attempts):
+        if os.path.isdir(dest):
+            shutil.rmtree(dest, ignore_errors=True)
+        cmd = ["git", "clone", "--depth", "1", "--no-tags", "--single-branch"]
+        if ref:
+            cmd += ["--branch", ref]
+        cmd += [url, dest]
+        proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+        try:
+            rc = proc.wait(timeout=per_attempt_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.wait()
+            rc = -1
+            log(f"[deps] git clone attempt {i + 1}/{attempts} exceeded {per_attempt_s}s — killed.")
+        if rc == 0:
+            return
+        if i == attempts - 1:
+            raise subprocess.CalledProcessError(rc or 1, cmd)
+        wait = 15 * (i + 1)
+        log(f"[deps] git clone failed (attempt {i + 1}/{attempts}) — slow/flaky uplink; retrying in {wait}s …")
+        time.sleep(wait)
+
+
+def _clear_uv_git_locks(env: dict) -> None:
+    """Remove stale uv `git+` lock files. A uv process killed mid git-fetch (e.g. a
+    terminated run) leaves a lock in `<uv-cache>/git-v0/locks/`; later git installs
+    then block on it for the lock timeout and fail. The holder is dead, so the lock
+    is safe to drop. (Single-user box; runs are serialized per venv.)"""
+    try:
+        cache = subprocess.check_output(["uv", "cache", "dir"], text=True, env=env, timeout=20).strip()
+    except Exception:
+        cache = env.get("UV_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "uv")
+    locks = os.path.join(cache, "git-v0", "locks")
+    removed = 0
+    try:
+        for f in os.listdir(locks):
+            try:
+                os.remove(os.path.join(locks, f))
+                removed += 1
+            except OSError:
+                pass
+    except OSError:
+        return
+    if removed:
+        log(f"[deps] cleared {removed} stale uv git lock(s) in {locks}")
+
+
 def _ensure_venv(cfg: dict, arch: str) -> str:
     """Create/reuse an isolated uv venv with the arch's training stack; return its
     python. Idempotent. torch 2.12 is common; the attention kernel is per-mode:
     gemma defaults to the FA4 cute fork (head_dim-512), else the FA3 wheel."""
     venv = _venv_path(cfg, arch)
     py = os.path.join(venv, "bin", "python")
-    env = {**os.environ, "PIP_CONSTRAINT": "", "PIP_REQUIRE_HASHES": "0"}
+    env = {
+        **os.environ, "PIP_CONSTRAINT": "", "PIP_REQUIRE_HASHES": "0",
+        # Big CUDA wheels (torch + nvidia-*-cu13, incl. nvidia-nvshmem-cu13 from
+        # pypi.nvidia.com) time out on a throttled/slow uplink (e.g. the tm VM's
+        # INTL link). Give uv a long per-request timeout; _pip also retries the
+        # whole command (and kills a true hang) on failure.
+        "UV_HTTP_TIMEOUT": os.environ.get("UV_HTTP_TIMEOUT", "600"),
+        # The FA4 cute fork is a git+ dependency; a stalled `git fetch` of
+        # flash-attention-512 over a flaky uplink hangs forever (no HTTP timeout
+        # covers it). Abort the fetch if it drops below 1 KB/s for 120s → the fetch
+        # fails → _pip retries it.
+        "GIT_HTTP_LOW_SPEED_LIMIT": os.environ.get("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
+        "GIT_HTTP_LOW_SPEED_TIME": os.environ.get("GIT_HTTP_LOW_SPEED_TIME", "120"),
+        # A uv killed mid `git+` fetch leaves a stale lock in <cache>/git-v0/locks/;
+        # the next git install then waits the (default 300s) lock timeout and fails.
+        # We proactively clear stale locks (below) AND fail fast if one is contended.
+        "UV_LOCK_TIMEOUT": os.environ.get("UV_LOCK_TIMEOUT", "60"),
+    }
     pkgs = list(_ARCH[arch]["deps"]) + list(_COMMON_DEPS)
     fa = _fa_mode(arch, cfg)
     # FA4 installs as the `flash_attn.cute` namespace pkg; FA3 as `flash_attn_interface`.
@@ -235,10 +347,43 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
             subprocess.check_call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"], env=env)
 
     def _pip(*args: str) -> None:
-        if have_uv:
-            subprocess.check_call(["uv", "pip", "install", "--python", py, *args], env=env)
-        else:
-            subprocess.check_call([py, "-m", "pip", "install", "-q", *args], env=env)
+        cmd = (
+            ["uv", "pip", "install", "--python", py, *args] if have_uv
+            else [py, "-m", "pip", "install", "-q", "--timeout", "600", "--retries", "5", *args]
+        )
+        # Retry the whole install, and KILL a true hang — the big CUDA wheels +
+        # the FA4 git fetch come over a slow/flaky uplink (tm). A timed-out download
+        # fails (→ retry); a stalled git fetch can hang with no output, so each
+        # attempt gets a hard wall-clock cap (process-group killed on timeout → retry).
+        attempts = 4
+        per_attempt_s = 2400  # 40 min — covers a slow torch/cu13 download, kills a real hang
+        for i in range(attempts):
+            # Drop any stale git-fetch lock left by a killed uv (incl. a prior
+            # attempt this loop SIGKILLed) so a `git+` install doesn't block on it.
+            if have_uv:
+                _clear_uv_git_locks(env)
+            failed = False
+            proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+            try:
+                rc = proc.wait(timeout=per_attempt_s)
+                failed = rc != 0
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+                proc.wait()
+                failed = True
+                log(f"[deps] install attempt {i + 1}/{attempts} exceeded {per_attempt_s}s "
+                    f"(likely a stalled fetch) — killed.")
+            if not failed:
+                return
+            if i == attempts - 1:
+                raise subprocess.CalledProcessError(1, cmd)
+            wait = 15 * (i + 1)
+            log(f"[deps] install failed (attempt {i + 1}/{attempts}) — slow/flaky uplink; "
+                f"retrying in {wait}s …")
+            time.sleep(wait)
 
     # torch 2.12 is the common base (the FA3-wheel ABI + torch._grouped_mm for MoE; the
     # FA4 cute fork also runs on it). The attention kernel then differs by mode.

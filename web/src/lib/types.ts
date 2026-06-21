@@ -870,7 +870,7 @@ export type LlmPackRequest = {
   subset?: string | null; // which subset/split to pack (null → first)
   sequence_length?: number; // multipack bin length (tokens); longer convs dropped
   tools_field?: string | null; // source tool/function column (blank → no tools)
-  all_reasoning?: boolean; // gemma-4: render every assistant turn's reasoning
+  all_reasoning?: boolean; // render every assistant turn's reasoning (gemma-4/MiniMax-M2 templates; no-op otherwise)
 };
 
 // Org-wide env var / secret (admin-managed). Mirrors gateway GlobalEnvRecord.
