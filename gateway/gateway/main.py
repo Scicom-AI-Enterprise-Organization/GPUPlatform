@@ -560,7 +560,7 @@ async def lifespan(app: FastAPI):
         logger.exception("proxy: failed to start health loop")
     if os.environ.get("AUTOSCALER", "0") == "1":
         from .provider import build_provider, cloud_providers_disabled, CLOUD_PROVIDER_NAMES
-        from .autoscaler import autoscaler_loop
+        from .autoscaler import autoscaler_loop, vm_watchdog_loop
         from .reconciler import reconciler_loop
 
         provider_name = os.environ.get("PROVIDER", "fake")
@@ -618,15 +618,20 @@ async def lifespan(app: FastAPI):
                 app.state.redis, app.state.provider, session_factory(), app.state.provider_cache
             )
         )
+        app.state.vm_watchdog_task = asyncio.create_task(
+            vm_watchdog_loop(
+                app.state.redis, session_factory(), app.state.provider_cache
+            )
+        )
         logger.info(
-            "autoscaler + reconciler enabled (provider=%s)",
+            "autoscaler + reconciler + vm_watchdog enabled (provider=%s)",
             app.state.provider.name if app.state.provider else f"{provider_name} (per-app rows)",
         )
 
     try:
         yield
     finally:
-        for task_attr in ("autoscaler_task", "reconciler_task", "bench_janitor_task", "compute_idle_task", "gitops_task", "proxy_healthcheck_task"):
+        for task_attr in ("autoscaler_task", "reconciler_task", "vm_watchdog_task", "bench_janitor_task", "compute_idle_task", "gitops_task", "proxy_healthcheck_task"):
             t = getattr(app.state, task_attr, None)
             if t:
                 t.cancel()
