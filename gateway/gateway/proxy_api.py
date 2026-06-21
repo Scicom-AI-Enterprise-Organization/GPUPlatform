@@ -411,6 +411,44 @@ async def _do_unary(app, endpoint_id: str, candidates: list[dict], alias: str,
     raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
 
 
+async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], alias: str,
+                              upstream_path: str, file_name: str, file_bytes: bytes,
+                              content_type: str, form_fields: dict, timeout_s: float) -> dict:
+    """Multipart forward (audio transcriptions/translations). Like _do_unary but
+    rebuilds the multipart body — the uploaded file + passthrough form fields, with
+    the upstream's mapped model name. Failover on connect error / 5xx."""
+    cli = _http(app)
+    last_err = "no upstream"
+    for u in candidates:
+        data = {**form_fields, "model": u["models"][alias]}
+        files = {"file": (file_name, file_bytes, content_type)}
+        headers = {}
+        if u.get("_key"):
+            headers["Authorization"] = f"Bearer {u['_key']}"
+        url = u["base_url"].rstrip("/") + upstream_path
+        t0 = time.perf_counter()
+        try:
+            r = await cli.post(url, data=data, files=files, headers=headers,
+                               timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError) as e:
+            _mark_health(app, endpoint_id, u["id"], False, error=str(e))
+            last_err = f"{u['name']}: {type(e).__name__}"
+            continue
+        lat = int((time.perf_counter() - t0) * 1000)
+        if r.status_code >= 500:
+            _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+            last_err = f"{u['name']}: HTTP {r.status_code}"
+            continue
+        _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
+        try:
+            data_out = r.json()
+        except Exception:
+            data_out = {"text": r.text}  # response_format=text → plain string
+        return {"upstream": u["name"], "status_code": r.status_code, "data": data_out,
+                "latency_ms": lat, "pt": None, "ct": None}
+    raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
+
+
 async def _watch_cancel(request: Request, cancel_ev: asyncio.Event) -> None:
     """Resolve when the client disconnects OR a manual cancel fires."""
     while True:
@@ -425,9 +463,12 @@ async def _watch_cancel(request: Request, cancel_ev: asyncio.Event) -> None:
         await asyncio.sleep(0.25)
 
 
-async def _unary(app, request: Request, request_id: str, endpoint_id: str, candidates: list[dict],
-                 alias: str, payload: dict, upstream_path: str, timeout_s: float,
+async def _unary(app, request: Request, request_id: str, forward,
                  sem: Optional[asyncio.Semaphore], cancel_ev: asyncio.Event) -> Response:
+    """Run one non-streaming forward (`forward` is a zero-arg coroutine returning the
+    {upstream,status_code,data,latency_ms,pt,ct} dict) with disconnect-cancel + the
+    concurrency slot + request tracking. Works for JSON (chat/completions/embeddings)
+    and multipart (audio) forwards alike."""
     live = _live(app)
 
     async def work() -> Response:
@@ -441,7 +482,7 @@ async def _unary(app, request: Request, request_id: str, endpoint_id: str, candi
             if request_id in live:
                 live[request_id]["state"] = "running"
             await _set_started(request_id)
-            res = await _do_unary(app, endpoint_id, candidates, alias, payload, upstream_path, timeout_s)
+            res = await forward()
             if request_id in live:
                 live[request_id]["upstream"] = res["upstream"]
             await _finish(request_id, "completed", status_code=res["status_code"],
@@ -562,15 +603,11 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
             asyncio.create_task(_finish(request_id, "cancelled", status_code=499, error="client disconnected"))
 
 
-async def _handle(request: Request, user: User, endpoint_name: str, payload: dict, upstream_path: str) -> Response:
-    app = request.app
-    alias = payload.get("model")
-    if not isinstance(alias, str) or not alias.strip():
-        raise HTTPException(status_code=400, detail={"error": "missing 'model' in request body"})
-    alias = alias.strip()
-    is_stream = bool(payload.get("stream"))
+async def _prepare(app, endpoint_name: str, alias: str, user: User, is_stream: bool):
+    """Resolve the endpoint + candidate upstreams for `alias`, resolve their keys, and
+    record a queued ProxyRequest. Returns (endpoint_id, candidates, timeout_s, max_conc,
+    request_id). Raises 404 if the endpoint or model alias is unknown/disabled."""
     request_id = f"pxr-{_secrets.token_hex(8)}"
-
     async with session_factory()() as s:
         ep = (await s.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint_name))).scalar_one_or_none()
         if ep is None or not ep.enabled:
@@ -591,22 +628,65 @@ async def _handle(request: Request, user: User, endpoint_name: str, payload: dic
             created_at=datetime.now(timezone.utc),
         ))
         await s.commit()
+    return endpoint_id, candidates, timeout_s, max_conc, request_id
 
-    sem = _get_sem(app, endpoint_id, max_conc)
-    cancel_ev = asyncio.Event()
+
+def _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream) -> None:
     _live(app)[request_id] = {
         "cancel": cancel_ev, "state": "queued", "endpoint_id": endpoint_id,
         "model": alias, "upstream": None, "created_at": time.time(),
         "owner": getattr(user, "username", "?"), "is_stream": is_stream, "id": request_id,
     }
 
+
+async def _handle(request: Request, user: User, endpoint_name: str, payload: dict, upstream_path: str) -> Response:
+    app = request.app
+    alias = payload.get("model")
+    if not isinstance(alias, str) or not alias.strip():
+        raise HTTPException(status_code=400, detail={"error": "missing 'model' in request body"})
+    alias = alias.strip()
+    is_stream = bool(payload.get("stream"))
+    endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, is_stream)
+    sem = _get_sem(app, endpoint_id, max_conc)
+    cancel_ev = asyncio.Event()
+    _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream)
     if is_stream:
         return StreamingResponse(
             _stream(app, request_id, endpoint_id, candidates, alias, payload, upstream_path, timeout_s, sem, cancel_ev),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-Id": request_id},
         )
-    return await _unary(app, request, request_id, endpoint_id, candidates, alias, payload, upstream_path, timeout_s, sem, cancel_ev)
+    return await _unary(app, request, request_id,
+                        lambda: _do_unary(app, endpoint_id, candidates, alias, payload, upstream_path, timeout_s),
+                        sem, cancel_ev)
+
+
+async def _handle_audio(request: Request, user: User, endpoint_name: str, upstream_path: str) -> Response:
+    """Multipart audio forward (transcriptions / translations). Routes by the `model`
+    form field and rebuilds the multipart for the chosen upstream. Non-streaming."""
+    app = request.app
+    form = await request.form()
+    alias = form.get("model")
+    if not isinstance(alias, str) or not alias.strip():
+        raise HTTPException(status_code=400, detail={"error": "missing 'model' form field"})
+    alias = alias.strip()
+    up = form.get("file")
+    if up is None or not hasattr(up, "read"):
+        raise HTTPException(status_code=400, detail={"error": "missing 'file' upload (multipart/form-data)"})
+    file_bytes = await up.read()
+    file_name = getattr(up, "filename", None) or "audio"
+    content_type = getattr(up, "content_type", None) or "application/octet-stream"
+    # Pass through every other text form field (language, prompt, response_format,
+    # temperature, timestamp_granularities[], …) verbatim to the upstream.
+    extra = {k: v for k, v in form.multi_items() if k not in ("file", "model") and isinstance(v, str)}
+    endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, False)
+    sem = _get_sem(app, endpoint_id, max_conc)
+    cancel_ev = asyncio.Event()
+    _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, False)
+    return await _unary(app, request, request_id,
+                        lambda: _do_unary_multipart(app, endpoint_id, candidates, alias, upstream_path,
+                                                    file_name, file_bytes, content_type, extra, timeout_s),
+                        sem, cancel_ev)
 
 
 # ---------- data-plane routes ------------------------------------------------
@@ -625,6 +705,16 @@ async def proxy_completions(endpoint: str, payload: dict, request: Request, user
 async def proxy_embeddings(endpoint: str, payload: dict, request: Request, user: User = Depends(current_user)):
     payload.pop("stream", None)  # embeddings are unary — never SSE
     return await _handle(request, user, endpoint, payload, "/embeddings")
+
+
+@data_router.post("/proxy/{endpoint}/v1/audio/transcriptions")
+async def proxy_audio_transcriptions(endpoint: str, request: Request, user: User = Depends(current_user)):
+    return await _handle_audio(request, user, endpoint, "/audio/transcriptions")
+
+
+@data_router.post("/proxy/{endpoint}/v1/audio/translations")
+async def proxy_audio_translations(endpoint: str, request: Request, user: User = Depends(current_user)):
+    return await _handle_audio(request, user, endpoint, "/audio/translations")
 
 
 @data_router.get("/proxy/{endpoint}/v1/models")
