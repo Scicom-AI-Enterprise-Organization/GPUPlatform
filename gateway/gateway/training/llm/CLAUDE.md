@@ -96,12 +96,20 @@ activation-checkpoint memory (O(seq×layers), unshardable) → ~64k context ceil
   was skipped (user) — its code path is the SAME FP8-MoE stack as MiniMax (which passed), just
   `mistral_small.py` instead of `minimax_m2.py` (+ `--no_shared_lora` available, MLA attention).
 
-**Also validated on a freshly-provisioned RunPod pod (2026-06-20)** — the gateway spawns the pod,
+**Also validated on a freshly-provisioned RunPod pod (2026-06-20/21)** — the gateway spawns the pod,
 ships the trainer, runs it detached, uploads to S3, and **tears the pod down** (no orphaned billing,
 confirmed `pod … torn down` for every run). TTS (1× H100) ✅, STT/Whisper (1× H100) ✅, gemma-4-31B
-(4× H100) ✅ — gemma ran the **FA3 path** (`gemma_fa4=false`) on the default `cu1281` image, since
-the FA4 cute fork needs a guaranteed CUDA-13 host (`cutlass-dsl[cu13]`) the stock image can't
-promise. The only RunPod-specific break was the `--r`/torchrun collision (below).
+(4× H100) ✅ **both attention paths**:
+- **FA3** (`gemma_fa4=false`, default `cu1281` image): loss 7.08→1.77, ~1.0–1.2k tokens/s.
+- **FA4** (`gemma_fa4=true`, image `runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404` → CUDA-13 host):
+  loss 7.10→1.83, **~4.0–4.4k tokens/s (~3.5× FA3)**. `cu130` torch wheel + the cute fork +
+  `cutlass-dsl[cu13]` all install on the pod; `FA4 cute import OK`, first step ~38s.
+
+**To run FA4 on RunPod you MUST pass a CUDA-13 image** (`…-cu1300-…`) so the pod lands on a ≥580
+driver — the FA4 cute kernel JIT-compiles CUDA-13 cubins via `cutlass-dsl[cu13]` and fails on an
+older host. `_extract_cuda_version` parses the image tag → `allowedCudaVersions=["13.0"]`, which is
+what pins the host. RunPod-specific breaks found: the `--r`/torchrun collision and the cuda-tag
+parse bug (both below).
 
 To drive a run without the web UI (admin API key as `Authorization: Bearer sgpu_…`):
 `POST /v1/training-runs` with `{task_type:"llm", dataset_id, base_model, provider_id, storage_id,
@@ -132,6 +140,12 @@ env_vars:{HF_HOME, HF_HUB_DISABLE_XET}}`.
   2.12.1 which resolved it. Fix: `gemma4.py` adds a `--r/--lora_r` alias (`dest="r"`) and the
   orchestrator passes the long form `--lora_r`. (minimax/mistral were never affected — their LoRA
   flags are already `--attn_r/--moe_r`, no bare `--r`.)
+- **`_extract_cuda_version` (compute.py) must parse RunPod's short `cuNNNN` tag.** It only matched
+  the dotted `cuda12.4.1` / `cuda_12_6` forms → returned `None` for modern `runpod/pytorch` tags
+  (`…-cu1300-…`, `…-cu1281-…`), so **`allowedCudaVersions` was never set**. Harmless for FA3 (any
+  ≥12.6 host works) but FATAL for FA4 — without the filter the cu1300 image could land on a CUDA-12
+  host and the cute kernel's CUDA-13 JIT fails. Fixed to also parse `cu1300→13.0`, `cu1281→12.8`
+  (2-digit major + 1-digit minor). This is what makes a CUDA-13 image actually pin a CUDA-13 host.
 
 **Monitoring gotcha:** the gateway's live log (`/tmp/sgpu-train/<id>/_full.log`, streamed via an SSH
 `tail -F`) can **freeze mid-run on long jobs** when that tail SSH connection drops — but the run is

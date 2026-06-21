@@ -382,26 +382,39 @@ def _extract_ssh(pod: dict) -> tuple[Optional[str], Optional[int]]:
 def _extract_cuda_version(image: str) -> Optional[str]:
     """Pull a CUDA major.minor version out of an image name.
 
-    RunPod-style: 'runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04'
-    Bare:        'nvidia/cuda:12.8.0-devel-ubuntu22.04'
-    PI-style:    'cuda_12_6_pytorch_2_7' (handled too, returns '12.6')
+    Dotted form:  'runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04'
+    Bare:         'nvidia/cuda:12.8.0-devel-ubuntu22.04'
+    PI-style:     'cuda_12_6_pytorch_2_7' (handled too, returns '12.6')
+    RunPod short: 'runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404' → '13.0'
+                  (modern runpod/pytorch tags drop the 'da' and pack the version:
+                   cu1281 → 12.8, cu1300 → 13.0, cu130 → 13.0, cu128 → 12.8)
 
     Returns None if no recognisable version is present. We pass the result
-    through to RunPod's allowedCudaVersions so a CUDA-12.8 image lands on a
-    host with a ≥555 driver instead of failing at runtime with 'forward
-    compatibility was attempted on non-supported HW'.
+    through to RunPod's allowedCudaVersions so a CUDA-13 image lands on a
+    host with a ≥580 driver instead of failing at runtime with 'forward
+    compatibility was attempted on non-supported HW'. This matters most for the
+    FA4 gemma stack, which needs a genuine CUDA-13 host (cutlass-dsl[cu13]).
     """
     if not image:
         return None
     import re
-    # Match dotted form first (runpod/* / bare images).
+    # Dotted form first (runpod/* / bare images): cuda12.4.1.
     m = re.search(r"cuda[:\-_]?(\d+)\.(\d+)", image, re.IGNORECASE)
-    if not m:
-        # Underscore form (PI enum).
-        m = re.search(r"cuda_(\d+)_(\d+)", image, re.IGNORECASE)
-    if not m:
-        return None
-    return f"{m.group(1)}.{m.group(2)}"
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    # Underscore form (PI enum): cuda_12_6.
+    m = re.search(r"cuda_(\d+)_(\d+)", image, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    # RunPod short form: '...-cu1300-...' / '...-cu130-...'. The digits are a
+    # packed version with a 2-digit major (11/12/13) + 1-digit minor (+ patch):
+    # 1300 → 13.0, 1281 → 12.8, 130 → 13.0, 128 → 12.8. Anchor on a non-digit
+    # boundary so 'torch291'/'ubuntu2404' can't be mistaken for a cuda tag.
+    m = re.search(r"(?:^|[^a-z0-9])cu(\d{3,5})(?![\d.])", image, re.IGNORECASE)
+    if m:
+        d = m.group(1)
+        return f"{d[0:2]}.{d[2:3]}"
+    return None
 
 
 # ---------- Prime Intellect helpers ------------------------------------
