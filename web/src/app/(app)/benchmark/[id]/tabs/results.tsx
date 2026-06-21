@@ -163,7 +163,7 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
       {accuracy.length > 0 && (
         <AccuracyResults accuracy={accuracy} onRefresh={refresh} loading={loading} />
       )}
-      <div className="flex items-end justify-between gap-3">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h2 className="text-lg font-semibold">Results</h2>
           <p className="text-xs text-muted-foreground">

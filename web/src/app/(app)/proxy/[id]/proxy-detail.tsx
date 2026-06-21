@@ -202,9 +202,8 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
                 <TabsList variant="line" className="bg-transparent">
                   <TabsTrigger value="curl">cURL</TabsTrigger>
                   <TabsTrigger value="curl-stream">cURL (stream)</TabsTrigger>
-                  <TabsTrigger value="openai">OpenAI client</TabsTrigger>
                   <TabsTrigger value="embeddings">Embeddings</TabsTrigger>
-                  <TabsTrigger value="audio">Transcribe</TabsTrigger>
+                  <TabsTrigger value="openai">OpenAI client</TabsTrigger>
                 </TabsList>
                 <TabsContent value="curl" className="mt-3 space-y-3">
                   <p className="text-sm text-muted-foreground">
@@ -218,23 +217,17 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
                   </p>
                   <CodeBlock display={curlChatStream(snippetBase, visToken, model0)} copy={curlChatStream(snippetBase, realToken, model0)} />
                 </TabsContent>
+                <TabsContent value="embeddings" className="mt-3 space-y-3">
+                  <p className="text-sm text-muted-foreground">
+                    OpenAI <code className="font-mono">/proxy/{ep.name}/v1/embeddings</code> — point <code className="font-mono">model</code> at an embedding alias to get the vector list back in one call (unary, never streamed).
+                  </p>
+                  <CodeBlock display={curlEmbeddings(snippetBase, visToken, model0)} copy={curlEmbeddings(snippetBase, realToken, model0)} />
+                </TabsContent>
                 <TabsContent value="openai" className="mt-3 space-y-3">
                   <p className="text-sm text-muted-foreground">
                     Point any OpenAI client at <code className="font-mono">{snippetBase}</code> — set <code className="font-mono">model</code> to one of the aliases above.
                   </p>
                   <CodeBlock display={openaiSnippet(snippetBase, visToken, model0)} copy={openaiSnippet(snippetBase, realToken, model0)} />
-                </TabsContent>
-                <TabsContent value="embeddings" className="mt-3 space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    OpenAI <code className="font-mono">/proxy/{ep.name}/v1/embeddings</code> — routes by <code className="font-mono">model</code> like the other endpoints.
-                  </p>
-                  <CodeBlock display={curlEmbeddings(snippetBase, visToken, model0)} copy={curlEmbeddings(snippetBase, realToken, model0)} />
-                </TabsContent>
-                <TabsContent value="audio" className="mt-3 space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    OpenAI <code className="font-mono">/proxy/{ep.name}/v1/audio/transcriptions</code> — multipart upload; the <code className="font-mono">model</code> form field selects the upstream. (<code className="font-mono">/audio/translations</code> works the same way.)
-                  </p>
-                  <CodeBlock display={curlTranscribe(snippetBase, visToken, model0)} copy={curlTranscribe(snippetBase, realToken, model0)} />
                 </TabsContent>
               </Tabs>
               {urlTarget === "internal" && (
@@ -405,14 +398,8 @@ function curlEmbeddings(base: string, token: string, model: string): string {
   -H 'Authorization: Bearer ${token}' \\
   -d '{
     "model": "${model}",
-    "input": "The quick brown fox"
+    "input": ["Hello, world"]
   }'`;
-}
-function curlTranscribe(base: string, token: string, model: string): string {
-  return `curl -X POST '${base}/audio/transcriptions' \\
-  -H 'Authorization: Bearer ${token}' \\
-  -F 'model=${model}' \\
-  -F 'file=@audio.mp3'`;
 }
 function openaiSnippet(base: string, token: string, model: string): string {
   return `from openai import OpenAI

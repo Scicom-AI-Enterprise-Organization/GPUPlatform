@@ -282,8 +282,8 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
 
   return (
     <div>
-      <div className="mb-4 flex gap-2">
-        <div className="relative flex-1">
+      <div className="mb-4 flex flex-wrap gap-2">
+        <div className="relative min-w-[180px] flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <input
             type="search"
@@ -377,7 +377,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
       </div>
 
       {selectMode && (
-        <div className="mb-3 flex items-center justify-between rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
+        <div className="mb-3 flex flex-col gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between">
           <span className="text-muted-foreground">
             {selected.size} selected
             {filtered.length > 0 && (
@@ -405,7 +405,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
               </>
             )}
           </span>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={onExportSelected}
