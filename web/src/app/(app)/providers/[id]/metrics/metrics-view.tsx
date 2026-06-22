@@ -20,6 +20,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 import type { ProviderBandwidth, ProviderMetrics, ProviderRecord } from "@/lib/types";
@@ -86,14 +94,22 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
   const [bwErr, setBwErr] = useState<string | null>(null);
   const [killing, setKilling] = useState<Set<number>>(new Set());
   const [killNote, setKillNote] = useState<string | null>(null);
+  const [pendingKill, setPendingKill] = useState<number | null>(null);
   const tick = useRef(0);
 
-  // Terminate a process holding a GPU (SIGKILL on the VM over SSH). Confirm first —
-  // it's destructive. On success, refresh metrics so the freed GPU shows immediately.
-  async function killPid(pid: number) {
-    if (!window.confirm(`Terminate (SIGKILL) pid ${pid} on this VM? This frees the GPU it holds.`)) return;
-    setKilling((s) => new Set(s).add(pid));
+  // Killing a GPU process is destructive (SIGKILL on the VM over SSH), so confirm via the themed
+  // dialog: the Kill button opens it (requestKill), the dialog's confirm runs the kill (confirmKill).
+  function requestKill(pid: number) {
     setKillNote(null);
+    setPendingKill(pid);
+  }
+
+  // Terminate the pending process. On success, refresh metrics so the freed GPU shows immediately.
+  async function confirmKill() {
+    const pid = pendingKill;
+    if (pid == null) return;
+    setPendingKill(null);
+    setKilling((s) => new Set(s).add(pid));
     try {
       const r = await gateway.killProviderPid(id, pid);
       setKillNote(`pid ${pid}: ${r.message}`);
@@ -371,7 +387,7 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
                                 <span className="min-w-0 flex-1 truncate text-muted-foreground">{model || p.comm || "?"}</span>
                                 <button
                                   type="button"
-                                  onClick={() => killPid(p.pid)}
+                                  onClick={() => requestKill(p.pid)}
                                   disabled={busy}
                                   title={`SIGKILL pid ${p.pid} to free this GPU`}
                                   className="shrink-0 rounded border border-destructive/40 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
@@ -458,6 +474,22 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
           )}
         </CardContent>
       </Card>
+
+      <Dialog open={pendingKill !== null} onOpenChange={(o) => { if (!o) setPendingKill(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Terminate process?</DialogTitle>
+            <DialogDescription>
+              SIGKILL <span className="font-mono text-foreground">pid {pendingKill}</span> on this VM to
+              free the GPU it holds. The process is killed immediately and cannot be resumed.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPendingKill(null)}>Cancel</Button>
+            <Button variant="destructive" onClick={confirmKill}>Kill</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
