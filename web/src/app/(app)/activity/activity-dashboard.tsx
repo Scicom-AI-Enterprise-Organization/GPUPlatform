@@ -23,7 +23,7 @@ const RANGES: Record<string, { label: string; days: number }> = {
   "30d": { label: "Past month", days: 30 },
 };
 const GRANS: { value: ActivityGranularity; label: string }[] = [
-  { value: "minute", label: "Per minute" },
+  { value: "15min", label: "Every 15 min" },
   { value: "hour", label: "Hourly" },
   { value: "day", label: "Daily" },
 ];
@@ -66,17 +66,27 @@ export function ActivityDashboard() {
     return () => window.clearTimeout(timer);
   }, [load]);
 
-  // Pivot by_model_bucket → one row per bucket with a column per model (stacked bar).
-  const { modelBuckets, modelKeys } = useMemo(() => {
-    const rows = summary?.by_model_bucket ?? [];
-    const keys = Array.from(new Set(rows.map((d) => d.model)));
-    const byBucket: Record<string, Record<string, number>> = {};
-    for (const r of rows) {
-      (byBucket[r.bucket] ??= { bucket: r.bucket } as Record<string, number> & { bucket?: string })[r.model] = r.requests;
-    }
-    const out = Object.values(byBucket).sort((a, b) => String(a.bucket).localeCompare(String(b.bucket)));
-    return { modelBuckets: out, modelKeys: keys };
-  }, [summary]);
+  // Pivot {by_model_bucket → requests, by_user_bucket → tokens} into one row per
+  // bucket with a column per series (for the stacked bars).
+  const pivot = useCallback(
+    (rows: { bucket: string }[] | undefined, key: string, val: string) => {
+      const keys = Array.from(new Set((rows ?? []).map((r) => (r as Record<string, string>)[key])));
+      const byBucket: Record<string, Record<string, number>> = {};
+      for (const r of rows ?? []) {
+        const rec = r as Record<string, string | number>;
+        (byBucket[r.bucket] ??= { bucket: r.bucket } as Record<string, number> & { bucket?: string })[
+          rec[key] as string
+        ] = rec[val] as number;
+      }
+      const out = Object.values(byBucket).sort((a, b) => String(a.bucket).localeCompare(String(b.bucket)));
+      return { rows: out, keys };
+    },
+    [],
+  );
+  const { rows: modelBuckets, keys: modelKeys } = useMemo(
+    () => pivot(summary?.by_model_bucket, "model", "requests"), [summary, pivot]);
+  const { rows: userBuckets, keys: userKeys } = useMemo(
+    () => pivot(summary?.by_user_bucket, "user", "tokens"), [summary, pivot]);
 
   const t = summary?.totals;
   const cards = [
@@ -135,64 +145,74 @@ export function ActivityDashboard() {
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* TTFT + latency over time */}
-        <ChartCard title="Latency over time" subtitle="Average TTFT and end-to-end latency per bucket.">
-          {!summary?.by_bucket.length ? (
-            <Empty loading={loading} />
-          ) : (
-            <LineChart data={summary.by_bucket}>
-              <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
-              <XAxis dataKey="bucket" tick={{ fontSize: 11 }} tickFormatter={(b) => tickFmt(b, gran)} minTickGap={28} />
-              <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => fmtMs(Number(v))} width={56} />
-              <Tooltip
-                contentStyle={{ fontSize: 12 }}
-                labelFormatter={(l) => fullLabel(String(l))}
-                formatter={(v, n) => [fmtMs(Number(v)), n === "avg_ttft_ms" ? "TTFT" : "Latency"]}
-              />
-              <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => (v === "avg_ttft_ms" ? "TTFT" : "Latency")} />
-              <Line type="monotone" dataKey="avg_ttft_ms" stroke="#3b82f6" strokeWidth={2} dot={false} connectNulls />
-              <Line type="monotone" dataKey="avg_latency_ms" stroke="#f59e0b" strokeWidth={2} dot={false} connectNulls />
-            </LineChart>
-          )}
+        <ChartCard title="Latency over time" subtitle="Average TTFT and end-to-end latency per bucket."
+          empty={!summary?.by_bucket.length} loading={loading}>
+          <LineChart data={summary?.by_bucket ?? []}>
+            <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
+            <XAxis dataKey="bucket" tick={{ fontSize: 11 }} tickFormatter={(b) => tickFmt(b, gran)} minTickGap={28} />
+            <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => fmtMs(Number(v))} width={56} />
+            <Tooltip
+              contentStyle={{ fontSize: 12 }}
+              labelFormatter={(l) => fullLabel(String(l))}
+              formatter={(v, n) => [fmtMs(Number(v)), n === "avg_ttft_ms" ? "TTFT" : "Latency"]}
+            />
+            <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => (v === "avg_ttft_ms" ? "TTFT" : "Latency")} />
+            <Line type="monotone" dataKey="avg_ttft_ms" stroke="#3b82f6" strokeWidth={2} dot={false} connectNulls />
+            <Line type="monotone" dataKey="avg_latency_ms" stroke="#f59e0b" strokeWidth={2} dot={false} connectNulls />
+          </LineChart>
         </ChartCard>
 
         {/* Requests by model (stacked) */}
-        <ChartCard title="Requests by model" subtitle="Requests per bucket, stacked by model.">
-          {!modelBuckets.length ? (
-            <Empty loading={loading} />
-          ) : (
-            <BarChart data={modelBuckets}>
-              <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
-              <XAxis dataKey="bucket" tick={{ fontSize: 11 }} tickFormatter={(b) => tickFmt(b, gran)} minTickGap={28} />
-              <YAxis tick={{ fontSize: 11 }} tickFormatter={fmtNum} allowDecimals={false} width={44} />
-              <Tooltip contentStyle={{ fontSize: 12 }} labelFormatter={(l) => fullLabel(String(l))} />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
-              {modelKeys.map((m, i) => (
-                <Bar key={m} dataKey={m} stackId="m" fill={PALETTE[i % PALETTE.length]} />
-              ))}
-            </BarChart>
-          )}
+        <ChartCard title="Requests by model" subtitle="Requests per bucket, stacked by model."
+          empty={!modelBuckets.length} loading={loading}>
+          <BarChart data={modelBuckets}>
+            <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
+            <XAxis dataKey="bucket" tick={{ fontSize: 11 }} tickFormatter={(b) => tickFmt(b, gran)} minTickGap={28} />
+            <YAxis tick={{ fontSize: 11 }} tickFormatter={fmtNum} allowDecimals={false} width={44} />
+            <Tooltip contentStyle={{ fontSize: 12 }} labelFormatter={(l) => fullLabel(String(l))} />
+            <Legend wrapperStyle={{ fontSize: 12 }} />
+            {modelKeys.map((m, i) => (
+              <Bar key={m} dataKey={m} stackId="m" fill={PALETTE[i % PALETTE.length]} />
+            ))}
+          </BarChart>
         </ChartCard>
       </div>
 
       {/* Token volume (prompt vs completion) */}
-      <ChartCard title="Token volume" subtitle="Prompt vs completion tokens per bucket.">
-        {!summary?.by_bucket.length ? (
-          <Empty loading={loading} />
-        ) : (
-          <BarChart data={summary.by_bucket}>
-            <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
-            <XAxis dataKey="bucket" tick={{ fontSize: 11 }} tickFormatter={(b) => tickFmt(b, gran)} minTickGap={28} />
-            <YAxis tick={{ fontSize: 11 }} tickFormatter={fmtNum} width={44} />
-            <Tooltip
-              contentStyle={{ fontSize: 12 }}
-              labelFormatter={(l) => fullLabel(String(l))}
-              formatter={(v, n) => [fmtNum(Number(v)), n === "prompt_tokens" ? "prompt" : "completion"]}
-            />
-            <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => (v === "prompt_tokens" ? "prompt" : "completion")} />
-            <Bar dataKey="prompt_tokens" stackId="t" fill="#3b82f6" />
-            <Bar dataKey="completion_tokens" stackId="t" fill="#a855f7" />
-          </BarChart>
-        )}
+      <ChartCard title="Token volume" subtitle="Prompt vs completion tokens per bucket."
+        empty={!summary?.by_bucket.length} loading={loading}>
+        <BarChart data={summary?.by_bucket ?? []}>
+          <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
+          <XAxis dataKey="bucket" tick={{ fontSize: 11 }} tickFormatter={(b) => tickFmt(b, gran)} minTickGap={28} />
+          <YAxis tick={{ fontSize: 11 }} tickFormatter={fmtNum} width={44} />
+          <Tooltip
+            contentStyle={{ fontSize: 12 }}
+            labelFormatter={(l) => fullLabel(String(l))}
+            formatter={(v, n) => [fmtNum(Number(v)), n === "prompt_tokens" ? "prompt" : "completion"]}
+          />
+          <Legend wrapperStyle={{ fontSize: 12 }} formatter={(v) => (v === "prompt_tokens" ? "prompt" : "completion")} />
+          <Bar dataKey="prompt_tokens" stackId="t" fill="#3b82f6" />
+          <Bar dataKey="completion_tokens" stackId="t" fill="#a855f7" />
+        </BarChart>
+      </ChartCard>
+
+      {/* Token volume by user (stacked) — own full-width row */}
+      <ChartCard title="Token volume by user" subtitle="Total tokens per bucket, stacked by user."
+        empty={!userBuckets.length} loading={loading}>
+        <BarChart data={userBuckets}>
+          <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
+          <XAxis dataKey="bucket" tick={{ fontSize: 11 }} tickFormatter={(b) => tickFmt(b, gran)} minTickGap={28} />
+          <YAxis tick={{ fontSize: 11 }} tickFormatter={fmtNum} width={44} />
+          <Tooltip
+            contentStyle={{ fontSize: 12 }}
+            labelFormatter={(l) => fullLabel(String(l))}
+            formatter={(v, n) => [fmtNum(Number(v)), String(n)]}
+          />
+          <Legend wrapperStyle={{ fontSize: 12 }} />
+          {userKeys.map((u, i) => (
+            <Bar key={u} dataKey={u} stackId="u" fill={PALETTE[i % PALETTE.length]} />
+          ))}
+        </BarChart>
       </ChartCard>
 
       {/* Top users + top models */}
@@ -210,13 +230,19 @@ export function ActivityDashboard() {
   );
 }
 
-function ChartCard({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactElement }) {
+function ChartCard({ title, subtitle, empty, loading, children }: {
+  title: string; subtitle?: string; empty: boolean; loading: boolean; children: React.ReactElement;
+}) {
   return (
     <div className="rounded-lg border bg-card p-4">
       <h2 className="mb-1 text-sm font-semibold">{title}</h2>
       {subtitle && <p className="mb-3 text-xs text-muted-foreground">{subtitle}</p>}
       <div className="h-64">
-        <ResponsiveContainer width="100%" height="100%">{children}</ResponsiveContainer>
+        {empty ? (
+          <Empty loading={loading} />
+        ) : (
+          <ResponsiveContainer width="100%" height="100%">{children}</ResponsiveContainer>
+        )}
       </div>
     </div>
   );

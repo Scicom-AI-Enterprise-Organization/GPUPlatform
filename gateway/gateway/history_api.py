@@ -741,8 +741,8 @@ def _bucket_key(dt: Optional[datetime], tzinfo, gran: str) -> str:
         d = dt.astimezone(tzinfo)
     except Exception:
         d = dt
-    if gran == "minute":
-        return d.strftime("%Y-%m-%dT%H:%M")
+    if gran == "15min":
+        return d.strftime(f"%Y-%m-%dT%H:{(d.minute // 15) * 15:02d}")  # floor to the 15-min mark
     if gran == "day":
         return d.strftime("%Y-%m-%d")
     return d.strftime("%Y-%m-%dT%H:00")  # hour (default)
@@ -755,6 +755,7 @@ class ActivityResponse(BaseModel):
     by_model: list[dict]
     top_users: list[dict]
     by_model_bucket: list[dict]
+    by_user_bucket: list[dict]
     note: str
 
 
@@ -793,7 +794,7 @@ async def history_activity(
     session: AsyncSession = Depends(get_session),
     since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
     tz: str = Query("UTC", description="IANA timezone for bucketing"),
-    granularity: str = Query("hour", pattern="^(minute|hour|day)$", description="time bucket size"),
+    granularity: str = Query("hour", pattern="^(15min|hour|day)$", description="time bucket size"),
     top: int = Query(10, ge=1, le=50, description="how many top users / models to return"),
 ):
     from collections import defaultdict
@@ -807,6 +808,7 @@ async def history_activity(
     by_model = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
     by_user = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
     model_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})
+    user_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})
     ttfts, lats = [], []
     sum_pin = sum_pout = 0
     for (oid, ts, model, _src, pin, pout, ttft, lat) in recs:
@@ -818,6 +820,7 @@ async def history_activity(
         m = by_model[model]; m["requests"] += 1; m["prompt_tokens"] += pin; m["completion_tokens"] += pout
         u = by_user[oid]; u["requests"] += 1; u["prompt_tokens"] += pin; u["completion_tokens"] += pout
         mb = model_bkt[(k, model)]; mb["requests"] += 1; mb["tokens"] += pin + pout
+        ub = user_bkt[(k, oid)]; ub["requests"] += 1; ub["tokens"] += pin + pout
 
     umap = await _user_map(session, list(by_user.keys()))
     top_models = sorted(by_model.items(), key=lambda kv: kv[1]["requests"], reverse=True)[:top]
@@ -828,6 +831,12 @@ async def history_activity(
         mb2[kk]["requests"] += v["requests"]; mb2[kk]["tokens"] += v["tokens"]
     top_user_items = sorted(by_user.items(),
                             key=lambda kv: kv[1]["prompt_tokens"] + kv[1]["completion_tokens"], reverse=True)[:top]
+    # Per-bucket token volume by user — top-N users by total tokens, the rest collapsed to "other".
+    top_oids = {oid for oid, _ in top_user_items}
+    ub2 = defaultdict(lambda: {"requests": 0, "tokens": 0})
+    for (k, oid), v in user_bkt.items():
+        name = _username(umap, oid) if oid in top_oids else "other"
+        ub2[(k, name)]["requests"] += v["requests"]; ub2[(k, name)]["tokens"] += v["tokens"]
 
     def _bo(k, v):
         return {"bucket": k, "requests": v["requests"], "prompt_tokens": v["prompt_tokens"],
@@ -847,6 +856,7 @@ async def history_activity(
         by_model=[{"model": k, **v} for k, v in top_models],
         top_users=[{"user": _username(umap, oid), "owner_id": oid, **v} for oid, v in top_user_items],
         by_model_bucket=[{"bucket": d, "model": m, **vv} for (d, m), vv in sorted(mb2.items())],
+        by_user_bucket=[{"bucket": d, "user": u, **vv} for (d, u), vv in sorted(ub2.items())],
         note=("Unified serverless + LLM-proxy usage. Tokens from vLLM `usage` (include_usage set "
               "on streams). TTFT recorded for streamed requests."
               + (" ⚠ window truncated at the scan cap." if capped else "")))

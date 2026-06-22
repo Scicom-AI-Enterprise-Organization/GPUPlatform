@@ -1359,7 +1359,7 @@ export type TestProxyUpstreamResult = {
 
 
 // ---- Usage activity analytics (the "Activity" dashboard) ----
-export type ActivityGranularity = "minute" | "hour" | "day";
+export type ActivityGranularity = "15min" | "hour" | "day";
 
 export type ActivitySummary = {
   window: { since: string | null; until: string | null; tz: string; granularity: ActivityGranularity };
@@ -1382,6 +1382,7 @@ export type ActivitySummary = {
   by_model: { model: string; requests: number; prompt_tokens: number; completion_tokens: number }[];
   top_users: { user: string; owner_id: number | null; requests: number; prompt_tokens: number; completion_tokens: number }[];
   by_model_bucket: { bucket: string; model: string; requests: number; tokens: number }[];
+  by_user_bucket: { bucket: string; user: string; requests: number; tokens: number }[];
   note: string;
 };
 
