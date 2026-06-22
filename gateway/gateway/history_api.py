@@ -717,3 +717,201 @@ async def history_endpoints(
         note=("Serverless endpoint lifecycle events from the audit log "
               "(status: created|deleted|stopped|purged|restarted; survives endpoint "
               "deletion; visible_devices / member_gpu_indices = CUDA device ids)."))
+
+
+# ── unified usage analytics (the "Activity" dashboard) ───────────────────────
+# Aggregates serverless `requests` + LLM-proxy `proxy_requests` into the cards +
+# charts the Activity page renders: requests, token volume in/out, avg TTFT/latency,
+# top users, usage-by-model (+ per-day stacks). Self-hosted → no $ spend; usage only.
+_ACTIVITY_CAP = 200_000  # max rows scanned per source over the window (memory bound)
+
+
+def _tzinfo(tz: str):
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz)
+    except Exception:
+        return timezone.utc
+
+
+def _day_key(dt: Optional[datetime], tzinfo) -> str:
+    if dt is None:
+        return "?"
+    try:
+        return dt.astimezone(tzinfo).strftime("%Y-%m-%d")
+    except Exception:
+        return dt.strftime("%Y-%m-%d")
+
+
+class ActivityResponse(BaseModel):
+    window: dict
+    totals: dict
+    by_day: list[dict]
+    by_model: list[dict]
+    top_users: list[dict]
+    by_model_day: list[dict]
+    note: str
+
+
+async def _activity_records(session, s_dt, u_dt):
+    """Projected (owner_id, ts, model, source, pin, pout, ttft_ms, latency_ms) rows
+    from both request tables over the window — blobs stay in SQL."""
+    from .proxy_api import ProxyRequest
+    model_col = func.json_extract_path_text(ReqRow.payload, "model").label("model")
+    tin_col = func.json_extract_path_text(ReqRow.output, "usage", "prompt_tokens").label("tin")
+    tout_col = func.json_extract_path_text(ReqRow.output, "usage", "completion_tokens").label("tout")
+    sv = select(ReqRow.owner_id, ReqRow.created_at, ReqRow.completed_at, ReqRow.ttft_ms,
+                ReqRow.status, model_col, tin_col, tout_col).where(ReqRow.created_at >= s_dt)
+    px = select(ProxyRequest).where(ProxyRequest.created_at >= s_dt)
+    if u_dt is not None:
+        sv = sv.where(ReqRow.created_at < u_dt)
+        px = px.where(ProxyRequest.created_at < u_dt)
+    sv_rows = (await session.execute(sv.order_by(ReqRow.created_at.desc()).limit(_ACTIVITY_CAP))).all()
+    px_rows = (await session.execute(px.order_by(ProxyRequest.created_at.desc()).limit(_ACTIVITY_CAP))).scalars().all()
+    recs = []
+    for r in sv_rows:
+        # End-to-end latency (queue + inference). Only for cleanly-completed requests —
+        # cancelled/stuck rows get a completed_at far from created_at and would wreck the avg.
+        lat = (int((r.completed_at - r.created_at).total_seconds() * 1000)
+               if (r.status == "completed" and r.completed_at and r.created_at) else None)
+        recs.append((r.owner_id, r.created_at, (r.model or "(unknown)"), "serverless",
+                     _int(r.tin) or 0, _int(r.tout) or 0, r.ttft_ms, lat))
+    for r in px_rows:
+        recs.append((r.owner_id, r.created_at, (r.model or "(unknown)"), "proxy",
+                     r.prompt_tokens or 0, r.completion_tokens or 0, r.ttft_ms, r.latency_ms))
+    return recs, (len(sv_rows) >= _ACTIVITY_CAP or len(px_rows) >= _ACTIVITY_CAP)
+
+
+@router.get("/activity", response_model=ActivityResponse)
+async def history_activity(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
+    tz: str = Query("UTC", description="IANA timezone for per-day bucketing"),
+    top: int = Query(10, ge=1, le=50, description="how many top users / models to return"),
+):
+    from collections import defaultdict
+    tzinfo = _tzinfo(tz)
+    s_dt = _parse_dt(since, "since") or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_WINDOW_DAYS))
+    u_dt = _parse_dt(until, "until")
+    recs, capped = await _activity_records(session, s_dt, u_dt)
+
+    day = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
+    by_model = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
+    by_user = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
+    model_day = defaultdict(lambda: {"requests": 0, "tokens": 0})
+    ttfts, lats = [], []
+    sum_pin = sum_pout = 0
+    for (oid, ts, model, _src, pin, pout, ttft, lat) in recs:
+        sum_pin += pin; sum_pout += pout
+        if ttft is not None: ttfts.append(ttft)
+        if lat is not None: lats.append(lat)
+        dk = _day_key(ts, tzinfo)
+        for bucket, key in ((day, dk), (by_model, model), (by_user, oid)):
+            b = bucket[key]; b["requests"] += 1; b["prompt_tokens"] += pin; b["completion_tokens"] += pout
+        md = model_day[(dk, model)]; md["requests"] += 1; md["tokens"] += pin + pout
+
+    umap = await _user_map(session, list(by_user.keys()))
+    top_models = sorted(by_model.items(), key=lambda kv: kv[1]["requests"], reverse=True)[:top]
+    top_names = {k for k, _ in top_models}
+    md2 = defaultdict(lambda: {"requests": 0, "tokens": 0})
+    for (dk, mdl), v in model_day.items():
+        kk = (dk, mdl if mdl in top_names else "other")
+        md2[kk]["requests"] += v["requests"]; md2[kk]["tokens"] += v["tokens"]
+    top_user_items = sorted(by_user.items(),
+                            key=lambda kv: kv[1]["prompt_tokens"] + kv[1]["completion_tokens"], reverse=True)[:top]
+    return ActivityResponse(
+        window={"since": _iso(s_dt), "until": _iso(u_dt), "tz": tz},
+        totals={
+            "requests": len(recs), "prompt_tokens": sum_pin, "completion_tokens": sum_pout,
+            "total_tokens": sum_pin + sum_pout,
+            "avg_ttft_ms": int(sum(ttfts) / len(ttfts)) if ttfts else None,
+            "avg_latency_ms": int(sum(lats) / len(lats)) if lats else None,
+        },
+        by_day=[{"day": k, **v} for k, v in sorted(day.items())],
+        by_model=[{"model": k, **v} for k, v in top_models],
+        top_users=[{"user": _username(umap, oid), "owner_id": oid, **v} for oid, v in top_user_items],
+        by_model_day=[{"day": d, "model": m, **vv} for (d, m), vv in sorted(md2.items())],
+        note=("Unified serverless + LLM-proxy usage. Tokens come from vLLM `usage` (the "
+              "proxy sets include_usage so streams count too; serverless streams need it). "
+              "TTFT is recorded for streamed proxy requests; serverless TTFT is a follow-up."
+              + (" ⚠ window truncated at the scan cap." if capped else "")))
+
+
+@router.get("/activity/logs", response_model=HistoryResponse)
+async def history_activity_logs(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
+    user: Optional[str] = _Q_USER, owner_id: Optional[int] = _Q_OWNER,
+    source: Optional[str] = Query(None, description="serverless | proxy (omit = both)"),
+    limit: int = _Q_LIMIT, offset: int = _Q_OFFSET,
+):
+    """Unified per-request log (who / endpoint / model / tokens / ttft / latency / time)
+    merged across serverless + proxy, newest first."""
+    from .proxy_api import ProxyEndpoint, ProxyRequest
+    s_dt = _parse_dt(since, "since") or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_WINDOW_DAYS))
+    u_dt = _parse_dt(until, "until")
+    owner = await _owner_filter(session, user, owner_id)
+    take = offset + limit + 1
+    rows: list[JobRecord] = []
+
+    if source in (None, "serverless"):
+        model_col = func.json_extract_path_text(ReqRow.payload, "model").label("model")
+        tin = func.json_extract_path_text(ReqRow.output, "usage", "prompt_tokens").label("tin")
+        tout = func.json_extract_path_text(ReqRow.output, "usage", "completion_tokens").label("tout")
+        sv = select(ReqRow.request_id, ReqRow.app_id, ReqRow.owner_id, ReqRow.status, ReqRow.is_stream,
+                    ReqRow.created_at, ReqRow.completed_at, ReqRow.ttft_ms, model_col, tin, tout
+                    ).where(ReqRow.created_at >= s_dt)
+        if u_dt is not None:
+            sv = sv.where(ReqRow.created_at < u_dt)
+        if owner is not None:
+            sv = sv.where(ReqRow.owner_id == owner)
+        svr = (await session.execute(sv.order_by(ReqRow.created_at.desc()).limit(take))).all()
+        appmap = {}
+        if svr:
+            for a in (await session.execute(select(App).where(App.app_id.in_({r.app_id for r in svr if r.app_id})))).scalars().all():
+                appmap[a.app_id] = a.name
+        umap_sv = await _user_map(session, [r.owner_id for r in svr])
+        for r in svr:
+            rows.append(JobRecord(
+                kind="serverless", id=r.request_id, name=r.model, owner_id=r.owner_id,
+                user=_username(umap_sv, r.owner_id), status=r.status,
+                created_at=_iso(r.created_at), started_at=None, ended_at=_iso(r.completed_at),
+                duration_s=_duration_s(r.created_at, r.completed_at), error_text=None,
+                detail={"endpoint": appmap.get(r.app_id, r.app_id), "model": r.model, "is_stream": r.is_stream,
+                        "prompt_tokens": _int(r.tin), "completion_tokens": _int(r.tout),
+                        "ttft_ms": r.ttft_ms,
+                        "latency_ms": int(_duration_s(r.created_at, r.completed_at) * 1000) if _duration_s(r.created_at, r.completed_at) is not None else None}))
+
+    if source in (None, "proxy"):
+        px = select(ProxyRequest).where(ProxyRequest.created_at >= s_dt)
+        if u_dt is not None:
+            px = px.where(ProxyRequest.created_at < u_dt)
+        if owner is not None:
+            px = px.where(ProxyRequest.owner_id == owner)
+        pxr = (await session.execute(px.order_by(ProxyRequest.created_at.desc()).limit(take))).scalars().all()
+        epmap = {}
+        if pxr:
+            for e in (await session.execute(select(ProxyEndpoint).where(ProxyEndpoint.id.in_({r.endpoint_id for r in pxr})))).scalars().all():
+                epmap[e.id] = e.name
+        umap_px = await _user_map(session, [r.owner_id for r in pxr])
+        for r in pxr:
+            rows.append(JobRecord(
+                kind="proxy", id=r.id, name=r.model, owner_id=r.owner_id,
+                user=_username(umap_px, r.owner_id), status=r.status,
+                created_at=_iso(r.created_at), started_at=_iso(r.started_at), ended_at=_iso(r.completed_at),
+                duration_s=_duration_s(r.started_at, r.completed_at), error_text=r.error_text,
+                detail={"endpoint": epmap.get(r.endpoint_id, r.endpoint_id), "model": r.model, "upstream": r.upstream,
+                        "is_stream": r.is_stream, "status_code": r.status_code,
+                        "prompt_tokens": r.prompt_tokens, "completion_tokens": r.completion_tokens,
+                        "ttft_ms": r.ttft_ms, "latency_ms": r.latency_ms}))
+
+    rows.sort(key=lambda j: j.created_at or "", reverse=True)
+    page = rows[offset:offset + limit + 1]
+    has_more = len(page) > limit
+    page = page[:limit]
+    return HistoryResponse(
+        kind="activity-logs", count=len(page), has_more=has_more,
+        window={"since": _iso(s_dt), "until": _iso(u_dt)}, jobs=page,
+        note="Unified per-request usage log across serverless + LLM-proxy (newest first).")

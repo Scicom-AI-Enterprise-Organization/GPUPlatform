@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, Package, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
+import { Activity, BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, Package, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ScicomLogo } from "@/components/scicom-logo";
 import { useSidebarState } from "./sidebar-state";
@@ -35,6 +35,7 @@ const ACCOUNT: Item[] = [
   { label: "Settings", href: "/settings", icon: Settings },
 ];
 const ADMIN: Item[] = [
+  { label: "Activity", href: "/activity", icon: Activity },
   { label: "Analytics", href: "/admin/analytics", icon: BarChart3 },
   { label: "GitOps", href: "/gitops", icon: GitBranch },
   { label: "Organization", href: "/organization", icon: Users },

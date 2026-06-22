@@ -87,6 +87,7 @@ class ProxyRequest(Base):
     is_stream: Mapped[bool] = mapped_column(Boolean, default=False)
     status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    ttft_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # time-to-first-token (stream)
     prompt_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     error_text: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
@@ -380,7 +381,7 @@ async def _set_started(request_id: str, upstream: Optional[str] = None) -> None:
 async def _finish(request_id: str, status: str, *, status_code: Optional[int] = None,
                   latency_ms: Optional[int] = None, pt: Optional[int] = None,
                   ct: Optional[int] = None, error: Optional[str] = None,
-                  upstream: Optional[str] = None) -> None:
+                  upstream: Optional[str] = None, ttft_ms: Optional[int] = None) -> None:
     async with session_factory()() as s:
         row = await s.get(ProxyRequest, request_id)
         if row is None:
@@ -390,6 +391,8 @@ async def _finish(request_id: str, status: str, *, status_code: Optional[int] = 
             row.status_code = status_code
         if latency_ms is not None:
             row.latency_ms = latency_ms
+        if ttft_ms is not None:
+            row.ttft_ms = ttft_ms
         if pt is not None:
             row.prompt_tokens = pt
         if ct is not None:
@@ -579,6 +582,9 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
         last_err = "no upstream"
         for u in candidates:
             body = {**payload, "model": u["models"][alias], "stream": True}
+            # Ask for a final usage chunk so streamed requests record token counts too
+            # (vLLM/OpenAI emit it last when include_usage=true). Don't clobber a caller's.
+            body.setdefault("stream_options", {"include_usage": True})
             headers = {"Content-Type": "application/json"}
             if u.get("_key"):
                 headers["Authorization"] = f"Bearer {u['_key']}"
@@ -596,12 +602,41 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
                         live[request_id]["upstream"] = u["name"]
                     await _set_started(request_id, upstream=u["name"])
                     sent_any = False
+                    ttft_ms: Optional[int] = None
+                    pt = ct = None
+                    usage_buf = ""
                     try:
                         async for chunk in r.aiter_bytes():
                             if cancel_ev.is_set():
                                 break
-                            sent_any = True
+                            if not sent_any:
+                                sent_any = True
+                                ttft_ms = int((time.perf_counter() - t0) * 1000)  # time-to-first-token
                             yield chunk
+                            # Light usage scan — the `"usage"` substring guard keeps the
+                            # JSON parser off content chunks; only the final usage frame hits it.
+                            try:
+                                usage_buf += chunk.decode("utf-8", "ignore")
+                                while "\n\n" in usage_buf:
+                                    frame, usage_buf = usage_buf.split("\n\n", 1)
+                                    if '"usage"' not in frame:
+                                        continue
+                                    for ln in frame.split("\n"):
+                                        if not ln.startswith("data:"):
+                                            continue
+                                        d = ln[5:].strip()
+                                        if not d or d == "[DONE]":
+                                            continue
+                                        try:
+                                            us = json.loads(d).get("usage") or {}
+                                            if us.get("prompt_tokens") is not None:
+                                                pt = us["prompt_tokens"]
+                                            if us.get("completion_tokens") is not None:
+                                                ct = us["completion_tokens"]
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
                     except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
                         # Upstream dropped the socket mid-stream (GPU node cold-start /
                         # recycle / overload → httpx "incomplete chunked read"). It's an
@@ -617,12 +652,13 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
                         finished = True
                         await _finish(request_id, "completed", status_code=r.status_code,
                                       latency_ms=int((time.perf_counter() - t0) * 1000),
-                                      upstream=u["name"],
+                                      ttft_ms=ttft_ms, pt=pt, ct=ct, upstream=u["name"],
                                       error=f"upstream closed mid-stream: {type(e).__name__}")
                         return
                     finished = True
                     await _finish(request_id, "completed", status_code=r.status_code,
-                                  latency_ms=int((time.perf_counter() - t0) * 1000), upstream=u["name"])
+                                  latency_ms=int((time.perf_counter() - t0) * 1000),
+                                  ttft_ms=ttft_ms, pt=pt, ct=ct, upstream=u["name"])
                     return
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 _mark_health(app, endpoint_id, u["id"], False, error=str(e))

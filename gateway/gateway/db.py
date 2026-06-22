@@ -559,6 +559,10 @@ class Request(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Time-to-first-token (ms): wall time from dispatch to the first streamed content
+    # chunk reaching the gateway. Captured by the stream relay; NULL for non-stream /
+    # failed / pre-upgrade rows. Total latency is (completed_at - created_at).
+    ttft_ms: Mapped[Optional[int]] = mapped_column(nullable=True)
 
 
 class ApiKey(Base):
@@ -650,6 +654,14 @@ async def init_db() -> None:
         # use the data plane. Existing rows stay private/admin-only.
         await conn.execute(text(
             "ALTER TABLE proxy_endpoints ADD COLUMN IF NOT EXISTS public BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        # Time-to-first-token (ms) for the usage/activity analytics — recorded by the
+        # streaming relays (serverless requests + proxy_requests).
+        await conn.execute(text(
+            "ALTER TABLE requests ADD COLUMN IF NOT EXISTS ttft_ms INTEGER"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE proxy_requests ADD COLUMN IF NOT EXISTS ttft_ms INTEGER"
         ))
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_args VARCHAR(2048) NOT NULL DEFAULT ''"

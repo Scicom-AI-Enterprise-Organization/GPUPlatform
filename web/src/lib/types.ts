@@ -736,6 +736,7 @@ export type DatasetKind =
   | "hf"
   | "label"
   | "tts_packed"
+  | "omnivoice_packed" // {audio,text} Higgs-codec → OmniVoice WebDataset shards (Pack for OmniVoice)
   | "hosted"
   | "llm"
   | "llm_packed";
@@ -867,6 +868,26 @@ export type TtsPackRequest = {
   venv_path?: string | null; // isolated uv venv for the NeuCodec/TTS deps
   // RunPod pod knobs (ignored for a VM provider)
   gpu_type?: string;
+  secure_cloud?: boolean;
+  disk_gb?: number;
+  volume_gb?: number;
+};
+
+// Higgs-codec tokenize an {audio,text} dataset into OmniVoice WebDataset shards
+// (kind=omnivoice_packed) on a GPU. Mirrors the gateway OmnivoicePackRequest.
+export type OmnivoicePackRequest = {
+  provider_id?: string | null;
+  storage_id: string;
+  tokenizer?: string | null;          // Higgs codec
+  default_language?: string | null;   // language_id when the dataset has no language column
+  language_field?: string | null;     // dataset column holding per-row language_id
+  eval_test_per_speaker?: number;
+  gpu_count?: number;
+  visible_devices?: string | null;
+  venv_path?: string | null;          // null → /share/autotrain-omnivoice
+  // RunPod pod knobs (OmniVoice needs CUDA 12.8)
+  gpu_type?: string;
+  image?: string | null;
   secure_cloud?: boolean;
   disk_gb?: number;
   volume_gb?: number;
@@ -1336,3 +1357,50 @@ export type TestProxyUpstreamResult = {
   models: string[];
 };
 
+
+// ---- Usage activity analytics (the "Activity" dashboard) ----
+export type ActivitySummary = {
+  window: { since: string | null; until: string | null; tz: string };
+  totals: {
+    requests: number;
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    avg_ttft_ms: number | null;
+    avg_latency_ms: number | null;
+  };
+  by_day: { day: string; requests: number; prompt_tokens: number; completion_tokens: number }[];
+  by_model: { model: string; requests: number; prompt_tokens: number; completion_tokens: number }[];
+  top_users: { user: string; owner_id: number | null; requests: number; prompt_tokens: number; completion_tokens: number }[];
+  by_model_day: { day: string; model: string; requests: number; tokens: number }[];
+  note: string;
+};
+
+export type ActivityLogRow = {
+  kind: string;
+  id: string;
+  name: string | null;
+  user: string;
+  status: string;
+  created_at: string | null;
+  ended_at: string | null;
+  duration_s: number | null;
+  detail: {
+    endpoint?: string;
+    model?: string | null;
+    upstream?: string | null;
+    is_stream?: boolean;
+    status_code?: number | null;
+    prompt_tokens?: number | null;
+    completion_tokens?: number | null;
+    ttft_ms?: number | null;
+    latency_ms?: number | null;
+  };
+};
+
+export type ActivityLogsResponse = {
+  kind: string;
+  count: number;
+  has_more: boolean;
+  jobs: ActivityLogRow[];
+};

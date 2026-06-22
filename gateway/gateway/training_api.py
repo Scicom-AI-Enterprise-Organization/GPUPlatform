@@ -238,6 +238,17 @@ def _llm_arch(model_id: Optional[str]) -> str:
     return "gemma"
 
 
+def _tts_arch(model_id: Optional[str]) -> str:
+    """omnivoice | qwen3 from a TTS base model id. OmniVoice (k2-fsa/OmniVoice or
+    a Scicom omnivoice repo) uses a different trainer + codec + packed format than
+    the default Qwen3+NeuCodec path. Drives the per-arch venv, trainer ship, and
+    packed-dataset kind. Unknown → qwen3 (the historical default)."""
+    n = (model_id or "").lower()
+    if "omnivoice" in n:
+        return "omnivoice"
+    return "qwen3"
+
+
 async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str] = None) -> dict:
     """Turn a Dataset row into the trainer's dataset spec, with creds inlined."""
     label_token = None
@@ -298,6 +309,19 @@ async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str
         return {
             "kind": "tts_packed",
             "packed_uri": ds.s3_metadata_uri,
+            "region": creds["region"], "endpoint": creds["endpoint"],
+            "access_key": creds["access_key"], "secret_key": creds["secret_key"],
+        }
+    if ds.kind == "omnivoice_packed":
+        # Pre-packed OmniVoice tokens (Higgs WebDataset shards + manifests):
+        # s3_metadata_uri is the shards prefix. omnivoice_finetune downloads it
+        # → ./tokens and trains directly (skips manifests + Higgs tokenization).
+        return {
+            "kind": "omnivoice_packed",
+            "packed_uri": ds.s3_metadata_uri,
+            # The Higgs audio codec recorded at pack time — the orchestrator bundles
+            # THIS (not the LM base model) into the clean checkpoint's audio_tokenizer/.
+            "higgs_tokenizer": ((ds.split_fields or {}).get("_omnivoice_pack") or {}).get("tokenizer"),
             "region": creds["region"], "endpoint": creds["endpoint"],
             "access_key": creds["access_key"], "secret_key": creds["secret_key"],
         }
@@ -665,27 +689,48 @@ async def _finish_tts_pack(run_id: str, cfg: dict, packed: dict) -> str:
     src_id = cfg.get("pack_source_dataset_id")
     new_id = "ds-" + os.urandom(4).hex()
     splits = packed.get("splits") or {}  # {split: record_count}
+    # OmniVoice packs to Higgs-codec WebDataset shards (format="omnivoice"), a
+    # different kind than the NeuCodec ChiniDataset path.
+    is_omni = (packed.get("format") == "omnivoice") or _tts_arch(cfg.get("base_model")) == "omnivoice"
     async with session_factory()() as s:
         src = await s.get(Dataset, src_id) if src_id else None
         run = await s.get(TrainingRun, run_id)
         base = (src.name if src else (run_id if run else src_id)) or run_id
-        ds = Dataset(
-            id=new_id,
-            owner_id=(src.owner_id if src else run.owner_id),
-            name=(f"{base}-tts-packed")[:255],
-            description=(f"NeuCodec + multipack (seq_len {packed.get('sequence_length')}, "
-                         f"tokenizer {packed.get('tokenizer')}, splits {list(splits) or ['(flat)']}) "
-                         f"of {base}")[:2048],
-            kind="tts_packed",
-            format="chinidataset",  # multipacked NeuCodec layout (ChiniDataset parquet shards)
-            storage_id=(run.storage_id if run else (src.storage_id if src else None)),
-            s3_metadata_uri=packed.get("s3_uri"),
-            num_rows=packed.get("samples"),
-            audio_field="audio", transcription_field="text",
-            split_fields={"_tts_pack": {"tokenizer": packed.get("tokenizer"),
-                                        "sequence_length": packed.get("sequence_length"),
-                                        "splits": splits}},
-        )
+        if is_omni:
+            ds = Dataset(
+                id=new_id,
+                owner_id=(src.owner_id if src else run.owner_id),
+                name=(f"{base}-omnivoice-packed")[:255],
+                description=(f"OmniVoice Higgs-codec WebDataset shards (tokenizer "
+                             f"{packed.get('tokenizer')}, splits {list(splits) or ['(flat)']}) "
+                             f"of {base}")[:2048],
+                kind="omnivoice_packed",
+                format="webdataset",
+                storage_id=(run.storage_id if run else (src.storage_id if src else None)),
+                s3_metadata_uri=packed.get("s3_uri"),
+                num_rows=packed.get("samples"),
+                audio_field="audio", transcription_field="text",
+                split_fields={"_omnivoice_pack": {"tokenizer": packed.get("tokenizer"),
+                                                   "splits": splits}},
+            )
+        else:
+            ds = Dataset(
+                id=new_id,
+                owner_id=(src.owner_id if src else run.owner_id),
+                name=(f"{base}-tts-packed")[:255],
+                description=(f"NeuCodec + multipack (seq_len {packed.get('sequence_length')}, "
+                             f"tokenizer {packed.get('tokenizer')}, splits {list(splits) or ['(flat)']}) "
+                             f"of {base}")[:2048],
+                kind="tts_packed",
+                format="chinidataset",  # multipacked NeuCodec layout (ChiniDataset parquet shards)
+                storage_id=(run.storage_id if run else (src.storage_id if src else None)),
+                s3_metadata_uri=packed.get("s3_uri"),
+                num_rows=packed.get("samples"),
+                audio_field="audio", transcription_field="text",
+                split_fields={"_tts_pack": {"tokenizer": packed.get("tokenizer"),
+                                            "sequence_length": packed.get("sequence_length"),
+                                            "splits": splits}},
+            )
         s.add(ds)
         await s.commit()
     return new_id
@@ -1277,7 +1322,11 @@ async def run_training(redis, run_id: str) -> None:
             # import crashes outside each range) → SEPARATE venvs per arch.
             _default_venv = f"/share/autotrain-llm-{_llm_arch(cfg.get('base_model'))}"
         elif task_type == "tts":
-            _default_venv = "/share/autotrain-tts"
+            # OmniVoice (torch 2.8/cu128 + its own repo) gets a SEPARATE venv from
+            # the Qwen3+NeuCodec TTS stack (cu13/2.9). Selected by base model.
+            _default_venv = ("/share/autotrain-omnivoice"
+                             if _tts_arch(cfg.get("base_model")) == "omnivoice"
+                             else "/share/autotrain-tts")
         else:
             _default_venv = "/share/autotrain-whisper"
         venv_path = (cfg.get("venv_path") or _default_venv).rstrip("/")
@@ -1318,7 +1367,16 @@ async def run_training(redis, run_id: str) -> None:
             remote_cfg = f"{stage}/config.json"
             await asyncio.to_thread(_ssh_put, cli, str(cfg_path), remote_cfg)
             base = _trainer_script_path().parent  # gateway/gateway/training/
-            if task_type == "tts":
+            if task_type == "tts" and _tts_arch(cfg.get("base_model")) == "omnivoice":
+                # OmniVoice: its own orchestrator + vendored omnivoice/ scripts. It
+                # imports build_dataset + S3 helpers from tts_finetune.py, so ship
+                # that sibling too (its module imports are light — no NeuCodec at
+                # import time; the tts/ dir isn't needed for omnivoice).
+                await asyncio.to_thread(_ssh_put, cli, str(base / "omnivoice_finetune.py"), f"{stage}/omnivoice_finetune.py")
+                await asyncio.to_thread(_ssh_put, cli, str(base / "tts_finetune.py"), f"{stage}/tts_finetune.py")
+                await asyncio.to_thread(_ssh_put_dir_tar, cli, str(base / "omnivoice"), f"{stage}/omnivoice")
+                worker_remote = f"{stage}/omnivoice_finetune.py"
+            elif task_type == "tts":
                 await asyncio.to_thread(_ssh_put, cli, str(base / "tts_finetune.py"), f"{stage}/tts_finetune.py")
                 # The tts/ dir carries the vendored chinidataset package + the
                 # convert/pack/train scripts; ship it as a sibling of the worker.
@@ -1831,6 +1889,13 @@ class CreateTrainingRunRequest(BaseModel):
     # gen + NeuCodec-decode + scorer pass dominates a short run, so a small count
     # keeps debug runs fast. Default 64.
     eval_max_samples: int = 64
+    # OmniVoice-only knobs (base model = k2-fsa/OmniVoice). language_id tagging for
+    # the Higgs manifests + the held-out eval split + trainer attn/batch.
+    default_language: Optional[str] = "en"     # language_id when no per-row field
+    language_field: Optional[str] = None       # dataset column holding language_id
+    eval_test_per_speaker: int = 25            # held-out test clips/speaker (no explicit test split)
+    attn_implementation: Optional[str] = "flex_attention"  # set "sdpa" if flex_attention won't build
+    batch_tokens: Optional[int] = None         # OmniVoice token-packing batch budget (default 8192)
     # TTS-only: after a successful run, synthesize N clips from the trained model
     # and auto-create a Label-platform *recording* project (with MOS rating) seeded
     # with them, for human listening / MOS. Texts come from the held-out test split
@@ -2033,18 +2098,29 @@ async def create_training_run(
     # transcription, speaker} source to PRODUCE the packed dataset, so it must
     # not require kind=tts_packed (that would make 'Pack for TTS' reject itself).
     if body.task_type == "tts" and not body.pack_only:
-        if ds.kind != "tts_packed":
-            raise HTTPException(
-                status_code=400,
-                detail="TTS training needs a packed dataset (kind=tts_packed) — pack it first via 'Pack for TTS'",
-            )
-        if tds is not None and tds.kind != "tts_packed":
-            raise HTTPException(status_code=400, detail="TTS test dataset must also be packed (kind=tts_packed)")
-        # block size follows the packed dataset's sequence_length.
-        _pack_meta = (ds.split_fields or {}).get("_tts_pack") or {}
-        _seq = _pack_meta.get("sequence_length")
-        if _seq:
-            body.block_size = int(_seq)
+        # OmniVoice consumes its own Higgs WebDataset shards (kind=omnivoice_packed);
+        # the Qwen3+NeuCodec path consumes kind=tts_packed.
+        if _tts_arch(body.base_model) == "omnivoice":
+            if ds.kind != "omnivoice_packed":
+                raise HTTPException(
+                    status_code=400,
+                    detail="OmniVoice training needs a kind=omnivoice_packed dataset — pack it first via 'Pack for OmniVoice'",
+                )
+            if tds is not None and tds.kind != "omnivoice_packed":
+                raise HTTPException(status_code=400, detail="OmniVoice test dataset must also be kind=omnivoice_packed")
+        else:
+            if ds.kind != "tts_packed":
+                raise HTTPException(
+                    status_code=400,
+                    detail="TTS training needs a packed dataset (kind=tts_packed) — pack it first via 'Pack for TTS'",
+                )
+            if tds is not None and tds.kind != "tts_packed":
+                raise HTTPException(status_code=400, detail="TTS test dataset must also be packed (kind=tts_packed)")
+            # block size follows the packed dataset's sequence_length.
+            _pack_meta = (ds.split_fields or {}).get("_tts_pack") or {}
+            _seq = _pack_meta.get("sequence_length")
+            if _seq:
+                body.block_size = int(_seq)
         # the trainer tokenizes with the base model's tokenizer; record it.
         body.tokenizer = body.base_model
     if body.task_type == "llm":
@@ -2163,6 +2239,13 @@ async def create_training_run(
         "augment_prob": body.augment_prob,
         "eval_methods": [m for m in (body.eval_methods or []) if m in _TTS_EVAL_METHODS],
         "eval_max_samples": body.eval_max_samples,
+        # OmniVoice (kind=omnivoice_packed) knobs — language tagging + eval split +
+        # trainer attn/batch. No-ops for the Qwen3+NeuCodec TTS path.
+        "default_language": (body.default_language or "en"),
+        "language_field": (body.language_field or None),
+        "eval_test_per_speaker": int(body.eval_test_per_speaker or 25),
+        "attn_implementation": (body.attn_implementation or "flex_attention"),
+        "batch_tokens": body.batch_tokens,
         # Post-train Label-platform export (TTS only). The token is stored Fernet-
         # encrypted (label_token_enc) like the kind=label dataset's — never raw.
         "label_export": bool(body.label_export and body.task_type == "tts"),

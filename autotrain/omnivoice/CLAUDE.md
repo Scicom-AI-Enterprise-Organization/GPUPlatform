@@ -76,13 +76,24 @@ batch**, so it's launch/overhead+memory-bound (0.6B model × 32 steps × CFG = m
 **Served-output CER = 0.243 == offline 0.247** → batching/bucketing **preserve quality** (verified by feeding
 the server's audio back through Whisper).
 
-**Continuous-batching for a diffusion TTS** (fixed 32 steps, no AR early-exit → padding is *spatial*, not temporal):
-(1) length bucketing [shipped]; (2) **varlen/packed attention** — the *training* forward already does this via
-`document_ids`+`create_block_mask`/flex_attention; reuse for zero-pad inference; (3) uniform-chunk + step-level
-admit/retire = true continuous batching. **Further speedups** (not yet done): `torch.compile(reduce-overhead)` =
-CUDA graphs over fixed bucket shapes (biggest small-batch win); `num_step` 32→16 (~2×, price the CER cost);
-prefix-KV reuse across steps; multi-stream overlap of codec-decode with the next batch's diffusion; **data-parallel
-replicas** (one per GPU, linear) for real scale-out.
+**Optimization campaign** (every config gated on served-CER + MOS; `opt_bench.sh` + `opt_round2.sh` + `score_dirs.py`):
+
+| num_step | CER ↓ | MOS ↑ | rps @c32 | RTF | verdict |
+|---|---|---|---|---|---|
+| 32 (orig) | 0.2445 | 2.997 | 3.5 | 33× | baseline |
+| 24 | 0.2439 | 2.939 | 5.4 | 52× | ok |
+| **16 (default)** | 0.2454 | 2.953 | **6.84** | **65×** | **~2× speed, no accuracy drop** |
+| 12 | 0.2441 | 2.947 | 6.73 | 65× | no extra speed |
+| 8 | 0.2509 ↑ | 2.888 ↓ | 7.76 | 75× | rejected (CER+MOS drop) |
+
+→ **`num_step=16` is the optimized default** (baked into `serve.py`): **2× throughput at flat CER + ~flat MOS**.
+Below 16 the diffusion loop stops being the bottleneck (decode/encode/batching floor) so speed plateaus; at 8 quality
+drops. **`torch.compile(reduce-overhead)`** (CUDA graphs) adds only ~9% @c32 and *hurts* single-request latency
+(0.55→0.97s) because varying seq-len causes per-shape graph **recapture** — so it's opt-in (`OV_COMPILE=1`) and needs
+**fixed-shape buckets** to pay off cleanly. Remaining levers (not done): fixed-length-grid CUDA graphs; **varlen/packed
+attention** (zero padding — the *training* forward already has the `document_ids`+`create_block_mask`/flex_attention
+machinery); uniform-chunk + step-level admit/retire (true continuous batching); prefix-KV reuse across steps; fp8 (gate
+on CER); **data-parallel replicas** (one per GPU, linear) for scale-out beyond the single-GPU ~2× ceiling.
 
 ## RunPod recipe (1× H100, US)
 Keys from `../.env` (`RUNPOD_API_KEY`, `HF_TOKEN`). Hard rules: `--country-code US`, work under `/root/...`
@@ -90,7 +101,11 @@ Keys from `../.env` (`RUNPOD_API_KEY`, `HF_TOKEN`). Hard rules: `--country-code 
 - Image **`runpod/pytorch:1.0.7-cu1281-torch280-ubuntu2404`** (OmniVoice pins **torch 2.8 + cu128** — NOT the
   cu13/torch-2.12 + FA3 image the gemma4/MoE siblings use). pip needs **`--break-system-packages`** (PEP-668).
 - `export HF_HUB_DISABLE_XET=1` (see Gotchas). Run long stages under **tmux/nohup** ("patient").
-- **Always `runpodctl pod delete <id>`** when done — real billing (~$3.3/hr H100).
+- **Always `runpodctl pod delete <id>`** when done — real billing (~$3.3/hr H100). This job names its pods
+  `omnivoice-*` (ft / ft20 / ab / samples / serve / opt); delete each when its stage finishes.
+- **Pod hygiene**: `runpodctl pod list` shows **all** account pods, including unrelated ones
+  (`sgpu-train-*`, `neucodec-*`, `aura-*`, …). Only delete pods you created (the `omnivoice-*` ones) — don't
+  touch others' running jobs. After a full session, `runpodctl pod list | grep omnivoice` should be empty.
 - SSH endpoint: `runpodctl pod create ... --ports "22/tcp"`, then GraphQL `pod(...).runtime.ports` for the
   public ip:port (or `runpodctl get pod -a`); key is `~/.ssh/id_rsa`.
 
@@ -117,6 +132,7 @@ Keys from `../.env` (`RUNPOD_API_KEY`, `HF_TOKEN`). Hard rules: `--country-code 
 `prepare_data.py` · `tokenize_audio.py` · `count_steps.py` · `train_config.json` · `data_config.json` ·
 `make_clean_checkpoint.py` · `tts_eval.py` · `run.sh` (stages 0–8) · `ab_eval.py` + `ab.sh` (base-vs-FT A/B) ·
 `make_samples.py` + `sample.sh` (demo `samples/`) · `serve.py` + `bench_serve.py` + `serve_client.py` +
-`serve_bench.sh` (OpenAI server + H100 benchmark). Result JSONs (`eval_results.json`, `ab_results.json`,
-`bench_*.json`, `served_cer.json`) are produced on the pod; headline numbers are above. `samples/` (committed
+`serve_bench.sh` (OpenAI server + H100 benchmark) · `opt_bench.sh` + `opt_round2.sh` + `score_dirs.py`
+(speed-vs-CER/MOS optimization sweep). Result JSONs (`eval_results.json`, `ab_results.json`,
+`bench_*.json`, `served_cer.json`, `opt/*.json`) are produced on the pod; headline numbers are above. `samples/` (committed
 demo audio) holds 5 synthesized clips + 1 reference per speaker.

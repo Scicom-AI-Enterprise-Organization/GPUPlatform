@@ -40,6 +40,7 @@ import type {
   UpdateDatasetRequest,
   TransformDatasetRequest,
   TtsPackRequest,
+  OmnivoicePackRequest,
   LlmPackRequest,
   DatasetRecord,
   DatasetPreview,
@@ -80,6 +81,8 @@ import type {
   UpdateProxyBody,
   TestProxyUpstreamBody,
   TestProxyUpstreamResult,
+  ActivitySummary,
+  ActivityLogsResponse,
 } from "./types";
 
 export type GpuAvailability = {
@@ -699,6 +702,22 @@ export const gateway = {
     request<{ ok: boolean; id: string }>(`/v1/proxy/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getProxyHealth: (id: string) =>
     request<ProxyUpstreamHealth[]>(`/v1/proxy/${encodeURIComponent(id)}/health`),
+  // ---- usage activity analytics (admin) ----
+  getActivity: (params: { since?: string; until?: string; tz?: string; top?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.since) q.set("since", params.since);
+    if (params.until) q.set("until", params.until);
+    if (params.tz) q.set("tz", params.tz);
+    if (params.top != null) q.set("top", String(params.top));
+    const s = q.toString();
+    return request<ActivitySummary>(`/v1/history/activity${s ? `?${s}` : ""}`);
+  },
+  getActivityLogs: (params: { since?: string; until?: string; user?: string; source?: string; limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v != null && v !== "") q.set(k, String(v));
+    const s = q.toString();
+    return request<ActivityLogsResponse>(`/v1/history/activity/logs${s ? `?${s}` : ""}`);
+  },
   getProxyRequests: (id: string, limit = 50) =>
     request<ProxyRequest[]>(`/v1/proxy/${encodeURIComponent(id)}/requests?limit=${limit}`),
   cancelProxyRequest: (id: string, reqId: string) =>
@@ -836,6 +855,13 @@ export const gateway = {
   // poll getDataset(id).transform_status / transform_log.
   packTtsDataset: (id: string, body: TtsPackRequest) =>
     request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/pack-tts`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // Higgs-codec tokenize an {audio,text} dataset into OmniVoice WebDataset shards
+  // (kind=omnivoice_packed) on a GPU box. Poll getDataset(id).transform_status.
+  packOmnivoiceDataset: (id: string, body: OmnivoicePackRequest) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/pack-omnivoice`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

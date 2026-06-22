@@ -18,7 +18,9 @@ similarity to the target TM voices** (+0.05). Served-output CER = **0.243 == off
 batched serving path preserves quality.
 
 **Serving** (`/v1/audio/speech`, dynamic batching + length bucketing): **2.0 → 3.5 rps** mixed-length
-(1.75×), **5.6 rps** uniform (2.8×, single-GPU ceiling — H100 is overhead/compute-bound at small batch).
+(1.75×), **5.6 rps** uniform (2.8×, single-GPU ceiling). **Optimization** (gated on CER+MOS): `num_step`
+32→**16** gives **~2× more (6.84 rps @c32, RTF 65×)** at flat CER (0.245) + ~flat MOS — the optimized
+default. Below 16 plateaus; at 8 quality drops. Scale-out beyond ~2× = data-parallel replicas (linear).
 
 ## Files
 | file | role |
@@ -34,6 +36,7 @@ batched serving path preserves quality.
 | `make_samples.py` / `sample.sh` | per-speaker demo `samples/` (1 reference + 5 synthesized) |
 | `serve.py` | OpenAI `/v1/audio/speech` server (cached voices, dynamic batching, length bucketing) |
 | `bench_serve.py` / `serve_client.py` / `serve_bench.sh` | concurrency benchmark + served-CER verifier |
+| `opt_bench.sh` / `opt_round2.sh` / `score_dirs.py` | optimization sweep: compile/num_step vs CER+MOS (→ `num_step=16`) |
 | `samples/` | committed demo audio (5 clips + 1 reference per speaker) |
 
 ## Run (RunPod 1× H100, image `runpod/pytorch:1.0.7-cu1281-torch280-ubuntu2404`)
@@ -50,5 +53,7 @@ OV_MODEL=Scicom-intl/omnivoice-tmvoice OV_VOICES=voices.json OV_MAX_BATCH=32 pyt
 curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
   -d '{"input":"Hello from TM-Voice.","voice":"tm_english","response_format":"wav"}' -o out.wav
 ```
-Pip needs `--break-system-packages` on the pod. **Always `runpodctl pod delete <id>`** when done.
+Pip needs `--break-system-packages` on the pod. **Always `runpodctl pod delete <id>`** when done — this job
+names pods `omnivoice-*`; `runpodctl pod list | grep omnivoice` should be empty after a session (don't delete
+unrelated pods the list may show).
 See `CLAUDE.md` for the design, accuracy details, serving/parallelization, and gotchas (esp. the Xet stall).

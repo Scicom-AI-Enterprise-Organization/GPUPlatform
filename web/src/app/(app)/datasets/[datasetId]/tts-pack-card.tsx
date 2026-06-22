@@ -81,26 +81,32 @@ export function TtsPackCard({
   initialStatus,
   initialLog,
   bare = false,
+  variant = "tts",
 }: {
   datasetId: string;
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
   bare?: boolean;
+  // "tts" = NeuCodec → ChiniDataset (tts_packed). "omnivoice" = Higgs codec →
+  // WebDataset shards (omnivoice_packed) for an OmniVoice finetune.
+  variant?: "tts" | "omnivoice";
 }) {
+  const isOmni = variant === "omnivoice";
   const router = useRouter();
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [storageId, setStorageId] = useState(s3Storages[0]?.id ?? "");
   const [seqLen, setSeqLen] = useState(4096);
-  // Isolated uv venv for the NeuCodec/TTS deps (mirrors Autotrain). Reused +
-  // cached across packs. Dedicated to NeuCodec by default.
-  const [venvPath, setVenvPath] = useState("/share/neucodec-tts");
+  const [lang, setLang] = useState("en");  // OmniVoice: default language_id when no per-row column
+  // Isolated uv venv for the codec/TTS deps (mirrors Autotrain). Reused + cached
+  // across packs. OmniVoice (torch 2.8/cu128) gets its own venv.
+  const [venvPath, setVenvPath] = useState(isOmni ? "/share/autotrain-omnivoice" : "/share/neucodec-tts");
 
   // Run-on (pod card)
   const [target, setTarget] = useState<"cloud" | "vm">("cloud");
   const [vmProviderId, setVmProviderId] = useState("");
   const [runpodProviderId, setRunpodProviderId] = useState("");
-  const [gpuType, setGpuType] = useState("NVIDIA L40S");
+  const [gpuType, setGpuType] = useState(isOmni ? "NVIDIA H100 80GB HBM3" : "NVIDIA L40S");
   const [gpuCount, setGpuCount] = useState(1);
   const [secureCloud, setSecureCloud] = useState(true);
   const [diskGb, setDiskGb] = useState(60);
@@ -206,10 +212,9 @@ export function TtsPackCard({
     const vd = visibleDevices.trim();
     setStarting(true);
     try {
-      const d = await gateway.packTtsDataset(datasetId, {
+      const common = {
         provider_id: target === "vm" ? vmProviderId : runpodProviderId || null,
         storage_id: storageId,
-        sequence_length: seqLen,
         venv_path: venvPath.trim() || null,
         gpu_count: gpuCount,
         gpu_type: gpuType,
@@ -217,7 +222,10 @@ export function TtsPackCard({
         disk_gb: diskGb,
         volume_gb: volumeGb,
         visible_devices: vd || null,
-      });
+      };
+      const d = isOmni
+        ? await gateway.packOmnivoiceDataset(datasetId, { ...common, default_language: lang.trim() || "en" })
+        : await gateway.packTtsDataset(datasetId, { ...common, sequence_length: seqLen });
       setStatus(d.transform_status ?? "running");
       setLog(d.transform_log ?? null);
     } catch (e) {
@@ -255,7 +263,13 @@ export function TtsPackCard({
     if (running && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [log, running]);
 
-  const desc = (
+  const desc = isOmni ? (
+    <span className="text-xs text-muted-foreground">
+      Encode the audio to <span className="font-mono">Higgs</span> codec tokens and write{" "}
+      <span className="font-mono">WebDataset</span> shards + manifests, then upload to S3. OmniVoice training
+      consumes the packed dataset directly (skips Higgs tokenization per run).
+    </span>
+  ) : (
     <span className="text-xs text-muted-foreground">
       Encode the audio to <span className="font-mono">NeuCodec</span> speech tokens and multipack into a{" "}
       <span className="font-mono">ChiniDataset</span> (sequence length {seqLen}), then upload the shards to S3.
@@ -388,10 +402,22 @@ export function TtsPackCard({
             </SelectContent>
           </Select>
         </div>
-        <div className="space-y-1.5">
-          <Label className="text-xs">Sequence length (multipack)</Label>
-          <NumberField min={256} value={seqLen} onChange={setSeqLen} />
-        </div>
+        {isOmni ? (
+          <div className="space-y-1.5">
+            <Label className="text-xs">Default language</Label>
+            <Input className="text-xs" placeholder="en" value={lang}
+              onChange={(e) => setLang(e.target.value)} disabled={running} />
+            <p className="text-[11px] text-muted-foreground">
+              <span className="font-mono">language_id</span> tag for the manifests when the dataset has no
+              language column (e.g. <span className="font-mono">en</span>, <span className="font-mono">zh</span>).
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-1.5">
+            <Label className="text-xs">Sequence length (multipack)</Label>
+            <NumberField min={256} value={seqLen} onChange={setSeqLen} />
+          </div>
+        )}
       </div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
@@ -421,7 +447,9 @@ export function TtsPackCard({
         </div>
       </div>
       <p className="text-[11px] text-muted-foreground">
-        Speech tokenizer is fixed — all Scicom TTS models share the NeuCodec speech-token vocab.
+        {isOmni
+          ? "Audio tokenizer is fixed — OmniVoice uses the Higgs (eustlb/higgs-audio-v2-tokenizer) codec."
+          : "Speech tokenizer is fixed — all Scicom TTS models share the NeuCodec speech-token vocab."}
       </p>
     </div>
   );
@@ -430,7 +458,7 @@ export function TtsPackCard({
     <div className="space-y-1">
       <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
         {running && <Loader2 className="h-3 w-3 animate-spin" />}
-        <span>{running ? "Live log (NeuCodec encode + multipack on the GPU box)" : "Log"}</span>
+        <span>{running ? `Live log (${isOmni ? "Higgs tokenize" : "NeuCodec encode + multipack"} on the GPU box)` : "Log"}</span>
         <ProgressEta log={log} running={running} />
       </div>
       <pre ref={logRef} className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-thin">
@@ -467,7 +495,7 @@ export function TtsPackCard({
           )}
           <Button onClick={run} disabled={running || starting}>
             {running || starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Boxes className="h-4 w-4" />}
-            {running ? "Packing…" : "Pack for TTS"}
+            {running ? "Packing…" : isOmni ? "Pack for OmniVoice" : "Pack for TTS"}
           </Button>
         </div>
       </div>
@@ -489,7 +517,9 @@ export function TtsPackCard({
     <div className="space-y-4">
       <Card>
         <CardHeader className="flex flex-col gap-0.5">
-          <CardTitle className="text-base">Pack for TTS — NeuCodec + multipack</CardTitle>
+          <CardTitle className="text-base">
+            {isOmni ? "Pack for OmniVoice — Higgs codec" : "Pack for TTS — NeuCodec + multipack"}
+          </CardTitle>
           {desc}
         </CardHeader>
         <CardContent className="space-y-4">

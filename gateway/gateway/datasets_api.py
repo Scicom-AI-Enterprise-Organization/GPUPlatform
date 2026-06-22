@@ -138,6 +138,28 @@ class TtsPackRequest(BaseModel):
     volume_gb: int = 80
 
 
+class OmnivoicePackRequest(BaseModel):
+    """Higgs-codec tokenize a {audio, transcription} dataset into OmniVoice
+    WebDataset shards (→ kind=omnivoice_packed), on a GPU box over SSH. Same
+    provisioning as Pack-for-TTS, but the OmniVoice stack (torch 2.8/cu128) — so a
+    RunPod pod should use a CUDA-12.8 image (NOT the cu13 gemma image)."""
+    provider_id: Optional[str] = None
+    storage_id: str
+    tokenizer: Optional[str] = None        # Higgs codec (default eustlb/higgs-audio-v2-tokenizer)
+    default_language: Optional[str] = "en"  # language_id when the dataset has no language column
+    language_field: Optional[str] = None    # dataset column holding per-row language_id
+    eval_test_per_speaker: int = 25         # held-out clips/speaker for the voice-clone eval set
+    gpu_count: int = 1
+    visible_devices: Optional[str] = None
+    venv_path: Optional[str] = None         # None → /share/autotrain-omnivoice
+    # RunPod pod knobs (ignored for a VM provider). OmniVoice needs CUDA 12.8.
+    gpu_type: str = "NVIDIA H100 80GB HBM3"
+    image: Optional[str] = None             # None → a cu128 pytorch image (set by the endpoint)
+    secure_cloud: bool = True
+    disk_gb: int = 80
+    volume_gb: int = 80
+
+
 class LlmPackRequest(BaseModel):
     """Chat → multipack a kind=llm dataset (its `messages` column, + an optional
     tools column) into a ChiniDataset (kind=llm_packed), the SAME layout the
@@ -2221,6 +2243,63 @@ async def pack_tts_dataset(
     await session.commit()
     await audit_module.record(user, "dataset.pack-tts", "dataset", dataset_id, d.name,
                               details={"run": run.id, "sequence_length": req.sequence_length})
+    await session.refresh(d)
+    return _to_record(d, user.username, None)
+
+
+@router.post("/{dataset_id}/pack-omnivoice", response_model=DatasetRecord)
+async def pack_omnivoice_dataset(
+    dataset_id: str,
+    req: OmnivoicePackRequest,
+    request: Request,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Higgs-codec tokenize this {audio, transcription} dataset into OmniVoice
+    WebDataset shards on a GPU box over SSH, then create a kind=omnivoice_packed
+    dataset. Implemented as a pack-only TTS run with base_model=k2-fsa/OmniVoice
+    (→ the omnivoice trainer is dispatched). Reuses Pack-for-TTS provisioning."""
+    d = await _require_dataset(session, dataset_id, user)
+    if d.kind == "omnivoice_packed":
+        raise HTTPException(status_code=400, detail="this dataset is already OmniVoice-packed")
+    if d.kind == "label":
+        tok = await _label_token(d, session)
+        if not (d.label_base_url and d.label_project_id and tok):
+            raise HTTPException(status_code=400, detail="label dataset needs a base URL, project, and stored token to pack")
+    if d.transform_status == "running":
+        raise HTTPException(status_code=409, detail="a transform is already running for this dataset")
+    st = await session.get(Storage, req.storage_id)
+    if st is None or st.kind != "s3":
+        raise HTTPException(status_code=400, detail="storage_id must reference a kind=s3 storage")
+
+    from .training_api import CreateTrainingRunRequest, create_training_run
+    body = CreateTrainingRunRequest(
+        name=f"pack-omni-{d.name}"[:128],
+        dataset_id=dataset_id,
+        base_model="k2-fsa/OmniVoice",  # → _tts_arch=omnivoice → omnivoice_finetune
+        task_type="tts",
+        provider_id=req.provider_id, storage_id=req.storage_id,
+        gpu_type=req.gpu_type, gpu_count=req.gpu_count,
+        # OmniVoice pins torch 2.8/cu128 → a CUDA-12.8 pod image (NOT the cu13 one).
+        image=(req.image or "").strip() or "runpod/pytorch:1.0.7-cu1281-torch280-ubuntu2404",
+        secure_cloud=req.secure_cloud, disk_gb=req.disk_gb, volume_gb=req.volume_gb,
+        visible_devices=req.visible_devices,
+        venv_path=(req.venv_path or "").strip() or "/share/autotrain-omnivoice",
+        tokenizer=req.tokenizer or "eustlb/higgs-audio-v2-tokenizer",
+        speaker_field=d.speaker_field or None,
+        default_language=req.default_language or "en",
+        language_field=req.language_field or None,
+        eval_test_per_speaker=req.eval_test_per_speaker,
+        pack_only=True, pack_source_dataset_id=dataset_id,
+        max_epochs=1,
+    )
+    run = await create_training_run(body, request, user, session)
+    d.transform_status = "running"
+    _where = req.provider_id or f"RunPod {req.gpu_type} ×{req.gpu_count}"
+    d.transform_log = f"OmniVoice pack queued (run {run.id}) · Higgs codec · {_where}"
+    await session.commit()
+    await audit_module.record(user, "dataset.pack-omnivoice", "dataset", dataset_id, d.name,
+                              details={"run": run.id})
     await session.refresh(d)
     return _to_record(d, user.username, None)
 

@@ -31,6 +31,7 @@ export const KIND_LABEL: Record<DatasetKind, string> = {
   hf: "huggingface",
   label: "labeling",
   tts_packed: "tts-packed",
+  omnivoice_packed: "omnivoice-packed",
   hosted: "hf repo",
   llm: "llm",
   llm_packed: "llm-packed",

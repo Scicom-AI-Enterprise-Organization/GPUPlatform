@@ -73,8 +73,14 @@ const TTS_BASE_MODELS = [
   "Scicom-intl/Multilingual-TTS-0.6B-Base",
   "Scicom-intl/Multilingual-Expressive-TTS-1.7B",
   "Scicom-intl/Multilingual-Expressive-TTS-0.6B",
+  // OmniVoice (Qwen3-0.6B diffusion LM) — a different stack: Higgs codec +
+  // kind=omnivoice_packed datasets + its own trainer.
+  "k2-fsa/OmniVoice",
 ];
 const DEFAULT_TTS_BASE = "Scicom-intl/Multilingual-TTS-1.7B-Base";
+// A TTS base model picks the OmniVoice path (vs Qwen3+NeuCodec) by name — mirrors
+// the gateway's _tts_arch. Drives the packed-dataset kind + venv default in the form.
+const isOmnivoice = (model: string) => /omnivoice/i.test(model);
 // LLM finetune (FSDP2 LoRA) over a packed chat dataset (kind=llm_packed). The
 // trainer is auto-detected from the base model: gemma-4 (custom dual-head_dim
 // attention), MiniMax-M2 (230B FP8 MoE) or Mistral-Small-4 (119B FP8 MoE, MLA) —
@@ -106,7 +112,7 @@ function llmVenvFor(model: string): string {
 // venv paths that count as "still a per-task default" (safe to auto-swap on a task
 // change); a user-customized path is left untouched.
 const KNOWN_VENVS = [
-  "/share/autotrain-whisper", "/share/autotrain-tts", "/share/autotrain-llm",
+  "/share/autotrain-whisper", "/share/autotrain-tts", "/share/autotrain-omnivoice", "/share/autotrain-llm",
   "/share/autotrain-llm-gemma4", "/share/autotrain-llm-minimax", "/share/autotrain-llm-mistral",
 ];
 // LLM LoRA target linear projections. q/k/v/o (attention) are the default; the MLP
@@ -580,10 +586,10 @@ export function TrainingForm() {
   // TTS/LLM train directly on a pre-packed ChiniDataset (tts_packed / llm_packed);
   // ASR uses raw audio sources — never a packed dataset.
   const pickDatasets = isTts
-    ? datasets.filter((d) => d.kind === "tts_packed")
+    ? datasets.filter((d) => d.kind === (isOmnivoice(baseModel) ? "omnivoice_packed" : "tts_packed"))
     : isLlm
       ? datasets.filter((d) => d.kind === "llm_packed")
-      : datasets.filter((d) => d.kind !== "tts_packed" && d.kind !== "llm_packed");
+      : datasets.filter((d) => !["tts_packed", "omnivoice_packed", "llm_packed"].includes(d.kind));
 
   // Optimizer steps per epoch ≈ ceil(train_rows / (batch × grad_accum × world_size)).
   // world_size = #GPUs whenever DDP runs: TTS ALWAYS torchruns (nproc = #GPUs), ASR
@@ -622,7 +628,14 @@ export function TrainingForm() {
   // arch-specific venv + LoRA defaults when they're still per-arch defaults.
   function onModelChange(v: string) {
     setModelChoice(v);
-    if (taskType !== "llm" || v === CUSTOM) return;
+    if (v === CUSTOM) return;
+    if (taskType === "tts") {
+      // OmniVoice gets its own venv (torch 2.8/cu128) + packed kind, vs Qwen3+NeuCodec.
+      const venvFor = isOmnivoice(v) ? "/share/autotrain-omnivoice" : "/share/autotrain-tts";
+      setVenvPath((cur) => (KNOWN_VENVS.includes(cur) ? venvFor : cur));
+      return;
+    }
+    if (taskType !== "llm") return;
     setVenvPath((cur) => (KNOWN_VENVS.includes(cur) ? llmVenvFor(v) : cur));
     const d = llmLoraDefaults(v);
     setLoraR((r) => ([16, 256].includes(r) ? d.r : r));
