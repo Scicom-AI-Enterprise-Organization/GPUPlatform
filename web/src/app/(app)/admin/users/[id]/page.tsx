@@ -55,7 +55,7 @@ export default async function UserProfilePage({
         ]}
         username={me.username}
       />
-      <div className="mx-auto w-full max-w-3xl px-6 py-10">
+      <div className="w-full px-6 py-10">
         <Link
           href="/organization"
           className="mb-4 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"

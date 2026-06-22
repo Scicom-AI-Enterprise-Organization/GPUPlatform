@@ -1,7 +1,9 @@
 "use client";
 
+import { useMemo, useState } from "react";
 import Link from "next/link";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Search } from "lucide-react";
+import { Input } from "@/components/ui/input";
 import type { AdminUserRecord, SectionKey } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +29,24 @@ function fmtDate(iso: string) {
 // you there. Keeping the table itself a clean overview avoids the cramped
 // dropdown grid we had before.
 export function OrganizationTable({ users }: { users: AdminUserRecord[] }) {
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const filtered = useMemo(() => {
+    if (!q) return users;
+    return users.filter((u) =>
+      [
+        u.username,
+        u.email ?? "",
+        String(u.id),
+        u.role,
+        u.policy_role_name ?? "",
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(q),
+    );
+  }, [users, q]);
+
   if (users.length === 0) {
     return (
       <div className="px-5 py-12 text-center text-sm text-muted-foreground">
@@ -35,8 +55,26 @@ export function OrganizationTable({ users }: { users: AdminUserRecord[] }) {
     );
   }
   return (
-    <ul className="divide-y divide-border">
-      {users.map((u) => (
+    <div>
+      <div className="border-b border-border px-5 py-3">
+        <div className="relative max-w-sm">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search by name, email, id, role…"
+            className="h-8 pl-8 text-sm"
+            aria-label="Search users"
+          />
+        </div>
+      </div>
+      {filtered.length === 0 ? (
+        <div className="px-5 py-12 text-center text-sm text-muted-foreground">
+          No users match “{query}”.
+        </div>
+      ) : (
+        <ul className="divide-y divide-border">
+          {filtered.map((u) => (
         <li key={u.id}>
           <Link
             href={`/admin/users/${u.id}`}
@@ -90,8 +128,10 @@ export function OrganizationTable({ users }: { users: AdminUserRecord[] }) {
             <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60 transition-transform group-hover:translate-x-0.5" />
           </Link>
         </li>
-      ))}
-    </ul>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
