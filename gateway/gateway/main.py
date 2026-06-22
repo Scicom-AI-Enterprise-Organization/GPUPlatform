@@ -234,6 +234,7 @@ class AppRecord(BaseModel):
     vllm_version: Optional[str] = None
     vllm_install_args: Optional[str] = None
     pre_script: Optional[str] = None
+    is_public: bool = False
     created_at: str
     owner: str
 
@@ -417,7 +418,15 @@ class GithubUpsertRequest(BaseModel):
     name: Optional[str] = Field(default=None, max_length=128)
 
 
-def _to_app_record(app: App) -> AppRecord:
+def _to_app_record(app: App, *, redacted: bool = False) -> AppRecord:
+    """Serialize an App. With redacted=True (a non-owner viewing a *public*
+    endpoint read-only), the infra/secret-bearing fields are blanked so a public
+    viewer never sees env vars, launch args, pre-scripts, the venv path, or the
+    cloud-account binding — only the shape of the endpoint (name/model/gpu/scale).
+    Per-member vLLM args (which can carry tokens) are stripped too."""
+    members = [MultiModelMember(**m) for m in (getattr(app, "models", None) or [])] or None
+    if redacted and members:
+        members = [m.model_copy(update={"extra_args": ""}) for m in members]
     return AppRecord(
         app_id=app.app_id,
         name=app.name,
@@ -428,21 +437,22 @@ def _to_app_record(app: App) -> AppRecord:
         cpu=app.cpu,
         memory=app.memory,
         request_timeout_s=app.request_timeout_s,
-        vllm_args=app.vllm_args or "",
+        vllm_args="" if redacted else (app.vllm_args or ""),
         enable_metrics=bool(getattr(app, "enable_metrics", True)),
         cloud_type=getattr(app, "cloud_type", None),
         container_disk_gb=getattr(app, "container_disk_gb", None),
         volume_gb=getattr(app, "volume_gb", None),
-        provider_id=getattr(app, "provider_id", None),
+        provider_id=None if redacted else getattr(app, "provider_id", None),
         mode=getattr(app, "mode", "single") or "single",
-        models=[MultiModelMember(**m) for m in (getattr(app, "models", None) or [])] or None,
+        models=members,
         sleep_level=int(getattr(app, "sleep_level", 1) or 1),
-        env_vars=getattr(app, "env_vars", None) or None,
-        visible_devices=getattr(app, "visible_devices", None) or None,
-        venv_path=getattr(app, "venv_path", None) or None,
+        env_vars=None if redacted else (getattr(app, "env_vars", None) or None),
+        visible_devices=None if redacted else (getattr(app, "visible_devices", None) or None),
+        venv_path=None if redacted else (getattr(app, "venv_path", None) or None),
         vllm_version=getattr(app, "vllm_version", None) or None,
-        vllm_install_args=getattr(app, "vllm_install_args", None) or None,
-        pre_script=getattr(app, "pre_script", None) or None,
+        vllm_install_args=None if redacted else (getattr(app, "vllm_install_args", None) or None),
+        pre_script=None if redacted else (getattr(app, "pre_script", None) or None),
+        is_public=bool(getattr(app, "is_public", False)),
         created_at=app.created_at.isoformat() if app.created_at else "",
         owner=app.owner.username if app.owner else "",
     )
@@ -1818,14 +1828,27 @@ async def list_apps(
     from sqlalchemy.orm import selectinload
     show_all = user.is_admin and scope == "all"
     stmt = select(App).options(selectinload(App.owner))
-    if not show_all:
-        stmt = stmt.where(App.owner_id == user.id)
+    if show_all:
+        pass  # admin + ?scope=all → every endpoint
+    elif user.is_admin:
+        stmt = stmt.where(App.owner_id == user.id)  # admin "mine" stays strictly own
+    else:
+        # Non-admins see their own endpoints plus any public ones (read-only),
+        # mirroring the benchmark list. Edit/delete is still owner-gated server-side.
+        stmt = stmt.where((App.owner_id == user.id) | (App.is_public.is_(True)))
     result = await session.execute(stmt)
     apps = result.scalars().all()
-    return [_to_app_record(a) for a in apps]
+    return [_to_app_record(a, redacted=not _viewer_is_owner(a, user)) for a in apps]
 
 
-async def _load_owned_app(session: AsyncSession, app_id: str, user: User) -> App:
+async def _load_owned_app(
+    session: AsyncSession, app_id: str, user: User, *, allow_public: bool = False
+) -> App:
+    """Load an app, enforcing access. Default (allow_public=False) is owner-or-admin
+    only — used by every MUTATING route, so writes stay strictly owner-scoped. Pass
+    allow_public=True on READ-ONLY routes that should also serve a *public* endpoint
+    to non-owners (record/status/workers/worker-events/stress-runs). It never relaxes
+    writes, the inference data plane, logs, or request history."""
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
     result = await session.execute(
@@ -1835,8 +1858,15 @@ async def _load_owned_app(session: AsyncSession, app_id: str, user: User) -> App
     if app is None:
         raise HTTPException(status_code=404, detail="no such app")
     if app.owner_id != user.id and not user.is_admin:
+        if allow_public and bool(getattr(app, "is_public", False)):
+            return app
         raise HTTPException(status_code=403, detail="not your app")
     return app
+
+
+def _viewer_is_owner(app: App, user: User) -> bool:
+    """True when `user` may see the full (un-redacted) record + manage the app."""
+    return bool(user.is_admin or app.owner_id == user.id)
 
 
 async def _provider_for_app(session: AsyncSession, app_id: str, user: User, app_state) -> Optional["Provider"]:
@@ -1862,8 +1892,87 @@ async def get_app_endpoint(
     user: User = Depends(require_section("inference")),
     session: AsyncSession = Depends(get_session),
 ):
-    app = await _load_owned_app(session, app_id, user)
+    app = await _load_owned_app(session, app_id, user, allow_public=True)
+    return _to_app_record(app, redacted=not _viewer_is_owner(app, user))
+
+
+class SetAppVisibilityRequest(BaseModel):
+    is_public: bool
+
+
+@app.post("/apps/{app_id}/visibility", response_model=AppRecord)
+async def set_app_visibility(
+    app_id: str,
+    body: SetAppVisibilityRequest,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Make an endpoint public (read-only visible to every logged-in user) or
+    private again. Owner (or admin) only — goes through the strict loader, so a
+    non-owner can never flip someone else's endpoint."""
+    app = await _load_owned_app(session, app_id, user)  # strict: owner/admin only
+    app.is_public = bool(body.is_public)
+    await session.commit()
+    await audit_module.record(
+        user, "inference.visibility", "app", app_id, app.name,
+        details={"is_public": app.is_public},
+    )
     return _to_app_record(app)
+
+
+class AppProxyLink(BaseModel):
+    id: str
+    name: str
+    public: bool
+    serving_path: str          # /proxy/{name}/v1
+    models: list[str] = []     # alias(es) on this proxy that route to this endpoint
+
+
+@app.get("/apps/{app_id}/proxies", response_model=list[AppProxyLink])
+async def list_app_proxies(
+    app_id: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """LLM API proxies that front this endpoint, matched by upstream URL (a
+    backend pointed at `/{app_id}/v1`) or by served model name. Read-only and
+    secret-stripped: only the proxy name, its stable serving path, and the model
+    aliases are returned — never upstream base_urls or API keys. Non-admins see
+    only PUBLIC proxies; admins see every matching proxy."""
+    app = await _load_owned_app(session, app_id, user, allow_public=True)
+    from .proxy_api import ProxyEndpoint
+    from sqlalchemy import select
+    # Models this endpoint serves (single: [model]; multi/proxy fleet: members).
+    served: set[str] = set()
+    if app.model:
+        served.add(app.model)
+    for m in (getattr(app, "models", None) or []):
+        mm = m.get("model") if isinstance(m, dict) else None
+        if mm:
+            served.add(mm)
+    rows = (await session.execute(select(ProxyEndpoint))).scalars().all()
+    out: list[AppProxyLink] = []
+    for ep in rows:
+        # Non-admins only ever see public proxies (proxies are admin-managed).
+        if not (user.is_admin or bool(getattr(ep, "public", False))):
+            continue
+        cfg = ep.config or {}
+        matched: set[str] = set()
+        for u in cfg.get("upstreams", []):
+            if not u.get("enabled", True):
+                continue
+            base = u.get("base_url") or ""
+            models_map = u.get("models") or {}  # alias -> real upstream model
+            if f"/{app_id}/" in base:
+                matched.update(models_map.keys())
+            else:
+                matched.update(a for a, real in models_map.items() if real in served)
+        if matched:
+            out.append(AppProxyLink(
+                id=ep.id, name=ep.name, public=bool(getattr(ep, "public", False)),
+                serving_path=f"/proxy/{ep.name}/v1", models=sorted(matched),
+            ))
+    return out
 
 
 @app.get("/apps/{app_id}/status")
@@ -1876,7 +1985,7 @@ async def get_app_status(
     """Operational state for the overview tab: live worker count, queue depth,
     and the most recent provision error (if any). Empty error means the
     autoscaler is either idle or scaling cleanly."""
-    app = await _load_owned_app(session, app_id, user)
+    app = await _load_owned_app(session, app_id, user, allow_public=True)
     rdb = request.app.state.redis
     paused = bool(await rdb.get(f"app:{app_id}:paused"))
     queue_len = await rdb.llen(f"queue:{app_id}")
@@ -2564,7 +2673,7 @@ async def list_worker_events(
     `provisioned`/`registered` with `terminated`/`idle_terminated` per
     `machine_id` to reconstruct serving spans."""
     from sqlalchemy import select, and_
-    await _load_owned_app(session, app_id, user)  # owner/admin authorization
+    await _load_owned_app(session, app_id, user, allow_public=True)  # owner/admin or public read
     if limit < 1 or limit > 10000:
         raise HTTPException(status_code=400, detail="limit must be 1..10000")
 
@@ -2784,7 +2893,7 @@ async def list_stress_runs(
     """Saved stress runs for an endpoint, newest first. Visible to anyone who can
     access the app — that's what makes a shared comparison link resolve."""
     from sqlalchemy import select
-    await _load_owned_app(session, app_id, user)
+    await _load_owned_app(session, app_id, user, allow_public=True)
     rows = (
         await session.execute(
             select(StressRun)
@@ -3261,7 +3370,7 @@ async def list_app_workers(
     pod list: a pod can be `running` on RunPod while its worker never registered /
     stopped heartbeating (the localhost-registration gotcha) — here that shows as a
     machine_id with `alive=false` (or absent entirely)."""
-    await _load_owned_app(session, app_id, user)
+    await _load_owned_app(session, app_id, user, allow_public=True)
     rdb = request.app.state.redis
     mids = await rdb.smembers(f"worker_index:{app_id}")
     out: list[AppWorkerRow] = []

@@ -76,7 +76,7 @@ export default async function ServerlessPage({
                 </Link>
               </Button>
             </div>
-            <EndpointGrid apps={apps} />
+            <EndpointGrid apps={apps} viewerUsername={username} isAdmin={me?.is_admin ?? false} />
           </section>
         )}
       </div>

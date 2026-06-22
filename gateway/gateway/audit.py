@@ -55,6 +55,8 @@ ACTIONS = {
     "inference.model_action",
     "inference.update_autoscaler",
     "inference.update_models",
+    "inference.visibility",
+    "proxy.visibility",
     "benchmark.create",
     "benchmark.delete",
     "benchmark.terminate",

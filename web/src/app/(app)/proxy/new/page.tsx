@@ -4,11 +4,19 @@ import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { ProxyForm } from "../proxy-form";
 
-export default async function NewProxyPage() {
+export default async function NewProxyPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ name?: string; base?: string; model?: string }>;
+}) {
   const me = await getMe();
   if (!me) redirect("/login");
   if (me.role !== "admin") redirect("/serverless");
   const username = await currentUsername();
+  // Optional prefill from the serverless "Proxy" tab: pre-point an upstream at a
+  // specific endpoint's serving URL + model.
+  const sp = await searchParams;
+  const prefill = sp.name || sp.base || sp.model ? { name: sp.name, base: sp.base, model: sp.model } : undefined;
   return (
     <div className="flex h-full flex-col">
       <ConsoleTopbar crumbs={[{ label: "LLM API Proxy", href: "/proxy" }, { label: "New endpoint" }]} username={username} />
@@ -20,7 +28,7 @@ export default async function NewProxyPage() {
             backend&apos;s real model name.
           </p>
         </div>
-        <ProxyForm />
+        <ProxyForm prefill={prefill} />
       </div>
     </div>
   );

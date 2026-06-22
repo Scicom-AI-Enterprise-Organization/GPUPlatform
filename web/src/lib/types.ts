@@ -52,8 +52,19 @@ export type AppRecord = {
   vllm_version?: string | null;
   vllm_install_args?: string | null;
   pre_script?: string | null;
+  is_public?: boolean;
   created_at: string;
   owner: string;
+};
+
+// An LLM API proxy that fronts a serverless endpoint (matched by upstream URL or
+// model). Secret-stripped: only name + stable serving path + model aliases.
+export type AppProxyLink = {
+  id: string;
+  name: string;
+  public: boolean;
+  serving_path: string;
+  models: string[];
 };
 
 export type CreateAppRequest = {
@@ -1248,6 +1259,7 @@ export type ProxyEndpoint = {
   id: string;
   name: string;
   enabled: boolean;
+  public?: boolean;
   max_concurrency: number;
   timeout_s: number;
   upstreams: ProxyUpstream[];
@@ -1275,6 +1287,7 @@ export type CreateProxyBody = {
   max_concurrency?: number;
   timeout_s?: number;
   enabled?: boolean;
+  public?: boolean;
   upstreams: ProxyUpstreamSpec[];
 };
 

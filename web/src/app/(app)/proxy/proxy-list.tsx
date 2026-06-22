@@ -23,7 +23,7 @@ function searchableText(ep: ProxyEndpoint): string {
   return [ep.name, `/proxy/${ep.name}/v1`, ep.created_by, ...aliases].join(" ").toLowerCase();
 }
 
-export function ProxyList({ items }: { items: ProxyEndpoint[] }) {
+export function ProxyList({ items, readOnly = false }: { items: ProxyEndpoint[]; readOnly?: boolean }) {
   const router = useRouter();
   const [busy, setBusy] = useState<string | null>(null);
   const [q, setQ] = useState("");
@@ -149,21 +149,24 @@ export function ProxyList({ items }: { items: ProxyEndpoint[] }) {
                       <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground">/proxy/{ep.name}/v1</div>
                     </div>
                   </div>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="icon-sm" onClick={(e) => e.stopPropagation()} className="-mr-1 shrink-0 text-muted-foreground hover:text-foreground" disabled={busy === ep.id}>⋯</Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem asChild><Link href={`/proxy/${ep.id}`}>Open</Link></DropdownMenuItem>
-                      <DropdownMenuItem asChild><Link href={`/proxy/${ep.id}/edit`}>Edit</Link></DropdownMenuItem>
-                      <DropdownMenuItem variant="destructive" onSelect={(e) => { e.preventDefault(); onDelete(ep); }}>
-                        <Trash2 className="h-4 w-4" /> Delete
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+                  {!readOnly && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon-sm" onClick={(e) => e.stopPropagation()} className="-mr-1 shrink-0 text-muted-foreground hover:text-foreground" disabled={busy === ep.id}>⋯</Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem asChild><Link href={`/proxy/${ep.id}`}>Open</Link></DropdownMenuItem>
+                        <DropdownMenuItem asChild><Link href={`/proxy/${ep.id}/edit`}>Edit</Link></DropdownMenuItem>
+                        <DropdownMenuItem variant="destructive" onSelect={(e) => { e.preventDefault(); onDelete(ep); }}>
+                          <Trash2 className="h-4 w-4" /> Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-1.5 text-xs">
                   {!ep.enabled && <span className="rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">disabled</span>}
+                  {ep.public && <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] uppercase text-emerald-700 dark:text-emerald-400">public</span>}
                   <span className="rounded-md bg-muted/50 px-2 py-0.5">{ep.upstreams.length} upstream{ep.upstreams.length === 1 ? "" : "s"}</span>
                   <span className="rounded-md bg-muted/50 px-2 py-0.5">{aliases.size} model{aliases.size === 1 ? "" : "s"}</span>
                   <span className="rounded-md bg-muted/50 px-2 py-0.5">conc {ep.max_concurrency || "∞"}</span>

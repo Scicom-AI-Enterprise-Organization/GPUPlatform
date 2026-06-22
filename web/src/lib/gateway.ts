@@ -5,6 +5,7 @@
 // Bearer-token translation server-side, so the token never hits the bundle.
 
 import type {
+  AppProxyLink,
   AdminUserRecord,
   AggregatePoint,
   ApiKeyRecord,
@@ -245,6 +246,17 @@ export const gateway = {
   },
   getAppStatus: (id: string) =>
     request<AppStatus>(`/apps/${encodeURIComponent(id)}/status`),
+  /** Owner/admin only: make an endpoint public (read-only visible to all logged-in
+   * users) or private again. */
+  setAppVisibility: (id: string, isPublic: boolean) =>
+    request<AppRecord>(`/apps/${encodeURIComponent(id)}/visibility`, {
+      method: "POST",
+      body: JSON.stringify({ is_public: isPublic }),
+    }),
+  /** LLM API proxies that front this endpoint (secret-stripped: name + serving
+   * path + model aliases). Non-admins see only public proxies. */
+  listAppProxies: (id: string) =>
+    request<AppProxyLink[]>(`/apps/${encodeURIComponent(id)}/proxies`),
 
   // ---- inference (OpenAI-compatible) ----
   /** Send a chat-completion to a specific model. For a multi-model endpoint,
@@ -675,6 +687,10 @@ export const gateway = {
   // ---- LLM API proxy ----
   listProxies: () => request<ProxyEndpoint[]>("/v1/proxy"),
   getProxy: (id: string) => request<ProxyEndpoint>(`/v1/proxy/${encodeURIComponent(id)}`),
+  /** Read-only public proxies — visible to any logged-in user (non-admins). */
+  listPublicProxies: () => request<ProxyEndpoint[]>("/v1/proxy/public"),
+  getPublicProxy: (id: string) =>
+    request<ProxyEndpoint>(`/v1/proxy/${encodeURIComponent(id)}/public`),
   createProxy: (body: CreateProxyBody) =>
     request<ProxyEndpoint>("/v1/proxy", { method: "POST", body: JSON.stringify(body) }),
   updateProxy: (id: string, body: UpdateProxyBody) =>
