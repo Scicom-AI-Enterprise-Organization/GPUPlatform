@@ -9,9 +9,9 @@ import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { ProxyList } from "./proxy-list";
 
-async function load(): Promise<{ items: ProxyEndpoint[]; error: string | null }> {
+async function load(admin: boolean): Promise<{ items: ProxyEndpoint[]; error: string | null }> {
   try {
-    return { items: await gateway.listProxies(), error: null };
+    return { items: admin ? await gateway.listProxies() : await gateway.listPublicProxies(), error: null };
   } catch (e) {
     return { items: [], error: e instanceof Error ? e.message : String(e) };
   }
@@ -20,9 +20,11 @@ async function load(): Promise<{ items: ProxyEndpoint[]; error: string | null }>
 export default async function ProxyPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  // Admins manage all proxies; everyone else gets a read-only view of the PUBLIC
+  // ones (proxies are admin-managed, so non-admins can view + use, never edit).
+  const isAdmin = me.role === "admin";
 
-  const [{ items, error }, username] = await Promise.all([load(), currentUsername()]);
+  const [{ items, error }, username] = await Promise.all([load(isAdmin), currentUsername()]);
 
   return (
     <div className="flex h-full flex-col">
@@ -35,6 +37,7 @@ export default async function ProxyPage() {
             behind the scenes — priority + health-aware failover, a per-endpoint queue, and
             auto-cancel on client disconnect. Your team points their client at{" "}
             <span className="font-mono">/proxy/&lt;name&gt;/v1</span> and never changes anything.
+            {!isAdmin && " Showing public endpoints — view and use them; only admins can edit."}
           </p>
         </div>
 
@@ -50,20 +53,26 @@ export default async function ProxyPage() {
               <h2 className="text-base font-medium">Endpoints</h2>
               <span className="text-xs text-muted-foreground">{items.length} total</span>
             </div>
-            <Button asChild size="sm">
-              <Link href="/proxy/new"><Plus className="h-4 w-4" /> New endpoint</Link>
-            </Button>
+            {isAdmin && (
+              <Button asChild size="sm">
+                <Link href="/proxy/new"><Plus className="h-4 w-4" /> New endpoint</Link>
+              </Button>
+            )}
           </div>
 
           {items.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
               <Inbox className="h-6 w-6 text-muted-foreground/60" />
               <p className="text-sm text-muted-foreground">
-                No proxy endpoints yet. Click <span className="font-medium text-foreground">New endpoint</span> to create one.
+                {isAdmin ? (
+                  <>No proxy endpoints yet. Click <span className="font-medium text-foreground">New endpoint</span> to create one.</>
+                ) : (
+                  "No public proxy endpoints yet."
+                )}
               </p>
             </div>
           ) : (
-            <ProxyList items={items} />
+            <ProxyList items={items} readOnly={!isAdmin} />
           )}
         </section>
       </div>

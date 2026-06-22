@@ -61,6 +61,10 @@ class ProxyEndpoint(Base):
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, index=True)  # the {endpoint} path segment
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    # Public proxies are visible (read-only, secret-stripped) to every logged-in
+    # user via /v1/proxy/public[/{id}] — name, serving URL, model aliases only.
+    # Admin-managed flag (proxies have no per-user ownership). Default private.
+    public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     # { max_concurrency:int, timeout_s:int, upstreams:[{id,name,base_url,
     #   api_key_secret?|api_key_enc?, models:{alias:real}, priority, enabled}] }
     config: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
@@ -111,6 +115,7 @@ class CreateProxyRequest(BaseModel):
     max_concurrency: int = 0              # 0 = unlimited (no queue)
     timeout_s: int = 600
     enabled: bool = True
+    public: bool = False
     upstreams: list[UpstreamSpec] = []
 
 
@@ -119,6 +124,7 @@ class UpdateProxyRequest(BaseModel):
     max_concurrency: Optional[int] = None
     timeout_s: Optional[int] = None
     enabled: Optional[bool] = None
+    public: Optional[bool] = None
     upstreams: Optional[list[UpstreamSpec]] = None
 
 
@@ -137,6 +143,7 @@ class ProxyEndpointRecord(BaseModel):
     id: str
     name: str
     enabled: bool
+    public: bool = False
     max_concurrency: int
     timeout_s: int
     upstreams: list[UpstreamRecord]
@@ -258,7 +265,7 @@ def _endpoint_record(app, e: ProxyEndpoint, owner_username: str) -> ProxyEndpoin
     live = _live(app)
     mine = [v for v in live.values() if v.get("endpoint_id") == e.id]
     return ProxyEndpointRecord(
-        id=e.id, name=e.name, enabled=bool(e.enabled),
+        id=e.id, name=e.name, enabled=bool(e.enabled), public=bool(getattr(e, "public", False)),
         max_concurrency=int(cfg.get("max_concurrency") or 0),
         timeout_s=int(cfg.get("timeout_s") or 600),
         upstreams=[_upstream_record(u) for u in cfg.get("upstreams", [])],
@@ -266,6 +273,37 @@ def _endpoint_record(app, e: ProxyEndpoint, owner_username: str) -> ProxyEndpoin
         queued=sum(1 for v in mine if v.get("state") == "queued"),
         created_at=e.created_at.isoformat() if e.created_at else "",
         created_by=owner_username,
+    )
+
+
+def _public_endpoint_record(app, e: ProxyEndpoint) -> ProxyEndpointRecord:
+    """Secret-stripped view of a PUBLIC proxy for non-admin viewers. Returns the
+    serving name, model aliases, and per-upstream priority/enabled only — NEVER
+    upstream base_urls, API-key references, real upstream model names, upstream
+    names, or the owning admin's username. Reuses ProxyEndpointRecord so the web
+    type is shared with the admin view."""
+    cfg = e.config or {}
+    live = _live(app)
+    mine = [v for v in live.values() if v.get("endpoint_id") == e.id]
+    safe_upstreams = [
+        UpstreamRecord(
+            id=u.get("id", ""), name="", base_url="",
+            api_key_secret=None, has_inline_key=False,
+            # keep the alias KEYS (callers need them) but blank the real model names
+            models={a: "" for a in (u.get("models") or {}).keys()},
+            priority=int(u.get("priority", 0)), enabled=bool(u.get("enabled", True)),
+        )
+        for u in cfg.get("upstreams", [])
+    ]
+    return ProxyEndpointRecord(
+        id=e.id, name=e.name, enabled=bool(e.enabled), public=True,
+        max_concurrency=int(cfg.get("max_concurrency") or 0),
+        timeout_s=int(cfg.get("timeout_s") or 600),
+        upstreams=safe_upstreams,
+        inflight=sum(1 for v in mine if v.get("state") == "running"),
+        queued=sum(1 for v in mine if v.get("state") == "queued"),
+        created_at=e.created_at.isoformat() if e.created_at else "",
+        created_by="",
     )
 
 
@@ -776,12 +814,27 @@ async def create_proxy(req: CreateProxyRequest, request: Request, user: User = D
         "upstreams": _build_upstreams(req.upstreams),
     }
     row = ProxyEndpoint(id=f"proxy-{_secrets.token_hex(4)}", owner_id=user.id, name=name,
-                        enabled=bool(req.enabled), config=cfg, created_at=datetime.now(timezone.utc))
+                        enabled=bool(req.enabled), public=bool(req.public), config=cfg,
+                        created_at=datetime.now(timezone.utc))
     session.add(row)
     await session.commit()
     await session.refresh(row)
     logger.info("created proxy endpoint %s (%s) for user=%s", row.id, name, user.username)
     return _endpoint_record(request.app, row, user.username)
+
+
+# Public read routes — ANY logged-in user (not just admins). Declared BEFORE the
+# /{proxy_id} matcher so "/v1/proxy/public" isn't captured as proxy_id="public".
+@router.get("/public", response_model=list[ProxyEndpointRecord])
+async def list_public_proxies(request: Request, user: User = Depends(current_user),  # noqa: ARG001
+                              session: AsyncSession = Depends(get_session)):
+    """Read-only list of PUBLIC proxy endpoints for any logged-in user — the
+    secret-stripped info cards (name, serving URL, model aliases). Lets non-admins
+    discover proxies they're allowed to use even though management is admin-only."""
+    rows = (await session.execute(
+        select(ProxyEndpoint).where(ProxyEndpoint.public.is_(True)).order_by(ProxyEndpoint.created_at.desc())
+    )).scalars().all()
+    return [_public_endpoint_record(request.app, e) for e in rows]
 
 
 @router.get("/{proxy_id}", response_model=ProxyEndpointRecord)
@@ -791,6 +844,17 @@ async def get_proxy(proxy_id: str, request: Request, user: User = Depends(requir
     if row is None:
         raise HTTPException(status_code=404, detail="proxy endpoint not found")
     return _endpoint_record(request.app, row, await _owner_username(session, row.owner_id))
+
+
+@router.get("/{proxy_id}/public", response_model=ProxyEndpointRecord)
+async def get_public_proxy(proxy_id: str, request: Request, user: User = Depends(current_user),  # noqa: ARG001
+                           session: AsyncSession = Depends(get_session)):
+    """Read-only view of ONE public proxy for any logged-in user. 404s a private
+    proxy so non-admins can't probe for existence/config of non-public endpoints."""
+    row = await session.get(ProxyEndpoint, proxy_id)
+    if row is None or not bool(getattr(row, "public", False)):
+        raise HTTPException(status_code=404, detail="proxy endpoint not found")
+    return _public_endpoint_record(request.app, row)
 
 
 @router.patch("/{proxy_id}", response_model=ProxyEndpointRecord)
@@ -810,6 +874,8 @@ async def update_proxy(proxy_id: str, req: UpdateProxyRequest, request: Request,
         row.name = n
     if req.enabled is not None:
         row.enabled = bool(req.enabled)
+    if req.public is not None:
+        row.public = bool(req.public)
     if req.max_concurrency is not None:
         cfg["max_concurrency"] = max(0, int(req.max_concurrency))
     if req.timeout_s is not None:

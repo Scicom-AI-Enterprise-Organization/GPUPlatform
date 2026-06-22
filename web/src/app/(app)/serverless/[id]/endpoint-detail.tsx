@@ -3,7 +3,7 @@
 import { useEffect, useState, useTransition } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Eraser, Loader2, RotateCw, Trash2, X } from "lucide-react";
+import { Eraser, Globe, Loader2, Lock, RotateCw, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -25,6 +25,7 @@ import { QueueTab } from "./tabs/queue";
 import { WorkersTab } from "./tabs/workers";
 import { VisualTab } from "./tabs/visual";
 import { MetricsTab } from "./tabs/metrics";
+import { ProxyTab } from "./tabs/proxy";
 
 const TABS = [
   { value: "overview", label: "Overview" },
@@ -34,11 +35,17 @@ const TABS = [
   { value: "workers", label: "Workers" },
   { value: "visual", label: "Visual" },
   { value: "metrics", label: "Metrics" },
+  { value: "proxy", label: "Proxy" },
 ] as const;
 
 type EndpointTab = (typeof TABS)[number]["value"];
 
-export function EndpointDetail({ app }: { app: AppRecord }) {
+// Tabs a non-owner (read-only) viewer of a PUBLIC endpoint may see. Playground,
+// Stress, and Queue are excluded — inference is owner-only server-side, and the
+// queue/requests views expose the owner's traffic.
+const READONLY_TABS = new Set<string>(["overview", "workers", "visual", "metrics", "proxy"]);
+
+export function EndpointDetail({ app, readOnly = false, isAdmin = false }: { app: AppRecord; readOnly?: boolean; isAdmin?: boolean }) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -47,7 +54,8 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
   // click still switches in place (useSearchParams is reactive to soft nav).
   // proxy endpoints (single-model VM, no queue) hide the Queue tab — requests are
   // forwarded straight to the model, nothing is ever enqueued.
-  const visibleTabs = app.mode === "proxy" ? TABS.filter((t) => t.value !== "queue") : TABS;
+  const modeTabs = app.mode === "proxy" ? TABS.filter((t) => t.value !== "queue") : TABS;
+  const visibleTabs = readOnly ? modeTabs.filter((t) => READONLY_TABS.has(t.value)) : modeTabs;
   const visibleValues = visibleTabs.map((t) => t.value) as readonly string[];
   const tabParam = searchParams.get("tab");
   const tab: EndpointTab = tabParam && visibleValues.includes(tabParam) ? (tabParam as EndpointTab) : "overview";
@@ -68,7 +76,28 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
   // Persistent inline result of the last worker op (redeploy/purge) — shown under
   // the header buttons. NOT a toast (those vanish); stays until the next op.
   const [opResult, setOpResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [isPublic, setIsPublic] = useState(app.is_public ?? false);
+  const [togglingPublic, setTogglingPublic] = useState(false);
   const avatar = avatarFor(app.name);
+
+  async function handleTogglePublic() {
+    setTogglingPublic(true);
+    try {
+      const updated = await gateway.setAppVisibility(app.app_id, !isPublic);
+      setIsPublic(updated.is_public ?? !isPublic);
+      setOpResult({
+        ok: true,
+        text: updated.is_public
+          ? "Endpoint is now public — read-only visible to every logged-in user. They can view the overview/workers/metrics but can't edit, delete, or run inference."
+          : "Endpoint is now private — only you (and admins) can see it.",
+      });
+      router.refresh();
+    } catch (e) {
+      setOpResult({ ok: false, text: `Visibility change failed: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      setTogglingPublic(false);
+    }
+  }
 
   function handleDelete() {
     setDeleteError(null);
@@ -126,36 +155,59 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
                 <span className="font-mono">{app.app_id}</span>
                 <span>·</span>
                 <span className="font-mono">{app.model}</span>
+                {isPublic && (
+                  <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+                    Public
+                  </span>
+                )}
               </div>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setConfirmRedeploy(true)}
-            >
-              <RotateCw className="h-4 w-4" />
-              Redeploy
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setConfirmPurge(true)}
-              title="Hard-clean stale worker pidfiles + orphan processes on the box"
-            >
-              <Eraser className="h-4 w-4" />
-              Purge PIDs
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setConfirmDelete(true)}
-              className="text-destructive hover:text-destructive"
-            >
-              <Trash2 className="h-4 w-4" />
-              Delete
-            </Button>
+            {readOnly ? (
+              <span className="rounded-md border border-border bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground">
+                Read-only{app.owner ? ` · ${app.owner}` : ""}
+              </span>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleTogglePublic}
+                  disabled={togglingPublic}
+                  title={isPublic ? "Make private — only you and admins can see it" : "Make public — read-only visible to every logged-in user"}
+                >
+                  {togglingPublic ? <Loader2 className="h-4 w-4 animate-spin" /> : isPublic ? <Globe className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
+                  {isPublic ? "Public" : "Make public"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setConfirmRedeploy(true)}
+                >
+                  <RotateCw className="h-4 w-4" />
+                  Redeploy
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setConfirmPurge(true)}
+                  title="Hard-clean stale worker pidfiles + orphan processes on the box"
+                >
+                  <Eraser className="h-4 w-4" />
+                  Purge PIDs
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setConfirmDelete(true)}
+                  className="text-destructive hover:text-destructive"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Delete
+                </Button>
+              </>
+            )}
           </div>
         </div>
 
@@ -194,13 +246,14 @@ export function EndpointDetail({ app }: { app: AppRecord }) {
 
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 scrollbar-thin">
         <Tabs value={tab}>
-          <TabsContent value="overview"><OverviewTab app={app} /></TabsContent>
-          <TabsContent value="playground"><RequestsTab app={app} /></TabsContent>
-          <TabsContent value="stress"><StressTab app={app} /></TabsContent>
-          {app.mode !== "proxy" && <TabsContent value="queue"><QueueTab app={app} /></TabsContent>}
+          <TabsContent value="overview"><OverviewTab app={app} readOnly={readOnly} /></TabsContent>
+          {!readOnly && <TabsContent value="playground"><RequestsTab app={app} /></TabsContent>}
+          {!readOnly && <TabsContent value="stress"><StressTab app={app} /></TabsContent>}
+          {!readOnly && app.mode !== "proxy" && <TabsContent value="queue"><QueueTab app={app} /></TabsContent>}
           <TabsContent value="workers"><WorkersTab app={app} /></TabsContent>
           <TabsContent value="visual"><VisualTab app={app} /></TabsContent>
           <TabsContent value="metrics"><MetricsTab app={app} /></TabsContent>
+          <TabsContent value="proxy"><ProxyTab app={app} readOnly={readOnly} isAdmin={isAdmin} /></TabsContent>
         </Tabs>
       </div>
 

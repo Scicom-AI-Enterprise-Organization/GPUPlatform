@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { Copy, Eye, EyeOff, Loader2, Network, Pencil, RefreshCw, Trash2 } from "lucide-react";
+import { Copy, Eye, EyeOff, Globe, Loader2, Lock, Network, Pencil, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -24,7 +24,6 @@ const TABS = [
 ] as const;
 const BUCKETS = ["queued", "running", "completed", "cancelled", "failed"] as const;
 type ProxyTab = (typeof TABS)[number]["value"];
-const TAB_VALUES = TABS.map((t) => t.value) as readonly string[];
 
 function fmtAgo(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -44,20 +43,26 @@ const STATUS_TONE: Record<string, string> = {
   cancelled: "bg-muted text-muted-foreground",
 };
 
-export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; baseUrl: string }) {
+export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: ProxyEndpoint; baseUrl: string; readOnly?: boolean }) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const ep = initial;
+  const isPublic = ep.public ?? false;
   const aliases = Array.from(new Set(ep.upstreams.flatMap((u) => Object.keys(u.models))));
   const proxyBase = `${baseUrl}/proxy/${ep.name}/v1`;
+  // Read-only viewers (non-admins on a public proxy) get Overview + Playground
+  // only — Stress and the Queue/health table poll admin-only routes.
+  const visibleTabs = readOnly ? TABS.filter((t) => t.value === "overview" || t.value === "playground") : TABS;
+  const visibleValues = visibleTabs.map((t) => t.value) as readonly string[];
+  const [togglingPublic, setTogglingPublic] = useState(false);
 
   // The active tab is derived from the URL (?tab=), and each trigger is a real
   // <Link> — so right-click / middle-click / ⌘-click "open in new tab" works.
   // useSearchParams is reactive to soft navigations, so a normal click still
   // switches tabs in place without a full reload.
   const tabParam = searchParams.get("tab");
-  const tab: ProxyTab = tabParam && TAB_VALUES.includes(tabParam) ? (tabParam as ProxyTab) : "overview";
+  const tab: ProxyTab = tabParam && visibleValues.includes(tabParam) ? (tabParam as ProxyTab) : "overview";
   const tabHref = (v: ProxyTab) => {
     const p = new URLSearchParams(searchParams.toString());
     p.set("tab", v);
@@ -92,10 +97,11 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
     }
   }, [ep.id]);
   useEffect(() => {
+    if (readOnly) return; // health + request history are admin-only; don't 403-spam
     poll();
     const t = window.setInterval(poll, POLL_MS);
     return () => window.clearInterval(t);
-  }, [poll]);
+  }, [poll, readOnly]);
 
   const onCancel = async (rid: string) => {
     try { await gateway.cancelProxyRequest(ep.id, rid); poll(); }
@@ -123,6 +129,12 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
     try { await gateway.deleteProxy(ep.id); router.push("/proxy"); router.refresh(); }
     catch (e) { alert(e instanceof Error ? e.message : String(e)); }
   };
+  const onTogglePublic = async () => {
+    setTogglingPublic(true);
+    try { await gateway.updateProxy(ep.id, { public: !isPublic }); router.refresh(); }
+    catch (e) { alert(e instanceof Error ? e.message : String(e)); }
+    finally { setTogglingPublic(false); }
+  };
 
   const model0 = aliases[0] ?? "qwen";
   const visToken = reveal && token ? token : token ? maskToken(token) : "sgpu_…";
@@ -148,6 +160,7 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
               <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
                 {ep.name}
                 {!ep.enabled && <span className="rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">disabled</span>}
+                {isPublic && <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] uppercase text-emerald-700 dark:text-emerald-400">public</span>}
               </h1>
               <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                 <span className="font-mono">{proxyBase}</span>
@@ -158,13 +171,24 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button asChild variant="outline" size="sm"><Link href={`/proxy/${ep.id}/edit`}><Pencil className="h-4 w-4" /> Edit</Link></Button>
-            <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={onDelete}><Trash2 className="h-4 w-4" /> Delete</Button>
+            {readOnly ? (
+              <span className="rounded-md border border-border bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground">Read-only</span>
+            ) : (
+              <>
+                <Button variant="outline" size="sm" onClick={onTogglePublic} disabled={togglingPublic}
+                        title={isPublic ? "Make private — hide from non-admins" : "Make public — any logged-in user can view + use"}>
+                  {togglingPublic ? <Loader2 className="h-4 w-4 animate-spin" /> : isPublic ? <Globe className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
+                  {isPublic ? "Public" : "Make public"}
+                </Button>
+                <Button asChild variant="outline" size="sm"><Link href={`/proxy/${ep.id}/edit`}><Pencil className="h-4 w-4" /> Edit</Link></Button>
+                <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={onDelete}><Trash2 className="h-4 w-4" /> Delete</Button>
+              </>
+            )}
           </div>
         </div>
         <Tabs value={tab} className="mt-3">
           <TabsList variant="line" className="bg-transparent">
-            {TABS.map((t) => (
+            {visibleTabs.map((t) => (
               <TabsTrigger key={t.value} value={t.value} asChild>
                 <Link href={tabHref(t.value)} scroll={false}>{t.label}</Link>
               </TabsTrigger>
@@ -234,6 +258,7 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
             </CardContent>
           </Card>
 
+          {!readOnly && (
           <Card>
             <CardHeader className="pb-2"><CardTitle className="text-sm">Upstreams <span className="text-[11px] font-normal text-muted-foreground">· live health</span></CardTitle></CardHeader>
             <CardContent className="space-y-2">
@@ -257,6 +282,7 @@ export function ProxyDetail({ initial, baseUrl }: { initial: ProxyEndpoint; base
               })}
             </CardContent>
           </Card>
+          )}
         </TabsContent>
 
         {/* ---- Playground ---- */}

@@ -42,8 +42,19 @@ function searchableText(a: AppRecord): string {
   return [a.name, a.app_id, a.model, a.gpu, a.owner ?? ""].join(" ").toLowerCase();
 }
 
-export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
+export function EndpointGrid({
+  apps,
+  viewerUsername = "",
+  isAdmin = false,
+}: {
+  apps: AppRecord[];
+  viewerUsername?: string;
+  isAdmin?: boolean;
+}) {
   const router = useRouter();
+  // A viewer can manage (delete/select) only endpoints they own (admins: all).
+  // Public endpoints owned by others are view-only — server-side enforced too.
+  const canManage = (a: AppRecord) => isAdmin || (!!viewerUsername && a.owner === viewerUsername);
   const [single, setSingle] = useState<AppRecord | null>(null);
   const [q, setQ] = useState("");
   const [selectMode, setSelectMode] = useState(false);
@@ -216,7 +227,7 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
                 {" "}
                 <button
                   type="button"
-                  onClick={() => setSelected(new Set(paged.map((a) => a.app_id)))}
+                  onClick={() => setSelected(new Set(paged.filter(canManage).map((a) => a.app_id)))}
                   className="ml-2 underline underline-offset-2 hover:text-foreground"
                 >
                   Select all visible
@@ -276,6 +287,7 @@ export function EndpointGrid({ apps }: { apps: AppRecord[] }) {
                 app={app}
                 selectMode={selectMode}
                 selected={selected.has(app.app_id)}
+                canManage={canManage(app)}
                 onToggle={toggle}
                 onDelete={() => setSingle(app)}
               />
@@ -338,22 +350,26 @@ function EndpointCard({
   app,
   selectMode,
   selected,
+  canManage,
   onToggle,
   onDelete,
 }: {
   app: AppRecord;
   selectMode: boolean;
   selected: boolean;
+  canManage: boolean;
   onToggle: (id: string) => void;
   onDelete: () => void;
 }) {
   const avatar = avatarFor(app.name);
+  // Only owners/admins can select-to-delete; others' public endpoints are view-only.
+  const selectable = selectMode && canManage;
 
   const inner = (
     <>
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
-          {selectMode && (
+          {selectable && (
             <input
               type="checkbox"
               checked={selected}
@@ -372,6 +388,11 @@ function EndpointCard({
               <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
                 Ready
               </span>
+              {app.is_public && (
+                <span className="rounded-full border border-sky-500/40 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-sky-700 dark:text-sky-400">
+                  Public
+                </span>
+              )}
             </div>
             <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
               <span className="truncate font-mono" title={app.app_id}>{app.app_id}</span>
@@ -385,7 +406,7 @@ function EndpointCard({
             </div>
           </div>
         </div>
-        {!selectMode && (
+        {!selectMode && canManage && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -444,7 +465,7 @@ function EndpointCard({
 
   const base = "group block rounded-xl border border-border bg-card p-4 transition-all";
 
-  if (selectMode) {
+  if (selectable) {
     return (
       <div
         role="button"

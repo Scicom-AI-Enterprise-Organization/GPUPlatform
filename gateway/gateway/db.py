@@ -130,6 +130,11 @@ class App(Base):
     gpu: Mapped[str] = mapped_column(String(64))
     gpu_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
     enable_metrics: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    # Public endpoints surface (read-only) in every logged-in user's endpoint
+    # list and let non-owners view the overview/workers/metrics — but never edit,
+    # delete, run inference, or read logs/requests. Only the owner (or an admin)
+    # can flip this or mutate the endpoint. Mirrors benchmarks.is_public.
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     autoscaler: Mapped[dict] = mapped_column(JSON)
     cpu: Mapped[int] = mapped_column(Integer, default=2)
     memory: Mapped[str] = mapped_column(String(32), default="16Gi")
@@ -633,6 +638,18 @@ async def init_db() -> None:
         # (read-only) in everyone's benchmark list. Existing rows stay private.
         await conn.execute(text(
             "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        # Public serverless endpoints: an owner can flip an endpoint public so it
+        # shows up (read-only) in every user's endpoint list. Existing rows stay
+        # private. Same shape as benchmarks.is_public above.
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        # Public LLM API proxies: an admin can flip a proxy public so any logged-in
+        # user can view its read-only info card (serving URL + model aliases) and
+        # use the data plane. Existing rows stay private/admin-only.
+        await conn.execute(text(
+            "ALTER TABLE proxy_endpoints ADD COLUMN IF NOT EXISTS public BOOLEAN NOT NULL DEFAULT FALSE"
         ))
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_args VARCHAR(2048) NOT NULL DEFAULT ''"

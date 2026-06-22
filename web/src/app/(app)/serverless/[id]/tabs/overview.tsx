@@ -40,7 +40,7 @@ const DEEPGEMM_SCRIPT =
 const VLLM_NIGHTLY_ARGS =
   "-U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130 --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match";
 
-export function OverviewTab({ app }: { app: AppRecord }) {
+export function OverviewTab({ app, readOnly = false }: { app: AppRecord; readOnly?: boolean }) {
   // A multi-model VM endpoint is one fixed, always-on node that time-shares its
   // GPUs via vLLM sleep/wake — the scale/idle knobs don't apply (read-only card).
   // A multi-model *cloud* endpoint (RunPod, gpu != "vm") still scales the pod and
@@ -59,10 +59,10 @@ export function OverviewTab({ app }: { app: AppRecord }) {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <DetailCard app={app} />
-        {(isMulti || isProxy) && isVm ? <VmServingCard app={app} /> : <ScaleStrategyCard app={app} />}
+        {(isMulti || isProxy) && isVm ? <VmServingCard app={app} /> : <ScaleStrategyCard app={app} readOnly={readOnly} />}
       </div>
 
-      {isMulti || isProxy ? <MultiModelArgsCard app={app} /> : <EngineArgsCard app={app} />}
+      {isMulti || isProxy ? <MultiModelArgsCard app={app} readOnly={readOnly} /> : <EngineArgsCard app={app} readOnly={readOnly} />}
 
       <EnvVarsCard app={app} />
     </div>
@@ -204,7 +204,7 @@ function errText(body: unknown, fallback: string): string {
   return fallback;
 }
 
-function MultiModelArgsCard({ app }: { app: AppRecord }) {
+function MultiModelArgsCard({ app, readOnly = false }: { app: AppRecord; readOnly?: boolean }) {
   const router = useRouter();
   const [editing, setEditing] = useState(false);
   const [rows, setRows] = useState<ModelRow[]>(() => toRows(app.models));
@@ -318,7 +318,7 @@ function MultiModelArgsCard({ app }: { app: AppRecord }) {
             {!editing && " with these args."}
           </span>
         </div>
-        {!editing && (
+        {!editing && !readOnly && (
           <Button variant="outline" size="xs" onClick={startEdit}>
             <Pencil className="h-3 w-3" /> Edit
           </Button>
@@ -931,7 +931,7 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-function ScaleStrategyCard({ app }: { app: AppRecord }) {
+function ScaleStrategyCard({ app, readOnly = false }: { app: AppRecord; readOnly?: boolean }) {
   const router = useRouter();
   const [editing, setEditing] = useState(false);
   const [maxInput, setMaxInput] = useState(String(app.autoscaler.max_containers));
@@ -984,7 +984,7 @@ function ScaleStrategyCard({ app }: { app: AppRecord }) {
     <Card>
       <CardHeader className="flex-row items-center justify-between gap-2">
         <CardTitle className="text-sm font-medium">Scale strategy</CardTitle>
-        {!editing ? (
+        {readOnly ? null : !editing ? (
           <Button variant="outline" size="xs" onClick={() => setEditing(true)}>
             <Pencil className="h-3 w-3" />
             Edit
@@ -1061,7 +1061,7 @@ function ScaleStrategyCard({ app }: { app: AppRecord }) {
   );
 }
 
-function EngineArgsCard({ app }: { app: AppRecord }) {
+function EngineArgsCard({ app, readOnly = false }: { app: AppRecord; readOnly?: boolean }) {
   const router = useRouter();
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState(app.vllm_args ?? "");
@@ -1146,7 +1146,7 @@ function EngineArgsCard({ app }: { app: AppRecord }) {
             boot. Changes apply on the next cold start.
           </span>
         </div>
-        {!editing ? (
+        {readOnly ? null : !editing ? (
           <div className="flex items-center gap-2">
             <Button
               variant="outline"

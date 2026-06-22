@@ -34,6 +34,23 @@ function blankUpstream(): UpstreamDraft {
   };
 }
 
+// Seed the first upstream from a deep-link prefill (e.g. the serverless "Proxy"
+// tab pre-pointing at an endpoint's serving URL + model). The admin still adds
+// the API key. No prefill → a blank upstream.
+function seededUpstream(prefill?: ProxyPrefill): UpstreamDraft {
+  const u = blankUpstream();
+  if (!prefill) return u;
+  u.name = prefill.name ? `${prefill.name}-endpoint` : "";
+  if (prefill.base) u.base_url = prefill.base;
+  if (prefill.model) {
+    const alias = prefill.name || prefill.model.split("/").pop() || prefill.model;
+    u.models = [{ alias, real: prefill.model }];
+  }
+  return u;
+}
+
+export type ProxyPrefill = { name?: string; base?: string; model?: string };
+
 function fromEndpoint(ep: ProxyEndpoint): UpstreamDraft[] {
   return ep.upstreams.map((u) => ({
     id: u.id,
@@ -50,14 +67,15 @@ function fromEndpoint(ep: ProxyEndpoint): UpstreamDraft[] {
   }));
 }
 
-export function ProxyForm({ initial }: { initial?: ProxyEndpoint }) {
+export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefill?: ProxyPrefill }) {
   const router = useRouter();
   const editing = !!initial;
-  const [name, setName] = useState(initial?.name ?? "");
+  const [name, setName] = useState(initial?.name ?? prefill?.name ?? "");
   const [enabled, setEnabled] = useState(initial?.enabled ?? true);
+  const [isPublic, setIsPublic] = useState(initial?.public ?? false);
   const [maxConc, setMaxConc] = useState(String(initial?.max_concurrency ?? 0));
   const [timeoutS, setTimeoutS] = useState(String(initial?.timeout_s ?? 600));
-  const [ups, setUps] = useState<UpstreamDraft[]>(initial ? fromEndpoint(initial) : [blankUpstream()]);
+  const [ups, setUps] = useState<UpstreamDraft[]>(initial ? fromEndpoint(initial) : [seededUpstream(prefill)]);
   const [secretKeys, setSecretKeys] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -129,6 +147,7 @@ export function ProxyForm({ initial }: { initial?: ProxyEndpoint }) {
         max_concurrency: Number(maxConc) || 0,
         timeout_s: Number(timeoutS) || 600,
         enabled,
+        public: isPublic,
         upstreams: b.upstreams,
       };
       const ep = editing
@@ -165,6 +184,15 @@ export function ProxyForm({ initial }: { initial?: ProxyEndpoint }) {
         <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
           <Label className="text-xs uppercase tracking-wide text-muted-foreground">Enabled</Label>
           <Switch checked={enabled} onCheckedChange={setEnabled} />
+        </div>
+        <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
+          <div>
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Public</Label>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Read-only visible to every logged-in user (name, serving URL, model aliases only) and usable via the data plane. Upstreams &amp; keys stay admin-only.
+            </p>
+          </div>
+          <Switch checked={isPublic} onCheckedChange={setIsPublic} />
         </div>
       </section>
 
