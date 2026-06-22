@@ -1,0 +1,66 @@
+{
+  "TM_English_sample1.wav": {
+    "speaker": "TM_English",
+    "language": "en",
+    "text": "She'd only met Murni that morning, when she introduced herself as the press officer of a Muslim feminist group."
+  },
+  "TM_English_sample2.wav": {
+    "speaker": "TM_English",
+    "language": "en",
+    "text": "Ming Jun flicked his eyes up, still typing. He had the grace to look embarrassed when his eyes slid over the title."
+  },
+  "TM_English_sample3.wav": {
+    "speaker": "TM_English",
+    "language": "en",
+    "text": "All Scicom's existing B P O customers are now migrating to the new A I platform developed in-house."
+  },
+  "TM_English_sample4.wav": {
+    "speaker": "TM_English",
+    "language": "en",
+    "text": "Miss Farah Binti Ahmad, as per checking you need to pay the bill before the twenty-fifth of January two thousand and twenty-six to avoid service interruption. Please pay immediately to avoid your account being blocked at any time by the system."
+  },
+  "TM_English_sample5.wav": {
+    "speaker": "TM_English",
+    "language": "en",
+    "text": "one one seven seven fourteen fourteen sixty sixty dash I I I L K L J U J U"
+  },
+  "TM_English_reference.wav": {
+    "speaker": "TM_English",
+    "language": "en",
+    "role": "reference voice prompt",
+    "text": "A late moth blustered in to find the fire. The Song of the Family came now from behind Kino.",
+    "duration_s": 6.5
+  },
+  "TM_Mandarin_sample1.wav": {
+    "speaker": "TM_Mandarin",
+    "language": "zh",
+    "text": "下载 MyUnifi 应用程序，轻松管理账单和服务订阅。如遇技术问题，请访问 easyfix dot unifi dot com dot m y 获取进一步协助。"
+  },
+  "TM_Mandarin_sample2.wav": {
+    "speaker": "TM_Mandarin",
+    "language": "zh",
+    "text": "一二七二三一八五八三二七"
+  },
+  "TM_Mandarin_sample3.wav": {
+    "speaker": "TM_Mandarin",
+    "language": "zh",
+    "text": "SMART Internet 为企业账户提供安全可靠的互联网接入服务，旨在从一开始就加强网络安全。"
+  },
+  "TM_Mandarin_sample4.wav": {
+    "speaker": "TM_Mandarin",
+    "language": "zh",
+    "text": "请再次确认一下相关的 T M 电线杆编号，是 T P G C 零一八 零零一三吗？"
+  },
+  "TM_Mandarin_sample5.wav": {
+    "speaker": "TM_Mandarin",
+    "language": "zh",
+    "text": "Zainal 先生，本次促销活动的合约期限仅为至少二十四个月。"
+  },
+  "TM_Mandarin_reference.wav": {
+    "speaker": "TM_Mandarin",
+    "language": "zh",
+    "role": "reference voice prompt",
+    "text": "如果您未能在二十四小时内激活，则需要重新提交申请。",
+    "duration_s": 5.3
+  }
+}
