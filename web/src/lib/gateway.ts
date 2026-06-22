@@ -703,11 +703,12 @@ export const gateway = {
   getProxyHealth: (id: string) =>
     request<ProxyUpstreamHealth[]>(`/v1/proxy/${encodeURIComponent(id)}/health`),
   // ---- usage activity analytics (admin) ----
-  getActivity: (params: { since?: string; until?: string; tz?: string; top?: number } = {}) => {
+  getActivity: (params: { since?: string; until?: string; tz?: string; granularity?: string; top?: number } = {}) => {
     const q = new URLSearchParams();
     if (params.since) q.set("since", params.since);
     if (params.until) q.set("until", params.until);
     if (params.tz) q.set("tz", params.tz);
+    if (params.granularity) q.set("granularity", params.granularity);
     if (params.top != null) q.set("top", String(params.top));
     const s = q.toString();
     return request<ActivitySummary>(`/v1/history/activity${s ? `?${s}` : ""}`);

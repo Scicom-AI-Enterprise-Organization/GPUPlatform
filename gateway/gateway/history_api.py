@@ -734,22 +734,27 @@ def _tzinfo(tz: str):
         return timezone.utc
 
 
-def _day_key(dt: Optional[datetime], tzinfo) -> str:
+def _bucket_key(dt: Optional[datetime], tzinfo, gran: str) -> str:
     if dt is None:
         return "?"
     try:
-        return dt.astimezone(tzinfo).strftime("%Y-%m-%d")
+        d = dt.astimezone(tzinfo)
     except Exception:
-        return dt.strftime("%Y-%m-%d")
+        d = dt
+    if gran == "minute":
+        return d.strftime("%Y-%m-%dT%H:%M")
+    if gran == "day":
+        return d.strftime("%Y-%m-%d")
+    return d.strftime("%Y-%m-%dT%H:00")  # hour (default)
 
 
 class ActivityResponse(BaseModel):
     window: dict
     totals: dict
-    by_day: list[dict]
+    by_bucket: list[dict]
     by_model: list[dict]
     top_users: list[dict]
-    by_model_day: list[dict]
+    by_model_bucket: list[dict]
     note: str
 
 
@@ -787,7 +792,8 @@ async def history_activity(
     _: User = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
     since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
-    tz: str = Query("UTC", description="IANA timezone for per-day bucketing"),
+    tz: str = Query("UTC", description="IANA timezone for bucketing"),
+    granularity: str = Query("hour", pattern="^(minute|hour|day)$", description="time bucket size"),
     top: int = Query(10, ge=1, le=50, description="how many top users / models to return"),
 ):
     from collections import defaultdict
@@ -796,45 +802,53 @@ async def history_activity(
     u_dt = _parse_dt(until, "until")
     recs, capped = await _activity_records(session, s_dt, u_dt)
 
-    day = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
+    bkt = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                               "_ts": 0, "_tn": 0, "_ls": 0, "_ln": 0})  # ttft/latency sum+count
     by_model = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
     by_user = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
-    model_day = defaultdict(lambda: {"requests": 0, "tokens": 0})
+    model_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})
     ttfts, lats = [], []
     sum_pin = sum_pout = 0
     for (oid, ts, model, _src, pin, pout, ttft, lat) in recs:
         sum_pin += pin; sum_pout += pout
-        if ttft is not None: ttfts.append(ttft)
-        if lat is not None: lats.append(lat)
-        dk = _day_key(ts, tzinfo)
-        for bucket, key in ((day, dk), (by_model, model), (by_user, oid)):
-            b = bucket[key]; b["requests"] += 1; b["prompt_tokens"] += pin; b["completion_tokens"] += pout
-        md = model_day[(dk, model)]; md["requests"] += 1; md["tokens"] += pin + pout
+        k = _bucket_key(ts, tzinfo, granularity)
+        b = bkt[k]; b["requests"] += 1; b["prompt_tokens"] += pin; b["completion_tokens"] += pout
+        if ttft is not None: ttfts.append(ttft); b["_ts"] += ttft; b["_tn"] += 1
+        if lat is not None: lats.append(lat); b["_ls"] += lat; b["_ln"] += 1
+        m = by_model[model]; m["requests"] += 1; m["prompt_tokens"] += pin; m["completion_tokens"] += pout
+        u = by_user[oid]; u["requests"] += 1; u["prompt_tokens"] += pin; u["completion_tokens"] += pout
+        mb = model_bkt[(k, model)]; mb["requests"] += 1; mb["tokens"] += pin + pout
 
     umap = await _user_map(session, list(by_user.keys()))
     top_models = sorted(by_model.items(), key=lambda kv: kv[1]["requests"], reverse=True)[:top]
     top_names = {k for k, _ in top_models}
-    md2 = defaultdict(lambda: {"requests": 0, "tokens": 0})
-    for (dk, mdl), v in model_day.items():
-        kk = (dk, mdl if mdl in top_names else "other")
-        md2[kk]["requests"] += v["requests"]; md2[kk]["tokens"] += v["tokens"]
+    mb2 = defaultdict(lambda: {"requests": 0, "tokens": 0})
+    for (k, mdl), v in model_bkt.items():
+        kk = (k, mdl if mdl in top_names else "other")
+        mb2[kk]["requests"] += v["requests"]; mb2[kk]["tokens"] += v["tokens"]
     top_user_items = sorted(by_user.items(),
                             key=lambda kv: kv[1]["prompt_tokens"] + kv[1]["completion_tokens"], reverse=True)[:top]
+
+    def _bo(k, v):
+        return {"bucket": k, "requests": v["requests"], "prompt_tokens": v["prompt_tokens"],
+                "completion_tokens": v["completion_tokens"],
+                "avg_ttft_ms": int(v["_ts"] / v["_tn"]) if v["_tn"] else None,
+                "avg_latency_ms": int(v["_ls"] / v["_ln"]) if v["_ln"] else None}
+
     return ActivityResponse(
-        window={"since": _iso(s_dt), "until": _iso(u_dt), "tz": tz},
+        window={"since": _iso(s_dt), "until": _iso(u_dt), "tz": tz, "granularity": granularity},
         totals={
             "requests": len(recs), "prompt_tokens": sum_pin, "completion_tokens": sum_pout,
             "total_tokens": sum_pin + sum_pout,
             "avg_ttft_ms": int(sum(ttfts) / len(ttfts)) if ttfts else None,
             "avg_latency_ms": int(sum(lats) / len(lats)) if lats else None,
         },
-        by_day=[{"day": k, **v} for k, v in sorted(day.items())],
+        by_bucket=[_bo(k, v) for k, v in sorted(bkt.items())],
         by_model=[{"model": k, **v} for k, v in top_models],
         top_users=[{"user": _username(umap, oid), "owner_id": oid, **v} for oid, v in top_user_items],
-        by_model_day=[{"day": d, "model": m, **vv} for (d, m), vv in sorted(md2.items())],
-        note=("Unified serverless + LLM-proxy usage. Tokens come from vLLM `usage` (the "
-              "proxy sets include_usage so streams count too; serverless streams need it). "
-              "TTFT is recorded for streamed proxy requests; serverless TTFT is a follow-up."
+        by_model_bucket=[{"bucket": d, "model": m, **vv} for (d, m), vv in sorted(mb2.items())],
+        note=("Unified serverless + LLM-proxy usage. Tokens from vLLM `usage` (include_usage set "
+              "on streams). TTFT recorded for streamed requests."
               + (" ⚠ window truncated at the scan cap." if capped else "")))
 
 

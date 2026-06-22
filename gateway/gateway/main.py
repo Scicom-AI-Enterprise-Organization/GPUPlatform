@@ -3510,6 +3510,38 @@ async def _mirror_status_to_db(
     await session.commit()
 
 
+async def _record_stream_completion(request_id: str, ttft_ms: Optional[int],
+                                    pt: Optional[int], ct: Optional[int]) -> None:
+    """Stamp TTFT + token usage onto a streamed request's row. The streaming relay
+    doesn't go through the result:{id} poll/mirror, so without this a streamed
+    serverless request never records ttft/tokens/completed_at. Best-effort + guarded
+    so it never clobbers a richer output a later lazy-mirror writes."""
+    from datetime import datetime, timezone
+    try:
+        async with session_factory()() as s:
+            row = await s.get(ReqRow, request_id)
+            if row is None:
+                return
+            if ttft_ms is not None and row.ttft_ms is None:
+                row.ttft_ms = ttft_ms
+            if row.completed_at is None:
+                row.completed_at = datetime.now(timezone.utc)
+            if row.status not in ("completed", "failed", "cancelled", "timeout"):
+                row.status = "completed"
+            if pt is not None or ct is not None:
+                out = dict(row.output or {})
+                usage = dict(out.get("usage") or {})
+                if pt is not None:
+                    usage.setdefault("prompt_tokens", pt)
+                if ct is not None:
+                    usage.setdefault("completion_tokens", ct)
+                out["usage"] = usage
+                row.output = out
+            await s.commit()
+    except Exception:
+        logger.warning("stream completion record failed for %s", request_id, exc_info=True)
+
+
 async def _cancel_on_disconnect(
     rdb, request_id: str, app_id: Optional[str] = None, job_blob: Optional[str] = None
 ) -> None:
@@ -3784,6 +3816,13 @@ async def _openai_endpoint(
         return await _proxy_to_upstream(request, app_id, payload, vllm_path, proxy_timeout_s)
 
     is_stream = bool(payload.get("stream"))
+    if is_stream:
+        # Ask vLLM for a final usage chunk so streamed requests record token counts
+        # too (the worker forwards the body verbatim; the relay below parses + stores
+        # it). Don't clobber a caller's own stream_options.
+        _so = dict(payload.get("stream_options") or {})
+        _so.setdefault("include_usage", True)
+        payload = {**payload, "stream_options": _so}
     request_id, timeout_s = await _admit_and_enqueue(
         rdb, db_session, app_id, user, payload, stream=is_stream, endpoint=vllm_path,
         target_model=target_model,
@@ -3834,17 +3873,28 @@ async def _openai_endpoint(
     channel = f"stream:{request_id}"
     pubsub = rdb.pubsub()
     await pubsub.subscribe(channel)
+    _t0 = time.perf_counter()
 
     async def gen():
         finished = False
+        ttft_ms: Optional[int] = None
+        pt = ct = None
         try:
             async for msg in pubsub.listen():
                 if msg.get("type") != "message":
                     continue
                 data = msg["data"]
+                if ttft_ms is None:
+                    ttft_ms = int((time.perf_counter() - _t0) * 1000)  # time-to-first-token
                 yield f"data: {data}\n\n"
                 try:
                     parsed = json.loads(data)
+                    us = parsed.get("usage")
+                    if isinstance(us, dict):
+                        if us.get("prompt_tokens") is not None:
+                            pt = us["prompt_tokens"]
+                        if us.get("completion_tokens") is not None:
+                            ct = us["completion_tokens"]
                     if parsed.get("done") or parsed.get("error"):
                         finished = True
                         break
@@ -3852,7 +3902,10 @@ async def _openai_endpoint(
                     continue
             yield "data: [DONE]\n\n"
         finally:
-            if not finished:
+            if finished:
+                # Stamp ttft/tokens/completed onto the row (detached — we may be mid-aclose).
+                asyncio.create_task(_record_stream_completion(request_id, ttft_ms, pt, ct))
+            else:
                 await _cancel_on_disconnect(rdb, request_id, app_id)
             await pubsub.unsubscribe(channel)
             await pubsub.aclose()
