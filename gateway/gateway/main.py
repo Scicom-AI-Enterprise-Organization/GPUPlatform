@@ -226,6 +226,7 @@ class AppRecord(BaseModel):
     container_disk_gb: Optional[int] = None
     volume_gb: Optional[int] = None
     provider_id: Optional[str] = None
+    provider_name: Optional[str] = None  # resolved on the single-app GET (the VM/cloud account name)
     mode: str = "single"
     models: Optional[list[MultiModelMember]] = None
     sleep_level: int = 1
@@ -1906,7 +1907,16 @@ async def get_app_endpoint(
     session: AsyncSession = Depends(get_session),
 ):
     app = await _load_owned_app(session, app_id, user, allow_public=True)
-    return _to_app_record(app, redacted=not _viewer_is_owner(app, user))
+    redacted = not _viewer_is_owner(app, user)
+    rec = _to_app_record(app, redacted=redacted)
+    # Resolve the provider's human name (e.g. the VM "tm-2") for the detail page.
+    # Single-app GET only — keeps the list endpoint free of an N+1 lookup.
+    if not redacted and getattr(app, "provider_id", None):
+        from .db import Provider
+        prov = await session.get(Provider, app.provider_id)
+        if prov is not None:
+            rec.provider_name = prov.name
+    return rec
 
 
 class SetAppVisibilityRequest(BaseModel):

@@ -626,9 +626,28 @@ async def init_db() -> None:
         max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "20") or "20"),
         pool_timeout=float(os.environ.get("DB_POOL_TIMEOUT_S", "10") or "10"),
         pool_recycle=int(os.environ.get("DB_POOL_RECYCLE_S", "1800") or "1800"),
+        connect_args={
+            "server_settings": {
+                # Reap any session left idle-in-transaction — e.g. a redeployed/killed
+                # gateway pod whose in-flight txn still holds ACCESS SHARE on a hot
+                # table (a leaked SSE get_session). Postgres won't reap a dead pod's
+                # TCP connection for a long time, so without this its lock blocks the
+                # next boot's ALTER TABLE migrations forever ("stuck initializing
+                # postgres" → manual Postgres restart). Now the holder self-clears.
+                "idle_in_transaction_session_timeout":
+                    os.environ.get("DB_IDLE_IN_TXN_TIMEOUT_MS", "120000") or "120000",
+            },
+        },
     )
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     async with _engine.begin() as conn:
+        # Backstop so an idempotent ALTER can't hang forever waiting on ACCESS
+        # EXCLUSIVE (a conflicting lock from a just-killed pod). Set > the
+        # idle-in-txn reap above so the holder self-clears first and the migration
+        # then proceeds; if something genuinely holds the lock longer, we fail
+        # loudly (→ restart + retry) instead of hanging until someone bounces PG.
+        _lock_ms = int(os.environ.get("DB_MIGRATION_LOCK_TIMEOUT_MS", "150000") or "150000")
+        await conn.execute(text(f"SET LOCAL lock_timeout = {_lock_ms}"))
         await conn.run_sync(Base.metadata.create_all)
         # Idempotent column adds for in-place upgrades — Base.metadata.create_all
         # only creates missing tables, not missing columns on existing ones.

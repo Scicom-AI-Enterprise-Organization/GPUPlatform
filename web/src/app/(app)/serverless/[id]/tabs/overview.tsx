@@ -167,6 +167,12 @@ function VmServingCard({ app, readOnly = false }: { app: AppRecord; readOnly?: b
         )}
       </CardHeader>
       <CardContent className="space-y-3 text-sm">
+        {(app.provider_name || app.provider_id) && (
+          <Row
+            label="VM"
+            value={<code className="font-mono">{app.provider_name ?? app.provider_id}</code>}
+          />
+        )}
         <Row label="Mode" value={isProxy ? "Single model · direct proxy" : "Multi-model (always-on)"} />
         <Row label="Models" value={<code className="font-mono">{models.length}</code>} />
         <Row label="GPUs" value={<code className="font-mono">{gpuIds || `×${app.gpu_count ?? 0}`}</code>} />

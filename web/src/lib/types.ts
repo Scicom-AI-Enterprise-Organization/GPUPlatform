@@ -43,6 +43,7 @@ export type AppRecord = {
   container_disk_gb?: number | null;
   volume_gb?: number | null;
   provider_id?: string | null;
+  provider_name?: string | null;
   mode?: ServingMode;
   models?: MultiModelMember[] | null;
   sleep_level?: number;
