@@ -50,7 +50,7 @@ export async function deployEndpoint(input: CreateAppRequest): Promise<DeployRes
 
 export async function updateAutoscaler(
   appId: string,
-  patch: Partial<{ max_containers: number; tasks_per_container: number; idle_timeout_s: number; worker_ttl_s: number; vllm_args: string }>,
+  patch: Partial<{ max_containers: number; tasks_per_container: number; idle_timeout_s: number; worker_ttl_s: number; vllm_args: string; request_timeout_s: number }>,
 ): Promise<DeployResult> {
   try {
     await gateway.updateAutoscaler(appId, patch);

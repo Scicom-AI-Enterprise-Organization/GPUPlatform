@@ -107,6 +107,7 @@ class UpdateAutoscalerRequest(BaseModel):
     worker_ttl_s: Optional[int] = None
     vllm_args: Optional[str] = None
     gpu_count: Optional[int] = None
+    request_timeout_s: Optional[int] = None
 
 
 class MultiModelMember(BaseModel):
@@ -2240,6 +2241,11 @@ async def update_app_autoscaler(
         if new_count < 1 or new_count > 8:
             raise HTTPException(status_code=400, detail="gpu_count must be 1..8")
         target.gpu_count = new_count
+    if "request_timeout_s" in updates:
+        rt = int(updates["request_timeout_s"])
+        if rt < 1 or rt > 86400:
+            raise HTTPException(status_code=400, detail="request_timeout_s must be 1..86400 seconds")
+        target.request_timeout_s = rt
     await session.commit()
     await session.refresh(target)
     # Reset the idle clock when idle_timeout_s changes — otherwise switching

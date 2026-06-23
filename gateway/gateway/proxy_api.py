@@ -114,7 +114,9 @@ class UpstreamSpec(BaseModel):
 class CreateProxyRequest(BaseModel):
     name: str
     max_concurrency: int = 0              # 0 = unlimited (no queue)
-    timeout_s: int = 600
+    # Same source as the runtime fallback (DEFAULT_TIMEOUT_S) so the per-endpoint
+    # "Timeout (s)" default and the fallback can't drift — change the constant once.
+    timeout_s: int = int(DEFAULT_TIMEOUT_S)
     enabled: bool = True
     public: bool = False
     upstreams: list[UpstreamSpec] = []

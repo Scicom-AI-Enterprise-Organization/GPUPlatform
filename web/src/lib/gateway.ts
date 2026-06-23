@@ -200,7 +200,7 @@ export const gateway = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  updateAutoscaler: (id: string, body: Partial<{ max_containers: number; tasks_per_container: number; idle_timeout_s: number; vllm_args: string }>) =>
+  updateAutoscaler: (id: string, body: Partial<{ max_containers: number; tasks_per_container: number; idle_timeout_s: number; vllm_args: string; request_timeout_s: number }>) =>
     request<AppRecord>(`/apps/${encodeURIComponent(id)}/autoscaler`, {
       method: "PATCH",
       body: JSON.stringify(body),

@@ -59,7 +59,7 @@ export function OverviewTab({ app, readOnly = false }: { app: AppRecord; readOnl
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <DetailCard app={app} />
-        {(isMulti || isProxy) && isVm ? <VmServingCard app={app} /> : <ScaleStrategyCard app={app} readOnly={readOnly} />}
+        {(isMulti || isProxy) && isVm ? <VmServingCard app={app} readOnly={readOnly} /> : <ScaleStrategyCard app={app} readOnly={readOnly} />}
       </div>
 
       {isMulti || isProxy ? <MultiModelArgsCard app={app} readOnly={readOnly} /> : <EngineArgsCard app={app} readOnly={readOnly} />}
@@ -110,19 +110,82 @@ function EnvVarsCard({ app }: { app: AppRecord }) {
 // Multi-model VM serving: a single fixed node, always-on, GPU-pinned, with
 // idle models evicted via vLLM sleep/wake. Read-only — there's nothing to
 // autoscale.
-function VmServingCard({ app }: { app: AppRecord }) {
+function VmServingCard({ app, readOnly = false }: { app: AppRecord; readOnly?: boolean }) {
+  const router = useRouter();
   const models = app.models ?? [];
   const gpuIds = (app.visible_devices ?? "").trim();
   const isProxy = app.mode === "proxy";
+  const [editing, setEditing] = useState(false);
+  const [reqTimeoutInput, setReqTimeoutInput] = useState(String(app.request_timeout_s));
+  const [pending, startTransition] = useTransition();
+
+  const parsedReqTimeout = Number.parseInt(reqTimeoutInput, 10);
+  const reqTimeoutInvalid =
+    !/^\d+$/.test(reqTimeoutInput.trim()) || !Number.isFinite(parsedReqTimeout) || parsedReqTimeout < 1 || parsedReqTimeout > 86400;
+
+  function save() {
+    if (reqTimeoutInvalid) {
+      toast.error("Request timeout must be an integer 1–86400 seconds.", { duration: 5000 });
+      return;
+    }
+    startTransition(async () => {
+      const res = await updateAutoscaler(app.app_id, { request_timeout_s: parsedReqTimeout });
+      if (!res.ok) {
+        toast.error(res.error, { duration: 5000 });
+        return;
+      }
+      toast.success("Request timeout updated", { duration: 3000 });
+      setEditing(false);
+      router.refresh();
+    });
+  }
+
+  function cancel() {
+    setReqTimeoutInput(String(app.request_timeout_s));
+    setEditing(false);
+  }
+
   return (
     <Card>
-      <CardHeader>
+      <CardHeader className="flex-row items-center justify-between gap-2">
         <CardTitle className="text-sm font-medium">VM serving</CardTitle>
+        {readOnly ? null : !editing ? (
+          <Button variant="outline" size="xs" onClick={() => { setReqTimeoutInput(String(app.request_timeout_s)); setEditing(true); }}>
+            <Pencil className="h-3 w-3" />
+            Edit
+          </Button>
+        ) : (
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="xs" onClick={cancel} disabled={pending}>
+              Cancel
+            </Button>
+            <Button size="xs" onClick={save} disabled={pending || reqTimeoutInvalid}>
+              {pending && <Loader2 className="h-3 w-3 animate-spin" />}
+              Save
+            </Button>
+          </div>
+        )}
       </CardHeader>
       <CardContent className="space-y-3 text-sm">
         <Row label="Mode" value={isProxy ? "Single model · direct proxy" : "Multi-model (always-on)"} />
         <Row label="Models" value={<code className="font-mono">{models.length}</code>} />
         <Row label="GPUs" value={<code className="font-mono">{gpuIds || `×${app.gpu_count ?? 0}`}</code>} />
+        {editing ? (
+          <EditRow label="Request timeout (s)">
+            <Input
+              type="text"
+              inputMode="numeric"
+              value={reqTimeoutInput}
+              onChange={(e) => setReqTimeoutInput(e.target.value)}
+              placeholder="1–86400"
+              aria-invalid={reqTimeoutInvalid}
+              className="h-8 w-24 text-right font-mono"
+              disabled={pending}
+            />
+          </EditRow>
+        ) : (
+          <Row label="Request timeout" value={<code className="font-mono">{app.request_timeout_s} s</code>} />
+        )}
         {!isProxy && <Row label="Eviction" value={`Sleep/wake · level ${app.sleep_level ?? 1}`} />}
         {isProxy && <Row label="Routing" value="Forward tunnel · no queue, no sleep" />}
         {app.vllm_version && !app.vllm_install_args && (
@@ -940,19 +1003,24 @@ function ScaleStrategyCard({ app, readOnly = false }: { app: AppRecord; readOnly
   const [editing, setEditing] = useState(false);
   const [maxInput, setMaxInput] = useState(String(app.autoscaler.max_containers));
   const [idleInput, setIdleInput] = useState(String(app.autoscaler.idle_timeout_s));
+  const [reqTimeoutInput, setReqTimeoutInput] = useState(String(app.request_timeout_s));
   const [pending, startTransition] = useTransition();
 
   useEffect(() => {
     setMaxInput(String(app.autoscaler.max_containers));
     setIdleInput(String(app.autoscaler.idle_timeout_s));
-  }, [app.autoscaler.max_containers, app.autoscaler.idle_timeout_s]);
+    setReqTimeoutInput(String(app.request_timeout_s));
+  }, [app.autoscaler.max_containers, app.autoscaler.idle_timeout_s, app.request_timeout_s]);
 
   const parsedMax = Number.parseInt(maxInput, 10);
   const parsedIdle = Number.parseInt(idleInput, 10);
+  const parsedReqTimeout = Number.parseInt(reqTimeoutInput, 10);
   const maxInvalid =
     !/^\d+$/.test(maxInput.trim()) || !Number.isFinite(parsedMax) || parsedMax < 1 || parsedMax > 20;
   const idleInvalid =
     !/^\d+$/.test(idleInput.trim()) || !Number.isFinite(parsedIdle) || parsedIdle < 0 || parsedIdle > 86400;
+  const reqTimeoutInvalid =
+    !/^\d+$/.test(reqTimeoutInput.trim()) || !Number.isFinite(parsedReqTimeout) || parsedReqTimeout < 1 || parsedReqTimeout > 86400;
 
   function save() {
     if (maxInvalid) {
@@ -963,10 +1031,15 @@ function ScaleStrategyCard({ app, readOnly = false }: { app: AppRecord; readOnly
       toast.error("Idle timeout must be an integer 0–86400 seconds (0 = always-on, { duration: 5000 }).");
       return;
     }
+    if (reqTimeoutInvalid) {
+      toast.error("Request timeout must be an integer 1–86400 seconds.", { duration: 5000 });
+      return;
+    }
     startTransition(async () => {
       const res = await updateAutoscaler(app.app_id, {
         max_containers: parsedMax,
         idle_timeout_s: parsedIdle,
+        request_timeout_s: parsedReqTimeout,
       });
       if (!res.ok) {
         toast.error(res.error, { duration: 5000 });
@@ -981,6 +1054,7 @@ function ScaleStrategyCard({ app, readOnly = false }: { app: AppRecord; readOnly
   function cancel() {
     setMaxInput(String(app.autoscaler.max_containers));
     setIdleInput(String(app.autoscaler.idle_timeout_s));
+    setReqTimeoutInput(String(app.request_timeout_s));
     setEditing(false);
   }
 
@@ -1001,7 +1075,7 @@ function ScaleStrategyCard({ app, readOnly = false }: { app: AppRecord; readOnly
             <Button
               size="xs"
               onClick={save}
-              disabled={pending || maxInvalid || idleInvalid}
+              disabled={pending || maxInvalid || idleInvalid || reqTimeoutInvalid}
             >
               {pending && <Loader2 className="h-3 w-3 animate-spin" />}
               Save
@@ -1037,6 +1111,18 @@ function ScaleStrategyCard({ app, readOnly = false }: { app: AppRecord; readOnly
                 disabled={pending}
               />
             </EditRow>
+            <EditRow label="Request timeout (s)">
+              <Input
+                type="text"
+                inputMode="numeric"
+                value={reqTimeoutInput}
+                onChange={(e) => setReqTimeoutInput(e.target.value)}
+                placeholder="1–86400"
+                aria-invalid={reqTimeoutInvalid}
+                className="h-8 w-24 text-right font-mono"
+                disabled={pending}
+              />
+            </EditRow>
           </>
         ) : (
           <>
@@ -1047,6 +1133,10 @@ function ScaleStrategyCard({ app, readOnly = false }: { app: AppRecord; readOnly
             <Row
               label="Idle timeout"
               value={<code className="font-mono">{app.autoscaler.idle_timeout_s} s</code>}
+            />
+            <Row
+              label="Request timeout"
+              value={<code className="font-mono">{app.request_timeout_s} s</code>}
             />
           </>
         )}
