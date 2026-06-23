@@ -128,6 +128,7 @@ postgres:
   metrics:
     enabled: true                # runs the exporter; needs metrics.serviceMonitor.enabled=true to actually be scraped
     image: quay.io/prometheuscommunity/postgres-exporter:v0.19.1
+    pullPolicy: IfNotPresent      # the exporter's own image (NOT image.pullPolicy, which is the gateway's)
     # Connects with the app's own POSTGRES_USER/PASSWORD (read from the
     # <fullname>-postgres-auth secret). For least-privilege, create a dedicated
     # role granted pg_monitor and point a separate secret at it instead.

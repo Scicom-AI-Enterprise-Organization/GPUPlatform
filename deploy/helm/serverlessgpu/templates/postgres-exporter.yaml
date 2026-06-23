@@ -48,7 +48,10 @@ spec:
       containers:
         - name: postgres-exporter
           image: {{ .Values.postgres.metrics.image | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # NOT .Values.image.pullPolicy — that's the gateway image's policy; the
+          # e2e sets it to Never for the side-loaded gateway, which would wedge this
+          # (un-sideloaded) quay.io image as ErrImageNeverPull.
+          imagePullPolicy: {{ .Values.postgres.metrics.pullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 9187
               name: metrics
