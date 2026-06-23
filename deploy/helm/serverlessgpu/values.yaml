@@ -119,6 +119,26 @@ postgres:
     limits:
       cpu: 1000m
       memory: 1Gi
+  # Prometheus postgres_exporter — a small standalone Deployment (NOT a sidecar,
+  # so it never restarts the DB) that connects to the postgres Service and
+  # exposes engine metrics (pg_up, connections, txn rates, locks, replication,
+  # db/table sizes, …) at :9187/metrics. The cluster's Grafana Alloy
+  # auto-discovers the ServiceMonitor below (gated on metrics.serviceMonitor.enabled
+  # + the monitoring.coreos.com CRDs) and ships it to VictoriaMetrics.
+  metrics:
+    enabled: true                # runs the exporter; needs metrics.serviceMonitor.enabled=true to actually be scraped
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.19.1
+    # Connects with the app's own POSTGRES_USER/PASSWORD (read from the
+    # <fullname>-postgres-auth secret). For least-privilege, create a dedicated
+    # role granted pg_monitor and point a separate secret at it instead.
+    sslmode: disable             # in-cluster postgres:16-alpine has no TLS
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
 
 redis:
   enabled: true

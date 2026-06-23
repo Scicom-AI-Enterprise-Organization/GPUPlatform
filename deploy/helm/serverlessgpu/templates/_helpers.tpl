@@ -34,6 +34,11 @@ app.kubernetes.io/name: {{ include "serverlessgpu.name" . }}
 app.kubernetes.io/component: postgres
 {{- end -}}
 
+{{- define "serverlessgpu.postgres-exporter.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "serverlessgpu.name" . }}
+app.kubernetes.io/component: postgres-exporter
+{{- end -}}
+
 {{- define "serverlessgpu.web.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "serverlessgpu.name" . }}
 app.kubernetes.io/component: web

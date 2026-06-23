@@ -5,5 +5,5 @@ description: |
   externally on Prime Intellect (provisioned by the gateway's autoscaler) —
   this chart does NOT spin up GPU pods inside your cluster.
 type: application
-version: 0.2.0
+version: 0.3.0
 appVersion: "0.2.0"
