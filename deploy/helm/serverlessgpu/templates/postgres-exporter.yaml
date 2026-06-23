@@ -1,0 +1,108 @@
+{{- if and .Values.postgres.enabled .Values.postgres.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "serverlessgpu.fullname" . }}-postgres-exporter
+  labels:
+    {{- include "serverlessgpu.labels" . | nindent 4 }}
+    {{- include "serverlessgpu.postgres-exporter.selectorLabels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9187
+      targetPort: metrics
+      name: metrics
+  selector:
+    {{- include "serverlessgpu.postgres-exporter.selectorLabels" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "serverlessgpu.fullname" . }}-postgres-exporter
+  labels:
+    {{- include "serverlessgpu.labels" . | nindent 4 }}
+    {{- include "serverlessgpu.postgres-exporter.selectorLabels" . | nindent 4 }}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      {{- include "serverlessgpu.postgres-exporter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "serverlessgpu.postgres-exporter.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.image.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres-exporter
+          image: {{ .Values.postgres.metrics.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 9187
+              name: metrics
+          env:
+            # Split DSN form: URI carries no credentials (kept out of the
+            # rendered manifest); user/pass come from the postgres-auth secret.
+            - name: DATA_SOURCE_URI
+              value: "{{ include "serverlessgpu.fullname" . }}-postgres:5432/{{ .Values.postgres.database }}?sslmode={{ .Values.postgres.metrics.sslmode }}"
+            - name: DATA_SOURCE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "serverlessgpu.fullname" . }}-postgres-auth
+                  key: POSTGRES_USER
+            - name: DATA_SOURCE_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "serverlessgpu.fullname" . }}-postgres-auth
+                  key: POSTGRES_PASSWORD
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet: { path: /, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.postgres.metrics.resources | nindent 12 }}
+{{- if and .Values.metrics.serviceMonitor.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "serverlessgpu.fullname" . }}-postgres-exporter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "serverlessgpu.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-exporter
+spec:
+  selector:
+    matchLabels:
+      {{- include "serverlessgpu.postgres-exporter.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval | default "30s" }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout | default "10s" }}
+{{- end }}
+{{- end }}
