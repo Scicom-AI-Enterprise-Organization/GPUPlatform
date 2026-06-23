@@ -486,6 +486,12 @@ async def lifespan(app: FastAPI):
     await seed_admin_user()
     logger.info("postgres ready")
 
+    # Background batch-writer for per-request stats (TTFT/tokens/latency/status).
+    # Handlers enqueue (non-blocking) instead of each opening a pooled connection
+    # to commit — under load the per-completion connections exhausted the pool.
+    from . import stats_writer
+    stats_writer.start(session_factory())
+
     # Warm the global-secret cache so sync credential resolvers (S3 key refs)
     # never see a cold cache before the first async load_global_env runs.
     try:
@@ -657,6 +663,12 @@ async def lifespan(app: FastAPI):
                 pass
         if app.state.provider:
             await app.state.provider.shutdown()
+        # Flush any queued stats before the engine is disposed.
+        try:
+            from . import stats_writer
+            await stats_writer.stop()
+        except Exception:  # noqa: BLE001
+            pass
         await app.state.redis.aclose()
         await shutdown_db()
 
@@ -3510,36 +3522,17 @@ async def _mirror_status_to_db(
     await session.commit()
 
 
-async def _record_stream_completion(request_id: str, ttft_ms: Optional[int],
-                                    pt: Optional[int], ct: Optional[int]) -> None:
+def _record_stream_completion(request_id: str, ttft_ms: Optional[int],
+                              pt: Optional[int], ct: Optional[int],
+                              latency_ms: Optional[int] = None) -> None:
     """Stamp TTFT + token usage onto a streamed request's row. The streaming relay
     doesn't go through the result:{id} poll/mirror, so without this a streamed
-    serverless request never records ttft/tokens/completed_at. Best-effort + guarded
-    so it never clobbers a richer output a later lazy-mirror writes."""
-    from datetime import datetime, timezone
-    try:
-        async with session_factory()() as s:
-            row = await s.get(ReqRow, request_id)
-            if row is None:
-                return
-            if ttft_ms is not None and row.ttft_ms is None:
-                row.ttft_ms = ttft_ms
-            if row.completed_at is None:
-                row.completed_at = datetime.now(timezone.utc)
-            if row.status not in ("completed", "failed", "cancelled", "timeout"):
-                row.status = "completed"
-            if pt is not None or ct is not None:
-                out = dict(row.output or {})
-                usage = dict(out.get("usage") or {})
-                if pt is not None:
-                    usage.setdefault("prompt_tokens", pt)
-                if ct is not None:
-                    usage.setdefault("completion_tokens", ct)
-                out["usage"] = usage
-                row.output = out
-            await s.commit()
-    except Exception:
-        logger.warning("stream completion record failed for %s", request_id, exc_info=True)
+    serverless request never records ttft/tokens/completed_at. Enqueued to the
+    batch stats writer (non-blocking) instead of opening a DB connection per
+    completion — under load that exhausted the pool and wedged the gateway.
+    `latency_ms` (stream duration) is used only to derive the TPS metric."""
+    from . import stats_writer
+    stats_writer.record_stream_completion(request_id, ttft_ms, pt, ct, latency_ms)
 
 
 async def _cancel_on_disconnect(
@@ -3903,8 +3896,11 @@ async def _openai_endpoint(
             yield "data: [DONE]\n\n"
         finally:
             if finished:
-                # Stamp ttft/tokens/completed onto the row (detached — we may be mid-aclose).
-                asyncio.create_task(_record_stream_completion(request_id, ttft_ms, pt, ct))
+                # Enqueue ttft/tokens/latency/completed for the batch writer (non-blocking, no DB).
+                # latency = full stream duration from dispatch; the writer derives TPS
+                # from (latency - ttft) and emits the serverless TTFT/TPS histograms.
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                _record_stream_completion(request_id, ttft_ms, pt, ct, latency_ms)
             else:
                 await _cancel_on_disconnect(rdb, request_id, app_id)
             await pubsub.unsubscribe(channel)

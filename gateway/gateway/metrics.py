@@ -96,6 +96,15 @@ _LATENCY_BUCKETS = (
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
     10.0, 30.0, 60.0, 120.0, float("inf"),
 )
+# Shared by the serverless + proxy TTFT/TPS histograms. TTFT (seconds) spans
+# sub-100ms to cold-start tens-of-seconds; TPS is output throughput (completion
+# tokens / generation time).
+_TTFT_BUCKETS = (
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0, 120.0, float("inf"),
+)
+_TPS_BUCKETS = (
+    1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 500.0, float("inf"),
+)
 
 # Label is `route` (not `endpoint`): the kube scrape attaches its own target
 # label `endpoint` = the Service port name ("http"), which would shadow an app
@@ -119,6 +128,36 @@ HTTP_REQUEST_DURATION = Histogram(
     buckets=_LATENCY_BUCKETS,
     registry=_registry,
 )
+
+# Streamed-inference quality metrics, gateway-observed per request (the stream
+# relay measures time-to-first-token and the generation window). Labelled by app
+# + the model alias the client sent, so a multi-model fleet splits per member.
+_STREAM_LABELS = ["app_id", "model"]
+SERVERLESS_TTFT = Histogram(
+    "serverless_ttft_seconds",
+    "Serverless time-to-first-token (streamed requests)",
+    _STREAM_LABELS,
+    buckets=_TTFT_BUCKETS,
+    registry=_registry,
+)
+SERVERLESS_TPS = Histogram(
+    "serverless_tokens_per_second",
+    "Serverless output throughput (completion tokens / generation time)",
+    _STREAM_LABELS,
+    buckets=_TPS_BUCKETS,
+    registry=_registry,
+)
+
+
+def observe_serverless_stream(
+    app_id: str, model: str, ttft_s: float | None = None, tps: float | None = None
+) -> None:
+    """Record a completed streamed serverless request's TTFT / output throughput.
+    Both are optional (None → not observed); only meaningful for completed streams."""
+    if ttft_s is not None:
+        SERVERLESS_TTFT.labels(app_id=app_id, model=model or "").observe(ttft_s)
+    if tps is not None:
+        SERVERLESS_TPS.labels(app_id=app_id, model=model or "").observe(tps)
 
 # Job OUTCOMES, as opposed to HTTP statuses: async requests (/run/{app_id})
 # return HTTP 200 at enqueue, so a job that later fails/times out (worker died,
@@ -182,7 +221,7 @@ def render_app(app_id: str) -> bytes:
 
     class _AppFilter:
         def collect(self):
-            for metric in (HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION):
+            for metric in (HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION, SERVERLESS_TTFT, SERVERLESS_TPS):
                 for mf in metric.collect():
                     samples = [s for s in mf.samples if s.labels.get("app_id") == app_id]
                     if not samples:
@@ -214,19 +253,39 @@ PROXY_REQUEST_DURATION = Histogram(
     buckets=_LATENCY_BUCKETS,
     registry=_registry,
 )
+PROXY_TTFT = Histogram(
+    "proxy_ttft_seconds",
+    "LLM-proxy time-to-first-token (streamed requests)",
+    ["proxy", "model"],
+    buckets=_TTFT_BUCKETS,
+    registry=_registry,
+)
+PROXY_TPS = Histogram(
+    "proxy_tokens_per_second",
+    "LLM-proxy output throughput (completion tokens / generation time)",
+    ["proxy", "model"],
+    buckets=_TPS_BUCKETS,
+    registry=_registry,
+)
 
 
 def observe_proxy(
-    proxy: str, model: str, upstream: str, status: str, duration_s: float | None = None
+    proxy: str, model: str, upstream: str, status: str, duration_s: float | None = None,
+    ttft_s: float | None = None, tps: float | None = None,
 ) -> None:
-    """Record one proxied request: bump the outcome counter and, when the request
-    actually ran (latency known), observe its latency. `proxy` is the endpoint id;
-    `status` is the terminal state (completed / failed / cancelled / timeout / …)."""
+    """Record one proxied request: bump the outcome counter and, when known, observe
+    its latency / time-to-first-token / output throughput. `proxy` is the endpoint id;
+    `status` is the terminal state (completed / failed / cancelled / timeout / …).
+    ttft_s/tps are only meaningful for completed requests (None otherwise)."""
     PROXY_REQUESTS_TOTAL.labels(
         proxy=proxy, model=model or "", upstream=upstream or "", status=status
     ).inc()
     if duration_s is not None:
         PROXY_REQUEST_DURATION.labels(proxy=proxy, model=model or "").observe(duration_s)
+    if ttft_s is not None:
+        PROXY_TTFT.labels(proxy=proxy, model=model or "").observe(ttft_s)
+    if tps is not None:
+        PROXY_TPS.labels(proxy=proxy, model=model or "").observe(tps)
 
 
 def render_proxy(proxy: str) -> bytes:
@@ -235,7 +294,7 @@ def render_proxy(proxy: str) -> bytes:
 
     class _ProxyFilter:
         def collect(self):
-            for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION):
+            for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION, PROXY_TTFT, PROXY_TPS):
                 for mf in metric.collect():
                     samples = [s for s in mf.samples if s.labels.get("proxy") == proxy]
                     if not samples:

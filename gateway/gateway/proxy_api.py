@@ -382,36 +382,17 @@ async def _finish(request_id: str, status: str, *, status_code: Optional[int] = 
                   latency_ms: Optional[int] = None, pt: Optional[int] = None,
                   ct: Optional[int] = None, error: Optional[str] = None,
                   upstream: Optional[str] = None, ttft_ms: Optional[int] = None) -> None:
-    async with session_factory()() as s:
-        row = await s.get(ProxyRequest, request_id)
-        if row is None:
-            return
-        row.status = status
-        if status_code is not None:
-            row.status_code = status_code
-        if latency_ms is not None:
-            row.latency_ms = latency_ms
-        if ttft_ms is not None:
-            row.ttft_ms = ttft_ms
-        if pt is not None:
-            row.prompt_tokens = pt
-        if ct is not None:
-            row.completion_tokens = ct
-        if upstream:
-            row.upstream = upstream
-        if error:
-            row.error_text = error[:2048]
-        row.completed_at = datetime.now(timezone.utc)
-        await s.commit()
-        # Per-proxy Prometheus metric (served at GET /proxy/{name}/metrics).
-        try:
-            from . import metrics as _metrics
-            _metrics.observe_proxy(
-                row.endpoint_id, row.model, (upstream or row.upstream or ""), status,
-                (latency_ms / 1000.0) if latency_ms is not None else None,
-            )
-        except Exception:
-            pass
+    """Record a proxied request's terminal outcome (status / latency / TTFT / tokens)
+    + its per-proxy Prometheus metric. Enqueued to the batch stats writer rather
+    than committed inline: opening a pooled connection per completion exhausted the
+    DB pool under load and wedged the gateway. Still `async def` so every existing
+    `await _finish(...)` / `create_task(_finish(...))` call site is unchanged; the
+    DB write + metric now happen in the writer's batched flush (parity preserved)."""
+    from . import stats_writer
+    stats_writer.record_proxy_finish(
+        request_id, status, status_code=status_code, latency_ms=latency_ms,
+        pt=pt, ct=ct, error=error, upstream=upstream, ttft_ms=ttft_ms,
+    )
 
 
 # ---------- forwarding engine ------------------------------------------------

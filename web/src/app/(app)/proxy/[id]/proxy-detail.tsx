@@ -14,6 +14,7 @@ import type { ProxyEndpoint, ProxyRequest, ProxyUpstreamHealth } from "@/lib/typ
 import { BaseUrlToggle, type UrlTarget } from "@/components/console/base-url-toggle";
 import { ProxyPlayground } from "./proxy-playground";
 import { ProxyStress } from "./proxy-stress";
+import { ProxyMetricsTab } from "./proxy-metrics";
 
 const POLL_MS = 4000;
 const TABS = [
@@ -21,6 +22,7 @@ const TABS = [
   { value: "playground", label: "Playground" },
   { value: "stress", label: "Stress test" },
   { value: "queue", label: "Queue" },
+  { value: "metrics", label: "Metrics" },
 ] as const;
 const BUCKETS = ["queued", "running", "completed", "cancelled", "failed"] as const;
 type ProxyTab = (typeof TABS)[number]["value"];
@@ -303,6 +305,11 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
         {/* ---- Playground ---- */}
         <TabsContent value="playground">
           <ProxyPlayground name={ep.name} aliases={aliases} baseUrl={baseUrl} />
+        </TabsContent>
+
+        {/* ---- Metrics ---- */}
+        <TabsContent value="metrics">
+          <ProxyMetricsTab ep={ep} />
         </TabsContent>
 
         {/* ---- Stress test ---- */}

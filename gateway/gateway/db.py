@@ -614,7 +614,19 @@ async def init_db() -> None:
     from . import compute  # noqa: F401
     from . import training_api  # noqa: F401
     from . import proxy_api  # noqa: F401  # registers ProxyEndpoint / ProxyRequest
-    _engine = create_async_engine(get_database_url(), pool_pre_ping=True)
+    # Explicit pool sizing — the SQLAlchemy async default (pool_size=5,
+    # max_overflow=10 → 15 conns, pool_timeout=30s) is small; under load a burst
+    # of concurrent requests exhausted it and every new checkout blocked 30s,
+    # wedging the gateway. pool_recycle also evicts connections idle past the prod
+    # Redis/PG ELB timeout. All tunable via env.
+    _engine = create_async_engine(
+        get_database_url(),
+        pool_pre_ping=True,
+        pool_size=int(os.environ.get("DB_POOL_SIZE", "20") or "20"),
+        max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "20") or "20"),
+        pool_timeout=float(os.environ.get("DB_POOL_TIMEOUT_S", "10") or "10"),
+        pool_recycle=int(os.environ.get("DB_POOL_RECYCLE_S", "1800") or "1800"),
+    )
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

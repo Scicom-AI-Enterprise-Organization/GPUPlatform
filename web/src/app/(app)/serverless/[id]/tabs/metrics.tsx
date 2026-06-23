@@ -23,7 +23,7 @@ import type { AppRecord } from "@/lib/types";
 // holds these counters in-memory (reset on restart), and the timeline below is
 // accumulated in the browser only while this tab is open.
 
-type Sample = { name: string; labels: Record<string, string>; value: number };
+export type Sample = { name: string; labels: Record<string, string>; value: number };
 
 type Row = {
   method: string;
@@ -36,10 +36,12 @@ type Row = {
 
 type HistoryPoint = { t: string; requests: number; errors: number };
 
-const REFRESH_MS = 5000;
-const COLOR_REQ = "#60a5fa"; // blue-400
-const COLOR_ERR = "#f87171"; // red-400
-const TOOLTIP_STYLE = {
+export const REFRESH_MS = 5000;
+export const COLOR_REQ = "#60a5fa"; // blue-400
+export const COLOR_ERR = "#f87171"; // red-400
+export const COLOR_TTFT = "#34d399"; // emerald-400
+export const COLOR_TPS = "#a78bfa"; // violet-400
+export const TOOLTIP_STYLE = {
   background: "#ffffff",
   border: "1px solid #e5e7eb",
   borderRadius: 6,
@@ -49,7 +51,7 @@ const TOOLTIP_STYLE = {
 
 // Prometheus exposition parser. Quote-aware brace matching matters here because a
 // label value like endpoint="/{app_id}/v1/chat/completions" contains a `}`.
-function parseExposition(text: string): Sample[] {
+export function parseExposition(text: string): Sample[] {
   const out: Sample[] = [];
   for (const raw of text.split("\n")) {
     const line = raw.trim();
@@ -93,6 +95,40 @@ function parseExposition(text: string): Sample[] {
   return out;
 }
 
+export type Bucket = { range: string; count: number };
+
+const sumOf = (samples: Sample[], name: string) =>
+  samples.filter((s) => s.name === `${name}_sum`).reduce((a, s) => a + s.value, 0);
+const countOf = (samples: Sample[], name: string) =>
+  samples.filter((s) => s.name === `${name}_count`).reduce((a, s) => a + s.value, 0);
+const avgOf = (sum: number, count: number) => (count > 0 ? sum / count : null);
+
+export function fmtTps(n: number): string {
+  return Number.isFinite(n) ? `${Math.round(n)}` : "∞";
+}
+
+// Histogram `_bucket{le}` series are cumulative; aggregate across label sets per
+// `le`, then difference adjacent edges to get the per-bucket count.
+export function histBuckets(samples: Sample[], name: string, fmt: (n: number) => string): Bucket[] {
+  const cum = new Map<number, number>();
+  for (const s of samples) {
+    if (s.name !== `${name}_bucket`) continue;
+    const le = s.labels.le === "+Inf" ? Infinity : Number(s.labels.le);
+    if (!Number.isNaN(le)) cum.set(le, (cum.get(le) ?? 0) + s.value);
+  }
+  const sorted = [...cum.entries()].sort((a, b) => a[0] - b[0]);
+  const out: Bucket[] = [];
+  let prev = 0;
+  let prevEdge = 0;
+  for (const [le, c] of sorted) {
+    const range = le === Infinity ? `>${fmt(prevEdge)}` : prevEdge === 0 ? `≤${fmt(le)}` : `${fmt(prevEdge)}–${fmt(le)}`;
+    out.push({ range, count: Math.max(0, c - prev) });
+    prev = c;
+    prevEdge = le === Infinity ? prevEdge : le;
+  }
+  return out;
+}
+
 type Summary = {
   rows: Row[];
   total: number;
@@ -102,6 +138,10 @@ type Summary = {
   c5: number;
   latSumAll: number;
   latCountAll: number;
+  ttftAvg: number | null;
+  tpsAvg: number | null;
+  ttftBuckets: Bucket[];
+  tpsBuckets: Bucket[];
 };
 
 // The gateway's per-app HTTP metrics. Accept both the current `serverless_*`
@@ -162,16 +202,22 @@ function summarize(samples: Sample[]): Summary {
     }
   }
   const list = [...rows.values()].sort((a, b) => b.requests - a.requests);
-  return { rows: list, total, errors, c2, c4, c5, latSumAll, latCountAll };
+  return {
+    rows: list, total, errors, c2, c4, c5, latSumAll, latCountAll,
+    ttftAvg: avgOf(sumOf(samples, "serverless_ttft_seconds"), countOf(samples, "serverless_ttft_seconds")),
+    tpsAvg: avgOf(sumOf(samples, "serverless_tokens_per_second"), countOf(samples, "serverless_tokens_per_second")),
+    ttftBuckets: histBuckets(samples, "serverless_ttft_seconds", (n) => fmtLatency(n)),
+    tpsBuckets: histBuckets(samples, "serverless_tokens_per_second", fmtTps),
+  };
 }
 
-function fmtLatency(seconds: number | null): string {
+export function fmtLatency(seconds: number | null): string {
   if (seconds == null || !Number.isFinite(seconds)) return "—";
   if (seconds < 1) return `${Math.round(seconds * 1000)} ms`;
   return `${seconds.toFixed(2)} s`;
 }
 
-function fmtInt(n: number): string {
+export function fmtInt(n: number): string {
   return Math.round(n).toLocaleString();
 }
 
@@ -312,7 +358,7 @@ export function MetricsTab({ app }: { app: AppRecord }) {
 
       {/* Summary cards */}
       {summary && (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <SummaryCard label="Requests" value={fmtInt(summary.total)} />
           <SummaryCard
             label="Errors (non-2xx)"
@@ -325,6 +371,8 @@ export function MetricsTab({ app }: { app: AppRecord }) {
             tone={errorRate > 0 ? "bad" : "neutral"}
           />
           <SummaryCard label="Avg latency" value={fmtLatency(avgAll)} />
+          <SummaryCard label="Avg TTFT" value={fmtLatency(summary.ttftAvg)} />
+          <SummaryCard label="Avg TPS" value={summary.tpsAvg != null ? `${summary.tpsAvg.toFixed(1)} tok/s` : "—"} />
         </div>
       )}
 
@@ -446,6 +494,26 @@ export function MetricsTab({ app }: { app: AppRecord }) {
         </div>
       )}
 
+      {/* TTFT + TPS bucket distributions */}
+      {summary && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="min-w-0 rounded-md border border-border bg-card p-3 text-foreground">
+            <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+              <span className="font-medium">Time-to-first-token distribution <span className="font-normal text-muted-foreground">(streamed)</span></span>
+              <LegendDot color={COLOR_TTFT} label="requests" />
+            </div>
+            <BucketChart data={summary.ttftBuckets} color={COLOR_TTFT} />
+          </div>
+          <div className="min-w-0 rounded-md border border-border bg-card p-3 text-foreground">
+            <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+              <span className="font-medium">Output throughput distribution <span className="font-normal text-muted-foreground">(tokens/s)</span></span>
+              <LegendDot color={COLOR_TPS} label="requests" />
+            </div>
+            <BucketChart data={summary.tpsBuckets} color={COLOR_TPS} />
+          </div>
+        </div>
+      )}
+
       {/* Status breakdown */}
       {summary && summary.total > 0 && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -540,7 +608,27 @@ export function MetricsTab({ app }: { app: AppRecord }) {
   );
 }
 
-function LegendDot({ color, label }: { color: string; label: string }) {
+export function BucketChart({ data, color }: { data: Bucket[]; color: string }) {
+  const hasAny = data.some((b) => b.count > 0);
+  return (
+    <div className="h-48 w-full">
+      {hasAny ? (
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+            <XAxis dataKey="range" tick={{ fontSize: 9, fill: "#6b7280" }} stroke="#d4d4d8" interval={0} angle={-30} textAnchor="end" height={48} />
+            <YAxis allowDecimals={false} tick={{ fontSize: 10, fill: "#6b7280" }} stroke="#d4d4d8" width={36} />
+            <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ fill: "#000", opacity: 0.05 }} />
+            <Bar dataKey="count" fill={color} radius={[3, 3, 0, 0]} isAnimationActive={false} />
+          </BarChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="flex h-full items-center justify-center text-center text-xs text-muted-foreground">No samples yet.</div>
+      )}
+    </div>
+  );
+}
+
+export function LegendDot({ color, label }: { color: string; label: string }) {
   return (
     <span className="flex items-center gap-1 text-muted-foreground">
       <span
@@ -552,7 +640,7 @@ function LegendDot({ color, label }: { color: string; label: string }) {
   );
 }
 
-function SummaryCard({
+export function SummaryCard({
   label,
   value,
   tone = "neutral",
