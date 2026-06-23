@@ -261,12 +261,33 @@ async def ensure_uv() -> str | None:
     return uv
 
 
+# Bootstrapping a vLLM venv pulls huge CUDA/torch wheels (nvidia-cudnn, nvshmem,
+# nvjitlink, cmake…). On a throttled uplink uv's default 30s per-request HTTP
+# timeout + high download concurrency make these time out — uv itself says so:
+# "Failed to download … Try increasing UV_HTTP_TIMEOUT (current value: 30s)".
+# Give uv a long per-request timeout and fewer parallel streams (so each download
+# gets more of the limited bandwidth). Only set defaults the operator hasn't —
+# UV_HTTP_TIMEOUT / UV_CONCURRENT_DOWNLOADS in the worker env still win.
+_UV_ENV_DEFAULTS = {
+    "UV_HTTP_TIMEOUT": "900",        # 15 min per request (uv default: 30s)
+    "UV_CONCURRENT_DOWNLOADS": "8",  # fewer parallel streams on a slow link
+}
+
+
+def _uv_env() -> dict:
+    env = dict(os.environ)
+    for k, v in _UV_ENV_DEFAULTS.items():
+        env.setdefault(k, v)
+    return env
+
+
 async def _uv_run(uv: str, args: list[str], what: str) -> bool:
     """Run `uv <args>`, streaming its output to the log. Returns True on success."""
     logger.info("%s: uv %s", what, " ".join(args))
     try:
         proc = await asyncio.create_subprocess_exec(
-            uv, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            uv, *args, env=_uv_env(),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         rc = await _stream_subprocess(proc)
         if rc != 0:
@@ -421,7 +442,7 @@ async def run_pre_script(pre_script: str | None, venv_path: str | None) -> None:
     script was actually required)."""
     if not pre_script or not pre_script.strip():
         return
-    env = dict(os.environ)
+    env = _uv_env()  # same long uv HTTP timeout — pre-scripts often pip/uv install
     if venv_path:
         env["VIRTUAL_ENV"] = venv_path
         env["PATH"] = f"{venv_path}/bin:" + env.get("PATH", "")

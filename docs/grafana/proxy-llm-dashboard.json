@@ -167,43 +167,46 @@
       "id": 9,
       "type": "timeseries",
       "title": "End-to-end latency (percentiles)",
+      "description": "Fixed 5m window + connect-nulls so the line stays continuous during quiet periods.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2, "spanNulls": true } }, "overrides": [] },
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.90, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p90" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p99" },
-        { "refId": "D", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(proxy_request_duration_seconds_sum{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])) / sum(rate(proxy_request_duration_seconds_count{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval]))", "legendFormat": "avg" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.90, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p90" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p99" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(proxy_request_duration_seconds_sum{proxy=~\"$proxy\", model=~\"$model\"}[5m])) / sum(rate(proxy_request_duration_seconds_count{proxy=~\"$proxy\", model=~\"$model\"}[5m]))", "legendFormat": "avg" }
       ]
     },
     {
       "id": 10,
       "type": "timeseries",
       "title": "Time-to-first-token (percentiles)",
+      "description": "TTFT is only recorded for streamed requests, so a short rate window gaps during quiet periods. Uses a fixed 5m window + connect-nulls to stay continuous.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2, "spanNulls": true } }, "overrides": [] },
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_ttft_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.90, sum by (le) (rate(proxy_ttft_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p90" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_ttft_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p99" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_ttft_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.90, sum by (le) (rate(proxy_ttft_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p90" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_ttft_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p99" }
       ]
     },
     {
       "id": 11,
       "type": "timeseries",
       "title": "Output throughput TPS (percentiles, higher is better)",
+      "description": "Fixed 5m window + connect-nulls so the line stays continuous during quiet periods.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2, "spanNulls": true } }, "overrides": [] },
       "options": { "legend": { "calcs": ["mean", "min"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_tokens_per_second_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.10, sum by (le) (rate(proxy_tokens_per_second_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p10 (slowest)" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.90, sum by (le) (rate(proxy_tokens_per_second_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])))", "legendFormat": "p90 (fastest)" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_tokens_per_second_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.10, sum by (le) (rate(proxy_tokens_per_second_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p10 (slowest)" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.90, sum by (le) (rate(proxy_tokens_per_second_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m])))", "legendFormat": "p90 (fastest)" }
       ]
     },
     {
@@ -272,8 +275,8 @@
     {
       "id": 17,
       "type": "state-timeline",
-      "title": "SLO uptime — p99 TTFT ≤ 1.2s · p10 TPS ≥ 20 tok/s",
-      "description": "Per-window SLO status — continuous, no gaps. Green = SLO met. Red = violated OR no data in that window (no traffic / API down). Missing evaluations are filled to 0 (red) via `or vector(0)`.",
+      "title": "SLO uptime — p99 TTFT ≤ 1.2s · p10 TPS ≥ 15 tok/s",
+      "description": "Per-window SLO status, two states: green = OK (SLO met, or idle — no requests is not a violation), red = violated (traffic present but out of SLO). Verdict is the rolling 5m quantile; idle windows fall back to OK so quiet periods stay green, never red.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 44 },
       "fieldConfig": {
@@ -282,16 +285,15 @@
           "color": { "mode": "thresholds" },
           "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] },
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "down / violated", "color": "red", "index": 0 }, "1": { "text": "OK", "color": "green", "index": 1 } } }
-          ],
-          "noValue": "no data"
+            { "type": "value", "options": { "0": { "text": "violated", "color": "red", "index": 0 }, "1": { "text": "OK", "color": "green", "index": 1 } } }
+          ]
         },
         "overrides": []
       },
       "options": { "mergeValues": true, "showValue": "never", "alignValue": "center", "rowHeight": 0.9, "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "(histogram_quantile(0.99, sum by (le) (rate(proxy_ttft_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval]))) < bool 1.2) or vector(0)", "legendFormat": "p99 TTFT ≤ 1.2s" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "(histogram_quantile(0.10, sum by (le) (rate(proxy_tokens_per_second_bucket{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval]))) > bool 20) or vector(0)", "legendFormat": "p10 TPS ≥ 20 tok/s" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "((histogram_quantile(0.99, sum by (le) (rate(proxy_ttft_seconds_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m]))) < bool 1.2) and on() (sum(rate(proxy_ttft_seconds_count{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])) > 0)) or vector(1)", "legendFormat": "p99 TTFT ≤ 1.2s" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "((histogram_quantile(0.10, sum by (le) (rate(proxy_tokens_per_second_bucket{proxy=~\"$proxy\", model=~\"$model\"}[5m]))) > bool 15) and on() (sum(rate(proxy_tokens_per_second_count{proxy=~\"$proxy\", model=~\"$model\"}[$__rate_interval])) > 0)) or vector(1)", "legendFormat": "p10 TPS ≥ 15 tok/s" }
       ]
     }
   ]

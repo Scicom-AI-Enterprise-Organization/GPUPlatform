@@ -280,6 +280,22 @@ class MultiModelScheduler:
 
     # ---- lifecycle --------------------------------------------------------
 
+    async def _ensure_deps(self) -> None:
+        """Bootstrap / top up the shared vLLM venv: create it if missing, install the
+        requested vLLM, ninja/cmake (flashinfer JIT), and audio-decode deps for any
+        Whisper member. All idempotent + best-effort — fast no-ops once satisfied — so
+        it's safe to re-run before a crash relaunch. That's what lets a launch that
+        died on a half-finished install (e.g. a wheel download that timed out on a
+        slow uplink) retry the INSTALL on the next backoff attempt and self-heal,
+        instead of relaunching the same broken venv until the retry budget is spent.
+        pre_script is deliberately excluded (it runs once in start())."""
+        await launcher.ensure_venv(
+            self.cfg.venv_path, self.cfg.vllm_version, self.cfg.vllm_install_args)
+        if not self.cfg.vllm_install_args:
+            await launcher.ensure_vllm(self.cfg.venv_path, self.cfg.vllm_version)
+        await launcher.ensure_build_tools(self.cfg.venv_path)
+        await launcher.ensure_audio_deps(self.cfg.venv_path, self.cfg.members)
+
     async def start(self) -> None:
         """Launch every member sequentially (so two models sharing GPUs never
         load at once and OOM), sleep each after it's healthy, then wake a
@@ -288,25 +304,13 @@ class MultiModelScheduler:
         # we haven't launched ours yet, so anything on these ports is an orphan
         # holding GPU memory that would block our launches.
         await self._kill_stale_vllm()
-        # Bootstrap the endpoint's vLLM venv if it doesn't exist yet (install uv,
-        # `uv venv` the path, install vLLM) so an endpoint can name a venv_path the
-        # VM hasn't created — instead of crashing on a missing {venv_path}/bin/python.
-        await launcher.ensure_venv(
-            self.cfg.venv_path, self.cfg.vllm_version, self.cfg.vllm_install_args)
-        # Ensure the requested vLLM version is present in the venv before any
-        # model launches (no-op when venv_path/vllm_version aren't set, or when a
-        # custom vllm_install_args spec owns the install).
-        if not self.cfg.vllm_install_args:
-            await launcher.ensure_vllm(self.cfg.venv_path, self.cfg.vllm_version)
-        # vLLM's flashinfer backend JIT-builds kernels at runtime via `ninja` on
-        # Blackwell — make sure ninja/cmake are in the venv (launch puts venv/bin on
-        # PATH so the JIT finds them).
-        await launcher.ensure_build_tools(self.cfg.venv_path)
-        # Whisper/ASR members need vLLM's audio-decode deps (librosa, soundfile) or
-        # every clip is rejected as "Invalid or unsupported audio file".
-        await launcher.ensure_audio_deps(self.cfg.venv_path, self.cfg.members)
+        # Bootstrap / top up the shared vLLM venv (idempotent). Also re-run before
+        # each crash relaunch (see _launch_and_sleep) so a launch that died on a
+        # half-finished install self-heals instead of relaunching a broken venv.
+        await self._ensure_deps()
         # Optional operator setup script (e.g. building DeepGEMM) — runs once now,
-        # with the venv ready and on PATH, before any model launches.
+        # with the venv ready and on PATH, before any model launches. NOT in
+        # _ensure_deps: it can be expensive / non-idempotent, so it stays once-only.
         await launcher.run_pre_script(self.cfg.pre_script, self.cfg.venv_path)
         # Load in WAVES: each wave is a set of mutually NON-overlapping members
         # (disjoint gpu_indices) loaded concurrently; waves run in sequence. On
@@ -396,6 +400,13 @@ class MultiModelScheduler:
     async def _launch_and_sleep(self, rt: ModelRuntime) -> None:
         try:
             rt.reason = None  # clear any stale cause from a prior attempt
+            # On a crash relaunch (restart_count>0, not the initial wave launch),
+            # re-run the venv/dep ensure first — so a launch that died because the
+            # install was incomplete (e.g. a wheel download timed out) retries the
+            # INSTALL, not just the vLLM process, and self-heals once it succeeds.
+            # Done before _hold_gpus: installs need no GPU and can take minutes.
+            if rt.restart_count > 0:
+                await self._ensure_deps()
             # Fresh timestamped log file for this attempt — never overwrites the
             # prior (possibly crashing) log; the shipper follows it + tags the
             # session so the UI can open historical logs.
