@@ -299,6 +299,25 @@ async def log_shipper_loop(
             except asyncio.TimeoutError:
                 pass
 
+        # Drain fired (graceful shutdown / reconciler drain / SIGTERM) → ship whatever
+        # was written since the last tick BEFORE the process exits. Without this final
+        # flush, a worker that boots and dies within one batch interval — common on a
+        # slow node whose vLLM bootstrap stalls — ships NOTHING: its boot log + crash
+        # reason never reach the gateway and the Workers tab shows a blank screen.
+        try:
+            if get_log_path is not None:
+                latest = get_log_path()
+                if latest and latest != cur_path:
+                    await drain(cur_path, session)  # dying file's tail under its own session
+                    cur_path = latest
+                    if fixed_session is None:
+                        session = _session_of(cur_path)
+                    offset = 0
+                    leftover = b""
+            await drain(cur_path, session)
+        except Exception:
+            logger.exception("final log flush failed")
+
 
 def _session_of(log_path: str | None) -> str | None:
     """Session id (trailing timestamp) of a timestamped log file, else None."""
@@ -589,17 +608,9 @@ async def main_async() -> None:
     )
 
     redis_url = await register(gateway_url, machine_id, app_id, token)
-    if mode == "proxy":
-        logger.info("registered with gateway (proxy mode: HTTP only, no redis)")
-    else:
-        logger.info("registered with gateway, redis=%s", redis_url)
+    logger.info("registered with gateway, redis=%s", redis_url)
 
-    # Proxy mode (single-model VM endpoint) never touches Redis: there's no job
-    # queue, and register/heartbeat/logs/metrics are all HTTP while inference goes
-    # straight over the forward tunnel. Skip the client entirely so the endpoint
-    # isn't coupled to Redis availability (no _redis_ready wait on a Redis it never
-    # uses). multi + legacy single-model modes still need it for the queue.
-    rdb = None if mode == "proxy" else redis_async.from_url(redis_url, **_REDIS_KW)
+    rdb = redis_async.from_url(redis_url, **_REDIS_KW)
     drain_event = asyncio.Event()
     # Drain gracefully on SIGTERM/SIGINT so the `finally` runs sched.shutdown(),
     # which group-kills every vLLM engine + its tp workers. Without this, the
@@ -727,8 +738,7 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event, queue_po
     ))
     monitor_task = asyncio.create_task(sched.monitor_loop(drain_event))
     try:
-        if rdb is not None:  # proxy mode passes rdb=None — no queue, no Redis
-            await _redis_ready(rdb)
+        await _redis_ready(rdb)
         await sched.start()
         if queue_poll:
             await multi_poll_loop(rdb, f"queue:{app_id}", machine_id, sched, drain_event)
@@ -747,8 +757,7 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event, queue_po
             except (asyncio.CancelledError, BaseException):
                 pass
         await sched.shutdown()
-        if rdb is not None:
-            await rdb.aclose()
+        await rdb.aclose()
 
 
 def run() -> None:
