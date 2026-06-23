@@ -589,9 +589,17 @@ async def main_async() -> None:
     )
 
     redis_url = await register(gateway_url, machine_id, app_id, token)
-    logger.info("registered with gateway, redis=%s", redis_url)
+    if mode == "proxy":
+        logger.info("registered with gateway (proxy mode: HTTP only, no redis)")
+    else:
+        logger.info("registered with gateway, redis=%s", redis_url)
 
-    rdb = redis_async.from_url(redis_url, **_REDIS_KW)
+    # Proxy mode (single-model VM endpoint) never touches Redis: there's no job
+    # queue, and register/heartbeat/logs/metrics are all HTTP while inference goes
+    # straight over the forward tunnel. Skip the client entirely so the endpoint
+    # isn't coupled to Redis availability (no _redis_ready wait on a Redis it never
+    # uses). multi + legacy single-model modes still need it for the queue.
+    rdb = None if mode == "proxy" else redis_async.from_url(redis_url, **_REDIS_KW)
     drain_event = asyncio.Event()
     # Drain gracefully on SIGTERM/SIGINT so the `finally` runs sched.shutdown(),
     # which group-kills every vLLM engine + its tp workers. Without this, the
@@ -719,7 +727,8 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event, queue_po
     ))
     monitor_task = asyncio.create_task(sched.monitor_loop(drain_event))
     try:
-        await _redis_ready(rdb)
+        if rdb is not None:  # proxy mode passes rdb=None — no queue, no Redis
+            await _redis_ready(rdb)
         await sched.start()
         if queue_poll:
             await multi_poll_loop(rdb, f"queue:{app_id}", machine_id, sched, drain_event)
@@ -738,7 +747,8 @@ async def _run_multi(rdb, app_id, machine_id, gateway_url, drain_event, queue_po
             except (asyncio.CancelledError, BaseException):
                 pass
         await sched.shutdown()
-        await rdb.aclose()
+        if rdb is not None:
+            await rdb.aclose()
 
 
 def run() -> None:
