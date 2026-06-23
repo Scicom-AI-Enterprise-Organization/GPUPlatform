@@ -48,7 +48,7 @@ data_router = APIRouter(tags=["proxy-data"])
 
 HEALTH_TTL_S = 120                 # a probe older than this is "stale/unknown"
 REQUEST_RETENTION_DAYS = 7
-DEFAULT_TIMEOUT_S = 600.0
+DEFAULT_TIMEOUT_S = 3600.0
 import re as _re
 _NAME_RE = _re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -270,7 +270,7 @@ def _endpoint_record(app, e: ProxyEndpoint, owner_username: str) -> ProxyEndpoin
     return ProxyEndpointRecord(
         id=e.id, name=e.name, enabled=bool(e.enabled), public=bool(getattr(e, "public", False)),
         max_concurrency=int(cfg.get("max_concurrency") or 0),
-        timeout_s=int(cfg.get("timeout_s") or 600),
+        timeout_s=int(cfg.get("timeout_s") or int(DEFAULT_TIMEOUT_S)),
         upstreams=[_upstream_record(u) for u in cfg.get("upstreams", [])],
         inflight=sum(1 for v in mine if v.get("state") == "running"),
         queued=sum(1 for v in mine if v.get("state") == "queued"),
@@ -301,7 +301,7 @@ def _public_endpoint_record(app, e: ProxyEndpoint) -> ProxyEndpointRecord:
     return ProxyEndpointRecord(
         id=e.id, name=e.name, enabled=bool(e.enabled), public=True,
         max_concurrency=int(cfg.get("max_concurrency") or 0),
-        timeout_s=int(cfg.get("timeout_s") or 600),
+        timeout_s=int(cfg.get("timeout_s") or int(DEFAULT_TIMEOUT_S)),
         upstreams=safe_upstreams,
         inflight=sum(1 for v in mine if v.get("state") == "running"),
         queued=sum(1 for v in mine if v.get("state") == "queued"),
