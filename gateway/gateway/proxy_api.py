@@ -447,8 +447,8 @@ async def _do_unary(app, endpoint_id: str, candidates: list[dict], alias: str,
         except Exception:
             data = {"raw": r.text}
         usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
-        return {"upstream": u["name"], "status_code": r.status_code, "data": data,
-                "latency_ms": lat, "pt": usage.get("prompt_tokens"), "ct": usage.get("completion_tokens")}
+        return {"upstream": u["name"], "upstream_url": u["base_url"], "status_code": r.status_code,
+                "data": data, "latency_ms": lat, "pt": usage.get("prompt_tokens"), "ct": usage.get("completion_tokens")}
     raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
 
 
@@ -485,8 +485,8 @@ async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], ali
             data_out = r.json()
         except Exception:
             data_out = {"text": r.text}  # response_format=text → plain string
-        return {"upstream": u["name"], "status_code": r.status_code, "data": data_out,
-                "latency_ms": lat, "pt": None, "ct": None}
+        return {"upstream": u["name"], "upstream_url": u["base_url"], "status_code": r.status_code,
+                "data": data_out, "latency_ms": lat, "pt": None, "ct": None}
     raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
 
 
@@ -528,7 +528,14 @@ async def _unary(app, request: Request, request_id: str, forward,
                 live[request_id]["upstream"] = res["upstream"]
             await _finish(request_id, "completed", status_code=res["status_code"],
                           latency_ms=res["latency_ms"], pt=res["pt"], ct=res["ct"], upstream=res["upstream"])
-            return JSONResponse(res["data"], status_code=res["status_code"])
+            # Surface which upstream actually served this request so callers can tell
+            # them apart (failover/health routing means it isn't always the primary).
+            hdrs = {"X-Request-Id": request_id}
+            if res.get("upstream_url"):
+                hdrs["X-Upstream-Url"] = res["upstream_url"]
+            if res.get("upstream"):
+                hdrs["X-Upstream-Name"] = res["upstream"]
+            return JSONResponse(res["data"], status_code=res["status_code"], headers=hdrs)
         finally:
             if acquired and sem is not None:
                 sem.release()
@@ -725,10 +732,19 @@ async def _handle(request: Request, user: User, endpoint_name: str, payload: dic
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream)
     if is_stream:
+        sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-Id": request_id}
+        # Response headers must be flushed before the body, but the streaming
+        # forward only picks an upstream once it starts (and may fail over before
+        # the first byte). So we can only name the upstream up front when there's
+        # exactly one candidate — then it's guaranteed accurate. With failover
+        # candidates, the actual upstream is recorded on the ProxyRequest row.
+        if len(candidates) == 1:
+            sse_headers["X-Upstream-Url"] = candidates[0]["base_url"]
+            sse_headers["X-Upstream-Name"] = candidates[0]["name"]
         return StreamingResponse(
             _stream(app, request_id, endpoint_id, candidates, alias, payload, upstream_path, timeout_s, sem, cancel_ev),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-Id": request_id},
+            headers=sse_headers,
         )
     return await _unary(app, request, request_id,
                         lambda: _do_unary(app, endpoint_id, candidates, alias, payload, upstream_path, timeout_s),

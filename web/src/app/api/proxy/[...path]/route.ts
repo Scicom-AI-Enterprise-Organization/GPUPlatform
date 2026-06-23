@@ -59,6 +59,13 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
   try {
     const res = await fetch(target, init);
     const ct = res.headers.get("content-type") ?? "application/json";
+    // Pass through the proxy router's routing-info headers so the browser
+    // (e.g. the proxy Playground) can show which upstream served the request.
+    const upstreamHeaders: Record<string, string> = {};
+    for (const k of ["x-upstream-url", "x-upstream-name", "x-request-id"]) {
+      const v = res.headers.get(k);
+      if (v) upstreamHeaders[k] = v;
+    }
     // SSE / chunked: pipe the body through instead of buffering — buffering
     // would break long-running streams (e.g. benchmark log tails).
     if (ct.includes("text/event-stream") || ct.includes("application/x-ndjson")) {
@@ -68,6 +75,7 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
           "Content-Type": ct,
           "Cache-Control": "no-cache",
           "X-Accel-Buffering": "no",
+          ...upstreamHeaders,
         },
       });
     }
@@ -91,7 +99,7 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
     const body = await res.text();
     return new NextResponse(body, {
       status: res.status,
-      headers: { "Content-Type": ct },
+      headers: { "Content-Type": ct, ...upstreamHeaders },
     });
   } catch (e) {
     return NextResponse.json(

@@ -688,8 +688,12 @@ function RequestPanel({ app }: { app: AppRecord }) {
   const exampleModel =
     isMulti && app.models && app.models.length > 0 ? app.models[0].model : app.app_id;
 
-  // Show the user's actual sgpu_ key prefix in snippets; if none, show placeholder.
-  const snippetKey = apiKeyPrefix ? `${apiKeyPrefix}...` : "YOUR_SGPU_API_KEY";
+  // Display shows the user's actual sgpu_ key prefix so they recognize it, but the
+  // full key is never available to the browser (shown once at creation, stored
+  // hashed). So COPY emits a replaceable placeholder rather than the truncated
+  // prefix — copying `sgpu_abc…` would paste a broken, unusable key.
+  const displayKey = apiKeyPrefix ? `${apiKeyPrefix}...` : "YOUR_SGPU_API_KEY";
+  const copyKey = "YOUR_SGPU_API_KEY";
 
   return (
     <Card>
@@ -734,8 +738,8 @@ function RequestPanel({ app }: { app: AppRecord }) {
               OpenAI <code className="font-mono">/{app.app_id}/v1/chat/completions</code> — scoped to this endpoint; returns the full completion JSON in one call.
             </p>
             <CodeBlock
-              displayCode={curlChatSnippet(base, snippetKey, exampleModel, app.app_id)}
-              copyCode={curlChatSnippet(base, snippetKey, exampleModel, app.app_id)}
+              displayCode={curlChatSnippet(base, displayKey, exampleModel, app.app_id)}
+              copyCode={curlChatSnippet(base, copyKey, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>
@@ -745,8 +749,8 @@ function RequestPanel({ app }: { app: AppRecord }) {
               Same endpoint with <code className="font-mono">&quot;stream&quot;: true</code> — token-by-token Server-Sent Events.
             </p>
             <CodeBlock
-              displayCode={curlChatStreamSnippet(base, snippetKey, exampleModel, app.app_id)}
-              copyCode={curlChatStreamSnippet(base, snippetKey, exampleModel, app.app_id)}
+              displayCode={curlChatStreamSnippet(base, displayKey, exampleModel, app.app_id)}
+              copyCode={curlChatStreamSnippet(base, copyKey, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>
@@ -759,8 +763,8 @@ function RequestPanel({ app }: { app: AppRecord }) {
                 : "The model field is ignored — this endpoint serves one model."}
             </p>
             <CodeBlock
-              displayCode={openaiSnippet(base, snippetKey, exampleModel, app.app_id)}
-              copyCode={openaiSnippet(base, snippetKey, exampleModel, app.app_id)}
+              displayCode={openaiSnippet(base, displayKey, exampleModel, app.app_id)}
+              copyCode={openaiSnippet(base, copyKey, exampleModel, app.app_id)}
             />
             <DocsLink />
           </TabsContent>

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { Copy, Eye, EyeOff, Globe, Loader2, Lock, Network, Pencil, RefreshCw, Trash2 } from "lucide-react";
+import { Copy, Globe, Loader2, Lock, Network, Pencil, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -32,8 +32,6 @@ function fmtAgo(iso: string | null | undefined): string {
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   return `${Math.round(s / 3600)}h ago`;
 }
-
-const maskToken = (t: string) => (t.length > 12 ? `${t.slice(0, 6)}…${t.slice(-4)}` : "•".repeat(Math.max(4, t.length)));
 
 const STATUS_TONE: Record<string, string> = {
   queued: "bg-status-init/15 text-status-init",
@@ -71,8 +69,8 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
 
   const [health, setHealth] = useState<ProxyUpstreamHealth[]>([]);
   const [reqs, setReqs] = useState<ProxyRequest[]>([]);
-  const [token, setToken] = useState<string | null>(null);
-  const [reveal, setReveal] = useState(false);
+  const [loggedIn, setLoggedIn] = useState(false);
+  const [apiKeyPrefix, setApiKeyPrefix] = useState<string | null>(null);
   const [urlTarget, setUrlTarget] = useState<UrlTarget>("public");
   const [filter, setFilter] = useState<"all" | (typeof BUCKETS)[number]>("all");
   const [flushing, setFlushing] = useState(false);
@@ -80,9 +78,19 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
 
   useEffect(() => {
     let abort = false;
-    fetch("/api/auth/token", { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((b) => { if (!abort) setToken(b?.token ?? null); })
+    // Snippets show the user's real sgpu_ API-key prefix (from API tokens),
+    // never the session cookie token. /api/auth/token is only used to know if
+    // we're signed in so we can show the right call-to-action.
+    Promise.all([
+      fetch("/api/auth/token", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)),
+      fetch("/api/api-keys", { cache: "no-store" }).then((r) => (r.ok ? r.json() : [])),
+    ])
+      .then(([tokenData, keys]) => {
+        if (abort) return;
+        setLoggedIn(!!tokenData?.token);
+        const first = Array.isArray(keys) && keys.length > 0 ? keys[0] : null;
+        setApiKeyPrefix(first?.prefix ?? null);
+      })
       .catch(() => {});
     return () => { abort = true; };
   }, []);
@@ -137,8 +145,11 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
   };
 
   const model0 = aliases[0] ?? "qwen";
-  const visToken = reveal && token ? token : token ? maskToken(token) : "sgpu_…";
-  const realToken = token ?? "YOUR_API_KEY";
+  // Display shows the user's key prefix for recognition; the copy uses a clear
+  // placeholder. The full key can't be embedded — the gateway stores only a hash
+  // (shown once at creation), so paste your real key from the API tokens page.
+  const snippetKeyShown = apiKeyPrefix ? `${apiKeyPrefix}...` : "YOUR_SGPU_API_KEY";
+  const snippetKeyCopy = "YOUR_SGPU_API_KEY";
 
   const internalBase = process.env.NEXT_PUBLIC_GATEWAY_INTERNAL_URL ?? "";
   // Snippet base only — the header URL + Playground keep the public base (an
@@ -210,10 +221,14 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
               </div>
               <div className="flex items-center gap-2">
                 {internalBase && <BaseUrlToggle value={urlTarget} onChange={setUrlTarget} />}
-                {token && (
-                  <Button variant="outline" size="xs" onClick={() => setReveal((v) => !v)}>
-                    {reveal ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}{reveal ? "Hide" : "Reveal"} key
-                  </Button>
+                {loggedIn ? (
+                  apiKeyPrefix ? (
+                    <Link href="/api-keys" className="text-xs text-primary hover:underline">Manage API keys →</Link>
+                  ) : (
+                    <Link href="/api-keys" className="text-xs text-primary hover:underline font-medium">+ Create API key</Link>
+                  )
+                ) : (
+                  <Link href="/login?next=/proxy" className="text-xs text-primary hover:underline">Sign in to use your key</Link>
                 )}
               </div>
             </CardHeader>
@@ -232,19 +247,19 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                   <p className="text-sm text-muted-foreground">
                     OpenAI <code className="font-mono">/proxy/{ep.name}/v1/chat/completions</code> — returns the full completion JSON in one call.
                   </p>
-                  <CodeBlock display={curlChat(snippetBase, visToken, model0)} copy={curlChat(snippetBase, realToken, model0)} />
+                  <CodeBlock display={curlChat(snippetBase, snippetKeyShown, model0)} copy={curlChat(snippetBase, snippetKeyCopy, model0)} />
                 </TabsContent>
                 <TabsContent value="curl-stream" className="mt-3 space-y-3">
                   <p className="text-sm text-muted-foreground">
                     Same endpoint with <code className="font-mono">&quot;stream&quot;: true</code> — token-by-token Server-Sent Events.
                   </p>
-                  <CodeBlock display={curlChatStream(snippetBase, visToken, model0)} copy={curlChatStream(snippetBase, realToken, model0)} />
+                  <CodeBlock display={curlChatStream(snippetBase, snippetKeyShown, model0)} copy={curlChatStream(snippetBase, snippetKeyCopy, model0)} />
                 </TabsContent>
                 <TabsContent value="openai" className="mt-3 space-y-3">
                   <p className="text-sm text-muted-foreground">
                     Point any OpenAI client at <code className="font-mono">{snippetBase}</code> — set <code className="font-mono">model</code> to one of the aliases above.
                   </p>
-                  <CodeBlock display={openaiSnippet(snippetBase, visToken, model0)} copy={openaiSnippet(snippetBase, realToken, model0)} />
+                  <CodeBlock display={openaiSnippet(snippetBase, snippetKeyShown, model0)} copy={openaiSnippet(snippetBase, snippetKeyCopy, model0)} />
                 </TabsContent>
               </Tabs>
               {urlTarget === "internal" && (
@@ -253,7 +268,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 </p>
               )}
               <p className="mt-3 text-[11px] text-muted-foreground">
-                Shown with your session token. For scripts/CI, use a long-lived key from <Link href="/api-keys" className="underline underline-offset-2 hover:text-foreground">API tokens</Link>.
+                Replace <code className="font-mono">YOUR_SGPU_API_KEY</code> with your key from <Link href="/api-keys" className="underline underline-offset-2 hover:text-foreground">API tokens</Link> (shown once at creation). The displayed prefix just identifies your existing key.
               </p>
             </CardContent>
           </Card>

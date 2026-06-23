@@ -45,10 +45,12 @@ export type SendHandlers = {
   onToken: () => void; // call per streamed token to drive tok/s
 };
 
+export type Upstream = { url?: string; name?: string };
 export type ChatTransport = {
   // Perform the request, pushing live updates through handlers; resolve with the
-  // final content/reasoning/tool-calls/token-count or throw on error.
-  send: (params: ChatParams, h: SendHandlers) => Promise<{ content: string; reasoning: string; tokens?: number; toolCalls?: string }>;
+  // final content/reasoning/tool-calls/token-count or throw on error. `upstream`
+  // (if the transport can determine it) names the backend that served the request.
+  send: (params: ChatParams, h: SendHandlers) => Promise<{ content: string; reasoning: string; tokens?: number; toolCalls?: string; upstream?: Upstream }>;
   // Render an equivalent curl for the current params + bearer token.
   curl: (params: ChatParams, token: string) => string;
 };
@@ -57,6 +59,7 @@ type Stats = { ttftMs: number; tokens: number; tps: number } | null;
 type Stored = {
   id: string; ts: number; prompt: string; model: string;
   status: "ok" | "error"; output?: string; reasoning?: string; toolCalls?: string; tokens?: number; error?: string;
+  upstream?: Upstream;
 };
 
 const MAX_HISTORY = 50;
@@ -112,6 +115,11 @@ export function openAiTransport(opts: { fetchPath: string; curlUrl: string }): C
         const t = await res.text().catch(() => "");
         throw new Error(`HTTP ${res.status}: ${t.slice(0, 300) || res.statusText}`);
       }
+      // Routing info from the proxy router (absent for streamed multi-upstream
+      // requests, where the served backend can't be known before headers flush).
+      const upUrl = res.headers.get("x-upstream-url") ?? undefined;
+      const upName = res.headers.get("x-upstream-name") ?? undefined;
+      const upstream: Upstream | undefined = upUrl || upName ? { url: upUrl, name: upName } : undefined;
       if (!p.stream) {
         const data = await res.json();
         const msg = data?.choices?.[0]?.message ?? {};
@@ -127,7 +135,7 @@ export function openAiTransport(opts: { fetchPath: string; curlUrl: string }): C
         h.onReasoning(reasoning);
         h.onToolCalls(toolCalls);
         h.onAnswer(content);
-        return { content, reasoning, toolCalls, tokens: data?.usage?.completion_tokens ?? undefined };
+        return { content, reasoning, toolCalls, tokens: data?.usage?.completion_tokens ?? undefined, upstream };
       }
       const reader = res.body.getReader();
       const dec = new TextDecoder();
@@ -170,7 +178,7 @@ export function openAiTransport(opts: { fetchPath: string; curlUrl: string }): C
           }
         }
       }
-      return { content: acc, reasoning: accR, toolCalls: formatToolCalls(toolAcc.filter(Boolean)), tokens: usage };
+      return { content: acc, reasoning: accR, toolCalls: formatToolCalls(toolAcc.filter(Boolean)), tokens: usage, upstream };
     },
   };
 }
@@ -208,6 +216,7 @@ export function ChatPlayground({
   const [answer, setAnswer] = useState("");
   const [reasoning, setReasoning] = useState("");
   const [toolCalls, setToolCalls] = useState("");
+  const [upstream, setUpstream] = useState<Upstream | null>(null);
   const [stats, setStats] = useState<Stats>(null);
   const [err, setErr] = useState<string | null>(null);
   const [sentParams, setSentParams] = useState<ChatParams | null>(null);
@@ -247,7 +256,7 @@ export function ChatPlayground({
     if (!prompt.trim()) { setErr("Prompt is required."); return; }
     if (!model) { setErr("Pick a model."); return; }
     if (useTools && !parsedTools) { setErr("Tools JSON is invalid — fix it or turn off tools."); return; }
-    setErr(null); setAnswer(""); setReasoning(""); setToolCalls(""); setStats(null);
+    setErr(null); setAnswer(""); setReasoning(""); setToolCalls(""); setStats(null); setUpstream(null);
     setSentParams(params);
     const id = `pg-${Date.now().toString(36)}`;
     const promptShort = prompt.slice(0, 80);
@@ -265,12 +274,13 @@ export function ChatPlayground({
     if (stream) setStreaming(true); else setSending(true);
     try {
       const r = await transport.send(params, { signal: ctrl.signal, onAnswer: setAnswer, onReasoning: setReasoning, onToolCalls: setToolCalls, onToken: bump });
+      if (r.upstream) setUpstream(r.upstream);
       if (r.tokens != null) {
         const ref = tFirst ?? t0;
         const secs = (now() - ref) / 1000;
         setStats({ ttftMs: tFirst != null ? Math.round(tFirst - t0) : 0, tokens: r.tokens, tps: secs > 0 ? r.tokens / secs : 0 });
       }
-      const ok: Stored = { id, ts: Date.now(), prompt: promptShort, model, status: "ok", output: r.content, reasoning: r.reasoning, toolCalls: r.toolCalls, tokens: r.tokens };
+      const ok: Stored = { id, ts: Date.now(), prompt: promptShort, model, status: "ok", output: r.content, reasoning: r.reasoning, toolCalls: r.toolCalls, tokens: r.tokens, upstream: r.upstream };
       persist([ok, ...history].slice(0, MAX_HISTORY));
     } catch (e) {
       const aborted = e instanceof DOMException && e.name === "AbortError";
@@ -390,6 +400,7 @@ export function ChatPlayground({
                   <div className="flex items-center gap-2">{busy && <Loader2 className="h-3 w-3 animate-spin" />}<span>Answer</span></div>
                   {stats && <span className="font-mono tabular-nums">{stats.tps.toFixed(1)} tok/s · {stats.tokens} tok{stats.ttftMs > 0 ? ` · TTFT ${stats.ttftMs} ms` : ""}</span>}
                 </div>
+                <UpstreamLine upstream={upstream} />
                 <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">{answer || (busy ? "…" : "")}</pre>
               </div>
             </div>
@@ -438,6 +449,17 @@ export function ChatPlayground({
   );
 }
 
+function UpstreamLine({ upstream }: { upstream?: Upstream | null }) {
+  if (!upstream || (!upstream.url && !upstream.name)) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+      <span>served by</span>
+      {upstream.name && <span className="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-primary">{upstream.name}</span>}
+      {upstream.url && <span className="break-all font-mono">{upstream.url}</span>}
+    </div>
+  );
+}
+
 function HistoryRow({ h }: { h: Stored }) {
   const [open, setOpen] = useState(false);
   return (
@@ -452,6 +474,7 @@ function HistoryRow({ h }: { h: Stored }) {
       </button>
       {open && (
         <div className="space-y-2 px-4 pb-3 pl-9">
+          <UpstreamLine upstream={h.upstream} />
           {h.reasoning && <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-dashed border-border bg-muted/20 p-2 font-mono text-[11px] italic text-muted-foreground scrollbar-thin">{h.reasoning}</pre>}
           {h.toolCalls && <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-status-active/40 bg-status-active/5 p-2 font-mono text-[11px] text-foreground scrollbar-thin">{h.toolCalls}</pre>}
           {h.error
