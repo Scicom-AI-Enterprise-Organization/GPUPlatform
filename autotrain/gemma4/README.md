@@ -58,6 +58,8 @@ at pack time (`pack_dataset.py --max-seq-len`); the bin must still contain the c
 | `merge_infer.py` | merge the custom LoRA into the base model and generate |
 | `pack_dataset.py` | build the multipacked ChiniDataset from a chat parquet (tools + reasoning) |
 | `eval_funccall.py` | function-calling accuracy eval (SyntheticGen scoring) via a vLLM server |
+| `bench_attention.py` | latency benchmark: FA4 cute (head_dim-512 fork) vs vLLM Triton attention |
+| `bench_setup.sh` + `bench_vllm_shim/` | copies vLLM's Triton kernel into a minimal shim (no full vLLM build) |
 | `run.sh` | one-shot pod bootstrap: deps → correctness test → download → train |
 | `CLAUDE.md` | design notes, gotchas, the full runpodctl workflow |
 
@@ -168,6 +170,60 @@ only the full-model path exercised transformers' `scaling=` kwarg):
 ```bash
 python compare_logits.py     # loads the model twice (dynamic vs default), asserts argmax match
 # PASS: argmax+top5 identical, cosine 0.998 (residual = bf16 noise from FA3+SDPA mix)
+```
+
+## Attention kernel benchmark — FA4 cute vs vLLM Triton (`bench_attention.py`)
+
+gemma-4's `head_dim=512` global layers rule out FA2/FA3 (cap ≤ 256), so the two real options are
+**FA4 cute** (the `flash-attention-512` fork — a *training* kernel: fwd+bwd, contiguous varlen) and
+**vLLM's Triton `unified_attention`** (the only vLLM backend that serves head_dim 512; paged KV with
+a 3D split-KV decode kernel). `bench_attention.py` times both on the real gemma-4-31B geometries —
+**full** (hd 512, 32 q / 4 kv) and **sliding** (hd 256, 32 q / 16 kv, window 1024) — for **prefill**
+(q=kv=L) and **decode** (q=1, kv=L) at L ∈ {1k…32k}. Measured on **one H20-3e (SM 9.0)**, bf16,
+torch 2.12.1+cu130 / triton 3.7.1, median of 50 iters.
+
+Latency in **ms** (median of 50 iters) — **FA4 vs vLLM Triton**, prefill (q=kv=L) and decode
+(q=1, kv=L). For decode, FA4 is shown both no-split (naive) and with manual FlashDecoding (the fix
+below); the faster FA4 decode is **bold**. Every shape: FA4↔Triton cosine ≥0.99999, both bit-match
+an fp32 SDPA reference.
+
+**full attention — head_dim 512, 32 q / 4 kv heads**
+
+| ms | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
+|----|------|------|------|------|-------|-------|
+| prefill — FA4              | 0.525 | 1.69  | 6.19  | 23.7  | 93.5  | 371   |
+| prefill — Triton (vLLM)    | 0.766 | 2.82  | 10.8  | 42.0  | 166   | 662   |
+| decode — FA4 FlashDecoding | 0.196 | **0.190** | **0.190** | **0.199** | **0.239** | **0.353** |
+| decode — FA4 naive         | **0.185** | 0.298 | 0.527 | 0.967 | 1.842 | 3.595 |
+| decode — Triton (vLLM)     | 0.083 | 0.082 | 0.087 | 0.087 | 0.139 | 0.262 |
+
+**sliding attention — head_dim 256, 32 q / 16 kv heads, window 1024**
+
+| ms | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
+|----|------|------|------|------|-------|-------|
+| prefill — FA4            | 0.222 | 0.500 | 1.04  | 2.15  | 4.31  | 8.64  |
+| prefill — Triton (vLLM)  | 0.636 | 1.75  | 4.00  | 8.48  | 17.5  | 35.4  |
+| decode — FA4 (no split)  | 0.147 | 0.146 | 0.146 | 0.146 | 0.145 | 0.147 |
+| decode — Triton (vLLM)   | 0.082 | 0.081 | 0.082 | 0.087 | 0.087 | 0.086 |
+
+**Prefill — FA4 wins** (FA2/FA3 can't even do head_dim 512): ~**1.8×** Triton on full hd512 (95 vs
+53 TFLOP/s at 32k), ~**4×** on sliding hd256 (125 vs 31). gemma4 trains with FA4
+(`GEMMA_ATTN=fa4_attention`, prefill-heavy long context).
+
+**Decode — Triton wins, but FA4 is now close.** FA4's varlen forward had no usable split-KV on
+Hopper (its native FlashDecoding asserts out on SM 9.0 — Blackwell-only), so decode grew ~linearly
+with context (full-hd512 naive: **3.6 ms at 32k**, ~14× Triton). Fixed with **manual FlashDecoding**
+(`run_fa4_decode_split`): split the KV into N chunks run as one varlen batch (`return_lse=True`) +
+a PyTorch LSE combine — no kernel change. That drops full-hd512 decode to **0.35 ms at 32k (10.2×
+the naive), ~flat across context, within 1.35× of Triton** (whose purpose-built paged decode still
+edges it, so serving stays on vLLM). Sliding decode is already window-bounded (~0.145 ms), so the
+sweep keeps `split=1` there. The FlashDecoding details + the run recipe (and the tiny
+`bench_vllm_shim/` that runs vLLM's exact kernel without a full vLLM build) are in `CLAUDE.md`.
+
+```bash
+VLLM_REPO=/path/to/vllm bash bench_setup.sh          # copy vLLM's Triton kernel into the shim
+CUDA_VISIBLE_DEVICES=7 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 \
+  python bench_attention.py --iters 50 --warmup 10 --out results.json
 ```
 
 ## Evaluation (function-calling accuracy)

@@ -308,3 +308,96 @@ GEMMA_ATTN=fa4_attention PYTORCH_ALLOC_CONF=expandable_segments:True FLASH_ATTEN
 `compare_logits_fa4.py` PASSED on the H20 (cosine **0.999843**). gemma-4-31B is pre-cached in
 `/share/huggingface` (no download). Post-train: `merge_infer.py --merged-out` then push/serve/eval
 as for the earlier runs.
+
+## FA4 cute vs vLLM Triton attention — kernel benchmark (`bench_attention.py`, 2026-06-24)
+
+Head-to-head latency of the **two attention kernels that can actually do gemma-4's head_dim-512
+global layers** — FA2/FA3 and vLLM's *FlashAttention* backend all cap at head_dim ≤ 256, so the
+realistic choices are **FA4 cute** (`flash_attn.cute.interface.flash_attn_varlen_func`, the
+`flash-attention-512` fork — built for *training*: fwd+bwd, contiguous varlen) and **vLLM's
+Triton** `unified_attention` (`vllm/v1/attention/ops/triton_unified_attention.py` — the only vLLM
+backend that serves head_dim 512; paged KV, 3D split-KV decode kernel). Both run on the two real
+gemma-4-31B geometries: **full** (hd 512, 32 q-heads / **4** kv-heads, full causal) and **sliding**
+(hd 256, 32 q / **16** kv, window 1024), for **prefill** (q=kv=L) and **decode** (q=1, kv=L) at
+L ∈ {1024, 2048, 4096, 8192, 16384, 32768}. Measured on **one H20-3e (SM 9.0), GPU 7**, bf16, torch
+2.12.1+cu130 / triton 3.7.1, 50 timed iters (median, CUDA events).
+
+**`fa4_ms` / `triton_ms` (ms); `r = fa4/tri` (<1 ⇒ FA4 faster). Decode `fa4_ms` is FA4 with manual
+FlashDecoding (the decode fix below); the no-split baseline is in the decode-fix table.**
+
+| geom | regime | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
+|------|--------|------|------|------|------|-------|-------|
+| full hd512    | prefill | 0.52 / 0.77 (0.69) | 1.69 / 2.82 (0.60) | 6.19 / 10.82 (0.57) | 23.7 / 42.0 (0.56) | 93.5 / 166.2 (0.56) | **371 / 662 (0.56)** |
+| full hd512    | decode  | 0.20 / 0.08 (2.4) | 0.19 / 0.08 (2.3) | 0.19 / 0.09 (2.2) | 0.20 / 0.09 (2.3) | 0.24 / 0.14 (1.7) | **0.35 / 0.26 (1.35)** |
+| sliding hd256 | prefill | 0.22 / 0.64 (0.35) | 0.50 / 1.75 (0.28) | 1.04 / 4.00 (0.26) | 2.15 / 8.48 (0.25) | 4.31 / 17.47 (0.25) | **8.64 / 35.4 (0.24)** |
+| sliding hd256 | decode  | 0.15 / 0.08 (1.8) | 0.15 / 0.08 (1.8) | 0.15 / 0.08 (1.8) | 0.15 / 0.09 (1.7) | 0.15 / 0.09 (1.7) | **0.15 / 0.09 (1.7)** |
+
+**Verdict — FA4 now competitive in BOTH regimes** (after the decode fix below):
+- **Prefill: FA4 wins big.** ~**1.8×** faster on full hd512 (95 vs 53 TFLOP/s at 32k) and ~**4×**
+  on sliding hd256 (125 vs 31 TFLOP/s) — the Triton kernel isn't tuned for head_dim 512 and tiles
+  the long key axis poorly. Ratio is flat across L (0.56 full / 0.24–0.35 sliding). This is the
+  long-context-training regime, which is *why* gemma4 trains with FA4 (`GEMMA_ATTN=fa4_attention`).
+- **Decode: FA4 ≈ Triton after FlashDecoding.** Full-hd512 decode is now **~flat at ~0.19–0.35 ms**
+  (1.35–2.4× Triton, gap *closing* as context grows) instead of scaling to **3.6 ms at 32k** — see
+  the fix below. Triton's purpose-built *paged* split-KV decode still edges it, so serving can stay
+  on vLLM (`eval_funccall.py`, the Try-it server), but FA4 is no longer catastrophic at decode.
+- **Both are numerically correct.** All shapes: FA4↔Triton **cosine ≥0.99999**, max-abs ≤ 8e-3,
+  and **both bit-match an fp32 SDPA reference** (`fa1.0000/tr1.0000`) — including the FlashDecoding
+  combine. Confirms head_dim-512 runs *correctly* through vLLM Triton too — it's just slow at prefill.
+
+### Decode fix — manual FlashDecoding (FA4's native SplitKV is Blackwell-only)
+
+FA4 decode was originally slow because **`flash_attn_varlen_func(num_splits=1)` launches one CTA per
+(query-block, head)** — for q_len=1 that's a handful of CTAs, each walking the *entire* KV serially,
+so latency ∝ context (0.18→1.84→**3.6 ms** at 16k→32k on full hd512, up to 14× Triton). The fork
+*has* a split-KV path + combine kernel, but it **asserts out on Hopper** (`assert not is_split_kv,
+"SplitKV not supported on SM 9.0"`; `FlashAttentionForwardSm90` takes no `is_split_kv` — split-KV is
+wired only for Blackwell sm100/110). So `num_splits=0` (the auto heuristic) hits that assert on the
+H20; `pack_gqa` was already auto-on and isn't enough.
+
+Fix (`bench_attention.py::run_fa4_decode_split`, **no kernel change**): do FlashDecoding *around* the
+kernel — split the KV into N contiguous chunks, run them as ONE varlen batch (the decode query
+repeated once per chunk, `return_lse=True`), then combine the N partial outputs with an LSE reduction
+in PyTorch (`O = Σ_s exp(lse_s−M)·O_s / Σ_s exp(lse_s−M)`, `M = max_s lse_s`). N× the CTAs → the long
+KV is processed in parallel. Exact for decode: the single query sits at the end and attends every key
+with **no causal mask**, so each chunk is a plain full attention over its key range (a sliding layer
+attends only the last `window` keys, so only those are split).
+
+Result (full hd512 decode; best N swept over {2,4,8,16,32,64}, ~flat after the fix):
+
+| L | naive (num_splits=1) | FlashDecoding | speedup | N | vs Triton |
+|---|----------------------|---------------|---------|---|-----------|
+| 2048  | 0.298 ms | 0.190 ms | 1.6× | 32 | 2.3× |
+| 4096  | 0.527 ms | 0.190 ms | 2.8× | 32 | 2.2× |
+| 8192  | 0.967 ms | 0.199 ms | 4.9× | 16 | 2.3× |
+| 16384 | 1.842 ms | 0.239 ms | 7.7× | 16 | 1.7× |
+| 32768 | 3.595 ms | 0.353 ms | **10.2×** | 16 | 1.35× |
+
+(At L=1024 the split overhead ≈ its savings, so naive ≈ split ≈0.19 ms; the sweep keeps whichever
+wins. **Sliding decode** is already window-bounded (~0.145 ms, only 1024 keys attended), so the sweep
+keeps `split=1` there — FlashDecoding isn't worth its overhead.) FA4 **prefill is untouched** (the
+heuristic returns 1 split when there are enough M-blocks; split-KV is a decode-only win).
+`run_fa4_decode_split` is the reference if FA4 is ever used for inference decode; the packed
+*training* path (`gemma4_fa4_attention.py`) is prefill-only and unaffected.
+
+**Run it** (results in `bench_attention_results.json`). Needs torch+triton (for the Triton kernel)
++ the FA4 cute fork + cutlass-dsl — same venv as the FA4 training recipe above. The benchmark runs
+vLLM's *exact* kernel source via `bench_vllm_shim/` (tiny stand-ins for the ~5 vllm internals the
+kernel imports — `envs`/`logger`/`platforms`/`triton_utils`/`KVQuantMode`, faithful to upstream;
+none touch the attention math), so **no full vLLM build** is needed:
+
+```bash
+# 1) copy vLLM's Triton kernel into the shim (pins to whatever vLLM checkout you point at):
+VLLM_REPO=/home/husein/ssd3/vllm bash bench_setup.sh            # add: --venv /share/gemma4-bench-venv (FA4_FORK=…) to also build the venv
+# 2) run on one GPU (FA4 cute JIT-compiles per shape; warmup absorbs it). Import needs a dir
+#    with NO local flash_attn/ folder — the job dir is fine:
+ssh -i scicom root@8.222.165.68 -p 1023   # the tm H20 box (port 1023)
+CUDA_VISIBLE_DEVICES=7 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 PYTORCH_ALLOC_CONF=expandable_segments:True \
+  python bench_attention.py --iters 50 --warmup 10 --out results.json   # --quick for a smoke
+```
+
+⚠ The tm box this ran on (`dsw-464391…`, port **1023**) is a *fresh* box — the FA4 venv/fork from
+the recipe above didn't exist, so it was rebuilt: torch 2.12 had to install via the explicit index
+(`uv pip install torch --index-url https://download.pytorch.org/whl/cu130`; this `uv`'s
+`--torch-backend` caps at cu129), and the box has **no `rsync`** (stage with `tar | ssh 'tar x'`,
+not rsync). gemma-4 is pre-cached in `/share/huggingface`.

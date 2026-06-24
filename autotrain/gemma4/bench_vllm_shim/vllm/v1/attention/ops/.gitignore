@@ -1,0 +1,5 @@
+# The two Triton kernel files here are copied verbatim from a vLLM checkout by
+# ../../../../../bench_setup.sh (run `VLLM_REPO=/path/to/vllm bash bench_setup.sh`).
+# They are vLLM's source, not vendored into this repo — keep them out of git.
+triton_unified_attention.py
+triton_attention_helpers.py
