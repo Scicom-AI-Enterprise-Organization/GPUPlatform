@@ -74,7 +74,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [enabled, setEnabled] = useState(initial?.enabled ?? true);
   const [isPublic, setIsPublic] = useState(initial?.public ?? false);
   const [maxConc, setMaxConc] = useState(String(initial?.max_concurrency ?? 0));
-  const [timeoutS, setTimeoutS] = useState(String(initial?.timeout_s ?? 600));
+  const [timeoutS, setTimeoutS] = useState(String(initial?.timeout_s ?? 3600));
   const [ups, setUps] = useState<UpstreamDraft[]>(initial ? fromEndpoint(initial) : [seededUpstream(prefill)]);
   const [secretKeys, setSecretKeys] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -145,7 +145,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
       const body = {
         name: name.trim(),
         max_concurrency: Number(maxConc) || 0,
-        timeout_s: Number(timeoutS) || 600,
+        timeout_s: Number(timeoutS) || 3600,
         enabled,
         public: isPublic,
         upstreams: b.upstreams,
