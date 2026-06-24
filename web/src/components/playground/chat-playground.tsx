@@ -156,11 +156,14 @@ export function openAiTransport(opts: { fetchPath: string; curlUrl: string }): C
             if (!line.startsWith("data:")) continue;
             const d = line.slice(5).trim();
             if (!d || d === "[DONE]") continue;
-            let c: { choices?: { delta?: { content?: string; reasoning_content?: string; tool_calls?: unknown } }[]; usage?: { completion_tokens?: number }; error?: { message?: string } };
+            let c: { choices?: { delta?: { content?: string; reasoning_content?: string; reasoning?: string; tool_calls?: unknown } }[]; usage?: { completion_tokens?: number }; error?: { message?: string } };
             try { c = JSON.parse(d); } catch { continue; }
             if (c.error) throw new Error(c.error.message || JSON.stringify(c.error));
             if (c.usage?.completion_tokens != null) usage = c.usage.completion_tokens;
-            const dr = c.choices?.[0]?.delta?.reasoning_content;
+            // Reasoning models stream their chain-of-thought as `delta.reasoning_content`
+            // (DeepSeek-style) OR `delta.reasoning` (GLM/vLLM) — accept both, else the
+            // bubble looks empty until `content` starts (which can be many tokens later).
+            const dr = c.choices?.[0]?.delta?.reasoning_content ?? c.choices?.[0]?.delta?.reasoning;
             if (dr) { accR += dr; h.onReasoning(accR); h.onToken(); }
             const dcp = c.choices?.[0]?.delta?.content;
             if (dcp) { acc += dcp; h.onAnswer(acc); h.onToken(); }

@@ -3223,6 +3223,16 @@ async def stream(
 ):
     rdb = request.app.state.redis
     app = await _load_owned_app(session, app_id, user)
+    # Proxy mode has no job queue / worker dispatch — the gateway forwards straight
+    # to the VM's vLLM over the (autossh) tunnel. Stream there instead of enqueuing
+    # to a queue nobody consumes (which would just hang after the meta event). Same
+    # delegation the unary /{app_id}/v1/chat/completions path does.
+    if (getattr(app, "mode", "single") or "single") == "proxy":
+        ep = payload.pop("endpoint", None)
+        vllm_path = ep if isinstance(ep, str) and ep.startswith("/v1/") else "/v1/chat/completions"
+        payload["stream"] = True
+        await rdb.set(f"app:{app_id}:last_request_ts", str(time.time()))
+        return await _proxy_to_upstream(request, app_id, payload, vllm_path, int(app.request_timeout_s))
     cfg = app.autoscaler
     cap = int(cfg["max_containers"]) * int(cfg["tasks_per_container"])
     queue_len = await rdb.llen(f"queue:{app_id}")
