@@ -3,10 +3,12 @@ WORKDIR /app
 
 # Runtime deps for benchmaq's runpod flow:
 #   git           — uv pip installs benchmaq from git
-#   openssh-client— benchmaq SSHs into the spawned RunPod pod
+#   openssh-client— benchmaq SSHs into the spawned RunPod pod; also the VM-proxy
+#                   forward tunnel (vm_tunnel.ensure_forward) shells out to ssh
+#   autossh       — keeps the gateway→VM vLLM forward tunnel alive + auto-reconnects
 #   ca-certificates + curl — fetch runpodctl binary
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git openssh-client ca-certificates curl \
+      git openssh-client autossh ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 # runpodctl — benchmaq shells out to it for `pod create / ssh info / delete`.

@@ -214,9 +214,16 @@ class VMProvider(Provider):
             )
         if all_ids:
             await self._rdb.srem(f"worker_index:{app_id}", *all_ids)
-        # Proxy endpoint bookkeeping (forward-tunnel upstream); the in-process
-        # listener thread lingers harmlessly until the next gateway restart, but
-        # the upstream key going away makes the dispatch path return 503 at once.
+        # Proxy endpoint bookkeeping: kill this endpoint's forward (autossh)
+        # subprocess so it doesn't linger, then drop the upstream key (makes the
+        # dispatch path return 503 at once).
+        vmport = await self._rdb.get(f"proxy:{app_id}:vmport")
+        if vmport:
+            from . import vm_tunnel
+            try:
+                vm_tunnel.close_forwards(self._host, int(vmport))
+            except Exception:
+                logger.warning("vm-purge: app=%s forward cleanup failed", app_id, exc_info=True)
         await self._rdb.delete(f"proxy:{app_id}:upstream", f"proxy:{app_id}:vmport")
         await self._rdb.srem(f"vm_proxy_apps:{self._provider_id}", app_id)
         logger.info("vm-purge: app=%s purged %d remnant(s) on %s", app_id, len(machine_ids), self._host)

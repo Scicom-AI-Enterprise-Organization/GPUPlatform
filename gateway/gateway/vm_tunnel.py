@@ -20,10 +20,17 @@ at a reachable Redis instead of using this.
 """
 from __future__ import annotations
 
+import atexit
+import hashlib
 import logging
+import os
 import select
+import shutil
 import socket
+import subprocess
+import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
@@ -33,6 +40,97 @@ logger = logging.getLogger("gateway.vm_tunnel")
 SOCK_BUF = 8192
 CONNECT_TIMEOUT_S = 20
 MONITOR_INTERVAL_S = 15
+
+# ---- native-OpenSSH forward tunnels (gateway → VM vLLM) --------------------
+# The gateway→vLLM forward (proxy mode) runs as a real `autossh -L` subprocess
+# rather than an in-process paramiko channel: OpenSSH does the byte relay in C
+# (no per-token GIL pump), autossh auto-reconnects with ServerAlive keepalives,
+# and it's a SEPARATE connection from the worker's reverse tunnel — so reverse-
+# tunnel health churn can't tear down in-flight proxy requests. Falls back to
+# plain `ssh` (the autoscaler re-spawns a dead one each tick) if autossh is absent.
+_AUTOSSH = shutil.which("autossh")
+_SSH = shutil.which("ssh") or "ssh"
+_FWD_LOCK = threading.Lock()
+
+
+@dataclass
+class _FwdProc:
+    proc: "subprocess.Popen"
+    local_port: int
+    keyfile: str
+
+
+_FWD_PROCS: dict = {}  # (host, port, vm_host, vm_port) -> _FwdProc
+
+
+def _free_local_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _keyfile_for(host: str, pkey_pem: str) -> str:
+    """Write the PEM to a stable 0600 temp file OpenSSH can read (`-i`). Reused
+    across re-spawns; keyed by host+key so a rotated key gets a fresh file."""
+    h = hashlib.sha256(f"{host}::{pkey_pem}".encode()).hexdigest()[:16]
+    path = os.path.join(tempfile.gettempdir(), f"sgpu_vmkey_{h}")
+    if not os.path.exists(path):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(pkey_pem if pkey_pem.endswith("\n") else pkey_pem + "\n")
+    return path
+
+
+def _port_accepting(port: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
+def _ssh_forward_cmd(local_port: int, vm_host: str, vm_port: int,
+                     host: str, port: int, user: str, keyfile: str) -> list[str]:
+    opts = [
+        "-N", "-T",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={CONNECT_TIMEOUT_S}",
+        "-i", keyfile,
+        "-p", str(port),
+        "-L", f"127.0.0.1:{local_port}:{vm_host}:{vm_port}",
+        f"{user}@{host}",
+    ]
+    if _AUTOSSH:
+        return [_AUTOSSH, "-M", "0", *opts]  # -M 0: no monitor port; rely on ServerAlive*
+    return [_SSH, *opts]
+
+
+def _kill_fwd(fp: "_FwdProc") -> None:
+    try:
+        fp.proc.terminate()
+        try:
+            fp.proc.wait(timeout=3)
+        except Exception:
+            fp.proc.kill()
+    except Exception:
+        pass
+
+
+@atexit.register
+def _cleanup_forwards() -> None:
+    for fp in list(_FWD_PROCS.values()):
+        _kill_fwd(fp)
 
 
 @dataclass(frozen=True)
@@ -325,49 +423,44 @@ def _forward_listener(t: _Tunnel, fwd: LocalForward) -> None:
 def ensure_forward(host: str, port: int, user: str, pkey_pem: str,
                    vm_port: int, vm_host: str = "127.0.0.1") -> int:
     """Idempotent `ssh -L`: ensure a local listener on the gateway that forwards
-    to `vm_host:vm_port` on the VM over the per-host SSH tunnel. Returns the local
-    port (stable across reconnects). Reuses the host's existing reverse tunnel
-    connection when present, else opens one. Safe to call every autoscaler tick."""
-    with _LOCK:
-        t = _TUNNELS.get(host)
-        if t is None:
-            t = _Tunnel(host=host, port=port, user=user, pkey_pem=pkey_pem, forwards=())
-            _TUNNELS[host] = t
-        # Already forwarding this VM port → return the stable local port.
-        for fwd in t.local_forwards:
-            if fwd.vm_port == vm_port and fwd.vm_host == vm_host:
-                if t.client is None or not _is_up(t):
-                    try:
-                        _safe_close(t)
-                        _connect(t)
-                    except Exception as e:
-                        logger.warning("vm-tunnel %s forward reconnect failed: %s", host, e)
-                return fwd.local_port
-        # Bind a fresh local listener (auto-pick a free port).
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(128)
-        local_port = srv.getsockname()[1]
-        fwd = LocalForward(vm_port=vm_port, vm_host=vm_host, local_port=local_port, _server=srv)
-        t.local_forwards.append(fwd)
-        # Make sure the SSH connection + monitor are up before the listener runs.
-        if t.client is None or not _is_up(t):
-            try:
-                _connect(t)
-            except Exception as e:
-                logger.warning("vm-tunnel %s forward connect failed (monitor will retry): %s", host, e)
-        if t.thread is None or not t.thread.is_alive():
-            t.thread = threading.Thread(target=_monitor, args=(t,), daemon=True, name=f"vm-tunnel-{host}")
-            t.thread.start()
-        fwd._thread = threading.Thread(
-            target=_forward_listener, args=(t, fwd), daemon=True,
-            name=f"vm-fwd-{host}-{vm_port}",
+    to `vm_host:vm_port` on the VM, via a native `autossh -L` subprocess. Returns
+    the local port. Reuses a live subprocess; re-spawns a dead one (so the
+    autoscaler tick heals it after a gateway restart). Safe to call every tick.
+
+    Native OpenSSH (not paramiko): the byte relay is in C, autossh keeps the
+    connection alive + reconnects on drop, and it's a dedicated connection per
+    forward — decoupled from the worker's reverse tunnel, so reverse-tunnel
+    health churn can't kill an in-flight proxy request."""
+    key = (host, int(port), vm_host, int(vm_port))
+    with _FWD_LOCK:
+        fp = _FWD_PROCS.get(key)
+        if fp is not None and fp.proc.poll() is None:
+            return fp.local_port  # subprocess alive → forward is up
+        if fp is not None:
+            _kill_fwd(fp)  # dead/exited → clean up before re-spawning
+        keyfile = _keyfile_for(host, pkey_pem)
+        local_port = _free_local_port()
+        cmd = _ssh_forward_cmd(local_port, vm_host, vm_port, host, port, user, keyfile)
+        env = {**os.environ, "AUTOSSH_GATETIME": "0"}  # keep retrying even if the 1st connect is slow
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, env=env,
         )
-        fwd._thread.start()
-        logger.info("vm-tunnel forward up: 127.0.0.1:%d → %s:%s on %s",
-                    local_port, vm_host, vm_port, host)
+        if not _port_accepting(local_port, timeout=15.0):
+            logger.warning("vm-tunnel forward %s:%d → %s:%d not accepting after spawn (will retry next tick)",
+                           host, port, vm_host, vm_port)
+        _FWD_PROCS[key] = _FwdProc(proc=proc, local_port=local_port, keyfile=keyfile)
+        logger.info("vm-tunnel forward (%s) up: 127.0.0.1:%d → %s:%d on %s",
+                    "autossh" if _AUTOSSH else "ssh", local_port, vm_host, vm_port, host)
         return local_port
+
+
+def close_forwards(host: str, vm_port: Optional[int] = None) -> None:
+    """Kill forward subprocesses for `host` (called on teardown/terminate). With
+    `vm_port`, kills only that forward — a host can serve several proxy endpoints."""
+    with _FWD_LOCK:
+        for key in [k for k in _FWD_PROCS if k[0] == host and (vm_port is None or k[3] == int(vm_port))]:
+            _kill_fwd(_FWD_PROCS.pop(key))
 
 
 def close(host: str) -> None:
