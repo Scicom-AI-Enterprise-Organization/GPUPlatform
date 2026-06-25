@@ -101,6 +101,35 @@ healthy; workaround is a `pre_script` `uv pip install -U "prometheus-fastapi-ins
 repeated re-provisions, free orphaned GPU memory with `POST /apps/{id}/workers/purge` (a self-exited
 vLLM the per-PID cleanup misses → "No available memory for the cache blocks" on the next launch).
 
+### Activity dashboard (`/activity`) + proxy-mode usage recording
+
+The **Activity** page (`web/.../activity-dashboard.tsx` → `GET /v1/history/activity` in
+`history_api.py`) is unified usage analytics: requests, token in/out, TTFT/latency, top
+users/models. It aggregates **two tables only** — `requests` (serverless queue) +
+`proxy_requests` (the separate LLM-proxy feature). So *anything that doesn't write one of
+those rows is invisible to Activity.*
+
+⚠ **Single-model VM endpoints (`mode=proxy`) bypass the queue/worker** — the gateway
+HTTP-forwards straight to the VM's vLLM (`main._proxy_to_upstream` / `_proxy_audio_to_upstream`),
+and that worker is what normally writes the `requests` row. So proxy traffic used to be recorded
+**nowhere** → missing from Activity (and request history). Fixed: the proxy path now records each
+request into the `requests` table itself (it's a serverless `App`, so `requests` is the right home —
+NOT `proxy_requests`, which belongs to the LLM-proxy and is pruned by *its* health loop). Details:
+- **`main._record_proxy_request`** writes a **slim** row — `payload={"model":…}` + `output={"usage":…}`
+  + `ttft_ms` + created/completed — exactly the fields the aggregator reads (`payload.model`,
+  `output.usage.{prompt,completion}_tokens`, `ttft_ms`, latency = completed−created). Slim on purpose:
+  proxy is the high-throughput path (synthetic-data gen). Streams get `stream_options.include_usage`
+  injected + the SSE chunks sniffed for the final usage block; TTFT is the first-chunk time.
+- **Non-blocking, off the DB hot path**: it ENQUEUEs to the background **`stats_writer`**
+  (`record_serverless_request`, a new INSERT path — the writer previously only did UPDATEs on
+  existing rows) rather than opening a pooled session per request. One writer connection batches the
+  whole burst; a per-request checkout here is exactly the pool-exhaustion incident `stats_writer` was
+  built to avoid. Load-verified locally: full proxy path through `_proxy_to_upstream` + a mock vLLM
+  sustained **~1200 RPS non-stream / ~514 RPS stream at 100 concurrency with every request recorded**
+  (writer hot-path enqueue ~10µs, peak 1 concurrent DB backend). Writer sustained ceiling ≈ **925
+  rows/s** on defaults (`STATS_FLUSH_MAX_BATCH=500`, shared across all stat sources); above that the
+  20k queue buffers then drops-and-logs (best-effort) — raise the batch env if real load nears it.
+
 ### Label platform (data-labelling app)
 
 A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)
