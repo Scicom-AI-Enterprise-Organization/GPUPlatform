@@ -1,0 +1,5 @@
+packed_data*
+.venv
+__pycache__
+checkpointing*
+memory_profile_*.pickle

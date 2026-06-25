@@ -65,6 +65,24 @@ def record_stream_completion(request_id: str, ttft_ms: Optional[int],
               "pt": pt, "ct": ct, "latency_ms": latency_ms})
 
 
+def record_serverless_request(request_id: str, app_id: str, owner_id: Optional[int],
+                              endpoint: str, model: Optional[str], *, is_stream: bool,
+                              status: str, created_at, completed_at,
+                              ttft_ms: Optional[int] = None, pt: Optional[int] = None,
+                              ct: Optional[int] = None) -> None:
+    """INSERT a whole serverless `requests` row (not an update of an existing one).
+
+    Used by the proxy-mode (single-model VM) path, which forwards straight to the VM's
+    vLLM and never goes through the queue/worker that normally inserts this row — so its
+    traffic is otherwise invisible to the Activity dashboard. Goes through the SAME
+    background writer as the update path so a burst of proxy requests costs one writer
+    connection, not one pooled checkout per request (the pool-exhaustion incident)."""
+    _enqueue({"kind": "serverless_insert", "id": request_id, "app_id": app_id,
+              "owner_id": owner_id, "endpoint": endpoint, "model": model,
+              "is_stream": is_stream, "status": status, "created_at": created_at,
+              "completed_at": completed_at, "ttft_ms": ttft_ms, "pt": pt, "ct": ct})
+
+
 def record_proxy_finish(request_id: str, status: str, *, status_code: Optional[int] = None,
                         latency_ms: Optional[int] = None, pt: Optional[int] = None,
                         ct: Optional[int] = None, error: Optional[str] = None,
@@ -160,6 +178,38 @@ def _apply_proxy(row, it: dict, now: datetime) -> None:
         pass
 
 
+def _insert_serverless(s, items: list[dict]) -> None:
+    """Stage brand-new serverless rows (proxy-mode requests) for INSERT. Sync — only
+    builds + s.add_all()s ORM objects; the caller awaits the batched commit."""
+    from .db import Request as ReqRow
+    objs = []
+    for it in items:
+        out = None
+        if it.get("pt") is not None or it.get("ct") is not None:
+            usage = {}
+            if it.get("pt") is not None:
+                usage["prompt_tokens"] = it["pt"]
+            if it.get("ct") is not None:
+                usage["completion_tokens"] = it["ct"]
+            out = {"usage": usage}
+        objs.append(ReqRow(
+            request_id=it["id"], app_id=it["app_id"], owner_id=it["owner_id"],
+            endpoint=it["endpoint"],
+            payload=({"model": it["model"]} if it.get("model") else {}),
+            status=it.get("status") or "completed", output=out,
+            is_stream=bool(it.get("is_stream")),
+            created_at=it["created_at"], completed_at=it.get("completed_at"),
+            ttft_ms=it.get("ttft_ms"),
+        ))
+    s.add_all(objs)
+    try:
+        from . import metrics as _metrics
+        for it in items:
+            _metrics.observe_job_outcome(it["app_id"], it.get("status") or "completed")
+    except Exception:  # noqa: BLE001 — metrics are best-effort
+        pass
+
+
 async def _flush(items: list[dict]) -> None:
     if not items or _sessionmaker is None:
         return
@@ -178,9 +228,12 @@ async def _flush(items: list[dict]) -> None:
 
     sv = {rid: it for (kind, rid), it in merged.items() if kind == "serverless"}
     px = {rid: it for (kind, rid), it in merged.items() if kind == "proxy"}
+    ins = {rid: it for (kind, rid), it in merged.items() if kind == "serverless_insert"}
     now = datetime.now(timezone.utc)
 
     async with _sessionmaker() as s:
+        if ins:
+            _insert_serverless(s, list(ins.values()))
         if sv:
             rows = (await s.execute(select(ReqRow).where(ReqRow.request_id.in_(list(sv))))).scalars().all()
             for row in rows:

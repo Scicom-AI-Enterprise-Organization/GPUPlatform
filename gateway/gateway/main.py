@@ -3232,7 +3232,7 @@ async def stream(
         vllm_path = ep if isinstance(ep, str) and ep.startswith("/v1/") else "/v1/chat/completions"
         payload["stream"] = True
         await rdb.set(f"app:{app_id}:last_request_ts", str(time.time()))
-        return await _proxy_to_upstream(request, app_id, payload, vllm_path, int(app.request_timeout_s))
+        return await _proxy_to_upstream(request, app_id, payload, vllm_path, int(app.request_timeout_s), owner_id=user.id)
     cfg = app.autoscaler
     cap = int(cfg["max_containers"]) * int(cfg["tasks_per_container"])
     queue_len = await rdb.llen(f"queue:{app_id}")
@@ -3702,18 +3702,60 @@ async def _resolve_endpoint_path(
     return app_id, None
 
 
+def _record_proxy_request(
+    app_id: str,
+    owner_id: Optional[int],
+    payload: dict,
+    endpoint: str,
+    *,
+    created_at: datetime,
+    is_stream: bool,
+    status: str = "completed",
+    usage: Optional[dict] = None,
+    ttft_ms: Optional[int] = None,
+) -> None:
+    """Record a proxy-mode (single-model VM) request into the `requests` table.
+
+    Proxy mode forwards straight to the VM's vLLM and never touches the queue/worker
+    that normally writes this row — so without this, proxy traffic is invisible to the
+    Activity dashboard + request history (both read only `requests`/`proxy_requests`).
+    We record a SLIM row — just `model` + token `usage`, NOT the full prompt/output, since
+    proxy is the high-throughput path (synthetic-data gen etc.) — carrying everything the
+    Activity aggregator reads: payload.model, output.usage.{prompt,completion}_tokens,
+    ttft_ms, and created/completed_at (its end-to-end latency = completed-created).
+
+    Non-blocking: ENQUEUEs to the background stats writer (one writer connection for a
+    whole burst) instead of opening a pooled connection per request — synthetic-data gen
+    fires these concurrently, and per-request checkout is exactly the pool-exhaustion
+    incident stats_writer was built to avoid."""
+    if owner_id is None:
+        return
+    model = payload.get("model") if isinstance(payload, dict) else None
+    u = usage if isinstance(usage, dict) else {}
+    from . import stats_writer
+    stats_writer.record_serverless_request(
+        f"req-{uuid.uuid4().hex[:12]}", app_id, owner_id, endpoint, model,
+        is_stream=is_stream, status=status, created_at=created_at,
+        completed_at=datetime.now(timezone.utc), ttft_ms=ttft_ms,
+        pt=u.get("prompt_tokens"), ct=u.get("completion_tokens"),
+    )
+
+
 async def _proxy_to_upstream(
     request: Request,
     app_id: str,
     payload: dict,
     vllm_path: str,
     timeout_s: int,
+    owner_id: Optional[int] = None,
 ):
     """Proxy-mode dispatch: forward the OpenAI request straight to the single
     model's vLLM over the gateway→VM forward tunnel. No Redis queue, no admission,
     no sleep/wake — a transparent reverse proxy. The upstream URL
     (`http://127.0.0.1:{local_forward_port}`) is published by the VM provider when
-    it opens the tunnel (see vm_serverless_provider._wire_proxy_forward)."""
+    it opens the tunnel (see vm_serverless_provider._wire_proxy_forward). `owner_id`
+    (when given) is recorded into the requests table so the Activity dashboard sees
+    proxy traffic too — see _record_proxy_request."""
     rdb = request.app.state.redis
     upstream = await rdb.get(f"proxy:{app_id}:upstream")
     if isinstance(upstream, (bytes, bytearray)):
@@ -3728,6 +3770,13 @@ async def _proxy_to_upstream(
     url = upstream.rstrip("/") + vllm_path
     httpx_to = httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0)
     is_stream = bool(payload.get("stream"))
+    if is_stream:
+        # Ask vLLM for a final usage chunk so streamed proxy requests record token
+        # counts too (mirrors the queue path). Don't clobber a caller's stream_options.
+        _so = dict(payload.get("stream_options") or {})
+        _so.setdefault("include_usage", True)
+        payload = {**payload, "stream_options": _so}
+    created_at = datetime.now(timezone.utc)
 
     if not is_stream:
         try:
@@ -3740,9 +3789,19 @@ async def _proxy_to_upstream(
             except Exception:
                 detail = {"error": r.text[:500]}
             raise HTTPException(status_code=r.status_code, detail=detail)
-        return r.json()
+        out = r.json()
+        _record_proxy_request(
+            app_id, owner_id, payload, vllm_path, created_at=created_at, is_stream=False,
+            usage=(out.get("usage") if isinstance(out, dict) else None),
+        )
+        return out
+
+    _t0 = time.perf_counter()
 
     async def gen():
+        ttft_ms: Optional[int] = None
+        usage: Optional[dict] = None
+        buf = ""  # SSE sniffer buffer (passthrough is untouched raw bytes)
         try:
             async with cli.stream("POST", url, json=payload, timeout=httpx_to) as r:
                 if r.status_code >= 400:
@@ -3750,12 +3809,39 @@ async def _proxy_to_upstream(
                     yield f"data: {json.dumps({'error': {'message': body, 'code': r.status_code}})}\n\n".encode()
                     yield b"data: [DONE]\n\n"
                     return
-                # vLLM already emits OpenAI SSE framing ("data: {…}\n\n") — pass bytes through.
+                # vLLM already emits OpenAI SSE framing ("data: {…}\n\n") — pass bytes
+                # through verbatim, and on the side sniff the final usage chunk + TTFT.
                 async for chunk in r.aiter_bytes():
+                    if ttft_ms is None:
+                        ttft_ms = int((time.perf_counter() - _t0) * 1000)
                     yield chunk
+                    try:
+                        buf += chunk.decode("utf-8", "replace")
+                        while "\n\n" in buf:
+                            event, buf = buf.split("\n\n", 1)
+                            for line in event.splitlines():
+                                if not line.startswith("data:"):
+                                    continue
+                                data = line[5:].strip()
+                                if not data or data == "[DONE]":
+                                    continue
+                                try:
+                                    parsed = json.loads(data)
+                                except json.JSONDecodeError:
+                                    continue
+                                u = parsed.get("usage") if isinstance(parsed, dict) else None
+                                if isinstance(u, dict):
+                                    usage = u
+                    except Exception:
+                        pass
         except httpx.HTTPError as e:
             yield f"data: {json.dumps({'error': {'message': f'upstream stream error: {type(e).__name__}'}})}\n\n".encode()
             yield b"data: [DONE]\n\n"
+        finally:
+            _record_proxy_request(
+                app_id, owner_id, payload, vllm_path, created_at=created_at,
+                is_stream=True, usage=usage, ttft_ms=ttft_ms,
+            )
 
     return StreamingResponse(
         gen(),
@@ -3770,12 +3856,14 @@ async def _proxy_audio_to_upstream(
     payload: dict,
     vllm_path: str,
     timeout_s: int,
+    owner_id: Optional[int] = None,
 ):
     """Proxy-mode audio dispatch: rebuild the multipart request from the base64
     payload and forward it straight to the model's vLLM (which serves
     /v1/audio/{transcriptions,translations} as native multipart) over the forward
     tunnel. The queue path base64s + has the worker rebuild multipart; here we
-    rebuild + proxy directly (no queue)."""
+    rebuild + proxy directly (no queue). `owner_id` (when given) records the request
+    into the requests table for the Activity dashboard (ASR carries no token usage)."""
     rdb = request.app.state.redis
     upstream = await rdb.get(f"proxy:{app_id}:upstream")
     if isinstance(upstream, (bytes, bytearray)):
@@ -3787,6 +3875,7 @@ async def _proxy_audio_to_upstream(
     data = {"model": payload["model"], **{k: str(v) for k, v in (payload.get("_form") or {}).items()}}
     cli: httpx.AsyncClient = request.app.state.proxy_http
     url = upstream.rstrip("/") + vllm_path
+    created_at = datetime.now(timezone.utc)
     try:
         r = await cli.post(url, files=files, data=data,
                            timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
@@ -3798,6 +3887,10 @@ async def _proxy_audio_to_upstream(
         except Exception:
             detail = {"error": r.text[:500]}
         raise HTTPException(status_code=r.status_code, detail=detail)
+    _record_proxy_request(
+        app_id, owner_id, {"model": payload.get("model")}, vllm_path,
+        created_at=created_at, is_stream=False,
+    )
     return r.json()
 
 
@@ -3832,7 +3925,7 @@ async def _openai_endpoint(
         if target_model:
             payload = {**payload, "model": target_model}
         await db_session.close()
-        return await _proxy_to_upstream(request, app_id, payload, vllm_path, proxy_timeout_s)
+        return await _proxy_to_upstream(request, app_id, payload, vllm_path, proxy_timeout_s, owner_id=user.id)
 
     is_stream = bool(payload.get("stream"))
     if is_stream:
@@ -4119,7 +4212,7 @@ async def _openai_audio_endpoint(
             payload["model"] = target_model
         ptimeout = int(getattr(app_row, "request_timeout_s", 600) or 600)
         await db_session.close()
-        return await _proxy_audio_to_upstream(request, app_id, payload, vllm_path, ptimeout)
+        return await _proxy_audio_to_upstream(request, app_id, payload, vllm_path, ptimeout, owner_id=user.id)
 
     request_id, _timeout_s = await _admit_and_enqueue(
         rdb, db_session, app_id, user, payload, stream=False, endpoint=vllm_path,

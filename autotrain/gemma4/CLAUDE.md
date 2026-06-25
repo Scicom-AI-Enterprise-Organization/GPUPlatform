@@ -327,23 +327,24 @@ FlashDecoding (the decode fix below); the no-split baseline is in the decode-fix
 
 | geom | regime | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
 |------|--------|------|------|------|------|-------|-------|
-| full hd512    | prefill | 0.52 / 0.77 (0.69) | 1.69 / 2.82 (0.60) | 6.19 / 10.82 (0.57) | 23.7 / 42.0 (0.56) | 93.5 / 166.2 (0.56) | **371 / 662 (0.56)** |
-| full hd512    | decode  | 0.20 / 0.08 (2.4) | 0.19 / 0.08 (2.3) | 0.19 / 0.09 (2.2) | 0.20 / 0.09 (2.3) | 0.24 / 0.14 (1.7) | **0.35 / 0.26 (1.35)** |
-| sliding hd256 | prefill | 0.22 / 0.64 (0.35) | 0.50 / 1.75 (0.28) | 1.04 / 4.00 (0.26) | 2.15 / 8.48 (0.25) | 4.31 / 17.47 (0.25) | **8.64 / 35.4 (0.24)** |
-| sliding hd256 | decode  | 0.15 / 0.08 (1.8) | 0.15 / 0.08 (1.8) | 0.15 / 0.08 (1.8) | 0.15 / 0.09 (1.7) | 0.15 / 0.09 (1.7) | **0.15 / 0.09 (1.7)** |
+| full hd512    | prefill | 0.52 / 0.77 (0.69) | 1.69 / 2.82 (0.60) | 6.15 / 10.7 (0.57) | 23.7 / 42.0 (0.56) | 93.5 / 166.2 (0.56) | **371 / 662 (0.56)** |
+| full hd512    | decode  | 0.09 / 0.08 (1.06) | 0.09 / 0.08 (1.06) | 0.09 / 0.09 (1.06) | 0.09 / 0.09 (1.03) | 0.13 / 0.14 (**0.94**) | **0.24 / 0.26 (0.92)** |
+| sliding hd256 | prefill | 0.22 / 0.64 (0.35) | 0.50 / 1.75 (0.28) | 1.04 / 4.00 (0.26) | 2.14 / 8.48 (0.25) | 4.31 / 17.50 (0.25) | **8.63 / 35.4 (0.24)** |
+| sliding hd256 | decode  | 0.09 / 0.08 (1.07) | 0.09 / 0.08 (1.08) | 0.09 / 0.08 (1.11) | 0.09 / 0.09 (**0.99**) | 0.09 / 0.09 (1.01) | **0.09 / 0.09 (1.01)** |
 
-**Verdict — FA4 now competitive in BOTH regimes** (after the decode fix below):
+**Verdict — FA4 wins prefill, and now wins long-context decode too** (after the decode fix below):
 - **Prefill: FA4 wins big.** ~**1.8×** faster on full hd512 (95 vs 53 TFLOP/s at 32k) and ~**4×**
   on sliding hd256 (125 vs 31 TFLOP/s) — the Triton kernel isn't tuned for head_dim 512 and tiles
   the long key axis poorly. Ratio is flat across L (0.56 full / 0.24–0.35 sliding). This is the
   long-context-training regime, which is *why* gemma4 trains with FA4 (`GEMMA_ATTN=fa4_attention`).
-- **Decode: FA4 ≈ Triton after FlashDecoding.** Full-hd512 decode is now **~flat at ~0.19–0.35 ms**
-  (1.35–2.4× Triton, gap *closing* as context grows) instead of scaling to **3.6 ms at 32k** — see
-  the fix below. Triton's purpose-built *paged* split-KV decode still edges it, so serving can stay
-  on vLLM (`eval_funccall.py`, the Try-it server), but FA4 is no longer catastrophic at decode.
+- **Decode: FA4-cute FlashDecoding beats Triton at ≥16k** (0.94× at 16k, 0.92× at 32k; ~1.03–1.13×
+  below that — the cute kernel's WGMMA M=64 can't tile GQA-8's 8 query rows tightly at short L). **But
+  the actual decode winner is a purpose-built Triton small-M flash-decode kernel** (`decode_attention.py`)
+  that beats *both* FA4-cute and vLLM at **every** L (~2× vLLM at short context, ~2.3× on sliding) — see
+  "Decode winner" below. FA4-cute stays the prefill/training path.
 - **Both are numerically correct.** All shapes: FA4↔Triton **cosine ≥0.99999**, max-abs ≤ 8e-3,
-  and **both bit-match an fp32 SDPA reference** (`fa1.0000/tr1.0000`) — including the FlashDecoding
-  combine. Confirms head_dim-512 runs *correctly* through vLLM Triton too — it's just slow at prefill.
+  and **both bit-match an fp32 SDPA reference** (`fa1.0000/tr1.0000`) — including the fused
+  FlashDecoding combine. Confirms head_dim-512 runs *correctly* through vLLM Triton too.
 
 ### Decode fix — manual FlashDecoding (FA4's native SplitKV is Blackwell-only)
 
@@ -355,30 +356,92 @@ so latency ∝ context (0.18→1.84→**3.6 ms** at 16k→32k on full hd512, up 
 wired only for Blackwell sm100/110). So `num_splits=0` (the auto heuristic) hits that assert on the
 H20; `pack_gqa` was already auto-on and isn't enough.
 
-Fix (`bench_attention.py::run_fa4_decode_split`, **no kernel change**): do FlashDecoding *around* the
-kernel — split the KV into N contiguous chunks, run them as ONE varlen batch (the decode query
-repeated once per chunk, `return_lse=True`), then combine the N partial outputs with an LSE reduction
-in PyTorch (`O = Σ_s exp(lse_s−M)·O_s / Σ_s exp(lse_s−M)`, `M = max_s lse_s`). N× the CTAs → the long
-KV is processed in parallel. Exact for decode: the single query sits at the end and attends every key
-with **no causal mask**, so each chunk is a plain full attention over its key range (a sliding layer
-attends only the last `window` keys, so only those are split).
+Fix (`run_fa4_decode_split` / `make_fa4_decode_runner`, **no kernel change**): do FlashDecoding
+*around* the kernel — split the KV into N contiguous chunks, run them as ONE varlen batch (the decode
+query repeated once per chunk, `return_lse=True`), then LSE-combine the N partials
+(`O = Σ_s exp(lse_s−M)·O_s / Σ_s exp(lse_s−M)`). N× the CTAs → the long KV is processed in parallel.
+Exact for decode: the single query sits at the end and attends every key with **no causal mask**, so
+each chunk is a plain full attention over its key range (a sliding layer attends only the last
+`window` keys, so only those are split).
 
-Result (full hd512 decode; best N swept over {2,4,8,16,32,64}, ~flat after the fix):
+To actually **beat** Triton needed three more things — profiling showed the split *kernel alone* already
+beat Triton (16k 0.128 vs 0.140 ms, 32k 0.241 vs 0.264), so the whole gap was Python/launch overhead:
+1. **Fused Triton combine** (`_fa4_combine_kernel`) — the LSE merge in ONE kernel launch instead of
+   ~5 torch ops (`amax`/`exp`/`einsum`/`sum`/`div` ≈ 40–70 µs of launch latency).
+2. **GPU-built `cu_seqlens` + precomputed static metadata** — the per-chunk `cu_seqlens` depend only
+   on (kv_len, N), so they're built once on-device (no per-call `torch.tensor(...)` H2D sync) and
+   reused across decode steps, exactly like the Triton runner's preallocated `block_table`. Only
+   query-repeat + kernel + combine sit on the per-token path.
+3. **Broadcast query, no copy** — the decode query is repeated to N split-rows as a stride-(0,D,1)
+   `q.expand(...)` *view* (all docs read the same memory), skipping the `.contiguous()` copy (~10–14 µs,
+   the last small-L gap). Verified bit-exact vs the contiguous copy / fp32 SDPA.
 
-| L | naive (num_splits=1) | FlashDecoding | speedup | N | vs Triton |
-|---|----------------------|---------------|---------|---|-----------|
-| 2048  | 0.298 ms | 0.190 ms | 1.6× | 32 | 2.3× |
-| 4096  | 0.527 ms | 0.190 ms | 2.8× | 32 | 2.2× |
-| 8192  | 0.967 ms | 0.199 ms | 4.9× | 16 | 2.3× |
-| 16384 | 1.842 ms | 0.239 ms | 7.7× | 16 | 1.7× |
-| 32768 | 3.595 ms | 0.353 ms | **10.2×** | 16 | 1.35× |
+Result — **FA4 now beats Triton at ≥16k and ties below** (full hd512; best N∈{2..64}; FA4 ~flat, naive ∝ L):
 
-(At L=1024 the split overhead ≈ its savings, so naive ≈ split ≈0.19 ms; the sweep keeps whichever
-wins. **Sliding decode** is already window-bounded (~0.145 ms, only 1024 keys attended), so the sweep
-keeps `split=1` there — FlashDecoding isn't worth its overhead.) FA4 **prefill is untouched** (the
-heuristic returns 1 split when there are enough M-blocks; split-KV is a decode-only win).
-`run_fa4_decode_split` is the reference if FA4 is ever used for inference decode; the packed
-*training* path (`gemma4_fa4_attention.py`) is prefill-only and unaffected.
+| L | naive | FA4 FlashDecoding | speedup | Triton | FA4 vs Triton |
+|---|-------|-------------------|---------|--------|---------------|
+| 1024  | 0.184 ms | 0.088 ms | 2.1×  | 0.082 ms | 1.06× (Triton) |
+| 4096  | 0.528 ms | 0.092 ms | 5.7×  | 0.087 ms | 1.06× (Triton) |
+| 8192  | 0.965 ms | 0.090 ms | 10.7× | 0.087 ms | 1.03× (Triton) |
+| 16384 | 1.843 ms | 0.131 ms | 14.1× | 0.140 ms | **0.94× (FA4 wins)** |
+| 32768 | 3.596 ms | 0.243 ms | **14.8×** | 0.263 ms | **0.92× (FA4 wins)** |
+
+So FA4 beats Triton's purpose-built paged decode at **≥16k**, and is ~1.03–1.13× below it at ≤8k (both
+~0.09 ms). **Sliding decode** is window-bounded (~0.09 ms, only 1024 keys); split helps (best N≈8) and
+FA4 ties Triton (0.99–1.1×). Timing uses the precomputed-metadata runner (per-token path =
+broadcast-query + kernel + combine), comparable to the Triton runner. FA4 **prefill is untouched** (the
+heuristic keeps 1 split — split-KV is a decode-only win). `run_fa4_decode_split` is the reference if FA4
+is used for inference decode; the packed *training* path (`gemma4_fa4_attention.py`) is prefill-only and
+unaffected.
+
+**Why the *cute* kernel can't win short-context decode (CUDA-graph evidence).** It's tempting to blame
+the ≤8k gap on FA4's per-call Python/launch overhead — but **CUDA-graphing the per-token path (both
+kernels) disproves that** (and the fix turned out to be a separate small-M kernel — see below). Graphs strip the launch overhead and *both* drop hard, yet Triton pulls **ahead** at short L:
+
+| L | eager fa4/tri | graphed fa4 / tri |
+|---|---------------|-------------------|
+| 1024  | 1.07 | 0.031 / 0.019 ms (**1.66**) |
+| 2048  | 1.13 | 0.048 / 0.026 ms (**1.86**) |
+| 8192  | 1.06 | 0.079 / 0.077 ms (1.03) |
+| 16384 | 0.94 | 0.131 / 0.140 ms (0.94) |
+| 32768 | 0.92 | 0.244 / 0.265 ms (0.92) |
+
+So the short-L gap is **GPU work, not launch latency**: FA4's prefill-derived cute kernel under-utilizes
+its MMA at q_len=1 / tiny KV, and graphs expose that (eager mode's launch floor was actually masking it
+— flattering FA4). At ≥16k the KV scan dominates, graphs change nothing, and FA4 wins regardless.
+
+**The wall is WGMMA, and it can't be tuned away (verified).** The decode under-utilization is structural:
+GQA-8 packs only **8 query rows**, but the SM90 forward is **WGMMA**-based with an **M=64 atom**, so it
+runs a 64-row tile with 8 valid rows (~8× waste). Sweeping the fork's `tile_mn` confirms there's no
+escape from the interface — `tile_m<64` is rejected outright (`ValueError: Expected size in shape to be
+strictly…`), the only valid hd512 config is the default `64×80` (explicit alternates
+`cudaErrorIllegalInstruction`), and `pack_gqa`/`tile_n` don't change the M-waste. Triton wins short
+decode precisely because its `tl.dot` tiles small-M (BLOCK_M=16) efficiently. So beating Triton at
+short-context decode needs a **non-WGMMA / small-M decode kernel** — *not* a tile/config tweak of the
+cute kernel (its WGMMA M=64 is hard). **So I wrote that kernel** (below).
+
+### Decode winner — a purpose-built Triton flash-decode kernel (`decode_attention.py`)
+
+Rather than fight WGMMA in the cute fork, the small-M decode path is a tidy ~80-line **Triton** kernel:
+split-KV, online softmax, **BLOCK_M=16** (so GQA-8's 8 query rows waste ½ a tile, not ⅞), contiguous
+KV (no paging/quant/sink/3D-segment machinery), `num_stages=1` (the hd512 K+V tiles would blow smem
+otherwise), + the same fused LSE combine. It **beats BOTH the cute FA4 FlashDecoding AND vLLM's general
+Triton at every context length** — including the short contexts that were the holdout — at cosine 1.0
+vs fp32 SDPA (`make_decode_runner`; bench `bench_decode_kernel.py`, one H20, median of 80):
+
+| geom | L | **custom** | vLLM | FA4-cute | custom/vLLM | custom/FA4 |
+|------|---|-----------|------|----------|-------------|-----------|
+| full hd512    | 1024  | **0.038** | 0.085 | 0.093 | 0.45× | 0.41× |
+| full hd512    | 8192  | **0.057** | 0.089 | 0.097 | 0.64× | 0.59× |
+| full hd512    | 32768 | **0.195** | 0.263 | 0.244 | 0.74× | 0.80× |
+| sliding hd256 | (any) | **~0.038** | ~0.088 | ~0.094 | ~0.44× | ~0.41× |
+
+i.e. **~2× faster than vLLM at short context, 1.35× at 32k, ~2.3× on sliding** — the general vLLM
+kernel's paging/branch overhead and the cute kernel's WGMMA M-waste both vanish. **This is the decode
+kernel to use** (`flash_decode` / `make_decode_runner` in `decode_attention.py`); FA4-cute stays the
+**prefill/training** path (`gemma4_fa4_attention.py`), where it wins ~1.8–4×. The cute fork is left
+untouched (no training-path risk). Note this kernel uses contiguous KV — fine for the autotrain decode
+path; a paged-serving deployment would add a block-table indirection (as vLLM does).
 
 **Run it** (results in `bench_attention_results.json`). Needs torch+triton (for the Triton kernel)
 + the FA4 cute fork + cutlass-dsl — same venv as the FA4 training recipe above. The benchmark runs

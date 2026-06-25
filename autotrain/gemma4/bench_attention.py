@@ -31,6 +31,8 @@ import os
 import sys
 
 import torch
+import triton
+import triton.language as tl
 
 # The vLLM Triton kernel imports `vllm.*` internally; point those imports at the local
 # shim package under bench_vllm_shim/ (which carries the exact kernel source copied from
@@ -105,45 +107,89 @@ def run_fa4(q, k, v, q_len, kv_len, cfg, scale, num_splits=1):
 DECODE_SPLIT_CANDIDATES = [2, 4, 8, 16, 32, 64]
 
 
-def run_fa4_decode_split(q, k, v, cfg, scale, n_splits):
-    """FlashDecoding for FA4 on SM90, done around the kernel (its native SplitKV is
-    Blackwell-only — `assert not is_split_kv` on SM 9.0). Split the KV into `n_splits`
-    contiguous chunks and run them as ONE varlen batch — the decode query repeated once per
-    chunk (cu_seqlens_q = 0,1,2,…,n) against per-chunk key ranges (cu_seqlens_k) — with
-    `return_lse=True`, then combine the n partial outputs with a log-sum-exp reduction in
-    PyTorch. This launches n× the CTAs so the long KV is processed in parallel instead of one
-    CTA walking it serially. Exact: for decode the single query sits at the end and attends
-    EVERY key with no causal mask, so each chunk is a plain full attention over its key range
-    (causal=False); a sliding layer attends only the last `window` keys, so we split just those.
-        combine:  O = Σ_s exp(lse_s − M)·O_s / Σ_s exp(lse_s − M),  M = max_s lse_s  (per head)."""
-    Hq, Hk, D = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
-    W = cfg["window"]
-    kv_len = k.shape[0]
+@triton.jit
+def _fa4_combine_kernel(out_ptr, lse_ptr, o_ptr, N, N_POW2: tl.constexpr, D,
+                        stride_on, stride_oh, BLOCK_D: tl.constexpr):
+    """FlashDecoding combine in ONE launch (vs ~5 torch ops): merge N split partials per
+    (head, D-block). grid = (num_heads, cdiv(D, BLOCK_D)). out:(N,Hq,D), lse:(Hq,N), o:(Hq,D).
+        O[h] = Σ_s exp(lse[h,s] − max_s) · out[s,h] / Σ_s exp(lse[h,s] − max_s)."""
+    h = tl.program_id(0)
+    db = tl.program_id(1)
+    n = tl.arange(0, N_POW2)
+    nmask = n < N
+    d = db * BLOCK_D + tl.arange(0, BLOCK_D)
+    dmask = d < D
+    lse = tl.load(lse_ptr + h * N + n, mask=nmask, other=-float("inf"))         # (N_POW2,)
+    m = tl.max(lse, axis=0)
+    w = tl.where(nmask, tl.exp(lse - m), 0.0)                                    # (N_POW2,)
+    denom = tl.sum(w, axis=0)
+    o = tl.load(out_ptr + n[:, None] * stride_on + h * stride_oh + d[None, :],
+                mask=nmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)  # (N_POW2,BLOCK_D)
+    acc = tl.sum(w[:, None] * o, axis=0) / denom                                 # (BLOCK_D,)
+    tl.store(o_ptr + h * D + d, acc.to(o_ptr.dtype.element_ty), mask=dmask)
+
+
+def fused_combine(out, lse, Hq, D):
+    """One-kernel LSE combine of the N split partials -> (1, Hq, D)."""
+    o = torch.empty((Hq, D), dtype=out.dtype, device=out.device)
+    N = out.shape[0]
+    N_POW2 = 1 << (N - 1).bit_length() if N > 1 else 1
+    BLOCK_D = 128
+    grid = (Hq, (D + BLOCK_D - 1) // BLOCK_D)
+    _fa4_combine_kernel[grid](out, lse, o, N, N_POW2, D,
+                              out.stride(0), out.stride(1), BLOCK_D)
+    return o.unsqueeze(0)
+
+
+def _decode_split_meta(q, k, v, cfg, n_splits):
+    """STATIC FlashDecoding metadata for (k, v, N): per-chunk cu_seqlens + the (sliding-)sliced
+    KV. These depend only on (kv_len, N), so a serving loop reuses them across decode steps —
+    like the Triton runner's preallocated block_table. Requires N | kv_len (callers ensure it)."""
+    Hq, D = cfg["num_q_heads"], cfg["head_dim"]
+    W, kv_len = cfg["window"], k.shape[0]
     if W is not None and W < kv_len:            # sliding: only the last-window keys are attended
         k, v, kv_len = k[kv_len - W:].contiguous(), v[kv_len - W:].contiguous(), W
     n = max(1, min(n_splits, kv_len))
-    base, rem = divmod(kv_len, n)               # near-equal, strictly-positive chunks
-    bounds, acc = [0], 0
-    for i in range(n):
-        acc += base + (1 if i < rem else 0)
-        bounds.append(acc)
-    cu_k = torch.tensor(bounds, dtype=torch.int32, device=DEVICE)
+    step = kv_len // n
+    cu_k = torch.arange(0, n * step + 1, step, dtype=torch.int32, device=DEVICE)  # GPU, no H2D
     cu_q = torch.arange(n + 1, dtype=torch.int32, device=DEVICE)
-    max_chunk = base + (1 if rem else 0)
-    q_rep = q.expand(n, Hq, D).contiguous()     # same decode query, one row per chunk
+    return dict(k=k, v=v, cu_k=cu_k, cu_q=cu_q, n=n, step=step, Hq=Hq, D=D)
+
+
+def _decode_split_run(q, meta, scale):
+    """Per-step decode: repeat the query once per chunk, one varlen kernel, fused combine.
+    Exact for decode — the single query sits at the end and attends EVERY key with no causal
+    mask, so each chunk is a plain full attention over its key range (causal=False)."""
+    n, Hq, D = meta["n"], meta["Hq"], meta["D"]
+    # Broadcast the decode query to n rows WITHOUT copying — a stride-(0,D,1) view. All n
+    # split-docs read the same query memory (each doc's query is identical), so the kernel's
+    # per-doc strided load is correct; skipping .contiguous() saves a per-token copy (~14us,
+    # the small-L gap vs Triton). Verified bit-exact vs the contiguous copy / fp32 SDPA.
+    q_rep = q.expand(n, Hq, D)
     out, lse = fa4_varlen(
-        q_rep, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
-        max_seqlen_q=1, max_seqlen_k=max_chunk,
-        softmax_scale=scale, causal=False, window_size=(None, None),
-        num_splits=1, return_lse=True,
+        q_rep, meta["k"], meta["v"], cu_seqlens_q=meta["cu_q"], cu_seqlens_k=meta["cu_k"],
+        max_seqlen_q=1, max_seqlen_k=meta["step"], softmax_scale=scale,
+        causal=False, window_size=(None, None), num_splits=1, return_lse=True,
     )
-    # out: (n, Hq, D); lse: (num_head, total_q) = (Hq, n)
-    lse = lse.transpose(0, 1).float()           # (n, Hq)
-    m = lse.max(dim=0, keepdim=True).values     # (1, Hq)
-    w = torch.exp(lse - m)                       # (n, Hq)
-    denom = w.sum(dim=0).clamp_min(1e-20)        # (Hq,)
-    o = (w.unsqueeze(-1) * out.float()).sum(dim=0) / denom.unsqueeze(-1)  # (Hq, D)
-    return o.unsqueeze(0).to(q.dtype)            # (1, Hq, D)
+    return fused_combine(out, lse, Hq, D)        # (1, Hq, D)
+
+
+def run_fa4_decode_split(q, k, v, cfg, scale, n_splits):
+    """Manual FlashDecoding for FA4 on SM90 (its native SplitKV is Blackwell-only — `assert not
+    is_split_kv` on SM 9.0). Split the KV into N chunks, run them as ONE varlen batch (decode
+    query repeated once per chunk, `return_lse=True`), then LSE-combine the N partials with the
+    fused Triton kernel — N× the CTAs so the long KV is processed in parallel, not walked
+    serially. One-shot wrapper (builds metadata per call); for steady-state timing use
+    make_fa4_decode_runner (metadata precomputed, like make_triton_runner)."""
+    return _decode_split_run(q, _decode_split_meta(q, k, v, cfg, n_splits), scale)
+
+
+def make_fa4_decode_runner(q, k, v, cfg, scale, n_splits):
+    """Precompute the static split metadata once; return (call, n) where call() does only
+    repeat-query -> varlen kernel -> fused combine (steady-state per-token decode, fairly
+    comparable to make_triton_runner whose block_table/segm buffers are also preallocated)."""
+    meta = _decode_split_meta(q, k, v, cfg, n_splits)
+    return (lambda: _decode_split_run(q, meta, scale)), meta["n"]
 
 
 def build_paged_cache(k, v, kv_len, cfg):
@@ -309,7 +355,9 @@ def main():
                     best_ms = time_call(base_fn, max(8, args.iters // 4), args.warmup)
                     best_n, fa4_fn = 1, base_fn
                     for n in DECODE_SPLIT_CANDIDATES:
-                        cand = (lambda nn: (lambda: run_fa4_decode_split(q, k, v, cfg, scale, nn)))(n)
+                        if kv_len % n != 0:      # even-split fast path needs n | kv_len
+                            continue
+                        cand, _ = make_fa4_decode_runner(q, k, v, cfg, scale, n)
                         try:
                             ms = time_call(cand, max(8, args.iters // 4), args.warmup)
                         except Exception:
@@ -317,7 +365,8 @@ def main():
                         if ms < best_ms:
                             best_ms, best_n, fa4_fn = ms, n, cand
                     split = best_n
-                    fa4_out = run_fa4_decode_split(q, k, v, cfg, scale, best_n)
+                    fa4_out = base_out if best_n == 1 else make_fa4_decode_runner(
+                        q, k, v, cfg, scale, best_n)[0]()
                 else:
                     fa4_fn, fa4_out = base_fn, base_out
 

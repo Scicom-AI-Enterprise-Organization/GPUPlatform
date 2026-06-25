@@ -59,6 +59,9 @@ at pack time (`pack_dataset.py --max-seq-len`); the bin must still contain the c
 | `pack_dataset.py` | build the multipacked ChiniDataset from a chat parquet (tools + reasoning) |
 | `eval_funccall.py` | function-calling accuracy eval (SyntheticGen scoring) via a vLLM server |
 | `bench_attention.py` | latency benchmark: FA4 cute (head_dim-512 fork) vs vLLM Triton attention |
+| `decode_attention.py` | **purpose-built Triton flash-decode kernel** — fastest decode (beats FA4 + vLLM) |
+| `bench_decode_kernel.py` | 3-way decode comparison: custom Triton vs vLLM vs FA4-cute |
+| `bench_decode_cudagraph.py` | eager-vs-CUDA-graph decode micro-bench (short-context analysis) |
 | `bench_setup.sh` + `bench_vllm_shim/` | copies vLLM's Triton kernel into a minimal shim (no full vLLM build) |
 | `run.sh` | one-shot pod bootstrap: deps → correctness test → download → train |
 | `CLAUDE.md` | design notes, gotchas, the full runpodctl workflow |
@@ -191,34 +194,51 @@ an fp32 SDPA reference.
 
 | ms | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
 |----|------|------|------|------|-------|-------|
-| prefill — FA4              | 0.525 | 1.69  | 6.19  | 23.7  | 93.5  | 371   |
-| prefill — Triton (vLLM)    | 0.766 | 2.82  | 10.8  | 42.0  | 166   | 662   |
-| decode — FA4 FlashDecoding | 0.196 | **0.190** | **0.190** | **0.199** | **0.239** | **0.353** |
-| decode — FA4 naive         | **0.185** | 0.298 | 0.527 | 0.967 | 1.842 | 3.595 |
-| decode — Triton (vLLM)     | 0.083 | 0.082 | 0.087 | 0.087 | 0.139 | 0.262 |
+| prefill — FA4              | 0.524 | 1.69  | 6.15  | 23.7  | 93.5  | 371   |
+| prefill — Triton (vLLM)    | 0.766 | 2.82  | 10.7  | 42.0  | 166   | 662   |
+| decode — FA4 FlashDecoding | 0.088 | 0.087 | 0.092 | 0.090 | **0.131** | **0.243** |
+| decode — FA4 naive         | 0.184 | 0.297 | 0.528 | 0.965 | 1.843 | 3.596 |
+| decode — Triton (vLLM)     | 0.082 | 0.082 | 0.087 | 0.087 | 0.140 | 0.263 |
 
 **sliding attention — head_dim 256, 32 q / 16 kv heads, window 1024**
 
 | ms | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
 |----|------|------|------|------|-------|-------|
-| prefill — FA4            | 0.222 | 0.500 | 1.04  | 2.15  | 4.31  | 8.64  |
-| prefill — Triton (vLLM)  | 0.636 | 1.75  | 4.00  | 8.48  | 17.5  | 35.4  |
-| decode — FA4 (no split)  | 0.147 | 0.146 | 0.146 | 0.146 | 0.145 | 0.147 |
-| decode — Triton (vLLM)   | 0.082 | 0.081 | 0.082 | 0.087 | 0.087 | 0.086 |
+| prefill — FA4              | 0.222 | 0.500 | 1.04  | 2.14  | 4.31  | 8.63  |
+| prefill — Triton (vLLM)    | 0.637 | 1.75  | 4.00  | 8.48  | 17.5  | 35.4  |
+| decode — FA4 FlashDecoding | 0.087 | 0.088 | 0.090 | 0.086 | 0.086 | 0.087 |
+| decode — Triton (vLLM)     | 0.081 | 0.081 | 0.081 | 0.087 | 0.086 | 0.086 |
 
 **Prefill — FA4 wins** (FA2/FA3 can't even do head_dim 512): ~**1.8×** Triton on full hd512 (95 vs
 53 TFLOP/s at 32k), ~**4×** on sliding hd256 (125 vs 31). gemma4 trains with FA4
 (`GEMMA_ATTN=fa4_attention`, prefill-heavy long context).
 
-**Decode — Triton wins, but FA4 is now close.** FA4's varlen forward had no usable split-KV on
-Hopper (its native FlashDecoding asserts out on SM 9.0 — Blackwell-only), so decode grew ~linearly
-with context (full-hd512 naive: **3.6 ms at 32k**, ~14× Triton). Fixed with **manual FlashDecoding**
-(`run_fa4_decode_split`): split the KV into N chunks run as one varlen batch (`return_lse=True`) +
-a PyTorch LSE combine — no kernel change. That drops full-hd512 decode to **0.35 ms at 32k (10.2×
-the naive), ~flat across context, within 1.35× of Triton** (whose purpose-built paged decode still
-edges it, so serving stays on vLLM). Sliding decode is already window-bounded (~0.145 ms), so the
-sweep keeps `split=1` there. The FlashDecoding details + the run recipe (and the tiny
-`bench_vllm_shim/` that runs vLLM's exact kernel without a full vLLM build) are in `CLAUDE.md`.
+**Decode — FA4 now beats Triton at ≥16k.** FA4's varlen forward had no usable split-KV on Hopper
+(its native FlashDecoding asserts out on SM 9.0 — Blackwell-only), so decode grew ~linearly with
+context (full-hd512 naive: **3.6 ms at 32k**, ~14× Triton). Fixed with **manual FlashDecoding**
+(`run_fa4_decode_split`, no kernel change): split the KV into N chunks run as one varlen batch
+(`return_lse=True`), combined with a **fused Triton kernel**; with precomputed cu_seqlens and a
+zero-copy broadcast query, the per-token path is just kernel + combine. That drops full-hd512 decode
+to **0.243 ms at 32k (14.8× the naive)**, ~flat across context — **0.92× Triton at 32k, 0.94× at
+16k**, and ~1.03–1.13× below at ≤8k (both ~0.09 ms; there Triton's decode-specialized kernel does
+genuinely less GPU work for tiny KV — confirmed by CUDA-graphing both, which strips launch overhead
+and leaves Triton ahead at short L). Everything stays bit-exact (cosine ≥0.99999, fp32-SDPA match).
+
+**Decode winner — `decode_attention.py` (custom Triton flash-decode).** The cute kernel can't win short
+decode (WGMMA forces a 64-row tile for GQA-8's 8 query rows), so the fix is a separate small-M kernel,
+not a cute-fork change. This ~80-line Triton split-KV flash-decode (BLOCK_M=16, contiguous KV) **beats
+both FA4-cute and vLLM's general Triton at every context length**, bit-exact:
+
+| geom | L | **custom** | vLLM | FA4-cute | custom/vLLM |
+|------|---|-----------|------|----------|-------------|
+| full hd512    | 1024  | **0.038 ms** | 0.085 | 0.093 | **0.45×** |
+| full hd512    | 32768 | **0.195 ms** | 0.263 | 0.244 | 0.74× |
+| sliding hd256 | any   | **~0.038 ms** | ~0.088 | ~0.094 | **~0.44×** |
+
+i.e. ~2× faster than vLLM at short context (2.3× on sliding), 1.35× at 32k. Use `decode_attention`
+for decode; FA4-cute stays the prefill/training path. Full details, the CUDA-graph short-context
+analysis + the run recipe (and the tiny `bench_vllm_shim/` that runs vLLM's exact kernel without a full
+vLLM build) are in `CLAUDE.md`.
 
 ```bash
 VLLM_REPO=/path/to/vllm bash bench_setup.sh          # copy vLLM's Triton kernel into the shim
