@@ -766,7 +766,7 @@ async def _activity_records(session, s_dt, u_dt):
     model_col = func.json_extract_path_text(ReqRow.payload, "model").label("model")
     tin_col = func.json_extract_path_text(ReqRow.output, "usage", "prompt_tokens").label("tin")
     tout_col = func.json_extract_path_text(ReqRow.output, "usage", "completion_tokens").label("tout")
-    sv = select(ReqRow.owner_id, ReqRow.created_at, ReqRow.completed_at, ReqRow.ttft_ms,
+    sv = select(ReqRow.owner_id, ReqRow.app_id, ReqRow.created_at, ReqRow.completed_at, ReqRow.ttft_ms,
                 ReqRow.status, model_col, tin_col, tout_col).where(ReqRow.created_at >= s_dt)
     px = select(ProxyRequest).where(ProxyRequest.created_at >= s_dt)
     if u_dt is not None:
@@ -774,13 +774,27 @@ async def _activity_records(session, s_dt, u_dt):
         px = px.where(ProxyRequest.created_at < u_dt)
     sv_rows = (await session.execute(sv.order_by(ReqRow.created_at.desc()).limit(_ACTIVITY_CAP))).all()
     px_rows = (await session.execute(px.order_by(ProxyRequest.created_at.desc()).limit(_ACTIVITY_CAP))).scalars().all()
+    # Requests whose body omitted `model` (valid on the path-scoped /{app_id}/v1/… routes —
+    # the URL already fixes the endpoint) land with no payload.model and would chart as
+    # "(unknown)". Backfill the label from the endpoint's served model instead. Only
+    # resolvable for a single-model endpoint (or a 1-member fleet/proxy); a true multi-model
+    # fleet stays "(unknown)" since we can't tell which member served an unlabeled request.
+    missing_apps = {r.app_id for r in sv_rows if not r.model and r.app_id}
+    app_model: dict[str, str] = {}
+    if missing_apps:
+        for a in (await session.execute(select(App).where(App.app_id.in_(missing_apps)))).scalars().all():
+            members = a.models or []
+            served = a.model or (members[0].get("model") if len(members) == 1 else None)
+            if served:
+                app_model[a.app_id] = served
     recs = []
     for r in sv_rows:
         # End-to-end latency (queue + inference). Only for cleanly-completed requests —
         # cancelled/stuck rows get a completed_at far from created_at and would wreck the avg.
         lat = (int((r.completed_at - r.created_at).total_seconds() * 1000)
                if (r.status == "completed" and r.completed_at and r.created_at) else None)
-        recs.append((r.owner_id, r.created_at, (r.model or "(unknown)"), "serverless",
+        model = r.model or app_model.get(r.app_id) or "(unknown)"
+        recs.append((r.owner_id, r.created_at, model, "serverless",
                      _int(r.tin) or 0, _int(r.tout) or 0, r.ttft_ms, lat))
     for r in px_rows:
         recs.append((r.owner_id, r.created_at, (r.model or "(unknown)"), "proxy",
