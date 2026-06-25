@@ -200,8 +200,9 @@ function VmServingCard({ app, readOnly = false }: { app: AppRecord; readOnly?: b
         {app.vllm_install_args && (
           <Row
             label="vLLM install"
+            stacked
             value={
-              <code className="block max-w-full truncate font-mono text-xs" title={app.vllm_install_args}>
+              <code className="block w-full whitespace-pre-wrap break-all rounded bg-muted/40 px-2 py-1 font-mono text-xs">
                 {app.vllm_install_args}
               </code>
             }
@@ -213,8 +214,9 @@ function VmServingCard({ app, readOnly = false }: { app: AppRecord; readOnly?: b
         {app.pre_script && (
           <Row
             label="Pre-script"
+            stacked
             value={
-              <code className="block max-w-full truncate font-mono text-xs" title={app.pre_script}>
+              <code className="block w-full whitespace-pre-wrap break-all rounded bg-muted/40 px-2 py-1 font-mono text-xs">
                 {app.pre_script}
               </code>
             }
@@ -995,11 +997,22 @@ function DetailCard({ app }: { app: AppRecord }) {
   );
 }
 
-function Row({ label, value }: { label: string; value: React.ReactNode }) {
+function Row({ label, value, stacked = false }: { label: string; value: React.ReactNode; stacked?: boolean }) {
+  // `stacked` puts the value on its own full-width line below the label — for long
+  // monospace values (install args, pre-script) that would otherwise overflow the
+  // side-by-side row and scroll the page horizontally.
+  if (stacked) {
+    return (
+      <div className="space-y-1 border-b border-border/40 pb-2 last:border-b-0 last:pb-0">
+        <span className="text-muted-foreground">{label}</span>
+        <div className="text-foreground">{value}</div>
+      </div>
+    );
+  }
   return (
-    <div className="flex items-center justify-between border-b border-border/40 pb-2 last:border-b-0 last:pb-0">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="text-foreground">{value}</span>
+    <div className="flex items-center justify-between gap-3 border-b border-border/40 pb-2 last:border-b-0 last:pb-0">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className="min-w-0 truncate text-right text-foreground">{value}</span>
     </div>
   );
 }
