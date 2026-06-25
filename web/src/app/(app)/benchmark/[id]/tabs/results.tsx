@@ -27,6 +27,7 @@ import {
   fetchBenchRows,
   fmt,
   LINE_COLORS,
+  perStreamOutputTps,
   type Row,
   type StatMode,
   statPick,
@@ -153,6 +154,7 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
 
   // Best-of cards (always show, single result OR sweep).
   const bestThroughput = bestBy(rows, (r) => r.total_token_throughput);
+  const bestIndivTps = bestBy(rows, (r) => perStreamOutputTps(r));
   const bestTtft = bestBy(rows, (r) => r.median_ttft_ms, /*lower=*/ true);
   const bestTpot = bestBy(rows, (r) => r.median_tpot_ms, /*lower=*/ true);
 
@@ -187,7 +189,7 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
       </div>
 
       {/* Best-of KPI cards */}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <KpiCard
           icon={<Zap className="h-4 w-4" />}
           label="Best throughput (total)"
@@ -199,6 +201,20 @@ export function ResultsTab({ bench }: { bench: BenchmarkRecord }) {
           sub={
             bestThroughput
               ? `${bestThroughput.output_throughput?.toFixed(1) ?? "—"} out/s · c=${bestThroughput.concurrency} · in=${bestThroughput.input_len}`
+              : undefined
+          }
+        />
+        <KpiCard
+          icon={<TrendingUp className="h-4 w-4" />}
+          label="Best individual TPS"
+          value={
+            bestIndivTps != null
+              ? `${perStreamOutputTps(bestIndivTps)!.toFixed(1)} tok/s`
+              : "—"
+          }
+          sub={
+            bestIndivTps
+              ? `per stream · out/s ÷ c=${bestIndivTps.concurrency} · in=${bestIndivTps.input_len}`
               : undefined
           }
         />
@@ -666,6 +682,7 @@ type SortKey =
   | "concurrency"
   | "total_token_throughput"
   | "output_throughput"
+  | "individual_tps"
   | "ttft"
   | "tpot"
   | "itl"
@@ -741,9 +758,9 @@ function fmtRunMetric(key: string, v: number): string {
 
 function RunMetricsPanel({ row }: { row: Row }) {
   const shown = new Set<string>(["max_concurrency", "num_prompts", "input_len", "output_len"]);
-  const groups = METRIC_GROUPS.map((g) => ({
-    title: g.title,
-    items: g.keys
+  const indivTps = perStreamOutputTps(row);
+  const groups = METRIC_GROUPS.map((g) => {
+    const items = g.keys
       .filter((k) => {
         const v = row.raw[k];
         return typeof v === "number" && Number.isFinite(v);
@@ -751,8 +768,14 @@ function RunMetricsPanel({ row }: { row: Row }) {
       .map((k) => {
         shown.add(k);
         return { key: k, label: METRIC_LABELS[k] ?? k, value: row.raw[k] };
-      }),
-  })).filter((g) => g.items.length > 0);
+      });
+    // Derived: per-stream output rate (output tok/s ÷ concurrency) alongside the
+    // aggregate throughputs — the "individual TPS" management asks for.
+    if (g.title === "Throughput" && indivTps != null) {
+      items.push({ key: "individual_tps", label: "Individual TPS (tok/s/req)", value: indivTps });
+    }
+    return { title: g.title, items };
+  }).filter((g) => g.items.length > 0);
 
   // Anything numeric in result.json we didn't place in a group above.
   const other = Object.keys(row.raw)
@@ -801,6 +824,7 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
         case "concurrency": return r.concurrency;
         case "total_token_throughput": return r.total_token_throughput ?? -Infinity;
         case "output_throughput": return r.output_throughput ?? -Infinity;
+        case "individual_tps": return perStreamOutputTps(r) ?? -Infinity;
         case "ttft": return statPick(r, "ttft", statMode) ?? Infinity;
         case "tpot": return statPick(r, "tpot", statMode) ?? Infinity;
         case "itl": return statPick(r, "itl", statMode) ?? Infinity;
@@ -840,6 +864,7 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
             {header("concurrency", "concurrency")}
             {header("total tok/s", "total_token_throughput")}
             {header("output tok/s", "output_throughput")}
+            {header("indiv tok/s", "individual_tps")}
             {header(`TTFT (${statMode})`, "ttft")}
             {header(`TPOT (${statMode})`, "tpot")}
             {header(`ITL (${statMode})`, "itl")}
@@ -874,6 +899,9 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
                   <td className="px-3 py-1.5 text-right tabular-nums">
                     {fmt(r.output_throughput, 1)}
                   </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums font-medium">
+                    {fmt(perStreamOutputTps(r), 1)}
+                  </td>
                   <td className="px-3 py-1.5 text-right tabular-nums">
                     {fmt(statPick(r, "ttft", statMode), 1)}
                   </td>
@@ -892,7 +920,7 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
                 </tr>
                 {isOpen && (
                   <tr>
-                    <td colSpan={10} className="p-0">
+                    <td colSpan={11} className="p-0">
                       <RunMetricsPanel row={r} />
                     </td>
                   </tr>

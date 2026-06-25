@@ -121,6 +121,15 @@ export function rowFromJson(filename: string, json: Record<string, unknown>): Ro
   };
 }
 
+/** Per-stream output rate a single concurrent request sees: output tok/s ÷
+ * concurrency — the "individual TPS". What one user's stream decodes at, vs. the
+ * aggregate server throughput. Null when concurrency is unknown (0). */
+export function perStreamOutputTps(r: Row): number | null {
+  return r.output_throughput != null && r.concurrency > 0
+    ? r.output_throughput / r.concurrency
+    : null;
+}
+
 export function statPick(
   r: Row,
   metric: "ttft" | "tpot" | "itl" | "e2el",

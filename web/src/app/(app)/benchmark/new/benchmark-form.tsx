@@ -110,12 +110,17 @@ const RUNPOD_GPU_FALLBACK: GpuTypeOption[] = [
 //      gdn_prefill_sm90 mid-inference.
 // The CUDA 12.4 image stays available as a lighter/older baseline.
 const DEFAULT_CONTAINER_IMAGE =
-  "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404";
+  "runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404";
 const CONTAINER_IMAGE_OPTIONS = [
   {
     id: DEFAULT_CONTAINER_IMAGE,
+    label: "CUDA 13.0 · torch 2.9",
+    hint: "default · vLLM ≥ 0.23 (CUDA-13 torch) · ≥580-driver hosts",
+  },
+  {
+    id: "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
     label: "CUDA 12.8 · torch 2.8",
-    hint: "default · modern hosts · Qwen3-Next / flashinfer GDN",
+    hint: "older vLLM (≤ 0.22) · 12.8-driver hosts",
   },
   {
     id: "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
@@ -132,7 +137,8 @@ const CUDA_MIN_DRIVER: Record<string, string> = {
   "11.8": "520.61",
   "12.0": "525.60", "12.1": "530.30", "12.2": "535.54", "12.3": "545.23",
   "12.4": "550.54", "12.5": "555.42", "12.6": "560.28", "12.7": "565.57",
-  "12.8": "570.00",
+  "12.8": "570.00", "12.9": "575.51",
+  "13.0": "580.65",
 };
 
 // Extract CUDA major.minor from a container image tag.
@@ -229,7 +235,7 @@ export const DEFAULTS: FormState = {
   max_num_seqs: "",
   port: "",
   dtype: "auto",
-  vllm_version: "0.19.1",
+  vllm_version: "0.23.0",
   // Benchmark-default extras: prefix caching off (so cache hits don't skew
   // numbers). --disable-log-requests was removed in vLLM > 0.15 and now
   // causes the server to refuse to start, so it's no longer in the default.
@@ -478,7 +484,7 @@ export function renderYaml(
     path: ~/.venv
     python_version: "3.11"
   dependencies:
-    - vllm==${s.vllm_version || "0.19.1"}
+    - vllm==${s.vllm_version || "0.23.0"}
     - huggingface_hub
     - hf_transfer
 `
@@ -489,7 +495,7 @@ ${vmProviderLine}${vmWorkdirLine}${vmCleanupLine}${vmEnvBlock}  uv:
     path: ~/.benchmark-venv
     python_version: "3.11"
   dependencies:
-    - vllm==${s.vllm_version || "0.19.1"}
+    - vllm==${s.vllm_version || "0.23.0"}
     - huggingface_hub
     - hf_transfer
 `;
@@ -1760,7 +1766,7 @@ export function BenchmarkForm({
                   className="font-mono"
                   value={form.vllm_version}
                   onChange={(e) => field("vllm_version", e.target.value)}
-                  placeholder="0.19.1"
+                  placeholder="0.23.0"
                 />
               </FieldWrap>
             </Grid>
