@@ -1,13 +1,14 @@
 # GPUPlatform
 
-A multi-tenant GPU workload platform. One control plane, four product surfaces:
+A multi-tenant GPU workload platform. One control plane, several product surfaces:
 
 - **Serverless** — deploy a model with the `serverlessgpu` Python decorator (or the web UI) and get an autoscaling, OpenAI-compatible HTTP endpoint backed by vLLM — chat / completions / embeddings, plus **Whisper audio** (`/v1/audio/transcriptions`) — that scales to zero when idle. Or stand up a **multi-model fleet** that time-shares its GPUs via vLLM sleep/wake, on your own **SSH VM** or a **cloud RunPod pod** — the cloud fleet scales to zero on idle and re-provisions itself on the next request.
-- **Autotrain** — finetune **Whisper (ASR)** or **Qwen3 + NeuCodec (TTS)** on your own datasets. Hyperparameter sweeps, audio augmentation, live per-step loss + per-epoch WER/CER, GPU telemetry, and W&B / MLflow tracking — orchestrated over SSH on your VM or a RunPod pod, with the model pushed to S3 / Hugging Face.
-- **Benchmark** — SSH-orchestrated [`llm-benchmaq`](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) sweeps on RunPod / Prime Intellect / your own VM, with live log streaming, S3-archived results, and a side-by-side compare view.
+- **Autotrain** — finetune **Whisper (ASR)**, **TTS** (Qwen3 + NeuCodec or OmniVoice + Higgs), or an **LLM** (Gemma-4 / MiniMax-M2 / Mistral, LoRA) on your own datasets. Hyperparameter sweeps, audio augmentation, live per-step loss + per-epoch metrics, GPU telemetry, and W&B / MLflow tracking — orchestrated over SSH on your VM or a RunPod pod, with the model pushed to S3 / Hugging Face.
+- **Benchmark** — SSH-orchestrated [`llm-benchmaq`](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) speed **and accuracy** sweeps on RunPod / Prime Intellect / your own VM (any vLLM version or custom fork), with live log streaming, S3-archived results, and a side-by-side compare view.
 - **Compute** — provision long-lived bare-metal GPU pods with SSH (and JupyterLab on Prime Intellect). Optional admin-approval gate.
+- **LLM Proxy** — register upstream OpenAI-compatible endpoints and serve them through one gateway URL with health checks, usage recording, and an in-UI playground.
 
-These sit on shared infrastructure you configure once: **Providers** (BYO RunPod / Prime Intellect / VM SSH credentials), **Storage** (S3 / Hugging Face backends), **Datasets** (audio + transcription corpora for Autotrain), and org-wide **Secrets** (global env vars + W&B / MLflow tracking credentials).
+These sit on shared infrastructure you configure once: **Providers** (BYO RunPod / Prime Intellect / VM SSH credentials), **Storage** (S3 / Hugging Face / local / SFTP backends), **Models** (a self-hosted Hugging Face catalog), **Datasets** (training corpora), and org-wide **Secrets** (global env + W&B / MLflow tracking). A **GitOps** surface reconciles platform resources from a Git repo, and an **Activity** dashboard unifies usage analytics across all of it.
 
 Users bring their own provider credentials; the gateway routes each workload to the right account and bills nothing of its own — you pay the provider only while a worker runs.
 
@@ -25,6 +26,9 @@ Users bring their own provider credentials; the gateway routes each workload to 
 - [Models (self-hosted Hugging Face catalog)](#models-self-hosted-hugging-face-catalog)
 - [Benchmark](#benchmark)
 - [Compute](#compute)
+- [LLM Proxy](#llm-proxy)
+- [GitOps](#gitops)
+- [Activity & analytics](#activity--analytics)
 - [Providers (BYO credentials)](#providers-byo-credentials)
 - [Storage](#storage)
 - [Secrets (global env + tracking)](#secrets-global-env--tracking)
@@ -222,6 +226,13 @@ fleet runs on either:
   ones serialize behind a per-GPU lock, so a 119B model can't OOM a 27B one mid-boot.
 - **vLLM sleep levels** — level 1 offloads weights to CPU RAM (fast wake); level 2
   discards them for a smaller footprint (slow wake = reload from disk). Chosen per fleet.
+- **Per-fleet vLLM build** — pin a `vllm_version`, pass a full `vllm_install_args` string
+  (nightly / custom CUDA / a **git fork** — e.g. the one-click **Gemma-4 FA4** preset, where a
+  leading `VLLM_USE_PRECOMPILED=1` reuses precompiled binaries), and run a `pre_script` once
+  before launch (DeepGEMM, the vLLM-0.23 Prometheus fix, …). A fleet on a fresh pod
+  **self-bootstraps its vLLM venv** (installs `uv`, builds the venv, installs vLLM, streaming
+  the install to the worker log) and tracks the spec with a `.sgpu_vllm_spec` marker — reinstall
+  on change, never touch a hand-built marker-less venv.
 - **Scale to zero / from zero** (cloud) — with `idle_timeout_s > 0` the idle pod is
   deleted (no GPU bill); the next request re-provisions it, waits out the cold load, and
   is served. The idle-terminator never kills a pod that's still **loading** or has
@@ -244,7 +255,7 @@ Stand one up and drive it entirely with `curl`: [docs/MULTI_MODEL_FLEET.md](docs
 
 Finetune a speech model on your own [dataset](#datasets) — orchestrated over SSH on a `vm` provider (bare-metal) or a RunPod pod the gateway spawns, with the trained model pushed to S3 (and optionally Hugging Face). Create a run in the form at `/autotrain/new` or via `POST /v1/training-runs`.
 
-- **Two task types** — **ASR** (Whisper: `whisper-large-v3`, `-v3-turbo`, …), evaluated per-epoch on **WER / CER** with early-stopping on patience; and **TTS** (Qwen3 + NeuCodec), trained on a `tts_packed` [dataset](#datasets) and evaluated post-training on **CER** (Whisper-transcribe), **MOS** (UTMOSv2), and **speaker similarity** (TitaNet).
+- **Three task types** — **ASR** (Whisper: `whisper-large-v3`, `-v3-turbo`, …), evaluated per-epoch on **WER / CER** with early-stopping on patience; **TTS**, trained on a packed [dataset](#datasets) and evaluated post-training on **CER** (Whisper-transcribe), **MOS** (UTMOSv2), and **speaker similarity** (TitaNet) — in two flavours auto-detected from the base model: **Qwen3 + NeuCodec** (`tts_packed`) or **OmniVoice + Higgs** (`omnivoice_packed`); and **LLM** (instruction/chat finetune of Gemma-4 / MiniMax-M2 / Mistral, **LoRA**), trained on a pre-packed `llm_packed` [dataset](#datasets).
 - **Hyperparameter sweep** — pass a `sweep` grid (e.g. `{"learning_rate":[1e-4,1e-5],"precision":["fp32-bf16","bf16-bf16"]}`) and the gateway runs the cross-product of trials, packing `gpus_per_trial` onto the GPUs you pinned with `visible_devices`. The detail page lists every trial (pending / running / done / failed) and splits the loss + WER/CER curves **per trial**, legended by params.
 - **Audio augmentation** — apply any of 8 techniques (`telephone`, `noise`, `dropout`, `gain`, `pitch`, `speed`, `reverb`, `bandpass`) at a chosen probability to the training split only (eval is never augmented).
 - **Live + persisted metrics** — per-step training loss, per-epoch eval (WER/CER/eval-loss), and a **GPU telemetry** graph (util / memory / temperature per GPU). All are persisted, so a finished run still renders its charts. Pull everything programmatically from `GET /v1/training-runs/{id}/metrics`.
@@ -270,7 +281,7 @@ curl -s -H "Authorization: Bearer $KEY" "$GATEWAY/v1/training-runs/<id>/metrics"
 
 ## Datasets
 
-A dataset is a named pointer to a metadata table of `{audio, transcription}` (optionally `speaker`) rows that Autotrain consumes. Manage them at `/datasets` or `POST /v1/datasets`. Five kinds:
+A dataset is a named pointer to a metadata table of rows that Autotrain consumes — `{audio, transcription}` (optionally `speaker`) for speech, or chat `messages` for LLM. Manage them at `/datasets` or `POST /v1/datasets`. Kinds:
 
 | Kind | Source |
 |---|---|
@@ -278,13 +289,16 @@ A dataset is a named pointer to a metadata table of `{audio, transcription}` (op
 | `s3` | a metadata file already in S3 — a full `s3://bucket/key` URI **or** a key relative to the storage bucket |
 | `hf` | a Hugging Face audio dataset (read lazily, per-split, with a token from a HF storage backend) |
 | `label` | a live project on a labeling platform |
-| `tts_packed` | the output of a **Pack for TTS** step — NeuCodec speech tokens multipacked into a ChiniDataset that TTS training streams directly |
+| `llm` | a Hugging Face chat/instruction dataset (a `messages` column), read lazily per-split — the source for LLM finetuning |
+| `tts_packed` | output of **Pack for TTS** — NeuCodec speech tokens multipacked into a ChiniDataset that Qwen3 TTS training streams directly |
+| `omnivoice_packed` | output of **Pack for OmniVoice** — Higgs-codec speech tokens in WebDataset shards that OmniVoice TTS training streams directly |
+| `llm_packed` | output of **Pack for LLM** — chat messages tokenized + multipacked into a ChiniDataset that LLM training streams directly |
 
 The detail page (`/datasets/{id}`) is tab-organized — **Rows / Columns / Transform / Details**:
 
 - **Rows** — paginate the whole corpus with inline **audio playback + waveform**, and **curate the training split in place**: untick a row to exclude it (`POST …/row-inclusion`) and the trainers skip it. A packed dataset instead shows one row per multipacked block, decoded back to text on demand.
 - **Columns** — map the `audio` / `transcription` / `speaker` columns (with per-split transcription overrides); lists the HF **splits**.
-- **Transform** — one operation per source kind. An `hf`/`label` dataset stores audio in archives / behind a label export, so it can only **extract a real audio column** (→ materialized to S3 or pushed to HF). An `s3`/`upload` dataset already has audio, so it can **Pack for TTS** — NeuCodec-encode + multipack into a `tts_packed` dataset on a GPU (a RunPod pod or your VM), with live log + progress. Uploaded metadata can also be **synced** to a HF repo.
+- **Transform** — one operation per source kind. An `hf`/`label` dataset stores audio in archives / behind a label export, so it can only **extract a real audio column** (→ materialized to S3 or pushed to HF). An `s3`/`upload` dataset already has audio, so it can **Pack for TTS** (NeuCodec → `tts_packed`) or **Pack for OmniVoice** (Higgs codec → `omnivoice_packed`) — encode + multipack on a GPU (a RunPod pod or your VM), with live log + progress. An `llm` dataset can **Pack for LLM** (tokenize + multipack chat messages → `llm_packed`). Uploaded metadata can also be **synced** to a HF repo.
 - **Details** — source/storage metadata, the S3 folder **size** (computed on demand), and — for a transformed dataset — a **Transformed from** link back to the source dataset + its original HF repo.
 
 ## Models (self-hosted Hugging Face catalog)
@@ -318,16 +332,31 @@ A repo **registered over existing data** — via `POST /v1/catalog` or **Publish
 
 Run [`llm-benchmaq`](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) (which wraps `vllm bench serve`) against a model and archive the results — on a RunPod/PI pod the gateway spins up, or on your own SSH VM (bare-metal).
 
-- **Config** — the benchmaq YAML: one or more `serve` configs × a `bench` sweep matrix (input/output length × concurrency × num prompts). Build it in the form at `/benchmark/new` or paste raw YAML; the gateway validates and rewrites the `remote:` block for the chosen target.
-- **VM runs** — pin to specific GPUs with `visible_devices` (→ `CUDA_VISIBLE_DEVICES`; the count is the tensor-parallel size). The gateway delivers the config over SSH, installs benchmaq, runs the sweep, and **never uploads the VM's private key** to S3.
+- **Config** — the benchmaq YAML: one or more `serve` configs × a `bench` sweep matrix (input/output length × concurrency × num prompts). Build it in the form at `/benchmark/new` or paste raw YAML; the gateway validates and rewrites the `remote:` block for the chosen target. The form defaults to a **CUDA-13 image + vLLM 0.23.0** (vLLM ≥ 0.23 ships a CUDA-13 torch; the gateway derives RunPod's `allowedCudaVersions` from the image tag so the pod lands on a ≥580-driver host).
+- **Speed or accuracy** — a **speed** run reports throughput + TTFT/TPOT/E2EL latency; an **accuracy** run scores model quality on **GSM8K**, **MMMLU** (configurable languages), and **multi-turn function-calling**, and still reports a decode tok/s so a multi-config run plots IQ-vs-speed on its own.
+- **Custom vLLM / forks** — pin `vllm_version`, paste a full `vllm_install_args` (nightly / custom CUDA), or use the **Custom fork** field (git repo + ref + "precompiled" toggle) with a one-click **Gemma-4 FA4** preset. A leading `VLLM_USE_PRECOMPILED=1` reuses precompiled binaries (no CUDA build); the gateway auto-adds `sentencepiece` for gemma/llama tokenizers. Omit `model.local_dir` to serve straight from an existing `HF_HOME` cache (no re-download).
+- **VM runs** — pin to specific GPUs with `visible_devices` (→ `CUDA_VISIBLE_DEVICES`; the count is the tensor-parallel size). The gateway delivers the config over SSH (a reconnect-per-command shim for proxied boxes), installs benchmaq, runs the sweep, and **never uploads the VM's private key** to S3.
+- **RunPod runs** — the gateway provisions the pod and **fails fast**: a vLLM engine crash on startup tears the pod down immediately instead of polling a dead `/health` to the ceiling (no wasted credits).
 - **Live + archived** — stream the log tail while it runs; on completion an aggregate `result.json` + per-config files land in your S3 storage.
-- **Results + Compare** — the detail page charts throughput / TTFT / TPOT / E2EL across the sweep; select multiple runs from the list to **compare** them side by side. Runs are renamable, duplicable, and terminable.
+- **Results + Compare** — the detail page charts throughput / **individual TPS** (per-stream output tok/s = output throughput ÷ concurrency) / TTFT / TPOT / E2EL across the sweep; select multiple runs from the list to **compare** them side by side. Runs are renamable, duplicable, and terminable.
 
 Fire one via the API with a key — see [API keys & the HTTP API](#api-keys--the-http-api) below and [docs/BENCHMARK_PLATFORM_VS_VLLM.md](docs/BENCHMARK_PLATFORM_VS_VLLM.md) (platform vs. direct-vLLM overhead, with numbers).
 
 ## Compute
 
 Raw GPU pods for interactive work, not serving. Provision a long-lived pod (`/compute/new`) with a chosen GPU/count, container disk, and template; get back an **SSH command** (and a **JupyterLab** URL + password on Prime Intellect). Live cost tracking per pod, and an optional **admin-approval gate** — pods land in `pending` until cleared (toggle per role). Terminate from the UI; the gateway tears down the provider pod.
+
+## LLM Proxy
+
+A lightweight reverse proxy in front of **external** OpenAI-compatible endpoints (`/proxy` UI, `/v1/proxy` API). Register an upstream (base URL + key + model map), and the gateway serves it at `/proxy/{endpoint}/v1/chat/completions` (+ `/completions`, `/embeddings`, `/v1/models`) under your own `sgpu_` key — with periodic **upstream health checks**, per-endpoint **request history**, a concurrency cap, and an in-UI **playground / metrics / stress** tab. Each proxied request is recorded into usage analytics (see [Activity](#activity--analytics)). Distinct from a serverless endpoint: the proxy doesn't run a worker, it just forwards to a model you already host elsewhere.
+
+## GitOps
+
+Reconcile platform resources from a Git repo (`/gitops` UI, `/v1/gitops` API). Register a repo (URL + branch + optional deploy key / token), and the engine reads declarative manifests and creates/updates the corresponding platform objects — **synced on demand, on a poll interval, or via webhook** (`POST /v1/gitops/webhook`), with resource pruning for anything removed from the repo. Lets you manage endpoints / providers / storage as code instead of clicking through the UI.
+
+## Activity & analytics
+
+The **Activity** dashboard (`/activity` → `GET /v1/history/activity`) is unified usage analytics across the whole platform — request counts, tokens in/out, TTFT/latency, and top users / models — aggregated from the serverless request queue **and** the LLM-proxy (single-model VM "proxy" endpoints record their traffic here too, so nothing is invisible). The admin **Analytics** surface adds a GPU-occupancy **timeline** (a week-calendar view per GPU node: inference vs. benchmark blocks with status badges) and cost roll-ups; its heavy record feeds are lazy-loaded per tab.
 
 ## Providers (BYO credentials)
 
@@ -342,14 +371,18 @@ Each user registers their own providers under `/providers`. Supported kinds:
 
 Credentials are encrypted at rest. Provider resolution per request: explicit `provider_id` → the user's sole provider of that kind → gateway-wide env fallback (`RUNPOD_API_KEY`, `PI_API_KEY`). `GET /v1/providers` also returns each cloud provider's **available GPU catalog** (`available_gpus` — id / label / VRAM), so a client can discover where it can run; `vm` providers report their fixed physical GPUs instead.
 
+A `vm` provider also has a **live metrics dashboard** (`/providers/{id}/metrics`): SSH-polled CPU / per-core / memory / disk plus per-GPU util / VRAM / temperature / PCIe / NVLink, and a **per-GPU process list** — VRAM-by-process from NVML (`nvidia-smi`, every owner incl. other tenants on a shared box) merged with the real command + killable container pid from a `/proc` scan, with a **Kill** button. On a containerized box (NVML reports host-namespace pids whose command isn't resolvable inside the container) foreign processes show as "command not visible" with their VRAM, while in-container GPU jobs show their full command.
+
 ## Storage
 
 Where artifacts and datasets live. Register a backend at `/storage` or `POST /v1/storage`:
 
 | Kind | What it holds | Used by |
 |---|---|---|
-| `s3` | bucket + region + (optional) endpoint + access key — Benchmark `result.json`, trained models, dataset metadata + audio | Benchmark, Autotrain, Datasets |
-| `huggingface` | an HF token (or a reference to a [global secret](#secrets-global-env--tracking)) | Datasets (`hf` source / sync), Autotrain (model push) |
+| `s3` | bucket + region + (optional) endpoint + access key — Benchmark `result.json`, trained models, dataset metadata + audio | Benchmark, Autotrain, Datasets, Models |
+| `huggingface` | an HF token (or a reference to a [global secret](#secrets-global-env--tracking)) | Datasets (`hf` source / sync), Autotrain (model push), Models |
+| `local` | a local filesystem path on the gateway host | Models, Datasets (dev / single-box) |
+| `sftp` | SFTP host + credentials | Models, Datasets (on-prem servers) |
 
 Credentials are Fernet-encrypted at rest and never returned by the API; `POST /v1/storage/test` validates connectivity before you save. Reads are org-wide; writes are admin-only.
 
@@ -366,12 +399,16 @@ Mint a long-lived bearer token on the **API tokens** page (or `POST /api-keys`).
 
 | Area | Key endpoints |
 |---|---|
-| Serverless | `POST /apps` · `GET /apps` · `GET /apps/{id}/status` · `GET /apps/{id}/workers` · `POST /apps/{id}/workers/{mid}/terminate` · `POST /apps/{id}/queue/flush` · `POST /v1/chat/completions` · `POST /v1/audio/transcriptions` · `GET /v1/models` · `POST /run/{app}` · `GET /result/{id}` · `GET /{app}/metrics` (per-endpoint Prometheus) |
+| Serverless | `POST /apps` · `GET /apps` · `GET /apps/{id}/status` · `GET /apps/{id}/workers` · `POST /apps/{id}/workers/{mid}/terminate` · `POST /apps/{id}/workers/purge` · `POST /apps/{id}/clear-restart` · `POST /apps/{id}/queue/flush` · `POST /v1/chat/completions` · `POST /v1/audio/transcriptions` · `GET /v1/models` · `POST /run/{app}` · `GET /result/{id}` · `GET /{app}/metrics` (per-endpoint Prometheus) |
 | Autotrain | `POST /v1/training-runs` · `GET /v1/training-runs` · `GET /v1/training-runs/{id}` · `GET /v1/training-runs/{id}/metrics` · `GET /v1/training-runs/{id}/files` · `GET /v1/training-runs/{id}/logs/stream` · `POST /v1/training-runs/{id}/restart` · `POST /v1/training-runs/{id}/terminate` · `POST /v1/training-runs/{id}/transcribe` · `POST /v1/training-runs/{id}/synthesize` |
-| Datasets | `GET /v1/datasets` · `POST /v1/datasets` · `POST /v1/datasets/{id}/upload` · `GET /v1/datasets/{id}/preview` · `POST /v1/datasets/{id}/row-inclusion` · `POST /v1/datasets/{id}/transform` · `POST /v1/datasets/{id}/pack-tts` · `POST /v1/datasets/{id}/sync` |
+| Datasets | `GET /v1/datasets` · `POST /v1/datasets` · `POST /v1/datasets/{id}/upload` · `GET /v1/datasets/{id}/preview` · `POST /v1/datasets/{id}/row-inclusion` · `POST /v1/datasets/{id}/transform` · `POST /v1/datasets/{id}/pack-tts` · `POST /v1/datasets/{id}/pack-omnivoice` · `POST /v1/datasets/{id}/pack-llm` · `POST /v1/datasets/{id}/sync` |
 | Benchmark | `POST /benchmarks` · `GET /benchmarks/{id}` · `GET /benchmarks/{id}/logs?tail=` · `POST /benchmarks/{id}/duplicate` · `PATCH /benchmarks/{id}` (rename) · `POST /benchmarks/{id}/terminate` |
 | Compute | `POST /compute` · `GET /compute` · `GET /compute/{id}/ssh` |
-| Providers / storage / secrets | `GET /v1/providers` · `GET /v1/storage` · `GET /v1/global-env` · `GET /v1/tracking-credentials` |
+| Models (HF catalog) | `GET /v1/catalog` · `POST /v1/catalog` · `GET /v1/catalog/{id}` · `PATCH /v1/catalog/{id}` · `DELETE /v1/catalog/{id}` · `GET /hf/...` (Hub-compatible mirror) |
+| LLM Proxy | `GET /v1/proxy` · `POST /v1/proxy` · `GET /v1/proxy/{id}` · `PATCH /v1/proxy/{id}` · `DELETE /v1/proxy/{id}` · `POST /proxy/{endpoint}/v1/chat/completions` · `GET /proxy/{endpoint}/v1/models` |
+| GitOps | `GET /v1/gitops` · `POST /v1/gitops` · `GET /v1/gitops/{id}` · `PATCH /v1/gitops/{id}` · `POST /v1/gitops/{id}/sync` · `POST /v1/gitops/webhook` · `DELETE /v1/gitops/{id}` |
+| Activity | `GET /v1/history/activity` · `GET /v1/history/{benchmarks,training,compute,inference,proxy}` |
+| Providers / storage / secrets | `GET /v1/providers` · `GET /v1/providers/{id}/metrics` (VM live metrics) · `GET /v1/storage` · `GET /v1/global-env` · `GET /v1/tracking-credentials` |
 | Ops | `GET /health` · `GET /ready` · `GET /metrics` |
 
 ```bash
@@ -400,6 +437,8 @@ Specs live under `web/src/**/*.test.ts`:
 | Spec | Covers |
 |---|---|
 | `src/lib/benchmark-ssh.test.ts` | SSH/VM benchmark create — replicates a 16-cell vLLM sweep pinned to chosen GPUs (`visible_devices`) — plus the get / list / rename / terminate / delete / files routes |
+| `src/lib/benchmark-runpod.test.ts` | RunPod (cloud) benchmark create — the spawn-a-pod config (image / GPU / disk) + cloud-specific request shape |
+| `src/app/(app)/benchmark/new/benchmark-roundtrip.test.ts` | Benchmark form ↔ YAML round-trip (vLLM pin, runtime env, fork install args survive the form ↔ raw-YAML conversion) |
 | `src/lib/__tests__/create-inference.test.ts` | Multi-model VM serverless endpoint create — the GPU-pinned `export`-env vLLM fleet |
 | `src/lib/__tests__/request-inference.test.ts` | Requesting `/v1/chat/completions` + `/v1/models` for each fleet model (parametrized) |
 | `src/app/(app)/serverless/__tests__/deploy-endpoint.test.ts` | Endpoint deploy flow |
@@ -436,7 +475,7 @@ curl -s -X POST "$SGPU_URL/benchmarks" \
     "storage_id":  "store-xxxx",
     "visible_devices": "6,7",
     "cleanup_model": false,
-    "config_yaml": "remote:\n  uv: {path: ~/.benchmark-venv, python_version: \"3.11\"}\n  dependencies: [vllm==0.19.1, huggingface_hub, hf_transfer]\nbenchmark:\n- name: bt\n  engine: vllm\n  model: {repo_id: qwen/qwen3.6-27b, local_dir: ~/models/qwen3p6-27b}\n  serve: {tensor_parallel_size: 2, port: 18017}\n  bench:\n  - {endpoint: /v1/completions, dataset_name: random, random_input_len: 128, random_output_len: 128, num_prompts: 50, max_concurrency: 50}\n  results: {save_result: true}"
+    "config_yaml": "remote:\n  uv: {path: ~/.benchmark-venv, python_version: \"3.11\"}\n  dependencies: [vllm==0.23.0, huggingface_hub, hf_transfer]\nbenchmark:\n- name: bt\n  engine: vllm\n  model: {repo_id: qwen/qwen3.6-27b, local_dir: ~/models/qwen3p6-27b}\n  serve: {tensor_parallel_size: 2, port: 18017}\n  bench:\n  - {endpoint: /v1/completions, dataset_name: random, random_input_len: 128, random_output_len: 128, num_prompts: 50, max_concurrency: 50}\n  results: {save_result: true}"
   }'
 # → {"id":"bench-...","status":"queued"}
 
@@ -455,18 +494,18 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 - **Compute approvals** at `/admin/compute-approvals` — pods land in `pending` until an admin clears them (toggle off per role).
 - **Provisioned** at `/admin/provisioned` — live view of every pod + serverless app across users, with cost tracking.
 - **Secrets** at `/admin/secrets` — org-wide global env vars + W&B / MLflow [tracking credentials](#secrets-global-env--tracking).
-- **Disable a surface** — set `DISABLED_SECTIONS` (comma-separated: `inference,benchmark,compute,datasets`) on the gateway **and** web; the section drops out of the sidebar, its pages 404, and the gateway 403s its routes.
+- **Disable a surface** — set `DISABLED_SECTIONS` (comma-separated, any of `inference,benchmark,compute,datasets,autotrain,catalog`) on the gateway **and** web; the section drops out of the sidebar, its pages 404, and the gateway 403s its routes.
 - **Admin Analytics GPU Timeline** — the GPU Timeline tab is a week-style calendar occupancy view: days across, hours downward, similar to Google Calendar. It has top-level controls to choose a specific GPU node and jump between weeks. Inference uses blue blocks, benchmarks use yellow blocks, and workload status is shown with badges / hover details instead of extra block colours. The week grid now uses responsive day columns so all 7 days fit the panel width on normal desktop screens, with horizontal scrolling only as a narrow-screen fallback. When a node has no blocks in the current week, the UI defaults to the most recent populated week for that node instead of opening on an empty calendar. The timeline feed itself is lazy-fetched only when that tab is selected.
 - **Analytics API split** — the web app no longer relies on a single GPU Platform analytics proxy payload. Overview cards/charts load through `/api/analytics/gpuplatform-overview`, record-heavy job/node surfaces load through `/api/analytics/gpuplatform-records`, and the GPU Timeline keeps its own on-demand `/api/analytics/worker-events` request. `GPU hours` is the default tab so the overview can render without pulling the record feed immediately. This keeps the admin page responsive while preserving the same date/filter behavior.
 - **Sidebar branding** — the top-left sidebar logo uses `/public/logos/scicom-logo-light-v2.svg` in light mode and switches to an inline SVG logo in dark mode so the brand remains readable against the sidebar in both themes.
 
 ## Repo layout
 
-- **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/training-runs`, `/v1/datasets`, `/v1/providers`, `/v1/storage`, `/v1/global-env`, `/v1/tracking-credentials`, `/api-keys`, `/auth`, `/admin/*`, `/metrics`
+- **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/training-runs`, `/v1/datasets`, `/v1/catalog` + `/hf` (HF mirror), `/v1/proxy` + `/proxy/*` (LLM proxy), `/v1/gitops`, `/v1/history` (activity), `/v1/providers`, `/v1/storage`, `/v1/global-env`, `/v1/tracking-credentials`, `/api-keys`, `/auth`, `/admin/*`, `/metrics`
 - **Trainers** (`gateway/gateway/training/`) — standalone runner scripts shipped over SSH per run: `whisper_finetune.py` (ASR), `tts_finetune.py` (the TTS pipeline — NeuCodec-encode → multipack into a ChiniDataset → Qwen3 causal-LM train → CER/MOS/similarity eval, with a **pack-only** mode that powers the dataset Pack-for-TTS step), and `sweep_runner.py` (GPU-pinned multi-trial orchestrator)
 - **Worker agent** (`worker-agent/`) — `BRPOP`s jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub (and rebuilds the multipart upload for Whisper `/v1/audio/*`); also drives the **multi-model fleet** on a VM **or a reverse-tunnelled RunPod pod** — wave-loads each vLLM, sleeps/wakes them per request, skips cancelled jobs before waking a model, runs operator commands (sleep/restart/kill), and ships per-model + scheduler logs to the gateway. The RunPod reverse-tunnel provisioning lives in `gateway/gateway/runpod_provider.py`.
 - **SDK + CLI** (`sdk/serverlessgpu/`) — `@endpoint` decorator, `QueueDepthAutoscaler`, and the `serverlessgpu` CLI
-- **Web** (`web/`) — Next.js UI: Serverless, Autotrain, Datasets, Benchmark, Compute, Providers, Storage, API tokens, Admin (users / roles / audit / approvals / provisioned / secrets)
+- **Web** (`web/`) — Next.js UI: Serverless, Autotrain, Datasets, Models, Benchmark, Compute, LLM Proxy, GitOps, Activity, Providers, Storage, API tokens, Organization, Settings, API Docs, Admin (users / roles / audit / approvals / provisioned / secrets / analytics)
 - **Helm chart** (`deploy/helm/serverlessgpu/`) — gateway + web + Postgres + Redis + Ingress (SSE-safe) + ServiceMonitor
 - **Grafana dashboard** (`deploy/grafana/`) — metrics panels wired to the gateway's Prometheus exporter
 - **CI** (`.github/workflows/ci.yml`) — helm lint + e2e (kind), and matrix multi-arch image builds (gateway + web → amd64/arm64 → merged manifest; PI worker → amd64)

@@ -201,6 +201,70 @@ client (huggingface_hub 1.17.0). Blob GC (orphans from overwrites/deletes) is NO
 ⚠️ Still **different from a `kind=hf` Dataset's `hf_revision`**, which pins a real commit/branch/tag
 on `huggingface.co` — don't conflate.
 
+### Benchmarks (benchmaq) + the provider metrics page
+
+The **Benchmark** section (`web/.../benchmark/new/benchmark-form.tsx` → `POST /v1/benchmarks` in
+`bench.py`) drives the external **benchmaq** tool (installed in the gateway venv from
+`git+…/llm-benchmaq`) to spin up a target and run vLLM/SGLang throughput + accuracy benches. Two backends:
+- **RunPod (cloud)** — `benchmaq runpod bench`: benchmaq deploys a pod, SSHes in, `uv pip install`s
+  `remote.dependencies`, serves + benches. The pod install runs via **pyremote** (`@remote`).
+- **VM (bare-metal)** — `remote.backend: ssh` via the gateway's **`pyremote_shim`** (reconnect-per-command
+  paramiko; TM's SSH proxy allows only one exec channel per TCP connection, hence the shim).
+
+**⚠ `HOME=/share/home` breaks RunPod SSH (bit us in prod).** A RunPod pod's boot script installs the
+injected key with `echo $PUBLIC_KEY >> ~/.ssh/authorized_keys`, so a `HOME` override lands the key in
+`/share/home/.ssh` while sshd reads `/root/.ssh` → every auth fails, pod stays "SSH not ready" to the
+ceiling, never runs, bills the whole time. Log tell: `grep: /share/home/.bashrc: No such file` during
+"Exporting environment variables". Fix: `bench.py` `_resolve_config` **strips `HOME` from the RunPod
+pod-boot env** (keeps it for the VM path, whose sshd is already set up; cache vars like
+`XDG_CACHE_HOME`/`HF_HOME` stay — read at runtime, not by the boot script).
+
+**vLLM ≥ 0.23 needs a CUDA-13 image.** vllm 0.23.0 pulls `torch==2.11` built for cu130 → needs a ≥580
+driver. A cu1281 image lands the pod on a 12.8-driver host → `NVIDIA driver too old (found 12080)` →
+EngineCore crash. Use **`runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404`** (`compute._extract_cuda_version`
+→ `allowedCudaVersions=["13.0"]` → ≥580 host). The benchmark form **defaults to cu1300 + vllm 0.23.0**.
+
+**Custom-fork vLLM on benchmaq** (mirrors the endpoint path). Form: "Custom fork / install args" + a
+one-click **Gemma-4 FA4** preset → renders `remote.uv.vllm_install_args` (e.g.
+`VLLM_USE_PRECOMPILED=1 git+…@ref --torch-backend=auto`). Backends consume it differently:
+- **VM** — `pyremote_shim` splits the leading `NAME=VALUE` env tokens off and emits them as a shell
+  **prefix** on `uv pip install -U …` (so `VLLM_USE_PRECOMPILED=1` is install env, not a bogus pip arg).
+- **RunPod** — `_resolve_config` translates it into `remote.dependencies` (git spec + flags); pyremote's
+  install runs in a non-login `bash -c` SSH session that does NOT inherit pod `--env`, so the gateway
+  exports the leading env via **`SGPU_PIP_ENV`** (read by a patched pyremote `_install_dependencies`) —
+  else the fork silently builds from source (~25 min) and times out.
+- Both add **`sentencepiece`** (the fork's precompiled wheel skips it; gemma/llama tokenizers need it,
+  else `Couldn't instantiate the backend tokenizer`).
+
+**Serve from an existing HF cache:** omit `model.local_dir` → benchmaq skips the download and runs
+`vllm serve <repo_id>` against `HF_HOME` (it downloads only when BOTH `repo_id` AND `local_dir` are set).
+This also dodges the VM `/workspace/…`→`~/…` `local_dir` rewrite, which `vllm serve` can't expand (`~`
+stays literal → "Invalid repository ID or local directory").
+
+**Crash-abort (RunPod):** `bench.py` `_drain` watches the streamed log for terminal vLLM init failures
+(`EngineCore failed to start`, `driver too old`, …) and tears the pod down immediately instead of
+polling a dead `/health` to the ceiling.
+
+**⚠ Ephemeral site-packages patches (NOT in the repo — `uv pip install` wipes them; make durable at
+gateway startup):** pyremote `_install_dependencies` (the `SGPU_PIP_ENV` prefix — needed for RunPod
+forks) and benchmaq `_wait_for_ssh` `timeout=600→1200` (large cu130 images cold-pull past 10 min). Also:
+benchmaq's metrics-output `@@`-section splitter in `vm_probe.py` has a **fixed marker whitelist** — any
+new `@@SECTION` must be added there or it's silently swallowed.
+
+**Provider metrics page** (`/providers/{id}/metrics` → `providers_api.provider_metrics` → `vm_probe.py`;
+VM providers only): live CPU/mem/GPU + per-GPU process list. GPU procs come from **two sources merged**:
+- **NVML** (`nvidia-smi --query-compute-apps`, same as nvtop) → per-GPU VRAM, every owner — but on a
+  **container** (TM is a PAI-DSW container) it reports **host-namespace pids** whose command can't be
+  resolved from inside (`/proc/<hostpid>` doesn't exist → shown as "foreign pid · command not visible").
+- **`/proc` cmdline scan** (world-readable) → real commands + **container pids** (killable), catching GPU
+  frameworks (vLLM/sglang) whose `/proc/<pid>/fd` is unreadable across the namespace. Device-holders
+  attach to the GPUs whose `/dev/nvidiaN` they hold; fd-unreadable framework servers attach to the
+  heavy-VRAM GPUs (best-effort — there's no host↔container pid bridge inside the container). nvidia-smi's
+  *human* process table is empty in a container, but the `--query-compute-apps` query interface isn't.
+
+Benchmark results show an **"individual TPS"** KPI = output tok/s ÷ concurrency (per-stream decode rate;
+`perStreamOutputTps` in `web/src/lib/bench-results.ts`, surfaced in `benchmark/[id]/tabs/results.tsx`).
+
 ### Testing the gateway locally (current `.env` reality)
 
 `gateway/.env` is currently `AUTH_DISABLED=0` + `GATEWAY_RELOAD=0` (despite older notes saying
