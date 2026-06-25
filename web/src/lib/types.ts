@@ -1029,6 +1029,8 @@ export type ProviderGpuProc = {
   pid: number; // container-namespace pid (what ps/kill see on the box)
   comm: string;
   cmd: string;
+  gpu_mem_mib?: number; // this process's VRAM on the GPU (from nvidia-smi)
+  gpus?: string; // host procs: GPU device indices it has open (if fd readable)
 };
 
 export type ProviderGpuMetric = {
@@ -1065,6 +1067,7 @@ export type ProviderMetrics = {
   mem_total_mib: number;
   gpus: ProviderGpuMetric[];
   disks: ProviderDisk[]; // real filesystems (df), largest first
+  host_gpu_procs?: ProviderGpuProc[]; // GPU procs found via /proc (cmd + container pid), not GPU-mapped
   checked_at: number;
 };
 

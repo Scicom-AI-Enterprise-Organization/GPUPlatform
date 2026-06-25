@@ -198,12 +198,16 @@ async def availability_vm(host: str, port: int, user: str, private_key: str) -> 
 # --------------------------------------------------------------------------
 @dataclass
 class GpuProc:
-    """A process bound to a GPU (matched by CUDA_VISIBLE_DEVICES). `pid` is the
-    container-namespace pid — the one `ps`/`kill` see on the box (NOT the host pid
-    nvidia-smi reports, which differs under a container)."""
+    """A process using a GPU. Sourced from `nvidia-smi` compute-apps (authoritative,
+    lists EVERY owner's process with its VRAM) and enriched with /proc/<pid>/cmdline
+    (world-readable, no root). `pid` is this box's pid namespace — killable on bare
+    metal; host-namespace (may not match ps/kill) under a container.
+    `gpu_mem_mib` is the process's VRAM on that GPU."""
     pid: int
     comm: str
     cmd: str
+    gpu_mem_mib: int = 0
+    gpus: str = ""   # for /proc-discovered host procs: GPU device indices it has open
 
 
 @dataclass
@@ -246,6 +250,11 @@ class VmMetricsResult:
     checked_at: float
     cpu_cores: list[float] = field(default_factory=list)  # per-core busy % (htop-style)
     disks: list[DiskMetric] = field(default_factory=list)  # real filesystems (df), largest first
+    # GPU processes discovered from /proc (cmdline world-readable) — catches the ones
+    # NVML can't name (host / other-container pids) + frameworks whose fds we can't
+    # read across the namespace. Not mapped to a specific GPU (no fd/NVML link), so
+    # listed host-level alongside the per-GPU NVML VRAM.
+    host_procs: list[GpuProc] = field(default_factory=list)
 
 
 # Two /proc/stat samples (CPU%), /proc/meminfo (RAM), nvidia-smi (GPUs) — one shot.
@@ -259,18 +268,39 @@ _METRICS_CMD = (
     "--format=csv,noheader,nounits 2>/dev/null; "
     # NVLink per-link status (one block per GPU; "<inactive>" links are skipped).
     "echo @@NVLINK; nvidia-smi nvlink --status 2>/dev/null; "
-    # Per-GPU processes by CUDA_VISIBLE_DEVICES (container-namespace pids — the ones
-    # ps/kill see; nvidia-smi's compute-apps pids are host-namespace under a
-    # container and don't match). One line per GPU process: pid|cvd|comm|cmd.
+    # GPU processes — two complementary sources, merged in the parser:
+    #   @@PROC: nvidia-smi --query-compute-apps (NVML — the SAME source nvtop uses;
+    #     lists EVERY GPU process with its VRAM, including host / other-container
+    #     tenants on a shared box). nvidia-smi's *human* process table is empty in a
+    #     container, but the query interface still returns them. We map gpu_uuid→
+    #     index (@@GPUUUID) and /proc-enrich the command where the pid is in our ns
+    #     (foreign pids → process_name fallback, command unobtainable from in here).
+    #   @@FDPROC: /proc/<pid>/fd open /dev/nvidiaN — THIS container's own GPU procs,
+    #     to catch any the NVML list missed and supply the full command.
+    "echo @@GPUUUID; nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null; "
     "echo @@PROC; "
-    "for e in /proc/[0-9]*/environ; do "
-    "p=${e%/environ}; p=${p#/proc/}; "
-    "cvd=$(tr '\\0' '\\n' < \"$e\" 2>/dev/null | sed -n 's/^CUDA_VISIBLE_DEVICES=//p' | head -1); "
-    "[ -z \"$cvd\" ] && continue; "
+    "nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory,process_name --format=csv,noheader,nounits 2>/dev/null | "
+    "while IFS=, read u pid mem pname; do "
+    "u=$(echo $u | tr -d ' '); pid=$(echo $pid | tr -d ' '); mem=$(echo $mem | tr -d ' '); pname=$(echo $pname | sed 's/^ *//'); "
+    "[ -z \"$pid\" ] && continue; "
+    "comm=$(cat /proc/$pid/comm 2>/dev/null); [ -z \"$comm\" ] && comm=\"$pname\"; "
+    "cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | cut -c1-300); [ -z \"$cmd\" ] && cmd=\"$pname\"; "
+    "echo \"$u|$pid|$mem|$comm|$cmd\"; done; "
+    # @@FDPROC: every process in /proc that looks GPU-related — either it holds a
+    # /dev/nvidiaN fd (readable for our own procs), OR its cmdline names a GPU engine
+    # (vllm/sglang/…) whose fds we can't read across the container boundary. cmdline
+    # is world-readable, so this surfaces e.g. a `vllm serve :8000` even when NVML
+    # only knows it by an unmappable host pid. Line: pid|gpus(empty if fd unreadable)|comm|cmd.
+    "echo @@FDPROC; "
+    "for d in /proc/[0-9]*; do p=${d#/proc/}; "
+    "cmd=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-300); "
+    "[ -z \"$cmd\" ] && continue; "
+    "g=$(ls -l /proc/$p/fd 2>/dev/null | grep -oE '/dev/nvidia[0-9]+' | grep -oE '[0-9]+$' | sort -un | tr '\\n' ',' | sed 's/,$//'); "
+    "gpu=0; [ -n \"$g\" ] && gpu=1; "
+    "case \"$cmd\" in *vllm*|*VLLM*|*sglang*|*SGLang*|*tensorrt*|*trtllm*|*deepspeed*) gpu=1;; esac; "
+    "[ \"$gpu\" = 0 ] && continue; "
     "comm=$(cat /proc/$p/comm 2>/dev/null); "
-    "cmd=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-110); "
-    "echo \"$p|$cvd|$comm|$cmd\"; "
-    "done 2>/dev/null; "
+    "echo \"$p|$g|$comm|$cmd\"; done 2>/dev/null; "
     # Disk: real filesystems only (skip virtual mounts), bytes used + total.
     # Columns come out in --output order: <mount> <used> <size>.
     "echo @@DISK; df -B1 -x tmpfs -x devtmpfs -x overlay -x squashfs "
@@ -317,7 +347,7 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
         cur = None
         for ln in out.splitlines():
             s = ln.strip()
-            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@NVLINK", "@@PROC", "@@DISK"):
+            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@NVLINK", "@@GPUUUID", "@@PROC", "@@FDPROC", "@@DISK"):
                 cur = s
                 sec[cur] = []
             elif cur:
@@ -409,19 +439,66 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
                 g.nvlink_active = cnt
                 g.nvlink_gbps = round(tot, 1)
 
-        # @@PROC: pid|CUDA_VISIBLE_DEVICES|comm|cmd → attach to the physical GPUs the
-        # process can see (CVD value == physical index). One process can span GPUs (TP).
-        proc_for: list[tuple[set[int], GpuProc]] = []
+        # @@GPUUUID: "index, uuid" → map so compute-apps (keyed by gpu_uuid) lands on
+        # the right physical GPU.
+        uuid2idx: dict[str, int] = {}
+        for ln in sec.get("@@GPUUUID", []):
+            parts = [x.strip() for x in ln.split(",")]
+            if len(parts) >= 2 and parts[0].isdigit():
+                uuid2idx[parts[1]] = int(parts[0])
+
+        # @@PROC: uuid|pid|mem_mib|comm|cmd from nvidia-smi compute-apps (NVML — every
+        # GPU process + VRAM, all owners). Foreign (host/other-container) pids carry
+        # VRAM but no resolvable command (process_name fallback). Authoritative.
+        procs_by_gpu: dict[int, list[GpuProc]] = {}
+        seen: dict[int, set[int]] = {}
         for ln in sec.get("@@PROC", []):
+            bits = ln.split("|", 4)
+            if len(bits) < 5 or not bits[1].strip().isdigit():
+                continue
+            idx = uuid2idx.get(bits[0].strip())
+            if idx is None:
+                continue
+            mem = int(bits[2]) if bits[2].strip().isdigit() else 0
+            pid, comm = int(bits[1]), (bits[3].strip() or "?")
+            cmd = bits[4].strip() or comm
+            # nvidia-smi can't resolve a host / other-container pid's name from inside
+            # this container — make that legible instead of the raw "[Not Found]".
+            if comm in ("[Not Found]", "[Insufficient Permissions]") or not comm:
+                comm = "foreign pid"
+                cmd = "command not visible from this container (host / other tenant)"
+            procs_by_gpu.setdefault(idx, []).append(GpuProc(pid, comm, cmd, mem))
+            seen.setdefault(idx, set()).add(pid)
+
+        # @@FDPROC: pid|gpus|comm|cmd — GPU processes discovered from /proc (full
+        # command + container pid → killable). Merge into each GPU so every card lists
+        # pid + command, not just the NVML host pids:
+        #  - device-holders (fd readable → their /dev/nvidiaN list) → those GPUs.
+        #  - framework servers whose fds we can't read across the namespace (vllm /
+        #    sglang, gpus="") → the GPUs carrying a heavy unnamed foreign allocation
+        #    (≥10 GiB), where a multi-GPU server is the obvious tenant. Best-effort:
+        #    there's no fd/NVML pid bridge inside the container, so this correlates the
+        #    NVML VRAM (host pid, no name) with the /proc command (container pid).
+        heavy = {idx for idx, ps in procs_by_gpu.items()
+                 if any(p.gpu_mem_mib >= 10240 for p in ps)}
+        for ln in sec.get("@@FDPROC", []):
             bits = ln.split("|", 3)
             if len(bits) < 4 or not bits[0].strip().isdigit():
                 continue
-            idxs = {int(t) for t in bits[1].split(",") if t.strip().isdigit()}
-            if not idxs:
-                continue
-            proc_for.append((idxs, GpuProc(int(bits[0]), bits[2].strip(), bits[3].strip())))
+            pid = int(bits[0])
+            dev = {int(t) for t in bits[1].split(",") if t.strip().isdigit()}
+            comm = bits[2].strip() or "?"
+            cmd = bits[3].strip() or comm
+            for idx in (dev or heavy):
+                if pid in seen.get(idx, set()):
+                    continue
+                procs_by_gpu.setdefault(idx, []).append(GpuProc(pid, comm, cmd, 0))
+                seen.setdefault(idx, set()).add(pid)
+        host_procs: list[GpuProc] = []  # merged into per-GPU lists above
         for g in gpus:
-            g.processes = [gp for (idxs, gp) in proc_for if g.index in idxs]
+            # Heaviest VRAM first — the GPU's real tenants (NVML) on top, then the
+            # /proc-named procs (0 VRAM here) beneath.
+            g.processes = sorted(procs_by_gpu.get(g.index, []), key=lambda p: -p.gpu_mem_mib)
 
         # @@DISK: `df` rows "<mount> <used> <total>" (bytes). First line is the
         # header (non-numeric) → skipped. Drop sub-1 GiB mounts (boot/efi/…).
@@ -443,7 +520,7 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
         return VmMetricsResult(
             ok, "ok" if ok else "no metrics parsed (is this a Linux host with nvidia-smi?)",
             cpu_pct, mem_used_mib, mem_total_mib, gpus, _time.time(),
-            cpu_cores=cpu_cores, disks=disks,
+            cpu_cores=cpu_cores, disks=disks, host_procs=host_procs,
         )
     finally:
         try:

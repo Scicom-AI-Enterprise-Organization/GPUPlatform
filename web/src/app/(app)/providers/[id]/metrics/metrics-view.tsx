@@ -319,6 +319,47 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
         </Card>
       )}
 
+      {m && m.host_gpu_procs && m.host_gpu_procs.length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              GPU processes
+              <span className="text-[11px] font-normal text-muted-foreground">· via /proc · {m.host_gpu_procs.length}</span>
+            </CardTitle>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Commands of GPU processes seen on this host (including other tenants). On a
+              shared / containerized box these can&apos;t be pinned to a specific GPU — match
+              them to the per-GPU VRAM below by command.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-1">
+            {m.host_gpu_procs.map((p) => {
+              const busy = killing.has(p.pid);
+              return (
+                <div key={p.pid} className="flex items-start justify-between gap-2 text-xs" title={p.cmd}>
+                  <span className="shrink-0 text-foreground">pid {p.pid}</span>
+                  {p.gpus ? (
+                    <span className="shrink-0 font-mono text-[10px] text-muted-foreground" title="GPU device nodes held">gpu {p.gpus}</span>
+                  ) : null}
+                  <span className="min-w-0 flex-1 truncate text-left font-mono text-[11px] text-muted-foreground">
+                    {p.cmd || p.comm || "?"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => requestKill(p.pid)}
+                    disabled={busy}
+                    title={`SIGKILL pid ${p.pid}`}
+                    className="shrink-0 rounded border border-destructive/40 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                  >
+                    {busy ? "…" : "Kill"}
+                  </button>
+                </div>
+              );
+            })}
+          </CardContent>
+        </Card>
+      )}
+
       {gpus.length > 0 && (
         <Card>
           <CardHeader className="pb-2">
@@ -381,10 +422,23 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
                           {g.processes!.map((p) => {
                             const model = p.cmd.match(/--model[=\s]+(\S+)/)?.[1];
                             const busy = killing.has(p.pid);
+                            // Show the full command line (what actually identifies the
+                            // process, e.g. `… vllm serve …`), not just comm ("python3").
+                            // Lead with the model when it's a vLLM serve; tooltip has the rest.
+                            const desc = p.cmd?.trim() || p.comm || "?";
                             return (
-                              <div key={p.pid} className="flex items-center justify-between gap-2" title={p.cmd}>
-                                <span className="text-foreground">pid {p.pid}</span>
-                                <span className="min-w-0 flex-1 truncate text-muted-foreground">{model || p.comm || "?"}</span>
+                              <div key={p.pid} className="flex items-start justify-between gap-2" title={p.cmd || p.comm}>
+                                <span className="shrink-0 text-foreground">pid {p.pid}</span>
+                                {p.gpu_mem_mib ? (
+                                  <span className="shrink-0 font-mono text-[11px] text-foreground" title="VRAM held on this GPU">
+                                    {p.gpu_mem_mib >= 1024 ? `${(p.gpu_mem_mib / 1024).toFixed(1)} GiB` : `${p.gpu_mem_mib} MiB`}
+                                  </span>
+                                ) : null}
+                                <span className="min-w-0 flex-1 truncate text-left font-mono text-[11px] text-muted-foreground">
+                                  {model ? <span className="text-foreground">{model}</span> : null}
+                                  {model ? "  " : null}
+                                  {desc}
+                                </span>
                                 <button
                                   type="button"
                                   onClick={() => requestKill(p.pid)}

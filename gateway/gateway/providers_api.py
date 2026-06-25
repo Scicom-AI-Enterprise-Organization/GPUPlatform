@@ -123,6 +123,8 @@ class GpuProcInfo(BaseModel):
     pid: int          # container-namespace pid (what ps/kill see on the box)
     comm: str
     cmd: str
+    gpu_mem_mib: int = 0   # this process's VRAM on the GPU (from nvidia-smi)
+    gpus: str = ""         # host procs: GPU device indices it has open (if readable)
 
 
 class GpuMetricInfo(BaseModel):
@@ -158,6 +160,9 @@ class ProviderMetricsResponse(BaseModel):
     mem_total_mib: int = 0
     gpus: list[GpuMetricInfo] = []
     disks: list[DiskInfo] = []     # real filesystems (df), largest first
+    # GPU processes found via /proc (command + container pid) that NVML can't map to
+    # a GPU here (host / other-container tenants on a shared box). Surfaced host-level.
+    host_gpu_procs: list[GpuProcInfo] = []
     checked_at: float
 
 
@@ -662,10 +667,12 @@ async def provider_metrics(
             pcie_gen_max=g.pcie_gen_max, pcie_width_max=g.pcie_width_max,
             nvlink_supported=g.nvlink_supported, nvlink_active=g.nvlink_active,
             nvlink_gbps=g.nvlink_gbps,
-            processes=[GpuProcInfo(pid=p.pid, comm=p.comm, cmd=p.cmd) for p in g.processes],
+            processes=[GpuProcInfo(pid=p.pid, comm=p.comm, cmd=p.cmd, gpu_mem_mib=p.gpu_mem_mib) for p in g.processes],
         ) for g in result.gpus],
         disks=[DiskInfo(mount=d.mount, used_bytes=d.used_bytes, total_bytes=d.total_bytes)
                for d in result.disks],
+        host_gpu_procs=[GpuProcInfo(pid=p.pid, comm=p.comm, cmd=p.cmd, gpus=p.gpus)
+                        for p in result.host_procs],
         checked_at=result.checked_at,
     )
 
