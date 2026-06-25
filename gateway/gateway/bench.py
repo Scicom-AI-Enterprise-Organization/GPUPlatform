@@ -790,6 +790,73 @@ async def _push_log(redis, bench_id: str, line: str) -> None:
 _POD_CREATED_RE = re.compile(r"Pod created:\s*(\S+)")
 _COST_CAPTURED: set[str] = set()
 
+# On the RunPod path benchmaq keeps polling the vLLM /health endpoint to its
+# (gateway-bumped) ceiling even after the engine has already crashed on startup
+# — burning pod credits on a pod that will never serve. (The "abort on process
+# death" patch in pyremote_shim only covers the ssh/bare-metal backend.) When we
+# spot an unambiguous engine-init failure on the streamed log we tear the pod
+# down + kill the run right away. {bench_id: pod_id}; aborted-set keeps the two
+# (stdout+stderr) drains from firing it twice.
+_POD_FOR_BENCH: dict[str, str] = {}
+_CRASH_ABORTED: set[str] = set()
+
+# Terminal vLLM startup-failure signatures → a clean one-line reason. Each only
+# prints once the engine/worker process has already exited (the serve will never
+# come up), so a match means "stop waiting, tear down". Deliberately narrow: a
+# cold-start 504 or a slow torch.compile must NOT match — those still go healthy.
+_VLLM_FATAL_SIGNATURES: list[tuple[str, str]] = [
+    (r"The NVIDIA driver on your system is too old",
+     "the pod's GPU driver is too old for the installed torch/vLLM build "
+     "(e.g. vllm==0.23.0 ships a CUDA-13 torch, but a cu128 image lands the pod "
+     "on a CUDA-12.x-driver host) — use a CUDA-13 image (…-cu1300-…) or pin a "
+     "cu128 vLLM build"),
+    (r"forward compatibility was attempted on non-supported",
+     "the pod's GPU driver is older than the CUDA the torch/vLLM build needs "
+     "— use a matching-CUDA image"),
+    (r"EngineCore failed to start|Engine core initialization failed",
+     "the vLLM engine core failed to initialise (see the traceback above)"),
+    (r"WorkerProc (initialization )?failed",
+     "a vLLM worker process failed to start (see the traceback above)"),
+]
+_VLLM_FATAL_RES = [(re.compile(rx), msg) for rx, msg in _VLLM_FATAL_SIGNATURES]
+
+
+def _vllm_fatal_reason(text: str) -> Optional[str]:
+    """Return a clean reason if a log line is a terminal vLLM startup failure
+    (engine will never serve), else None. Used to fail-fast + tear the pod down
+    instead of polling a dead /health for the whole health-wait ceiling."""
+    for rx, msg in _VLLM_FATAL_RES:
+        if rx.search(text):
+            return msg
+    return None
+
+
+async def _abort_on_vllm_crash(
+    redis, bench_id: str, reason: str, provider_id: Optional[str] = None
+) -> None:
+    """Tear down a run whose vLLM engine crashed on startup — don't let benchmaq
+    poll a dead /health to its ceiling and burn pod credits. Tears the (expensive)
+    RunPod pod down first, then kills the local benchmaq subprocess so the runner
+    proceeds to mark the row failed."""
+    await _push_log(
+        redis, bench_id,
+        f"[gateway] vLLM engine crashed on startup — {reason}. "
+        "Aborting the health wait and tearing the pod down to stop credit burn.",
+    )
+    pod_id = _POD_FOR_BENCH.get(bench_id)
+    if pod_id:
+        try:
+            await _terminate_runpod_pod(pod_id, provider_id=provider_id)
+            await _push_log(redis, bench_id, f"[gateway] runpod pod {pod_id} torn down (crash-abort)")
+        except Exception as e:
+            await _push_log(redis, bench_id, f"[gateway] crash-abort: runpod teardown failed: {e}")
+    proc = _LIVE.get(bench_id)
+    if proc and proc.returncode is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
 
 async def _fetch_runpod_cost(pod_id: str, provider_id: Optional[str] = None) -> Optional[float]:
     """Return RunPod's costPerHr for a pod by id, or None if anything goes
@@ -866,7 +933,15 @@ async def _drain(stream: asyncio.StreamReader, prefix: str, redis, bench_id: str
             m = _POD_CREATED_RE.search(text)
             if m:
                 _COST_CAPTURED.add(bench_id)
+                _POD_FOR_BENCH[bench_id] = m.group(1)
                 asyncio.create_task(_capture_runpod_cost(bench_id, m.group(1), provider_id=provider_id))
+        # Fail fast on a terminal vLLM engine crash — otherwise benchmaq polls a
+        # dead /health to its ceiling and burns pod credits. Fires once per bench.
+        if bench_id not in _CRASH_ABORTED:
+            reason = _vllm_fatal_reason(text)
+            if reason:
+                _CRASH_ABORTED.add(bench_id)
+                asyncio.create_task(_abort_on_vllm_crash(redis, bench_id, reason, provider_id=provider_id))
 
 
 # Recognised model-download (hf) failure signatures → a clean one-liner. When a
@@ -1143,6 +1218,9 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         raise
     finally:
         _LIVE.pop(bench_id, None)
+        _POD_FOR_BENCH.pop(bench_id, None)
+        _CRASH_ABORTED.discard(bench_id)
+        _COST_CAPTURED.discard(bench_id)
 
     await _push_log(redis, bench_id, f"[gateway] benchmaq exited rc={rc}")
 
@@ -1319,10 +1397,22 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
                 error_excerpt = "".join(all_lines[-50:])[-4000:]
                 # Surface a clean one-liner for known failure patterns so the
                 # list page doesn't show a raw log wall.
+                # A vLLM engine crash we already crash-aborted on: lead with the
+                # reason we logged (it sits just below the traceback, so scan a
+                # wider window than the 50-line tail).
+                _crash_m = re.search(
+                    r"\[gateway\] vLLM engine crashed on startup[^\n]*",
+                    "".join(all_lines[-300:]),
+                )
                 _cuda_m = re.search(
                     r"CUDA mismatch[^\n]{0,200}", error_excerpt, re.IGNORECASE
                 )
-                if _cuda_m:
+                if _crash_m:
+                    error_excerpt = (
+                        _crash_m.group(0).replace("[gateway] ", "").strip()
+                        + "\n\n— log tail —\n" + (error_excerpt or "")
+                    )[:4000]
+                elif _cuda_m:
                     error_excerpt = _cuda_m.group(0).strip()
                 else:
                     # Model-download failures: the real hf error sits ABOVE the

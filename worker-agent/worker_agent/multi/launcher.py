@@ -281,12 +281,18 @@ def _uv_env() -> dict:
     return env
 
 
-async def _uv_run(uv: str, args: list[str], what: str) -> bool:
-    """Run `uv <args>`, streaming its output to the log. Returns True on success."""
-    logger.info("%s: uv %s", what, " ".join(args))
+async def _uv_run(uv: str, args: list[str], what: str, env_extra: dict | None = None) -> bool:
+    """Run `uv <args>`, streaming its output to the log. Returns True on success.
+    `env_extra` overlays extra env vars on the install subprocess (e.g.
+    VLLM_USE_PRECOMPILED=1 for a fast git-fork install)."""
+    env = _uv_env()
+    if env_extra:
+        env.update(env_extra)
+    logged = (" ".join(f"{k}={v}" for k, v in (env_extra or {}).items()) + " ").lstrip()
+    logger.info("%s: %suv %s", what, logged, " ".join(args))
     try:
         proc = await asyncio.create_subprocess_exec(
-            uv, *args, env=_uv_env(),
+            uv, *args, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         rc = await _stream_subprocess(proc)
@@ -378,16 +384,33 @@ async def ensure_venv(
     else:
         logger.info("venv %s exists but vLLM not importable — (re)installing %s", venv_path, desc)
     if custom:
-        # Operator-provided install command (e.g. a nightly with extra index URLs).
-        # Run verbatim — no --torch-backend injection, no fallback.
+        # Operator-provided install command (e.g. a nightly with extra index URLs,
+        # or a git fork). Run verbatim — no --torch-backend injection, no fallback.
         try:
             extra = shlex.split(custom)
         except ValueError as e:
             logger.error("vllm_install_args is not a valid shell arg string (%s) — skipping install", e)
             extra = None
         if extra:
-            await _uv_run(uv, ["pip", "install", "--python", py, *extra],
-                          f"install vLLM (custom) into {venv_path}")
+            # Leading NAME=VALUE tokens are environment assignments for the install
+            # subprocess (shell-style), e.g. "VLLM_USE_PRECOMPILED=1 git+https://…@ref":
+            # lets a git-fork install reuse precompiled vLLM binaries (fast, no CUDA
+            # toolchain) without that var leaking into a real pip arg. Everything from
+            # the first non-assignment token on is passed to `uv pip install` verbatim.
+            # NAME=VALUE but NOT a pip requirement: `(?!=)` rejects `vllm==0.23.0`
+            # (and `name>=…`/`name[extra]==…` already fail the leading-char class).
+            env_extra: dict[str, str] = {}
+            i = 0
+            while i < len(extra) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=(?!=)", extra[i]):
+                k, v = extra[i].split("=", 1)
+                env_extra[k] = v
+                i += 1
+            pip_args = extra[i:]
+            if not pip_args:
+                logger.error("vllm_install_args has no install target after env assignments — skipping")
+            else:
+                await _uv_run(uv, ["pip", "install", "--python", py, *pip_args],
+                              f"install vLLM (custom) into {venv_path}", env_extra=env_extra or None)
     else:
         spec = f"vllm=={vllm_version}" if vllm_version else "vllm"
         # --torch-backend=auto lets uv pick the PyTorch CUDA build matching the VM's

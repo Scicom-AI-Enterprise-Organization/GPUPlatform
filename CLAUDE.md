@@ -83,12 +83,30 @@ doesn't exist and the worker installs `uv` (if absent), `uv venv`s the path (mkd
 installs vLLM, *streaming* the install to the `__worker__` log. Logic in
 `worker-agent/.../multi/launcher.py` (`ensure_venv`/`ensure_build_tools`/`run_pre_script`) +
 `scheduler.start()`. Knobs (create form **and** Overview → Models → Edit; stored on `App`):
-- **vLLM version** (`vllm_version`) — `uv pip install vllm==X --torch-backend=auto`.
+- **vLLM version** (`vllm_version`) — `uv pip install vllm==X --torch-backend=auto`. **Default `0.23.0`**
+  (the form pre-fills it / falls back to it; ⚠ 0.23.0 needs the prometheus fix below).
 - **vLLM install args** (`vllm_install_args`) — a full `uv pip install` arg string used *verbatim*
-  (overrides the version), for nightlies/custom CUDA. The form has an **Insert nightly (cu130)** button.
+  (overrides the version), for nightlies/custom CUDA/**git forks**. The form has an **Insert nightly
+  (cu130)** button. A **leading `NAME=VALUE` token is an install-subprocess env var** (shell-style),
+  parsed off in `ensure_venv` before the pip args — e.g. `VLLM_USE_PRECOMPILED=1 git+…@ref` reuses
+  precompiled vLLM binaries (fast, no CUDA toolchain). The `(?!=)` guard means `vllm==0.23.0` is NOT
+  mistaken for an env assignment.
+- **Custom vLLM fork (git)** — form-only affordance (URL + ref + "precompiled" checkbox) that *composes*
+  `vllm_install_args` to `git+<url>@<ref>` (+ `--torch-backend=auto`); precompiled prepends
+  `VLLM_USE_PRECOMPILED=1`, unchecking it builds CUDA from source. A **"Use Gemma-4 FA4 fork"** preset
+  one-clicks the [vllm-gemma4-fa4-cute](https://github.com/Scicom-AI-Enterprise-Organization/vllm-gemma4-fa4-cute)
+  fork: sets a **dedicated venv** (`/share/vllm-gemma4-fa4-venv` — NOT the shared marker-less
+  `/share/vllm-venv`, which the worker refuses to touch so the fork would silently never install), adds
+  `--attention-backend FLASH_ATTN_CUTE` to every member, and appends the 0.23.0 prometheus fix to
+  `pre_script`. ⚠ Do **NOT** add a `cutlass-dsl` pin — the fork declares its own `nvidia-cutlass-dsl==4.5.2`
+  (the README's "cutlass-dsl==4.4.2" is stale; the PyPI name is `nvidia-cutlass-dsl`, imports as `cutlass`),
+  and any conflicting pin makes uv unsatisfiable. POD-VERIFIED on the tm H20 (precompiled git install → 13G
+  venv, `import vllm`+`cutlass` OK) AND **e2e through the local gateway** (deployed proxy endpoint
+  `gemma4-fa4-fork`, gemma-4-31b TP=1 on GPU 6, vLLM log `Using AttentionBackendEnum.FLASH_ATTN_CUTE`
+  + `kv cache block size to 80`, served a chat completion over the gateway proxy).
 - **Pre-launch script** (`pre_script`) — shell run once after the venv is ready, before launch, with
-  `{venv}/bin` on PATH + VIRTUAL_ENV set. The form has a **+ Install DeepGEMM** button. Runs under
-  `bash` so `bash <(curl … install_deepgemm.sh)` works.
+  `{venv}/bin` on PATH + VIRTUAL_ENV set. The form has **+ Install DeepGEMM** and **+ Fix vLLM 0.23.0
+  prometheus** buttons. Runs under `bash` so `bash <(curl … install_deepgemm.sh)` works.
 
 A `{venv}/.sgpu_vllm_spec` marker means: skip if the spec is unchanged, reinstall if you change it,
 **never touch a venv with no marker** (hand-built ones like the tm fleet's `/share/vllm-venv`).
@@ -100,6 +118,28 @@ venv needs `ninja`+`cmake` AND `{venv}/bin` on PATH (`launch_member` prepends it
 healthy; workaround is a `pre_script` `uv pip install -U "prometheus-fastapi-instrumentator>=7"`. After
 repeated re-provisions, free orphaned GPU memory with `POST /apps/{id}/workers/purge` (a self-exited
 vLLM the per-PID cleanup misses → "No available memory for the cache blocks" on the next launch).
+
+### VM reverse tunnel — autossh `ssh -R`, keyed by (host, **port**)
+
+A VM worker phones home (register/heartbeat/Redis) over a **reverse SSH tunnel** the gateway opens
+(`vm_tunnel.ensure`), needed whenever the gateway isn't publicly reachable (local dev — set
+`VM_REVERSE_TUNNEL=1`; the worker then gets `GATEWAY_URL=http://127.0.0.1:{gw_port}` which routes back
+through the tunnel). In **prod** the gateway is reachable so the worker connects directly — that's why
+"works in prod, not localhost". The reverse tunnel now uses **autossh `ssh -R`** (native OpenSSH, same
+as the forward `ensure_forward`) — NOT the old in-process paramiko `request_port_forward`, whose
+`_monitor`/`_healthy` close+reconnect loop raced the VM's port release → endless **`TCP forwarding
+request denied`** flapping (tunnel up→denied→up, worker's 30 register attempts all miss). A bare
+`ssh -R` never flaps; autossh keeps it alive + reconnects.
+
+⚠ **Keyed by `(host, port)`, not host.** Two providers can share one host on different SSH ports —
+e.g. the tm box runs **two containers**: `tm`=`8.222.165.68:1024` (prov-5be27d21) and
+`tm-2`=`8.222.165.68:1023` (prov-32bb483b). The old `_TUNNELS[host]`/`_REV_PROCS[host]` keying made the
+second provider **reuse the first's tunnel** (bound in the wrong container) → its workers' registration
+silently failed. `_REV_PROCS`/`_kill_stale_reverse` are now `(host,port)`-scoped so each container gets
+its own `-R`. autossh subprocesses are detached (`start_new_session`) so they survive a gateway restart;
+`_kill_stale_reverse(host, port, …)` reaps the prior process's `-R` (matched by keyfile + `-p {port}` so
+it never kills a sibling provider's tunnel). Verified e2e on tm: both `-p 1023` and `-p 1024` reverse
+tunnels coexist, the `:1024` worker registers + serves.
 
 ### Activity dashboard (`/activity`) + proxy-mode usage recording
 

@@ -144,6 +144,37 @@ const DEEPGEMM_SCRIPT =
 // A nightly vLLM install (cu130) — handy starting point for the install-args field.
 const VLLM_NIGHTLY_ARGS =
   "-U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130 --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match";
+// Default vLLM version installed into the VM/pod venv when none is pinned.
+const DEFAULT_VLLM_VERSION = "0.23.0";
+// Custom vLLM fork (git) — the Gemma-4 FA4 "CUTE" fork + what it needs to run.
+const GEMMA4_FA4_FORK_URL = "https://github.com/Scicom-AI-Enterprise-Organization/vllm-gemma4-fa4-cute";
+const GEMMA4_FA4_REF = "main";
+const GEMMA4_FA4_BACKEND = "--attention-backend FLASH_ATTN_CUTE"; // activates the FA4 CUTE backend
+// NOTE: the fork pins its own `nvidia-cutlass-dsl` (==4.5.2) as a dependency, so we do
+// NOT add a cutlass requirement here — pinning a different version makes uv unsatisfiable.
+// The fork must live in its OWN venv — NOT the shared /share/vllm-venv (hand-built,
+// no .sgpu_vllm_spec marker → the worker refuses to touch it, so the fork would never install).
+const GEMMA4_FA4_VENV = "/share/vllm-gemma4-fa4-venv";
+// vLLM 0.23.0 ships a prometheus-fastapi-instrumentator that 500s every route
+// (incl. /health) → the worker never goes healthy. Pin the fixed release.
+const VLLM_PROM_FIX = 'uv pip install -U "prometheus-fastapi-instrumentator>=7"';
+
+// Compose a verbatim `uv pip install` arg string for a git-fork vLLM. A leading
+// `VLLM_USE_PRECOMPILED=1` (the worker reads leading NAME=VALUE tokens as install
+// env, not pip args) reuses precompiled vLLM binaries — fast, no CUDA toolchain.
+// Uncheck precompiled to build CUDA from source. extraDeps (e.g. cutlass-dsl) are
+// installed in the same command; --torch-backend=auto picks the driver-matched torch.
+function composeForkArgs(url: string, ref: string, precompiled: boolean, extraDeps: string[] = []): string {
+  const u = url.trim();
+  if (!u) return "";
+  const spec = `git+${u}${ref.trim() ? "@" + ref.trim() : ""}`;
+  return [
+    ...(precompiled ? ["VLLM_USE_PRECOMPILED=1"] : []),
+    spec,
+    ...extraDeps,
+    "--torch-backend=auto",
+  ].join(" ");
+}
 
 /** Returns an error string for obviously-broken vLLM args (stray line-continuation
  * backslash, unbalanced quotes, platform-reserved flags), else null. */
@@ -208,10 +239,53 @@ export function InferenceForm() {
   // Default to the standard shared venv on the VM — leaving this empty makes the
   // worker fall back to bare `python3` (no vLLM), which silently never launches.
   const [venvPath, setVenvPath] = useState("/share/vllm-venv");
-  const [vllmVersion, setVllmVersion] = useState("");
+  const [vllmVersion, setVllmVersion] = useState(DEFAULT_VLLM_VERSION);
   // Advanced: a full `uv pip install` arg string for vLLM, used verbatim instead of
-  // the version — e.g. a nightly with extra index URLs. Overrides the version.
+  // the version — e.g. a nightly with extra index URLs, or a git fork. Overrides the version.
   const [vllmInstallArgs, setVllmInstallArgs] = useState("");
+  // Custom vLLM fork (git): repo URL + ref, installed via `git+…@ref`. Precompiled
+  // (default) overlays stock binaries onto the fork's Python (fast); uncheck to build
+  // CUDA from source. Composing fills vllmInstallArgs (which overrides the version).
+  const [forkUrl, setForkUrl] = useState("");
+  const [forkRef, setForkRef] = useState("main");
+  const [forkPrecompiled, setForkPrecompiled] = useState(true);
+  // Append a serve flag (e.g. --attention-backend FLASH_ATTN_CUTE) to every member
+  // that doesn't already carry it. VM (proxy/fleet) + cloud-multi serve via members.
+  const addServeFlagToMembers = (flag: string) =>
+    setMembers((arr) =>
+      arr.map((m) =>
+        m.extra_args.includes(flag.split(" ")[1] ?? flag)
+          ? m
+          : { ...m, extra_args: (m.extra_args.trim() ? m.extra_args.trim() + " " : "") + flag },
+      ),
+    );
+  // Fill vllmInstallArgs from a git fork (URL+ref+precompiled). Install args override
+  // the version field, so blank the version to avoid a confusing dual spec.
+  const applyFork = (extraDeps: string[] = []) => {
+    const args = composeForkArgs(forkUrl, forkRef, forkPrecompiled, extraDeps);
+    if (!args) return;
+    setVllmInstallArgs(args);
+    setVllmVersion("");
+  };
+  // One-click: the Gemma-4 FA4 CUTE fork — git install (precompiled) + cutlass-dsl,
+  // the FA4 serve flag on every member, and the vLLM 0.23.0 prometheus fix in pre-launch.
+  const useGemma4Fa4Preset = () => {
+    setForkUrl(GEMMA4_FA4_FORK_URL);
+    setForkRef(GEMMA4_FA4_REF);
+    setForkPrecompiled(true);
+    // No extra deps — the fork declares its own nvidia-cutlass-dsl pin.
+    setVllmInstallArgs(composeForkArgs(GEMMA4_FA4_FORK_URL, GEMMA4_FA4_REF, true));
+    setVllmVersion("");
+    // Install the fork into its OWN venv, never the shared hand-built /share/vllm-venv
+    // (no marker → the worker won't touch it, so the fork would silently never install).
+    setVenvPath(GEMMA4_FA4_VENV);
+    addServeFlagToMembers(GEMMA4_FA4_BACKEND);
+    setPreScript((s) =>
+      s.includes("prometheus-fastapi-instrumentator")
+        ? s
+        : (s.trim() ? s.trimEnd() + "\n" : "") + VLLM_PROM_FIX,
+    );
+  };
   // Optional setup script the worker runs once after the venv is ready and before
   // launching models — e.g. building DeepGEMM. Empty = none.
   const [preScript, setPreScript] = useState("");
@@ -534,7 +608,7 @@ export function InferenceForm() {
             // default version (let the worker run the args verbatim).
             ...(vllmInstallArgs.trim()
               ? { vllm_install_args: vllmInstallArgs.trim() }
-              : { vllm_version: vllmVersion.trim() || "0.19.1" }),
+              : { vllm_version: vllmVersion.trim() || DEFAULT_VLLM_VERSION }),
             ...(preScript.trim() ? { pre_script: preScript } : {}),
           };
       startTransition(async () => applyResult(await deployEndpoint(body)));
@@ -934,14 +1008,14 @@ export function InferenceForm() {
                 label="vLLM version (optional)"
                 hint={
                   isVm
-                    ? "Pin vLLM to this version in the VM's vLLM venv (below) — the worker uv pip installs it if missing. Empty = use whatever's installed."
-                    : "Pin vLLM to this version — installed into the pod's venv on each provision. Empty = 0.19.1."
+                    ? `Pin vLLM to this version in the VM's vLLM venv (below) — the worker uv pip installs it if missing. Default ${DEFAULT_VLLM_VERSION}; empty = use whatever's installed.`
+                    : `Pin vLLM to this version — installed into the pod's venv on each provision. Empty = ${DEFAULT_VLLM_VERSION}.`
                 }
               >
                 <Input
                   value={vllmVersion}
                   onChange={(e) => setVllmVersion(e.target.value)}
-                  placeholder="0.19.1"
+                  placeholder={DEFAULT_VLLM_VERSION}
                   disabled={!!vllmInstallArgs.trim()}
                   className="font-mono text-xs"
                 />
@@ -950,8 +1024,60 @@ export function InferenceForm() {
 
             {(isVm || cloudMulti) && (
               <Field
+                label="Custom vLLM fork (git)"
+                hint="Install a forked vLLM from a git repo (e.g. the Gemma-4 FA4 CUTE fork). Precompiled reuses stock binaries over the fork's Python — fast, no CUDA toolchain; uncheck to build CUDA from source. Applying fills the install args below (which override the version)."
+              >
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={useGemma4Fa4Preset}
+                    className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted"
+                  >
+                    Use Gemma-4 FA4 fork
+                  </button>
+                  <span className="text-[11px] text-muted-foreground">
+                    sets a dedicated venv + {GEMMA4_FA4_BACKEND} + the 0.23.0 prometheus fix
+                  </span>
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Input
+                    value={forkUrl}
+                    onChange={(e) => setForkUrl(e.target.value)}
+                    placeholder="https://github.com/org/vllm-fork"
+                    className="font-mono text-xs sm:flex-1"
+                  />
+                  <Input
+                    value={forkRef}
+                    onChange={(e) => setForkRef(e.target.value)}
+                    placeholder="main"
+                    className="font-mono text-xs sm:w-32"
+                  />
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+                  <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={forkPrecompiled}
+                      onChange={(e) => setForkPrecompiled(e.target.checked)}
+                    />
+                    Use precompiled binaries (uncheck = build CUDA from source)
+                  </label>
+                  <button
+                    type="button"
+                    disabled={!forkUrl.trim()}
+                    onClick={() => applyFork()}
+                    className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted disabled:opacity-40"
+                  >
+                    Apply to install args ↓
+                  </button>
+                </div>
+              </Field>
+            )}
+
+            {(isVm || cloudMulti) && (
+              <Field
                 label="vLLM install args (advanced)"
-                hint="Full `uv pip install` args for vLLM, used verbatim (overrides the version above) — for nightly / custom CUDA builds. The worker runs `uv pip install --python {venv}/bin/python <these args>`."
+                hint="Full `uv pip install` args for vLLM, used verbatim (overrides the version above) — for nightly / custom CUDA / git-fork builds. Leading NAME=VALUE tokens become install env (e.g. VLLM_USE_PRECOMPILED=1). The worker runs `uv pip install --python {venv}/bin/python <these args>`."
               >
                 <div className="flex items-center gap-2">
                   <button
@@ -1017,6 +1143,19 @@ export function InferenceForm() {
                     className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted"
                   >
                     + Install DeepGEMM
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setPreScript((s) =>
+                        s.includes("prometheus-fastapi-instrumentator")
+                          ? s
+                          : (s.trim() ? s.trimEnd() + "\n" : "") + VLLM_PROM_FIX,
+                      )
+                    }
+                    className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted"
+                  >
+                    + Fix vLLM 0.23.0 prometheus
                   </button>
                   <span className="text-[11px] text-muted-foreground">common for high-tier (large-MoE) models</span>
                 </div>

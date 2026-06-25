@@ -61,6 +61,10 @@ class _FwdProc:
 
 
 _FWD_PROCS: dict = {}  # (host, port, vm_host, vm_port) -> _FwdProc
+_REV_PROCS: dict = {}  # (host, port) -> _FwdProc  (the reverse `ssh -R` autossh subprocess)
+# Keyed by (host, port), NOT host: two providers can share a host on different SSH
+# ports (separate containers, e.g. tm :1024 + tm-2 :1023) and each needs its own
+# reverse tunnel into its own container.
 
 
 def _free_local_port() -> int:
@@ -116,6 +120,59 @@ def _ssh_forward_cmd(local_port: int, vm_host: str, vm_port: int,
     return [_SSH, *opts]
 
 
+def _ssh_reverse_cmd(forwards: "tuple[Forward, ...]", host: str, port: int,
+                     user: str, keyfile: str) -> list[str]:
+    """Native-OpenSSH reverse tunnel: bind each `127.0.0.1:vm_port` on the VM and
+    pump it back to the gateway's `local_host:local_port`. Same resilient flags as
+    the forward path — autossh + ServerAlive keepalives + ExitOnForwardFailure, so
+    a flaky bind self-heals instead of the paramiko close/reconnect port-release
+    race that caused the 'TCP forwarding request denied' flapping."""
+    opts = [
+        "-N", "-T",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={CONNECT_TIMEOUT_S}",
+        "-i", keyfile,
+        "-p", str(port),
+    ]
+    for f in forwards:
+        opts += ["-R", f"127.0.0.1:{f.vm_port}:{f.local_host}:{f.local_port}"]
+    opts.append(f"{user}@{host}")
+    if _AUTOSSH:
+        return [_AUTOSSH, "-M", "0", *opts]  # -M 0: no monitor port; rely on ServerAlive*
+    return [_SSH, *opts]
+
+
+def _kill_stale_reverse(host: str, port: int, forwards: "tuple[Forward, ...]") -> None:
+    """Kill a reverse autossh/ssh for `host:port` left over from a PRIOR gateway
+    process. The subprocess is detached (start_new_session) so it survives a gateway
+    restart and would keep the VM port bound → a fresh spawn gets 'forwarding request
+    denied'. Matched by our keyfile marker + the reverse-forward of the gateway port +
+    `-p {port}`, so it does NOT kill a SIBLING provider's tunnel on the same host but a
+    different SSH port (e.g. tm :1024 vs tm-2 :1023)."""
+    if not forwards:
+        return
+    marker = f"-R 127.0.0.1:{forwards[0].vm_port}:"
+    port_marker = f" -p {port} "
+    try:
+        out = subprocess.run(["pgrep", "-af", "sgpu_vmkey"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return
+    import signal
+    for line in out.splitlines():
+        pid_str, _, cmd = line.partition(" ")
+        if host in cmd and marker in cmd and port_marker in cmd:
+            try:
+                os.kill(int(pid_str), signal.SIGKILL)
+                logger.info("vm-tunnel reverse: killed stale autossh pid=%s for %s:%s", pid_str, host, port)
+            except (ProcessLookupError, ValueError, PermissionError):
+                pass
+
+
 def _kill_fwd(fp: "_FwdProc") -> None:
     try:
         fp.proc.terminate()
@@ -130,6 +187,8 @@ def _kill_fwd(fp: "_FwdProc") -> None:
 @atexit.register
 def _cleanup_forwards() -> None:
     for fp in list(_FWD_PROCS.values()):
+        _kill_fwd(fp)
+    for fp in list(_REV_PROCS.values()):
         _kill_fwd(fp)
 
 
@@ -355,25 +414,34 @@ def _monitor(t: _Tunnel) -> None:
 
 def ensure(host: str, port: int, user: str, pkey_pem: str, forwards: list[Forward]) -> None:
     """Idempotent: ensure a live reverse tunnel to `host` with `forwards`. Cheap
-    no-op when already connected. Safe to call every autoscaler tick."""
+    no-op when the autossh subprocess is still alive. Safe to call every autoscaler
+    tick. Native OpenSSH (autossh `ssh -R`), NOT paramiko: OpenSSH does the relay in
+    C, autossh keeps it alive + reconnects on drop, and there's no in-process
+    health-check close/reconnect loop racing the VM's port release (which caused the
+    'TCP forwarding request denied' flapping). Mirrors `ensure_forward`."""
+    fwds = tuple(forwards)
+    key = (host, int(port))
     with _LOCK:
-        t = _TUNNELS.get(host)
-        if t is not None and _healthy(t):
-            return
-        if t is not None and t.client is not None:
-            # Stale/half-dead tunnel — drop it before rebuilding so _connect
-            # starts from a clean slate (and frees the orphaned VM listener).
-            _safe_close(t)
-        if t is None:
-            t = _Tunnel(host=host, port=port, user=user, pkey_pem=pkey_pem, forwards=tuple(forwards))
-            _TUNNELS[host] = t
-        try:
-            _connect(t)
-        except Exception as e:
-            logger.warning("vm-tunnel %s initial connect failed (monitor will retry): %s", host, e)
-        if t.thread is None or not t.thread.is_alive():
-            t.thread = threading.Thread(target=_monitor, args=(t,), daemon=True, name=f"vm-tunnel-{host}")
-            t.thread.start()
+        rp = _REV_PROCS.get(key)
+        if rp is not None and rp.proc.poll() is None:
+            return  # subprocess alive → reverse tunnel is up (autossh self-heals drops)
+        if rp is not None:
+            _kill_fwd(rp)  # ours, but dead/exited → clean up before re-spawning
+        # An autossh from a PRIOR gateway process is detached and still holding the
+        # VM ports → kill it so our fresh `-R` bind isn't denied.
+        _kill_stale_reverse(host, int(port), fwds)
+        keyfile = _keyfile_for(host, pkey_pem)
+        cmd = _ssh_reverse_cmd(fwds, host, port, user, keyfile)
+        env = {**os.environ, "AUTOSSH_GATETIME": "0"}  # keep retrying even if the 1st bind races a release
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, env=env,
+        )
+        _REV_PROCS[key] = _FwdProc(proc=proc, local_port=0, keyfile=keyfile)
+        logger.info(
+            "vm-tunnel reverse (%s) up: %s ← %s", "autossh" if _AUTOSSH else "ssh", host,
+            ", ".join(f"127.0.0.1:{f.vm_port}→{f.local_host}:{f.local_port}" for f in fwds),
+        )
 
 
 def _forward_listener(t: _Tunnel, fwd: LocalForward) -> None:
@@ -465,8 +533,15 @@ def close_forwards(host: str, vm_port: Optional[int] = None) -> None:
 
 def close(host: str) -> None:
     with _LOCK:
+        # _REV_PROCS is keyed by (host, port) — close every tunnel for this host.
+        rev = [(k, v) for k, v in _REV_PROCS.items() if k[0] == host]
+        for k, _ in rev:
+            _REV_PROCS.pop(k, None)
         t = _TUNNELS.pop(host, None)
-    if t is not None:
+    for k, rp in rev:
+        _kill_fwd(rp)
+        logger.info("vm-tunnel reverse closed: %s:%s", k[0], k[1])
+    if t is not None:  # legacy paramiko tunnel (pre-autossh); harmless if unused
         t.stop.set()
         for fwd in t.local_forwards:
             try:
