@@ -130,6 +130,23 @@ const CONTAINER_IMAGE_OPTIONS = [
 ];
 const CUSTOM_IMAGE_SENTINEL = "__custom__";
 
+// Custom vLLM fork (git) — the Gemma-4 FA4 "CUTE" fork (mirrors serverless/new).
+const GEMMA4_FA4_FORK_URL = "https://github.com/Scicom-AI-Enterprise-Organization/vllm-gemma4-fa4-cute";
+const GEMMA4_FA4_REF = "main";
+const GEMMA4_FA4_BACKEND = "--attention-backend FLASH_ATTN_CUTE"; // FA4 CUTE serve flag
+
+// Compose a verbatim `uv pip install` arg string for a git-fork vLLM. A leading
+// `VLLM_USE_PRECOMPILED=1` (the gateway reads leading NAME=VALUE tokens as install
+// env, not pip args) reuses precompiled vLLM binaries — fast, no CUDA build. The
+// gateway forwards this to the VM (pyremote `uv pip install -U …`) or translates
+// it into the RunPod pod's dependencies + env.
+function composeForkArgs(url: string, ref: string, precompiled: boolean): string {
+  const u = url.trim();
+  if (!u) return "";
+  const spec = `git+${u}${ref.trim() ? "@" + ref.trim() : ""}`;
+  return [...(precompiled ? ["VLLM_USE_PRECOMPILED=1"] : []), spec, "--torch-backend=auto"].join(" ");
+}
+
 // CUDA toolkit version → minimum NVIDIA driver version (Linux)
 const CUDA_MIN_DRIVER: Record<string, string> = {
   "11.0": "450.80", "11.1": "455.23", "11.2": "460.27", "11.3": "465.19",
@@ -179,6 +196,9 @@ type FormState = {
   port: string;
   dtype: "auto" | "bfloat16" | "float16" | "float32";
   vllm_version: string;
+  // A full `uv pip install` arg string for vLLM (a git fork or nightly), used
+  // verbatim instead of the version pin. Overrides vllm_version when non-empty.
+  vllm_install_args: string;
   // Cmdline-style flags appended to vLLM. Parsed into snake_case serve: keys
   // at render time. e.g. "--enforce-eager --quantization awq"
   extra_args_raw: string;
@@ -236,6 +256,7 @@ export const DEFAULTS: FormState = {
   port: "",
   dtype: "auto",
   vllm_version: "0.23.0",
+  vllm_install_args: "",
   // Benchmark-default extras: prefix caching off (so cache hits don't skew
   // numbers). --disable-log-requests was removed in vLLM > 0.15 and now
   // causes the server to refuse to start, so it's no longer in the default.
@@ -477,15 +498,22 @@ export function renderYaml(
       ? `  cleanup_model: ${vmExtras.cleanupModel}\n`
       : "";
 
+  // Custom-fork / nightly vLLM: a full install-args string overrides the version.
+  // It rides `remote.uv.vllm_install_args` — the gateway feeds it to the VM
+  // (pyremote `uv pip install -U …`) or translates it into the RunPod pod's deps
+  // + env. When set, drop the `vllm==` pin so the two specs don't fight.
+  const forkArgs = s.vllm_install_args.trim();
+  const uvInstallLine = forkArgs ? `    vllm_install_args: ${JSON.stringify(forkArgs)}\n` : "";
+  const vllmDep = forkArgs ? "" : `    - vllm==${s.vllm_version || "0.23.0"}\n`;
+
   const remoteBlock = target === "cloud"
     ? `remote:
   key_filename: ""
   uv:
     path: ~/.venv
     python_version: "3.11"
-  dependencies:
-    - vllm==${s.vllm_version || "0.23.0"}
-    - huggingface_hub
+${uvInstallLine}  dependencies:
+${vllmDep}    - huggingface_hub
     - hf_transfer
 `
     : `# host/port/username/key_filename are injected by the gateway from
@@ -494,9 +522,8 @@ remote:
 ${vmProviderLine}${vmWorkdirLine}${vmCleanupLine}${vmEnvBlock}  uv:
     path: ~/.benchmark-venv
     python_version: "3.11"
-  dependencies:
-    - vllm==${s.vllm_version || "0.23.0"}
-    - huggingface_hub
+${uvInstallLine}  dependencies:
+${vllmDep}    - huggingface_hub
     - hf_transfer
 `;
 
@@ -636,6 +663,15 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
   if (typeof env.HF_HOME === "string") next.hf_home = env.HF_HOME;
   for (const k of Object.keys(env)) {
     if (k !== "HF_HOME") unknown.push(`runpod.env.${k}`);
+  }
+
+  // ---- remote.uv.vllm_install_args — a fork / custom install string (overrides
+  // the version). Round-trips so a fork survives YAML ↔ Form.
+  const uvBlock = (d.remote as Record<string, unknown> | undefined)?.uv as
+    | Record<string, unknown>
+    | undefined;
+  if (uvBlock && typeof uvBlock.vllm_install_args === "string") {
+    next.vllm_install_args = uvBlock.vllm_install_args.trim();
   }
 
   // ---- remote.dependencies — pick the vllm pin if present.
@@ -1767,7 +1803,55 @@ export function BenchmarkForm({
                   value={form.vllm_version}
                   onChange={(e) => field("vllm_version", e.target.value)}
                   placeholder="0.23.0"
+                  disabled={!!form.vllm_install_args.trim()}
                 />
+              </FieldWrap>
+              <FieldWrap
+                label="Custom fork / install args"
+                hint="A full `uv pip install` arg string — overrides the version. For a git fork or nightly; a leading VLLM_USE_PRECOMPILED=1 installs precompiled binaries. Works on both VM and RunPod targets."
+                wide
+              >
+                <Input
+                  className="font-mono"
+                  value={form.vllm_install_args}
+                  onChange={(e) => field("vllm_install_args", e.target.value)}
+                  placeholder="VLLM_USE_PRECOMPILED=1 git+https://github.com/owner/vllm-fork@ref --torch-backend=auto"
+                />
+              </FieldWrap>
+              <FieldWrap
+                label="Presets"
+                hint="One-click forks — fills the install args above and adds the matching serve flag to Advanced args."
+                wide
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      field("vllm_install_args", composeForkArgs(GEMMA4_FA4_FORK_URL, GEMMA4_FA4_REF, true));
+                      field("vllm_version", "");
+                      if (!form.extra_args_raw.includes("FLASH_ATTN_CUTE")) {
+                        field(
+                          "extra_args_raw",
+                          (form.extra_args_raw.trim() ? form.extra_args_raw.trim() + " " : "") + GEMMA4_FA4_BACKEND,
+                        );
+                      }
+                    }}
+                  >
+                    Gemma-4 FA4 fork
+                  </Button>
+                  {form.vllm_install_args.trim() ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => field("vllm_install_args", "")}
+                    >
+                      Clear fork
+                    </Button>
+                  ) : null}
+                </div>
               </FieldWrap>
             </Grid>
           </SectionCard>

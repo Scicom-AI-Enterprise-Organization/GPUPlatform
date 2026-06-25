@@ -245,9 +245,30 @@ def install() -> None:
             # upgrade) AFTER benchmaq[vllm] installs — for nightlies / custom CUDA
             # builds, e.g. "vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130 ...".
             vllm_install_args = (uv_cfg.get("vllm_install_args") or "").strip()
-            _vllm_extra_install = (
-                f"uv pip install -U {vllm_install_args}\n" if vllm_install_args else ""
-            )
+            if vllm_install_args:
+                # A leading run of NAME=VALUE tokens (e.g. `VLLM_USE_PRECOMPILED=1`,
+                # which a git-fork install needs) is install-time ENV, not pip args —
+                # emit it as a shell prefix so the fork installs precompiled instead
+                # of uv choking on a bogus requirement. The `(?!=)` look-ahead keeps
+                # real pins (`pkg==ver`) and flags out of the env split.
+                import shlex as _ishlex
+                import re as _ire
+                _itoks = _ishlex.split(vllm_install_args)
+                _ienv: dict[str, str] = {}
+                _i = 0
+                for _t in _itoks:
+                    _m = _ire.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(?!=)(.*)$", _t)
+                    if not _m:
+                        break
+                    _ienv[_m.group(1)] = _m.group(2)
+                    _i += 1
+                _iprefix = "".join(f"{_k}={_ishlex.quote(_v)} " for _k, _v in _ienv.items())
+                _ipip = " ".join(_ishlex.quote(_t) for _t in _itoks[_i:])
+                # sentencepiece: fork precompiled wheels skip it, but gemma/llama
+                # tokenizers need it (else "Couldn't instantiate the backend tokenizer").
+                _vllm_extra_install = f"{_iprefix}uv pip install -U {_ipip}\nuv pip install sentencepiece\n"
+            else:
+                _vllm_extra_install = ""
 
             # Accuracy mode: any benchmark item carrying an `accuracy:` block is
             # evaluated by our accuracy_eval.py (shipped + run after benchmaq).

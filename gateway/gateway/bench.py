@@ -423,6 +423,28 @@ def _merge_run_env(
     return env
 
 
+def _split_leading_env(args: str) -> tuple[dict[str, str], list[str]]:
+    """Split a leading run of `NAME=VALUE` tokens (install-time env, e.g.
+    `VLLM_USE_PRECOMPILED=1`) off the front of a `uv pip install` arg string.
+
+    Returns (env, remaining_tokens). Stops at the first token that isn't a bare
+    `NAME=VALUE` assignment — a flag (`--torch-backend=auto`), a VCS spec
+    (`git+https://…`), or a pin (`vllm==0.23.0`, rejected via the `(?!=)`
+    look-ahead). Used so a custom-fork vLLM spec installs with its env applied,
+    not passed to pip as a bogus requirement."""
+    import shlex
+    toks = shlex.split(args or "")
+    env: dict[str, str] = {}
+    i = 0
+    for t in toks:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(?!=)(.*)$", t)
+        if not m:
+            break
+        env[m.group(1)] = m.group(2)
+        i += 1
+    return env, toks[i:]
+
+
 def _resolve_config(
     raw_yaml: str,
     vm_target: Optional[dict] = None,
@@ -459,9 +481,45 @@ def _resolve_config(
             rp["ssh_private_key"] = rp_key
         if not rp.get("runpod_api_key"):
             rp["runpod_api_key"] = os.environ.get("RUNPOD_API_KEY", "")
-        # RunPod path: benchmaq's runner forwards `runpod.env` to the pod (--env).
-        if run_env:
-            rp["env"] = {**(rp.get("env") or {}), **run_env}
+        # Custom-fork vLLM: benchmaq's RunPod runner installs `remote.dependencies`
+        # via `uv pip install` (no `vllm_install_args` hook like the SSH path has).
+        # So translate a `remote.uv.vllm_install_args` spec into that mechanism:
+        # leading NAME=VALUE tokens (e.g. VLLM_USE_PRECOMPILED=1) become pod env so
+        # they're set when uv runs; the rest (git+… spec, --torch-backend=auto, …)
+        # replaces the `vllm==` pin in dependencies. huggingface_hub + hf_transfer
+        # are re-appended so the model still downloads.
+        fork_env: dict[str, str] = {}
+        _uv = cfg.get("remote", {}).get("uv", {}) if isinstance(cfg.get("remote"), dict) else {}
+        _install_args = str(_uv.get("vllm_install_args") or "").strip()
+        if _install_args:
+            fork_env, _fork_tokens = _split_leading_env(_install_args)
+            _rem = cfg.setdefault("remote", {})
+            if _fork_tokens:
+                # sentencepiece: fork precompiled wheels skip it, but gemma/llama
+                # tokenizers need it (else "Couldn't instantiate the backend tokenizer").
+                _rem["dependencies"] = [*_fork_tokens, "sentencepiece", "huggingface_hub", "hf_transfer"]
+            _rem.get("uv", {}).pop("vllm_install_args", None)  # consumed; not read by the runpod runner
+            logger.info("bench: RunPod fork install — deps=%s env=%s", _fork_tokens, list(fork_env))
+        # RunPod path: benchmaq forwards `runpod.env` into the pod (--env) — and the
+        # pod's boot script has it in scope when it installs the injected SSH key
+        # into `$HOME/.ssh/authorized_keys`. HOME is therefore poison here: a HOME
+        # override (e.g. /share/home) lands the key off /root, sshd (which reads
+        # /root/.ssh) never sees it, and the pod stays "SSH not ready" until the
+        # wait ceiling — burning credits, never running. Strip HOME from the *pod*
+        # env; runtime cache redirects (XDG_CACHE_HOME / HF_HOME / VLLM_CACHE_ROOT /
+        # …) are read by the benchmark process, not the boot script, so they stay.
+        # The VM path (below) keeps HOME — its sshd auth is already established.
+        pod_env = {**(rp.get("env") or {}), **run_env, **fork_env}
+        dropped_home = pod_env.pop("HOME", None)
+        if dropped_home is not None:
+            logger.warning(
+                "bench: dropped HOME=%r from RunPod pod env — it breaks the pod's "
+                "boot-time SSH-key install (key would land off /root); caches still "
+                "honour XDG_CACHE_HOME/HF_HOME/etc.",
+                dropped_home,
+            )
+        if pod_env:
+            rp["env"] = pod_env
 
         rem = cfg.setdefault("remote", {})
         if not rem.get("key_filename") or "path/to/your" in str(rem.get("key_filename")):
@@ -1180,6 +1238,23 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     # Force unbuffered stdout/stderr — without this, benchmaq's print()s sit
     # in the pipe buffer and the UI sees nothing until the run finishes.
     env["PYTHONUNBUFFERED"] = "1"
+
+    # Custom-fork installs need their leading env (e.g. VLLM_USE_PRECOMPILED=1) ON
+    # the `uv pip install` command. The RunPod path installs via benchmaq→pyremote,
+    # whose non-login `bash -c` SSH session does NOT inherit the pod `--env` — so the
+    # fork would silently build from source (very slow). Pass the install env to our
+    # patched pyremote `_install_dependencies` via SGPU_PIP_ENV. (The VM path applies
+    # this itself in pyremote_shim and doesn't use pyremote's installer, so no-op there.)
+    try:
+        _cfg0 = yaml.safe_load(raw_yaml) or {}
+        _ia = str((((_cfg0.get("remote") or {}).get("uv") or {}).get("vllm_install_args")) or "").strip()
+        if _ia:
+            _ienv, _ = _split_leading_env(_ia)
+            if _ienv:
+                env["SGPU_PIP_ENV"] = "".join(f"{k}={v} " for k, v in _ienv.items())
+                await _push_log(redis, bench_id, f"[gateway] fork install env: {' '.join(_ienv)}")
+    except Exception:
+        pass
 
     await _push_log(redis, bench_id, f"[gateway] benchmaq binary: {benchmaq_bin}")
 
