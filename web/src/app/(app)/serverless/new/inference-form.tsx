@@ -150,14 +150,29 @@ const DEFAULT_VLLM_VERSION = "0.23.0";
 const GEMMA4_FA4_FORK_URL = "https://github.com/Scicom-AI-Enterprise-Organization/vllm-gemma4-fa4-cute";
 const GEMMA4_FA4_REF = "main";
 const GEMMA4_FA4_BACKEND = "--attention-backend FLASH_ATTN_CUTE"; // activates the FA4 CUTE backend
-// NOTE: the fork pins its own `nvidia-cutlass-dsl` (==4.5.2) as a dependency, so we do
-// NOT add a cutlass requirement here — pinning a different version makes uv unsatisfiable.
+// The FA4 CUTE backend REQUIRES the flash-attention-512 "cute" fork (it provides
+// `flash_attn.cute`, which the vLLM fork imports). Installed in the pre-launch
+// step below (the vLLM fork's own deps don't include it).
+const GEMMA4_FA4_FLASH_ATTN_URL = "https://github.com/Scicom-AI-Enterprise-Organization/flash-attention-512";
 // The fork must live in its OWN venv — NOT the shared /share/vllm-venv (hand-built,
 // no .sgpu_vllm_spec marker → the worker refuses to touch it, so the fork would never install).
 const GEMMA4_FA4_VENV = "/share/vllm-gemma4-fa4-venv";
 // vLLM 0.23.0 ships a prometheus-fastapi-instrumentator that 500s every route
 // (incl. /health) → the worker never goes healthy. Pin the fixed release.
 const VLLM_PROM_FIX = 'uv pip install -U "prometheus-fastapi-instrumentator>=7"';
+// Pre-launch script for the Gemma-4 FA4 fork, run by the worker once in the fork
+// venv (GEMMA4_FA4_VENV) after vLLM is installed and before serving:
+//   1. install the flash-attention-512 cute fork (provides flash_attn.cute), then
+//   2. PIN nvidia-cutlass-dsl==4.4.2 + quack-kernels==0.3.10 — the fork's CLAUDE.md
+//      says cutlass-dsl 4.5.x breaks FA4 ("nvvm has no attribute vote_ballot_sync"),
+//      so force the known-good combo AFTER any install that pulled a newer one, then
+//   3. the vLLM 0.23.0 prometheus fix. (Adjust the cutlass [cuXX] extra if the box
+//      isn't CUDA 13.)
+const GEMMA4_FA4_PRESCRIPT = [
+  `uv pip install "git+${GEMMA4_FA4_FLASH_ATTN_URL}.git@main#subdirectory=flash_attn/cute"`,
+  'uv pip install "nvidia-cutlass-dsl==4.4.2" "quack-kernels==0.3.10"',
+  VLLM_PROM_FIX,
+].join("\n");
 
 // Compose a verbatim `uv pip install` arg string for a git-fork vLLM. A leading
 // `VLLM_USE_PRECOMPILED=1` (the worker reads leading NAME=VALUE tokens as install
@@ -267,13 +282,16 @@ export function InferenceForm() {
     setVllmInstallArgs(args);
     setVllmVersion("");
   };
-  // One-click: the Gemma-4 FA4 CUTE fork — git install (precompiled) + cutlass-dsl,
-  // the FA4 serve flag on every member, and the vLLM 0.23.0 prometheus fix in pre-launch.
+  // One-click: the Gemma-4 FA4 CUTE fork — git install (precompiled) of the vLLM
+  // fork, the FA4 serve flag on every member, and a pre-launch script that installs
+  // the REQUIRED flash-attention-512 cute fork + pins cutlass-dsl/quack to the
+  // FA4-compatible combo (+ the vLLM 0.23.0 prometheus fix).
   const useGemma4Fa4Preset = () => {
     setForkUrl(GEMMA4_FA4_FORK_URL);
     setForkRef(GEMMA4_FA4_REF);
     setForkPrecompiled(true);
-    // No extra deps — the fork declares its own nvidia-cutlass-dsl pin.
+    // No extra deps in the vLLM install itself — the flash-attn fork + the cutlass/
+    // quack pins are applied in the pre-launch script (which runs last, so its pins win).
     setVllmInstallArgs(composeForkArgs(GEMMA4_FA4_FORK_URL, GEMMA4_FA4_REF, true));
     setVllmVersion("");
     // Install the fork into its OWN venv, never the shared hand-built /share/vllm-venv
@@ -281,9 +299,9 @@ export function InferenceForm() {
     setVenvPath(GEMMA4_FA4_VENV);
     addServeFlagToMembers(GEMMA4_FA4_BACKEND);
     setPreScript((s) =>
-      s.includes("prometheus-fastapi-instrumentator")
+      s.includes("flash-attention-512")
         ? s
-        : (s.trim() ? s.trimEnd() + "\n" : "") + VLLM_PROM_FIX,
+        : (s.trim() ? s.trimEnd() + "\n" : "") + GEMMA4_FA4_PRESCRIPT,
     );
   };
   // Optional setup script the worker runs once after the venv is ready and before

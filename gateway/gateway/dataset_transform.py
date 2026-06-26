@@ -84,7 +84,7 @@ async def start_transform(
 async def start_llm_pack(
     dataset_id: str,
     *,
-    subset: Optional[str],
+    subsets: Optional[list[str]],
     tokenizer: str,
     sequence_length: int,
     storage_id: str,
@@ -93,18 +93,20 @@ async def start_llm_pack(
 ) -> None:
     """Mark the dataset running and kick off the in-process chat→multipack job
     (kind=llm → kind=llm_packed ChiniDataset on S3). CPU-only tokenization, so it
-    runs here (no GPU box) — the threadpool steps stay off the event loop."""
+    runs here (no GPU box) — the threadpool steps stay off the event loop.
+    `subsets` may name several subset/split labels — their rows are concatenated
+    into one packed dataset; None/empty packs the first split."""
     async with session_factory()() as s:
         d = await s.get(Dataset, dataset_id)
         if d is None:
             return
         d.transform_status = "running"
         d.transform_log = _append_log(
-            None, f"LLM pack queued · subset={subset or '(first)'} · tokenizer={tokenizer} "
-                  f"· seq_len {sequence_length}")
+            None, f"LLM pack queued · subsets={', '.join(subsets) if subsets else '(first)'} "
+                  f"· tokenizer={tokenizer} · seq_len {sequence_length}")
         await s.commit()
     task = asyncio.create_task(_run_llm_pack(
-        dataset_id, subset=subset, tokenizer=tokenizer, sequence_length=sequence_length,
+        dataset_id, subsets=subsets, tokenizer=tokenizer, sequence_length=sequence_length,
         storage_id=storage_id, tools_field=tools_field, all_reasoning=all_reasoning,
     ))
     _active[dataset_id] = task
@@ -322,6 +324,155 @@ async def _run(
             shutil.rmtree(work, ignore_errors=True)
 
 
+# ---------------- merge label datasets → one combined audio dataset ----------
+
+
+async def start_merge(
+    output_id: str,
+    *,
+    source_ids: list[str],
+    target: str,
+    hf_repo: Optional[str],
+    storage_id: Optional[str],
+    s3_folder: Optional[str] = None,
+) -> None:
+    """Mark the (already-created) merged OUTPUT dataset running and kick off the
+    background merge: export + download each source label project's audio and
+    write ONE combined audio dataset (HF or S3). Status/log live on the OUTPUT
+    dataset (poll GET /{output_id})."""
+    async with session_factory()() as s:
+        d = await s.get(Dataset, output_id)
+        if d is None:
+            return
+        d.transform_status = "running"
+        d.transform_log = _append_log(
+            None, f"merge queued · {len(source_ids)} label source(s) → {target}")
+        await s.commit()
+    task = asyncio.create_task(_run_merge(
+        output_id, source_ids=source_ids, target=target, hf_repo=hf_repo,
+        storage_id=storage_id, s3_folder=s3_folder,
+    ))
+    _active[output_id] = task
+    task.add_done_callback(lambda _t: _active.pop(output_id, None))
+
+
+async def _run_merge(
+    output_id: str,
+    *,
+    source_ids: list[str],
+    target: str,
+    hf_repo: Optional[str],
+    storage_id: Optional[str],
+    s3_folder: Optional[str],
+) -> None:
+    """Concatenate several kind=label datasets into one audio dataset. Each source
+    is exported + its clips downloaded into its own scratch subdir (per-source
+    filename prefix → unique S3 basenames), then all pairs are concatenated and
+    written once via the SAME HF/S3 writers the single-source transform uses."""
+    from fastapi.concurrency import run_in_threadpool
+    from sqlalchemy import select
+
+    from .datasets_api import _hf_endpoint, _hf_token, _label_token, _s3_target_and_prefix
+
+    work = _work_dir(output_id) + "-merge"
+    success = False
+    progress = _make_progress(output_id, asyncio.get_running_loop())
+    try:
+        if os.path.isdir(work):
+            shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+
+        # Resolve output storage + HF token, and each source's label config.
+        async with session_factory()() as s:
+            out = await s.get(Dataset, output_id)
+            if out is None:
+                return
+            transcription_field = out.transcription_field or "transcription"
+            hf_store = (
+                await s.execute(select(Storage).where(Storage.kind == "huggingface").limit(1))
+            ).scalars().first()
+            token = await _hf_token(hf_store, s)
+            _hf_endpoint_unused = await _hf_endpoint(hf_store, s)  # noqa: F841 — parity with _run
+            out_storage = await s.get(Storage, storage_id) if (target == "s3" and storage_id) else None
+            s3_target, s3_prefix = (_s3_target_and_prefix(out_storage) if out_storage else (None, ""))
+            sources: list[dict] = []
+            for sid in source_ids:
+                sd = await s.get(Dataset, sid)
+                if sd is None:
+                    await _finish(output_id, "failed", f"source dataset {sid} not found")
+                    return
+                if sd.kind != "label":
+                    await _finish(output_id, "failed",
+                                  f"source {sid} is kind={sd.kind}; merge supports kind=label sources only")
+                    return
+                sources.append({
+                    "id": sid, "name": sd.name,
+                    "base_url": sd.label_base_url, "project_id": sd.label_project_id,
+                    "status": sd.label_status or "approved",
+                    "token": await _label_token(sd, s),
+                })
+
+        if target == "hf" and not (hf_repo and "/" in hf_repo):
+            await _finish(output_id, "failed", "target HF repo must be owner/name")
+            return
+        if target == "s3" and out_storage is None:
+            await _finish(output_id, "failed", "pick an S3 storage for the S3 target")
+            return
+
+        all_pairs: list[tuple[str, str, str, dict]] = []
+        for idx, src in enumerate(sources):
+            if not (src["base_url"] and src["project_id"] and src["token"]):
+                await _finish(output_id, "failed",
+                              f"source '{src['name']}' is not a fully-configured label dataset "
+                              f"(base URL, project, token)")
+                return
+            await _log(output_id,
+                       f"[{idx + 1}/{len(sources)}] exporting '{src['name']}' "
+                       f"(project {src['project_id']}, status={src['status']}) …")
+            sub = os.path.join(work, f"src-{idx}")
+            pairs = await run_in_threadpool(
+                _label_pairs, src["base_url"], src["project_id"], src["token"],
+                src["status"], sub, f"s{idx}-",
+            )
+            await _log(output_id, f"  ↳ {len(pairs)} clip(s) from '{src['name']}'")
+            all_pairs.extend(pairs)
+
+        if not all_pairs:
+            await _finish(output_id, "failed",
+                          "no tasks with downloadable audio across the selected sources "
+                          "(check each project's status filter / token)")
+            return
+        await _log(output_id,
+                   f"merged {len(all_pairs)} rows from {len(sources)} sources; building output …")
+
+        if target == "hf":
+            await run_in_threadpool(_push_hf, all_pairs, transcription_field, hf_repo, token)
+            await _finish(
+                output_id, "done",
+                f"pushed → {hf_repo} ({len(all_pairs)} rows from {len(sources)} sources)",
+                hf_repo=hf_repo, num_rows=len(all_pairs))
+            success = True
+        else:
+            uri = await run_in_threadpool(
+                _materialise_s3, all_pairs, transcription_field, s3_target, s3_prefix,
+                output_id, s3_folder, progress,
+            )
+            await _finish(
+                output_id, "done",
+                f"materialised → {uri} ({len(all_pairs)} rows from {len(sources)} sources)",
+                s3_metadata_uri=uri, num_rows=len(all_pairs))
+            success = True
+    except ModuleNotFoundError as e:
+        await _finish(output_id, "failed",
+                      f"missing dependency: {e}. Install datasets + soundfile in the gateway.")
+    except Exception as e:  # noqa: BLE001
+        await _finish(output_id, "failed", f"merge failed: {e}")
+        logger.exception("merge %s failed", output_id)
+    finally:
+        if work and success:
+            shutil.rmtree(work, ignore_errors=True)
+
+
 # ---------------- LLM chat → multipack (kind=llm → kind=llm_packed) ----------
 
 
@@ -409,7 +560,7 @@ def _upload_chinidataset_dir(out_dir: str, target, key_prefix: str,
 async def _run_llm_pack(
     dataset_id: str,
     *,
-    subset: Optional[str],
+    subsets: Optional[list[str]],
     tokenizer: str,
     sequence_length: int,
     storage_id: str,
@@ -461,18 +612,30 @@ async def _run_llm_pack(
             return
         target, base_prefix = _s3_target_and_prefix(out_storage)
 
-        # 1. Resolve the chosen subset → (config, split) + list its parquet files.
-        await _log(dataset_id, f"resolving subset {subset or '(first)'} on {src_repo} …")
-        config, split, label = await run_in_threadpool(
-            _resolve_hf_subset, src_repo, token, subset, src_revision)
-        urls = await run_in_threadpool(
-            _hf_parquet_files, src_repo, token, config, split, src_revision)
-        if not urls:
-            await _finish(dataset_id, "failed",
-                          f"no parquet files for subset '{label}' (config={config}, split={split}) "
-                          f"on the HF datasets-server")
-            return
-        await _log(dataset_id, f"subset '{label}' → config={config} split={split}; {len(urls)} parquet file(s)")
+        # 1. Resolve each chosen subset → (config, split) + its parquet files. Several
+        #    subsets are concatenated into one packed dataset (one combined URL list,
+        #    so the download step indexes filenames globally → no collisions).
+        want = subsets or [None]
+        labels: list[str] = []
+        urls: list[str] = []
+        for sub in want:
+            await _log(dataset_id, f"resolving subset {sub or '(first)'} on {src_repo} …")
+            config, split, label = await run_in_threadpool(
+                _resolve_hf_subset, src_repo, token, sub, src_revision)
+            sub_urls = await run_in_threadpool(
+                _hf_parquet_files, src_repo, token, config, split, src_revision)
+            if not sub_urls:
+                await _finish(dataset_id, "failed",
+                              f"no parquet files for subset '{label}' (config={config}, split={split}) "
+                              f"on the HF datasets-server")
+                return
+            labels.append(label)
+            urls.extend(sub_urls)
+            await _log(dataset_id,
+                       f"subset '{label}' → config={config} split={split}; {len(sub_urls)} parquet file(s)")
+        label = ", ".join(labels)
+        if len(labels) > 1:
+            await _log(dataset_id, f"{len(labels)} subsets [{label}] → {len(urls)} parquet file(s) total")
 
         # 2. Download the parquet shards (auth via the HF token).
         await _log(dataset_id, "downloading source parquet …")
@@ -678,11 +841,16 @@ def _label_pairs(
     token: str,
     status: str,
     work: str,
+    name_prefix: str = "",
 ) -> list[tuple[str, str, str, dict]]:
     """Stream a labeling-platform project export (export.v1.jsonl) and download
     each task's audio into `work/audio`. Returns [(split, abs_audio_path,
     transcription, extra)] — the same shape `_build_pairs` produces for HF
     sources (extra is empty here), so the HF/S3 target writers are reused.
+
+    `name_prefix` is prepended to each downloaded filename — used by the merge
+    job to keep basenames unique ACROSS projects (S3 keys collide on basename;
+    two projects can each have a `task-5.wav`). Empty for the single-project path.
 
     Audio resolution mirrors the gateway's label-audio proxy: tasks whose
     `audio_url` lives under the platform (or that only expose a task id) are
@@ -708,25 +876,38 @@ def _label_pairs(
         for i, r in enumerate(rows):
             u = str(r.get("audio_url") or "").strip()
             tid = r.get("id")
-            # Decide download URL + whether to attach the platform token.
-            if (not u or u.startswith(base)) and tid is not None:
-                dl_url = f"{base}/api/projects/{project_id}/tasks/{tid}/audio"
-                headers = {"Authorization": f"Bearer {token}"}
-            elif u:
-                dl_url, headers = u, {}
-            else:
+            # Candidate download URLs, in priority order. A presigned off-platform
+            # `audio_url` is fastest (no platform load); but some storage configs
+            # presign an S3 endpoint we can't resolve (e.g. a non-routable region
+            # host), so fall back to the platform's authenticated task-audio
+            # endpoint whenever there's a task id.
+            candidates: list[tuple[str, dict]] = []
+            if u and not u.startswith(base):
+                candidates.append((u, {}))                       # direct presigned
+            if tid is not None:
+                candidates.append((f"{base}/api/projects/{project_id}/tasks/{tid}/audio",
+                                   {"Authorization": f"Bearer {token}"}))
+            elif u and u.startswith(base):
+                candidates.append((u, {"Authorization": f"Bearer {token}"}))  # on-platform; needs token
+            if not candidates:
                 continue
-            try:
-                resp = cli.get(dl_url, headers=headers)
-                resp.raise_for_status()
-            except Exception:  # noqa: BLE001 — skip the task, keep going
+            resp = None
+            for dl_url, dl_headers in candidates:
+                try:
+                    rr = cli.get(dl_url, headers=dl_headers)
+                    rr.raise_for_status()
+                    resp = rr
+                    break
+                except Exception:  # noqa: BLE001 — try the next candidate
+                    continue
+            if resp is None:
                 logger.warning("label audio download failed (task=%s)", tid)
                 continue
             # Pick an extension: URL basename, else the response content-type.
             ext = _os.path.splitext(unquote(_os.path.basename(urlparse(u).path)))[1].lower()
             if ext not in _AUDIO_EXTS:
                 ext = _CT_EXT.get((resp.headers.get("content-type") or "").split(";")[0].strip().lower(), ".wav")
-            name = f"task-{tid}{ext}" if tid is not None else f"row-{i}{ext}"
+            name = f"{name_prefix}task-{tid}{ext}" if tid is not None else f"{name_prefix}row-{i}{ext}"
             dest = audio_dir / name
             dest.write_bytes(resp.content)
             text = r.get("transcription")

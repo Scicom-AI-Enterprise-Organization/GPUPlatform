@@ -3,10 +3,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Loader2, Package, X } from "lucide-react";
+import { ArrowRight, ChevronDown, Loader2, Package, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -47,17 +53,20 @@ export function LlmPackCard({
   s3Storages,
   initialStatus,
   initialLog,
+  initialSplit,
 }: {
   datasetId: string;
   messagesField: string;
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
+  initialSplit?: string | null;
 }) {
   const router = useRouter();
   const [splits, setSplits] = useState<SplitInfo[] | null>(null);
   const [loadingSplits, setLoadingSplits] = useState(false);
-  const [subset, setSubset] = useState<string>("");
+  // Multiselect: pack one or several subsets/splits together (rows concatenated).
+  const [subsets, setSubsets] = useState<string[]>([]);
   const [tokenizer, setTokenizer] = useState(DEFAULT_TOKENIZER);
   const [seqLen, setSeqLen] = useState(DEFAULT_SEQ_LEN);
   const [storageId, setStorageId] = useState(s3Storages[0]?.id ?? "");
@@ -87,13 +96,25 @@ export function LlmPackCard({
       const data = (await r.json()) as { splits?: SplitInfo[] };
       const info = data.splits ?? [];
       setSplits(info);
-      setSubset((cur) => cur || info[0]?.split || "");
+      // Seed the selection: prefer the split(s) carried in the URL (the row browser
+      // uses a comma-joined `split` param), else fall back to the first split. Keep
+      // the picks in the dataset's split order for a stable concat order.
+      setSubsets((cur) => {
+        if (cur.length) return cur;
+        const avail = info.map((s) => s.split);
+        const want = (initialSplit ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s && avail.includes(s));
+        const seeded = want.length ? avail.filter((s) => want.includes(s)) : avail.slice(0, 1);
+        return seeded;
+      });
     } catch {
       setSplits([]);
     } finally {
       setLoadingSplits(false);
     }
-  }, [datasetId]);
+  }, [datasetId, initialSplit]);
 
   useEffect(() => {
     void loadSplits();
@@ -140,12 +161,16 @@ export function LlmPackCard({
       setErr("Sequence length must be a positive integer.");
       return;
     }
+    if (splits && splits.length && !subsets.length) {
+      setErr("Pick at least one subset / split to pack.");
+      return;
+    }
     setStarting(true);
     try {
       const d = await gateway.packLlmDataset(datasetId, {
         storage_id: storageId,
         tokenizer: tokenizer.trim(),
-        subset: subset || null,
+        subsets: subsets.length ? subsets : null,
         sequence_length: seqLen,
         tools_field: toolsField.trim() || null,
         all_reasoning: allReasoning,
@@ -199,27 +224,55 @@ export function LlmPackCard({
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="space-y-1">
               <Label className="text-xs">Subset / split</Label>
-              <Select value={subset} onValueChange={setSubset} disabled={running || loadingSplits}>
-                <SelectTrigger className="text-xs">
-                  <SelectValue
-                    placeholder={
-                      loadingSplits
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    disabled={running || loadingSplits || !(splits && splits.length)}
+                    className="h-9 w-full justify-between px-3 text-xs font-normal"
+                  >
+                    <span className="truncate">
+                      {loadingSplits
                         ? "Loading subsets…"
-                        : splits && splits.length
-                          ? "Pick a subset"
-                          : "No subsets found"
-                    }
-                  />
-                </SelectTrigger>
-                <SelectContent>
+                        : !(splits && splits.length)
+                          ? "No subsets found"
+                          : subsets.length === 0
+                            ? "Pick subset(s)"
+                            : subsets.length === 1
+                              ? subsets[0]
+                              : `${subsets.length} subsets`}
+                    </span>
+                    <ChevronDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-60" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="max-h-72 overflow-y-auto">
                   {(splits ?? []).map((s) => (
-                    <SelectItem key={s.split} value={s.split}>
+                    <DropdownMenuCheckboxItem
+                      key={s.split}
+                      checked={subsets.includes(s.split)}
+                      // keep the menu open so several subsets can be ticked in one go
+                      onSelect={(e) => e.preventDefault()}
+                      onCheckedChange={(c) => {
+                        setSubsets((prev) => {
+                          const next = c ? [...prev, s.split] : prev.filter((x) => x !== s.split);
+                          // keep the dataset's split order (stable concat order)
+                          const order = (splits ?? []).map((x) => x.split);
+                          return order.filter((x) => next.includes(x));
+                        });
+                      }}
+                      className="text-xs"
+                    >
                       {s.split}
                       {typeof s.num_rows === "number" ? ` · ${s.num_rows} rows` : ""}
-                    </SelectItem>
+                    </DropdownMenuCheckboxItem>
                   ))}
-                </SelectContent>
-              </Select>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              {subsets.length > 1 && (
+                <p className="text-[11px] text-muted-foreground">
+                  {subsets.length} subsets → concatenated into one packed dataset.
+                </p>
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="lp-seq" className="text-xs">Sequence length (tokens)</Label>

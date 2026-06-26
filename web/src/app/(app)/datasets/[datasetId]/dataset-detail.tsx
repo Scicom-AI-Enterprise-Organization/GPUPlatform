@@ -237,6 +237,7 @@ export function DatasetDetail({
                 s3Storages={s3Storages}
                 initialStatus={dataset.transform_status ?? null}
                 initialLog={dataset.transform_log ?? null}
+                initialSplit={initialSplit}
               />
             </TabsContent>
           )}

@@ -22,6 +22,7 @@ export function TransformationCard({
   s3Storages,
   initialStatus,
   initialLog,
+  initialSplit,
 }: {
   datasetId: string;
   kind: DatasetKind;
@@ -30,6 +31,7 @@ export function TransformationCard({
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
+  initialSplit?: string | null;
 }) {
   // A chat dataset = kind=llm, OR a kind=hf dataset with a messages column mapped
   // (a chat dataset registered as plain hf — that's what shows a chat preview).
@@ -43,6 +45,7 @@ export function TransformationCard({
         s3Storages={s3Storages}
         initialStatus={initialStatus}
         initialLog={initialLog}
+        initialSplit={initialSplit}
       />
     );
   }

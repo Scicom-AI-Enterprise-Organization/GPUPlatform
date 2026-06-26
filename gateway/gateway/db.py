@@ -691,6 +691,41 @@ async def init_db() -> None:
         _lock_ms = int(os.environ.get("DB_MIGRATION_LOCK_TIMEOUT_MS", "150000") or "150000")
         await conn.execute(text(f"SET LOCAL lock_timeout = {_lock_ms}"))
         await conn.run_sync(Base.metadata.create_all)
+        # ── Steady-state fast-path ──────────────────────────────────────────
+        # The `ADD COLUMN IF NOT EXISTS` statements below still take an ACCESS
+        # EXCLUSIVE lock on each table EVEN when the column already exists (the
+        # lock is grabbed before the existence check). During a rolling deploy the
+        # previous pod is still live and constantly reading the hot tables
+        # (apps/benchmarks/requests), so those no-op locks queue behind its traffic
+        # and the new pod wedges right here — the "stuck initializing postgres"
+        # failure the connect_args above try to bound (they only help a *dead idle*
+        # holder; a live old pod never self-clears). So once the DB already has
+        # every column our models declare, skip the whole idempotent block: the
+        # inspection below hits only the system catalogs (no table locks).
+        # create_all already added any missing TABLES, and the concurrent-index
+        # block at the end is a catalog-only no-op once built. The first boot after
+        # a new column is added still runs the block (once) to apply it.
+        # NOTE: an index-only migration (a new index with no new column) won't be
+        # picked up by this column check — add such migrations above create_all or
+        # extend this guard.
+        def _schema_has_all_model_columns(sync_conn) -> bool:
+            from sqlalchemy import inspect as _sa_inspect
+            insp = _sa_inspect(sync_conn)
+            tables = set(insp.get_table_names())
+            for tbl in Base.metadata.tables.values():
+                if tbl.name not in tables:
+                    return False
+                have = {c["name"] for c in insp.get_columns(tbl.name)}
+                if any(col.name not in have for col in tbl.columns):
+                    return False
+            return True
+
+        if await conn.run_sync(_schema_has_all_model_columns):
+            import logging as _logging
+            _logging.getLogger("gateway.db").info(
+                "schema already current — skipping idempotent migrations (no table locks)"
+            )
+            return
         # Idempotent column adds for in-place upgrades — Base.metadata.create_all
         # only creates missing tables, not missing columns on existing ones.
         await conn.execute(text(

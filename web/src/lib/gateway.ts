@@ -42,6 +42,7 @@ import type {
   TtsPackRequest,
   OmnivoicePackRequest,
   LlmPackRequest,
+  DatasetMergeRequest,
   DatasetRecord,
   DatasetPreview,
   DatasetFile,
@@ -927,6 +928,13 @@ export const gateway = {
   // getDataset(id).transform_status / transform_log.
   packLlmDataset: (id: string, body: LlmPackRequest) =>
     request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/pack-llm`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // Concatenate >=2 kind=label datasets into one combined audio dataset.
+  // Returns the NEW dataset (transform_status=running) — poll getDataset(id).
+  mergeDatasets: (body: DatasetMergeRequest) =>
+    request<DatasetRecord>("/v1/datasets/merge", {
       method: "POST",
       body: JSON.stringify(body),
     }),

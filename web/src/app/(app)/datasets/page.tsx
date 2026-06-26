@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Inbox, Plus } from "lucide-react";
+import { GitMerge, Inbox, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
@@ -110,12 +110,20 @@ export default async function DatasetsPage({
                   {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
-              <Button asChild size="sm">
-                <Link href="/datasets/new">
-                  <Plus className="h-4 w-4" />
-                  New dataset
-                </Link>
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button asChild size="sm" variant="outline">
+                  <Link href="/datasets/merge">
+                    <GitMerge className="h-4 w-4" />
+                    Merge label datasets
+                  </Link>
+                </Button>
+                <Button asChild size="sm">
+                  <Link href="/datasets/new">
+                    <Plus className="h-4 w-4" />
+                    New dataset
+                  </Link>
+                </Button>
+              </div>
             </div>
 
             {items.length === 0 ? (

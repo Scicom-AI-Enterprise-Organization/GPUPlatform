@@ -906,10 +906,23 @@ export type OmnivoicePackRequest = {
 export type LlmPackRequest = {
   storage_id: string; // kind=s3 storage for the packed shards
   tokenizer: string; // HF tokenizer (chat template), e.g. google/gemma-4-31B-it
-  subset?: string | null; // which subset/split to pack (null → first)
+  subset?: string | null; // single subset/split to pack (null → first); legacy/fallback
+  subsets?: string[] | null; // multiple subset/split labels packed together (rows concatenated); takes precedence over subset
   sequence_length?: number; // multipack bin length (tokens); longer convs dropped
   tools_field?: string | null; // source tool/function column (blank → no tools)
   all_reasoning?: boolean; // render every assistant turn's reasoning (gemma-4/MiniMax-M2 templates; no-op otherwise)
+};
+
+// Concatenate >=2 kind=label datasets into one combined audio dataset (HF or
+// S3). Mirrors the gateway DatasetMergeRequest. Background job: the response is
+// the new dataset (transform_status=running) — poll getDataset(id).
+export type DatasetMergeRequest = {
+  source_ids: string[]; // >= 2 kind=label dataset ids
+  target: "hf" | "s3";
+  hf_repo?: string | null; // owner/name (target=hf)
+  storage_id?: string | null; // kind=s3 storage (target=s3)
+  s3_folder?: string | null; // blank → datasets/{new_id}/transformed
+  name?: string | null; // output dataset name (blank → auto)
 };
 
 // Org-wide env var / secret (admin-managed). Mirrors gateway GlobalEnvRecord.

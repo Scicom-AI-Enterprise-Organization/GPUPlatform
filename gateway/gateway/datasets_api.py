@@ -167,7 +167,11 @@ class LlmPackRequest(BaseModel):
     gateway (no GPU box). The user picks the subset + tokenizer."""
     storage_id: str                        # kind=s3 storage for the packed shards
     tokenizer: str                         # HF tokenizer (chat template), e.g. google/gemma-4-31B-it
-    subset: Optional[str] = None           # which subset/split label to pack (None → first)
+    subset: Optional[str] = None           # single subset/split label to pack (None → first); legacy/fallback
+    # Multiple subset/split labels packed together into ONE ChiniDataset (their rows
+    # concatenated in selection order). Takes precedence over `subset`; None/empty →
+    # fall back to `subset` (or the first split).
+    subsets: Optional[list[str]] = None
     sequence_length: int = 32768           # multipack bin length (tokens); convs longer are dropped
     # Source column of OpenAI-style tool/function declarations rendered as tools=
     # into the chat template. Blank/None → no tools. Default "functions".
@@ -176,6 +180,19 @@ class LlmPackRequest(BaseModel):
     # message (gemma-4, MiniMax-M2, …): render EVERY assistant turn's reasoning.
     # No-op on templates without that guard. See llm_pack.build_chat_template.
     all_reasoning: bool = True
+
+
+class DatasetMergeRequest(BaseModel):
+    """Concatenate several existing kind=label datasets into ONE combined audio
+    dataset (their clips downloaded + paired with transcription, then written to
+    HF or S3 — the SAME output a single-project transform produces). The merge
+    runs as an in-process background job; status/log live on the NEW dataset."""
+    source_ids: list[str]                  # >= 2 kind=label datasets to concatenate
+    target: str = "s3"                     # "hf" | "s3"
+    hf_repo: Optional[str] = None          # owner/name (target=hf)
+    storage_id: Optional[str] = None       # kind=s3 storage (target=s3)
+    s3_folder: Optional[str] = None        # blank → datasets/{new_id}/transformed
+    name: Optional[str] = None             # output dataset name (blank → auto)
 
 
 class DatasetRecord(BaseModel):
@@ -1699,11 +1716,14 @@ async def preview_dataset(
 
             def _label_audio(r: dict) -> Optional[str]:
                 u = str(r.get("audio_url") or "")
-                # Proxy-mode export URLs ({base}/api/…) need the lpat token, which
-                # the browser can't send — route them through our audio proxy
-                # (binary-safe via the web /api/datasets/{id}/label-audio route).
-                # Presigned-S3 URLs are browser-playable as-is.
-                if u.startswith(base + "/api/") and r.get("id"):
+                # Prefer our audio proxy whenever the task has an id: it streams the
+                # clip via the platform's task-audio endpoint (authenticated, binary-
+                # safe via the web /api/datasets/{id}/label-audio route). This both
+                # hides the lpat token (proxy-mode export URLs need it) AND survives
+                # presigned `audio_url`s whose S3 endpoint the browser can't resolve
+                # (some platform storage configs presign a non-routable region host).
+                # Only fall back to the raw URL when there's no task id to proxy by.
+                if r.get("id"):
                     return f"/api/datasets/{d.id}/label-audio?task_id={r['id']}"
                 return _audio_str(u)
 
@@ -2409,10 +2429,15 @@ async def pack_llm_dataset(
     if st is None or st.kind != "s3":
         raise HTTPException(status_code=400, detail="storage_id must reference a kind=s3 storage")
 
+    # Accept a multiselect (`subsets`); fall back to the single `subset`. Each label
+    # is resolved + packed, with all selected subsets concatenated into one dataset.
+    raw = req.subsets if req.subsets else ([req.subset] if req.subset else [])
+    subsets = [s.strip() for s in raw if s and s.strip()]
+
     from . import dataset_transform
     await dataset_transform.start_llm_pack(
         dataset_id,
-        subset=(req.subset or "").strip() or None,
+        subsets=subsets or None,
         tokenizer=req.tokenizer.strip(),
         sequence_length=int(req.sequence_length),
         storage_id=req.storage_id,
@@ -2420,10 +2445,80 @@ async def pack_llm_dataset(
         all_reasoning=bool(req.all_reasoning),
     )
     await audit_module.record(user, "dataset.pack-llm", "dataset", dataset_id, d.name,
-                              details={"tokenizer": req.tokenizer, "subset": req.subset,
+                              details={"tokenizer": req.tokenizer, "subsets": subsets,
                                        "sequence_length": req.sequence_length})
     await session.refresh(d)
     return _to_record(d, user.username, None)
+
+
+@router.post("/merge", response_model=DatasetRecord)
+async def merge_datasets(
+    req: DatasetMergeRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Concatenate >=2 kind=label datasets into one new audio dataset (HF or S3).
+    Creates the merged dataset row up front (transform_status=running) and runs
+    the export+download+write in-process — poll GET /{new_id}."""
+    ids: list[str] = []
+    for sid in (req.source_ids or []):
+        sid = (sid or "").strip()
+        if sid and sid not in ids:   # de-dup, preserve order
+            ids.append(sid)
+    if len(ids) < 2:
+        raise HTTPException(status_code=400, detail="merge needs at least 2 distinct source dataset ids")
+
+    sources: list[Dataset] = []
+    for sid in ids:
+        d = await _require_dataset(session, sid, user)  # 404 / 403 as needed
+        if d.kind != "label":
+            raise HTTPException(
+                status_code=400,
+                detail=f"source {sid} is kind={d.kind}; merge currently supports kind=label datasets only",
+            )
+        sources.append(d)
+
+    if req.target not in ("hf", "s3"):
+        raise HTTPException(status_code=400, detail="target must be 'hf' or 's3'")
+    if req.target == "hf" and not (req.hf_repo and "/" in req.hf_repo):
+        raise HTTPException(status_code=400, detail="target HF repo must be owner/name")
+    if req.target == "s3":
+        st = await session.get(Storage, req.storage_id) if req.storage_id else None
+        if st is None or st.kind != "s3":
+            raise HTTPException(status_code=400, detail="storage_id must reference a kind=s3 storage")
+
+    # Create the merged OUTPUT dataset row up front so the UI has an id to poll.
+    transcription_field = next((s.transcription_field for s in sources if s.transcription_field), None) or "transcription"
+    name = (req.name or "").strip() or f"Merged: {' + '.join(s.name for s in sources)}"
+    new = Dataset(
+        id=_gen_id(),
+        owner_id=user.id,
+        name=name[:255],
+        description=f"Merge of {len(sources)} label datasets ({', '.join(s.id for s in sources)})",
+        kind=("hf" if req.target == "hf" else "s3"),
+        storage_id=(req.storage_id if req.target == "s3" else None),
+        hf_repo=((req.hf_repo or "").strip() or None) if req.target == "hf" else None,
+        audio_field="audio",
+        transcription_field=transcription_field,
+        num_rows=0,
+        transform_status="running",
+    )
+    session.add(new)
+    await session.commit()
+
+    from . import dataset_transform
+    await dataset_transform.start_merge(
+        new.id,
+        source_ids=ids,
+        target=req.target,
+        hf_repo=(req.hf_repo or "").strip() or None,
+        storage_id=req.storage_id,
+        s3_folder=(req.s3_folder or "").strip() or None,
+    )
+    await audit_module.record(user, "dataset.merge", "dataset", new.id, name,
+                              details={"sources": ids, "target": req.target})
+    await session.refresh(new)
+    return _to_record(new, user.username, None)
 
 
 @router.post("/{dataset_id}/cancel-transform", response_model=DatasetRecord)

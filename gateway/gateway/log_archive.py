@@ -86,6 +86,13 @@ async def _flush_entry(session_maker, redis, key, ent) -> None:
         return
     storage_id: str = ent["storage_id"]
     model: str = ent["model"]
+    prefix = archive_prefix(app_id, slug, session)
+
+    # 1) Short txn: resolve the storage backend + this file's row (creating it on
+    #    first sight) and read the next part sequence. We deliberately do NOT hold
+    #    the transaction across the S3 upload below — a slow/stuck upload would
+    #    otherwise leave an idle-in-transaction connection holding locks (reaped at
+    #    DB_IDLE_IN_TXN_TIMEOUT_MS, losing the flush) and add lock churn on deploys.
     async with session_maker() as s:
         store = await s.get(Storage, storage_id)
         if store is None or not getattr(store, "enabled", True) or store.kind != "s3":
@@ -95,7 +102,6 @@ async def _flush_entry(session_maker, redis, key, ent) -> None:
             )
             return
         backend = _backend_for(store)
-        prefix = archive_prefix(app_id, slug, session)
         row = (await s.execute(
             select(ServerlessLogArchive).where(
                 ServerlessLogArchive.app_id == app_id,
@@ -111,22 +117,30 @@ async def _flush_entry(session_maker, redis, key, ent) -> None:
                 started_at=session_to_dt(session),
             )
             s.add(row)
-            await s.flush()
-        seq = row.next_seq
-        data = ("\n".join(lines) + "\n").encode("utf-8", "replace")
-        key_obj = f"{prefix}/{seq:08d}.log"
-        # boto3 is sync — keep the event loop free during the upload.
-        await asyncio.to_thread(backend.put_bytes, key_obj, data)
+            await s.commit()
+        row_id = row.id
+        seq = int(row.next_seq or 0)
+
+    # 2) Upload the part OUTSIDE any DB transaction. Single sequential flusher →
+    #    no other writer races on `seq` for this (app, slug, session).
+    data = ("\n".join(lines) + "\n").encode("utf-8", "replace")
+    key_obj = f"{prefix}/{seq:08d}.log"
+    await asyncio.to_thread(backend.put_bytes, key_obj, data)  # boto3 is sync
+    crash = await redis.get(f"wlog_crash:{app_id}:{slug}:{session}")
+
+    # 3) Short txn: bump the counters now that the bytes are durably stored.
+    async with session_maker() as s2:
+        row = await s2.get(ServerlessLogArchive, row_id)
+        if row is None:
+            return
         row.next_seq = seq + 1
         row.bytes = (row.bytes or 0) + len(data)
         row.lines = (row.lines or 0) + len(lines)
         row.model = model
         row.updated_at = datetime.now(timezone.utc)
-        # Mirror the launch's crash reason (set by the scheduler in Redis) if present.
-        crash = await redis.get(f"wlog_crash:{app_id}:{slug}:{session}")
         if crash:
             row.crash = crash[:2048]
-        await s.commit()
+        await s2.commit()
 
 
 async def flush_once(session_maker, redis) -> int:
