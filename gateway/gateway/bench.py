@@ -1773,6 +1773,10 @@ class CreateBenchmarkRequest(BaseModel):
     # Ingress endpoint API key. A global-secret KEY (resolved to OPENAI_API_KEY at
     # launch). Pasted keys come through env_vars["OPENAI_API_KEY"].
     api_key_secret: Optional[str] = None
+    # Create the run already shared publicly (read-only visible to every logged-in
+    # user). Default False = private. Same flag the post-creation
+    # /{bench_id}/visibility toggle flips; set here to choose at create time.
+    is_public: bool = False
 
 
 class RenameBenchmarkRequest(BaseModel):
@@ -2112,6 +2116,7 @@ async def create_benchmark(
         owner_id=user.id,
         provider_id=body.provider_id,
         storage_id=storage_id,
+        is_public=bool(body.is_public),
         # Only honoured when provider_id is set (VM path). Default True.
         cleanup_model=True if body.cleanup_model is None else bool(body.cleanup_model),
         env_vars={k: str(v) for k, v in (body.env_vars or {}).items()} or None,

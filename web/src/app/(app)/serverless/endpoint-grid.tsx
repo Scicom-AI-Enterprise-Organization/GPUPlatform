@@ -6,10 +6,12 @@ import { useEffect, useMemo, useState, useTransition } from "react";
 import {
   CheckSquare,
   Cpu,
+  Globe,
   Inbox,
   LayoutGrid,
   List,
   Loader2,
+  Lock,
   MoreHorizontal,
   Search,
   Trash2,
@@ -36,7 +38,7 @@ import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-se
 import type { AppRecord } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
-import { deleteEndpoint } from "./actions";
+import { deleteEndpoint, setEndpointVisibility } from "./actions";
 
 function searchableText(a: AppRecord): string {
   return [a.name, a.app_id, a.model, a.gpu, a.owner ?? ""].join(" ").toLowerCase();
@@ -89,6 +91,16 @@ export function EndpointGrid({
   const exitSelect = () => {
     setSelectMode(false);
     setSelected(new Set());
+  };
+
+  // Flip a single endpoint public<->private from the "..." menu (owner/admin
+  // only; server-enforced). Mirrors the benchmark list's row action.
+  const [, startVisTransition] = useTransition();
+  const toggleVisibility = (app: AppRecord) => {
+    startVisTransition(async () => {
+      const res = await setEndpointVisibility(app.app_id, !app.is_public);
+      if (res.ok) router.refresh();
+    });
   };
 
   const filtered = useMemo(() => {
@@ -290,6 +302,7 @@ export function EndpointGrid({
                 canManage={canManage(app)}
                 onToggle={toggle}
                 onDelete={() => setSingle(app)}
+                onToggleVisibility={() => toggleVisibility(app)}
               />
             ))}
           </div>
@@ -353,6 +366,7 @@ function EndpointCard({
   canManage,
   onToggle,
   onDelete,
+  onToggleVisibility,
 }: {
   app: AppRecord;
   selectMode: boolean;
@@ -360,6 +374,7 @@ function EndpointCard({
   canManage: boolean;
   onToggle: (id: string) => void;
   onDelete: () => void;
+  onToggleVisibility: () => void;
 }) {
   const avatar = avatarFor(app.name);
   // Only owners/admins can select-to-delete; others' public endpoints are view-only.
@@ -423,6 +438,15 @@ function EndpointCard({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+              <DropdownMenuItem
+                onSelect={(e) => {
+                  e.preventDefault();
+                  onToggleVisibility();
+                }}
+              >
+                {app.is_public ? <Lock className="h-4 w-4" /> : <Globe className="h-4 w-4" />}
+                {app.is_public ? "Make private" : "Make public"}
+              </DropdownMenuItem>
               <DropdownMenuItem
                 variant="destructive"
                 onSelect={(e) => {

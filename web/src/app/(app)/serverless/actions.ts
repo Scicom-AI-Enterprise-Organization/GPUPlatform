@@ -95,3 +95,19 @@ export async function deleteEndpoint(appId: string): Promise<DeployResult> {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+/** Owner/admin: make an endpoint public (read-only visible to all logged-in
+ * users) or private again. Mirrors the benchmark list's "Make public/private". */
+export async function setEndpointVisibility(
+  appId: string,
+  isPublic: boolean,
+): Promise<DeployResult> {
+  try {
+    await gateway.setAppVisibility(appId, isPublic);
+    revalidatePath(`/serverless/${appId}`);
+    revalidatePath("/serverless");
+    return { ok: true, app_id: appId };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}

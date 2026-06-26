@@ -176,6 +176,10 @@ class CreateAppRequest(BaseModel):
     request_timeout_s: int = 600
     vllm_args: str = ""
     enable_metrics: bool = True
+    # Create the endpoint already shared publicly (read-only visible to every
+    # logged-in user). Default False = private. Same flag the post-creation
+    # /apps/{id}/visibility toggle flips; set here to choose at create time.
+    is_public: bool = False
     # RunPod cloud tier. None = provider default. Only "COMMUNITY" / "SECURE".
     cloud_type: Optional[str] = None
     # Per-worker disk sizing. None = provider default.
@@ -1686,6 +1690,7 @@ async def create_app(
         gpu=gpu,
         gpu_count=gpu_count,
         enable_metrics=req.enable_metrics,
+        is_public=bool(req.is_public),
         autoscaler=autoscaler_dict,
         cpu=req.cpu,
         memory=req.memory,

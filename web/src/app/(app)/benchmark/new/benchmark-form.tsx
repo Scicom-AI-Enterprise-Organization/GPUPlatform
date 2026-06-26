@@ -960,6 +960,11 @@ export function BenchmarkForm({
   // RunPod GPU catalog — fetched live from the gateway, fallback until it lands.
   const [gpuOptions, setGpuOptions] = useState<GpuTypeOption[]>(RUNPOD_GPU_FALLBACK);
   const [cleanupModel, setCleanupModel] = useState(true);
+  // Visibility at create time. false (default) = private (only you + admins).
+  // true = public: read-only visible to every logged-in user. Owner can flip it
+  // later from the benchmark row menu / detail page. Platform flag — NOT part of
+  // the benchmaq config YAML, so it's a form-only control.
+  const [isPublic, setIsPublic] = useState(false);
   // CUDA_VISIBLE_DEVICES pin + extra env exported for the run (cache/home dirs).
   const [visibleDevices, setVisibleDevices] = useState("");
   const [envText, setEnvText] = useState("");
@@ -1202,6 +1207,7 @@ export function BenchmarkForm({
               ? null // ingress provisions nothing — gateway detects base_url
               : runpodProviderId || null,
         storage_id: storageId || null,
+        is_public: isPublic,
         cleanup_model: target === "vm" ? effectiveCleanup : undefined,
         ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
         ...(effectiveVisibleDevices.trim()
@@ -1942,6 +1948,32 @@ export function BenchmarkForm({
                 Manage backends under <a href="/storage" className="underline underline-offset-2 hover:text-foreground">Storage</a>.
               </p>
             </div>
+          </SectionCard>
+
+          {/* Visibility — platform-level public/private flag (NOT part of the
+              benchmaq config YAML, so it's form-only). Mirrors the post-creation
+              "Make public" toggle: public = read-only to every logged-in user. */}
+          <SectionCard
+            icon={<Globe className="h-4 w-4" />}
+            title="Visibility"
+            description="Who can see this run. You can change it later from the benchmark menu."
+          >
+            <label className="flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-sm hover:bg-muted/50">
+              <input
+                type="checkbox"
+                checked={isPublic}
+                onChange={(e) => setIsPublic(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary"
+              />
+              <div className="min-w-0">
+                <div className="font-medium">Make public (read-only)</div>
+                <div className="text-xs text-muted-foreground">
+                  Off (default) keeps the run private — only you and admins can
+                  see it. On shares it read-only with every logged-in user: they
+                  can view the results but can&apos;t edit, delete, or re-run it.
+                </div>
+              </div>
+            </label>
           </SectionCard>
 
           {/* Container image — picks the CUDA / pytorch baseline on the pod.

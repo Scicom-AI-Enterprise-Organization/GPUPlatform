@@ -212,6 +212,11 @@ export function InferenceForm() {
   const [idleInput, setIdleInput] = useState("120"); // 2 min scale-to-zero (single-model only; multi VM fleets are always-on)
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [enableMetrics, setEnableMetrics] = useState(true);
+  // Visibility at create time. false (default) = private (only you + admins).
+  // true = public: read-only visible to every logged-in user (they can view the
+  // overview/workers/metrics but can't edit, delete, or run inference). Owner can
+  // flip it later from the endpoint detail page.
+  const [isPublic, setIsPublic] = useState(false);
   // Run-on target (mirrors the benchmark form): "cloud" spawns a fresh RunPod
   // pod, "vm" SSHes onto a registered VM. Each keeps its own provider pick.
   const [target, setTarget] = useState<"cloud" | "vm">("cloud");
@@ -580,6 +585,7 @@ export function InferenceForm() {
             sleep_level: sleepLevel,
             autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: 0 },
             enable_metrics: enableMetrics,
+            is_public: isPublic,
             ...(hasEnvVars ? { env_vars: envVars } : {}),
             ...(vdRaw ? { visible_devices: vdRaw } : {}),
             ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
@@ -600,6 +606,7 @@ export function InferenceForm() {
             sleep_level: sleepLevel,
             autoscaler: { max_containers: 1, tasks_per_container: 64, idle_timeout_s: parsedIdle },
             enable_metrics: enableMetrics,
+            is_public: isPublic,
             ...(hasEnvVars ? { env_vars: envVars } : {}),
             // The fleet installs vLLM into its venv (a volume path persists across
             // re-provisions); pin the version (default 0.19.1) for reproducibility.
@@ -661,6 +668,7 @@ export function InferenceForm() {
       autoscaler: { max_containers: MAX_WORKERS, idle_timeout_s: parsedIdle },
       vllm_args: vllmArgs,
       enable_metrics: enableMetrics,
+      is_public: isPublic,
       provider_id: providerId || null,
       ...(hasEnvVars ? { env_vars: envVars } : {}),
       ...(isVm
@@ -1498,6 +1506,28 @@ export function InferenceForm() {
               </div>
             )}
           </div>
+        </Section>
+
+        <Section
+          title="Visibility"
+          description="Who can see this endpoint. You can change it later from the endpoint page or the list menu."
+        >
+          <label className="flex cursor-pointer items-start gap-3">
+            <Checkbox
+              checked={isPublic}
+              onCheckedChange={(v) => setIsPublic(v === true)}
+              className="mt-0.5"
+            />
+            <div className="flex-1">
+              <div className="text-sm font-medium">Make public (read-only)</div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Off (default) keeps the endpoint private — only you and admins can
+                see it. On shares it read-only with every logged-in user: they can
+                view the overview, workers, and metrics but can&apos;t edit, delete,
+                or run inference.
+              </p>
+            </div>
+          </label>
         </Section>
 
         <Section title="Engine" description="Scaling behaviour, vLLM args, and metrics.">
