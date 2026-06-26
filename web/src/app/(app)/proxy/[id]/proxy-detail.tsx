@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Pagination } from "@/components/ui/pagination";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 import type { ProxyEndpoint, ProxyRequest, ProxyUpstreamHealth } from "@/lib/types";
@@ -28,12 +29,19 @@ const TABS = [
 const BUCKETS = ["queued", "running", "completed", "cancelled", "failed"] as const;
 type ProxyTab = (typeof TABS)[number]["value"];
 
-function fmtAgo(iso: string | null | undefined): string {
+// Absolute timestamp for the "Requested" column — matches the serverless queue.
+function formatTs(iso: string | null | undefined): string {
   if (!iso) return "—";
-  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  return `${Math.round(s / 3600)}h ago`;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
 }
 
 const STATUS_TONE: Record<string, string> = {
@@ -78,6 +86,8 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
   const [filter, setFilter] = useState<"all" | (typeof BUCKETS)[number]>("all");
   const [flushing, setFlushing] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
   // Server-side queue filters/sort (cover the full retained history, not one page).
   // URL-driven so they're shareable + survive refresh: ?user ?upstream ?sort ?req.
   const ownerF = searchParams.get("user") ?? "";        // "" = all users
@@ -118,7 +128,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
       const [h, r] = await Promise.all([
         gateway.getProxyHealth(ep.id),
         gateway.getProxyRequests(ep.id, {
-          limit: 100,
+          limit: 200,
           owner: ownerF || undefined,
           upstream: upstreamF || undefined,
           sort: sortBy,
@@ -143,6 +153,8 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
     if (readOnly) return;
     gateway.getProxyRequestFacets(ep.id).then((f) => setFacetUsers(f.users ?? [])).catch(() => {});
   }, [ep.id, readOnly]);
+  // Back to page 1 whenever a filter/sort changes (the result set shifts under the page).
+  useEffect(() => { setPage(1); }, [filter, ownerF, upstreamF, sortBy, orderDir, reqIdQuery]);
 
   const onCancel = async (rid: string) => {
     try { await gateway.cancelProxyRequest(ep.id, rid); poll(); }
@@ -165,6 +177,11 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
   const onRefresh = async () => { setRefreshing(true); await poll(); setRefreshing(false); };
   const count = (s: string) => reqs.filter((r) => r.status === s).length;
   const filtered = filter === "all" ? reqs : reqs.filter((r) => r.status === filter);
+  // Client-side pagination over the fetched (server-filtered/sorted) page, like the
+  // serverless queue. Clamp in render so a shrinking result set can't strand a page.
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
   const onDelete = async () => {
     if (!confirm(`Delete proxy endpoint "${ep.name}"?`)) return;
     try { await gateway.deleteProxy(ep.id); router.push("/proxy"); router.refresh(); }
@@ -432,8 +449,8 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 <tr>
                   <th className="px-3 py-2 font-medium">Request ID</th>
                   <th className="px-3 py-2 font-medium">Requested</th>
-                  <th className="px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium">User</th>
+                  <th className="px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium">Model</th>
                   <th className="px-3 py-2 font-medium">Upstream</th>
                   <th className="px-3 py-2 font-medium">Code</th>
@@ -443,7 +460,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((r) => (
+                {paged.map((r) => (
                   <tr key={r.id} className="border-b border-border/60 last:border-0">
                     <td className="px-3 py-2">
                       <div className="flex items-center gap-1">
@@ -463,12 +480,12 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                         </button>
                       </div>
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground" title={r.created_at ?? ""}>{fmtAgo(r.created_at)}</td>
+                    <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground" title={r.created_at ?? ""}>{formatTs(r.created_at)}</td>
+                    <td className="px-3 py-2 text-xs">{r.owner ?? "—"}</td>
                     <td className="px-3 py-2">
                       <span className={cn("rounded px-1.5 py-0.5 text-[11px] font-medium", STATUS_TONE[r.status] ?? "")}>{r.status}</span>
                       {r.is_stream && <span className="ml-1 text-[10px] text-status-init">stream</span>}
                     </td>
-                    <td className="px-3 py-2 text-xs">{r.owner ?? "—"}</td>
                     <td className="px-3 py-2 font-mono text-xs">{r.model}</td>
                     <td className="px-3 py-2 text-xs">{r.upstream ?? "—"}</td>
                     <td className="px-3 py-2 text-xs">{r.status_code ?? "—"}</td>
@@ -489,6 +506,18 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
               </tbody>
             </table>
           </Card>
+
+          {filtered.length > 0 && (
+            <Pagination
+              page={currentPage}
+              pageCount={pageCount}
+              total={filtered.length}
+              pageSize={pageSize}
+              onPageChange={setPage}
+              onPageSizeChange={(n) => { setPageSize(n); setPage(1); }}
+              itemLabel="requests"
+            />
+          )}
         </TabsContent>
         </Tabs>
       </div>
