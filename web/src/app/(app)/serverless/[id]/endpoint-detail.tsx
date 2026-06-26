@@ -23,6 +23,7 @@ import { RequestsTab } from "./tabs/requests";
 import { StressTab } from "./tabs/stress";
 import { QueueTab } from "./tabs/queue";
 import { WorkersTab } from "./tabs/workers";
+import { LogsTab } from "./tabs/logs";
 import { VisualTab } from "./tabs/visual";
 import { MetricsTab } from "./tabs/metrics";
 import { ProxyTab } from "./tabs/proxy";
@@ -33,6 +34,7 @@ const TABS = [
   { value: "stress", label: "Stress test" },
   { value: "queue", label: "Queue" },
   { value: "workers", label: "Workers" },
+  { value: "logs", label: "Logs" },
   { value: "visual", label: "Visual" },
   { value: "metrics", label: "Metrics" },
   { value: "proxy", label: "Proxy" },
@@ -251,6 +253,7 @@ export function EndpointDetail({ app, readOnly = false, isAdmin = false }: { app
           {!readOnly && <TabsContent value="stress"><StressTab app={app} /></TabsContent>}
           {!readOnly && app.mode !== "proxy" && <TabsContent value="queue"><QueueTab app={app} /></TabsContent>}
           <TabsContent value="workers"><WorkersTab app={app} /></TabsContent>
+          {!readOnly && <TabsContent value="logs"><LogsTab app={app} /></TabsContent>}
           <TabsContent value="visual"><VisualTab app={app} /></TabsContent>
           <TabsContent value="metrics"><MetricsTab app={app} /></TabsContent>
           <TabsContent value="proxy"><ProxyTab app={app} readOnly={readOnly} isAdmin={isAdmin} /></TabsContent>

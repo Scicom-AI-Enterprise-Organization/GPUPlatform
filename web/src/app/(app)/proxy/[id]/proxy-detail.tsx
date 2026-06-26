@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 import type { ProxyEndpoint, ProxyRequest, ProxyUpstreamHealth } from "@/lib/types";
@@ -77,6 +78,21 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
   const [filter, setFilter] = useState<"all" | (typeof BUCKETS)[number]>("all");
   const [flushing, setFlushing] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // Server-side queue filters/sort (cover the full retained history, not one page).
+  // URL-driven so they're shareable + survive refresh: ?user ?upstream ?sort ?req.
+  const ownerF = searchParams.get("user") ?? "";        // "" = all users
+  const upstreamF = searchParams.get("upstream") ?? "";  // "" = all upstreams
+  const reqIdQuery = searchParams.get("req") ?? "";      // applied exact request-id lookup
+  const sortParam = searchParams.get("sort") ?? "created:desc";
+  const sortBy: "created" | "latency" = sortParam.startsWith("latency") ? "latency" : "created";
+  const orderDir: "asc" | "desc" = sortParam.endsWith("asc") ? "asc" : "desc";
+  const [reqIdF, setReqIdF] = useState(searchParams.get("req") ?? ""); // in-progress text
+  const [facetUsers, setFacetUsers] = useState<string[]>([]);
+  const setQ = useCallback((updates: Record<string, string | null>) => {
+    const params = new URLSearchParams(searchParams.toString());
+    for (const [k, v] of Object.entries(updates)) { if (v) params.set(k, v); else params.delete(k); }
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+  }, [router, pathname, searchParams]);
 
   useEffect(() => {
     let abort = false;
@@ -99,19 +115,34 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
 
   const poll = useCallback(async () => {
     try {
-      const [h, r] = await Promise.all([gateway.getProxyHealth(ep.id), gateway.getProxyRequests(ep.id)]);
+      const [h, r] = await Promise.all([
+        gateway.getProxyHealth(ep.id),
+        gateway.getProxyRequests(ep.id, {
+          limit: 100,
+          owner: ownerF || undefined,
+          upstream: upstreamF || undefined,
+          sort: sortBy,
+          order: orderDir,
+          requestId: reqIdQuery || undefined,
+        }),
+      ]);
       setHealth(h);
       setReqs(r);
     } catch {
       /* transient */
     }
-  }, [ep.id]);
+  }, [ep.id, ownerF, upstreamF, sortBy, orderDir, reqIdQuery]);
   useEffect(() => {
     if (readOnly) return; // health + request history are admin-only; don't 403-spam
     poll();
     const t = window.setInterval(poll, POLL_MS);
     return () => window.clearInterval(t);
   }, [poll, readOnly]);
+  // Populate the user-filter dropdown from the full history (once).
+  useEffect(() => {
+    if (readOnly) return;
+    gateway.getProxyRequestFacets(ep.id).then((f) => setFacetUsers(f.users ?? [])).catch(() => {});
+  }, [ep.id, readOnly]);
 
   const onCancel = async (rid: string) => {
     try { await gateway.cancelProxyRequest(ep.id, rid); poll(); }
@@ -339,6 +370,49 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
             </div>
           </div>
 
+          {/* Server-side filters/sort over the full retained history */}
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={ownerF || "__all"} onValueChange={(v) => setQ({ user: v === "__all" ? null : v })}>
+              <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__all" className="text-xs">All users</SelectItem>
+                {facetUsers.map((u) => <SelectItem key={u} value={u} className="text-xs">{u}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Select value={upstreamF || "__all"} onValueChange={(v) => setQ({ upstream: v === "__all" ? null : v })}>
+              <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__all" className="text-xs">All upstreams</SelectItem>
+                {ep.upstreams.map((u) => <SelectItem key={u.id} value={u.name} className="text-xs">{u.name}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Select value={`${sortBy}:${orderDir}`} onValueChange={(v) => setQ({ sort: v === "created:desc" ? null : v })}>
+              <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="created:desc" className="text-xs">Newest first</SelectItem>
+                <SelectItem value="created:asc" className="text-xs">Oldest first</SelectItem>
+                <SelectItem value="latency:desc" className="text-xs">Slowest first</SelectItem>
+                <SelectItem value="latency:asc" className="text-xs">Fastest first</SelectItem>
+              </SelectContent>
+            </Select>
+            <form
+              className="flex items-center gap-1"
+              onSubmit={(e) => { e.preventDefault(); setQ({ req: reqIdF.trim() || null }); }}
+            >
+              <input
+                value={reqIdF}
+                onChange={(e) => setReqIdF(e.target.value)}
+                placeholder="request id (exact)…"
+                className="h-8 w-[200px] rounded-md border border-border bg-background px-2 font-mono text-xs"
+              />
+              {reqIdQuery ? (
+                <Button type="button" variant="outline" size="xs" onClick={() => { setReqIdF(""); setQ({ req: null }); }}>clear</Button>
+              ) : (
+                <Button type="submit" variant="outline" size="xs" disabled={!reqIdF.trim()}>find</Button>
+              )}
+            </form>
+          </div>
+
           <div className="flex gap-1 border-b border-border">
             {(["all", ...BUCKETS] as const).map((b) => {
               const n = b === "all" ? reqs.length : count(b);
@@ -356,6 +430,8 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
             <table className="w-full text-sm">
               <thead className="border-b border-border bg-muted/20 text-left text-xs uppercase tracking-wide text-muted-foreground">
                 <tr>
+                  <th className="px-3 py-2 font-medium">Request ID</th>
+                  <th className="px-3 py-2 font-medium">Requested</th>
                   <th className="px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium">User</th>
                   <th className="px-3 py-2 font-medium">Model</th>
@@ -363,13 +439,31 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                   <th className="px-3 py-2 font-medium">Code</th>
                   <th className="px-3 py-2 font-medium">Latency</th>
                   <th className="px-3 py-2 font-medium">Tokens</th>
-                  <th className="px-3 py-2 font-medium">When</th>
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
               <tbody>
                 {filtered.map((r) => (
                   <tr key={r.id} className="border-b border-border/60 last:border-0">
+                    <td className="px-3 py-2">
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => setQ({ req: r.id === reqIdQuery ? null : r.id })}
+                          className={cn("font-mono text-xs hover:text-primary", r.id === reqIdQuery && "font-medium text-primary")}
+                          title="Filter the queue to this request id"
+                        >
+                          {r.id}
+                        </button>
+                        <button
+                          onClick={() => { navigator.clipboard.writeText(r.id); toast.success("Request ID copied", { duration: 3000 }); }}
+                          title="Copy request id"
+                          aria-label="Copy request id"
+                        >
+                          <Copy className="h-3 w-3 text-muted-foreground hover:text-foreground" />
+                        </button>
+                      </div>
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground" title={r.created_at ?? ""}>{fmtAgo(r.created_at)}</td>
                     <td className="px-3 py-2">
                       <span className={cn("rounded px-1.5 py-0.5 text-[11px] font-medium", STATUS_TONE[r.status] ?? "")}>{r.status}</span>
                       {r.is_stream && <span className="ml-1 text-[10px] text-status-init">stream</span>}
@@ -380,7 +474,6 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                     <td className="px-3 py-2 text-xs">{r.status_code ?? "—"}</td>
                     <td className="px-3 py-2 text-xs">{r.latency_ms != null ? `${r.latency_ms}ms` : "—"}</td>
                     <td className="px-3 py-2 text-xs">{r.prompt_tokens != null ? `${r.prompt_tokens}/${r.completion_tokens ?? "?"}` : "—"}</td>
-                    <td className="px-3 py-2 text-xs text-muted-foreground">{fmtAgo(r.created_at)}</td>
                     <td className="px-3 py-2">
                       {r.live && (r.status === "queued" || r.status === "running") && (
                         <Button variant="ghost" size="xs" className="text-destructive hover:text-destructive" onClick={() => onCancel(r.id)}>Cancel</Button>
@@ -389,7 +482,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                   </tr>
                 ))}
                 {filtered.length === 0 && (
-                  <tr><td colSpan={9} className="px-4 py-10 text-center text-sm text-muted-foreground">
+                  <tr><td colSpan={10} className="px-4 py-10 text-center text-sm text-muted-foreground">
                     {filter === "all" ? "No requests yet — fire one from the Playground." : `No ${filter} requests.`}
                   </td></tr>
                 )}

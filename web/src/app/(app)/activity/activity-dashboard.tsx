@@ -10,11 +10,15 @@ import {
   Bar, BarChart, CartesianGrid, Legend, Line, LineChart,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
-import { Download, Loader2 } from "lucide-react";
+import { ChevronDown, Download, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent,
+  DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { gateway } from "@/lib/gateway";
 import type { ActivitySummary, ActivityGranularity } from "@/lib/types";
 
@@ -83,6 +87,8 @@ export function ActivityDashboard() {
   const [customFrom, setCustomFrom] = useState(localDate(new Date(initialToday.getTime() - 6 * 86400_000)));
   const [customTo, setCustomTo] = useState(todayStr);
   const [gran, setGran] = useState<ActivityGranularity>("hour");
+  // Model filter — empty means "all models" (no server-side filter applied).
+  const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [summary, setSummary] = useState<ActivitySummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -92,13 +98,16 @@ export function ActivityDashboard() {
     try {
       const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
       const { since, until } = rangeBounds(range, customFrom, customTo);
-      setSummary(await gateway.getActivity({ since, until, tz, granularity: gran, top: 8 }));
+      setSummary(await gateway.getActivity({
+        since, until, tz, granularity: gran, top: 8,
+        models: selectedModels.length ? selectedModels : undefined,
+      }));
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, [range, customFrom, customTo, gran]);
+  }, [range, customFrom, customTo, gran, selectedModels]);
   useEffect(() => {
     const timer = window.setTimeout(() => { void load(); }, 0);
     return () => window.clearTimeout(timer);
@@ -137,6 +146,8 @@ export function ActivityDashboard() {
     () => pivot(summary?.by_model_bucket, "model", "requests"), [summary, pivot]);
   const { rows: userBuckets, keys: userKeys } = useMemo(
     () => pivot(summary?.by_user_bucket, "user", "tokens"), [summary, pivot]);
+  const { rows: upstreamBuckets, keys: upstreamKeys } = useMemo(
+    () => pivot(summary?.by_upstream_bucket, "upstream", "requests"), [summary, pivot]);
 
   const t = summary?.totals;
   const cards = [
@@ -159,6 +170,7 @@ export function ActivityDashboard() {
 
       {/* Controls bar */}
       <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-card px-4 py-3">
+        <ModelFilter all={summary?.all_models ?? []} selected={selectedModels} onChange={setSelectedModels} />
         {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Button variant="outline" size="sm" onClick={exportCsv} disabled={loading || !summary?.by_bucket.length}>
@@ -290,6 +302,25 @@ export function ActivityDashboard() {
         </BarChart>
       </ChartCard>
 
+      {/* Requests by upstream (proxy only, stacked) — own full-width row */}
+      <ChartCard title="Requests by upstream" subtitle="Proxy requests per bucket, stacked by upstream."
+        empty={!upstreamBuckets.length} loading={loading}>
+        <BarChart data={upstreamBuckets}>
+          <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.1} />
+          <XAxis dataKey="bucket" tick={{ fontSize: 11 }} tickFormatter={(b) => tickFmt(b, gran)} minTickGap={28} />
+          <YAxis tick={{ fontSize: 11 }} tickFormatter={fmtNum} allowDecimals={false} width={44} />
+          <Tooltip
+            contentStyle={{ fontSize: 12 }}
+            labelFormatter={(l) => fullLabel(String(l))}
+            formatter={(v, n) => [fmtNum(Number(v)), String(n)]}
+          />
+          <Legend wrapperStyle={{ fontSize: 12 }} />
+          {upstreamKeys.map((u, i) => (
+            <Bar key={u} dataKey={u} stackId="up" fill={PALETTE[i % PALETTE.length]} />
+          ))}
+        </BarChart>
+      </ChartCard>
+
       {/* Top users + top models */}
       <div className="grid gap-6 lg:grid-cols-2">
         <RankCard title="Top users" subtitle="By total tokens in this period."
@@ -302,6 +333,57 @@ export function ActivityDashboard() {
 
       {summary?.note && <p className="text-xs text-muted-foreground">{summary.note}</p>}
     </div>
+  );
+}
+
+// Multi-select model picker. Empty selection = all models (no filter). Options
+// come from the summary's full model list, so they stay complete while filtered.
+function ModelFilter({ all, selected, onChange }: {
+  all: string[]; selected: string[]; onChange: (next: string[]) => void;
+}) {
+  const label = selected.length === 0 ? "All models"
+    : selected.length === 1 ? selected[0]
+    : `${selected.length} models`;
+  const toggle = (m: string) =>
+    onChange(selected.includes(m) ? selected.filter((x) => x !== m) : [...selected, m]);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className="w-[180px] justify-between gap-2 font-normal">
+          <span className="truncate">{label}</span>
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="max-h-80 w-64 overflow-y-auto">
+        <DropdownMenuLabel>Filter by model</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {all.length === 0 ? (
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">No models in range.</div>
+        ) : (
+          <>
+            <DropdownMenuItem
+              disabled={selected.length === 0}
+              onSelect={(e) => { e.preventDefault(); onChange([]); }}
+              className="text-xs text-muted-foreground"
+            >
+              Clear (show all)
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            {all.map((m) => (
+              <DropdownMenuCheckboxItem
+                key={m}
+                checked={selected.includes(m)}
+                onSelect={(e) => e.preventDefault()}
+                onCheckedChange={() => toggle(m)}
+                className="font-mono text-xs"
+              >
+                <span className="truncate">{m}</span>
+              </DropdownMenuCheckboxItem>
+            ))}
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

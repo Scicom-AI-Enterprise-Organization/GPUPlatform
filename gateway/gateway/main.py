@@ -17,7 +17,7 @@ import redis.asyncio as redis_async
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,6 +51,7 @@ from . import training_api as training_module
 from . import tracking_creds_api as tracking_creds_module
 from . import gitops_api as gitops_module
 from . import proxy_api as proxy_module
+from . import log_archive
 from . import history_api as history_module
 from . import catalog_api as catalog_module
 from . import hf_mirror_api as hf_mirror_module
@@ -227,6 +228,8 @@ class AppRecord(BaseModel):
     volume_gb: Optional[int] = None
     provider_id: Optional[str] = None
     provider_name: Optional[str] = None  # resolved on the single-app GET (the VM/cloud account name)
+    storage_id: Optional[str] = None     # log-archive Storage (kind=s3); None = Redis-only
+    storage_name: Optional[str] = None   # resolved on the single-app GET (the Storage's name)
     mode: str = "single"
     models: Optional[list[MultiModelMember]] = None
     sleep_level: int = 1
@@ -445,6 +448,7 @@ def _to_app_record(app: App, *, redacted: bool = False) -> AppRecord:
         container_disk_gb=getattr(app, "container_disk_gb", None),
         volume_gb=getattr(app, "volume_gb", None),
         provider_id=None if redacted else getattr(app, "provider_id", None),
+        storage_id=None if redacted else getattr(app, "storage_id", None),
         mode=getattr(app, "mode", "single") or "single",
         models=members,
         sleep_level=int(getattr(app, "sleep_level", 1) or 1),
@@ -510,6 +514,27 @@ async def lifespan(app: FastAPI):
     app.state.bench_janitor_task = None
     app.state.compute_idle_task = None
     app.state.gitops_task = None
+    app.state.log_archive_task = None
+
+    # Backfill the log-archive Redis mirror (app:{id}:log_storage_id) from the DB
+    # so the /workers/logs hot path can decide to archive without a DB hit. The
+    # setter keeps it fresh after this; this covers apps configured while the
+    # gateway was down. Then start the flusher that ships buffered logs to S3.
+    try:
+        from sqlalchemy import select as _select_apps
+        async with session_factory()() as _s:
+            rows = (await _s.execute(
+                _select_apps(App.app_id, App.storage_id).where(App.storage_id.isnot(None))
+            )).all()
+        for _aid, _sid in rows:
+            await app.state.redis.set(f"app:{_aid}:log_storage_id", _sid)
+        if rows:
+            logger.info("log-archive: mirrored %d app→storage binding(s) to redis", len(rows))
+    except Exception:  # noqa: BLE001 — non-fatal; setter still maintains the mirror
+        logger.warning("log-archive: redis mirror backfill failed (non-fatal)", exc_info=True)
+    app.state.log_archive_task = asyncio.create_task(
+        log_archive.flusher_loop(session_factory(), app.state.redis)
+    )
     if os.environ.get("BENCHMARK_S3_BUCKET", "").strip():
         # Materialize SSH key from env (prod) before anything else uses it.
         bench_module.bootstrap_ssh_key_from_env()
@@ -649,7 +674,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task_attr in ("autoscaler_task", "reconciler_task", "vm_watchdog_task", "bench_janitor_task", "compute_idle_task", "gitops_task", "proxy_healthcheck_task"):
+        for task_attr in ("autoscaler_task", "reconciler_task", "vm_watchdog_task", "bench_janitor_task", "compute_idle_task", "gitops_task", "proxy_healthcheck_task", "log_archive_task"):
             t = getattr(app.state, task_attr, None)
             if t:
                 t.cancel()
@@ -713,7 +738,15 @@ async def metrics_mw(request: Request, call_next):
     try:
         resp = await call_next(request)
         status_code = resp.status_code
-        resp.headers["x-request-id"] = request_id
+        # A route handler may have already set its OWN X-Request-Id — the proxy's
+        # `pxr-…` id, or the serverless queue's actual `req-…` id. That's the
+        # ACTIONABLE id (it matches the stored request row the queue tab filters by),
+        # so keep it and log THAT; only mint one when the route didn't set any.
+        existing = resp.headers.get("x-request-id")
+        if existing:
+            request_id = existing
+        else:
+            resp.headers["x-request-id"] = request_id
         return resp
     finally:
         elapsed = time.perf_counter() - start
@@ -1916,6 +1949,67 @@ async def get_app_endpoint(
         prov = await session.get(Provider, app.provider_id)
         if prov is not None:
             rec.provider_name = prov.name
+    # Resolve the log-archive storage's human name for the Logs tab.
+    if not redacted and getattr(app, "storage_id", None):
+        from .db import Storage
+        store = await session.get(Storage, app.storage_id)
+        if store is not None:
+            rec.storage_name = store.name
+    return rec
+
+
+class SetLogStorageRequest(BaseModel):
+    # The kind="s3" Storage to archive logs to. None / "" clears it → Redis-only.
+    storage_id: Optional[str] = None
+
+
+@app.patch("/apps/{app_id}/log-storage", response_model=AppRecord)
+async def set_app_log_storage(
+    app_id: str,
+    body: SetLogStorageRequest,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Set (or clear) the endpoint's persistent log-archive storage. When set to a
+    kind="s3" Storage, the gateway archives every worker/model log line there
+    uncapped (vs the default Redis 5000-line/1h cap). Clearing it (storage_id null
+    /empty) stops archival; existing Redis logs keep their normal TTL. We mirror
+    the choice to Redis so the log-ingest hot path can check it without a DB hit."""
+    app = await _load_owned_app(session, app_id, user)
+    sid = (body.storage_id or "").strip() or None
+    store_name: Optional[str] = None
+    if sid is not None:
+        from .db import Storage
+        store = await session.get(Storage, sid)
+        if store is None:
+            raise HTTPException(status_code=404, detail="storage not found")
+        if store.owner_id != user.id and not user.is_admin:
+            raise HTTPException(status_code=403, detail="not your storage")
+        if store.kind != "s3":
+            raise HTTPException(
+                status_code=400,
+                detail="log archival currently supports only s3-compatible storage",
+            )
+        if not getattr(store, "enabled", True):
+            raise HTTPException(status_code=400, detail="that storage is disabled")
+        store_name = store.name
+    app.storage_id = sid
+    await session.commit()
+    await session.refresh(app)
+    # Mirror to Redis for the /workers/logs hot path (delete = no archival).
+    rdb = request.app.state.redis
+    if sid:
+        await rdb.set(f"app:{app_id}:log_storage_id", sid)
+    else:
+        await rdb.delete(f"app:{app_id}:log_storage_id")
+    await audit_module.record(
+        user, "inference.log_storage", "app", app_id, app_id,
+        details={"storage_id": sid},
+    )
+    logger.info("log-archive storage set app=%s storage=%s by user=%s", app_id, sid, user.username)
+    rec = _to_app_record(app)
+    rec.storage_name = store_name
     return rec
 
 
@@ -2160,6 +2254,185 @@ async def get_app_model_log_sessions(
         crash = await rdb.get(f"wlog_crash:{app_id}:{slug}:{s}")
         out.append({"session": s, "started_at": iso, "lines": n, "crash": crash})
     return {"app_id": app.app_id, "model": model, "sessions": out}
+
+
+def _parse_log_file_id(file_id: str) -> tuple[str, str]:
+    """A log file id is "{slug}:{session}". slug is _logs_slug output (no ':'),
+    session is "YYYYMMDD-HHMMSS", so split on the last ':'."""
+    if ":" not in file_id:
+        raise HTTPException(status_code=400, detail="bad log file id")
+    slug, sess = file_id.rsplit(":", 1)
+    if not slug or not sess:
+        raise HTTPException(status_code=400, detail="bad log file id")
+    return slug, sess
+
+
+def _slug_to_source(app: App, slug: str) -> str:
+    """Best-effort display label (model name / "__worker__") for a slug."""
+    if slug == _logs_slug("__worker__"):
+        return "__worker__"
+    for m in (getattr(app, "models", None) or []):
+        name = m.get("model")
+        if name and _logs_slug(name) == slug:
+            return name
+    return slug
+
+
+@app.get("/apps/{app_id}/logs/files")
+async def list_app_log_files(
+    app_id: str,
+    request: Request,
+    source: Optional[str] = None,
+    q: Optional[str] = None,
+    sort: str = "started_desc",
+    limit: int = 10,
+    offset: int = 0,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Paginated/searchable list of an endpoint's log files (one per launch
+    session per source). When the app has an s3 log-archive storage, this reads
+    the durable ServerlessLogArchive index (scales to thousands of files). With
+    no storage it falls back to the Redis session buckets (capped, 1h TTL) for
+    the app's configured members + the worker-agent log."""
+    app = await _load_owned_app(session, app_id, user)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    asc = sort == "started_asc"
+    rdb = request.app.state.redis
+
+    if getattr(app, "storage_id", None):
+        from sqlalchemy import select as _sel, func as _func
+        from .db import ServerlessLogArchive
+        base = _sel(ServerlessLogArchive).where(ServerlessLogArchive.app_id == app_id)
+        if source:
+            base = base.where(ServerlessLogArchive.slug == _logs_slug(source))
+        if q:
+            base = base.where(ServerlessLogArchive.model.ilike(f"%{q}%"))
+        total = (await session.execute(
+            _sel(_func.count()).select_from(base.subquery())
+        )).scalar_one()
+        order = (ServerlessLogArchive.started_at.asc() if asc
+                 else ServerlessLogArchive.started_at.desc())
+        rows = (await session.execute(
+            base.order_by(order).offset(offset).limit(limit)
+        )).scalars().all()
+        now = datetime.now(timezone.utc)
+        files = [{
+            "id": f"{r.slug}:{r.session}",
+            "source": r.model, "slug": r.slug, "session": r.session,
+            "started_at": r.started_at.isoformat() if r.started_at else "",
+            "bytes": int(r.bytes or 0), "lines": int(r.lines or 0),
+            "crash": r.crash, "archived": True,
+            "live": bool(r.updated_at and (now - r.updated_at).total_seconds() < 60),
+        } for r in rows]
+        return {"files": files, "total": int(total), "archived": True}
+
+    # Redis-only fallback: enumerate the app's members + worker-agent log.
+    members: list[tuple[str, str]] = [
+        (m.get("model"), _logs_slug(m.get("model")))
+        for m in (getattr(app, "models", None) or []) if m.get("model")
+    ]
+    members.append(("__worker__", _logs_slug("__worker__")))
+    want_slug = _logs_slug(source) if source else None
+    ql = q.lower() if q else None
+    items: list[dict] = []
+    for model_name, slug in members:
+        if want_slug and slug != want_slug:
+            continue
+        if ql and ql not in (model_name or "").lower():
+            continue
+        sessions = await rdb.zrevrange(f"wlog_sessions:{app_id}:{slug}", 0, 199)
+        for s in sessions:
+            n = await rdb.llen(f"wlog:{app_id}:{slug}:{s}")
+            crash = await rdb.get(f"wlog_crash:{app_id}:{slug}:{s}")
+            items.append({
+                "id": f"{slug}:{s}", "source": model_name, "slug": slug, "session": s,
+                "started_at": log_archive.session_to_dt(s).isoformat(),
+                "bytes": None, "lines": int(n or 0), "crash": crash,
+                "archived": False, "live": False,
+            })
+    items.sort(key=lambda x: x["session"], reverse=not asc)
+    total = len(items)
+    return {"files": items[offset:offset + limit], "total": total, "archived": False}
+
+
+@app.get("/apps/{app_id}/logs/files/{file_id}")
+async def get_app_log_file(
+    app_id: str,
+    file_id: str,
+    request: Request,
+    tail: int = 0,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Full (or tailed) content of one log file. Reads the durable storage parts
+    when archived, else the Redis session buffer."""
+    app = await _load_owned_app(session, app_id, user)
+    slug, sess = _parse_log_file_id(file_id)
+    from sqlalchemy import select as _sel
+    from .db import ServerlessLogArchive, Storage
+    row = (await session.execute(
+        _sel(ServerlessLogArchive).where(
+            ServerlessLogArchive.app_id == app_id,
+            ServerlessLogArchive.slug == slug,
+            ServerlessLogArchive.session == sess,
+        )
+    )).scalar_one_or_none()
+    if row is not None:
+        store = await session.get(Storage, row.storage_id)
+        if store is not None:
+            backend = log_archive.backend_for_storage(store)
+            text = await log_archive.read_all_text(backend, row.key_prefix)
+            lines = text.splitlines()
+            if tail and tail > 0:
+                lines = lines[-tail:]
+            return {"lines": lines, "count": len(lines), "archived": True,
+                    "session": sess, "source": row.model, "crash": row.crash}
+    rdb = request.app.state.redis
+    cap = tail if (tail and tail > 0) else WORKER_LOGS_CAP
+    raw = await rdb.lrange(f"wlog:{app_id}:{slug}:{sess}", 0, cap - 1)
+    lines = list(reversed(raw))
+    crash = await rdb.get(f"wlog_crash:{app_id}:{slug}:{sess}")
+    return {"lines": lines, "count": len(lines), "archived": False,
+            "session": sess, "source": _slug_to_source(app, slug), "crash": crash}
+
+
+@app.get("/apps/{app_id}/logs/files/{file_id}/download")
+async def download_app_log_file(
+    app_id: str,
+    file_id: str,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Download a log file as a single attachment — concatenated storage parts
+    (archived) or the Redis buffer (fallback)."""
+    app = await _load_owned_app(session, app_id, user)
+    slug, sess = _parse_log_file_id(file_id)
+    fname = f"{app_id}-{slug}-{sess}.log"
+    disp = {"Content-Disposition": f'attachment; filename="{fname}"'}
+    from sqlalchemy import select as _sel
+    from .db import ServerlessLogArchive, Storage
+    row = (await session.execute(
+        _sel(ServerlessLogArchive).where(
+            ServerlessLogArchive.app_id == app_id,
+            ServerlessLogArchive.slug == slug,
+            ServerlessLogArchive.session == sess,
+        )
+    )).scalar_one_or_none()
+    if row is not None:
+        store = await session.get(Storage, row.storage_id)
+        if store is not None:
+            backend = log_archive.backend_for_storage(store)
+            return StreamingResponse(
+                log_archive.iter_parts_bytes(backend, row.key_prefix),
+                media_type="application/octet-stream", headers=disp,
+            )
+    rdb = request.app.state.redis
+    raw = await rdb.lrange(f"wlog:{app_id}:{slug}:{sess}", 0, WORKER_LOGS_CAP - 1)
+    body = ("\n".join(reversed(raw)) + "\n").encode("utf-8", "replace")
+    return Response(content=body, media_type="application/octet-stream", headers=disp)
 
 
 @app.post("/apps/{app_id}/model-action")
@@ -3446,7 +3719,13 @@ async def list_app_requests(
     user: User = Depends(require_section("inference")),
     session: AsyncSession = Depends(get_session),
     limit: int = 50,
+    offset: int = 0,
     status_filter: Optional[str] = None,
+    owner: Optional[str] = None,
+    model: Optional[str] = None,
+    request_id: Optional[str] = None,
+    sort: str = "created",   # created | latency | ttft
+    order: str = "desc",     # asc | desc
 ):
     """Recent requests for an app, newest first. Owner-scoped (admin sees all).
     Reconciles unsettled rows against Redis on the way out so the queue UI shows
@@ -3456,11 +3735,31 @@ async def list_app_requests(
     isn't cancelled by the client's 504). The Redis result lives ~1h, which bounds
     which rows can still be upgraded."""
     app = await _load_owned_app(session, app_id, user)
-    from sqlalchemy import select, desc
+    from sqlalchemy import select, desc, asc, func
     from datetime import datetime, timezone, timedelta
-    stmt = select(ReqRow).where(ReqRow.app_id == app_id).order_by(desc(ReqRow.created_at)).limit(min(limit, 200))
-    if status_filter:
-        stmt = stmt.where(ReqRow.status == status_filter)
+    stmt = select(ReqRow).where(ReqRow.app_id == app_id)
+    if request_id:
+        # Direct primary-key lookup — finds the request anywhere in the FULL history
+        # (not just the 200-row page); other filters/sort don't apply to a unique id.
+        stmt = stmt.where(ReqRow.request_id == request_id)
+    else:
+        if status_filter:
+            stmt = stmt.where(ReqRow.status == status_filter)
+        if owner:
+            ou = await get_user_by_username(session, owner)
+            stmt = stmt.where(ReqRow.owner_id == (ou.id if ou else -1))  # -1 matches nothing
+        if model:
+            stmt = stmt.where(func.json_extract_path_text(ReqRow.payload, "model") == model)
+        if sort == "latency":
+            # serverless latency = completed_at - created_at (no stored column); NULLs (still
+            # running / never settled) sort last so the slowest completed rows lead.
+            latcol = ReqRow.completed_at - ReqRow.created_at
+            stmt = stmt.order_by(latcol.asc().nulls_last() if order == "asc" else latcol.desc().nulls_last())
+        elif sort == "ttft":
+            stmt = stmt.order_by(ReqRow.ttft_ms.asc().nulls_last() if order == "asc" else ReqRow.ttft_ms.desc().nulls_last())
+        else:
+            stmt = stmt.order_by(asc(ReqRow.created_at) if order == "asc" else desc(ReqRow.created_at))
+        stmt = stmt.offset(max(0, offset)).limit(min(limit, 200))
     result = await session.execute(stmt)
     rows = list(result.scalars().all())
 
@@ -3510,6 +3809,31 @@ async def list_app_requests(
         umap = {u.id: u.username for u in urows.scalars().all()}
 
     return [_to_request_record(r, umap.get(r.owner_id)) for r in rows]
+
+
+@app.get("/apps/{app_id}/request-facets")
+async def app_request_facets(
+    app_id: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Distinct users + models seen on this endpoint — to populate the queue tab's
+    filter dropdowns server-side (covers the full retained history, not one page)."""
+    app = await _load_owned_app(session, app_id, user)
+    from sqlalchemy import select, func
+    oids = [o for o in (await session.execute(
+        select(ReqRow.owner_id).where(ReqRow.app_id == app_id).distinct()
+    )).scalars().all() if o is not None]
+    users: list[str] = []
+    if oids:
+        from .db import User as _User
+        users = sorted(u.username for u in (await session.execute(
+            select(_User).where(_User.id.in_(oids)))).scalars().all())
+    mcol = func.json_extract_path_text(ReqRow.payload, "model")
+    models = sorted({m for m in (await session.execute(
+        select(mcol).where(ReqRow.app_id == app_id).distinct()
+    )).scalars().all() if m})
+    return {"users": users, "models": models}
 
 
 def _worker_meta_from_result(raw: dict) -> Optional[dict]:
@@ -3960,7 +4284,9 @@ async def _openai_endpoint(
                 if status == "completed":
                     async with session_factory()() as s:
                         await _mirror_status_to_db(s, request_id, "completed", raw.get("output"), worker_meta=_worker_meta_from_result(raw))
-                    return raw.get("output", {})
+                    # Surface the queue request_id so callers can correlate / filter
+                    # by it later (the streamed paths already set this header).
+                    return JSONResponse(content=raw.get("output", {}), headers={"X-Request-Id": request_id})
                 if status in ("timeout", "cancelled", "failed"):
                     async with session_factory()() as s:
                         await _mirror_status_to_db(s, request_id, status, raw.get("output"), worker_meta=_worker_meta_from_result(raw))
@@ -4226,7 +4552,7 @@ async def _openai_audio_endpoint(
             status = raw.get("status")
             if status == "completed":
                 await _mirror_status_to_db(db_session, request_id, "completed", raw.get("output"), worker_meta=_worker_meta_from_result(raw))
-                return raw.get("output", {})
+                return JSONResponse(content=raw.get("output", {}), headers={"X-Request-Id": request_id})
             if status in ("timeout", "cancelled", "failed"):
                 await _mirror_status_to_db(db_session, request_id, status, raw.get("output"), worker_meta=_worker_meta_from_result(raw))
                 raise HTTPException(status_code=504, detail=raw.get("output"))
@@ -4450,6 +4776,14 @@ async def ingest_worker_logs(req: WorkerLogsRequest, request: Request):
         score = float(digits) if digits.isdigit() else 0.0  # "YYYYMMDD-HHMMSS" sorts chronologically
         await rdb.zadd(idx, {req.session: score})
         await rdb.expire(idx, WLOG_SESSION_TTL)
+        # Persistent archival (uncapped) when this endpoint has an s3 log-archive
+        # storage set. The mirror key is maintained by the log-storage setter +
+        # startup backfill, so this stays a single Redis GET on the hot path.
+        storage_id = await rdb.get(f"app:{req.app_id}:log_storage_id")
+        if storage_id:
+            await log_archive.enqueue(
+                req.app_id, slug, req.source, req.session, storage_id, truncated,
+            )
     return {"ok": True, "stored": len(truncated)}
 
 

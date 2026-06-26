@@ -13,6 +13,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { WaveformPlayer } from "@/components/waveform-player";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
@@ -652,8 +658,15 @@ export function RowBrowser({
   const isLlm = !!(messagesField ?? "").trim();
   const [limit, setLimit] = useState(initial.limit && initial.limit > 0 ? initial.limit : 20);
   const [offset, setOffset] = useState(initial.offset ?? 0);
-  const [split, setSplit] = useState<string | null>(initial.split ?? null);
+  // Subsets (HF splits) are a MULTISELECT: pick several and the rows are merged
+  // into one paged list (combined total) server-side. initial.split may be a
+  // comma-joined list (shareable URL). Empty = the dataset's first split (default).
+  const [selected, setSelected] = useState<string[]>(
+    (initial.split ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  );
   const [splits] = useState<string[]>(initial.splits ?? []);
+  const splitKey = selected.join(",");
+  const multiSubset = selected.length > 1;
   // Speaker filter (S3/upload datasets with a speaker column). The list is
   // per-split, so it's refreshed from each fetch.
   const [speaker, setSpeaker] = useState<string | null>(initial.speaker ?? null);
@@ -741,14 +754,14 @@ export function RowBrowser({
       const q = new URLSearchParams(window.location.search);
       q.set("offset", String(offset));
       q.set("limit", String(limit));
-      if (split) q.set("split", split);
+      if (splitKey) q.set("split", splitKey);
       else q.delete("split");
       if (speaker) q.set("speaker", speaker);
       else q.delete("speaker");
       window.history.replaceState(null, "", `${window.location.pathname}?${q.toString()}`);
     }
-    void fetchPage(offset, limit, split, speaker);
-  }, [offset, limit, split, speaker, fetchPage]);
+    void fetchPage(offset, limit, splitKey, speaker);
+  }, [offset, limit, splitKey, speaker, fetchPage]);
 
   const from = total === 0 ? 0 : offset + 1;
   const to = offset + rows.length;
@@ -778,25 +791,40 @@ export function RowBrowser({
         </div>
         <div className="flex items-center gap-2">
           {splits.length > 1 && (
-            <Select
-              value={split ?? splits[0]}
-              onValueChange={(v) => {
-                setOffset(0);
-                setSpeaker(null); // speaker lists are per-split; reset on split change
-                setSplit(v);
-              }}
-            >
-              <SelectTrigger className="h-8 w-[130px] text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="h-8 text-xs font-normal">
+                  {selected.length === 0
+                    ? `subset: ${splits[0]}`
+                    : selected.length === 1
+                      ? `subset: ${selected[0]}`
+                      : `${selected.length} subsets`}
+                  <ChevronDown className="ml-1 h-3.5 w-3.5 opacity-60" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="max-h-72 overflow-y-auto">
                 {splits.map((s) => (
-                  <SelectItem key={s} value={s} className="text-xs">
-                    split: {s}
-                  </SelectItem>
+                  <DropdownMenuCheckboxItem
+                    key={s}
+                    checked={selected.includes(s)}
+                    // keep the menu open so several subsets can be ticked in one go
+                    onSelect={(e) => e.preventDefault()}
+                    onCheckedChange={(c) => {
+                      setOffset(0);
+                      setSpeaker(null); // speaker lists are per-split; reset on change
+                      setSelected((prev) => {
+                        const next = c ? [...prev, s] : prev.filter((x) => x !== s);
+                        // keep selection in the dataset's split order (stable merge order)
+                        return splits.filter((x) => next.includes(x));
+                      });
+                    }}
+                    className="text-xs"
+                  >
+                    {s}
+                  </DropdownMenuCheckboxItem>
                 ))}
-              </SelectContent>
-            </Select>
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
           {speakers.length > 1 && (
             <Select
@@ -853,15 +881,27 @@ export function RowBrowser({
                 <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
               </div>
             )}
-            {rows.map((r, i) =>
-              r.packed === true ? (
-                <PackedRowItem key={offset + i} datasetId={datasetId} index={offset + i} row={r} split={split} decoder={decoder} />
+            {rows.map((r, i) => {
+              // In merged multi-subset view, tag each row with which subset it came from.
+              const rowSplit = typeof r.__split === "string" ? r.__split : null;
+              const item = r.packed === true ? (
+                <PackedRowItem datasetId={datasetId} index={offset + i} row={r} split={rowSplit ?? selected[0] ?? null} decoder={decoder} />
               ) : isLlm ? (
-                <LlmRowItem key={offset + i} index={offset + i} row={r} messagesField={messagesField ?? "messages"} />
+                <LlmRowItem index={offset + i} row={r} messagesField={messagesField ?? "messages"} />
               ) : (
-                <RowItem key={offset + i} index={offset + i} row={r} onToggle={setIncluded} speakerField={speakerField} />
-              ),
-            )}
+                <RowItem index={offset + i} row={r} onToggle={setIncluded} speakerField={speakerField} />
+              );
+              return (
+                <div key={offset + i} className="space-y-1">
+                  {multiSubset && rowSplit && (
+                    <span className="inline-block rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                      subset: {rowSplit}
+                    </span>
+                  )}
+                  {item}
+                </div>
+              );
+            })}
           </div>
         )}
 

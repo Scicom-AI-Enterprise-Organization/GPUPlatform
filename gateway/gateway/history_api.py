@@ -756,6 +756,8 @@ class ActivityResponse(BaseModel):
     top_users: list[dict]
     by_model_bucket: list[dict]
     by_user_bucket: list[dict]
+    by_upstream_bucket: list[dict]  # proxy-only: requests per bucket, by upstream
+    all_models: list[str]           # every model seen in the window, pre-filter (for the picker)
     note: str
 
 
@@ -794,11 +796,13 @@ async def _activity_records(session, s_dt, u_dt):
         lat = (int((r.completed_at - r.created_at).total_seconds() * 1000)
                if (r.status == "completed" and r.completed_at and r.created_at) else None)
         model = r.model or app_model.get(r.app_id) or "(unknown)"
+        # serverless requests aren't proxied → no upstream.
         recs.append((r.owner_id, r.created_at, model, "serverless",
-                     _int(r.tin) or 0, _int(r.tout) or 0, r.ttft_ms, lat))
+                     _int(r.tin) or 0, _int(r.tout) or 0, r.ttft_ms, lat, None))
     for r in px_rows:
         recs.append((r.owner_id, r.created_at, (r.model or "(unknown)"), "proxy",
-                     r.prompt_tokens or 0, r.completion_tokens or 0, r.ttft_ms, r.latency_ms))
+                     r.prompt_tokens or 0, r.completion_tokens or 0, r.ttft_ms, r.latency_ms,
+                     r.upstream or "(unknown)"))
     return recs, (len(sv_rows) >= _ACTIVITY_CAP or len(px_rows) >= _ACTIVITY_CAP)
 
 
@@ -810,22 +814,30 @@ async def history_activity(
     tz: str = Query("UTC", description="IANA timezone for bucketing"),
     granularity: str = Query("hour", pattern="^(15min|hour|day)$", description="time bucket size"),
     top: int = Query(10, ge=1, le=50, description="how many top users / models to return"),
+    models: Optional[list[str]] = Query(None, description="filter to these model names (repeatable); omit for all"),
 ):
     from collections import defaultdict
     tzinfo = _tzinfo(tz)
     s_dt = _parse_dt(since, "since") or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_WINDOW_DAYS))
     u_dt = _parse_dt(until, "until")
     recs, capped = await _activity_records(session, s_dt, u_dt)
+    # The picker lists every model in the window; compute it before the filter narrows recs.
+    all_models = sorted({r[2] for r in recs}, key=str.lower)
+    if models:
+        wanted = set(models)
+        recs = [r for r in recs if r[2] in wanted]
 
     bkt = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
                                "_ts": 0, "_tn": 0, "_ls": 0, "_ln": 0})  # ttft/latency sum+count
     by_model = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
     by_user = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
+    by_upstream = defaultdict(lambda: {"requests": 0, "tokens": 0})  # proxy-only
     model_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})
     user_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})
+    upstream_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})  # proxy-only
     ttfts, lats = [], []
     sum_pin = sum_pout = 0
-    for (oid, ts, model, _src, pin, pout, ttft, lat) in recs:
+    for (oid, ts, model, src, pin, pout, ttft, lat, upstream) in recs:
         sum_pin += pin; sum_pout += pout
         k = _bucket_key(ts, tzinfo, granularity)
         b = bkt[k]; b["requests"] += 1; b["prompt_tokens"] += pin; b["completion_tokens"] += pout
@@ -835,6 +847,9 @@ async def history_activity(
         u = by_user[oid]; u["requests"] += 1; u["prompt_tokens"] += pin; u["completion_tokens"] += pout
         mb = model_bkt[(k, model)]; mb["requests"] += 1; mb["tokens"] += pin + pout
         ub = user_bkt[(k, oid)]; ub["requests"] += 1; ub["tokens"] += pin + pout
+        if src == "proxy":  # upstream only exists for proxied requests
+            bu = by_upstream[upstream]; bu["requests"] += 1; bu["tokens"] += pin + pout
+            upb = upstream_bkt[(k, upstream)]; upb["requests"] += 1; upb["tokens"] += pin + pout
 
     umap = await _user_map(session, list(by_user.keys()))
     top_models = sorted(by_model.items(), key=lambda kv: kv[1]["requests"], reverse=True)[:top]
@@ -851,6 +866,14 @@ async def history_activity(
     for (k, oid), v in user_bkt.items():
         name = _username(umap, oid) if oid in top_oids else "other"
         ub2[(k, name)]["requests"] += v["requests"]; ub2[(k, name)]["tokens"] += v["tokens"]
+
+    # Per-bucket proxy requests by upstream — top-N upstreams by request count, rest → "other".
+    top_up_names = {k for k, _ in sorted(
+        by_upstream.items(), key=lambda kv: kv[1]["requests"], reverse=True)[:top]}
+    upb2 = defaultdict(lambda: {"requests": 0, "tokens": 0})
+    for (k, ups), v in upstream_bkt.items():
+        name = ups if ups in top_up_names else "other"
+        upb2[(k, name)]["requests"] += v["requests"]; upb2[(k, name)]["tokens"] += v["tokens"]
 
     def _bo(k, v):
         return {"bucket": k, "requests": v["requests"], "prompt_tokens": v["prompt_tokens"],
@@ -871,6 +894,8 @@ async def history_activity(
         top_users=[{"user": _username(umap, oid), "owner_id": oid, **v} for oid, v in top_user_items],
         by_model_bucket=[{"bucket": d, "model": m, **vv} for (d, m), vv in sorted(mb2.items())],
         by_user_bucket=[{"bucket": d, "user": u, **vv} for (d, u), vv in sorted(ub2.items())],
+        by_upstream_bucket=[{"bucket": d, "upstream": u, **vv} for (d, u), vv in sorted(upb2.items())],
+        all_models=all_models,
         note=("Unified serverless + LLM-proxy usage. Tokens from vLLM `usage` (include_usage set "
               "on streams). TTFT recorded for streamed requests."
               + (" ⚠ window truncated at the scan cap." if capped else "")))

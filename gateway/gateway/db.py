@@ -154,6 +154,10 @@ class App(Base):
     # API surface is stable and we can backfill the resolver wiring later
     # without a second migration.
     provider_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    # Persistent log-archive storage (a kind="s3" Storage row) for worker/model
+    # logs. NULL = no archival → logs stay in Redis with the 5000-line cap and 1h
+    # TTL (the default). When set, every log line is archived uncapped to S3.
+    storage_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     # Serving mode. "single" = one model per endpoint (the original behaviour).
     # "multi" = a fleet of vLLM servers on one VM, model-routed with vLLM
     # sleep/wake eviction. Multi requires a kind="vm" provider_id.
@@ -309,6 +313,44 @@ class Storage(Base):
     config: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class ServerlessLogArchive(Base):
+    """Index of a serverless endpoint's persisted log files (one row per launch
+    session per source). Populated by the gateway's log-archive flusher when an
+    app has a log-archive `storage_id` set; the actual log bytes live in that
+    storage under `serverless-logs/{app_id}/{slug}/{session}/{seq}.log` parts.
+
+    This table is the searchable/paginated index the Logs tab browses — it
+    scales to thousands of files where the Redis session list (capped, 1h TTL)
+    does not. One file = one (app_id, slug, session).
+    """
+    __tablename__ = "serverless_log_archive"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # slog-<hex>
+    app_id: Mapped[str] = mapped_column(String(64), index=True)
+    storage_id: Mapped[str] = mapped_column(String(64))
+    # _logs_slug(source); "__worker__" for the worker-agent scheduler log.
+    slug: Mapped[str] = mapped_column(String(128), index=True)
+    # Human label: the served model name, or "__worker__" for the agent log.
+    model: Mapped[str] = mapped_column(String(255))
+    # Per-launch timestamp "YYYYMMDD-HHMMSS" — the unit the worker tags batches by.
+    session: Mapped[str] = mapped_column(String(32))
+    # Object-key prefix for this file's parts (within the storage's own root).
+    key_prefix: Mapped[str] = mapped_column(String(1024))
+    next_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    lines: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    # Crash reason for this launch (mirrored from wlog_crash:*), NULL if clean.
+    crash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    __table_args__ = (
+        UniqueConstraint("app_id", "slug", "session", name="uq_slog_app_slug_session"),
     )
 
 
@@ -694,6 +736,9 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE proxy_requests ADD COLUMN IF NOT EXISTS ttft_ms INTEGER"
         ))
+        # NOTE: the queue-history indexes on the high-volume requests/proxy_requests
+        # tables are built CONCURRENTLY *after* this transaction (see below) so they
+        # never take an ACCESS EXCLUSIVE lock during startup on a large prod table.
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_args VARCHAR(2048) NOT NULL DEFAULT ''"
         ))
@@ -753,6 +798,13 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_install_args TEXT"
+        ))
+        # Per-endpoint log-archive storage (a kind=s3 Storage). NULL = Redis-only.
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS storage_id VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_apps_storage_id ON apps(storage_id)"
         ))
         await conn.execute(text(
             "ALTER TABLE benchmark_shares ADD COLUMN IF NOT EXISTS pairing JSON"
@@ -953,6 +1005,31 @@ async def init_db() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_gitops_resources_repo_kind_name "
             "ON gitops_resources(repo_id, kind, name)"
         ))
+
+    # Queue-history indexes on the HIGH-VOLUME, now-indefinitely-retained request
+    # tables — built CONCURRENTLY in autocommit (OUTSIDE the txn above) so they take
+    # no ACCESS EXCLUSIVE lock: a large prod `requests`/`proxy_requests` stays
+    # readable/writable while the index builds. Each runs in its own implicit txn
+    # (CONCURRENTLY can't run inside one); `IF NOT EXISTS` makes it a no-op once
+    # built, and a failure (e.g. a leftover INVALID index) is logged, not fatal.
+    _conc_indexes = (
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_endpoint_created ON proxy_requests (endpoint_id, created_at DESC)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_endpoint_latency ON proxy_requests (endpoint_id, latency_ms)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_owner ON proxy_requests (owner_id)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_upstream ON proxy_requests (endpoint_id, upstream)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requests_app_created ON requests (app_id, created_at DESC)",
+    )
+    import logging as _logging
+    # AUTOCOMMIT engine variant (AsyncEngine.execution_options is sync, returns an
+    # engine) → each statement runs outside a txn, which CONCURRENTLY requires.
+    _ac_engine = _engine.execution_options(isolation_level="AUTOCOMMIT")
+    async with _ac_engine.connect() as conn:
+        for _ix in _conc_indexes:
+            try:
+                await conn.execute(text(_ix))
+            except Exception:
+                _logging.getLogger("gateway.db").warning(
+                    "concurrent index build skipped: %s", _ix.split(" ON ")[0], exc_info=True)
 
 
 async def seed_admin_user() -> None:

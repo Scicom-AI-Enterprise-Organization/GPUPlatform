@@ -1315,6 +1315,70 @@ def _hf_preview_rows(
         return [r.get("row", {}) for r in body.get("rows", [])], total, ident(chosen), names
 
 
+def _hf_preview_rows_multi(
+    hf_repo: str, token: Optional[str], limit: int, offset: int, want: list[str],
+    revision: Optional[str] = None,
+) -> tuple[list[dict[str, Any]], Optional[int], Optional[str], list[str]]:
+    """Like `_hf_preview_rows` but reads ACROSS several splits, concatenated in the
+    dataset's split order with a COMBINED total — so the row browser pages through
+    multiple subsets as one list. Each row is tagged `__split`. `want` = selected
+    split idents (empty / no match → the first split). Costs one extra count probe
+    per selected split, then one /rows call per split the page window spans."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    rev = {"revision": revision} if revision else {}
+    with httpx.Client(timeout=20.0) as cli:
+        sp = cli.get(
+            "https://datasets-server.huggingface.co/splits",
+            params={"dataset": hf_repo, **rev}, headers=headers,
+        )
+        sp.raise_for_status()
+        splits = sp.json().get("splits", [])
+        if not splits:
+            return [], 0, None, []
+        ident = _hf_split_ident(splits)
+        names = [ident(s) for s in splits]
+        wanted = set(want or [])
+        chosen = [s for s in splits if ident(s) in wanted] or [splits[0]]
+
+        def _count(s: dict) -> int:
+            rr = cli.get(
+                "https://datasets-server.huggingface.co/rows",
+                params={"dataset": hf_repo, "config": s["config"], "split": s["split"],
+                        "offset": 0, "length": 1, **rev}, headers=headers,
+            )
+            rr.raise_for_status()
+            return int(rr.json().get("num_rows_total") or 0)
+
+        totals = [_count(s) for s in chosen]
+        combined = sum(totals)
+        out: list[dict[str, Any]] = []
+        need = limit
+        start = 0  # running global start index of the current split
+        for s, tot in zip(chosen, totals):
+            if need <= 0:
+                break
+            s_start, s_end = start, start + tot
+            start = s_end
+            if offset >= s_end or offset + limit <= s_start:
+                continue  # page window doesn't intersect this split
+            local_off = max(0, offset - s_start)
+            take = min(need, tot - local_off, 100)
+            if take <= 0:
+                continue
+            rr = cli.get(
+                "https://datasets-server.huggingface.co/rows",
+                params={"dataset": hf_repo, "config": s["config"], "split": s["split"],
+                        "offset": local_off, "length": take, **rev}, headers=headers,
+            )
+            rr.raise_for_status()
+            for item in rr.json().get("rows", []):
+                row = item.get("row", {})
+                row["__split"] = ident(s)
+                out.append(row)
+            need -= take
+        return out, combined, ",".join(ident(s) for s in chosen), names
+
+
 def _hf_split_columns(hf_repo: str, token: Optional[str], revision: Optional[str] = None) -> list[dict[str, Any]]:
     """Per-split column names + row counts for an HF dataset, from the HF
     datasets-server: `/splits` for the authoritative config/split list and
@@ -1654,12 +1718,22 @@ async def preview_dataset(
             if not d.hf_repo:
                 return _resp(rows=[], error="no hf_repo set")
             mf = getattr(d, "messages_field", None) or None  # None = not configured
-            raw, total, used_split, names = await _run_sync(
-                _hf_preview_rows, d.hf_repo, await _hf_token(storage, session), limit, offset, split,
-                d.hf_revision,
-            )
-            # Honour the per-split transcription mapping (e.g. test→after).
-            tcol = (d.split_fields or {}).get(used_split or "") or tf
+            tok = await _hf_token(storage, session)
+            # `split` may be a comma-separated list (the row browser's multiselect):
+            # >1 → read all of them merged into one paged list with a combined total.
+            sel = [s.strip() for s in (split or "").split(",") if s.strip()]
+            if len(sel) > 1:
+                raw, total, used_split, names = await _run_sync(
+                    _hf_preview_rows_multi, d.hf_repo, tok, limit, offset, sel, d.hf_revision,
+                )
+            else:
+                raw, total, used_split, names = await _run_sync(
+                    _hf_preview_rows, d.hf_repo, tok, limit, offset, (sel[0] if sel else None),
+                    d.hf_revision,
+                )
+            # Honour the per-split transcription mapping (e.g. test→after), per row in
+            # the merged case (each row carries its own `__split`).
+            sfmap = d.split_fields or {}
             # Source audio lives in a zip (no playable column). If it's been
             # materialised to S3, resolve audio by basename through the proxy.
             resolver = await _source_audio_resolver(session, d)
@@ -1678,6 +1752,7 @@ async def preview_dataset(
 
             rows = []
             for r in raw:
+                tcol = sfmap.get(r.get("__split") or used_split or "") or tf
                 row: dict[str, Any] = {
                     "audio_url": resolver(r.get(af)) if resolver else _audio_str(r.get(af)),
                     "transcription": r.get(tcol),

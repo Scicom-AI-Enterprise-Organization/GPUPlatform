@@ -83,6 +83,8 @@ import type {
   TestProxyUpstreamResult,
   ActivitySummary,
   ActivityLogsResponse,
+  LogFilesResponse,
+  LogFileContent,
 } from "./types";
 
 export type GpuAvailability = {
@@ -238,10 +240,21 @@ export const gateway = {
       `/apps/${encodeURIComponent(id)}/queue/flush`,
       { method: "POST" },
     ),
-  listAppRequests: (id: string, limit = 100) =>
-    request<GatewayRequestRecord[]>(
-      `/apps/${encodeURIComponent(id)}/requests?limit=${limit}`,
-    ),
+  listAppRequests: (
+    id: string,
+    opts: { limit?: number; owner?: string; model?: string; status?: string; sort?: string; order?: string; requestId?: string } = {},
+  ) => {
+    const q = new URLSearchParams({ limit: String(opts.limit ?? 100) });
+    if (opts.owner) q.set("owner", opts.owner);
+    if (opts.model) q.set("model", opts.model);
+    if (opts.status) q.set("status_filter", opts.status);
+    if (opts.sort) q.set("sort", opts.sort);
+    if (opts.order) q.set("order", opts.order);
+    if (opts.requestId) q.set("request_id", opts.requestId);
+    return request<GatewayRequestRecord[]>(`/apps/${encodeURIComponent(id)}/requests?${q.toString()}`);
+  },
+  getAppRequestFacets: (id: string) =>
+    request<{ users: string[]; models: string[] }>(`/apps/${encodeURIComponent(id)}/request-facets`),
   checkAvailability: (gpu: string, count = 1, cloudType?: "COMMUNITY" | "SECURE") => {
     const params = new URLSearchParams({ gpu, count: String(count) });
     if (cloudType) params.set("cloud_type", cloudType);
@@ -703,24 +716,67 @@ export const gateway = {
   getProxyHealth: (id: string) =>
     request<ProxyUpstreamHealth[]>(`/v1/proxy/${encodeURIComponent(id)}/health`),
   // ---- usage activity analytics (admin) ----
-  getActivity: (params: { since?: string; until?: string; tz?: string; granularity?: string; top?: number } = {}) => {
+  getActivity: (params: { since?: string; until?: string; tz?: string; granularity?: string; top?: number; models?: string[] } = {}) => {
     const q = new URLSearchParams();
     if (params.since) q.set("since", params.since);
     if (params.until) q.set("until", params.until);
     if (params.tz) q.set("tz", params.tz);
     if (params.granularity) q.set("granularity", params.granularity);
     if (params.top != null) q.set("top", String(params.top));
+    for (const m of params.models ?? []) q.append("models", m);
     const s = q.toString();
     return request<ActivitySummary>(`/v1/history/activity${s ? `?${s}` : ""}`);
   },
+  // ---- serverless endpoint logs (Logs tab) ----
+  // Set (storageId) or clear (null) the endpoint's s3 log-archive storage.
+  setLogStorage: (appId: string, storageId: string | null) =>
+    request<AppRecord>(`/apps/${encodeURIComponent(appId)}/log-storage`, {
+      method: "PATCH",
+      body: JSON.stringify({ storage_id: storageId }),
+    }),
+  listAppLogFiles: (
+    appId: string,
+    params: { source?: string; q?: string; sort?: string; limit?: number; offset?: number } = {},
+  ) => {
+    const p = new URLSearchParams();
+    if (params.source) p.set("source", params.source);
+    if (params.q) p.set("q", params.q);
+    if (params.sort) p.set("sort", params.sort);
+    if (params.limit != null) p.set("limit", String(params.limit));
+    if (params.offset != null) p.set("offset", String(params.offset));
+    const s = p.toString();
+    return request<LogFilesResponse>(`/apps/${encodeURIComponent(appId)}/logs/files${s ? `?${s}` : ""}`);
+  },
+  getAppLogFile: (appId: string, fileId: string, tail?: number) =>
+    request<LogFileContent>(
+      `/apps/${encodeURIComponent(appId)}/logs/files/${encodeURIComponent(fileId)}${tail ? `?tail=${tail}` : ""}`,
+    ),
+  // Browser download URL (anchor href) — goes through the cookie-auth proxy.
+  appLogFileDownloadUrl: (appId: string, fileId: string) =>
+    `/api/proxy/apps/${encodeURIComponent(appId)}/logs/files/${encodeURIComponent(fileId)}/download`,
   getActivityLogs: (params: { since?: string; until?: string; user?: string; source?: string; limit?: number; offset?: number } = {}) => {
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) if (v != null && v !== "") q.set(k, String(v));
     const s = q.toString();
     return request<ActivityLogsResponse>(`/v1/history/activity/logs${s ? `?${s}` : ""}`);
   },
-  getProxyRequests: (id: string, limit = 50) =>
-    request<ProxyRequest[]>(`/v1/proxy/${encodeURIComponent(id)}/requests?limit=${limit}`),
+  getProxyRequests: (
+    id: string,
+    opts: { limit?: number; owner?: string; upstream?: string; status?: string; sort?: string; order?: string; requestId?: string } = {},
+  ) => {
+    const q = new URLSearchParams({ limit: String(opts.limit ?? 50) });
+    if (opts.owner) q.set("owner", opts.owner);
+    if (opts.upstream) q.set("upstream", opts.upstream);
+    if (opts.status) q.set("status", opts.status);
+    if (opts.sort) q.set("sort", opts.sort);
+    if (opts.order) q.set("order", opts.order);
+    if (opts.requestId) q.set("request_id", opts.requestId);
+    return request<ProxyRequest[]>(`/v1/proxy/${encodeURIComponent(id)}/requests?${q.toString()}`);
+  },
+  getProxyRequestFacets: (id: string) =>
+    request<{ users: string[]; upstreams: string[] }>(
+      `/v1/proxy/${encodeURIComponent(id)}/request-facets`,
+    ),
   cancelProxyRequest: (id: string, reqId: string) =>
     request<{ ok: boolean; id: string }>(
       `/v1/proxy/${encodeURIComponent(id)}/requests/${encodeURIComponent(reqId)}/cancel`,

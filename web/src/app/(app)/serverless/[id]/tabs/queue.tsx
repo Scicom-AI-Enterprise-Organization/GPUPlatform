@@ -15,6 +15,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Pagination } from "@/components/ui/pagination";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -86,6 +87,15 @@ export function QueueTab({ app }: { app: AppRecord }) {
   const [confirmFlush, setConfirmFlush] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
+  // Server-side filters/sort over the full retained history (not just the page).
+  const [ownerF, setOwnerF] = useState("");
+  const [modelF, setModelF] = useState("");
+  const [sortBy, setSortBy] = useState<"created" | "latency">("created");
+  const [orderDir, setOrderDir] = useState<"desc" | "asc">("desc");
+  const [reqIdF, setReqIdF] = useState("");
+  const [reqIdQuery, setReqIdQuery] = useState("");
+  const [facetUsers, setFacetUsers] = useState<string[]>([]);
+  const [facetModels, setFacetModels] = useState<string[]>([]);
 
   // The nested filter is URL-driven (?q=queued|running|completed|failed; "all"
   // omits it) so it's shareable + survives back/forward — single source of truth.
@@ -116,7 +126,13 @@ export function QueueTab({ app }: { app: AppRecord }) {
   const fetchQueue = useCallback(async () => {
     setLoading(true);
     try {
-      const r = await fetch(`/api/cluster/queue?app=${encodeURIComponent(app.app_id)}`, {
+      const qp = new URLSearchParams({ app: app.app_id });
+      if (ownerF) qp.set("owner", ownerF);
+      if (modelF) qp.set("model", modelF);
+      if (sortBy) qp.set("sort", sortBy);
+      if (orderDir) qp.set("order", orderDir);
+      if (reqIdQuery) qp.set("request_id", reqIdQuery);
+      const r = await fetch(`/api/cluster/queue?${qp.toString()}`, {
         cache: "no-store",
       });
       const body = (await r.json()) as QueueResponse;
@@ -131,13 +147,20 @@ export function QueueTab({ app }: { app: AppRecord }) {
     } finally {
       setLoading(false);
     }
-  }, [app.app_id]);
+  }, [app.app_id, ownerF, modelF, sortBy, orderDir, reqIdQuery]);
 
   useEffect(() => {
     fetchQueue();
     const id = window.setInterval(fetchQueue, POLL_MS);
     return () => window.clearInterval(id);
   }, [fetchQueue]);
+
+  // Populate the user/model filter dropdowns from the full history (once).
+  useEffect(() => {
+    gateway.getAppRequestFacets(app.app_id)
+      .then((f) => { setFacetUsers(f.users ?? []); setFacetModels(f.models ?? []); })
+      .catch(() => {});
+  }, [app.app_id]);
 
   const queued = data?.queue_length ?? 0;
   const onFlush = useCallback(async () => {
@@ -162,11 +185,14 @@ export function QueueTab({ app }: { app: AppRecord }) {
   const filtered = useMemo(() => {
     if (!data) return [];
     const items = filter === "all" ? data.items : data.items.filter((i) => i.bucket === filter);
-    // Order: in queue (FIFO), in progress, completed, failed.
+    // Latency sort comes pre-ordered from the server — honour it. Otherwise group
+    // by lifecycle: in queue (FIFO), in progress, completed, failed (stable sort
+    // preserves the server's within-bucket time order).
+    if (sortBy === "latency") return items;
     return [...items].sort(
       (a, b) => BUCKET_ORDER.indexOf(a.bucket) - BUCKET_ORDER.indexOf(b.bucket),
     );
-  }, [data, filter]);
+  }, [data, filter, sortBy]);
 
   // Reset to page 1 whenever the bucket filter changes (incl. back/forward).
   useEffect(() => {
@@ -219,6 +245,46 @@ export function QueueTab({ app }: { app: AppRecord }) {
             Refresh
           </Button>
         </div>
+      </div>
+
+      {/* Server-side filters/sort over the full retained history */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Select value={ownerF || "__all"} onValueChange={(v) => { setOwnerF(v === "__all" ? "" : v); setPage(1); }}>
+          <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all" className="text-xs">All users</SelectItem>
+            {facetUsers.map((u) => <SelectItem key={u} value={u} className="text-xs">{u}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={modelF || "__all"} onValueChange={(v) => { setModelF(v === "__all" ? "" : v); setPage(1); }}>
+          <SelectTrigger className="h-8 w-[180px] text-xs"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all" className="text-xs">All models</SelectItem>
+            {facetModels.map((m) => <SelectItem key={m} value={m} className="font-mono text-xs">{m}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={`${sortBy}:${orderDir}`} onValueChange={(v) => { const [s, o] = v.split(":"); setSortBy(s as "created" | "latency"); setOrderDir(o as "asc" | "desc"); setPage(1); }}>
+          <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="created:desc" className="text-xs">Newest first</SelectItem>
+            <SelectItem value="created:asc" className="text-xs">Oldest first</SelectItem>
+            <SelectItem value="latency:desc" className="text-xs">Slowest first</SelectItem>
+            <SelectItem value="latency:asc" className="text-xs">Fastest first</SelectItem>
+          </SelectContent>
+        </Select>
+        <form className="flex items-center gap-1" onSubmit={(e) => { e.preventDefault(); setReqIdQuery(reqIdF.trim()); setPage(1); }}>
+          <input
+            value={reqIdF}
+            onChange={(e) => setReqIdF(e.target.value)}
+            placeholder="request id (exact)…"
+            className="h-8 w-[200px] rounded-md border border-border bg-background px-2 font-mono text-xs"
+          />
+          {reqIdQuery ? (
+            <Button type="button" variant="outline" size="xs" onClick={() => { setReqIdF(""); setReqIdQuery(""); }}>clear</Button>
+          ) : (
+            <Button type="submit" variant="outline" size="xs" disabled={!reqIdF.trim()}>find</Button>
+          )}
+        </form>
       </div>
 
       <div className="flex gap-1 border-b border-border">

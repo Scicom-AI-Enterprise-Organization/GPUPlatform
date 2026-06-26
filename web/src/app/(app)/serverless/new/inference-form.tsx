@@ -1003,6 +1003,100 @@ export function InferenceForm() {
               </Select>
             </Field>
 
+            {target === "cloud" && (
+              <Field
+                label="Serving mode"
+                hint="Single = one model per pod, scale-to-zero. Multi-model fleet = several models time-sharing the pod's GPUs (sleep/wake), deleted after the idle timeout and re-provisioned on demand."
+              >
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setCloudMulti(false)}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                      !cloudMulti ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="font-medium">Single model</div>
+                    <div className="text-xs text-muted-foreground">One model, scale-to-zero.</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCloudMulti(true)}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                      cloudMulti ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="font-medium">Multi-model fleet</div>
+                    <div className="text-xs text-muted-foreground">Many models, idle auto-delete.</div>
+                  </button>
+                </div>
+              </Field>
+            )}
+
+            {isVm && (
+              <Field
+                label="Deployment"
+                hint="Multi-model fleet = several models time-share the VM's GPUs (queue + sleep/wake). Single model (proxy) = one always-on model the gateway proxies to directly over a forward tunnel — no queue, no sleep."
+              >
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVmKind("proxy");
+                      setMembers((arr) => arr.slice(0, 1));
+                    }}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                      vmKind === "proxy" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="font-medium">Single model (proxy)</div>
+                    <div className="text-xs text-muted-foreground">One model, no queue/sleep.</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setVmKind("fleet")}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                      vmKind === "fleet" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <div className="font-medium">Multi-model fleet</div>
+                    <div className="text-xs text-muted-foreground">Many models, sleep/wake.</div>
+                  </button>
+                </div>
+              </Field>
+            )}
+
+            <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              {isVm && vmKind === "proxy" ? (
+                <>
+                  <span className="font-medium text-foreground">Single model · direct proxy</span> — one always-on
+                  model on this VM. The gateway forwards each request straight to it over a tunnel: no queue, no
+                  sleep/wake, no scale-to-zero.
+                </>
+              ) : isVm ? (
+                <>
+                  <span className="font-medium text-foreground">Multi-model fleet</span> — models share this VM&apos;s
+                  GPUs and swap in via sleep/wake. Add one model for a single-model endpoint (you still get the
+                  sleep/wake benefits).
+                </>
+              ) : cloudMulti ? (
+                <>
+                  <span className="font-medium text-foreground">Multi-model fleet on RunPod</span> — several models
+                  time-share the pod&apos;s GPUs via sleep/wake. The whole pod is deleted after the idle timeout and
+                  re-provisioned on the next request (set Idle timeout under Engine).
+                </>
+              ) : (
+                <>
+                  <span className="font-medium text-foreground">Single-model endpoint</span> — one model per RunPod /
+                  PI pod, scale-to-zero.
+                </>
+              )}
+            </div>
+
             {(isVm || cloudMulti) && (
               <Field
                 label="vLLM version (optional)"
@@ -1243,100 +1337,6 @@ export function InferenceForm() {
                 </div>
               </Field>
             )}
-
-            {target === "cloud" && (
-              <Field
-                label="Serving mode"
-                hint="Single = one model per pod, scale-to-zero. Multi-model fleet = several models time-sharing the pod's GPUs (sleep/wake), deleted after the idle timeout and re-provisioned on demand."
-              >
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setCloudMulti(false)}
-                    className={cn(
-                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
-                      !cloudMulti ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
-                    )}
-                  >
-                    <div className="font-medium">Single model</div>
-                    <div className="text-xs text-muted-foreground">One model, scale-to-zero.</div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setCloudMulti(true)}
-                    className={cn(
-                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
-                      cloudMulti ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
-                    )}
-                  >
-                    <div className="font-medium">Multi-model fleet</div>
-                    <div className="text-xs text-muted-foreground">Many models, idle auto-delete.</div>
-                  </button>
-                </div>
-              </Field>
-            )}
-
-            {isVm && (
-              <Field
-                label="Deployment"
-                hint="Multi-model fleet = several models time-share the VM's GPUs (queue + sleep/wake). Single model (proxy) = one always-on model the gateway proxies to directly over a forward tunnel — no queue, no sleep."
-              >
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setVmKind("fleet")}
-                    className={cn(
-                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
-                      vmKind === "fleet" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
-                    )}
-                  >
-                    <div className="font-medium">Multi-model fleet</div>
-                    <div className="text-xs text-muted-foreground">Many models, sleep/wake.</div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setVmKind("proxy");
-                      setMembers((arr) => arr.slice(0, 1));
-                    }}
-                    className={cn(
-                      "rounded-md border px-3 py-2 text-left text-sm transition-colors",
-                      vmKind === "proxy" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40",
-                    )}
-                  >
-                    <div className="font-medium">Single model (proxy)</div>
-                    <div className="text-xs text-muted-foreground">One model, no queue/sleep.</div>
-                  </button>
-                </div>
-              </Field>
-            )}
-
-            <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-              {isVm && vmKind === "proxy" ? (
-                <>
-                  <span className="font-medium text-foreground">Single model · direct proxy</span> — one always-on
-                  model on this VM. The gateway forwards each request straight to it over a tunnel: no queue, no
-                  sleep/wake, no scale-to-zero.
-                </>
-              ) : isVm ? (
-                <>
-                  <span className="font-medium text-foreground">Multi-model fleet</span> — models share this VM&apos;s
-                  GPUs and swap in via sleep/wake. Add one model for a single-model endpoint (you still get the
-                  sleep/wake benefits).
-                </>
-              ) : cloudMulti ? (
-                <>
-                  <span className="font-medium text-foreground">Multi-model fleet on RunPod</span> — several models
-                  time-share the pod&apos;s GPUs via sleep/wake. The whole pod is deleted after the idle timeout and
-                  re-provisioned on the next request (set Idle timeout under Engine).
-                </>
-              ) : (
-                <>
-                  <span className="font-medium text-foreground">Single-model endpoint</span> — one model per RunPod /
-                  PI pod, scale-to-zero.
-                </>
-              )}
-            </div>
 
             <Field label="Endpoint name" required>
               <Input

@@ -28,6 +28,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { HeadersPanel } from "@/components/playground/chat-playground";
 import { TranscribeTab } from "./transcribe";
 import { EmbeddingTab } from "./embedding";
 import { gateway } from "@/lib/gateway";
@@ -271,6 +272,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
   // first token). Finalised from `usage` when the model reports it.
   const [streamStats, setStreamStats] = useState<{ ttftMs: number; tokens: number; tps: number } | null>(null);
   const [streamToolCalls, setStreamToolCalls] = useState("");
+  const [respHeaders, setRespHeaders] = useState<Record<string, string> | null>(null);
   const streamAbort = useRef<AbortController | null>(null);
 
   // Equivalent OpenAI curl for the last-sent request (shared on Run).
@@ -369,6 +371,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
     setStreamReasoning("");
     setStreamToolCalls("");
     setStreamStats(null);
+    setRespHeaders(null);
     const t0 = perfNow();
     const ts = Date.now();
     try {
@@ -385,6 +388,12 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
         return;
       }
       const id = (respBody as { request_id?: string })?.request_id as string;
+      // Surface response headers; the queue request_id lives in the /run BODY (the
+      // middleware's x-request-id header is a different value), so prefer the body id.
+      const hdrs: Record<string, string> = {};
+      r.headers.forEach((v, k) => { hdrs[k] = v; });
+      if (id) hdrs["x-request-id"] = id;
+      setRespHeaders(hdrs);
       const promptShort = prompt.slice(0, 80);
       upsert({ id, ts, prompt: promptShort, status: "pending", app_id: appId });
       // Await so the Send button stays busy and the reasoning/answer panels
@@ -450,6 +459,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
     setStreamReasoning("");
     setStreamToolCalls("");
     setStreamStats(null);
+    setRespHeaders(null);
     // include_usage → vLLM appends a final chunk with exact token usage.
     const body = { ...buildBody(), stream_options: { include_usage: true } };
     const toolAcc: ToolCallAcc[] = [];
@@ -480,6 +490,9 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
         try { parsed = txt ? JSON.parse(txt) : ""; } catch { /* keep raw text */ }
         throw new Error(errText(parsed, res.statusText));
       }
+      const hdrs: Record<string, string> = {};
+      res.headers.forEach((v, k) => { hdrs[k] = v; });
+      setRespHeaders(hdrs);
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = "";
@@ -803,6 +816,7 @@ function RequestsTabInner({ appId, app }: { appId: string; app?: AppRecord }) {
                   <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">
                     {streamText || ((streaming || sending) ? "…" : "")}
                   </pre>
+                  <HeadersPanel headers={respHeaders} />
                 </div>
               )}
             </div>

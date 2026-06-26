@@ -44,6 +44,8 @@ export type AppRecord = {
   volume_gb?: number | null;
   provider_id?: string | null;
   provider_name?: string | null;
+  storage_id?: string | null;   // log-archive Storage (kind=s3); null = Redis-only
+  storage_name?: string | null; // resolved on the single-app GET
   mode?: ServingMode;
   models?: MultiModelMember[] | null;
   sleep_level?: number;
@@ -1387,7 +1389,32 @@ export type ActivitySummary = {
   top_users: { user: string; owner_id: number | null; requests: number; prompt_tokens: number; completion_tokens: number }[];
   by_model_bucket: { bucket: string; model: string; requests: number; tokens: number }[];
   by_user_bucket: { bucket: string; user: string; requests: number; tokens: number }[];
+  by_upstream_bucket: { bucket: string; upstream: string; requests: number; tokens: number }[];
+  all_models: string[];
   note: string;
+};
+
+// ---- serverless endpoint log files (Logs tab) ----
+export type LogFile = {
+  id: string;          // "{slug}:{session}"
+  source: string;      // model name, or "__worker__" for the worker-agent log
+  slug: string;
+  session: string;     // "YYYYMMDD-HHMMSS"
+  started_at: string;  // ISO
+  bytes: number | null;
+  lines: number;
+  crash: string | null;
+  archived: boolean;   // persisted to s3 (vs Redis-only)
+  live: boolean;       // session updated within the last minute
+};
+export type LogFilesResponse = { files: LogFile[]; total: number; archived: boolean };
+export type LogFileContent = {
+  lines: string[];
+  count: number;
+  archived: boolean;
+  session: string;
+  source: string;
+  crash: string | null;
 };
 
 export type ActivityLogRow = {

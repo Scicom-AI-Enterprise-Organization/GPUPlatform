@@ -35,13 +35,21 @@ function bucketFor(status: string): Bucket {
 }
 
 export async function GET(req: NextRequest) {
-  const appId = req.nextUrl.searchParams.get("app") ?? "";
+  const sp = req.nextUrl.searchParams;
+  const appId = sp.get("app") ?? "";
   if (!APP_ID_RX.test(appId)) {
     return NextResponse.json({ error: "invalid or missing app" }, { status: 400 });
   }
 
   try {
-    const rows: GatewayRequestRecord[] = await gateway.listAppRequests(appId, LIMIT);
+    const rows: GatewayRequestRecord[] = await gateway.listAppRequests(appId, {
+      limit: LIMIT,
+      owner: sp.get("owner") || undefined,
+      model: sp.get("model") || undefined,
+      sort: sp.get("sort") || undefined,
+      order: sp.get("order") || undefined,
+      requestId: sp.get("request_id") || undefined,
+    });
 
     const items: Item[] = rows.map((r) => ({
       request_id: r.request_id,

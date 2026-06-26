@@ -37,7 +37,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from . import crypto
 from .auth import current_user, require_admin
-from .db import Base, User, get_session, session_factory
+from .db import Base, User, get_session, get_user_by_username, session_factory
 from .global_env_api import load_global_env
 
 logger = logging.getLogger("gateway.proxy")
@@ -47,7 +47,9 @@ router = APIRouter(prefix="/v1/proxy", tags=["proxy"])
 data_router = APIRouter(tags=["proxy-data"])
 
 HEALTH_TTL_S = 120                 # a probe older than this is "stale/unknown"
-REQUEST_RETENTION_DAYS = 7
+# 0 (default) = keep proxy request history INDEFINITELY (no prune). Set
+# PROXY_REQUEST_RETENTION_DAYS=N to prune rows older than N days.
+REQUEST_RETENTION_DAYS = int(os.environ.get("PROXY_REQUEST_RETENTION_DAYS", "0") or "0")
 DEFAULT_TIMEOUT_S = 3600.0
 import re as _re
 _NAME_RE = _re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -591,6 +593,13 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
                     if request_id in live:
                         live[request_id]["upstream"] = u["name"]
                     await _set_started(request_id, upstream=u["name"])
+                    # With failover candidates the chosen upstream isn't known when the
+                    # SSE response HEADERS flush, so X-Upstream-* can't be set there. Emit
+                    # it instead as a leading SSE COMMENT (a line starting with ":", which
+                    # the SSE spec says consumers ignore — OpenAI/EventSource parsers skip
+                    # it, so it's safe for every client) that the playground surfaces.
+                    if len(candidates) > 1:
+                        yield (": sgpu-upstream " + json.dumps({"name": u["name"], "url": u["base_url"]}) + "\n\n").encode()
                     sent_any = False
                     ttft_ms: Optional[int] = None
                     pt = ct = None
@@ -957,8 +966,30 @@ async def proxy_health(proxy_id: str, request: Request, user: User = Depends(req
     return out
 
 
+@router.get("/{proxy_id}/request-facets")
+async def proxy_request_facets(proxy_id: str, user: User = Depends(require_admin),  # noqa: ARG001
+                               session: AsyncSession = Depends(get_session)):
+    """Distinct users + upstreams seen on this endpoint — to populate the queue
+    tab's filter dropdowns (server-side, so it covers the full history)."""
+    row = await session.get(ProxyEndpoint, proxy_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="proxy endpoint not found")
+    oids = [o for o in (await session.execute(
+        select(ProxyRequest.owner_id).where(ProxyRequest.endpoint_id == proxy_id).distinct()
+    )).scalars().all() if o is not None]
+    users: list[str] = []
+    if oids:
+        users = sorted(u.username for u in (await session.execute(
+            select(User).where(User.id.in_(oids)))).scalars().all())
+    upstreams = sorted({u.get("name") for u in (row.config or {}).get("upstreams", []) if u.get("name")})
+    return {"users": users, "upstreams": upstreams}
+
+
 @router.get("/{proxy_id}/requests", response_model=list[ProxyRequestRecord])
-async def proxy_requests(proxy_id: str, request: Request, limit: int = 50,
+async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offset: int = 0,
+                         owner: Optional[str] = None, upstream: Optional[str] = None,
+                         status: Optional[str] = None, sort: str = "created", order: str = "desc",
+                         request_id: Optional[str] = None,
                          user: User = Depends(require_admin),  # noqa: ARG001
                          session: AsyncSession = Depends(get_session)):
     row = await session.get(ProxyEndpoint, proxy_id)
@@ -966,10 +997,26 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50,
         raise HTTPException(status_code=404, detail="proxy endpoint not found")
     live = _live(request.app)
     live_ids = {rid for rid, v in live.items() if v.get("endpoint_id") == proxy_id}
-    rows = (await session.execute(
-        select(ProxyRequest).where(ProxyRequest.endpoint_id == proxy_id)
-        .order_by(ProxyRequest.created_at.desc()).limit(min(limit, 200))
-    )).scalars().all()
+    q = select(ProxyRequest).where(ProxyRequest.endpoint_id == proxy_id)
+    if request_id:
+        # Direct primary-key lookup — finds the row anywhere in the FULL history (not
+        # just the 200-row page); other filters/sort are irrelevant for a unique id.
+        rows = (await session.execute(q.where(ProxyRequest.id == request_id))).scalars().all()
+    else:
+        if owner:
+            ou = await get_user_by_username(session, owner)
+            q = q.where(ProxyRequest.owner_id == (ou.id if ou else -1))  # -1 matches nothing
+        if upstream:
+            q = q.where(ProxyRequest.upstream == upstream)
+        if status:
+            q = q.where(ProxyRequest.status == status)
+        col = ProxyRequest.latency_ms if sort == "latency" else ProxyRequest.created_at
+        direction = col.asc() if order == "asc" else col.desc()
+        # latency is NULL while queued/running — keep those out of a latency sort's way
+        q = q.order_by(direction.nulls_last() if sort == "latency" else direction)
+        rows = (await session.execute(
+            q.offset(max(0, offset)).limit(min(limit, 200))
+        )).scalars().all()
     owner_ids = {r.owner_id for r in rows if r.owner_id is not None}
     owners: dict[int, str] = {}
     if owner_ids:
@@ -1115,8 +1162,9 @@ async def proxy_health_loop(app) -> None:
                     for u in (ep.config or {}).get("upstreams", []):
                         if u.get("enabled", True) and u.get("base_url"):
                             targets.append((ep.id, u, _resolve_key(u, genv)))
-                cutoff = datetime.now(timezone.utc) - timedelta(days=REQUEST_RETENTION_DAYS)
-                await s.execute(delete(ProxyRequest).where(ProxyRequest.created_at < cutoff))
+                if REQUEST_RETENTION_DAYS > 0:  # 0 = keep indefinitely (no prune)
+                    cutoff = datetime.now(timezone.utc) - timedelta(days=REQUEST_RETENTION_DAYS)
+                    await s.execute(delete(ProxyRequest).where(ProxyRequest.created_at < cutoff))
                 await s.commit()
             cli = _http(app)
             for endpoint_id, u, key in targets:
