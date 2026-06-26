@@ -453,6 +453,7 @@ def _resolve_config(
     runpod_key_path: Optional[str] = None,
     bench_id: Optional[str] = None,
     global_env: Optional[dict] = None,
+    ingress: bool = False,
 ) -> str:
     """Inject runtime values (SSH key path, RunPod API key) into the user's YAML.
 
@@ -470,6 +471,16 @@ def _resolve_config(
         return raw_yaml
 
     run_env = _merge_run_env(env_vars, visible_devices, global_env)
+
+    if ingress:
+        # Ingress: no machine is provisioned. The in-gateway client
+        # (gateway.bench_ingress) only needs base_url + benchmark; drop the
+        # runpod/remote blocks so a leftover provider/pod spec can't confuse it.
+        # base_url already rides on the config (top-level or per-item) from the
+        # form. run_env (e.g. HF_TOKEN) reaches the client via the process env.
+        cfg.pop("runpod", None)
+        cfg.pop("remote", None)
+        return yaml.safe_dump(cfg, sort_keys=False)
 
     if vm_target is None:
         # Prefer the per-run ephemeral key (minted in run_benchmark); fall back to
@@ -615,6 +626,32 @@ def _pick_engine_subcommand(raw_yaml: str) -> list[str]:
     except Exception:
         pass
     return ["vllm", "bench"]
+
+
+def _ingress_base_url(raw_yaml: str) -> Optional[str]:
+    """Return the base_url when this config is an *ingress* run, else None.
+
+    Ingress = bench an already-served, ingressed vLLM with no machine to
+    provision. The signal is a `base_url` on the config — top-level or on a
+    benchmark item — which the web form emits (and only emits) for ingress mode.
+    The caller additionally requires no machine provider to be selected, so a
+    stray base_url on a runpod/vm config never silently skips provisioning.
+    """
+    try:
+        cfg = yaml.safe_load(raw_yaml) or {}
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    top = cfg.get("base_url")
+    if isinstance(top, str) and top.strip():
+        return top.strip()
+    for item in cfg.get("benchmark") or []:
+        if isinstance(item, dict):
+            bu = item.get("base_url")
+            if isinstance(bu, str) and bu.strip():
+                return bu.strip()
+    return None
 
 
 async def _materialise_vm_key(work_dir: Path, provider_id: str) -> dict:
@@ -1082,6 +1119,11 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
             run_env_vars = {**(run_env_vars or {}), "HF_TOKEN": global_env[hf_secret_key]}
         await s.commit()
 
+    # Ingress: bench an already-served endpoint, no machine. Detected from a
+    # base_url in the config + no machine provider picked. Runs the in-gateway
+    # httpx client instead of benchmaq; skips provisioning, cloud check and keys.
+    is_ingress = (not provider_id) and (_ingress_base_url(raw_yaml) is not None)
+
     # Disambiguate provider kind. A runpod-kind provider_id picks WHICH
     # RunPod account to bill against (cred override only); a vm-kind id
     # switches us onto the bare-metal SSH path.
@@ -1108,7 +1150,10 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     # create API rejects these up front too.
     from .provider import ensure_benchmark_provider_allowed, CloudProviderDisabled
     try:
-        ensure_benchmark_provider_allowed(provider_kind)
+        # Ingress provisions nothing (no pod, no cloud spend) so the cloud-
+        # disabled gate doesn't apply — it only guards the spawn-a-pod path.
+        if not is_ingress:
+            ensure_benchmark_provider_allowed(provider_kind)
     except CloudProviderDisabled:
         msg = ("cloud GPU providers are disabled on this deployment — register a "
                "physical 'vm' provider and re-run this benchmark")
@@ -1185,7 +1230,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     # don't depend on a pre-provisioned key on disk. benchmaq injects the .pub
     # into the pod (PUBLIC_KEY) and SSHes with the private half; both are deleted
     # once benchmaq exits.
-    if vm_target is None:
+    if vm_target is None and not is_ingress:
         try:
             runpod_key_path = _gen_ephemeral_runpod_key(work, bench_id)
             await _push_log(redis, bench_id, "[gateway] minted ephemeral SSH keypair for pod access")
@@ -1194,12 +1239,19 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
 
     cfg_path = work / "config.yaml"
     cfg_path.write_text(_resolve_config(
-        raw_yaml, vm_target=vm_target,
+        raw_yaml, vm_target=vm_target, ingress=is_ingress,
         env_vars=run_env_vars, visible_devices=run_visible_devices,
         runpod_key_path=runpod_key_path, bench_id=bench_id, global_env=global_env,
     ))
 
-    if vm_target:
+    sub_cmd: list[str] = []
+    if is_ingress:
+        await _push_log(
+            redis, bench_id,
+            f"[gateway] ingress mode — benchmarking {_ingress_base_url(raw_yaml)} "
+            f"with the in-gateway client (no pod) (cwd={work})",
+        )
+    elif vm_target:
         sub_cmd = _pick_engine_subcommand(raw_yaml)
         await _push_log(redis, bench_id, f"[gateway] starting benchmaq {' '.join(sub_cmd)} (cwd={work})")
     else:
@@ -1264,7 +1316,11 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     # the pyremote reconnect-per-command shim before benchmaq's CLI runs.
     # This sidesteps Go-based SSH proxies (e.g. TM's `ssh.*.gpu.tm.com.my`)
     # that enforce one exec channel per TCP connection.
-    if vm_target is not None:
+    if is_ingress:
+        # No machine: run the lightweight in-gateway httpx load generator
+        # against base_url. No benchmaq, no SSH wrapper.
+        cmd_argv = [sys.executable, "-u", "-m", "gateway.bench_ingress", str(cfg_path)]
+    elif vm_target is not None:
         cmd_argv = [sys.executable, "-u", "-m", "gateway.bench_remote_wrapper", *sub_cmd, str(cfg_path)]
     else:
         cmd_argv = [sys.executable, "-u", benchmaq_bin, *sub_cmd, str(cfg_path)]
@@ -1328,7 +1384,7 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     prefix = s3_prefix
     s3_put_text(
         f"{prefix}config.yaml",
-        _resolve_config(raw_yaml, vm_target=vm_target, env_vars=run_env_vars, visible_devices=run_visible_devices, runpod_key_path=runpod_key_path, bench_id=bench_id, global_env=global_env),
+        _resolve_config(raw_yaml, vm_target=vm_target, ingress=is_ingress, env_vars=run_env_vars, visible_devices=run_visible_devices, runpod_key_path=runpod_key_path, bench_id=bench_id, global_env=global_env),
         target=target,
     )
     result_json: Optional[dict] = None
@@ -1971,9 +2027,14 @@ async def create_benchmark(
     # runpod/pi one — defaults to the `benchmaq runpod bench` cloud path and
     # spawns a pod. Refuse at submit time so the user gets a clear 403 instead of
     # a cryptic failure deep inside the benchmaq subprocess (no RUNPOD_API_KEY).
+    # Ingress runs provision nothing (no pod / no cloud spend), so the cloud-
+    # disabled gate doesn't apply — it only guards the spawn-a-pod path. Detect
+    # the same way the runner does: a base_url in the config + no machine provider.
+    is_ingress = (not body.provider_id) and (_ingress_base_url(body.config_yaml) is not None)
     from .provider import ensure_benchmark_provider_allowed, CloudProviderDisabled
     try:
-        ensure_benchmark_provider_allowed(prov_kind)
+        if not is_ingress:
+            ensure_benchmark_provider_allowed(prov_kind)
     except CloudProviderDisabled:
         raise HTTPException(
             status_code=403,

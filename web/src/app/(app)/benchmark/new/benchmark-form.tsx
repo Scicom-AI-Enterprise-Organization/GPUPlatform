@@ -17,6 +17,7 @@ import {
   FileCode2,
   FlaskConical,
   Gauge,
+  Globe,
   Info,
   KeyRound,
   Loader2,
@@ -185,6 +186,11 @@ type FormState = {
   volume_size: number;
   container_image: string;
   model_repo_id: string;
+  // Ingress target only: the already-served, ingressed vLLM endpoint to bench
+  // (e.g. https://my-model.example.com). Empty for cloud/vm targets. When set,
+  // the run skips all provisioning and hits this URL directly. model_repo_id
+  // doubles as the served model name for the API request.
+  ingress_base_url: string;
   // All vLLM engine args are strings so empty = "use vLLM default" — same
   // ergonomics as the serverless endpoint create form.
   tensor_parallel_size: string;
@@ -248,6 +254,7 @@ export const DEFAULTS: FormState = {
   volume_size: 80,
   container_image: DEFAULT_CONTAINER_IMAGE,
   model_repo_id: "Qwen/Qwen2.5-0.5B-Instruct",
+  ingress_base_url: "",
   tensor_parallel_size: "",
   data_parallel_size: "",
   max_model_len: "",
@@ -434,7 +441,7 @@ function totalRuns(s: FormState): number {
 
 export function renderYaml(
   s: FormState,
-  target: "cloud" | "vm" = "cloud",
+  target: "cloud" | "vm" | "ingress" = "cloud",
   storageName?: string,
   vmExtras?: {
     providerName?: string;
@@ -552,6 +559,21 @@ ${renderBenchEntries(s)}
       save_detailed: true
 `;
 
+  // Ingress: bench an already-served, ingressed vLLM. No pod, no remote, no
+  // serve block — just point base_url at the endpoint. The gateway sees the
+  // base_url (and no machine provider) and runs its in-gateway httpx client.
+  // model.repo_id is the served model name for the API request. Storage still
+  // applies — results + logs land in the selected S3 backend.
+  if (target === "ingress") {
+    return `benchmark:
+  - name: ${s.benchName}
+${benchStorageLine}    engine: vllm
+    base_url: "${s.ingress_base_url}"
+    model:
+      repo_id: "${s.model_repo_id}"
+${workloadBlock}`;
+  }
+
   return `${runpodBlock}${remoteBlock}
 benchmark:
   - name: ${s.benchName}
@@ -597,6 +619,9 @@ type ParseYamlResult = {
   cleanupModel: boolean | null;
   visibleDevices: string | null;
   envText: string | null;
+  /** Ingress `base_url` (top-level or on benchmark[0]) if present. The caller
+   * uses its presence to switch the Run-on target to "ingress". */
+  baseUrl: string | null;
 };
 
 /** Parse a benchmaq YAML config back into FormState. Anything the form
@@ -617,6 +642,7 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
       cleanupModel: null,
       visibleDevices: null,
       envText: null,
+      baseUrl: null,
     };
   }
   if (!doc || typeof doc !== "object") {
@@ -629,6 +655,7 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
       cleanupModel: null,
       visibleDevices: null,
       envText: null,
+      baseUrl: null,
     };
   }
   const d = doc as Record<string, unknown>;
@@ -704,6 +731,15 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
   }
   const model = (first.model ?? {}) as Record<string, unknown>;
   if (typeof model.repo_id === "string") next.model_repo_id = model.repo_id;
+  // Ingress configs carry the served name as a bare `model: "name"` string.
+  if (typeof first.model === "string") next.model_repo_id = first.model;
+
+  // ---- base_url (ingress) — top-level or on the item. Its presence is what the
+  // caller keys on to flip the Run-on target to "ingress" after a YAML edit.
+  const itemBaseUrl = typeof first.base_url === "string" ? first.base_url.trim() : "";
+  const topBaseUrl = typeof d.base_url === "string" ? (d.base_url as string).trim() : "";
+  const baseUrl = itemBaseUrl || topBaseUrl || null;
+  if (baseUrl) next.ingress_base_url = baseUrl;
 
   // ---- benchmark[0].serve — split into form-mapped keys + Extra args.
   const serve = (first.serve ?? {}) as Record<string, unknown>;
@@ -852,6 +888,7 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
     cleanupModel,
     visibleDevices,
     envText,
+    baseUrl,
   };
 }
 
@@ -906,8 +943,12 @@ export function BenchmarkForm({
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   // Source-of-truth: if duplicating from a bench that ran on a VM, start in
   // "vm" mode with that provider preselected; otherwise default to cloud.
-  const [target, setTarget] = useState<"cloud" | "vm">(
-    initialProviderId ? "vm" : "cloud",
+  const [target, setTarget] = useState<"cloud" | "vm" | "ingress">(
+    initialProviderId
+      ? "vm"
+      : initialYaml && /\bbase_url\s*:/.test(initialYaml)
+        ? "ingress"
+        : "cloud",
   );
   const [providerId, setProviderId] = useState<string>(initialProviderId ?? "");
   // RunPod-account selection for cloud target. Empty = gateway-default key.
@@ -1104,6 +1145,16 @@ export function BenchmarkForm({
       );
       return;
     }
+    if (target === "ingress") {
+      const hasBaseUrl =
+        mode === "yaml"
+          ? /\bbase_url\s*:/.test(yamlBuf)
+          : !!form.ingress_base_url.trim();
+      if (!hasBaseUrl) {
+        setSubmitError("Enter the endpoint URL (base_url) of the served vLLM to benchmark.");
+        return;
+      }
+    }
     if (!storageId) {
       // In YAML mode the backend can be named inside the config (`storage:`),
       // which the gateway resolves at submit — so don't force a dropdown pick
@@ -1135,7 +1186,9 @@ export function BenchmarkForm({
         provider_id:
           target === "vm"
             ? effectiveProviderId
-            : runpodProviderId || null,
+            : target === "ingress"
+              ? null // ingress provisions nothing — gateway detects base_url
+              : runpodProviderId || null,
         storage_id: storageId || null,
         cleanup_model: target === "vm" ? effectiveCleanup : undefined,
         ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
@@ -1273,6 +1326,9 @@ export function BenchmarkForm({
             }
             setForm(parsed.state);
             setName(parsed.state.benchName);
+            // A base_url in the YAML means ingress — flip the Run-on target so
+            // the form shows the Endpoint card (and submits with no provider).
+            if (parsed.baseUrl) setTarget("ingress");
             // Resolve the YAML's `storage:` name to a real backend id and
             // select it, so the dropdown — and the storage_id we submit —
             // matches what the YAML asked for. Match by name (case-insensitive),
@@ -1350,9 +1406,9 @@ export function BenchmarkForm({
           <SectionCard
             icon={<Server className="h-4 w-4" />}
             title="Run on"
-            description="Default cloud spawns a fresh RunPod pod per run. Bare metal uses a VM you've registered under GPU Providers."
+            description="Default cloud spawns a fresh RunPod pod per run. Bare metal uses a registered VM. Ingress benchmarks a vLLM you've already served + exposed — no provisioning."
           >
-            <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+            <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
               <button
                 type="button"
                 onClick={() => setTarget("cloud")}
@@ -1389,12 +1445,69 @@ export function BenchmarkForm({
                   </div>
                 </div>
               </button>
+              <button
+                type="button"
+                onClick={() => setTarget("ingress")}
+                className={cn(
+                  "flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
+                  target === "ingress"
+                    ? "border-primary/60 bg-primary/5"
+                    : "border-border hover:border-primary/40 hover:bg-muted/40",
+                )}
+              >
+                <Globe className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                <div className="min-w-0">
+                  <div className="font-medium">Ingress (existing endpoint)</div>
+                  <div className="text-xs text-muted-foreground">
+                    Bench a vLLM you already serve. No pod, no SSH.
+                  </div>
+                </div>
+              </button>
             </div>
           </SectionCard>
 
+          {/* Ingress — bench an already-served, ingressed vLLM. No pod / no SSH;
+              the gateway hits this URL directly with its in-gateway client. */}
+          {target === "ingress" && (
+            <SectionCard
+              icon={<Globe className="h-4 w-4" />}
+              title="Endpoint"
+              description="The already-served vLLM to benchmark. No GPU is provisioned — the gateway sends the workload straight to this URL."
+            >
+              <div className="space-y-4">
+                <FieldWrap
+                  label="Endpoint URL (base_url)"
+                  hint="The OpenAI-compatible base. The path (e.g. /v1/completions) is appended per bench row — don't include it. Point at the raw vLLM ingress, not a gateway needing an API key."
+                  wide
+                >
+                  <Input
+                    className="font-mono"
+                    value={form.ingress_base_url}
+                    onChange={(e) => field("ingress_base_url", e.target.value)}
+                    placeholder="https://my-model.example.com"
+                  />
+                </FieldWrap>
+                <FieldWrap
+                  label="Served model name"
+                  hint="Must match the model id the endpoint serves (its /v1/models id) — it's sent verbatim in each request. No weights are downloaded."
+                  wide
+                >
+                  <Input
+                    className="font-mono"
+                    value={form.model_repo_id}
+                    onChange={(e) => field("model_repo_id", e.target.value)}
+                    placeholder="google/gemma-4-31b-it"
+                  />
+                </FieldWrap>
+              </div>
+            </SectionCard>
+          )}
+
           {/* Pod — when cloud, shows GPU/disk knobs for the fresh RunPod pod.
               When bare-metal, swaps to a VM picker + cleanup toggle. Same
-              section so the layout stays consistent regardless of target. */}
+              section so the layout stays consistent regardless of target.
+              Hidden for ingress (nothing is provisioned). */}
+          {target !== "ingress" && (
           <SectionCard
             icon={<Server className="h-4 w-4" />}
             title="Pod"
@@ -1598,6 +1711,7 @@ export function BenchmarkForm({
             </div>
           )}
           </SectionCard>
+          )}
 
           {/* Runtime environment — GPU pinning + extra env exported for the run. */}
           <SectionCard
@@ -1786,7 +1900,9 @@ export function BenchmarkForm({
           </SectionCard>
           )}
 
-          {/* Engine runtime — what gets installed on the pod */}
+          {/* Engine runtime — what gets installed on the pod. Ingress hits an
+              already-running server, so nothing is installed → hidden. */}
+          {target !== "ingress" && (
           <SectionCard
             icon={<Package className="h-4 w-4" />}
             title="Engine"
@@ -1855,8 +1971,11 @@ export function BenchmarkForm({
               </FieldWrap>
             </Grid>
           </SectionCard>
+          )}
 
-          {/* Model + Serve */}
+          {/* Model + Serve — for ingress the model name + URL live in the
+              Endpoint card above, and there's no serve block to configure. */}
+          {target !== "ingress" && (
           <SectionCard
             icon={<Cpu className="h-4 w-4" />}
             title="Model"
@@ -1876,6 +1995,7 @@ export function BenchmarkForm({
 
             <AdvancedVllmArgs form={form} setField={field} />
           </SectionCard>
+          )}
 
           {/* Bench */}
           <SectionCard
