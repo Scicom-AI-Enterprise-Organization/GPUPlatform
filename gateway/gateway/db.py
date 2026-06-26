@@ -937,6 +937,10 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS hf_token_secret VARCHAR(128)"
         ))
+        # Ingress endpoint API key: a global-secret key aliased to OPENAI_API_KEY.
+        await conn.execute(text(
+            "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS api_key_secret VARCHAR(128)"
+        ))
         # Worker/node identity per inference request (history API): mirrored
         # from the worker's Redis result alongside status/output.
         await conn.execute(text(

@@ -249,6 +249,10 @@ export type CreateBenchmarkRequest = {
   // A global-secret key whose value is injected as HF_TOKEN at launch (gated
   // models). A pasted token is sent via env_vars["HF_TOKEN"] instead.
   hf_token_secret?: string | null;
+  // Ingress only: a global-secret key whose value is injected as OPENAI_API_KEY
+  // at launch (the ingress client sends it as Authorization: Bearer). A pasted
+  // key is sent via env_vars["OPENAI_API_KEY"] instead.
+  api_key_secret?: string | null;
 };
 
 export type BenchmarkFile = {

@@ -137,6 +137,10 @@ class Benchmark(Base):
     # this run — resolved fresh at launch so rotating the secret takes effect.
     # NULL = none (a pasted token lands in env_vars["HF_TOKEN"] instead).
     hf_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Ingress only: a global-secret key whose value is injected as OPENAI_API_KEY
+    # at launch (the in-gateway ingress client sends it as Authorization: Bearer).
+    # NULL = none (a pasted key lands in env_vars["OPENAI_API_KEY"] instead).
+    api_key_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
 
 # ---------- S3 ----------------------------------------------------------
@@ -1117,6 +1121,11 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
         hf_secret_key = getattr(b, "hf_token_secret", None)
         if hf_secret_key and global_env.get(hf_secret_key):
             run_env_vars = {**(run_env_vars or {}), "HF_TOKEN": global_env[hf_secret_key]}
+        # Same for the ingress endpoint API key → OPENAI_API_KEY (the ingress
+        # client reads it and sends Authorization: Bearer).
+        api_secret_key = getattr(b, "api_key_secret", None)
+        if api_secret_key and global_env.get(api_secret_key):
+            run_env_vars = {**(run_env_vars or {}), "OPENAI_API_KEY": global_env[api_secret_key]}
         await s.commit()
 
     # Ingress: bench an already-served endpoint, no machine. Detected from a
@@ -1761,6 +1770,9 @@ class CreateBenchmarkRequest(BaseModel):
     # HuggingFace token for gated models. A global-secret KEY (resolved to
     # HF_TOKEN at launch). Pasted tokens come through env_vars["HF_TOKEN"].
     hf_token_secret: Optional[str] = None
+    # Ingress endpoint API key. A global-secret KEY (resolved to OPENAI_API_KEY at
+    # launch). Pasted keys come through env_vars["OPENAI_API_KEY"].
+    api_key_secret: Optional[str] = None
 
 
 class RenameBenchmarkRequest(BaseModel):
@@ -1790,6 +1802,7 @@ class BenchmarkRecord(BaseModel):
     env_vars: Optional[dict[str, str]] = None
     visible_devices: Optional[str] = None
     hf_token_secret: Optional[str] = None
+    api_key_secret: Optional[str] = None
     # Exposed so the UI "Re-run" button can faithfully recreate the run — without
     # it, a re-run would default cleanup_model=true and wipe a pre-downloaded cache.
     cleanup_model: Optional[bool] = None
@@ -1885,6 +1898,7 @@ def _to_record(
         env_vars=getattr(b, "env_vars", None) or None,
         visible_devices=getattr(b, "visible_devices", None) or None,
         hf_token_secret=getattr(b, "hf_token_secret", None) or None,
+        api_key_secret=getattr(b, "api_key_secret", None) or None,
         cleanup_model=getattr(b, "cleanup_model", None),
     )
 
@@ -2103,6 +2117,7 @@ async def create_benchmark(
         env_vars={k: str(v) for k, v in (body.env_vars or {}).items()} or None,
         visible_devices=(body.visible_devices or "").strip() or None,
         hf_token_secret=(body.hf_token_secret or "").strip() or None,
+        api_key_secret=(body.api_key_secret or "").strip() or None,
     )
     session.add(bench)
     await session.commit()
@@ -2999,6 +3014,7 @@ async def import_benchmark(
         env_vars=data.env_vars,
         visible_devices=data.visible_devices,
         hf_token_secret=None,
+        api_key_secret=None,
     )
     session.add(b)
     await session.commit()

@@ -969,6 +969,12 @@ export function BenchmarkForm({
   const [hfSource, setHfSource] = useState<"secret" | "paste">("secret");
   const [hfToken, setHfToken] = useState("");
   const [hfTokenSecret, setHfTokenSecret] = useState("");
+  // Ingress endpoint API key (optional) — for a served vLLM behind auth. From a
+  // global secret (aliased to OPENAI_API_KEY at launch) or a pasted key. The
+  // ingress client sends it as `Authorization: Bearer <key>`.
+  const [apiKeySource, setApiKeySource] = useState<"secret" | "paste">("paste");
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeySecret, setApiKeySecret] = useState("");
 
   // Live SSH probe of the selected VM. Re-fires when the user changes the
   // provider, and when they hit the refresh button.
@@ -1180,6 +1186,12 @@ export function BenchmarkForm({
       if (hfSource === "paste" && hfToken.trim()) {
         envVars.HF_TOKEN = hfToken.trim();
       }
+      // Ingress endpoint API key: a pasted key rides in env_vars as OPENAI_API_KEY
+      // (the ingress client sends it as Authorization: Bearer); a chosen global
+      // secret is sent as a key ref the gateway aliases to OPENAI_API_KEY at launch.
+      if (target === "ingress" && apiKeySource === "paste" && apiKey.trim()) {
+        envVars.OPENAI_API_KEY = apiKey.trim();
+      }
       const created = await gateway.createBenchmark({
         name: name.trim(),
         config_yaml,
@@ -1196,6 +1208,7 @@ export function BenchmarkForm({
           ? { visible_devices: effectiveVisibleDevices.trim() }
           : {}),
         ...(hfSource === "secret" && hfTokenSecret ? { hf_token_secret: hfTokenSecret } : {}),
+        ...(target === "ingress" && apiKeySource === "secret" && apiKeySecret ? { api_key_secret: apiKeySecret } : {}),
       });
       toast.success(`Created ${created.id}`, { duration: 4000 });
       router.push(`/benchmark/${encodeURIComponent(created.id)}`);
@@ -1477,7 +1490,7 @@ export function BenchmarkForm({
               <div className="space-y-4">
                 <FieldWrap
                   label="Endpoint URL (base_url)"
-                  hint="The OpenAI-compatible base. The path (e.g. /v1/completions) is appended per bench row — don't include it. Point at the raw vLLM ingress, not a gateway needing an API key."
+                  hint="The OpenAI-compatible base. The path (e.g. /v1/completions) is appended per bench row — don't include it. If it's behind auth, set an API key below."
                   wide
                 >
                   <Input
@@ -1498,6 +1511,58 @@ export function BenchmarkForm({
                     onChange={(e) => field("model_repo_id", e.target.value)}
                     placeholder="google/gemma-4-31b-it"
                   />
+                </FieldWrap>
+                <FieldWrap
+                  label="API key (optional)"
+                  hint="For an endpoint behind auth — sent as Authorization: Bearer on each request. Use a global secret (resolved to OPENAI_API_KEY at launch, rotates without editing this benchmark) or paste a key. Leave empty for an open endpoint."
+                  wide
+                >
+                  <div className="space-y-2">
+                    <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                      {(["secret", "paste"] as const).map((src) => (
+                        <button
+                          key={src}
+                          type="button"
+                          onClick={() => setApiKeySource(src)}
+                          className={
+                            "rounded px-2.5 py-1 transition-colors " +
+                            (apiKeySource === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                          }
+                        >
+                          {src === "secret" ? "Global secret" : "Paste a key"}
+                        </button>
+                      ))}
+                    </div>
+                    {apiKeySource === "secret" ? (
+                      secretKeys.length > 0 ? (
+                        <Select value={apiKeySecret} onValueChange={setApiKeySecret}>
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select a secret (e.g. OPENAI_API_KEY)" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {secretKeys.map((k) => (
+                              <SelectItem key={k} value={k} className="font-mono text-xs">{k}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">
+                          No global secrets yet. Add one under{" "}
+                          <a href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</a>{" "}
+                          then pick it here — or switch to <span className="font-medium">Paste a key</span>.
+                        </p>
+                      )
+                    ) : (
+                      <Input
+                        type="password"
+                        autoComplete="off"
+                        className="font-mono"
+                        value={apiKey}
+                        onChange={(e) => setApiKey(e.target.value)}
+                        placeholder="sk-… (leave empty if no key is needed)"
+                      />
+                    )}
+                  </div>
                 </FieldWrap>
               </div>
             </SectionCard>
@@ -1713,7 +1778,10 @@ export function BenchmarkForm({
           </SectionCard>
           )}
 
-          {/* Runtime environment — GPU pinning + extra env exported for the run. */}
+          {/* Runtime environment — GPU pinning + extra env exported for the run.
+              Hidden for ingress: nothing is provisioned, so GPU pinning / run env
+              don't apply. */}
+          {target !== "ingress" && (
           <SectionCard
             icon={<Cpu className="h-4 w-4" />}
             title="Runtime environment"
@@ -1757,9 +1825,12 @@ export function BenchmarkForm({
               </div>
             </div>
           </SectionCard>
+          )}
 
           {/* HuggingFace token for gated models — a global secret (recommended,
-              rotates without editing this run) or a pasted token for this run. */}
+              rotates without editing this run) or a pasted token for this run.
+              Hidden for ingress: no weights are downloaded, so it doesn't apply. */}
+          {target !== "ingress" && (
           <SectionCard
             icon={<KeyRound className="h-4 w-4" />}
             title="HuggingFace token"
@@ -1830,6 +1901,7 @@ export function BenchmarkForm({
               )}
             </div>
           </SectionCard>
+          )}
 
           {/* Storage — where this run's logs.txt + result files land. Required;
               only enabled S3 storages are eligible (HF storages can't hold the
