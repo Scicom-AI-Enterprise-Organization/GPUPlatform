@@ -243,6 +243,7 @@ async def _run(
             label_base_url = d.label_base_url
             label_project_id = d.label_project_id
             label_status = d.label_status or "approved"
+            label_updated_until = d.label_updated_until
             label_token = await _label_token(d, s) if kind == "label" else None
 
         if kind == "label":
@@ -262,9 +263,11 @@ async def _run(
         if kind == "label":
             # Stream the project export + download each task's audio. No archive
             # extraction — the export already pairs audio with its transcription.
-            await _log(dataset_id, f"exporting label project {label_project_id} (status={label_status}) …")
+            _cut = f", until={label_updated_until}" if label_updated_until else ""
+            await _log(dataset_id, f"exporting label project {label_project_id} (status={label_status}{_cut}) …")
             pairs = await run_in_threadpool(
-                _label_pairs, label_base_url, label_project_id, label_token, label_status, work,
+                _label_pairs, label_base_url, label_project_id, label_token, label_status, work, "",
+                label_updated_until,
             )
             if not pairs:
                 await _finish(dataset_id, "failed", "no tasks with downloadable audio in the label export (check the status filter / token)")
@@ -409,6 +412,7 @@ async def _run_merge(
                     "id": sid, "name": sd.name,
                     "base_url": sd.label_base_url, "project_id": sd.label_project_id,
                     "status": sd.label_status or "approved",
+                    "until": sd.label_updated_until,
                     "token": await _label_token(sd, s),
                 })
 
@@ -426,13 +430,14 @@ async def _run_merge(
                               f"source '{src['name']}' is not a fully-configured label dataset "
                               f"(base URL, project, token)")
                 return
+            _cut = f", until={src['until']}" if src.get("until") else ""
             await _log(output_id,
                        f"[{idx + 1}/{len(sources)}] exporting '{src['name']}' "
-                       f"(project {src['project_id']}, status={src['status']}) …")
+                       f"(project {src['project_id']}, status={src['status']}{_cut}) …")
             sub = os.path.join(work, f"src-{idx}")
             pairs = await run_in_threadpool(
                 _label_pairs, src["base_url"], src["project_id"], src["token"],
-                src["status"], sub, f"s{idx}-",
+                src["status"], sub, f"s{idx}-", src["until"],
             )
             await _log(output_id, f"  ↳ {len(pairs)} clip(s) from '{src['name']}'")
             all_pairs.extend(pairs)
@@ -842,6 +847,7 @@ def _label_pairs(
     status: str,
     work: str,
     name_prefix: str = "",
+    until: Optional[str] = None,
 ) -> list[tuple[str, str, str, dict]]:
     """Stream a labeling-platform project export (export.v1.jsonl) and download
     each task's audio into `work/audio`. Returns [(split, abs_audio_path,
@@ -851,6 +857,8 @@ def _label_pairs(
     `name_prefix` is prepended to each downloaded filename — used by the merge
     job to keep basenames unique ACROSS projects (S3 keys collide on basename;
     two projects can each have a `task-5.wav`). Empty for the single-project path.
+    `until` (ISO-8601) is the point-in-time cutoff forwarded to the export so only
+    tasks last updated at or before it are pulled.
 
     Audio resolution mirrors the gateway's label-audio proxy: tasks whose
     `audio_url` lives under the platform (or that only expose a task id) are
@@ -867,7 +875,7 @@ def _label_pairs(
     base = (base_url or "").rstrip("/")
     # limit=huge → read every line; offset=0. _label_export_rows stops only when
     # it has `total` rows, so a limit past the end safely yields all of them.
-    rows, _total = _label_export_rows(base_url, project_id, token, status, 10**9, 0)
+    rows, _total = _label_export_rows(base_url, project_id, token, status, 10**9, 0, until)
 
     audio_dir = Path(work) / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)

@@ -815,9 +815,9 @@ export const gateway = {
       `/v1/datasets/${encodeURIComponent(id)}/row-inclusion`,
       { method: "POST", body: JSON.stringify(body) },
     ),
-  deleteDataset: (id: string) =>
-    request<{ ok: boolean; id: string }>(
-      `/v1/datasets/${encodeURIComponent(id)}`,
+  deleteDataset: (id: string, purge = false) =>
+    request<{ ok: boolean; id: string; purged_objects?: number }>(
+      `/v1/datasets/${encodeURIComponent(id)}${purge ? "?purge=true" : ""}`,
       { method: "DELETE" },
     ),
   /** Publish an S3-backed dataset to the HF mirror as a hosted dataset repo. */

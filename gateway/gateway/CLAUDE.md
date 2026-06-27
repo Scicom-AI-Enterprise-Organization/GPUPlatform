@@ -128,7 +128,11 @@ labelled rows) and **write** (autotrain TTS auto-creates a recording+MOS project
 Auth is a `lpat_…` PAT carrying its owner's role (create-project needs an admin PAT). Full API
 reference + the audio-filename↔storage prefix gotcha: **`docs/LABEL_PLATFORM.md`**. Gateway
 integration lives in `datasets_api.py` (read) and `training_api.py` `_create_label_project_for_run`
-+ `training/tts/tts_label_export.py` (write, VM-only — synthesis needs the box).
++ `training/tts/tts_label_export.py` (write, VM-only — synthesis needs the box). A `kind=label`
+Dataset's import is filtered by `label_status` (review status) and `label_updated_until` (an
+optional ISO-8601 point-in-time cutoff → the export's `updated_until`; only tasks last updated
+at/before it are pulled). Both are forwarded on every read (`_label_export_rows`, `_label_pairs`)
+and editable post-creation via PATCH — changing either re-counts the dataset's rows.
 
 ### Self-hosted HuggingFace catalog (the "Models" section)
 

@@ -422,6 +422,11 @@ class Dataset(Base):
     # Which review status to import from the project: approved | rejected |
     # not_reviewed | all (the export endpoint's `status` filter). Default approved.
     label_status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # Optional point-in-time cutoff (ISO-8601, UTC) for the import: only tasks whose
+    # last_updated_at is at or before this instant are pulled (the export endpoint's
+    # `updated_until` filter). None → no upper bound (every task). Set on /datasets/new
+    # and editable later — lets a label dataset materialise a stable snapshot.
+    label_updated_until: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     # Alternatively the lpat token can come from a named global secret instead of
     # being stored per-dataset; resolved via load_global_env() at use time.
     label_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
@@ -733,6 +738,11 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS catalog_repo_id VARCHAR(64)"
+        ))
+        # Point-in-time cutoff for kind=label imports (export `updated_until`). NULL on
+        # existing rows → unchanged behaviour (import every task).
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_updated_until VARCHAR(64)"
         ))
         # Catalog revisions: existing repos stay flat (versioned=false) → no behaviour
         # change; only mirror-native pushes set versioned=true. catalog_revisions

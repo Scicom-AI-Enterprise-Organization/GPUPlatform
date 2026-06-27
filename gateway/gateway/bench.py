@@ -369,6 +369,20 @@ def s3_list(prefix: str, target: Optional[S3Target] = None) -> list[dict]:
     return out
 
 
+def s3_delete_prefix(prefix: str, target: Optional[S3Target] = None) -> int:
+    """Delete every object under `prefix` (batched, 1000/req). Returns the count
+    deleted. Refuses an empty/root prefix — that would wipe the whole bucket."""
+    if not (prefix and prefix.strip("/")):
+        raise ValueError("refusing to delete an empty/root S3 prefix")
+    t = target or _env_s3_target()
+    cli = _s3_client(t)
+    keys = [o["key"] for o in s3_list(prefix, t)]
+    for i in range(0, len(keys), 1000):
+        batch = [{"Key": k} for k in keys[i : i + 1000]]
+        cli.delete_objects(Bucket=t.bucket, Delete={"Objects": batch})
+    return len(keys)
+
+
 def s3_presign_get(key: str, expires: int = 3600, target: Optional[S3Target] = None) -> str:
     t = target or _env_s3_target()
     return _s3_client(t).generate_presigned_url(

@@ -34,7 +34,7 @@ POST  /api/projects                  {name, description?, type, labeling_mode?} 
 PUT   /api/projects/{id}/storage      {provider, bucket, region, prefix, endpoint?, access_key, secret_key}
 PATCH /api/projects/{id}             {mos_enabled?, mos_axes?, restrict_to_assigned?, hide_approved_from_labeller?}
 POST  /api/projects/{id}/tasks        {tasks: TaskRow[]}                          → {imported:N}
-GET   /api/projects/{id}/export.v1.jsonl?status=approved|rejected|not_reviewed|all
+GET   /api/projects/{id}/export.v1.jsonl?status=approved|rejected|not_reviewed|all[&updated_since=ISO][&updated_until=ISO]
 ```
 
 `type ∈ transcription | recording | preference | red_teaming | ocr | human_mos | pipeline`.
@@ -86,6 +86,16 @@ and configures the Label storage with `prefix:""`, so proxy key == export key.
 `GET /api/projects/{id}/export.v1.jsonl` — **only `transcription` + `recording`** projects;
 NDJSON, one line per task with non-empty `audio_filename`. Each line:
 `{id, audio_url, audio_filename, transcription, reviewed, review_comment, word_timings,
-segments, pii_entities, mos_scores, annotated_by, reviewed_by, created_at}`. For S3 storage
-`audio_url` is a 1h presigned GET; otherwise an internal proxy URL (needs the PAT to fetch).
-Headers: `X-Total-Tasks`, `X-Schema-Version: v1`, `ETag` (supports `If-None-Match` → 304).
+segments, pii_entities, mos_scores, annotated_by, reviewed_by, created_at, last_updated_at}`.
+For S3 storage `audio_url` is a 1h presigned GET; otherwise an internal proxy URL (needs the
+PAT to fetch). Headers: `X-Total-Tasks`, `X-Schema-Version: v1`, `ETag` (supports
+`If-None-Match` → 304).
+
+**Filters** (query params): `status` (`approved` (default) | `rejected` | `not_reviewed` |
+`all`), and a `last_updated_at` range — `updated_since` (≥, incremental pulls) and
+`updated_until` (≤, **point-in-time snapshot**). `last_updated_at` is the latest of a task's
+creation, any edit, or any annotation. The cutoff filters server-side, so `X-Total-Tasks` and
+the gateway's pagination stay accurate. A `kind=label` Dataset stores its cutoff in
+`Dataset.label_updated_until` (ISO-8601 UTC; set on `/datasets/new`, editable from the dataset's
+**Import filter** card) and the gateway forwards it as `updated_until` on every preview /
+transform / merge read (`_label_export_rows`, `_label_pairs`).

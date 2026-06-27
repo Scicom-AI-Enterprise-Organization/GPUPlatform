@@ -8,6 +8,7 @@ import type { DatasetPreview, DatasetRecord, StorageRecord } from "@/lib/types";
 import { DatasetTitle } from "./dataset-title";
 import { DeleteButton } from "./delete-button";
 import { ColumnsCard } from "./columns-card";
+import { LabelImportCard } from "./label-import-card";
 import { TransformationCard } from "./transformation-card";
 import { RowBrowser } from "./row-browser";
 import { DecoderCard, type DecoderState } from "./decoder-card";
@@ -158,7 +159,7 @@ export function DatasetDetail({
               )}
             </div>
           </div>
-          <DeleteButton id={dataset.id} name={dataset.name} />
+          <DeleteButton id={dataset.id} name={dataset.name} kind={dataset.kind} />
         </div>
 
         <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-5">
@@ -209,7 +210,14 @@ export function DatasetDetail({
             </TabsContent>
           )}
 
-          <TabsContent value="columns" className="!flex-none">
+          <TabsContent value="columns" className="!flex-none space-y-4">
+            {dataset.kind === "label" && (
+              <LabelImportCard
+                datasetId={dataset.id}
+                labelStatus={dataset.label_status}
+                labelUpdatedUntil={dataset.label_updated_until}
+              />
+            )}
             <ColumnsCard
               datasetId={dataset.id}
               kind={dataset.kind}
@@ -275,6 +283,12 @@ export function DatasetDetail({
                         {dataset.label_base_url}/dashboard/projects/{dataset.label_project_id}
                       </span>
                     }
+                  />
+                )}
+                {dataset.kind === "label" && dataset.label_updated_until && (
+                  <Row
+                    label="Import cutoff"
+                    value={<span className="text-xs">{new Date(dataset.label_updated_until).toLocaleString()}</span>}
                   />
                 )}
                 <Row label="Format" value={dataset.format ? dataset.format.toUpperCase() : "—"} />

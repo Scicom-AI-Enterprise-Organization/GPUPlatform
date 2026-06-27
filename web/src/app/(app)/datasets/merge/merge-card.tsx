@@ -37,6 +37,19 @@ function errText(body: unknown, fallback: string): string {
   return fallback;
 }
 
+// Turn a dataset name into a safe S3 path segment: lowercase, non-alphanumerics
+// (spaces, punctuation, non-ASCII) collapse to a single dash, trimmed. Empty if
+// nothing survives (e.g. an all-CJK name) → caller falls back to the id default.
+function slugify(s: string): string {
+  return s
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80)
+    .replace(/-+$/g, "");
+}
+
 export function MergeCard({
   labelDatasets,
   s3Storages,
@@ -50,7 +63,9 @@ export function MergeCard({
   const [target, setTarget] = useState<"hf" | "s3">("s3");
   const [outRepo, setOutRepo] = useState("");
   const [storageId, setStorageId] = useState(s3Storages[0]?.id ?? "");
-  const [s3Folder, setS3Folder] = useState("");
+  // S3 folder is derived from the (effective) dataset name; null until the user
+  // manually overrides it in the field.
+  const [folderOverride, setFolderOverride] = useState<string | null>(null);
   const [newId, setNewId] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [log, setLog] = useState<string | null>(null);
@@ -95,6 +110,17 @@ export function MergeCard({
       : selected.length === 1
         ? byId.get(selected[0])?.name ?? selected[0]
         : `${selected.length} datasets`;
+
+  // The name the merge will use: the typed name, else the auto "Merged: A + B"
+  // (mirrors the gateway). The S3 folder is derived from it (slugified) unless
+  // the user has overridden the field — blank slug → the gateway's id default.
+  const autoName = selected.length
+    ? `Merged: ${selected.map((id) => byId.get(id)?.name ?? id).join(" + ")}`
+    : "";
+  const effectiveName = name.trim() || autoName;
+  const nameSlug = slugify(effectiveName);
+  const derivedFolder = nameSlug ? `datasets/${nameSlug}/transformed` : "";
+  const s3Folder = folderOverride ?? derivedFolder;
 
   async function run() {
     setErr(null);
@@ -270,14 +296,15 @@ export function MergeCard({
                   <Input
                     id="mg-folder"
                     value={s3Folder}
-                    onChange={(e) => setS3Folder(e.target.value)}
+                    onChange={(e) => setFolderOverride(e.target.value)}
                     placeholder="datasets/<new-id>/transformed"
                     disabled={running}
                     className="font-mono text-xs"
                   />
                   <p className="text-xs text-muted-foreground">
-                    Blank → <span className="font-mono">datasets/&lt;new-id&gt;/transformed</span> under the
-                    storage prefix. Audio → <span className="font-mono">…/audio/</span>, metadata →{" "}
+                    Auto-derived from the dataset name (slugified); edit to override. Blank →{" "}
+                    <span className="font-mono">datasets/&lt;new-id&gt;/transformed</span> under the storage
+                    prefix. Audio → <span className="font-mono">…/audio/</span>, metadata →{" "}
                     <span className="font-mono">…/metadata.csv</span>.
                   </p>
                 </div>

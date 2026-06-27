@@ -75,6 +75,7 @@ class CreateDatasetRequest(BaseModel):
     label_token: Optional[str] = None        # lpat_… (stored Fernet-encrypted, never returned)
     label_token_secret: Optional[str] = None # OR: a global-secret key holding the lpat token
     label_status: Optional[str] = None       # approved | rejected | not_reviewed | all (default approved)
+    label_updated_until: Optional[str] = None # ISO-8601 cutoff — import only tasks last updated at/before it
 
 
 class UpdateDatasetRequest(BaseModel):
@@ -90,6 +91,11 @@ class UpdateDatasetRequest(BaseModel):
     split_fields: Optional[dict[str, str]] = None
     # kind=llm — which column holds the messages array. Pass "" to reset to default.
     messages_field: Optional[str] = None
+    # kind=label import filters. None → leave unchanged. label_status switches the
+    # review-status filter; label_updated_until sets/clears (pass "") the ISO-8601
+    # point-in-time cutoff. Changing either re-counts the dataset's rows.
+    label_status: Optional[str] = None
+    label_updated_until: Optional[str] = None
 
 
 class RowInclusionRequest(BaseModel):
@@ -227,6 +233,7 @@ class DatasetRecord(BaseModel):
     label_base_url: Optional[str] = None     # kind=label source (token never returned)
     label_project_id: Optional[str] = None
     label_status: Optional[str] = None
+    label_updated_until: Optional[str] = None  # ISO-8601 point-in-time import cutoff (None → no upper bound)
     label_token_secret: Optional[str] = None  # global-secret key (if used instead of a stored token)
     transform_status: Optional[str] = None  # "" | running | done | failed
     transform_log: Optional[str] = None     # short tail of progress lines
@@ -287,6 +294,24 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
+def _norm_cutoff(raw: Optional[str]) -> Optional[str]:
+    """Validate + canonicalise a kind=label import cutoff (the `updated_until`
+    filter). Accepts any ISO-8601 instant (a trailing `Z` or an offset); a naive
+    value is read as UTC. Returns a canonical UTC ISO-8601 string (`…+00:00`) the
+    Label export compares lexicographically, or None for a blank/cleared value.
+    Raises HTTPException(400) on an unparseable timestamp."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid timestamp: {s!r} (expected ISO-8601)") from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _to_record(
     d: Dataset,
     owner_username: str,
@@ -323,6 +348,7 @@ def _to_record(
         label_base_url=getattr(d, "label_base_url", None),
         label_project_id=getattr(d, "label_project_id", None),
         label_status=getattr(d, "label_status", None),
+        label_updated_until=getattr(d, "label_updated_until", None),
         label_token_secret=getattr(d, "label_token_secret", None),
         messages_field=getattr(d, "messages_field", None) or None,
         transform_status=getattr(d, "transform_status", None),
@@ -556,6 +582,7 @@ async def create_dataset(
     label_token_enc: Optional[str] = None
     label_token_secret_val: Optional[str] = None
     label_status_val: Optional[str] = None
+    label_updated_until_val: Optional[str] = None
     label_num_rows: Optional[int] = None
     if req.kind in ("upload", "s3", "tts_packed", "llm_packed"):
         if not req.storage_id:
@@ -595,11 +622,14 @@ async def create_dataset(
         label_status_val = (req.label_status or "approved").strip() or "approved"
         if label_status_val not in ("approved", "rejected", "not_reviewed", "all"):
             raise HTTPException(status_code=400, detail=f"invalid label_status: {label_status_val}")
-        # Verify the token + project reachable, and grab the row count, by reading
-        # the export header (limit=0 stops after the first line).
+        label_updated_until_val = _norm_cutoff(req.label_updated_until)
+        # Verify the token + project reachable, and grab the row count (under the
+        # status + cutoff filters), by reading the export header (limit=0 stops after
+        # the first line).
         try:
             _, label_num_rows = await _run_sync(
-                _label_export_rows, label_base_url, label_project_id, verify_tok, label_status_val, 0, 0,
+                _label_export_rows, label_base_url, label_project_id, verify_tok,
+                label_status_val, 0, 0, label_updated_until_val,
             )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(
@@ -630,6 +660,7 @@ async def create_dataset(
         label_token_enc=label_token_enc,
         label_token_secret=label_token_secret_val,
         label_status=label_status_val,
+        label_updated_until=label_updated_until_val,
     )
     if req.kind == "label":
         # The Label export uses audio_url + transcription columns.
@@ -889,6 +920,33 @@ async def update_dataset(
         d.split_fields = cleaned or None
     if req.messages_field is not None:
         d.messages_field = req.messages_field.strip() or None
+    # kind=label import filters. Changing the status or the point-in-time cutoff
+    # changes which tasks the dataset materialises, so re-count the rows (best-effort
+    # — a transient platform/token issue must not block the metadata edit).
+    label_filter_changed = False
+    if d.kind == "label":
+        if req.label_status is not None:
+            st = req.label_status.strip() or "approved"
+            if st not in ("approved", "rejected", "not_reviewed", "all"):
+                raise HTTPException(status_code=400, detail=f"invalid label_status: {st}")
+            if st != (d.label_status or "approved"):
+                d.label_status = st
+                label_filter_changed = True
+        if req.label_updated_until is not None:
+            cutoff = _norm_cutoff(req.label_updated_until)  # "" clears it → None
+            if cutoff != d.label_updated_until:
+                d.label_updated_until = cutoff
+                label_filter_changed = True
+    if label_filter_changed:
+        tok = await _label_token(d, session)
+        if d.label_base_url and d.label_project_id and tok:
+            try:
+                _, d.num_rows = await _run_sync(
+                    _label_export_rows, d.label_base_url, d.label_project_id, tok,
+                    d.label_status or "approved", 0, 0, d.label_updated_until,
+                )
+            except Exception:  # noqa: BLE001 — keep the stale count rather than fail the edit
+                pass
     await session.commit()
     await session.refresh(d)
     storage = await session.get(Storage, d.storage_id) if d.storage_id else None
@@ -897,18 +955,54 @@ async def update_dataset(
     return _to_record(d, owner.username if owner else "", storage.name if storage else None)
 
 
+def _dataset_storage_prefix(d: Dataset, storage: Optional[Storage]) -> Optional[str]:
+    """The S3 key prefix holding this dataset's materialised files (for
+    purge-on-delete), or None when nothing under our storage is the dataset's to
+    delete — kind=hf is pushed to a HF repo, kind=label lives on the labeling
+    platform, and a dataset with no S3 backing has nothing here."""
+    uri = d.s3_metadata_uri or ""
+    if uri.startswith("s3://"):
+        key = urlparse(uri).path.lstrip("/")
+        if d.kind == "s3":
+            # metadata.csv lives at {base}/metadata.csv → purge the {base}/ folder.
+            return (key.rsplit("/", 1)[0] + "/") if "/" in key else None
+        if d.kind in ("tts_packed", "llm_packed"):
+            return key.rstrip("/") + "/"  # the URI already points at the shards prefix
+    if d.kind == "upload" and storage is not None and storage.kind == "s3" and d.metadata_filename:
+        _, base = _s3_target_and_prefix(storage)
+        return _join_key(base, "datasets", d.id) + "/"
+    return None
+
+
 @router.delete("/{dataset_id}")
 async def delete_dataset(
     dataset_id: str,
+    purge: bool = Query(False, description="also delete the dataset's files in S3 storage"),
     user: User = Depends(require_section("datasets")),
     session: AsyncSession = Depends(get_session),
 ):
+    """Delete the dataset record. With `purge=true`, ALSO delete the dataset's
+    files in S3 storage first (only for S3-backed kinds: s3 / tts_packed /
+    llm_packed / upload). If a requested purge fails, the record is kept so the
+    caller can retry rather than orphaning files."""
     d = await _require_dataset(session, dataset_id, user)
     name = d.name
+    purged = 0
+    if purge:
+        storage = await session.get(Storage, d.storage_id) if d.storage_id else None
+        prefix = _dataset_storage_prefix(d, storage)
+        if prefix and storage is not None and storage.kind == "s3":
+            try:
+                target, _ = _s3_target_and_prefix(storage)
+                purged = await _run_sync(bench.s3_delete_prefix, prefix, target)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("purge failed for dataset %s (prefix=%s): %s", dataset_id, prefix, e)
+                raise HTTPException(status_code=502, detail=f"failed to purge storage files: {e}") from e
     await session.delete(d)
     await session.commit()
-    await audit_module.record(user, "dataset.delete", "dataset", dataset_id, name)
-    return {"ok": True, "id": dataset_id}
+    await audit_module.record(user, "dataset.delete", "dataset", dataset_id, name,
+                              details={"purge": purge, "purged_objects": purged})
+    return {"ok": True, "id": dataset_id, "purged_objects": purged}
 
 
 # ---------- publish to the self-hosted HF mirror -----------------------
@@ -1497,19 +1591,25 @@ async def _label_token(d: Dataset, session: AsyncSession) -> Optional[str]:
 
 def _label_export_rows(
     base_url: str, project_id: str, token: str, status: str, limit: int, offset: int,
+    until: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], Optional[int]]:
     """Stream a Label-platform project's `export.v1.jsonl` (one task per line, with
     `audio_url` + `transcription`) and return (rows[offset:offset+limit], total).
     Auth is `Authorization: Bearer <lpat token>`. Reads `X-Total-Tasks` for the
     count so we can stop early once the requested page is collected; `limit=0`
-    just verifies the token + returns the total. Sync — call via `_run_sync`."""
+    just verifies the token + returns the total. `until` (ISO-8601) is forwarded as
+    the export's `updated_until` cutoff so the platform filters server-side (total +
+    pagination stay accurate). Sync — call via `_run_sync`."""
     base = base_url.rstrip("/")
     url = f"{base}/api/projects/{project_id}/export.v1.jsonl"
+    params: dict[str, str] = {"status": status or "approved"}
+    if until:
+        params["updated_until"] = until
     rows: list[dict[str, Any]] = []
     total: Optional[int] = None
     with httpx.Client(timeout=120.0, follow_redirects=True) as cli:
         with cli.stream(
-            "GET", url, params={"status": status or "approved"},
+            "GET", url, params=params,
             headers={"Authorization": f"Bearer {token}"},
         ) as r:
             r.raise_for_status()
@@ -1711,6 +1811,7 @@ async def preview_dataset(
             raw, total = await _run_sync(
                 _label_export_rows, d.label_base_url, d.label_project_id, tok,
                 d.label_status or "approved", limit, offset,
+                getattr(d, "label_updated_until", None),
             )
             base = (d.label_base_url or "").rstrip("/")
 

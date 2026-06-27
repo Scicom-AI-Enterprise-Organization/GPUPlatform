@@ -66,6 +66,10 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
   const [labelProjectUrl, setLabelProjectUrl] = useState("");
   const [labelToken, setLabelToken] = useState("");
   const [labelStatus, setLabelStatus] = useState("approved");
+  // label: optional point-in-time cutoff — only import tasks last updated at/before
+  // this instant. Held as a `datetime-local` value (browser-local wall clock); sent
+  // as a UTC ISO-8601 string. Empty → no upper bound (import every task).
+  const [labelUpdatedUntil, setLabelUpdatedUntil] = useState("");
   const [tokenMode, setTokenMode] = useState<"paste" | "secret">("paste");
   const [labelTokenSecret, setLabelTokenSecret] = useState("");
   const [secrets, setSecrets] = useState<GlobalEnvRecord[]>([]);
@@ -141,6 +145,8 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
         label_token: kind === "label" && tokenMode === "paste" ? labelToken.trim() : null,
         label_token_secret: kind === "label" && tokenMode === "secret" ? labelTokenSecret : null,
         label_status: kind === "label" ? labelStatus : null,
+        label_updated_until:
+          kind === "label" && labelUpdatedUntil ? new Date(labelUpdatedUntil).toISOString() : null,
       });
       router.push(`/datasets/${encodeURIComponent(created.id)}`);
     } catch (e) {
@@ -502,6 +508,27 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                     </SelectContent>
                   </Select>
                 </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="ds-labelcutoff" className="text-xs uppercase tracking-wide text-muted-foreground">
+                  Up to (timestamp cutoff) <span className="text-muted-foreground/60 normal-case">— optional</span>
+                </Label>
+                <Input
+                  id="ds-labelcutoff"
+                  type="datetime-local"
+                  value={labelUpdatedUntil}
+                  onChange={(e) => setLabelUpdatedUntil(e.target.value)}
+                  className="sm:max-w-xs"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Only import tasks last updated at or before this moment — a point-in-time snapshot. Read in your
+                  local timezone
+                  {labelUpdatedUntil ? (
+                    <> (= <span className="font-mono">{new Date(labelUpdatedUntil).toISOString()}</span> UTC)</>
+                  ) : null}
+                  . Leave blank to import every task.
+                </p>
               </div>
 
               <div className="space-y-2">
