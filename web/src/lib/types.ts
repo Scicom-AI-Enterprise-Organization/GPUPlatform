@@ -457,6 +457,10 @@ export type CreateTrainingRunRequest = {
   visible_devices?: string | null;
   storage_id?: string | null;
   hf_push_repo?: string | null;
+  // HF token for the run (gated/private datasets + push to Hub). hf_token_secret = a
+  // Secrets-page key reference (wins); hf_token = a pasted token (stored encrypted).
+  hf_token?: string | null;
+  hf_token_secret?: string | null;
   // experiment tracking — non-secret per-run knobs only; creds come from the
   // global Secrets page.
   report_to?: ("mlflow" | "wandb")[];

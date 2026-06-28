@@ -24,13 +24,27 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Optional
 
 _LOGGER = logging.getLogger("gateway.access")
+# Separate stream for serverless-endpoint (vLLM) logs re-emitted from
+# /workers/logs, so Loki/Alloy can ingest them as `service="vllm"` alongside
+# the gateway access log. Independent logger keeps its JSON lines unprefixed.
+_EP_LOGGER = logging.getLogger("gateway.endpoint")
 _JSON = False
 _INIT = False
+# True once endpoint re-emit is actually wired (LOG_JSON=1 → prod Alloy tails
+# stdout, or GATEWAY_ENDPOINT_LOG set → dev Promtail tails the file). When False
+# `log_endpoint_lines` is a no-op so plain local dev pays nothing.
+_EP_ENABLED = False
+
+# vLLM/uvicorn lines carry a level token near the start, e.g.
+# "(EngineCore pid=…) ERROR 06-28 …" — lift it to a `level` field for
+# `{service="vllm"} | json | level="error"`.
+_LEVEL_RE = re.compile(r"\b(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG)\b")
 
 
 def _truthy(v: str) -> bool:
@@ -55,6 +69,26 @@ def init_access_logging() -> None:
     for h in handlers:
         h.setFormatter(fmt)
         _LOGGER.addHandler(h)
+
+    # Endpoint (vLLM) log stream. Always JSON (it's a machine stream consumed by
+    # Loki/Alloy, never a human terminal). stdout only in LOG_JSON mode (prod
+    # Alloy tails the gateway's stdout); the file tee (GATEWAY_ENDPOINT_LOG) is
+    # what a host-side dev Promtail tails — kept off stdout so it doesn't clutter
+    # the local terminal.
+    global _EP_ENABLED
+    _EP_LOGGER.setLevel(logging.INFO)
+    _EP_LOGGER.propagate = False
+    ep_handlers: list[logging.Handler] = []
+    if _JSON:
+        ep_handlers.append(logging.StreamHandler(sys.stdout))
+    ep_path = os.environ.get("GATEWAY_ENDPOINT_LOG", "").strip()
+    if ep_path:
+        os.makedirs(os.path.dirname(ep_path) or ".", exist_ok=True)
+        ep_handlers.append(logging.FileHandler(ep_path))
+    for h in ep_handlers:
+        h.setFormatter(fmt)
+        _EP_LOGGER.addHandler(h)
+    _EP_ENABLED = bool(ep_handlers)
     _INIT = True
 
 
@@ -95,3 +129,54 @@ def log_request(
         _LOGGER.info(json.dumps(rec, separators=(",", ":")))
     else:
         _LOGGER.info("%s %s → %d (%.3fms)", method, path, status, duration_ms)
+
+
+def _line_level(line: str) -> str:
+    """Best-effort severity for a vLLM log line (scan only the head — the level
+    token sits near the front). Defaults to info."""
+    m = _LEVEL_RE.search(line[:120])
+    if not m:
+        return "info"
+    t = m.group(1)
+    if t in ("ERROR", "CRITICAL"):
+        return "error"
+    if t in ("WARNING", "WARN"):
+        return "warn"
+    if t == "DEBUG":
+        return "debug"
+    return "info"
+
+
+def log_endpoint_lines(
+    *,
+    app_id: str,
+    model: Optional[str],
+    machine: Optional[str],
+    session: Optional[str],
+    lines: list[str],
+) -> None:
+    """Re-emit a batch of serverless-endpoint (vLLM) log lines into the
+    ``service="vllm"`` stream for Loki/Alloy. No-op unless endpoint logging is
+    wired (see ``_EP_ENABLED``), so the /workers/logs hot path pays nothing in
+    plain local dev. Each line becomes a JSON record; ``app_id``/``model`` are
+    low-cardinality and meant to be promoted to Loki labels by the collector,
+    while ``machine``/``session`` stay queryable JSON fields (``machine`` is an
+    unbounded RunPod pod id — a poor label)."""
+    if not _EP_ENABLED or not lines:
+        return
+    now = int(time.time() * 1000)
+    for line in lines:
+        if not line:
+            continue
+        rec = {
+            "service": "vllm",
+            "kind": "endpoint_log",
+            "level": _line_level(line),
+            "app_id": app_id,
+            "model": model,
+            "machine": machine,
+            "session": session,
+            "time": now,
+            "msg": line,
+        }
+        _EP_LOGGER.info(json.dumps(rec, separators=(",", ":"), ensure_ascii=False))

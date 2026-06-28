@@ -5,22 +5,33 @@ SlurmUI's: RED metrics, latency percentiles, by-route tables, and a **filterable
 request-log panel**. It does not depend on any cluster's Grafana.
 
 ```
-gateway /metrics            ──scrape──▶ Prometheus ──┐
+gateway /metrics             ──scrape──▶ Prometheus ──┐
 gateway JSON access log file ──tail──▶ Promtail ▶ Loki┤──▶ Grafana (GPUPlatform — API Layer)
+gateway endpoint (vLLM) log  ──tail──▶ Promtail ▶ Loki┤   ({service="vllm"})
 Redis queue:{app_id} (sampled into /metrics)─────────┘
 ```
 
 ## Run it locally
 
-1. Start the gateway with JSON access logs teed to a file Promtail can tail:
+1. Start the gateway with JSON logs teed to files Promtail can tail:
 
    ```bash
-   LOG_JSON=1 GATEWAY_ACCESS_LOG=deploy/monitoring/logs/gateway-access.log .venv/bin/gateway
+   LOG_JSON=1 \
+     GATEWAY_ACCESS_LOG=deploy/monitoring/logs/gateway-access.log \
+     GATEWAY_ENDPOINT_LOG=deploy/monitoring/logs/endpoint.log \
+     .venv/bin/gateway
    ```
 
-   (`LOG_JSON` unset → human-readable `POST /tm-fleet/v1/chat/completions → 200
-   (842ms)` lines for the terminal; the file is still written if `GATEWAY_ACCESS_LOG`
-   is set.)
+   - `GATEWAY_ACCESS_LOG` → per-request HTTP access lines (`service="gateway"`).
+   - `GATEWAY_ENDPOINT_LOG` → serverless-endpoint **vLLM** logs (`service="vllm"`),
+     the same lines shown on `/serverless/<app>?tab=logs`, re-emitted from the
+     `/workers/logs` ingest path. Tagged with `app_id` / `model` / `level` labels
+     and `machine` / `session` JSON fields.
+
+   (`LOG_JSON` unset → human-readable access lines for the terminal; the access
+   file is still written if `GATEWAY_ACCESS_LOG` is set. The endpoint re-emit is a
+   no-op unless `LOG_JSON=1` **or** `GATEWAY_ENDPOINT_LOG` is set, so plain dev
+   pays nothing.)
 
 2. Bring up the stack:
 
@@ -57,5 +68,10 @@ variable filter per fleet.
 
 The Helm chart already ships a `ServiceMonitor` scraping `/metrics`. For logs in
 the cluster, set `LOG_JSON=1` on the gateway deployment and point Alloy/Promtail
-(from `kube-prometheus-stack` / `grafana/loki-stack`) at the gateway pod stdout
-with `service=gateway`, then import `deploy/grafana/api-layer.json`.
+(from `kube-prometheus-stack` / `grafana/loki-stack`) at the gateway pod stdout,
+then import `deploy/grafana/api-layer.json`. With `LOG_JSON=1` the gateway writes
+**both** streams to stdout as JSON; distinguish them by the `service` field
+(`service="gateway"` access lines vs `service="vllm"` endpoint lines) — e.g. an
+Alloy `loki.process` stage that promotes `service`, `app_id`, and (for vLLM)
+`model` / `level` to labels. No `GATEWAY_ENDPOINT_LOG` file is needed in-cluster;
+that file tee is only for tailing a host-process gateway in local dev.

@@ -119,16 +119,37 @@ is cross-entropy against `labels`. Padding positions are set to **`-100`** so th
 ignored by the loss (see the collator: `masked_fill(attention_mask.ne(1), -100)`, and
 it strips a leading BOS that the decoder re-adds).
 
+**Text cleaning + per-utterance language** (`_prepare_texts`, a vendored mirror of
+`autotrain/whisper/cleaning.py` — the pod gets no gateway imports, so keep the two in
+sync). Before tokenizing, every transcription is standardized with
+`whisper_textcleaning` (NFKC, fold CJK/full-width punctuation → ASCII, drop `[...]`,
+canonicalize fillers; `clean_text=false` to skip). **By default** (when `language` is
+unset/`auto`/`multilingual`) each utterance's language is detected and the full prompt
+`<|startoftranscript|><|LANG|><|transcribe|><|notimestamps|> TEXT<|endoftext|>` is built
+per row (tokenized with `add_special_tokens=False`): **`zh` when CJK ideographs are ≥
+50% of the characters** (`chinese_ratio` — the bahasa/en fastText model has no `zh`
+label), else fastText `bahasa`→`ms` / else→`en`. Set a concrete `language` code to opt
+out — that pins every utterance and keeps the processor-prompt path. fastText
+(`fasttext-wheel` + `mesolitica/fasttext-language-detection-bahasa-en`) loads on the
+pod; if it's unavailable, zh is still tagged by ratio and the rest default to `en`.
+
 ### 1.3 What the script actually does (read in this order)
 
 - `parse_precision()` — `"<load>-<amp>"`, default **`fp32-bf16`** (load weights in
   fp32, train with bf16 mixed precision). Don't default to `bf16-bf16`.
 - `_ensure_venv()` — isolated venv at **`/share/autotrain-whisper`** (transformers,
-  accelerate, `soundfile`+`librosa` for audio decode, `peft` for LoRA, boto3).
-- `load_pairs()` / `_LazyAsrDataset` — resolve the dataset (S3 metadata rows or a HF
-  dataset), and **lazily** per item: decode+resample to 16 kHz → `feature_extractor`
-  → `input_features`; `tokenizer(text)` → `labels`. Lazy = we don't hold every mel in
-  RAM.
+  accelerate, `soundfile`+`librosa` for audio decode, `peft` for LoRA, boto3,
+  `fasttext-wheel` for language detection). Two pins matter: **`numpy==1.26.4`**
+  (fasttext-wheel's C ext breaks on numpy 2.x) and **`torch==2.8.0` from the `cu128`
+  wheel index** (matches the cu1281 pod image — an unpinned `torch` pulls a cu13 build
+  whose CUDA mismatches the pod → `torch.cuda` unavailable → "doesn't support bf16/gpu").
+  torch is installed in a separate step from the PyPI pkgs (the CUDA index 404s them).
+  The venv health-check requires both pins, so a stale venv is reconciled in place.
+- `load_pairs()` / `_prepare_texts()` / `_LazyAsrDataset` — resolve the dataset (S3
+  metadata rows or a HF dataset); `_prepare_texts` cleans + (auto mode) language-tags
+  each row's text once up front; then **lazily** per item: decode+resample to 16 kHz →
+  `feature_extractor` → `input_features`; `tokenizer(text)` → `labels` (preformatted
+  rows use `add_special_tokens=False`). Lazy = we don't hold every mel in RAM.
 - `_augment_audio()` / `_AUG_FUNCS` — optional robustness augmentations (telephone
   band-pass, additive noise, packet-loss dropout, gain, pitch, speed, reverb).
 - the data **collator** — pads a batch of variable-length `input_features` and

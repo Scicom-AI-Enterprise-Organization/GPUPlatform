@@ -20,10 +20,12 @@ import argparse
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import traceback
+import unicodedata
 
 
 # Under torchrun (DDP) every GPU runs this script as a separate rank; only rank 0
@@ -65,11 +67,221 @@ def parse_precision(p):
     return load_dt, (amp if amp in ("bf16", "fp16") else "")
 
 
+# ==========================================================================
+# Text standardization + language detection
+# --------------------------------------------------------------------------
+# Mirror of autotrain/whisper/cleaning.py (this script ships to the pod with NO
+# gateway imports, so it can't import that module — keep the two in sync).
+# fix_spacing / whisper_textcleaning / chinese_ratio are verbatim; detect_language
+# additionally tolerates a missing model (returns en); format_whisper's
+# clean→detect→format is inlined in _prepare_texts (it handles empty rows here).
+# Used to (1) standardize/clean each transcription before tokenizing and (2) tag
+# each utterance's language for the Whisper prompt. zh is decided by CJK character
+# ratio (the bahasa/en fastText model has no `zh` label); see detect_language.
+# ==========================================================================
+
+# CJK / full-width punctuation that NFKC does NOT fold to ASCII (ideographic full stop,
+# enumeration comma, full-width colon/semicolon, CJK brackets and dashes). We map them to
+# a single ASCII punctuation set so the model sees consistent punctuation across en/ms/zh.
+# (NFKC already handles the full-width comma '，', question '？' and exclamation '！'.)
+_CJK_PUNCT = str.maketrans({
+    '。': '.', '、': ',', '〜': '~', '～': '~',
+    '；': ';', '：': ':', '·': ' ', '・': ' ',
+    '「': '"', '」': '"', '『': '"', '』': '"',
+    '《': '"', '》': '"', '〈': '"', '〉': '"',
+    '【': '(', '】': ')', '〔': '(', '〕': ')',
+})
+
+# Curly quotes / dashes / ellipsis -> ASCII so they don't fragment the vocab.
+_QUOTES_DASHES = str.maketrans({
+    '‘': "'", '’': "'", '“': '"', '”': '"',
+    '–': '-', '—': '-', '―': '-', '−': '-',
+})
+
+# Zero-width / BiDi / BOM control characters that carry no acoustic content.
+_INVISIBLES = re.compile(r'[­​-‏‪-‮⁠﻿]')
+
+
+def fix_spacing(text):
+    quote_pattern = r'"([^"]*)"'
+    def fix_quotes(match):
+        content = match.group(1).strip()
+        return f'"{content}"'
+
+    text = re.sub(quote_pattern, fix_quotes, text)
+
+    paren_pattern = r'\(([^)]*)\)'
+    def fix_parens(match):
+        content = match.group(1).strip()
+        return f'({content})'
+
+    text = re.sub(paren_pattern, fix_parens, text)
+    text = re.sub(r'\s+([,\.!?])', r'\1', text)
+    return text
+
+def whisper_textcleaning(text):
+    # --- unicode standardization (run first, before any regex) ---
+    # NFKC folds full-width letters/digits + '，！？' to ASCII and the ideographic space to ' '.
+    text = unicodedata.normalize('NFKC', text)
+    text = _INVISIBLES.sub('', text)
+    text = text.translate(_QUOTES_DASHES)
+    text = text.translate(_CJK_PUNCT)
+    text = text.replace('…', '...')
+
+    text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
+    text = re.sub(r'\b(?:ok|oke|okay|okey|okie)\b', 'OK', text, flags=re.IGNORECASE)
+    # nasal hesitations (hmm/mm/erm/um/uh/uhm ...) -> single canonical token
+    text = re.sub(r'\b(?:h+m+|u+h*m+|u+h+|erm+|mm+)\b', 'herm', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(a+h+|a+\s*a+)(?=[\s,\.!?]|$)', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\.{2,}', ',', text)
+    text = re.sub(r'(?<=\s)-(\w+)\b', r'\1', text)
+    text = re.sub(r'\b(\w+)-(?=\s|$)', r'\1', text)
+    text = re.sub(r'\b(um|uh|aa|erm|herm)(\s+\1)+', r'\1', text, flags=re.IGNORECASE)
+    # collapse repeated end-punctuation ("!!" / "??" / ",,")
+    text = re.sub(r'([,!?])\1+', r'\1', text)
+    # space after , ! ? unless the next char is whitespace or a CJK character
+    text = re.sub(r'([,!?])(?=[^\s一-鿿])', r'\1 ', text)
+    # space after a sentence-ending period only before a capital letter (keep decimals,
+    # domains and emails intact: 3.30 / i.unify.my / name@gmail.com)
+    text = re.sub(r'(?<!\d)\.(?=[A-Z])', '. ', text)
+    text = fix_spacing(text)
+    # tidy punctuation stranded by removed interjections ("Sekejap. Ah, ..." / "Gun, ah?"):
+    text = re.sub(r'\s*,\s*(?=[.!?])', '', text)           # drop a comma sitting before . ! ?
+    text = re.sub(r'([.!?])\s*,', r'\1', text)              # drop a comma sitting after . ! ?
+    text = re.sub(r'([,.!?])(?:\s*[,.!?])+', r'\1', text)   # collapse any remaining run -> first mark
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'^[\s,.?!:;]+', '', text)                # strip leading punctuation
+    text = re.sub(r'\s*[,:;]+$', '', text)                  # strip a dangling trailing , : ;
+    return text.strip()
+
+
+# CJK ideograph ranges (Unified, Extension-A, Compatibility). Used to decide Chinese
+# by character ratio — the bahasa/en fastText model has no `zh` label, so Chinese
+# transcripts would otherwise be misdetected as `en`. (Full-width CJK *punctuation*
+# is already folded to ASCII by whisper_textcleaning, so only ideographs match here.)
+_CJK = re.compile(r'[一-鿿㐀-䶿豈-﫿]')
+
+
+def chinese_ratio(text):
+    """Fraction (0..1) of non-whitespace characters that are CJK ideographs."""
+    chars = re.sub(r'\s+', '', text)
+    if not chars:
+        return 0.0
+    return len(_CJK.findall(chars)) / len(chars)
+
+
+def detect_language(text, lang_model, chinese_threshold=0.5):
+    """Whisper language code for `text`:
+
+    - `zh` when CJK ideographs are at least `chinese_threshold` of the characters
+      (default 50%), checked first since the fastText model can't see Chinese;
+    - otherwise the fastText bahasa/en model
+      (`mesolitica/fasttext-language-detection-bahasa-en`): `bahasa` -> `ms`,
+      anything else (incl. `english` / `other`) -> `en`.
+
+    `lang_model` may be None (model unavailable) — then non-Chinese text falls back
+    to `en` (the zh-by-ratio decision still stands).
+    """
+    if chinese_ratio(text) >= chinese_threshold:
+        return "zh"
+    if lang_model is None:
+        return "en"
+    line = text.replace("\n", " ").replace("\r", " ").strip()
+    if not line:
+        return "en"
+    labels, _ = lang_model.predict(line, k=10)
+    clean = [l.replace("__label__", "") for l in labels]
+    top = clean[0]
+    if top == "other" and len(clean) > 1:
+        top = clean[1]
+    return "ms" if top == "bahasa" else "en"
+
+
+# --------------------------------------------------------------------------
+# Per-utterance language tagging glue (gateway-side; not part of cleaning.py)
+# --------------------------------------------------------------------------
+_LANG_MODEL = None  # cached fastText model (loaded once per process)
+
+
+def _auto_lang(cfg) -> bool:
+    """Per-utterance language detection (en/ms/zh) is the **default** — ON whenever
+    `language` is unset/None/'' (or explicitly 'auto'/'multi'/'multilingual'). Set a
+    concrete code (e.g. 'ms') to opt out and pin every utterance to that language."""
+    return (cfg.get("language") or "").strip().lower() in ("", "auto", "multi", "multilingual")
+
+
+def _load_lang_model(cfg):
+    """Download + load the bahasa/en fastText model for language detection. Cached.
+    Returns None on failure — detection then tags zh by character ratio and defaults
+    everything else to en (see detect_language)."""
+    global _LANG_MODEL
+    if _LANG_MODEL is not None:
+        return _LANG_MODEL
+    try:
+        import fasttext
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(
+            repo_id="mesolitica/fasttext-language-detection-bahasa-en",
+            filename="fasttext.ftz",
+            token=cfg.get("hf_token") or None,
+        )
+        _LANG_MODEL = fasttext.load_model(path)
+        log("[lang] fastText bahasa/en model loaded for per-utterance detection")
+    except Exception as e:  # noqa: BLE001
+        log(f"[lang] WARNING: fastText model unavailable ({e}); "
+            "tagging zh by CJK character ratio and defaulting other text to en")
+        _LANG_MODEL = None
+    return _LANG_MODEL
+
+
+def _prepare_texts(pairs: list, cfg: dict, lang_model, label: str) -> None:
+    """In-place: standardize/clean each pair's transcription and (auto mode) prepend
+    the Whisper prompt with a per-utterance language token. Sets pair['preformatted']
+    when the text already carries the full `<|startoftranscript|>…<|endoftext|>`
+    prompt (so __getitem__ tokenizes with add_special_tokens=False)."""
+    if not pairs:
+        return
+    clean = bool(cfg.get("clean_text", True))
+    auto = _auto_lang(cfg)
+    task = cfg.get("task") or "transcribe"
+    n_clean = 0
+    counts: dict[str, int] = {}
+    for p in pairs:
+        t = p.get("text") or ""
+        if clean:
+            ct = whisper_textcleaning(t)
+            if ct != t:
+                n_clean += 1
+            t = ct
+        if auto:
+            # zh decided by CJK character ratio first; ms/en via fastText (or en fallback).
+            lang = detect_language(t, lang_model)
+            p["text"] = f"<|startoftranscript|><|{lang}|><|{task}|><|notimestamps|> {t}<|endoftext|>"
+            p["preformatted"] = True
+            counts[lang] = counts.get(lang, 0) + 1
+        else:
+            p["text"] = t
+    if clean:
+        log(f"[clean] {label}: standardized {n_clean}/{len(pairs)} transcriptions")
+    if auto:
+        log(f"[lang] {label}: per-utterance language → "
+            + (", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"))
+
+
 # --------------------------------------------------------------------------
 # Dependency bootstrap — an isolated uv venv (created by --deps-only), so the
 # Whisper stack never clobbers the box's system python or the TTS stack.
 # --------------------------------------------------------------------------
 DEFAULT_VENV = "/share/autotrain-whisper"
+# Pin torch to match the pod image (DEFAULT_IMAGE = runpod/pytorch:…-cu1281-torch280…)
+# and install it from the matching CUDA wheel index — like the sibling trainers
+# (omnivoice/llm_finetune). An UNPINNED `torch` from PyPI's default index pulls the
+# latest (a cu13 build) whose CUDA mismatches the cu128 pod → torch.cuda unavailable →
+# transformers raises "doesn't support bf16/gpu". A cu128 build also runs on newer
+# (cu130) drivers via CUDA backward-compat.
+TORCH_VERSION = "2.8.0"
+TORCH_CUDA = "cu128"
 
 
 def _ensure_venv(cfg: dict) -> str:
@@ -83,11 +295,21 @@ def _ensure_venv(cfg: dict) -> str:
     env = {**os.environ, "PIP_CONSTRAINT": "", "PIP_REQUIRE_HASHES": "0"}
     # peft is always installed so the same venv serves LoRA + non-LoRA runs (and
     # _present checks it, so a venv first built for a non-LoRA run still gets it).
+    # torch is installed SEPARATELY below (pinned + CUDA index); these are the
+    # PyPI-default packages.
     pkgs = [
-        "torch", "transformers>=4.44", "datasets>=2.20,<4.0", "evaluate", "jiwer",
+        # fasttext-wheel's compiled extension is built against the numpy 1.x C ABI —
+        # under numpy 2.x its predict() raises "Unable to avoid copy" / "dtype size
+        # changed". Pin numpy 1.26.4 (last 1.x; compatible with this torch/transformers/
+        # datasets stack) so language detection works. Keep first so the resolver honours it.
+        "numpy==1.26.4",
+        "transformers>=4.44", "datasets>=2.20,<4.0", "evaluate", "jiwer",
         "accelerate>=0.30", "soundfile", "librosa", "boto3", "huggingface_hub", "peft>=0.11",
+        # per-utterance bahasa/en language detection (zh is decided by char ratio,
+        # no model). fasttext-wheel = prebuilt wheels, no C++ toolchain on the pod.
+        "fasttext-wheel",
     ]
-    check_mods = ["torch", "transformers", "datasets", "evaluate", "jiwer", "soundfile", "boto3", "peft"]
+    check_mods = ["torch", "transformers", "datasets", "evaluate", "jiwer", "soundfile", "boto3", "peft", "fasttext"]
     report_to = (cfg.get("tracking") or {}).get("report_to") or cfg.get("report_to") or []
     if "wandb" in report_to:
         pkgs.append("wandb"); check_mods.append("wandb")
@@ -95,9 +317,18 @@ def _ensure_venv(cfg: dict) -> str:
         pkgs.append("mlflow"); check_mods.append("mlflow")
 
     def _present() -> bool:
+        # Require numpy 1.x AND the pinned torch. A venv built before these pins may
+        # carry numpy 2.x (breaks fasttext) or a too-new torch (a cu13 wheel → no GPU
+        # on the cu128 pod). Either → exit(3) so the install below reconciles it.
+        probe = (
+            "import " + ", ".join(check_mods) + "\n"
+            "import numpy, torch, sys\n"
+            f"ok = numpy.__version__.startswith('1.') and torch.__version__.startswith('{TORCH_VERSION}')\n"
+            "sys.exit(0 if ok else 3)\n"
+        )
         try:
             subprocess.check_call(
-                [py, "-c", "import " + ", ".join(check_mods)],
+                [py, "-c", probe],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             return True
@@ -108,6 +339,13 @@ def _ensure_venv(cfg: dict) -> str:
         log(f"[deps] Whisper venv ready: {py}")
         return py
     have_uv = shutil.which("uv") is not None
+
+    def _pip(*args):
+        if have_uv:
+            subprocess.check_call(["uv", "pip", "install", "--python", py, *args], env=env)
+        else:
+            subprocess.check_call([py, "-m", "pip", "install", "-q", *args], env=env)
+
     # Create the venv only if absent (`uv venv` errors on a non-empty dir); then
     # ALWAYS install — idempotent, and adds any missing pkg (e.g. peft) to a venv
     # first built for a different run.
@@ -118,11 +356,13 @@ def _ensure_venv(cfg: dict) -> str:
         else:
             subprocess.check_call([sys.executable, "-m", "venv", venv], env=env)
             subprocess.check_call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"], env=env)
+    # torch first, pinned + from the CUDA wheel index (those wheels aren't on PyPI's
+    # default index). A separate call from the PyPI pkgs: passing --index-url with the
+    # PyPI-only pkgs would 404 them. Downgrades a previously-resolved too-new torch.
+    log(f"[deps] installing torch=={TORCH_VERSION} ({TORCH_CUDA}) into {venv} …")
+    _pip(f"torch=={TORCH_VERSION}", "--index-url", f"https://download.pytorch.org/whl/{TORCH_CUDA}")
     log(f"[deps] installing Whisper stack into {venv} …")
-    if have_uv:
-        subprocess.check_call(["uv", "pip", "install", "--python", py, *pkgs], env=env)
-    else:
-        subprocess.check_call([py, "-m", "pip", "install", "-q", *pkgs], env=env)
+    _pip(*pkgs)
     log(f"[deps] Whisper venv ready: {py}")
     return py
 
@@ -430,7 +670,12 @@ class _LazyAsrDataset:
                 if self.augment_techniques and random.random() < self.augment_prob:
                     array = _augment_audio(array, sr, self.augment_techniques)
                 feat = self.processor.feature_extractor(array, sampling_rate=sr).input_features[0]
-                labels = self.processor.tokenizer(it["text"]).input_ids
+                # Auto mode: it["text"] already carries the full Whisper prompt
+                # (<|startoftranscript|><|lang|>…<|endoftext|>) with a per-utterance
+                # language token, so don't let the tokenizer add its own. Fixed mode:
+                # plain (cleaned) text — the processor prepends its configured prompt.
+                add_special = not it.get("preformatted")
+                labels = self.processor.tokenizer(it["text"], add_special_tokens=add_special).input_ids
                 return {"input_features": feat, "labels": labels}
             except Exception as e:  # noqa: BLE001
                 last_err = e
@@ -505,7 +750,10 @@ def run(cfg: dict) -> None:
     _RUN_WORKDIR = work
     log(f"[trainer] work dir: {work}")
     base_model = cfg["base_model"]
-    language = cfg.get("language") or None
+    auto_lang = _auto_lang(cfg)
+    # Auto mode → processor/generation language is None (the per-utterance language
+    # token comes from the preformatted labels); fixed mode → the configured code.
+    language = None if auto_lang else (cfg.get("language") or None)
     task = cfg.get("task") or "transcribe"
     metric_name = (cfg.get("eval_metric") or "wer").lower()
 
@@ -529,6 +777,15 @@ def run(cfg: dict) -> None:
         raise RuntimeError(
             f"need both train and eval examples (got {len(train_pairs)}/{len(eval_pairs)})"
         )
+
+    # Standardize/clean every transcription (cleaning.py) and, in auto mode, tag each
+    # utterance's language for the Whisper prompt (zh by CJK character ratio, else
+    # fastText ms/en). Done once here, not per __getitem__, so it's cheap across epochs.
+    lang_model = _load_lang_model(cfg) if auto_lang else None
+    log(f"[train] text: clean={bool(cfg.get('clean_text', True))} "
+        f"language={'auto (per-utterance en/ms/zh)' if auto_lang else (language or 'none')}")
+    _prepare_texts(train_pairs, cfg, lang_model, "train")
+    _prepare_texts(eval_pairs, cfg, lang_model, "eval")
 
     load_dt, amp = parse_precision(cfg.get("precision"))
     _tdt = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[load_dt]

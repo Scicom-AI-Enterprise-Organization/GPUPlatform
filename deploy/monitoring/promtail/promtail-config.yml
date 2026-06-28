@@ -1,11 +1,18 @@
-# Promtail tails the gateway's JSON access log (written via
-# LOG_JSON=1 GATEWAY_ACCESS_LOG=deploy/monitoring/logs/gateway-access.log) and
-# ships to Loki, parsing the JSON so fields like status / route / app_id /
-# durationMs become queryable in Grafana via LogQL:
+# Promtail tails two JSON log streams the gateway tees to files and ships them
+# to Loki, parsing the JSON so fields become queryable in Grafana via LogQL.
 #
-#   {service="gateway"} | json | status >= 500
-#   {service="gateway"} | json | durationMs > 1000
-#   {service="gateway", app_id="tm-fleet"} | json
+#   gateway access log  (LOG_JSON=1 GATEWAY_ACCESS_LOG=…/gateway-access.log):
+#     {service="gateway"} | json | status >= 500
+#     {service="gateway"} | json | durationMs > 1000
+#     {service="gateway", app_id="tm-fleet"} | json
+#
+#   serverless-endpoint (vLLM) logs  (GATEWAY_ENDPOINT_LOG=…/endpoint.log):
+#     {service="vllm", app_id="qwen3-8b-h100"}
+#     {service="vllm", level="error"}
+#     {service="vllm", model="Qwen/Qwen3.6-27B"} | json | machine="m-…"
+#
+# In-cluster (prod) the gateway logs to stdout with LOG_JSON=1 and Grafana Alloy
+# tails the pod stdout instead — both streams are distinguished by `service`.
 server:
   http_listen_port: 9080
   grpc_listen_port: 0
@@ -23,7 +30,8 @@ scrape_configs:
       - targets: [localhost]
         labels:
           service: gateway
-          __path__: /logs/*.log
+          # Scoped to the access file so it never also grabs endpoint.log below.
+          __path__: /logs/gateway-access.log
     pipeline_stages:
       # Parse the JSON access line. Non-JSON lines fall through unchanged
       # (the json stage is lenient on parse failure).
@@ -47,6 +55,37 @@ scrape_configs:
           app_id:
           kind:
       # Use the app's own millisecond timestamp.
+      - json:
+          expressions:
+            time: time
+      - timestamp:
+          source: time
+          format: UnixMs
+
+  # Serverless-endpoint (vLLM) logs, re-emitted by the gateway's /workers/logs
+  # handler into GATEWAY_ENDPOINT_LOG. One JSON object per vLLM stdout line.
+  - job_name: vllm-endpoint
+    static_configs:
+      - targets: [localhost]
+        labels:
+          service: vllm
+          __path__: /logs/endpoint.log
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            kind: kind
+            app_id: app_id
+            model: model
+            machine: machine
+            session: session
+            msg: msg
+      # Promote only bounded fields to labels. machine (RunPod pod id) and
+      # session are unbounded → leave as JSON fields (query with `| json`).
+      - labels:
+          app_id:
+          model:
+          level:
       - json:
           expressions:
             time: time

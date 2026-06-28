@@ -550,6 +550,24 @@ def _resolve_config(
         if pod_env:
             rp["env"] = pod_env
 
+        # benchmaq's RunPod (pyremote) path runs `hf download` inside the pod over a
+        # pyremote exec session that does NOT inherit the pod `--env` (the same reason
+        # the fork-install env has to ride SGPU_PIP_ENV rather than runpod.env). So an
+        # HF_TOKEN placed only in runpod.env never reaches the download — it goes out
+        # "unauthenticated" (throttled, and fails outright on gated repos). benchmaq
+        # DOES read `benchmark[].model.hf_token` from the config, which pyremote ships
+        # into the pod via the serialized-closure config (not env), so fold the resolved
+        # token in there. A token the user pinned in their own YAML wins; benchmaq never
+        # prints the model block, so this doesn't leak into the bench logs.
+        hf_tok = (run_env or {}).get("HF_TOKEN")
+        if hf_tok:
+            for item in cfg.get("benchmark") or []:
+                if not isinstance(item, dict):
+                    continue
+                model = item.get("model")
+                if isinstance(model, dict) and not str(model.get("hf_token") or "").strip():
+                    model["hf_token"] = hf_tok
+
         rem = cfg.setdefault("remote", {})
         if not rem.get("key_filename") or "path/to/your" in str(rem.get("key_filename")):
             rem["key_filename"] = rp_key
@@ -2280,6 +2298,31 @@ def _parse_config(yaml_text: str) -> dict:
     }
 
 
+async def _bench_gpu_meta(b: "Benchmark") -> dict:
+    """Resolve a benchmark's hardware/serve metadata: ``{gpu_type, gpu_count,
+    model, tp, dp, engine}``. RunPod runs carry ``gpu_type`` in the YAML's
+    ``runpod.pod`` block; VM (bare-metal) runs don't, so fall back to the bound
+    provider's stored GPU info (populated by its last Test/availability probe),
+    e.g. ``"H20-3e (tm-2)"``. Opens its own session for the provider lookup so
+    it's safe to call from concurrent gather() contexts."""
+    meta = _parse_config(b.config_yaml or "")
+    if b.provider_id and not meta.get("gpu_type"):
+        try:
+            async with session_factory()() as _s:
+                from .db import Provider as _Provider
+                prov = await _s.get(_Provider, b.provider_id)
+            if prov is not None:
+                pcfg = prov.config or {}
+                gpus_list = pcfg.get("gpus") or []
+                if isinstance(gpus_list, list) and gpus_list:
+                    # Just the GPU model (e.g. "H20-3e") — no provider/VM-name suffix.
+                    meta["gpu_type"] = str(gpus_list[0]).replace("NVIDIA ", "").strip()
+                meta["gpu_count"] = int(pcfg.get("gpu_count") or meta.get("gpu_count") or 1)
+        except Exception as e:
+            logger.warning("gpu meta: provider lookup for %s failed: %s", b.id, e)
+    return meta
+
+
 @router.post("/_compact")
 async def compact_result_json(
     user: User = Depends(require_section("benchmark")),
@@ -2345,26 +2388,10 @@ async def aggregate(
     benches = list(rows.scalars().all())
 
     async def fetch_one(b: Benchmark) -> list[AggregatePoint]:
-        cfg_meta = _parse_config(b.config_yaml or "")
-        # VM (bare-metal) benches don't have a runpod.pod block in the YAML,
-        # so gpu_type/gpu_count come back empty. Fall back to the provider's
-        # stored GPU info (populated by the last Test/availability probe) so
-        # the Performance explorer can label the series with e.g. "L40S
-        # (TM-VM1)" instead of "—".
-        if b.provider_id and not cfg_meta.get("gpu_type"):
-            try:
-                async with session_factory()() as _s:
-                    from .db import Provider as _Provider
-                    prov = await _s.get(_Provider, b.provider_id)
-                if prov is not None:
-                    pcfg = prov.config or {}
-                    gpus_list = pcfg.get("gpus") or []
-                    if isinstance(gpus_list, list) and gpus_list:
-                        short = str(gpus_list[0]).replace("NVIDIA ", "").strip()
-                        cfg_meta["gpu_type"] = f"{short} ({prov.name})"
-                    cfg_meta["gpu_count"] = int(pcfg.get("gpu_count") or cfg_meta.get("gpu_count") or 1)
-            except Exception as e:
-                logger.warning("aggregate: provider lookup for %s failed: %s", b.id, e)
+        # Config's runpod.pod gpu_type, else the bound VM provider's stored GPU
+        # (e.g. "L40S (TM-VM1)") so the Performance explorer labels series
+        # instead of showing "—". Shared with the export endpoint.
+        cfg_meta = await _bench_gpu_meta(b)
         try:
             # Resolve this bench's storage so aggregates read from wherever its
             # results actually live — each bench may use a different backend.
@@ -2931,6 +2958,10 @@ async def export_benchmark(
             total += len(data)
             files.append({"name": rel, "content_b64": base64.b64encode(data).decode("ascii")})
 
+    # Resolve the GPU/serve metadata (config's runpod.pod block, else the VM
+    # provider's stored GPU info) so the export is self-describing — the
+    # importing deployment has no access to this instance's providers.
+    gpu_meta = await _bench_gpu_meta(b)
     export = {
         "kind": EXPORT_KIND,
         "version": 1,
@@ -2949,6 +2980,13 @@ async def export_benchmark(
             "cost_per_hr": b.cost_per_hr,
             "env_vars": b.env_vars,
             "visible_devices": b.visible_devices,
+            # Hardware + serve shape (resolved, not just what's in the YAML).
+            "gpu_type": gpu_meta.get("gpu_type"),
+            "gpu_count": gpu_meta.get("gpu_count") or 1,
+            "model": gpu_meta.get("model"),
+            "engine": gpu_meta.get("engine") or "vllm",
+            "tensor_parallel_size": gpu_meta.get("tp") or 1,
+            "data_parallel_size": gpu_meta.get("dp") or 1,
         },
         "files": files,
         "files_omitted": omitted,

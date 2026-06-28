@@ -11,6 +11,7 @@ import {
   Cpu,
   Database,
   FlaskConical,
+  KeyRound,
   Loader2,
   RefreshCw,
   Server,
@@ -342,6 +343,11 @@ export function TrainingForm() {
   // artifacts
   const [storageId, setStorageId] = useState("");
   const [hfPushRepo, setHfPushRepo] = useState("");
+  // HF token for the run (gated/private datasets + push to Hub) — pasted, or a
+  // global-secret reference resolved at run time. Like serverless/new.
+  const [hfTokenMode, setHfTokenMode] = useState<"paste" | "secret">("secret");
+  const [hfToken, setHfToken] = useState("");
+  const [hfTokenSecret, setHfTokenSecret] = useState("");
   const [workDir, setWorkDir] = useState("/share");
   // Isolated uv venv for the trainer deps (mirrors serverless's vLLM venv_path).
   const [venvPath, setVenvPath] = useState(
@@ -526,6 +532,8 @@ export function TrainingForm() {
         // artifacts
         setStorageId(r.storage_id || "");
         if (c.hf_push_repo) setHfPushRepo(str(c.hf_push_repo));
+        // Restore an HF-token secret reference (the pasted token is encrypted / not returned).
+        if (c.hf_token_secret) { setHfTokenMode("secret"); setHfTokenSecret(str(c.hf_token_secret)); }
         if (c.work_dir) setWorkDir(str(c.work_dir));
         if (c.venv_path) setVenvPath(str(c.venv_path));
         if (c.cleanup_checkpoints != null) setCleanupCheckpoints(!!c.cleanup_checkpoints);
@@ -580,6 +588,8 @@ export function TrainingForm() {
     return null;
   }, [visibleDevices, gpuBound]);
   const hasStorage = s3Storages.length > 0;
+  // Global-secret keys the HF token can reference (keys only; values stay server-side).
+  const hfSecretKeys = secrets.filter((s) => s.is_secret).map((s) => s.key);
   const isTts = taskType === "tts";
   const isLlm = taskType === "llm";
   const MODELS = isTts ? TTS_BASE_MODELS : isLlm ? LLM_BASE_MODELS : WHISPER_MODELS;
@@ -843,6 +853,8 @@ export function TrainingForm() {
       ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
       storage_id: storageId,
       hf_push_repo: hfPushRepo.trim() || null,
+      hf_token: hfTokenMode === "paste" ? (hfToken.trim() || null) : null,
+      hf_token_secret: hfTokenMode === "secret" ? (hfTokenSecret || null) : null,
       work_dir: workDir.trim() || "/share",
       venv_path: venvPath.trim() || null,
       cleanup_checkpoints: cleanupCheckpoints,
@@ -1838,6 +1850,79 @@ export function TrainingForm() {
       </Section>
 
       {/* Artifacts */}
+      {/* HuggingFace token for gated/private datasets + pushing the model to the Hub.
+          A global secret (recommended — rotates without editing this run) or a pasted
+          token. Mirrors the benchmark/new "HuggingFace token" card. */}
+      <Section
+        icon={<KeyRound className="h-4 w-4" />}
+        title="HuggingFace token"
+        description="For gated / private datasets and pushing the model to the Hub. Use a global secret or paste a token. Leave on a secret to rotate without editing this run; empty falls back to the org HF_TOKEN secret."
+      >
+        <div className="space-y-2">
+          <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+            {(["secret", "paste"] as const).map((src) => (
+              <button
+                key={src}
+                type="button"
+                onClick={() => setHfTokenMode(src)}
+                className={
+                  "rounded px-2.5 py-1 transition-colors " +
+                  (hfTokenMode === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                }
+              >
+                {src === "secret" ? "Global secret" : "Paste a token"}
+              </button>
+            ))}
+          </div>
+
+          {hfTokenMode === "secret" ? (
+            hfSecretKeys.length > 0 ? (
+              <div className="space-y-1.5">
+                <Label htmlFor="at-hf-secret" className="text-xs uppercase tracking-wide text-muted-foreground">Global secret</Label>
+                <Select value={hfTokenSecret} onValueChange={setHfTokenSecret}>
+                  <SelectTrigger id="at-hf-secret">
+                    <SelectValue placeholder="Select a secret (e.g. HF_TOKEN)" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {hfSecretKeys.map((k) => (
+                      <SelectItem key={k} value={k} className="font-mono text-xs">{k}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Resolved from{" "}
+                  <a href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</a>{" "}
+                  at run time and injected as <span className="font-mono">HF_TOKEN</span>.
+                </p>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                No global secrets yet. Add one under{" "}
+                <a href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</a>{" "}
+                (e.g. <span className="font-mono">HF_TOKEN</span>), then pick it here — or switch to{" "}
+                <span className="font-medium">Paste a token</span>.
+              </p>
+            )
+          ) : (
+            <div className="space-y-1.5">
+              <Label htmlFor="at-hf-token" className="text-xs uppercase tracking-wide text-muted-foreground">Token</Label>
+              <Input
+                id="at-hf-token"
+                type="password"
+                autoComplete="off"
+                value={hfToken}
+                onChange={(e) => setHfToken(e.target.value)}
+                placeholder="hf_..."
+                className="font-mono text-xs"
+              />
+              <p className="text-xs text-muted-foreground">
+                Sent with this run, stored Fernet-encrypted (never returned). Prefer a global secret for shared / rotating tokens.
+              </p>
+            </div>
+          )}
+        </div>
+      </Section>
+
       <Section icon={<Database className="h-4 w-4" />} title="Artifacts"
         description="Where the best model, per-epoch metrics, and logs are written.">
         <Grid>
@@ -1859,7 +1944,7 @@ export function TrainingForm() {
               </Select>
             )}
           </FieldWrap>
-          <FieldWrap label="Push best model to HF (optional)" hint="HuggingFace repo, e.g. you/whisper-ms. Uses HF_TOKEN.">
+          <FieldWrap label="Push best model to HF (optional)" hint="HuggingFace repo, e.g. you/whisper-ms. Pushed with the HuggingFace token above.">
             <Input className="font-mono" placeholder="org/model-finetuned" value={hfPushRepo} onChange={(e) => setHfPushRepo(e.target.value)} />
           </FieldWrap>
         </Grid>

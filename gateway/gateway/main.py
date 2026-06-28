@@ -4784,6 +4784,17 @@ async def ingest_worker_logs(req: WorkerLogsRequest, request: Request):
             await log_archive.enqueue(
                 req.app_id, slug, req.source, req.session, storage_id, truncated,
             )
+    # Re-emit into the structured `service="vllm"` log stream so Loki/Alloy (or
+    # a dev Promtail) ingest endpoint logs alongside the gateway access log.
+    # No-op unless LOG_JSON=1 (prod Alloy tails stdout) or GATEWAY_ENDPOINT_LOG
+    # is set (dev). Best-effort — must never break log ingestion.
+    try:
+        accesslog.log_endpoint_lines(
+            app_id=req.app_id, model=req.source,
+            machine=req.machine_id, session=req.session, lines=truncated,
+        )
+    except Exception:
+        pass
     return {"ok": True, "stored": len(truncated)}
 
 

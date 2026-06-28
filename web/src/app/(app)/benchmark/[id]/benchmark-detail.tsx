@@ -2,7 +2,8 @@
 
 import { useEffect, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Check, Copy, Globe, Lock, Octagon, Pencil, RotateCw, Trash2, X } from "lucide-react";
+import { Check, Copy, Download, Globe, Lock, Octagon, Pencil, RotateCw, Trash2, X } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -65,6 +66,7 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [terminateError, setTerminateError] = useState<string | null>(null);
   const [rerunError, setRerunError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(bench.name);
   const [renaming, setRenaming] = useState(false);
@@ -147,6 +149,30 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
         setTerminateError(e instanceof Error ? e.message : String(e));
       }
     });
+  }
+
+  // Self-contained export (results + config + GPU/serve metadata + embedded S3
+  // files). Mirrors the Files tab action but lives in the header so it's
+  // reachable from any tab.
+  async function handleExport() {
+    setExporting(true);
+    try {
+      const data = await gateway.exportBenchmark(bench.id);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${bench.id}.benchmark.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success("Benchmark exported", { duration: 3000 });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
   }
 
   function handleTogglePublic() {
@@ -308,6 +334,16 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
             >
               <Copy className="h-4 w-4" />
               Duplicate
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleExport}
+              disabled={exporting}
+              title="Download a self-contained JSON (results + config + GPU/serve metadata + files)"
+            >
+              <Download className="h-4 w-4" />
+              {exporting ? "Exporting…" : "Export"}
             </Button>
             {!inFlight && (
               <Button

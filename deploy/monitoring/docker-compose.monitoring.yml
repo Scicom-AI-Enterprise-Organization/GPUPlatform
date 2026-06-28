@@ -9,9 +9,13 @@
 #
 # The gateway runs on the host (.venv/bin/gateway on :8080), so from inside these
 # bridged containers we reach it at host.docker.internal:8080 via the host-gateway
-# alias. Run the gateway with JSON access logs teed to a file Promtail can tail:
+# alias. Run the gateway with JSON logs teed to files Promtail can tail (access +
+# serverless-endpoint vLLM logs):
 #
-#   LOG_JSON=1 GATEWAY_ACCESS_LOG=deploy/monitoring/logs/gateway-access.log .venv/bin/gateway
+#   LOG_JSON=1 \
+#     GATEWAY_ACCESS_LOG=deploy/monitoring/logs/gateway-access.log \
+#     GATEWAY_ENDPOINT_LOG=deploy/monitoring/logs/endpoint.log \
+#     .venv/bin/gateway
 #
 # Grafana:    http://localhost:3001  (admin / admin on first boot)
 # Prometheus: http://localhost:9091

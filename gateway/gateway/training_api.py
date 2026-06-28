@@ -605,16 +605,24 @@ async def _provision_pod(
         except (TypeError, ValueError):
             cost_f = None
 
-        deadline = time.time() + POLL_TIMEOUT_S
-        while time.time() < deadline:
-            await asyncio.sleep(POLL_INTERVAL_S)
-            pr = await cli.get(f"/pods/{runpod_id}")
-            if pr.status_code >= 400:
-                continue
-            ip, port = compute._extract_ssh(pr.json() or {})
-            if ip and port:
-                return runpod_id, ip, int(port), cost_f
-    raise RuntimeError(f"pod {runpod_id} SSH not ready after {POLL_TIMEOUT_S}s")
+        # The pod now EXISTS and is billing. If anything below fails (SSH never lands,
+        # an API hiccup, cancellation), the caller never receives `runpod_id` — the
+        # `runpod_id, … = await _provision_pod(…)` assignment doesn't run when the call
+        # raises — so it can't terminate it. Clean up our own pod here, then re-raise.
+        try:
+            deadline = time.time() + POLL_TIMEOUT_S
+            while time.time() < deadline:
+                await asyncio.sleep(POLL_INTERVAL_S)
+                pr = await cli.get(f"/pods/{runpod_id}")
+                if pr.status_code >= 400:
+                    continue
+                ip, port = compute._extract_ssh(pr.json() or {})
+                if ip and port:
+                    return runpod_id, ip, int(port), cost_f
+            raise RuntimeError(f"pod {runpod_id} SSH not ready after {POLL_TIMEOUT_S}s")
+        except BaseException:
+            await _terminate_pod(api_key, runpod_id)
+            raise
 
 
 async def _terminate_pod(api_key: str, runpod_id: str) -> None:
@@ -1063,13 +1071,29 @@ async def run_training(redis, run_id: str) -> None:
             v = genv.get(k)
             return v if v not in (None, "") else (os.environ.get(k) or None)
 
-        cfg["dataset"] = await _resolve_dataset_spec(dataset_id, g("HF_TOKEN"))
+        # Per-run HF token (gated/private datasets + push to Hub). A user-supplied
+        # token wins — a referenced Secrets-page key (hf_token_secret) or the pasted
+        # token (Fernet-encrypted hf_token_enc). None here → the org HF_TOKEN fallback
+        # is applied below where needed.
+        _run_hf_token: Optional[str] = None
+        _hf_sec = (cfg.get("hf_token_secret") or "").strip()
+        if _hf_sec:
+            _run_hf_token = g(_hf_sec)
+        elif cfg.get("hf_token_enc"):
+            try:
+                _run_hf_token = json.loads(crypto.decrypt(cfg["hf_token_enc"])).get("token")
+            except Exception:  # noqa: BLE001
+                _run_hf_token = None
+        # Token used to read the dataset(s): the user's run token, else the org HF_TOKEN.
+        _ds_hf_token = _run_hf_token or g("HF_TOKEN")
+
+        cfg["dataset"] = await _resolve_dataset_spec(dataset_id, _ds_hf_token)
         if cfg.get("no_eval"):
             # "No test set" — train on everything, no eval. Never resolve a test
             # dataset or set test_from_split (the trainers force eval off).
             await _push_log(redis, run_id, "[gateway] no_eval: training with no test set / no eval")
         elif test_dataset_id and test_dataset_id != dataset_id:
-            cfg["test_dataset"] = await _resolve_dataset_spec(test_dataset_id, g("HF_TOKEN"))
+            cfg["test_dataset"] = await _resolve_dataset_spec(test_dataset_id, _ds_hf_token)
         elif test_dataset_id and test_dataset_id == dataset_id:
             # Train + eval on the SAME dataset → evaluate on its built-in
             # test/validation rows (the trainer's split_pairs prefers a `split`
@@ -1087,10 +1111,17 @@ async def run_training(redis, run_id: str) -> None:
             "access_key": target.access_key, "secret_key": target.secret_key,
             "prefix": s3_prefix.rstrip("/"),
         }
-        # LLM training downloads the gated gemma-4 base model on the box, so it
-        # always needs the HF token (not just when pushing the result to HF).
-        if cfg.get("hf_push_repo") or (cfg.get("task_type") or "").lower() == "llm":
-            cfg["hf_token"] = g("HF_TOKEN")
+        # HF token for the trainer itself: push to Hub + gated base-model download.
+        # The user's run token (resolved above) wins; else the org HF_TOKEN when the run
+        # pushes to HF or trains a gated base (llm — gemma-4 downloads on the box). The
+        # fastText lang model used for ASR language detection is public (no token).
+        _hf_tok = _run_hf_token or (
+            g("HF_TOKEN")
+            if (cfg.get("hf_push_repo") or (cfg.get("task_type") or "").lower() == "llm")
+            else None
+        )
+        if _hf_tok:
+            cfg["hf_token"] = _hf_tok
         # Experiment tracking: non-secret per-run fields from config_json override
         # the global-env value; secrets (WANDB_API_KEY, MLFLOW_TRACKING_USERNAME/
         # PASSWORD) come from the Secrets page. Built here at run time, never
@@ -1932,6 +1963,11 @@ class CreateTrainingRunRequest(BaseModel):
     visible_devices: Optional[str] = None
     storage_id: Optional[str] = None
     hf_push_repo: Optional[str] = None
+    # HF token for the run (gated/private datasets + push to Hub). A Secrets-page key
+    # reference (hf_token_secret) wins; else the pasted token, stored Fernet-encrypted
+    # — never raw. Resolved into cfg["hf_token"] at run time. Mirrors serverless/new.
+    hf_token: Optional[str] = None
+    hf_token_secret: Optional[str] = None
     # Roomy dir on the remote for checkpoints + temp (TMPDIR). Defaults to
     # /share (the VM's big volume); /tmp is a small disk that overflows on big
     # models. The best model is uploaded to S3 regardless.
@@ -2273,6 +2309,14 @@ async def create_training_run(
             "image": (body.image or "").strip() or None,
         }),
         "hf_push_repo": body.hf_push_repo,
+        # HF token: a Secrets-page key reference wins; else the pasted token Fernet-
+        # encrypted (never raw). Resolved into cfg["hf_token"] at run time.
+        "hf_token_secret": (body.hf_token_secret or "").strip() or None,
+        "hf_token_enc": (
+            crypto.encrypt(json.dumps({"token": body.hf_token.strip()}))
+            if (body.hf_token and body.hf_token.strip()
+                and not (body.hf_token_secret or "").strip()) else None
+        ),
         "work_dir": (body.work_dir or "/share").strip() or "/share",
         "venv_path": (body.venv_path or "").strip() or None,
         "cleanup_checkpoints": body.cleanup_checkpoints,
