@@ -160,7 +160,12 @@ async def _one_request(
                 piece = ""
                 if choices:
                     if is_chat:
-                        piece = (choices[0].get("delta") or {}).get("content") or ""
+                        delta = choices[0].get("delta") or {}
+                        # Reasoning models (served with --reasoning-parser) stream the
+                        # <think> block as `reasoning_content`, separate from the final
+                        # `content`. Count both as output, else a reasoning-only or
+                        # length-truncated turn looks like "no tokens streamed".
+                        piece = (delta.get("content") or "") or (delta.get("reasoning_content") or "")
                     else:
                         piece = choices[0].get("text") or ""
                 if piece:
@@ -239,6 +244,17 @@ async def _run_bench_config(
     max_conc = int(bench_cfg.get("max_concurrency") or num_prompts)
     num_warmups = int(bench_cfg.get("num_warmups") or 0)
     ignore_eos = bool(bench_cfg.get("ignore_eos", True))
+    # Per-request body extensions (e.g. reasoning controls:
+    #   {"reasoning_effort": "low"} or {"chat_template_kwargs": {"enable_thinking": false}}).
+    # Accepts a dict or a JSON string; ignored if it isn't valid JSON object.
+    extra_body = bench_cfg.get("extra_body")
+    if isinstance(extra_body, str):
+        try:
+            extra_body = json.loads(extra_body)
+        except Exception:
+            extra_body = None
+    if not isinstance(extra_body, dict):
+        extra_body = None
     rate = bench_cfg.get("request_rate", "inf")
     try:
         rate_val = float(rate)
@@ -256,11 +272,18 @@ async def _run_bench_config(
             "temperature": 0.0,
             "stream": True,
             "stream_options": {"include_usage": True},
-            # vLLM extensions: force exact output length so every request does the
-            # same generation work regardless of when the model would emit EOS.
-            "min_tokens": output_len,
             "ignore_eos": ignore_eos,
         }
+        # Fixed-length mode (ignore_eos=True, the default): also pin min_tokens so
+        # every request does the same generation work regardless of when EOS fires.
+        # When ignore_eos is False (e.g. reasoning-effort sweeps) let the model decide
+        # its own length, so reasoning_effort actually changes the token count.
+        if ignore_eos:
+            body["min_tokens"] = output_len
+        # Merge config extensions (reasoning_effort / chat_template_kwargs / etc.)
+        # before messages so a stray key can't clobber the prompt.
+        if extra_body:
+            body.update(extra_body)
         if is_chat:
             body["messages"] = [{"role": "user", "content": prompt}]
         else:
