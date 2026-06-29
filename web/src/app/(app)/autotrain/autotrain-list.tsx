@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useListUrlState, readParam } from "@/lib/list-url-state";
 import {
   Cpu,
   Inbox,
@@ -99,10 +100,12 @@ function primaryMetric(r: TrainingRunRecord): { label: string; value: string } |
 
 export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
   const router = useRouter();
-  const [q, setQ] = useState("");
-  const [status, setStatus] = useState<StatusFilter>("all");
-  const [sort, setSort] = useState<SortDir>("newest");
-  const [view, setView] = useState<"rows" | "grid">("grid");
+  const sp = useSearchParams();
+  // Seed search/status/sort/view from the URL (shareable); mirrored back below.
+  const [q, setQ] = useState(() => sp.get("q") ?? "");
+  const [status, setStatus] = useState<StatusFilter>(() => readParam(sp, "status", STATUS_OPTIONS, "all"));
+  const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
+  const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
 
@@ -115,15 +118,17 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
   const [renameError, setRenameError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (sp.get("view")) return;   // URL view wins over the saved preference
     const v = window.localStorage.getItem("sgpu_autotrain_view");
     // Reading client-only localStorage post-mount avoids an SSR/CSR mismatch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "rows" || v === "grid") setView(v);
-  }, []);
+  }, [sp]);
   const setViewPersist = (v: "rows" | "grid") => {
     setView(v);
     window.localStorage.setItem("sgpu_autotrain_view", v);
   };
+  useListUrlState({ q, status, sort, view });
 
   const haystacks = useMemo(
     () => items.map((r) => ({ run: r, text: searchableText(r) })),

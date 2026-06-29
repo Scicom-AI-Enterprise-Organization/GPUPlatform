@@ -459,7 +459,7 @@ export const gateway = {
     const buf = await file.arrayBuffer();
     const q = new URLSearchParams({ filename: file.name || "audio.wav" });
     if (gpu) q.set("gpu", gpu);
-    return request<{ text: string; device?: string; logs?: string[] }>(
+    return request<{ text: string; raw?: string | null; device?: string; logs?: string[] }>(
       `/v1/training-runs/${encodeURIComponent(id)}/transcribe?${q.toString()}`,
       { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: buf },
     );

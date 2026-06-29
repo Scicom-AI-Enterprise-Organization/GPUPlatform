@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import yaml from "js-yaml";
+import { useListUrlState, readParam } from "@/lib/list-url-state";
 import { CheckSquare, Download, GitCompare, Globe, Inbox, LayoutGrid, List, Lock, MoreHorizontal, Search, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -70,10 +71,13 @@ type StatusFilter = (typeof STATUS_OPTIONS)[number];
 
 export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const router = useRouter();
-  const [q, setQ] = useState("");
-  const [status, setStatus] = useState<StatusFilter>("all");
-  const [sort, setSort] = useState<SortDir>("newest");
-  const [selectMode, setSelectMode] = useState(false);
+  const sp = useSearchParams();
+  // Initial filter/sort/view/select come from the URL (shareable), falling back to
+  // defaults. useListUrlState (below) mirrors changes back into the URL.
+  const [q, setQ] = useState(() => sp.get("q") ?? "");
+  const [status, setStatus] = useState<StatusFilter>(() => readParam(sp, "status", STATUS_OPTIONS, "all"));
+  const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
+  const [selectMode, setSelectMode] = useState(() => sp.get("select") === "1");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
@@ -87,19 +91,24 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const [renameDraft, setRenameDraft] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
-  const [view, setView] = useState<"rows" | "grid">("grid");
+  const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
   useEffect(() => {
+    // The URL wins over localStorage (so a shared link shows its view); only fall
+    // back to the saved preference when the URL didn't specify one.
+    if (sp.get("view")) return;
     const v = window.localStorage.getItem("sgpu_bench_view");
     // Reading client-only localStorage post-mount avoids an SSR/CSR mismatch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "rows" || v === "grid") setView(v);
-  }, []);
+  }, [sp]);
   const setViewPersist = (v: "rows" | "grid") => {
     setView(v);
     window.localStorage.setItem("sgpu_bench_view", v);
   };
+  // Mirror the shareable state into the URL (search, status, sort, view, select).
+  useListUrlState({ q, status, sort, view, select: selectMode });
 
   const toggle = (id: string) => {
     setSelected((prev) => {

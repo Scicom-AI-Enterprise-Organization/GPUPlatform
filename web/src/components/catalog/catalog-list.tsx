@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useListUrlState, readParam } from "@/lib/list-url-state";
 import { Boxes, Database, Files, LayoutGrid, List, Loader2, Lock, Package, Search, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
@@ -47,25 +48,30 @@ export function CatalogList({
   noun?: string;
 }) {
   const router = useRouter();
-  const [q, setQ] = useState("");
-  const [sort, setSort] = useState<SortDir>("newest");
-  const [view, setView] = useState<View>("grid");
+  const sp = useSearchParams();
+  // Seed search/sort/view from the URL (shareable); mirrored back below.
+  const [q, setQ] = useState(() => sp.get("q") ?? "");
+  const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
+  const [view, setView] = useState<View>(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
   const [deleteTarget, setDeleteTarget] = useState<CatalogRecord | null>(null);
   const [wipe, setWipe] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
-  // Hydrate the saved view post-mount (start from the default so SSR matches).
+  // Hydrate the saved view post-mount — but the URL wins (so shared links keep their
+  // view); only fall back to the saved preference when the URL didn't specify one.
   useEffect(() => {
+    if (sp.get("view")) return;
     const v = window.localStorage.getItem("sgpu_catalog_view");
     // Reading client-only localStorage post-mount avoids an SSR/CSR mismatch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "rows" || v === "grid") setView(v);
-  }, []);
+  }, [sp]);
   const setViewPersist = (v: View) => {
     setView(v);
     window.localStorage.setItem("sgpu_catalog_view", v);
   };
+  useListUrlState({ q, sort, view });
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();

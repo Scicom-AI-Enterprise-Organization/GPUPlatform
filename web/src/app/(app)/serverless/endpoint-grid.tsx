@@ -1,8 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState, useTransition } from "react";
+import { useListUrlState, readParam } from "@/lib/list-url-state";
 import {
   CheckSquare,
   Cpu,
@@ -52,30 +53,34 @@ export function EndpointGrid({
   isAdmin?: boolean;
 }) {
   const router = useRouter();
+  const sp = useSearchParams();
   // A viewer can manage (delete/select) only endpoints they own (admins: all).
   // Public endpoints owned by others are view-only — server-side enforced too.
   const canManage = (a: AppRecord) => isAdmin || (!!viewerUsername && a.owner === viewerUsername);
   const [single, setSingle] = useState<AppRecord | null>(null);
-  const [q, setQ] = useState("");
-  const [selectMode, setSelectMode] = useState(false);
+  // Filter/sort/view/select seeded from the URL (shareable); mirrored back below.
+  const [q, setQ] = useState(() => sp.get("q") ?? "");
+  const [selectMode, setSelectMode] = useState(() => sp.get("select") === "1");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [sort, setSort] = useState<SortDir>("newest");
-  const [view, setView] = useState<"rows" | "grid">("grid");
+  const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
+  const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
   useEffect(() => {
+    if (sp.get("view")) return;   // URL view wins over the saved preference
     const v = window.localStorage.getItem("sgpu_serverless_view");
     // Reading client-only localStorage post-mount avoids an SSR/CSR mismatch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "rows" || v === "grid") setView(v);
-  }, []);
+  }, [sp]);
   const setViewPersist = (v: "rows" | "grid") => {
     setView(v);
     window.localStorage.setItem("sgpu_serverless_view", v);
   };
+  useListUrlState({ q, sort, view, select: selectMode });
 
   const toggle = (id: string) => {
     setSelected((prev) => {

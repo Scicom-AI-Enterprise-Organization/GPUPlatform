@@ -2962,6 +2962,24 @@ async def export_benchmark(
     # provider's stored GPU info) so the export is self-describing — the
     # importing deployment has no access to this instance's providers.
     gpu_meta = await _bench_gpu_meta(b)
+    # Bake the resolved GPU into the EXPORTED config (not the original row) under
+    # the canonical runpod.pod block that _parse_config reads. VM runs resolve
+    # their GPU from the provider, which doesn't travel — so without this the
+    # importer (which drops provider_id) shows a blank GPU. Baking it into
+    # config_yaml means GPU survives the round-trip regardless of the importer's
+    # code version, since every deployment derives GPU from config_yaml.
+    export_config_yaml = b.config_yaml or ""
+    if gpu_meta.get("gpu_type"):
+        try:
+            cfg = yaml.safe_load(export_config_yaml) or {}
+            if isinstance(cfg, dict):
+                pod = cfg.setdefault("runpod", {}).setdefault("pod", {})
+                if not pod.get("gpu_type"):
+                    pod["gpu_type"] = gpu_meta["gpu_type"]
+                    pod.setdefault("gpu_count", gpu_meta.get("gpu_count") or 1)
+                    export_config_yaml = yaml.safe_dump(cfg, sort_keys=False)
+        except Exception as e:
+            logger.warning("export %s: could not bake gpu into config: %s", b.id, e)
     export = {
         "kind": EXPORT_KIND,
         "version": 1,
@@ -2969,7 +2987,7 @@ async def export_benchmark(
         "source_bench_id": b.id,
         "benchmark": {
             "name": b.name,
-            "config_yaml": b.config_yaml,
+            "config_yaml": export_config_yaml,
             "status": b.status,
             "exit_code": b.exit_code,
             "error_text": b.error_text,

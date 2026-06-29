@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Inbox, LayoutGrid, List, Loader2, Search, X } from "lucide-react";
+import { useListUrlState, readParam } from "@/lib/list-url-state";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { DatasetKind, DatasetRecord } from "@/lib/types";
@@ -58,10 +59,14 @@ const SOURCE_OPTIONS: Array<{ value: "all" | DatasetKind; label: string }> = [
 
 export function DatasetsList({ items }: { items: DatasetRecord[] }) {
   const router = useRouter();
-  const [q, setQ] = useState("");
-  const [source, setSource] = useState<"all" | DatasetKind>("all");
-  const [sort, setSort] = useState<SortDir>("newest");
-  const [view, setView] = useState<"rows" | "grid">("grid");
+  const sp = useSearchParams();
+  // Seed search/source/sort/view from the URL (shareable); mirrored back below.
+  const [q, setQ] = useState(() => sp.get("q") ?? "");
+  const [source, setSource] = useState<"all" | DatasetKind>(
+    () => readParam(sp, "source", SOURCE_OPTIONS.map((o) => o.value), "all"),
+  );
+  const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
+  const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
 
@@ -75,16 +80,18 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
   const [renameError, setRenameError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (sp.get("view")) return;   // URL view wins over the saved preference
     const v = window.localStorage.getItem("sgpu_datasets_view");
     // Reading client-only localStorage post-mount is the correct way to avoid an
     // SSR/CSR mismatch — a lazy initializer would diverge on hydrate.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "rows" || v === "grid") setView(v);
-  }, []);
+  }, [sp]);
   const setViewPersist = (v: "rows" | "grid") => {
     setView(v);
     window.localStorage.setItem("sgpu_datasets_view", v);
   };
+  useListUrlState({ q, sort, view, extra: { source: { value: source, def: "all" } } });
 
   const haystacks = useMemo(() => items.map((d) => ({ d, text: searchableText(d) })), [items]);
   const filtered = useMemo(() => {

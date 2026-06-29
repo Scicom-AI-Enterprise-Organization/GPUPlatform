@@ -237,10 +237,13 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const packOnly = run.config_json?.pack_only === true;
   // Try-it playground: a finished run on a VM (inference runs on that VM) — ASR
   // transcribes an uploaded clip; TTS synthesizes speech from text.
+  // VM runs serve try-it on the persistent VM. Cloud runs (training pod gone) can
+  // still try-it for ASR — Load spins up a temporary pod on demand (auto-torn-down).
+  const isVmRun = run.provider_kind === "vm";
   const canTryIt =
     run.status === "done" &&
-    run.provider_kind === "vm" &&
-    !!run.result_json?.artifact?.s3_uri;
+    !!run.result_json?.artifact?.s3_uri &&
+    (isVmRun || (run.task_type ?? "asr") === "asr");
   const metricLabel = run.task_type === "tts"
     ? "loss"
     : String((run.config_json?.eval_metric as string) || "wer").toUpperCase();
@@ -875,7 +878,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               ? <TtsPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
               : run.task_type === "llm"
                 ? <LlmPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
-                : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />}
+                : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} isCloud={!isVmRun} />}
           </TabsContent>
         )}
       </Tabs>
@@ -1586,12 +1589,14 @@ function EvalCurve({ epochs, sweep, trials }: { epochs: TrainingEpoch[]; sweep: 
 
 // Try-it playground — upload a clip, pick a GPU the run used (or CPU), and
 // transcribe it with the finetuned model on the run's VM (over SSH).
-function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevices: string | null }) {
-  const gpuIds = (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+function PlaygroundTab({ runId, visibleDevices, isCloud }: { runId: string; visibleDevices: string | null; isCloud?: boolean }) {
+  // Cloud try-it runs on a fresh single-GPU pod (not the run's training GPUs), so
+  // default to "auto" — a training-pin index like "6" wouldn't exist there.
+  const gpuIds = isCloud ? [] : (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const [file, setFile] = useState<File | null>(null);
   const [gpu, setGpu] = useState<string>(gpuIds[0] ?? "auto");
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ text: string; device?: string; logs?: string[] } | null>(null);
+  const [result, setResult] = useState<{ text: string; raw?: string | null; device?: string; logs?: string[] } | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   async function onTranscribe() {
@@ -1613,9 +1618,20 @@ function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevice
       <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — transcribe a clip</CardTitle></CardHeader>
       <CardContent className="space-y-4">
         <p className="text-xs text-muted-foreground">
-          Runs the finetuned model on this run&apos;s VM. Pick a GPU the run used (or CPU), upload a short
-          audio clip (≤ 25 MB), and transcribe. The first request downloads the model onto the VM, so it
-          can take a little longer.
+          {isCloud ? (
+            <>
+              This run trained on a cloud pod (gone after training), so <span className="font-medium">Load model</span> first —
+              it spins up a <span className="font-medium">temporary GPU pod</span> for this run (first load ~10 min: provision +
+              install + download). Then upload a short clip (≤ 25 MB) and transcribe. The pod auto-stops after 15 min idle, or
+              when you click Unload — so it can&apos;t keep billing.
+            </>
+          ) : (
+            <>
+              Runs the finetuned model on this run&apos;s VM. Pick a GPU the run used (or CPU), upload a short
+              audio clip (≤ 25 MB), and transcribe. The first request downloads the model onto the VM, so it
+              can take a little longer.
+            </>
+          )}
         </p>
         <PersistentControls runId={runId} gpu={gpu} />
         <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
@@ -1655,6 +1671,17 @@ function PlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevice
             </div>
             <div className="whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-3 text-sm">
               {result.text || <span className="text-muted-foreground">(empty — the model returned nothing)</span>}
+            </div>
+          </div>
+        )}
+        {result?.raw && (
+          <div className="space-y-1.5">
+            <div className="text-xs text-muted-foreground">
+              Raw output (special tokens kept · first 30s) — verify the Whisper prompt +{" "}
+              <span className="font-mono">{"<|endoftext|>"}</span> EOS
+            </div>
+            <div className="whitespace-pre-wrap break-all rounded-md border border-border bg-muted/30 p-3 font-mono text-xs">
+              {result.raw}
             </div>
           </div>
         )}

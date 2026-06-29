@@ -142,7 +142,25 @@ def main() -> int:
     out = asr({"raw": audio, "sampling_rate": sr}, generate_kwargs=gen_kwargs, return_timestamps=False)
     text = (out["text"] if isinstance(out, dict) else str(out)) or ""
     log(f"done in {time.time() - _t:.1f}s → {len(text.split())} words on {device}")
-    emit({"text": text.strip(), "device": device})
+
+    # Raw token sequence WITH special tokens kept — so the playground can verify the
+    # finetuned model emits the Whisper prompt (<|startoftranscript|><|lang|>
+    # <|transcribe|><|notimestamps|>) and, crucially, the <|endoftext|> EOS that ends
+    # generation. The pipeline strips specials (skip_special_tokens=True); here we run
+    # one generate on the first 30s window and decode WITHOUT stripping. Best-effort —
+    # a decode hiccup must not fail the transcription.
+    raw_tokens = None
+    try:
+        feats = asr.feature_extractor(
+            audio[: sr * 30], sampling_rate=sr, return_tensors="pt",
+        ).input_features.to(asr.model.device, dtype)
+        gen_ids = asr.model.generate(feats, **gen_kwargs)
+        raw_tokens = asr.tokenizer.decode(gen_ids[0], skip_special_tokens=False)
+        log(f"raw tokens (first 30s, specials kept): {raw_tokens}")
+    except Exception as e:  # noqa: BLE001
+        log(f"raw-token decode skipped: {e}")
+
+    emit({"text": text.strip(), "raw": raw_tokens, "device": device})
     return 0
 
 

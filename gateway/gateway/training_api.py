@@ -1800,6 +1800,12 @@ async def cleanup_orphaned_running(redis) -> int:
             continue
         if (await _reconcile_orphan(row, redis)) not in ("running", "requeued"):
             n += 1
+    # A gateway restart loses the in-memory try-it setup tasks, so any surviving
+    # cloud try-it pod is orphaned — terminate them all (the session is over).
+    try:
+        await _reap_idle_tryit_pods(force_all=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("try-it startup reaper: %s", e)
     return n
 
 
@@ -1818,6 +1824,13 @@ async def training_janitor_loop(redis, interval: int = 90) -> None:
                 if row.id in _active_runners:
                     continue  # actively run by THIS gateway (VM or pod) → it finalizes
                 await _reconcile_orphan(row, redis)
+            # Reap idle / orphaned cloud try-it pods so they can't bill forever.
+            try:
+                n = await _reap_idle_tryit_pods()
+                if n:
+                    logger.info("training janitor: reaped %d idle try-it pod(s)", n)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("try-it reaper: %s", e)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -3135,6 +3148,185 @@ async def _resolve_run_ssh(row: TrainingRun) -> Optional[tuple[str, int, str, st
     return ip, int(port), "root", key
 
 
+# ---------- cloud try-it pod (ASR): a finished RunPod-cloud run's training pod is
+# torn down, so "Try it" provisions a fresh, short-lived pod on demand, builds the
+# Whisper venv (--deps-only), and keeps it warm for transcribes. It auto-tears-down
+# after _TRYIT_IDLE_S idle (bumped on each transcribe) or on Unload — the janitor +
+# startup cleanup reap it (restart-safe), so it can't bill forever. State lives on
+# the run's result_json["tryit"] = {pod_id, provider_id, phase, message, expires_at};
+# phase ∈ provisioning|installing|ready|error. VM runs keep using the SSH path above.
+_TRYIT_IDLE_S = 15 * 60          # auto-teardown after this many idle seconds (user-chosen)
+_tryit_tasks: dict[str, "asyncio.Task"] = {}   # in-flight setup tasks (dedup + cancel)
+
+
+def _tryit_state(row) -> dict:
+    return dict((getattr(row, "result_json", None) or {}).get("tryit") or {})
+
+
+def _tryit_exp() -> str:
+    return _iso(datetime.now(timezone.utc) + timedelta(seconds=_TRYIT_IDLE_S)) or ""
+
+
+async def _tryit_save(run_id: str, **fields) -> None:
+    """Merge fields into the run's result_json['tryit'] (JSON; no migration)."""
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None:
+            return
+        rj = dict(row.result_json or {})
+        ti = dict(rj.get("tryit") or {})
+        ti.update(fields)
+        rj["tryit"] = ti
+        row.result_json = rj
+        if fields.get("pod_id"):
+            row.runpod_pod_id = fields["pod_id"]   # so _resolve_run_ssh finds the live pod
+        await s.commit()
+
+
+async def _tryit_teardown(run_id: str) -> None:
+    """Terminate the try-it pod (if any) and clear the state. Idempotent + best-effort."""
+    task = _tryit_tasks.pop(run_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None:
+            return
+        ti = dict((row.result_json or {}).get("tryit") or {})
+        pod_id, prov = ti.get("pod_id"), ti.get("provider_id")
+        rj = dict(row.result_json or {})
+        rj.pop("tryit", None)
+        row.result_json = rj
+        row.runpod_pod_id = None
+        await s.commit()
+    if pod_id:
+        try:
+            api_key = await compute._resolve_api_key(prov)
+            await _terminate_pod(api_key, pod_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("try-it pod %s teardown failed: %s", pod_id, e)
+
+
+def _tryit_build_venv_ssh(host: str, port: int, user: str, key_filename: str,
+                          run_id: str, cfg: dict) -> None:
+    """On the fresh pod: ship whisper_finetune.py + run `--deps-only` (reusing the
+    training path's uv bootstrap) to build the Whisper venv. Blocking — to_thread."""
+    import tempfile
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        _ssh_put(cli, str(_trainer_script_path()), "/tmp/sgpu_tryit_whisper.py")
+        dconf = {"venv_path": cfg.get("venv_path") or "/share/autotrain-whisper",
+                 "work_dir": cfg.get("work_dir") or "/share"}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(dconf)); local = f.name
+        try:
+            _ssh_put(cli, local, "/tmp/sgpu_tryit_deps.json")
+        finally:
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        deps_cmd = (f"{user_env}{_UV_BOOTSTRAP}"
+                    "python -u /tmp/sgpu_tryit_whisper.py --deps-only --config /tmp/sgpu_tryit_deps.json")
+        rc = _ssh_run_stream(cli, deps_cmd, lambda _l: None)
+        if rc != 0:
+            raise RuntimeError(f"Whisper deps install failed on the try-it pod (rc={rc})")
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _tryit_cloud_setup(run_id: str, gpu: str) -> None:
+    """Provision a fresh pod for a cloud run's ASR try-it, build the venv, keep warm.
+    Updates result_json['tryit'].phase as it goes; tears the pod down on failure so a
+    half-provisioned pod can't leak (mirrors _provision_pod's own self-cleanup)."""
+    pod_id = None
+    provider_id = None
+    try:
+        async with session_factory()() as s:
+            row = await s.get(TrainingRun, run_id)
+            cfg = dict(row.config_json or {})
+            provider_id = row.provider_id
+            gpu_type = row.gpu_type or "NVIDIA L40S"
+        await _tryit_save(run_id, phase="provisioning", provider_id=provider_id,
+                          message="starting a GPU pod …", expires_at=_tryit_exp())
+        api_key = await compute._resolve_api_key(provider_id)
+        key_filename, pub = _gen_ssh_key(_work_dir(run_id))
+        runpod_id, host, port, _cost = await _provision_pod(
+            api_key, f"sgpu-tryit-{run_id}", cfg.get("image") or DEFAULT_IMAGE,
+            gpu_type, 1, bool(cfg.get("secure_cloud", True)),
+            int(cfg.get("disk_gb", 60)), int(cfg.get("volume_gb", 80)), pub,
+        )
+        pod_id = runpod_id
+        await _tryit_save(run_id, pod_id=runpod_id, phase="installing",
+                          message="installing the Whisper stack (torch + fasttext) — first load ~10 min …",
+                          expires_at=_tryit_exp())
+        await asyncio.to_thread(_tryit_build_venv_ssh, host, int(port), "root", key_filename, run_id, cfg)
+        await _tryit_save(run_id, phase="ready", message="ready — upload a clip and transcribe",
+                          expires_at=_tryit_exp())
+    except asyncio.CancelledError:
+        await _tryit_teardown(run_id)
+        raise
+    except Exception as e:  # noqa: BLE001
+        # Surface the error AND make sure the pod (if created) is gone.
+        if pod_id:
+            try:
+                await _terminate_pod(await compute._resolve_api_key(provider_id), pod_id)
+            except Exception:  # noqa: BLE001
+                pass
+        await _tryit_save(run_id, phase="error", pod_id=None,
+                          message=f"try-it setup failed: {str(e)[:280]}")
+        async with session_factory()() as s:
+            row = await s.get(TrainingRun, run_id)
+            if row is not None:
+                row.runpod_pod_id = None
+                await s.commit()
+    finally:
+        _tryit_tasks.pop(run_id, None)
+
+
+def _tryit_status(row) -> "PlaygroundStatus":
+    """Map a cloud run's try-it state → the PlaygroundStatus the UI polls."""
+    ti = _tryit_state(row)
+    phase = ti.get("phase")
+    msg = ti.get("message") or ""
+    return PlaygroundStatus(
+        running=phase in ("provisioning", "installing", "ready"),
+        ready=(phase == "ready"),
+        kind="asr",
+        logs=([f"[try-it] {msg}"] if msg else []),
+    )
+
+
+async def _reap_idle_tryit_pods(force_all: bool = False) -> int:
+    """Terminate try-it pods whose idle window has elapsed (periodic janitor). With
+    force_all=True, terminate every try-it pod regardless of expiry — used on startup,
+    where the in-memory setup tasks are gone, so any surviving pod is orphaned."""
+    now = datetime.now(timezone.utc)
+    async with session_factory()() as s:
+        rows = (await s.execute(
+            select(TrainingRun).where(TrainingRun.status == "done")
+        )).scalars().all()
+    reaped = 0
+    for row in rows:
+        ti = dict((row.result_json or {}).get("tryit") or {})
+        if not ti.get("pod_id"):
+            continue
+        if row.id in _tryit_tasks:
+            continue  # setup still in flight (this gateway) → leave it
+        try:
+            exp = datetime.fromisoformat(str(ti.get("expires_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            exp = now  # malformed → reap
+        if force_all or exp <= now:
+            await _tryit_teardown(row.id)
+            reaped += 1
+    return reaped
+
+
 # ---------- persistent "Try it" worker (loaded model, served over a Unix socket,
 # lifecycle managed over SSH — the small sibling of the serverless worker) --------
 
@@ -3529,7 +3721,7 @@ def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
             except OSError:
                 pass
         user_env = _render_env_exports(cfg.get("env_vars") or {})
-        out: dict = {"text": None, "device": None, "error": None, "lines": []}
+        out: dict = {"text": None, "raw": None, "device": None, "error": None, "lines": []}
 
         def on_line(line: str) -> None:
             out["lines"].append(line)
@@ -3543,6 +3735,7 @@ def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
                     out["error"] = obj["error"]
                 else:
                     out["text"] = obj.get("text", "")
+                    out["raw"] = obj.get("raw")
                     out["device"] = obj.get("device")
 
         # Run with the ASR trainer venv (torch/transformers/librosa/boto3); the
@@ -3560,7 +3753,7 @@ def _run_transcribe_ssh(host: str, port: int, user: str, key_filename: str,
         if out["text"] is None:
             tail = "\n".join(out["lines"][-15:])
             raise RuntimeError(f"transcription produced no output (rc={rc}):\n{tail}")
-        return out["text"], out.get("device"), out["lines"][-120:]
+        return out["text"], out.get("device"), out.get("raw"), out["lines"][-120:]
     finally:
         try:
             cli.close()
@@ -3642,6 +3835,10 @@ async def training_gpu(
 
 class TranscribeResponse(BaseModel):
     text: str
+    # Raw decode with special tokens KEPT (<|startoftranscript|><|lang|><|transcribe|>
+    # <|notimestamps|> … <|endoftext|>) — lets the playground verify the finetuned
+    # model emits the Whisper prompt + EOS. None if the raw decode was skipped.
+    raw: Optional[str] = None
     device: Optional[str] = None
     logs: list[str] = []          # VM-side progress (model download, inference) for the playground
 
@@ -3668,12 +3865,18 @@ async def transcribe_with_run(
     if not model_s3:
         raise HTTPException(status_code=400, detail="no trained model artifact for this run")
     prov = await session.get(Provider, row.provider_id) if row.provider_id else None
-    if prov is None or prov.kind != "vm":
-        raise HTTPException(
-            status_code=400,
-            detail=("try-it runs on a VM provider; this run used a cloud pod "
-                    "(gone after training). Push to HF and try there, or re-run on a VM."),
-        )
+    is_cloud = prov is None or prov.kind != "vm"
+    if is_cloud:
+        # Cloud run — the training pod is gone. Transcribe runs on the on-demand
+        # try-it pod (Load it first via …/playground/start). Bump its idle window.
+        ti = _tryit_state(row)
+        if ti.get("phase") != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail=("load the try-it pod first (it spins up a temporary GPU pod for this "
+                        "cloud run) — POST …/playground/start, then transcribe once it's ready."),
+            )
+        await _tryit_save(run_id, expires_at=_tryit_exp())
     # Validate the GPU choice against the run's pinned GPUs (if any).
     sel = (gpu or "").strip().lower()
     if sel and sel not in ("cpu", "auto"):
@@ -3696,13 +3899,13 @@ async def transcribe_with_run(
     if ssh is None:
         raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
     try:
-        text, device, logs = await asyncio.to_thread(
+        text, device, raw, logs = await asyncio.to_thread(
             _run_transcribe_ssh, *ssh, run_id, model_s3, creds, audio,
             filename or "audio.wav", dict(row.config_json or {}), sel or "auto",
         )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"transcription failed: {e}")
-    return TranscribeResponse(text=text, device=device, logs=logs)
+    return TranscribeResponse(text=text, device=device, raw=raw, logs=logs)
 
 
 def _run_synthesize_ssh(host: str, port: int, user: str, key_filename: str,
@@ -4137,7 +4340,29 @@ async def playground_start(
 
     LLM (gemma-4) runs serve with vLLM (eager); `gpu` may be a comma-list (e.g. "6,7")
     to pick the serve GPUs (TP = count), defaulting to the run's training pin:
-    download LoRA → merge → save → vLLM serve."""
+    download LoRA → merge → save → vLLM serve.
+
+    A finished ASR run on a CLOUD provider (training pod gone) instead spins up a
+    fresh, short-lived pod here: returns immediately with phase=provisioning, builds
+    the venv (~10 min), then phase=ready. Auto-tears-down after idle / on stop."""
+    row0 = await _owned(run_id, user, session)
+    prov0 = await session.get(Provider, row0.provider_id) if row0.provider_id else None
+    if (row0.task_type or "asr").lower() == "asr" and (prov0 is None or prov0.kind != "vm"):
+        if row0.status != "done":
+            raise HTTPException(status_code=400, detail="the run must finish training first")
+        if not ((row0.result_json or {}).get("artifact") or {}).get("s3_uri"):
+            raise HTTPException(status_code=400, detail="no trained model artifact for this run")
+        if _tryit_state(row0).get("phase") in ("provisioning", "installing", "ready"):
+            return _tryit_status(row0)   # already loading / loaded — idempotent
+        sel = (gpu or "").strip().lower()
+        if sel and sel not in ("cpu", "auto") and not sel.isdigit():
+            raise HTTPException(status_code=400, detail="gpu must be a GPU index, 'cpu', or 'auto'")
+        await _tryit_save(run_id, phase="provisioning", message="starting a GPU pod …",
+                          expires_at=_tryit_exp())
+        _tryit_tasks[run_id] = asyncio.create_task(_tryit_cloud_setup(run_id, sel or "auto"))
+        async with session_factory()() as s:
+            row0 = await s.get(TrainingRun, run_id)
+        return _tryit_status(row0)
     row, kind, model_s3, creds, ssh, cfg = await _playground_ctx(run_id, user, session)
     if kind == "llm":
         # Serve GPUs: an explicit `gpu` (comma-list like "6,7") overrides the run's
@@ -4179,6 +4404,10 @@ async def playground_status(
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
+    row0 = await _owned(run_id, user, session)
+    prov0 = await session.get(Provider, row0.provider_id) if row0.provider_id else None
+    if (row0.task_type or "asr").lower() == "asr" and (prov0 is None or prov0.kind != "vm"):
+        return _tryit_status(row0)   # cloud try-it pod phase (provisioning/installing/ready/error)
     row, kind, _m, _c, ssh, cfg = await _playground_ctx(run_id, user, session)
     try:
         st = await asyncio.to_thread(_playground_status_ssh, *ssh, run_id, cfg, kind)
@@ -4193,7 +4422,14 @@ async def playground_stop(
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Unload the persistent worker and free the GPU (SIGTERM its process group)."""
+    """Unload the persistent worker and free the GPU (SIGTERM its process group).
+    For a cloud try-it run this terminates the on-demand pod entirely."""
+    row0 = await _owned(run_id, user, session)
+    prov0 = await session.get(Provider, row0.provider_id) if row0.provider_id else None
+    if (row0.task_type or "asr").lower() == "asr" and (prov0 is None or prov0.kind != "vm"):
+        await _tryit_teardown(run_id)
+        return PlaygroundStatus(running=False, ready=False, kind="asr",
+                                logs=["[try-it] pod torn down"])
     row, kind, _m, _c, ssh, cfg = await _playground_ctx(run_id, user, session)
     try:
         st = await asyncio.to_thread(_playground_stop_ssh, *ssh, run_id, cfg, kind)
