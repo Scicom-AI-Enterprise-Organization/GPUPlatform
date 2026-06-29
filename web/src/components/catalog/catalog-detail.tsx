@@ -152,7 +152,7 @@ export function CatalogDetail({
   const curFilePage = Math.min(filePage, filePageCount);
   const pageFiles = filteredFiles.slice((curFilePage - 1) * filePageSize, curFilePage * filePageSize);
 
-  const envSnippet = `export HF_ENDPOINT=${endpoint}\nexport HF_TOKEN=sgpu_…   # your platform API key\n# or:  hf auth login --token sgpu_…`;
+  const envSnippet = `export HF_ENDPOINT=${endpoint}\nexport HF_TOKEN=sgpu_…   # your platform API key\n# or:  hf auth login --token sgpu_…\nexport HF_HUB_DISABLE_XET=1   # this mirror uses LFS, not Xet — required for hf upload (else 404)`;
 
   const pullSnippet = isDataset
     ? `# Python\nfrom huggingface_hub import snapshot_download\nsnapshot_download("${repo.full_id}", repo_type="dataset")\n\n# CLI\nhf download ${repo.full_id} --repo-type dataset`

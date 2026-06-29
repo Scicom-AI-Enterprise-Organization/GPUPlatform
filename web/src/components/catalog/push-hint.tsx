@@ -23,6 +23,7 @@ export function PushHint({
     `# 1 · Point HF tooling at this gateway`,
     `export HF_ENDPOINT=${endpoint}`,
     `export HF_TOKEN=sgpu_…   # your platform API key`,
+    `export HF_HUB_DISABLE_XET=1   # this mirror uses LFS, not Xet (else upload 404s)`,
     ``,
     `# 2 · Push with the hf CLI (creates the repo on first upload)`,
     isDataset

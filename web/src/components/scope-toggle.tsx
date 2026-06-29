@@ -11,7 +11,13 @@ export function ScopeToggle({ scope }: { scope: "mine" | "all" }) {
 
   function setScope(next: "mine" | "all") {
     if (next === scope) return;
-    const sp = new URLSearchParams(params.toString());
+    // Read the LIVE URL rather than useSearchParams: the list components mirror their
+    // search/status/sort/view/select state into the URL via history.replaceState,
+    // which the Next router (and useSearchParams) doesn't observe. Using
+    // window.location.search preserves those filters so toggling scope keeps the
+    // full shareable URL intact (scope + filters together).
+    const live = typeof window !== "undefined" ? window.location.search : `?${params.toString()}`;
+    const sp = new URLSearchParams(live);
     if (next === "mine") sp.delete("scope");
     else sp.set("scope", "all");
     const qs = sp.toString();
