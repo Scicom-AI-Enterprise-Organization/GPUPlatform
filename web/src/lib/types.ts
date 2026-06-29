@@ -81,6 +81,9 @@ export type CreateAppRequest = {
   request_timeout_s?: number;
   vllm_args?: string;
   enable_metrics?: boolean;
+  // Create already public (read-only visible to every logged-in user). Omitted/
+  // false = private. Same flag the /apps/{id}/visibility toggle flips.
+  is_public?: boolean;
   cloud_type?: "COMMUNITY" | "SECURE";
   container_disk_gb?: number;
   volume_gb?: number;
@@ -253,6 +256,9 @@ export type CreateBenchmarkRequest = {
   // at launch (the ingress client sends it as Authorization: Bearer). A pasted
   // key is sent via env_vars["OPENAI_API_KEY"] instead.
   api_key_secret?: string | null;
+  // Create already public (read-only visible to every logged-in user). Omitted/
+  // false = private. Same flag the /benchmarks/{id}/visibility toggle flips.
+  is_public?: boolean;
 };
 
 export type BenchmarkFile = {
