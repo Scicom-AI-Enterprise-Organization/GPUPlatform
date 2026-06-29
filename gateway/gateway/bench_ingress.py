@@ -162,10 +162,16 @@ async def _one_request(
                     if is_chat:
                         delta = choices[0].get("delta") or {}
                         # Reasoning models (served with --reasoning-parser) stream the
-                        # <think> block as `reasoning_content`, separate from the final
-                        # `content`. Count both as output, else a reasoning-only or
-                        # length-truncated turn looks like "no tokens streamed".
-                        piece = (delta.get("content") or "") or (delta.get("reasoning_content") or "")
+                        # thinking block separately from the final answer. vLLM >= 0.10
+                        # renamed the field `reasoning_content` -> `reasoning` (POD-VERIFIED
+                        # on Qwen3.6 + vLLM 0.23: deltas arrive as {"reasoning": "..."}).
+                        # Count the answer OR either reasoning field, else a reasoning-only
+                        # or length-truncated turn looks like "no tokens streamed".
+                        piece = (
+                            (delta.get("content") or "")
+                            or (delta.get("reasoning") or "")
+                            or (delta.get("reasoning_content") or "")
+                        )
                     else:
                         piece = choices[0].get("text") or ""
                 if piece:
