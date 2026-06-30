@@ -104,10 +104,9 @@ DEPS = [
     # range numba 0.61 supports, still fine for torch/transformers) makes it resolve.
     "numba>=0.61", "numpy<2.3",
     "librosa", "soundfile", "datasets", "wandb", "boto3",
-    # Scicom neucodec fork — adds NeuCodec._from_pretrained(decoder_depth=…) + the
-    # 44.1 kHz depth-20 decoder used at encode/decode (model: Scicom-intl/neucodec-44k-d20).
-    # Imports as `neucodec`; bare git URL so pip derives the dist name from the repo.
-    "git+https://github.com/Scicom-AI-Enterprise-Organization/neucodec-44k.git",
+    # Upstream neucodec (neuphonic/neucodec, 24 kHz). The encode/decode paths load
+    # `NeuCodec.from_pretrained("neuphonic/neucodec")`.
+    "neucodec",
     "pandas", "pyarrow", "multiprocess", "liger-kernel",
     "git+https://github.com/apple/ml-cross-entropy",
     "peft>=0.11",  # LoRA (all-linear adapters, merged into base at save)
@@ -132,16 +131,16 @@ def _ensure_venv(cfg: dict) -> str:
         pkgs.append("mlflow")
 
     def _present() -> bool:
-        # Also assert neucodec was installed from the Scicom fork (PEP 610
-        # direct_url.json carries the git URL) — a venv built with the old PyPI
-        # neucodec imports fine but lacks _from_pretrained(decoder_depth=…), so it
-        # must be reinstalled. Scan all dists for the org URL (the fork's dist name
-        # may differ from the `neucodec` import name); plain PyPI installs have none.
+        # Require UPSTREAM neucodec (neuphonic/neucodec), NOT the old Scicom 44k fork:
+        # a venv still carrying the fork (PEP 610 direct_url.json with the org git URL)
+        # must be reinstalled so the encode/decode paths load neuphonic/neucodec. Plain
+        # PyPI installs have no such direct_url → pass. (Scan all dists — the fork's
+        # dist name may differ from the `neucodec` import name.)
         probe = (
             "import torch, torchaudio, transformers, neucodec, pyarrow, boto3; "
             "import importlib.metadata as _m; "
-            "assert any('Scicom-AI-Enterprise-Organization' in (d.read_text('direct_url.json') or '') "
-            "for d in _m.distributions()), 'neucodec not the Scicom fork'"
+            "assert not any('Scicom-AI-Enterprise-Organization' in (d.read_text('direct_url.json') or '') "
+            "for d in _m.distributions()), 'neucodec is still the Scicom fork'"
         )
         try:
             subprocess.check_call(

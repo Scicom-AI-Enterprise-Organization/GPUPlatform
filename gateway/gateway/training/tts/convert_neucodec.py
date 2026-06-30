@@ -132,10 +132,9 @@ def loop(items_device):
     import torch
 
     torch.autograd.set_grad_enabled(False)
-    # Scicom d20 fork: decoder_depth=20 matches the finetuned depth-20 decoder. The
-    # frozen encoder still resamples to 16 kHz internally, so the FSQ codes are
-    # unchanged — only the loader + decoder differ from upstream neuphonic/neucodec.
-    model = NeuCodec._from_pretrained(model_id="Scicom-intl/neucodec-44k-d20", decoder_depth=20)
+    # Upstream neucodec (neuphonic/neucodec, 24 kHz). The frozen encoder resamples to
+    # 16 kHz internally, so the FSQ speech codes are the standard NeuCodec tokens.
+    model = NeuCodec.from_pretrained("neuphonic/neucodec")
     model.eval().cuda()
 
     # Resume: skip clips whose tokens already exist (count them as done up front).
