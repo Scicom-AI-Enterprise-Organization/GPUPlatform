@@ -1002,7 +1002,34 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
             spawned = (api_key, runpod_id)
             await _push_log(redis, run_id,
                             "[gateway] label export: installing the TTS stack on the pod (first build is slow) …")
-            await asyncio.to_thread(_label_build_tts_venv_ssh, host, int(port), "root", key_filename, run_id, dict(cfg))
+            # Stream the (slow) install to the run's logs via a short-lived pump, so it
+            # isn't silent and any pip/uv error is visible live (not just a final rc).
+            build_lines: list[str] = []
+            _bn = {"n": 0}
+
+            async def _build_pump() -> None:
+                while True:
+                    await asyncio.sleep(0.5)
+                    while _bn["n"] < len(build_lines):
+                        await _push_log(redis, run_id, build_lines[_bn["n"]])
+                        _bn["n"] += 1
+
+            bpump = asyncio.create_task(_build_pump())
+            try:
+                await asyncio.to_thread(_label_build_tts_venv_ssh, host, int(port), "root",
+                                        key_filename, run_id, dict(cfg), build_lines.append)
+            finally:
+                bpump.cancel()
+                try:
+                    await bpump
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                while _bn["n"] < len(build_lines):  # flush any tail the pump missed
+                    try:
+                        await _push_log(redis, run_id, build_lines[_bn["n"]])
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _bn["n"] += 1
             ssh = (host, int(port), "root", key_filename)
         elif run_on == "vm":
             vm_prov = prov
@@ -1037,7 +1064,7 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
             except Exception:  # noqa: BLE001
                 pass
         await _push_log(redis, run_id, f"[gateway] label export: provisioning failed: {e}")
-        await _set_label_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
+        await _set_label_export_state(run_id, {"status": "failed", "error": str(e)[:1200]})
         return
     # Stream the VM-side synthesis/upload log to the run's logs (the script runs in a
     # thread; it appends lines to this buffer and an async pump mirrors them to Redis,
@@ -3537,7 +3564,13 @@ async def stream_training_logs(
                 sent += 1
             async with session_factory()() as s:
                 cur = await s.get(TrainingRun, run_id)
-            if cur is None or cur.status in ("done", "failed", "cancelled"):
+            # Keep streaming a finished run while a post-train export is still in
+            # flight (label synthesis / HF push run AFTER the run is "done" — else the
+            # stream would end immediately and their progress never reaches the UI).
+            rj = (cur.result_json or {}) if cur is not None else {}
+            exporting = (((rj.get("label_export") or {}).get("status") == "running")
+                         or ((rj.get("hf_export") or {}).get("status") == "running"))
+            if cur is None or (cur.status in ("done", "failed", "cancelled") and not exporting):
                 yield "event: end\ndata: end\n\n"
                 return
             await asyncio.sleep(1.0)
@@ -3663,10 +3696,13 @@ async def _resolve_provider_ssh(prov: Provider, run_id: str) -> Optional[tuple[s
 
 
 def _label_build_tts_venv_ssh(host: str, port: int, user: str, key_filename: str,
-                              run_id: str, cfg: dict) -> None:
+                              run_id: str, cfg: dict, line_sink=None) -> None:
     """On a freshly-spawned pod: ship tts_finetune.py + run `--deps-only` (reusing the
     training path's uv bootstrap) to build the TTS venv the export's synthesis needs.
-    Blocking — call via to_thread. Mirrors `_tryit_build_venv_ssh` (the ASR twin)."""
+    Blocking — call via to_thread. Mirrors `_tryit_build_venv_ssh` (the ASR twin).
+    `line_sink(str)` (if given) gets every install line so the caller can stream the
+    slow build; on failure the RuntimeError carries the output tail (the real
+    pip/uv/build error — not just an opaque rc)."""
     import tempfile
     cli = _ssh_connect(host, int(port), user, key_filename)
     try:
@@ -3686,9 +3722,23 @@ def _label_build_tts_venv_ssh(host: str, port: int, user: str, key_filename: str
         user_env = _render_env_exports(cfg.get("env_vars") or {})
         deps_cmd = (f"{user_env}{_UV_BOOTSTRAP}"
                     "python -u /tmp/sgpu_label_tts.py --deps-only --config /tmp/sgpu_label_deps.json")
-        rc = _ssh_run_stream(cli, deps_cmd, lambda _l: None)
+        tail: list[str] = []
+
+        def on_line(line: str) -> None:
+            if line_sink is not None:
+                try:
+                    line_sink(line)
+                except Exception:  # noqa: BLE001
+                    pass
+            tail.append(line)            # keep a rolling tail (the error is at the END)
+            if len(tail) > 80:
+                del tail[0]
+
+        rc = _ssh_run_stream(cli, deps_cmd, on_line)
         if rc != 0:
-            raise RuntimeError(f"TTS deps install failed on the label-export pod (rc={rc})")
+            detail = "\n".join(tail[-25:]).strip()
+            raise RuntimeError(f"TTS deps install failed on the label-export pod (rc={rc})"
+                               + (f":\n{detail}" if detail else ""))
     finally:
         try:
             cli.close()

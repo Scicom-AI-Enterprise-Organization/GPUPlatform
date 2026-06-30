@@ -99,3 +99,40 @@ the gateway's pagination stay accurate. A `kind=label` Dataset stores its cutoff
 `Dataset.label_updated_until` (ISO-8601 UTC; set on `/datasets/new`, editable from the dataset's
 **Import filter** card) and the gateway forwards it as `updated_until` on every preview /
 transform / merge read (`_label_export_rows`, `_label_pairs`).
+
+## Gateway API — trigger a TTS label export (write side)
+
+Drive the **post-train TTS → Label** export programmatically against the **gateway** (these are
+gateway routes, auth = a `sgpu_…` API key; not the Label platform's `lpat_…`). The run must be a
+finished (`status=done`) **TTS** run with a model artifact.
+
+```
+POST /v1/training-runs/{run_id}/label-export          → {"status":"started"}
+POST /v1/training-runs/{run_id}/label-export/cancel    → {"status":"cancelled"}
+```
+
+`label-export` synthesizes N clips from the trained model, uploads them to the run's S3, creates a
+Label **recording+MOS** project, imports the clips as tasks, and round-trips a `kind=label`
+Dataset. It runs in the **background** — progress streams to the run's Logs, and
+`result_json.label_projects[]` (+ `label_project` for the first) carry the created project(s).
+Re-POSTing supersedes an in-flight export. **Pre-flight:** the gateway first does a `GET
+{base_url}/api/projects` with the token and **fails fast (502) before provisioning any pod / VM**
+if the platform is unreachable or the token is rejected.
+
+Body (all optional — unset fields fall back to the run's stored config):
+
+| field | meaning |
+|-------|---------|
+| `base_url` / `base_url_secret` | Label platform URL (pasted, or a Secrets-page key) |
+| `token` / `token_secret` | admin `lpat_…` (pasted, encrypted at rest, or a Secrets key) |
+| `project_name`, `samples`, `mos_axes[]` | project name, #clips, 1–5 MOS rating axes |
+| `speakers[]`, `per_speaker`, `speaker_prefix` | voices to use; one project per speaker (each from that speaker's own clips); prefix transcript with the speaker name |
+| `reject_keywords[]` | drop text samples containing any phrase (case-insensitive, spacing-agnostic) |
+| `run_on` (`cloud`\|`vm`), `provider_id` | where to synthesize — a fresh RunPod pod (needs a RunPod `provider_id`) or a registered VM. Omitted → the run's own box (the auto post-train export reuses the still-alive training pod). |
+| `gpu_type`, `gpu_count`, `secure_cloud`, `disk_gb`, `volume_gb`, `visible_devices`, `venv_path` | cloud-pod hardware + the TTS venv path |
+
+**Automatic export:** enabling *"Create labelling project after training"* on the run sets
+`config.label_export=true`; the gateway then runs this same flow at finalize (reusing the live
+training pod — no new pod). `cancel` stops a running export (kills the box-side synth, tears down
+any pod it spawned, clears the `running` state); a gateway restart also reconciles a stuck
+`running` export to `failed`.

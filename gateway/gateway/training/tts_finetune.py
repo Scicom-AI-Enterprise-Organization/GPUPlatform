@@ -97,6 +97,12 @@ def _run_loss(cmd: list[str], cwd: str, env: dict) -> float | None:
 DEFAULT_VENV = "/share/autotrain-tts"
 DEPS = [
     "torch==2.9.1", "torchaudio==2.9.1", "transformers==4.57.3", "accelerate",
+    # Pin numba/numpy: librosa pulls numba transitively, and on a FRESH py3.12 venv
+    # uv otherwise backtracks numba to 0.53.1 (no py3.12 wheel → sdist build that
+    # hard-fails "only versions >=3.6,<3.10 are supported") because torch's numpy 2.3
+    # has no compatible numba. Pinning numba>=0.61 (py3.12 wheels) + numpy<2.3 (the
+    # range numba 0.61 supports, still fine for torch/transformers) makes it resolve.
+    "numba>=0.61", "numpy<2.3",
     "librosa", "soundfile", "datasets", "wandb", "boto3",
     # Scicom neucodec fork — adds NeuCodec._from_pretrained(decoder_depth=…) + the
     # 44.1 kHz depth-20 decoder used at encode/decode (model: Scicom-intl/neucodec-44k-d20).
