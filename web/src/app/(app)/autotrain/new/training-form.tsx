@@ -379,6 +379,10 @@ export function TrainingForm() {
   const [labelSamples, setLabelSamples] = useState(32);
   const [labelSpeakers, setLabelSpeakers] = useState("");
   const [labelSpeakerPrefix, setLabelSpeakerPrefix] = useState(false);
+  // Comma/newline-separated phrases; text samples containing any are dropped.
+  const [labelRejectKeywords, setLabelRejectKeywords] = useState("");
+  // Make a separate Label project per speaker (each from that speaker's own clips).
+  const [labelPerSpeaker, setLabelPerSpeaker] = useState(false);
   const [labelMosAxes, setLabelMosAxes] = useState("Naturalness, Intelligibility, Noise");
   // experiment tracking — named credentials from the Secrets page (picked per run)
   const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
@@ -412,7 +416,15 @@ export function TrainingForm() {
   useEffect(() => {
     gateway.listDatasets().then(setDatasets).catch(() => {});
     gateway.listStorage().then(setStorages).catch(() => {});
-    gateway.listProviders().then(setProviders).catch(() => {});
+    gateway
+      .listProviders()
+      .then((ps) => {
+        setProviders(ps);
+        // Auto-select the first registered RunPod account — no gateway-default fallback.
+        const firstRunpod = ps.find((p) => p.kind === "runpod");
+        if (firstRunpod) setRunpodProviderId((cur) => cur || firstRunpod.id);
+      })
+      .catch(() => {});
     gateway.listTrackingCredentials().then(setTrackingCreds).catch(() => {});
     gateway.listGlobalEnv().then(setSecrets).catch(() => {});
     gateway
@@ -516,6 +528,9 @@ export function TrainingForm() {
         if (Array.isArray(c.label_speakers) && c.label_speakers.length)
           setLabelSpeakers(arr(c.label_speakers).map(String).join(", "));
         if (c.label_speaker_prefix != null) setLabelSpeakerPrefix(!!c.label_speaker_prefix);
+        if (Array.isArray(c.label_reject_keywords) && c.label_reject_keywords.length)
+          setLabelRejectKeywords(arr(c.label_reject_keywords).map(String).join(", "));
+        if (c.label_per_speaker != null) setLabelPerSpeaker(!!c.label_per_speaker);
         // run on
         if (r.provider_kind === "vm") { setTarget("vm"); setProviderId(r.provider_id || ""); }
         else if (r.provider_id) { setTarget("cloud"); setRunpodProviderId(r.provider_id); }
@@ -721,7 +736,8 @@ export function TrainingForm() {
     if (!baseModel) return setError("Pick or enter a base model.");
     if (!datasetId) return setError("Pick a training dataset.");
     if (!storageId) return setError("Pick an S3 storage for artifacts + logs.");
-    if (target === "vm" && !providerId) return setError("Pick a VM provider, or switch to Default cloud.");
+    if (target === "vm" && !providerId) return setError("Pick a VM provider, or switch to cloud.");
+    if (target === "cloud" && !runpodProviderId) return setError("Select a RunPod provider — add one under GPU Providers.");
 
     // --- GPU pin: non-negative integers, no dupes, within the target's count ---
     const vd = visibleDevices.trim();
@@ -838,12 +854,15 @@ export function TrainingForm() {
             label_mos_axes: labelMosAxes.split(",").map((s) => s.trim()).filter(Boolean),
             label_speakers: labelSpeakers.split(",").map((s) => s.trim()).filter(Boolean),
             label_speaker_prefix: labelSpeakerPrefix,
+            // Split on comma/newline only — a keyword may contain spaces ("E M G S").
+            label_reject_keywords: labelRejectKeywords.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
+            label_per_speaker: labelPerSpeaker,
           }
         : {}),
       ...(sweepOn && Object.keys(sweepGrid).length
         ? { sweep: sweepGrid, gpus_per_trial: gpusPerTrial }
         : {}),
-      provider_id: target === "vm" ? providerId : runpodProviderId || null,
+      provider_id: target === "vm" ? providerId : runpodProviderId,
       gpu_type: gpuType,
       gpu_count: gpuCount,
       secure_cloud: secureCloud,
@@ -1087,7 +1106,7 @@ export function TrainingForm() {
               return (
                 <button key={v} type="button" onClick={() => setSweepOn(v === "sweep")}
                   className={cn("rounded px-3 py-1 transition-colors",
-                    active ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
+                    active ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
                   {label}
                 </button>
               );
@@ -1409,7 +1428,7 @@ export function TrainingForm() {
                       {(["paste", "secret"] as const).map((m) => (
                         <button key={m} type="button" onClick={() => setLabelUrlMode(m)}
                           className={cn("px-2.5 py-1 transition-colors",
-                            labelUrlMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
+                            labelUrlMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
                           {m === "paste" ? "Paste" : "From secret"}
                         </button>
                       ))}
@@ -1436,7 +1455,7 @@ export function TrainingForm() {
                       {(["paste", "secret"] as const).map((m) => (
                         <button key={m} type="button" onClick={() => setLabelTokenMode(m)}
                           className={cn("px-2.5 py-1 transition-colors",
-                            labelTokenMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
+                            labelTokenMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
                           {m === "paste" ? "Paste" : "From secret"}
                         </button>
                       ))}
@@ -1470,11 +1489,24 @@ export function TrainingForm() {
                   </FieldWrap>
                 </div>
                 <div className="sm:col-span-2">
-                  <FieldWrap label="Speaker names (optional)" hint="Comma-separated. Balances the clips evenly across these voices — e.g. 2 speakers + 32 samples → 16 each. Blank → the dataset's original voices.">
+                  <FieldWrap label="Reject keywords (optional)" hint="Comma- or newline-separated phrases. Text samples whose transcript contains any are dropped (case-insensitive, spacing-agnostic — “E M G S” matches any spacing).">
+                    <Input value={labelRejectKeywords} placeholder="EMGS, E M G S, Husein"
+                      onChange={(e) => setLabelRejectKeywords(e.target.value)} />
+                  </FieldWrap>
+                </div>
+                <div className="sm:col-span-2">
+                  <FieldWrap label="Speaker names (optional)" hint={labelPerSpeaker
+                    ? "Comma-separated. One project is created per speaker, each seeded only from that speaker's own clips. Names must match the dataset's speaker labels."
+                    : "Comma-separated. Balances the clips evenly across these voices — e.g. 2 speakers + 32 samples → 16 each. Blank → the dataset's original voices."}>
                     <Input value={labelSpeakers} placeholder="speakerA, speakerB"
                       onChange={(e) => setLabelSpeakers(e.target.value)} />
                   </FieldWrap>
                 </div>
+                <label className="flex cursor-pointer items-center gap-2 text-sm sm:col-span-2">
+                  <input type="checkbox" checked={labelPerSpeaker} onChange={(e) => setLabelPerSpeaker(e.target.checked)}
+                    className="h-4 w-4 accent-primary" />
+                  <span>Separate project per speaker <span className="text-muted-foreground">(each from that speaker&apos;s own clips · {labelSamples} per speaker)</span></span>
+                </label>
                 <label className="flex cursor-pointer items-center gap-2 text-sm sm:col-span-2">
                   <input type="checkbox" checked={labelSpeakerPrefix} onChange={(e) => setLabelSpeakerPrefix(e.target.checked)}
                     className="h-4 w-4 accent-primary" />
@@ -1539,7 +1571,7 @@ export function TrainingForm() {
             >
               <input
                 type="checkbox"
-                className="mt-0.5"
+                className="mt-0.5 h-4 w-4 accent-primary"
                 checked={sweepAugment && augmentTechniques.length > 0}
                 disabled={augmentTechniques.length === 0}
                 onChange={(e) => setSweepAugment(e.target.checked)}
@@ -1621,12 +1653,10 @@ export function TrainingForm() {
         )}
         {target === "cloud" && (
           <div className="space-y-5">
-            <FieldWrap label="RunPod account" hint="Which RunPod provider to bill against. Default = gateway env key.">
-              <Select value={runpodProviderId || "__default__"}
-                onValueChange={(v) => setRunpodProviderId(v === "__default__" ? "" : v)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
+            <FieldWrap label="RunPod account" hint="Which RunPod provider to bill against.">
+              <Select value={runpodProviderId} onValueChange={setRunpodProviderId}>
+                <SelectTrigger><SelectValue placeholder="Choose a RunPod account…" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__default__">Gateway default (RunPod)</SelectItem>
                   {runpodProviders.map((p) => (
                     <SelectItem key={p.id} value={p.id}>
                       {p.name}{p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}

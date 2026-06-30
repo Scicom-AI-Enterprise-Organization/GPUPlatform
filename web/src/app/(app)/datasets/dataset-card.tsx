@@ -57,10 +57,16 @@ export function DatasetCard({
   dataset: d,
   onRename,
   onDelete,
+  selectMode = false,
+  selected = false,
+  onToggle,
 }: {
   dataset: DatasetRecord;
   onRename?: (d: DatasetRecord) => void;
   onDelete?: (d: DatasetRecord) => void;
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggle?: (id: string) => void;
 }) {
   const avatar = avatarFor(d.name);
   const detail = sourceDetail(d);
@@ -68,13 +74,20 @@ export function DatasetCard({
   const hosted = d.kind === "hosted";
   const href = hosted ? `/datasets/hosted/${d.name}` : `/datasets/${encodeURIComponent(d.id)}`;
 
-  return (
-    <Link
-      href={href}
-      className="group block rounded-xl border border-border bg-card p-4 transition-all hover:border-primary/40 hover:bg-card/80 hover:shadow-md"
-    >
+  const inner = (
+    <>
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
+          {selectMode && (
+            <input
+              type="checkbox"
+              checked={selected}
+              onChange={() => onToggle?.(d.id)}
+              onClick={(e) => e.stopPropagation()}
+              className="h-4 w-4 shrink-0 cursor-pointer accent-primary"
+              aria-label={`Select ${d.name}`}
+            />
+          )}
           <div className={cn("flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-base font-semibold", avatar.bg, avatar.text)}>
             {avatar.letter}
           </div>
@@ -95,7 +108,7 @@ export function DatasetCard({
           </div>
         </div>
 
-        {(onRename || onDelete) && (
+        {!selectMode && (onRename || onDelete) && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -156,6 +169,37 @@ export function DatasetCard({
           {new Date(d.created_at).toLocaleDateString()}
         </span>
       </div>
+    </>
+  );
+
+  const baseCard = "group block rounded-xl border border-border bg-card p-4 transition-all";
+
+  if (selectMode) {
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => onToggle?.(d.id)}
+        onKeyDown={(e) => {
+          if (e.key === " " || e.key === "Enter") {
+            e.preventDefault();
+            onToggle?.(d.id);
+          }
+        }}
+        className={cn(
+          baseCard,
+          "cursor-pointer",
+          selected ? "border-primary/60 bg-primary/5" : "hover:border-primary/40 hover:bg-card/80",
+        )}
+      >
+        {inner}
+      </div>
+    );
+  }
+
+  return (
+    <Link href={href} className={cn(baseCard, "hover:border-primary/40 hover:bg-card/80 hover:shadow-md")}>
+      {inner}
     </Link>
   );
 }

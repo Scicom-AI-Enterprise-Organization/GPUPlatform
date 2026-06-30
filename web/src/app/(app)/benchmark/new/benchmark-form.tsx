@@ -1057,7 +1057,15 @@ export function BenchmarkForm({
 
   useEffect(() => {
     gateway.listBenchmarkTemplates().then(setTemplates).catch(() => {});
-    gateway.listProviders().then(setProviders).catch(() => {});
+    gateway
+      .listProviders()
+      .then((ps) => {
+        setProviders(ps);
+        // Auto-select the first registered RunPod account — no gateway-default fallback.
+        const firstRunpod = ps.find((p) => p.kind === "runpod");
+        if (firstRunpod) setRunpodProviderId((cur) => cur || firstRunpod.id);
+      })
+      .catch(() => {});
     gateway.listStorage().then(setStorages).catch(() => {});
     // Global-secret keys the HF token can reference (keys only; values stay server-side).
     fetch("/api/proxy/v1/global-env", { cache: "no-store" })
@@ -1152,8 +1160,12 @@ export function BenchmarkForm({
     }
     if (target === "vm" && !effectiveProviderId) {
       setSubmitError(
-        "Pick a VM provider, name one in the YAML (remote.provider), or switch back to Default cloud.",
+        "Pick a VM provider, name one in the YAML (remote.provider), or switch back to cloud.",
       );
+      return;
+    }
+    if (target === "cloud" && !runpodProviderId) {
+      setSubmitError("Select a RunPod provider — add one under GPU Providers.");
       return;
     }
     if (target === "ingress") {
@@ -1205,7 +1217,7 @@ export function BenchmarkForm({
             ? effectiveProviderId
             : target === "ingress"
               ? null // ingress provisions nothing — gateway detects base_url
-              : runpodProviderId || null,
+              : runpodProviderId,
         storage_id: storageId || null,
         is_public: isPublic,
         cleanup_model: target === "vm" ? effectiveCleanup : undefined,
@@ -1667,17 +1679,16 @@ export function BenchmarkForm({
             <div className="space-y-5">
               <FieldWrap
                 label="RunPod account"
-                hint="Which RunPod provider to bill against. Default = gateway env key."
+                hint="Which RunPod provider to bill against."
               >
                 <Select
-                  value={runpodProviderId || "__default__"}
-                  onValueChange={(v) => setRunpodProviderId(v === "__default__" ? "" : v)}
+                  value={runpodProviderId}
+                  onValueChange={setRunpodProviderId}
                 >
                   <SelectTrigger>
-                    <SelectValue />
+                    <SelectValue placeholder="Choose a RunPod account…" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__default__">Gateway default (RunPod)</SelectItem>
                     {providers
                       .filter((p) => p.kind === "runpod")
                       .map((p) => (
@@ -2135,7 +2146,7 @@ export function BenchmarkForm({
                       className={cn(
                         "rounded-md px-4 py-1.5 text-sm font-medium capitalize transition-colors",
                         form.bench_type === t
-                          ? "bg-foreground text-background"
+                          ? "bg-primary text-primary-foreground"
                           : "text-muted-foreground hover:text-foreground",
                       )}
                     >

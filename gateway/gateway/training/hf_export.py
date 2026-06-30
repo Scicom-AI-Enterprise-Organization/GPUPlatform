@@ -102,6 +102,12 @@ def main() -> int:
     # Custom HF_ENDPOINT (a self-hosted, HF-compatible Hub) — None → huggingface.co.
     hf_endpoint = (cfg.get("hf_endpoint") or "").strip().rstrip("/") or None
     base_url = hf_endpoint or "https://huggingface.co"
+    # The self-hosted mirror speaks LFS but NOT Xet — a modern huggingface_hub (with
+    # hf_xet) otherwise probes `{endpoint}/api/models/{repo}/xet-write-token/{rev}`,
+    # gets a 404, and aborts the push. Force the LFS path for mirror targets. Must be
+    # set before huggingface_hub is imported (the constant is read at import time).
+    if hf_endpoint:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
 
     model_dir = _download_model(cfg)
 

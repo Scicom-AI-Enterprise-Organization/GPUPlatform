@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/select";
 import { ProgressEta } from "@/components/progress-eta";
 import { gateway, GatewayError } from "@/lib/gateway";
-import type { DatasetKind, StorageRecord } from "@/lib/types";
+import type { DatasetKind, StorageRecord, TransformDatasetRequest } from "@/lib/types";
 
 function errText(body: unknown, fallback: string): string {
   if (typeof body === "string") return body || fallback;
@@ -54,6 +54,9 @@ export function TransformCard({
   const [outRepo, setOutRepo] = useState(hfRepo ? `${hfRepo}-audio` : "");
   const [storageId, setStorageId] = useState(s3Storages[0]?.id ?? "");
   const [s3Folder, setS3Folder] = useState(`datasets/${datasetId}/transformed`);
+  const [testSplitOn, setTestSplitOn] = useState(false);
+  const [testSplitMode, setTestSplitMode] = useState<"pct" | "count">("pct");
+  const [testSplitValue, setTestSplitValue] = useState("10");
   const [status, setStatus] = useState<string | null>(initialStatus);
   const [log, setLog] = useState<string | null>(initialLog);
   const [err, setErr] = useState<string | null>(null);
@@ -101,13 +104,30 @@ export function TransformCard({
       setErr("Pick an S3 storage.");
       return;
     }
+    let testSplit: Pick<TransformDatasetRequest, "test_split_pct" | "test_split_count"> = {};
+    if (testSplitOn) {
+      const v = Number(testSplitValue);
+      if (!Number.isFinite(v) || v < 0) {
+        setErr("Enter a valid test-split size.");
+        return;
+      }
+      if (testSplitMode === "pct") {
+        if (v >= 100) {
+          setErr("Test split percentage must be below 100.");
+          return;
+        }
+        testSplit = { test_split_pct: v };
+      } else {
+        testSplit = { test_split_count: Math.round(v) };
+      }
+    }
     setStarting(true);
     try {
       const d = await gateway.transformDataset(
         datasetId,
         target === "hf"
-          ? { target: "hf", hf_repo: outRepo.trim() }
-          : { target: "s3", storage_id: storageId, s3_folder: s3Folder.trim() || null },
+          ? { target: "hf", hf_repo: outRepo.trim(), ...testSplit }
+          : { target: "s3", storage_id: storageId, s3_folder: s3Folder.trim() || null, ...testSplit },
       );
       setStatus(d.transform_status ?? "running");
       setLog(d.transform_log ?? null);
@@ -226,6 +246,55 @@ export function TransformCard({
             </div>
           </div>
         )}
+
+        <div className="space-y-2 rounded-md border border-border p-3">
+          <label className="flex items-center gap-2 text-xs font-medium">
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-primary"
+              checked={testSplitOn}
+              onChange={(e) => setTestSplitOn(e.target.checked)}
+              disabled={running}
+            />
+            Add a held-out test split
+          </label>
+          {testSplitOn && (
+            <div className="space-y-2 pl-6">
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={0}
+                  value={testSplitValue}
+                  onChange={(e) => setTestSplitValue(e.target.value)}
+                  disabled={running}
+                  className="h-8 w-24 text-xs"
+                />
+                <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                  {(["pct", "count"] as const).map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => setTestSplitMode(m)}
+                      disabled={running}
+                      className={
+                        "rounded px-2.5 py-1 transition-colors " +
+                        (testSplitMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                      }
+                    >
+                      {m === "pct" ? "% of rows" : "# rows"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Randomly holds out{" "}
+                {testSplitMode === "pct" ? `${testSplitValue || "0"}%` : `${testSplitValue || "0"} row(s)`} as a{" "}
+                <span className="font-mono">test</span> split; the rest become{" "}
+                <span className="font-mono">train</span>. Any source splits are collapsed.
+              </p>
+            </div>
+          )}
+        </div>
 
         {err && <p className="text-sm text-destructive">{err}</p>}
 

@@ -166,8 +166,9 @@ class TTSEngine:
         step(f"moving language model to {self.device}")
         self.model = (m.cuda() if use_cuda else m).eval()
 
-        step("loading NeuCodec audio decoder (neuphonic/neucodec)")
-        neu = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
+        step("loading NeuCodec audio decoder (Scicom-intl/neucodec-44k-d20)")
+        # Scicom d20 fork: decoder_depth=20 matches the finetuned depth-20 decoder → 44.1 kHz.
+        neu = NeuCodec._from_pretrained(model_id="Scicom-intl/neucodec-44k-d20", decoder_depth=20).eval()
         step(f"moving NeuCodec to {self.device}")
         self.neu = neu.cuda() if use_cuda else neu
         self.im_end = self.tok.convert_tokens_to_ids("<|im_end|>")
@@ -207,7 +208,7 @@ class TTSEngine:
             if self.use_cuda:
                 fsq = fsq.cuda()
             wav = self.neu.decode_code(fsq).squeeze().detach().cpu().float().numpy()
-        sr = int(getattr(self.neu, "sample_rate", 24000))
+        sr = int(getattr(self.neu, "sample_rate", 44100))
         buf = io.BytesIO()
         self.sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
         return {"wav_b64": base64.b64encode(buf.getvalue()).decode(), "sample_rate": sr,
@@ -231,8 +232,9 @@ class DecodeEngine:
         self.use_cuda = use_cuda
         self.device = "cuda" if use_cuda else "cpu"
 
-        step("loading NeuCodec audio decoder (neuphonic/neucodec)")
-        neu = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
+        step("loading NeuCodec audio decoder (Scicom-intl/neucodec-44k-d20)")
+        # Scicom d20 fork: decoder_depth=20 matches the finetuned depth-20 decoder → 44.1 kHz.
+        neu = NeuCodec._from_pretrained(model_id="Scicom-intl/neucodec-44k-d20", decoder_depth=20).eval()
         step(f"moving NeuCodec to {self.device}")
         self.neu = neu.cuda() if use_cuda else neu
         if use_cuda:
@@ -259,7 +261,7 @@ class DecodeEngine:
             if self.use_cuda:
                 fsq = fsq.cuda()
             wav = self.neu.decode_code(fsq).squeeze().detach().cpu().float().numpy()
-        sr = int(getattr(self.neu, "sample_rate", 24000))
+        sr = int(getattr(self.neu, "sample_rate", 44100))
         buf = io.BytesIO()
         self.sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
         log(f"decoded {len(codes)} codes → {len(wav) / sr:.2f}s @ {sr}Hz in {time.time() - t:.2f}s")

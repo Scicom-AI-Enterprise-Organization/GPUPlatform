@@ -90,9 +90,10 @@ def _utterance_parts(tokenizer, utt_ids):
 # ---------------------------------------------------------------------------
 # Generation: prompt → speech tokens → NeuCodec wav
 # ---------------------------------------------------------------------------
-def _decode_neucodec(neucodec, codes, sr_out=24000):
+def _decode_neucodec(neucodec, codes, sr_out=44100):
     """NeuCodec codes (list[int]) → mono waveform (numpy float32) + sample rate.
-    Inverse of convert_neucodec's `encode_code`/`fsq_codes[0,0]`."""
+    Inverse of convert_neucodec's `encode_code`/`fsq_codes[0,0]`. The Scicom d20
+    decoder outputs 44.1 kHz (read from `neucodec.sample_rate`)."""
     import torch
 
     with torch.no_grad():
@@ -118,7 +119,8 @@ def generate_pairs(model_dir, packed_dir, out_dir, max_samples, max_new_tokens=2
     # logits when labels is None — so it can't `.generate()`. The saved weights
     # are standard Qwen3ForCausalLM, which generates correctly.
     model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.bfloat16).cuda().eval()
-    neucodec = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
+    # Scicom d20 fork: decoder_depth=20 matches the finetuned depth-20 decoder → 44.1 kHz.
+    neucodec = NeuCodec._from_pretrained(model_id="Scicom-intl/neucodec-44k-d20", decoder_depth=20).eval()
     neucodec = neucodec.cuda() if torch.cuda.is_available() else neucodec
     im_end_id = tokenizer.convert_tokens_to_ids(_IM_END)
 

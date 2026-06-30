@@ -464,27 +464,42 @@ def _ssh_put(cli, local: str, remote: str) -> None:
 
 
 def _ssh_put_bytes(cli, data: bytes, remote: str) -> None:
-    """Stream raw bytes to a remote file over an exec channel's stdin (no SFTP,
-    no argv-length limit) — for payloads too big for _ssh_put's base64 argv
-    (capped ~128 KB by MAX_ARG_STRLEN), e.g. an uploaded audio clip."""
+    """Write arbitrary bytes to a remote file — NOT SFTP, NOT raw stdin. The
+    proxied GPU SSH endpoints we target (PAI DSW, TM, RunPod-behind-a-proxy) only
+    reliably pass a single safe argv — the same reason _ssh_put base64s its
+    payload. Raw binary on an exec channel's *stdin* (the old `cat > file`) gets
+    mangled / short-written on some of them: `cat` still exits 0, leaving a corrupt
+    file, so a downstream `tar -xzf` died with rc=2 (the bug this fixes). Instead we
+    base64 the payload and write it in argv-sized chunks (`printf %s … | base64 -d`,
+    first truncates then appends) — no stdin, no ~128 KB single-argv cap — then
+    verify the landed byte count so a short write is loud, not silent."""
+    import base64 as _b64
     import shlex as _shlex
 
-    write_cmd = f"mkdir -p \"$(dirname {_shlex.quote(remote)})\" && cat > {_shlex.quote(remote)}"
-    chan = cli.get_transport().open_session()
-    chan.set_combine_stderr(True)
-    chan.exec_command(f"bash -c {_shlex.quote(write_cmd)}")
-    chan.sendall(data)
-    chan.shutdown_write()
-    out = b""
-    while not chan.exit_status_ready() or chan.recv_ready():
-        if chan.recv_ready():
-            out += chan.recv(8192)
-        else:
-            time.sleep(0.05)
-    rc = chan.recv_exit_status()
-    if rc != 0:
+    b64 = _b64.b64encode(data).decode("ascii")
+    rq = _shlex.quote(remote)
+    # 60 KB of base64 per write keeps each argv well under Linux MAX_ARG_STRLEN
+    # (128 KB per single argument), with margin for the rest of the command.
+    CHUNK = 60_000
+    chunks = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)] or [""]
+    for idx, chunk in enumerate(chunks):
+        inner = (
+            (f"mkdir -p \"$(dirname {rq})\" && " if idx == 0 else "")
+            + f"printf %s {_shlex.quote(chunk)} | base64 -d {'>' if idx == 0 else '>>'} {rq}"
+        )
+        rc, out = _ssh_exec_out(cli, f"bash -c {_shlex.quote(inner)}")
+        if rc != 0:
+            raise RuntimeError(
+                f"remote write of {remote} failed (chunk {idx + 1}/{len(chunks)}, "
+                f"rc={rc}): {out.strip()}"
+            )
+    # Verify the whole payload landed — a silent short write is exactly what made
+    # the old raw-stdin path fail untar with rc=2.
+    rc, out = _ssh_exec_out(cli, f"wc -c < {rq}")
+    got = out.strip()
+    if rc == 0 and got.isdigit() and int(got) != len(data):
         raise RuntimeError(
-            f"remote write of {remote} failed (rc={rc}): {out.decode('utf-8', 'replace').strip()}"
+            f"remote write of {remote} truncated: {got} of {len(data)} bytes landed"
         )
 
 
@@ -500,19 +515,31 @@ def _ssh_put_dir_tar(cli, local_dir: str, remote_dir: str) -> None:
         base = os.path.basename(ti.name)
         if base == "__pycache__" or base.endswith((".pyc", ".pyo")):
             return None
+        # Neutralize ownership: the local (macOS) uid/gid don't exist on the pod,
+        # and GNU tar extracting as root tries to chown the files to them →
+        # "Cannot change ownership … Invalid argument" → rc=2. Owned-by-root (0:0)
+        # archive + --no-same-owner below = portable extraction anywhere.
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
         return ti
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         tar.add(local_dir, arcname=".", filter=_filter)
     _ssh_put_bytes(cli, buf.getvalue(), "/tmp/_sgpu_ship.tar.gz")
-    rc = _ssh_exec(
+    rc, out = _ssh_exec_out(
         cli,
+        # --no-same-owner: don't restore archived ownership (we run as root on the
+        # pod; a chown to a nonexistent uid is a hard rc=2 even though the file
+        # content extracts fine).
         f"mkdir -p {_shlex.quote(remote_dir)} && "
-        f"tar -xzf /tmp/_sgpu_ship.tar.gz -C {_shlex.quote(remote_dir)} && rm -f /tmp/_sgpu_ship.tar.gz",
+        f"tar --no-same-owner -xzf /tmp/_sgpu_ship.tar.gz -C {_shlex.quote(remote_dir)} && rm -f /tmp/_sgpu_ship.tar.gz",
     )
     if rc != 0:
-        raise RuntimeError(f"failed to ship/untar {local_dir} → {remote_dir} (rc={rc})")
+        # Surface tar/gzip's own stderr — an opaque rc=2 was undebuggable.
+        raise RuntimeError(
+            f"failed to ship/untar {local_dir} → {remote_dir} (rc={rc}): {out.strip()[:500]}"
+        )
 
 
 def _render_env_exports(env: dict) -> str:
@@ -538,6 +565,24 @@ def _ssh_exec(cli, command: str) -> int:
     chan = cli.get_transport().open_session()
     chan.exec_command(command)
     return chan.recv_exit_status()
+
+
+def _ssh_exec_out(cli, command: str) -> tuple[int, str]:
+    """Run a one-shot command; return (exit_status, combined stdout+stderr).
+    Drains the channel to EOF *before* reading the exit status — the safe pattern.
+    (The recv_ready()/exit_status_ready() poll used elsewhere can stop before a
+    large buffered reply is fully read; see _ssh_run_stream's docstring.) Lets
+    callers surface a remote command's error text instead of just an opaque rc."""
+    chan = cli.get_transport().open_session()
+    chan.set_combine_stderr(True)
+    chan.exec_command(command)
+    buf = b""
+    while True:
+        chunk = chan.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    return chan.recv_exit_status(), buf.decode("utf-8", "replace")
 
 
 def _ssh_run_stream(cli, command: str, on_line) -> int:
@@ -832,8 +877,16 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
         owner_id = row.owner_id
         run_name = row.name or run_id
         storage_id = row.storage_id
-    if prov is None or prov.kind != "vm":
-        await _push_log(redis, run_id, "[gateway] label export needs a VM provider (skipped)")
+    # Where to synthesize: an explicit Run-on target chosen in the export tab —
+    # "vm" (a registered VM provider) or "cloud" (a fresh RunPod pod) — else the
+    # run's own VM (back-compat for the auto post-train export).
+    run_on = (cfg.get("label_run_on") or "").strip().lower()
+    exp_provider_id = (cfg.get("label_provider_id") or "").strip() or None
+    if not run_on and (prov is None or prov.kind != "vm"):
+        await _push_log(redis, run_id,
+                        "[gateway] label export needs a VM provider or a Run-on target (skipped)")
+        await _set_label_export_state(run_id, {"status": "failed",
+                                               "error": "no VM provider — pick a Run-on target (VM or cloud)"})
         return
 
     creds = _s3_creds_from_storage(storage)
@@ -870,15 +923,62 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
     upload_prefix = (f"{sp}/training-runs/{run_id}/tts-label" if sp
                      else f"training-runs/{run_id}/tts-label")
 
-    ssh = await _resolve_run_ssh(row)
-    if ssh is None:
-        await _push_log(redis, run_id, "[gateway] label export: can't reach the run's VM (skipped)")
-        await _set_label_export_state(run_id, {"status": "failed", "error": "can't reach the run's VM"})
-        return
-
-    # Mark the export in-flight so the UI shows "exporting to Label" instead of the
-    # run's terminal "done" status until it finishes (or fails).
+    # Mark in-flight up front (cloud provisioning takes minutes) so the UI shows
+    # "exporting to Label" instead of the run's terminal "done" the whole time.
     await _set_label_export_state(run_id, {"status": "running"})
+    # CUDA pin for the synthesis (Run-on → CUDA_VISIBLE_DEVICES), else all GPUs.
+    gpu_for_synth = (cfg.get("label_visible_devices") or "").strip() or "auto"
+    # A pod we spawn for the "cloud" target → (api_key, runpod_id) to tear down after.
+    spawned: Optional[tuple[str, str]] = None
+    try:
+        if run_on == "cloud":
+            api_key = await compute._resolve_api_key(exp_provider_id)
+            key_filename, pub = _gen_ssh_key(_work_dir(run_id))
+            gpu_type = cfg.get("label_gpu_type") or "NVIDIA L40S"
+            gpu_count = max(1, int(cfg.get("label_gpu_count") or 1))
+            await _push_log(redis, run_id,
+                            f"[gateway] label export: provisioning RunPod pod ({gpu_type} x{gpu_count}) …")
+            runpod_id, host, port, _cost = await _provision_pod(
+                api_key, f"sgpu-label-{run_id}", cfg.get("image") or DEFAULT_IMAGE,
+                gpu_type, gpu_count, bool(cfg.get("label_secure_cloud", True)),
+                int(cfg.get("label_disk_gb", 60)), int(cfg.get("label_volume_gb", 80)), pub)
+            spawned = (api_key, runpod_id)
+            await _push_log(redis, run_id,
+                            "[gateway] label export: installing the TTS stack on the pod (first build is slow) …")
+            await asyncio.to_thread(_label_build_tts_venv_ssh, host, int(port), "root", key_filename, run_id, dict(cfg))
+            ssh = (host, int(port), "root", key_filename)
+        elif run_on == "vm":
+            vm_prov = prov
+            if exp_provider_id and (prov is None or prov.id != exp_provider_id):
+                async with session_factory()() as s:
+                    vm_prov = await s.get(Provider, exp_provider_id)
+            if vm_prov is None or vm_prov.kind != "vm":
+                await _set_label_export_state(run_id, {"status": "failed", "error": "chosen VM provider not found"})
+                return
+            ssh = await _resolve_provider_ssh(vm_prov, run_id)
+            if ssh is None:
+                await _push_log(redis, run_id, "[gateway] label export: can't reach the chosen VM (skipped)")
+                await _set_label_export_state(run_id, {"status": "failed", "error": "can't reach the chosen VM"})
+                return
+        else:
+            ssh = await _resolve_run_ssh(row)
+            if ssh is None:
+                await _push_log(redis, run_id, "[gateway] label export: can't reach the run's VM (skipped)")
+                await _set_label_export_state(run_id, {"status": "failed", "error": "can't reach the run's VM"})
+                return
+    except asyncio.CancelledError:
+        if spawned:
+            await _terminate_pod(*spawned)
+        raise
+    except Exception as e:  # noqa: BLE001
+        if spawned:
+            try:
+                await _terminate_pod(*spawned)
+            except Exception:  # noqa: BLE001
+                pass
+        await _push_log(redis, run_id, f"[gateway] label export: provisioning failed: {e}")
+        await _set_label_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
+        return
     # Stream the VM-side synthesis/upload log to the run's logs (the script runs in a
     # thread; it appends lines to this buffer and an async pump mirrors them to Redis,
     # the same decoupling run_training uses) — so a multi-minute synth isn't silent.
@@ -897,7 +997,7 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
         await _push_log(redis, run_id, f"[gateway] label export: synthesizing {n} clips ({source_desc}) …")
         manifest = await asyncio.to_thread(
             _run_tts_label_export_ssh, *ssh, run_id, model_s3, creds, packed_uri, "",
-            is_random, n, speaker, creds["bucket"], upload_prefix, dict(cfg), "auto",
+            is_random, n, speaker, creds["bucket"], upload_prefix, dict(cfg), gpu_for_synth,
             export_lines.append,
         )
         items = manifest.get("items") or []
@@ -909,13 +1009,18 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
         # ---- Label platform: create project → storage → MOS → tasks ----
         import httpx
 
-        proj_name = (cfg.get("label_project_name") or f"{run_name}-eval")[:200]
+        base_name = (cfg.get("label_project_name") or f"{run_name}-eval")
         axes = [a for a in (cfg.get("label_mos_axes") or []) if a] or ["Naturalness", "Intelligibility", "Noise"]
         headers = {"Authorization": f"Bearer {token}"}
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as cli:
+
+        async def _make_one(cli, group: list[dict], proj_name: str, speaker: str) -> dict:
+            """Create a recording+MOS project, configure its S3 storage, seed it with
+            `group`'s clips as tasks, and round-trip a kind=label dataset. Returns the
+            result_json card. `speaker` ("" for the combined project) tags both."""
             r = await cli.post(f"{base_url}/api/projects", headers=headers, json={
                 "name": proj_name, "type": "recording",
-                "description": f"Autotrain TTS eval — {run_name} ({run_id})",
+                "description": (f"Autotrain TTS eval — {run_name} ({run_id})"
+                                + (f" · speaker {speaker}" if speaker else "")),
             })
             r.raise_for_status()
             pid = ((r.json() or {}).get("project") or {}).get("id")
@@ -931,44 +1036,85 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
                                 json={"mos_enabled": True, "mos_axes": axes})
             r.raise_for_status()
             tasks = [{"transcription": it.get("text") or "", "audio_filename": it.get("key") or ""}
-                     for it in items if it.get("key")]
+                     for it in group if it.get("key")]
             r = await cli.post(f"{base_url}/api/projects/{pid}/tasks", headers=headers, json={"tasks": tasks})
             r.raise_for_status()
 
-        # Round-trip: a kind=label dataset pointing at the new project + stamp the run.
-        label_ds_id = "ds-" + os.urandom(4).hex()
+            # Round-trip: a kind=label dataset pointing at the new project.
+            label_ds_id = "ds-" + os.urandom(4).hex()
+            async with session_factory()() as s:
+                s.add(Dataset(
+                    id=label_ds_id, owner_id=owner_id,
+                    name=(f"{run_name}-tts-eval-labels" + (f" ({speaker})" if speaker else ""))[:255],
+                    description=(f"Human MOS / recording labels for autotrain TTS run {run_id}"
+                                 + (f" — speaker {speaker}" if speaker else ""))[:2048],
+                    kind="label", storage_id=storage_id,
+                    label_base_url=base_url, label_project_id=pid,
+                    # Reference the Secrets key when one was used (no token copy); else store
+                    # the resolved token Fernet-encrypted, like the datasets create path.
+                    label_token_secret=(tok_secret or None),
+                    label_token_enc=(None if tok_secret else crypto.encrypt(json.dumps({"token": token}))),
+                    label_status="approved",
+                    audio_field="audio_url", transcription_field="transcription",
+                ))
+                await s.commit()
+            await _push_log(
+                redis, run_id,
+                f"[gateway] label project created{f' [{speaker}]' if speaker else ''}: "
+                f"{base_url}/dashboard/projects/{pid} ({len(tasks)} clips) + dataset {label_ds_id}")
+            return {
+                "id": pid, "url": f"{base_url}/dashboard/projects/{pid}",
+                "count": len(tasks), "dataset_id": label_ds_id, "project_name": proj_name,
+                **({"speaker": speaker} if speaker else {}),
+            }
+
+        # One project per speaker (each seeded from that speaker's own clips) when
+        # per-speaker is on + speakers are named; otherwise a single combined project.
+        speakers_cfg = [str(s).strip() for s in (cfg.get("label_speakers") or []) if str(s).strip()]
+        per_speaker = bool(cfg.get("label_per_speaker")) and bool(speakers_cfg)
+        cards: list[dict] = []
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as cli:
+            if per_speaker:
+                from collections import defaultdict
+                by_spk: dict[str, list[dict]] = defaultdict(list)
+                for it in items:
+                    by_spk[(it.get("speaker") or "").strip()].append(it)
+                for spk in speakers_cfg:
+                    grp = by_spk.get(spk) or []
+                    if not grp:
+                        await _push_log(redis, run_id,
+                                        f"[gateway] label export: no clips for speaker {spk!r} — skipped")
+                        continue
+                    cards.append(await _make_one(cli, grp, f"{base_name} — {spk}"[:200], spk))
+                if not cards:
+                    await _set_label_export_state(run_id, {"status": "failed",
+                                                           "error": "no clips matched the named speakers"})
+                    return
+            else:
+                cards.append(await _make_one(cli, items, base_name[:200], ""))
+
+        # Stamp the run: label_projects (all) + label_project (first, for older UIs).
         async with session_factory()() as s:
-            s.add(Dataset(
-                id=label_ds_id, owner_id=owner_id,
-                name=(f"{run_name}-tts-eval-labels")[:255],
-                description=(f"Human MOS / recording labels for autotrain TTS run {run_id}")[:2048],
-                kind="label", storage_id=storage_id,
-                label_base_url=base_url, label_project_id=pid,
-                # Reference the Secrets key when one was used (no token copy); else store
-                # the resolved token Fernet-encrypted, like the datasets create path.
-                label_token_secret=(tok_secret or None),
-                label_token_enc=(None if tok_secret else crypto.encrypt(json.dumps({"token": token}))),
-                label_status="approved",
-                audio_field="audio_url", transcription_field="transcription",
-            ))
             run2 = await s.get(TrainingRun, run_id)
             if run2 is not None:
                 rj = dict(run2.result_json or {})
-                rj["label_project"] = {
-                    "id": pid, "url": f"{base_url}/dashboard/projects/{pid}",
-                    "count": len(tasks), "dataset_id": label_ds_id, "project_name": proj_name,
-                }
+                rj["label_projects"] = cards
+                rj["label_project"] = cards[0] if cards else None
                 rj["label_export"] = {"status": "done"}
                 run2.result_json = rj
             await s.commit()
-        await _push_log(
-            redis, run_id,
-            f"[gateway] label project created: {base_url}/dashboard/projects/{pid} "
-            f"({len(tasks)} clips) + dataset {label_ds_id}")
     except Exception as e:  # noqa: BLE001 — record the failure, then re-raise so the caller logs it
         await _set_label_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
         raise
     finally:
+        # Tear down a pod we spawned for the "cloud" target so it can't bill on
+        # past the synthesis (best-effort; mirrors _provision_pod's self-cleanup).
+        if spawned:
+            try:
+                await _terminate_pod(*spawned)
+                await _push_log(redis, run_id, "[gateway] label export: cloud pod torn down")
+            except Exception:  # noqa: BLE001
+                logger.warning("label export %s: pod teardown failed", run_id)
         pump_task.cancel()
         try:
             await pump_task
@@ -1959,6 +2105,13 @@ class CreateTrainingRunRequest(BaseModel):
     label_speakers: list[str] = []
     # Prefix each Label task's transcription with the speaker name ("spk: text").
     label_speaker_prefix: bool = False
+    # Drop text samples whose transcript contains any of these phrases (case-
+    # insensitive, whitespace-collapsed — so "E M G S" matches any spacing).
+    label_reject_keywords: list[str] = []
+    # With label_speakers: make a SEPARATE Label project per speaker, each seeded
+    # only from that speaker's own clips (label_samples is then per speaker). Else
+    # the speakers are round-robin'd into one combined project.
+    label_per_speaker: bool = False
     precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
@@ -2312,6 +2465,8 @@ async def create_training_run(
         "label_mos_axes": [a.strip() for a in (body.label_mos_axes or []) if str(a).strip()],
         "label_speakers": [str(s).strip() for s in (body.label_speakers or []) if str(s).strip()],
         "label_speaker_prefix": bool(body.label_speaker_prefix),
+        "label_reject_keywords": [str(k).strip() for k in (body.label_reject_keywords or []) if str(k).strip()],
+        "label_per_speaker": bool(body.label_per_speaker),
         "precision": body.precision, "language": body.language, "task": body.task,
         "base_model": body.base_model,
         # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab
@@ -2459,6 +2614,20 @@ class LabelExportRequest(BaseModel):
     mos_axes: Optional[list[str]] = None
     speakers: Optional[list[str]] = None  # balance clips across these speaker names
     speaker_prefix: Optional[bool] = None  # prefix transcription with the speaker name
+    reject_keywords: Optional[list[str]] = None  # drop text samples containing these phrases
+    per_speaker: Optional[bool] = None    # one project per speaker (from each speaker's own clips)
+    # Run-on target for the synthesis (mirrors serverless/new). "vm" → a registered
+    # VM provider; "cloud" → spawn a fresh RunPod pod (provision → synth → teardown).
+    # Absent → the run's own VM (back-compat).
+    run_on: Optional[str] = None
+    provider_id: Optional[str] = None     # vm provider (run_on=vm) or RunPod account (run_on=cloud)
+    gpu_type: Optional[str] = None         # run_on=cloud
+    gpu_count: Optional[int] = None        # run_on=cloud
+    secure_cloud: Optional[bool] = None    # run_on=cloud
+    disk_gb: Optional[int] = None          # run_on=cloud
+    volume_gb: Optional[int] = None        # run_on=cloud
+    visible_devices: Optional[str] = None  # CUDA_VISIBLE_DEVICES pin for the synth
+    venv_path: Optional[str] = None        # TTS uv venv on the box (default /share/autotrain-tts)
 
 
 @router.post("/{run_id}/label-export")
@@ -2473,7 +2642,8 @@ async def retry_label_export(
     from the trained model + create/seed a recording+MOS project. Used when the run
     finished without label creds, or to re-export. Runs in the background (synthesis
     over SSH takes minutes) — progress streams to the run's logs and the
-    result_json.label_project card appears when done. VM-provider runs only."""
+    result_json.label_project card appears when done. Runs on the chosen Run-on
+    target: a registered VM provider, or a fresh RunPod pod (spawned + torn down)."""
     row = await _owned(run_id, user, session)
     if (row.task_type or "asr") != "tts":
         raise HTTPException(status_code=400, detail="label export is for TTS runs")
@@ -2481,10 +2651,26 @@ async def retry_label_export(
         raise HTTPException(status_code=400, detail="the run must finish successfully first")
     if not (((row.result_json or {}).get("artifact") or {}).get("s3_uri")):
         raise HTTPException(status_code=400, detail="no trained model artifact for this run")
-    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
-    if prov is None or prov.kind != "vm":
-        raise HTTPException(status_code=400, detail=("label export runs on a VM provider; this run "
-                            "used a cloud pod (gone after training). Re-run on a VM."))
+    # Validate the chosen Run-on target (mirrors serverless/new). Absent → fall back
+    # to the run's own VM (back-compat), which must then be a live VM provider.
+    run_on = (body.run_on or "").strip().lower()
+    exp_provider_id = (body.provider_id or "").strip() or None
+    if run_on == "cloud":
+        if exp_provider_id:
+            p = await session.get(Provider, exp_provider_id)
+            if p is None or p.kind != "runpod":
+                raise HTTPException(status_code=400, detail="provider_id must be a RunPod account for cloud export")
+    elif run_on == "vm":
+        vm_id = exp_provider_id or row.provider_id
+        p = await session.get(Provider, vm_id) if vm_id else None
+        if p is None or p.kind != "vm":
+            raise HTTPException(status_code=400, detail="pick a registered VM provider for a bare-metal export")
+        exp_provider_id = vm_id
+    else:
+        prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+        if prov is None or prov.kind != "vm":
+            raise HTTPException(status_code=400, detail=("label export runs on a VM provider; this run used a "
+                                "cloud pod (gone after training). Pick a Run-on target (VM or cloud)."))
     # A previous export still in flight (possibly stuck on a slow synth)? Cancel it
     # and start fresh — re-clicking "Export to Label" supersedes it. The cancelled
     # task's project-creation step never runs, so no duplicate project is created
@@ -2516,6 +2702,27 @@ async def retry_label_export(
         cfg["label_speakers"] = [s.strip() for s in body.speakers if str(s).strip()]
     if body.speaker_prefix is not None:
         cfg["label_speaker_prefix"] = bool(body.speaker_prefix)
+    if body.reject_keywords is not None:
+        cfg["label_reject_keywords"] = [k.strip() for k in body.reject_keywords if str(k).strip()]
+    if body.per_speaker is not None:
+        cfg["label_per_speaker"] = bool(body.per_speaker)
+    # Run-on target (where to synthesize) + the cloud pod spec.
+    cfg["label_run_on"] = run_on or None
+    cfg["label_provider_id"] = exp_provider_id
+    if body.gpu_type is not None:
+        cfg["label_gpu_type"] = body.gpu_type.strip() or None
+    if body.gpu_count is not None:
+        cfg["label_gpu_count"] = max(1, int(body.gpu_count))
+    if body.secure_cloud is not None:
+        cfg["label_secure_cloud"] = bool(body.secure_cloud)
+    if body.disk_gb is not None:
+        cfg["label_disk_gb"] = max(20, int(body.disk_gb))
+    if body.volume_gb is not None:
+        cfg["label_volume_gb"] = max(0, int(body.volume_gb))
+    if body.visible_devices is not None:
+        cfg["label_visible_devices"] = body.visible_devices.strip() or None
+    if body.venv_path is not None:
+        cfg["venv_path"] = body.venv_path.strip() or cfg.get("venv_path")
     cfg["label_export"] = True
 
     has_url = bool((cfg.get("label_base_url_secret") or "").strip() or (cfg.get("label_base_url") or "").strip())
@@ -2533,7 +2740,10 @@ async def retry_label_export(
             merged = dict(r2.config_json or {})
             for k in ("label_export", "label_base_url", "label_base_url_secret",
                       "label_token_secret", "label_token_enc", "label_project_name",
-                      "label_samples", "label_mos_axes", "label_speakers", "label_speaker_prefix"):
+                      "label_samples", "label_mos_axes", "label_speakers", "label_speaker_prefix",
+                      "label_reject_keywords", "label_per_speaker", "label_run_on", "label_provider_id",
+                      "label_gpu_type", "label_gpu_count", "label_secure_cloud", "label_disk_gb",
+                      "label_volume_gb", "label_visible_devices", "venv_path"):
                 merged[k] = cfg.get(k)
             r2.config_json = merged
             await s.commit()
@@ -3114,6 +3324,27 @@ def _run_gpu_id_csv(row: TrainingRun) -> Optional[str]:
     return None
 
 
+async def _runpod_pod_ssh(
+    run_id: str, provider_id: Optional[str], pod_id: Optional[str], key_name: str = "id_ed25519",
+) -> Optional[tuple[str, int, str, str]]:
+    """(host, port, "root", key_filename) for a live RunPod pod, reusing the
+    ephemeral key minted at provision. None if pod / SSH / key is unresolvable.
+    Shared by the run's training pod (_resolve_run_ssh) and a fresh try-it pod."""
+    if not pod_id:
+        return None
+    try:
+        api_key = await compute._resolve_api_key(provider_id)
+        async with compute._client(api_key=api_key) as cli:
+            pr = await cli.get(f"/pods/{pod_id}")
+        ip, port = compute._extract_ssh(pr.json() or {})
+    except Exception:
+        return None
+    key = str(_work_dir(run_id) / key_name)
+    if not ip or not port or not Path(key).exists():
+        return None
+    return ip, int(port), "root", key
+
+
 async def _resolve_run_ssh(row: TrainingRun) -> Optional[tuple[str, int, str, str]]:
     """(host, port, user, key_filename) for the run's box — VM provider or the
     RunPod pod — reusing the ephemeral key minted at launch. None if unresolvable."""
@@ -3132,20 +3363,80 @@ async def _resolve_run_ssh(row: TrainingRun) -> Optional[tuple[str, int, str, st
             Path(key).write_text(crypto.decrypt(enc))
             os.chmod(key, 0o600)
         return pc.get("host"), int(pc.get("port") or 22), pc.get("user") or "root", key
-    # RunPod pod
-    if not row.runpod_pod_id:
+    # RunPod pod (the run's training pod)
+    return await _runpod_pod_ssh(row.id, row.provider_id, row.runpod_pod_id)
+
+
+async def _resolve_tryit_ssh(row: TrainingRun) -> Optional[tuple[str, int, str, str]]:
+    """SSH coords for the run's *try-it* compute, which (unlike _resolve_run_ssh) may
+    be a target the user chose at load time — decoupled from where the run trained:
+    a fresh RunPod pod (cloud) or any registered VM provider (vm). Falls back to the
+    run's own box when no try-it target is set (legacy cloud-ASR / VM-trained runs)."""
+    ti = _tryit_state(row)
+    target = ti.get("target")
+    if not target:
+        return await _resolve_run_ssh(row)
+    if target == "vm":
+        async with session_factory()() as s:
+            prov = await s.get(Provider, ti.get("provider_id"))
+        if prov is None:
+            return None
+        return await _resolve_provider_ssh(prov, row.id)
+    if target == "cloud":
+        # pod_id + the RunPod account live in try-it state — NOT row.runpod_pod_id.
+        return await _runpod_pod_ssh(row.id, ti.get("provider_id"), ti.get("pod_id"))
+    return None
+
+
+async def _resolve_provider_ssh(prov: Provider, run_id: str) -> Optional[tuple[str, int, str, str]]:
+    """(host, port, user, key_filename) for an ARBITRARY registered VM provider — the
+    same shape `_resolve_run_ssh` returns, but for a VM the export was explicitly
+    routed to (Run-on → Bare metal) rather than the run's own box. Decrypts the
+    provider's stored private key into the run's scratch dir. None if unconfigured."""
+    if prov.kind != "vm":
         return None
+    pc = prov.config or {}
+    enc = pc.get("private_key_enc")
+    if not enc:
+        return None
+    key = str(_work_dir(run_id) / "label_vm_key")
+    Path(key).write_text(crypto.decrypt(enc))
+    os.chmod(key, 0o600)
+    return pc.get("host"), int(pc.get("port") or 22), pc.get("user") or "root", key
+
+
+def _label_build_tts_venv_ssh(host: str, port: int, user: str, key_filename: str,
+                              run_id: str, cfg: dict) -> None:
+    """On a freshly-spawned pod: ship tts_finetune.py + run `--deps-only` (reusing the
+    training path's uv bootstrap) to build the TTS venv the export's synthesis needs.
+    Blocking — call via to_thread. Mirrors `_tryit_build_venv_ssh` (the ASR twin)."""
+    import tempfile
+    cli = _ssh_connect(host, int(port), user, key_filename)
     try:
-        api_key = await compute._resolve_api_key(row.provider_id)
-        async with compute._client(api_key=api_key) as cli:
-            pr = await cli.get(f"/pods/{row.runpod_pod_id}")
-        ip, port = compute._extract_ssh(pr.json() or {})
-    except Exception:
-        return None
-    key = str(work / "id_ed25519")
-    if not ip or not port or not Path(key).exists():
-        return None
-    return ip, int(port), "root", key
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        _ssh_put(cli, str(base / "tts_finetune.py"), "/tmp/sgpu_label_tts.py")
+        dconf = {"venv_path": (cfg.get("venv_path") or "/share/autotrain-tts").rstrip("/"),
+                 "work_dir": (cfg.get("work_dir") or "/share").rstrip("/")}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(dconf)); local = f.name
+        try:
+            _ssh_put(cli, local, "/tmp/sgpu_label_deps.json")
+        finally:
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        deps_cmd = (f"{user_env}{_UV_BOOTSTRAP}"
+                    "python -u /tmp/sgpu_label_tts.py --deps-only --config /tmp/sgpu_label_deps.json")
+        rc = _ssh_run_stream(cli, deps_cmd, lambda _l: None)
+        if rc != 0:
+            raise RuntimeError(f"TTS deps install failed on the label-export pod (rc={rc})")
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------- cloud try-it pod (ASR): a finished RunPod-cloud run's training pod is
@@ -3178,26 +3469,34 @@ async def _tryit_save(run_id: str, **fields) -> None:
         ti.update(fields)
         rj["tryit"] = ti
         row.result_json = rj
-        if fields.get("pod_id"):
-            row.runpod_pod_id = fields["pod_id"]   # so _resolve_run_ssh finds the live pod
+        # NB: the try-it pod id lives ONLY in tryit state (resolved by
+        # _resolve_tryit_ssh) — we do NOT touch row.runpod_pod_id, which is the
+        # run's training-pod metadata (overwriting it conflated two lifecycles).
         await s.commit()
 
 
 async def _tryit_teardown(run_id: str) -> None:
-    """Terminate the try-it pod (if any) and clear the state. Idempotent + best-effort."""
+    """Terminate the try-it pod (if any) and clear the state. Idempotent + best-effort.
+    Cloud target → terminate the RunPod pod; VM target → SIGTERM the persistent worker
+    on the chosen VM (frees its GPU). Leaves row.runpod_pod_id (training metadata) alone."""
     task = _tryit_tasks.pop(run_id, None)
     if task is not None and not task.done():
         task.cancel()
+    vm_provider_id = None
+    cfg: dict = {}
     async with session_factory()() as s:
         row = await s.get(TrainingRun, run_id)
         if row is None:
             return
         ti = dict((row.result_json or {}).get("tryit") or {})
         pod_id, prov = ti.get("pod_id"), ti.get("provider_id")
+        target, kind = ti.get("target"), (ti.get("kind") or row.task_type or "asr")
+        if target == "vm":
+            vm_provider_id = prov
+            cfg = dict(row.config_json or {})
         rj = dict(row.result_json or {})
         rj.pop("tryit", None)
         row.result_json = rj
-        row.runpod_pod_id = None
         await s.commit()
     if pod_id:
         try:
@@ -3205,6 +3504,16 @@ async def _tryit_teardown(run_id: str) -> None:
             await _terminate_pod(api_key, pod_id)
         except Exception as e:  # noqa: BLE001
             logger.warning("try-it pod %s teardown failed: %s", pod_id, e)
+    elif vm_provider_id:
+        # VM target: stop the resident worker on the chosen VM so it doesn't hold the GPU.
+        try:
+            async with session_factory()() as s:
+                vprov = await s.get(Provider, vm_provider_id)
+            ssh = await _resolve_provider_ssh(vprov, run_id) if vprov else None
+            if ssh:
+                await asyncio.to_thread(_playground_stop_ssh, *ssh, run_id, cfg, kind)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("try-it VM worker teardown failed for %s: %s", run_id, e)
 
 
 def _tryit_build_venv_ssh(host: str, port: int, user: str, key_filename: str,
@@ -3239,33 +3548,39 @@ def _tryit_build_venv_ssh(host: str, port: int, user: str, key_filename: str,
             pass
 
 
-async def _tryit_cloud_setup(run_id: str, gpu: str) -> None:
-    """Provision a fresh pod for a cloud run's ASR try-it, build the venv, keep warm.
-    Updates result_json['tryit'].phase as it goes; tears the pod down on failure so a
-    half-provisioned pod can't leak (mirrors _provision_pod's own self-cleanup)."""
+async def _tryit_cloud_setup(run_id: str, *, gpu_type: str, gpu_count: int, cloud_type: str,
+                             provider_id: Optional[str], kind: str) -> None:
+    """Provision a fresh pod for a cloud try-it (ASR or TTS) on the chosen GPU /
+    account, build the right venv, and keep it warm. Updates result_json['tryit']
+    .phase as it goes; tears the pod down on failure so a half-provisioned pod can't
+    leak. The pod id lives in tryit state (resolved by _resolve_tryit_ssh)."""
     pod_id = None
-    provider_id = None
     try:
         async with session_factory()() as s:
             row = await s.get(TrainingRun, run_id)
             cfg = dict(row.config_json or {})
-            provider_id = row.provider_id
-            gpu_type = row.gpu_type or "NVIDIA L40S"
-        await _tryit_save(run_id, phase="provisioning", provider_id=provider_id,
-                          message="starting a GPU pod …", expires_at=_tryit_exp())
+        await _tryit_save(run_id, target="cloud", provider_id=provider_id, kind=kind,
+                          gpu_type=gpu_type, gpu_count=gpu_count, cloud_type=cloud_type,
+                          phase="provisioning", message="starting a GPU pod …", expires_at=_tryit_exp())
         api_key = await compute._resolve_api_key(provider_id)
         key_filename, pub = _gen_ssh_key(_work_dir(run_id))
         runpod_id, host, port, _cost = await _provision_pod(
             api_key, f"sgpu-tryit-{run_id}", cfg.get("image") or DEFAULT_IMAGE,
-            gpu_type, 1, bool(cfg.get("secure_cloud", True)),
+            gpu_type, max(1, int(gpu_count)), (cloud_type or "SECURE") == "SECURE",
             int(cfg.get("disk_gb", 60)), int(cfg.get("volume_gb", 80)), pub,
         )
         pod_id = runpod_id
+        stack = "TTS stack (torch + neucodec)" if kind == "tts" else "Whisper stack (torch + fasttext)"
         await _tryit_save(run_id, pod_id=runpod_id, phase="installing",
-                          message="installing the Whisper stack (torch + fasttext) — first load ~10 min …",
+                          message=f"installing the {stack} — first load ~10 min …",
                           expires_at=_tryit_exp())
-        await asyncio.to_thread(_tryit_build_venv_ssh, host, int(port), "root", key_filename, run_id, cfg)
-        await _tryit_save(run_id, phase="ready", message="ready — upload a clip and transcribe",
+        # TTS reuses the label-export TTS venv bootstrap (ships tts_finetune.py +
+        # --deps-only); ASR builds the Whisper venv. Same (host,port,user,key,run_id,cfg) shape.
+        build = _label_build_tts_venv_ssh if kind == "tts" else _tryit_build_venv_ssh
+        await asyncio.to_thread(build, host, int(port), "root", key_filename, run_id, cfg)
+        await _tryit_save(run_id, phase="ready",
+                          message=("ready — type text and synthesize" if kind == "tts"
+                                   else "ready — upload a clip and transcribe"),
                           expires_at=_tryit_exp())
     except asyncio.CancelledError:
         await _tryit_teardown(run_id)
@@ -3279,24 +3594,19 @@ async def _tryit_cloud_setup(run_id: str, gpu: str) -> None:
                 pass
         await _tryit_save(run_id, phase="error", pod_id=None,
                           message=f"try-it setup failed: {str(e)[:280]}")
-        async with session_factory()() as s:
-            row = await s.get(TrainingRun, run_id)
-            if row is not None:
-                row.runpod_pod_id = None
-                await s.commit()
     finally:
         _tryit_tasks.pop(run_id, None)
 
 
 def _tryit_status(row) -> "PlaygroundStatus":
-    """Map a cloud run's try-it state → the PlaygroundStatus the UI polls."""
+    """Map a cloud try-it pod's state → the PlaygroundStatus the UI polls."""
     ti = _tryit_state(row)
     phase = ti.get("phase")
     msg = ti.get("message") or ""
     return PlaygroundStatus(
         running=phase in ("provisioning", "installing", "ready"),
         ready=(phase == "ready"),
-        kind="asr",
+        kind=ti.get("kind") or (getattr(row, "task_type", None) or "asr"),
         logs=([f"[try-it] {msg}"] if msg else []),
     )
 
@@ -4026,6 +4336,11 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
             "label_speakers": [str(s).strip() for s in (cfg.get("label_speakers") or []) if str(s).strip()],
             # Prefix each task's transcription with the speaker name ("spk: text").
             "label_speaker_prefix": bool(cfg.get("label_speaker_prefix")),
+            # Drop text samples containing any of these phrases (case-insensitive).
+            "reject_keywords": [str(k).strip() for k in (cfg.get("label_reject_keywords") or []) if str(k).strip()],
+            # true → N clips from EACH speaker's own utterances (gateway then makes
+            # one project per speaker); false → round-robin re-voicing into one project.
+            "per_speaker": bool(cfg.get("label_per_speaker")),
         }
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(tconf))
@@ -4297,10 +4612,10 @@ class PlaygroundStatus(BaseModel):
     logs: list[str] = []    # tail of the worker's load/serve log (for live load progress)
 
 
-async def _playground_ctx(run_id: str, user: User, session: AsyncSession):
-    """Validate + resolve everything the playground lifecycle needs: the run must
-    be a finished ASR/TTS run on a VM with a model artifact. Returns
-    (row, kind, model_s3, creds, ssh, cfg)."""
+async def _playground_validate(run_id: str, user: User, session: AsyncSession):
+    """Shared try-it validation: a finished ASR/TTS/LLM run with a model artifact.
+    Returns (row, kind, model_s3, creds, cfg) — provider/SSH resolution is the
+    caller's (the run's own box vs a chosen VM)."""
     row = await _owned(run_id, user, session)
     kind = (row.task_type or "asr").lower()
     if kind not in ("asr", "tts", "llm"):
@@ -4310,23 +4625,55 @@ async def _playground_ctx(run_id: str, user: User, session: AsyncSession):
     model_s3 = ((row.result_json or {}).get("artifact") or {}).get("s3_uri")
     if not model_s3:
         raise HTTPException(status_code=400, detail="no trained model artifact for this run")
+    storage = await session.get(Storage, row.storage_id) if row.storage_id else None
+    creds = _s3_creds_from_storage(storage)
+    return row, kind, model_s3, creds, dict(row.config_json or {})
+
+
+async def _playground_ctx(run_id: str, user: User, session: AsyncSession):
+    """Persistent try-it on the run's OWN box (legacy default — must be a VM).
+    Returns (row, kind, model_s3, creds, ssh, cfg)."""
+    row, kind, model_s3, creds, cfg = await _playground_validate(run_id, user, session)
     prov = await session.get(Provider, row.provider_id) if row.provider_id else None
     if prov is None or prov.kind != "vm":
         raise HTTPException(status_code=400, detail="persistent try-it needs a VM provider")
-    storage = await session.get(Storage, row.storage_id) if row.storage_id else None
-    creds = _s3_creds_from_storage(storage)
     ssh = await _resolve_run_ssh(row)
     if ssh is None:
         raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
-    return row, kind, model_s3, creds, ssh, dict(row.config_json or {})
+    return row, kind, model_s3, creds, ssh, cfg
+
+
+async def _playground_ctx_for_target(run_id: str, user: User, session: AsyncSession,
+                                     *, vm_provider_id: Optional[str]):
+    """Persistent try-it on a CHOSEN VM provider (Run-on → Bare metal), which may
+    differ from where the run trained. Validates the provider is the caller's own
+    (or admin) and kind=vm. Returns (row, kind, model_s3, creds, ssh, cfg)."""
+    row, kind, model_s3, creds, cfg = await _playground_validate(run_id, user, session)
+    prov = await session.get(Provider, vm_provider_id) if vm_provider_id else None
+    if prov is None or prov.kind != "vm":
+        raise HTTPException(status_code=400, detail="pick a registered VM provider to run try-it on")
+    if prov.owner_id != user.id and not user.is_admin:
+        raise HTTPException(status_code=403, detail="that VM provider isn't yours")
+    ssh = await _resolve_provider_ssh(prov, run_id)
+    if ssh is None:
+        raise HTTPException(status_code=400, detail="can't reach the chosen VM (SSH coords / key unavailable)")
+    return row, kind, model_s3, creds, ssh, cfg
 
 
 @router.post("/{run_id}/playground/start", response_model=PlaygroundStatus)
 async def playground_start(
     run_id: str,
-    gpu: Optional[str] = Query(None, description="GPU index, 'cpu', or 'auto'"),
+    target: Optional[str] = Query(None,
+        description="'cloud' (spin up a fresh RunPod pod) or 'vm' (a registered VM provider). "
+                    "Omitted → derived from where the run trained (back-compat)."),
+    gpu: Optional[str] = Query(None,
+        description="VM target: GPU index, 'cpu', or 'auto' (LLM: a comma-list like '6,7'). Ignored for cloud."),
+    gpu_type: Optional[str] = Query(None, description="cloud target: GPU type to provision (e.g. 'L40S')."),
+    gpu_count: Optional[int] = Query(None, ge=1, le=8, description="cloud target: number of GPUs."),
+    cloud_type: Optional[str] = Query(None, description="cloud target: 'SECURE' or 'COMMUNITY'."),
+    provider_id: Optional[str] = Query(None, description="cloud: RunPod account; vm: the chosen VM provider."),
     idle_minutes: float = Query(5, ge=0, le=120,
-                                description="auto-unload after this many idle minutes (0 = never)"),
+                                description="VM target: auto-unload after this many idle minutes (0 = never)"),
     vllm_args: Optional[str] = Query(None,
         description="LLM only: extra vLLM serve CLI args, verbatim (e.g. '--enable-auto-tool-choice "
                     "--tool-call-parser hermes --max-model-len 32768'). Appended last so they override "
@@ -4334,36 +4681,67 @@ async def playground_start(
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Load the run's model into a persistent worker on its VM (served over a Unix
-    socket) so try-it requests skip the per-call model load. Returns immediately;
-    poll …/playground/status until ready. Auto-unloads after idle_minutes idle.
-
-    LLM (gemma-4) runs serve with vLLM (eager); `gpu` may be a comma-list (e.g. "6,7")
-    to pick the serve GPUs (TP = count), defaulting to the run's training pin:
-    download LoRA → merge → save → vLLM serve.
-
-    A finished ASR run on a CLOUD provider (training pod gone) instead spins up a
-    fresh, short-lived pod here: returns immediately with phase=provisioning, builds
-    the venv (~10 min), then phase=ready. Auto-tears-down after idle / on stop."""
+    """Load the run's model into a persistent worker so try-it requests skip the
+    per-call model load. The COMPUTE target is chosen here, decoupled from where the
+    run trained:
+      • cloud → spin up a fresh RunPod pod (gpu_type / gpu_count / cloud_type / account),
+        build the venv (ASR or TTS), keep it warm. Returns phase=provisioning→ready.
+      • vm    → load a persistent worker on the chosen (or the run's) VM provider.
+    Switching target/spec while one is loaded tears the old down first. Poll
+    …/playground/status until ready. LLM (gemma-4) is VM-only and serves via vLLM."""
     row0 = await _owned(run_id, user, session)
     prov0 = await session.get(Provider, row0.provider_id) if row0.provider_id else None
-    if (row0.task_type or "asr").lower() == "asr" and (prov0 is None or prov0.kind != "vm"):
+    kind0 = (row0.task_type or "asr").lower()
+    explicit = bool((target or "").strip())
+    eff_target = (target or "").strip().lower()
+    if eff_target not in ("cloud", "vm"):
+        eff_target = "vm" if (prov0 is not None and prov0.kind == "vm") else "cloud"
+    ti = _tryit_state(row0)
+    cur_target = ti.get("target")
+
+    if eff_target == "cloud":
+        if kind0 == "llm":
+            raise HTTPException(status_code=400,
+                detail="LLM try-it needs a VM (vLLM); cloud try-it supports ASR / TTS only")
         if row0.status != "done":
             raise HTTPException(status_code=400, detail="the run must finish training first")
         if not ((row0.result_json or {}).get("artifact") or {}).get("s3_uri"):
             raise HTTPException(status_code=400, detail="no trained model artifact for this run")
-        if _tryit_state(row0).get("phase") in ("provisioning", "installing", "ready"):
-            return _tryit_status(row0)   # already loading / loaded — idempotent
-        sel = (gpu or "").strip().lower()
-        if sel and sel not in ("cpu", "auto") and not sel.isdigit():
-            raise HTTPException(status_code=400, detail="gpu must be a GPU index, 'cpu', or 'auto'")
-        await _tryit_save(run_id, phase="provisioning", message="starting a GPU pod …",
-                          expires_at=_tryit_exp())
-        _tryit_tasks[run_id] = asyncio.create_task(_tryit_cloud_setup(run_id, sel or "auto"))
+        # Resolve the pod spec. Explicit requests carry the picker's values; the
+        # legacy (no-target) cloud-ASR path defaults to the run's training compute.
+        acct = (provider_id or "").strip() or (None if explicit else row0.provider_id)
+        gtype = (gpu_type or "").strip() or (row0.gpu_type or "NVIDIA L40S")
+        gcount = max(1, int(gpu_count or 1))
+        ctype = (cloud_type or "").strip().upper()
+        if ctype not in ("SECURE", "COMMUNITY"):
+            ctype = "SECURE"
+        # Idempotent: same cloud spec already provisioning/ready → just report it.
+        same_spec = (cur_target == "cloud" and ti.get("provider_id") == acct
+                     and ti.get("gpu_type") == gtype and int(ti.get("gpu_count") or 1) == gcount
+                     and (ti.get("cloud_type") or "SECURE") == ctype)
+        if same_spec and ti.get("phase") in ("provisioning", "installing", "ready"):
+            return _tryit_status(row0)
+        # Different target/spec (or a prior errored attempt) → tear the old one down first.
+        if cur_target:
+            await _tryit_teardown(run_id)
+        await _tryit_save(run_id, target="cloud", provider_id=acct, kind=kind0,
+                          gpu_type=gtype, gpu_count=gcount, cloud_type=ctype,
+                          phase="provisioning", message="starting a GPU pod …", expires_at=_tryit_exp())
+        _tryit_tasks[run_id] = asyncio.create_task(_tryit_cloud_setup(
+            run_id, gpu_type=gtype, gpu_count=gcount, cloud_type=ctype, provider_id=acct, kind=kind0))
         async with session_factory()() as s:
             row0 = await s.get(TrainingRun, run_id)
         return _tryit_status(row0)
-    row, kind, model_s3, creds, ssh, cfg = await _playground_ctx(run_id, user, session)
+
+    # ---- vm target: persistent worker on the chosen (or the run's) VM provider ----
+    vm_pid = (provider_id or "").strip() or (row0.provider_id if (prov0 and prov0.kind == "vm") else None)
+    # Switching away from a cloud pod, or to a different VM, tears the old down first.
+    if cur_target == "cloud" or (cur_target == "vm" and ti.get("provider_id") != vm_pid):
+        await _tryit_teardown(run_id)
+    row, kind, model_s3, creds, ssh, cfg = await _playground_ctx_for_target(
+        run_id, user, session, vm_provider_id=vm_pid)
+    # Record the target so status / stop / transcribe / synthesize resolve the SAME box.
+    await _tryit_save(run_id, target="vm", provider_id=vm_pid, kind=kind)
     if kind == "llm":
         # Serve GPUs: an explicit `gpu` (comma-list like "6,7") overrides the run's
         # training pin; tensor-parallel size = the number of GPUs chosen.

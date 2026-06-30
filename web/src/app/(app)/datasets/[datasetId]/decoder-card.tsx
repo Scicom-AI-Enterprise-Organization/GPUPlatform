@@ -68,11 +68,20 @@ export function DecoderCard({
   const runpodProviders = useMemo(() => providers.filter((p) => p.kind === "runpod"), [providers]);
   const availability = useGpuAvailability(gpuType, gpuCount, target === "cloud", secureCloud ? "SECURE" : "COMMUNITY");
 
-  // The provider id the decode calls target: the VM, or the chosen/default RunPod account.
-  const activeProviderId = target === "vm" ? vmProviderId : (runpodProviderId || "__runpod_default__");
+  // The provider id the decode calls target: the VM, or the chosen RunPod account
+  // (a named provider is always required — there's no gateway-default fallback).
+  const activeProviderId = target === "vm" ? vmProviderId : runpodProviderId;
 
   useEffect(() => {
-    gateway.listProviders().then(setProviders).catch(() => {});
+    gateway
+      .listProviders()
+      .then((ps) => {
+        setProviders(ps);
+        // Auto-select the first registered RunPod account — no gateway-default fallback.
+        const firstRunpod = ps.find((p) => p.kind === "runpod");
+        if (firstRunpod) setRunpodProviderId((cur) => cur || firstRunpod.id);
+      })
+      .catch(() => {});
     gateway.listRunpodGpuTypes().then((t) => { if (t?.length) setGpuOptions(t); }).catch(() => {});
   }, []);
 
@@ -127,7 +136,7 @@ export function DecoderCard({
   function loadBody() {
     return {
       target,
-      provider_id: target === "vm" ? vmProviderId : runpodProviderId || null,
+      provider_id: target === "vm" ? vmProviderId : runpodProviderId,
       gpu: target === "vm" ? vmGpu : "auto",
       gpu_type: gpuType,
       gpu_count: gpuCount,
@@ -137,7 +146,8 @@ export function DecoderCard({
   }
 
   async function load() {
-    if (target === "vm" && !vmProviderId) return setErr("Pick a VM provider, or switch to Default cloud.");
+    if (target === "vm" && !vmProviderId) return setErr("Pick a VM provider, or switch to cloud.");
+    if (target === "cloud" && !runpodProviderId) return setErr("Select a RunPod provider — add one under GPU Providers.");
     setBusy(true);
     setErr(null);
     try {
@@ -321,13 +331,12 @@ export function DecoderCard({
             <div className="space-y-1.5">
               <Label className="text-xs">RunPod account</Label>
               <Select
-                value={runpodProviderId || "__default__"}
-                onValueChange={(v) => setRunpodProviderId(v === "__default__" ? "" : v)}
+                value={runpodProviderId}
+                onValueChange={setRunpodProviderId}
                 disabled={lockPicker}
               >
-                <SelectTrigger className="text-xs"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="text-xs"><SelectValue placeholder="Choose a RunPod account…" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__default__">Gateway default (RunPod)</SelectItem>
                   {runpodProviders.map((p) => (
                     <SelectItem key={p.id} value={p.id}>
                       {p.name}{p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
@@ -335,6 +344,11 @@ export function DecoderCard({
                   ))}
                 </SelectContent>
               </Select>
+              {runpodProviders.length === 0 && (
+                <p className="text-[11px] text-muted-foreground">
+                  None registered. <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add a RunPod account →</a>
+                </p>
+              )}
             </div>
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">

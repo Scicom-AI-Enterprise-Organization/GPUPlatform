@@ -66,6 +66,7 @@ import type {
   TrainingMetrics,
   CreateTrainingRunRequest,
   TrainingFile,
+  TryItTarget,
   TrackingCredentialRecord,
   CreateTrackingCredentialRequest,
   GitopsRepo,
@@ -415,6 +416,17 @@ export const gateway = {
       mos_axes?: string[];
       speakers?: string[];
       speaker_prefix?: boolean;
+      reject_keywords?: string[];
+      per_speaker?: boolean;
+      run_on?: "vm" | "cloud";
+      provider_id?: string | null;
+      gpu_type?: string;
+      gpu_count?: number;
+      secure_cloud?: boolean;
+      disk_gb?: number;
+      volume_gb?: number;
+      visible_devices?: string | null;
+      venv_path?: string | null;
     },
   ) =>
     request<{ status: string }>(
@@ -481,12 +493,23 @@ export const gateway = {
     return { url, sampleRate: res.sample_rate, device: res.device, logs: res.logs ?? [],
              prompt: res.prompt, genText: res.gen_text };
   },
-  /** Persistent try-it worker: load the model once on the VM and keep it resident
-   * (subsequent transcribe/synthesize skip the per-request model load). */
-  playgroundStart: (id: string, gpu?: string, vllmArgs?: string) => {
+  /** Persistent try-it worker: load the model once and keep it resident
+   * (subsequent transcribe/synthesize skip the per-request model load). The
+   * compute target (a fresh RunPod pod or a registered VM) is chosen per-call —
+   * see TryItTarget; omitting it preserves the legacy run's-own-box behaviour. */
+  playgroundStart: (id: string, opts?: Partial<TryItTarget> & { gpu?: string; vllmArgs?: string }) => {
     const qs = new URLSearchParams();
-    if (gpu) qs.set("gpu", gpu);
-    if (vllmArgs && vllmArgs.trim()) qs.set("vllm_args", vllmArgs.trim());
+    if (opts?.target) qs.set("target", opts.target);
+    if (opts?.target === "cloud") {
+      if (opts.gpu_type) qs.set("gpu_type", opts.gpu_type);
+      if (opts.gpu_count) qs.set("gpu_count", String(opts.gpu_count));
+      if (opts.cloud_type) qs.set("cloud_type", opts.cloud_type);
+    }
+    // provider_id = the RunPod account (cloud) or the chosen VM provider (vm).
+    if (opts?.provider_id) qs.set("provider_id", opts.provider_id);
+    // GPU device index (vm target) + vLLM args (llm) — ignored by the cloud path.
+    if (opts?.gpu) qs.set("gpu", opts.gpu);
+    if (opts?.vllmArgs && opts.vllmArgs.trim()) qs.set("vllm_args", opts.vllmArgs.trim());
     const q = qs.toString();
     return request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
       `/v1/training-runs/${encodeURIComponent(id)}/playground/start${q ? `?${q}` : ""}`,

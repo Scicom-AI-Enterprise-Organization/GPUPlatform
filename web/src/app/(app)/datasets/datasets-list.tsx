@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Inbox, LayoutGrid, List, Loader2, Search, X } from "lucide-react";
+import { CheckSquare, GitMerge, Inbox, LayoutGrid, List, Loader2, Search, X } from "lucide-react";
 import { useListUrlState, readParam } from "@/lib/list-url-state";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
@@ -48,6 +48,9 @@ function searchableText(d: DatasetRecord): string {
     .toLowerCase();
 }
 
+// Kinds the gateway's /datasets/merge can concatenate into one audio dataset.
+const MERGEABLE_KINDS = new Set<DatasetKind>(["label", "s3"]);
+
 const SOURCE_OPTIONS: Array<{ value: "all" | DatasetKind; label: string }> = [
   { value: "all", label: "All sources" },
   { value: "upload", label: "Upload" },
@@ -67,6 +70,8 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
   );
   const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
   const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
+  const [selectMode, setSelectMode] = useState(() => sp.get("select") === "1");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
 
@@ -91,7 +96,32 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
     setView(v);
     window.localStorage.setItem("sgpu_datasets_view", v);
   };
-  useListUrlState({ q, sort, view, extra: { source: { value: source, def: "all" } } });
+  useListUrlState({ q, sort, view, select: selectMode, extra: { source: { value: source, def: "all" } } });
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const exitSelect = () => {
+    setSelectMode(false);
+    setSelected(new Set());
+  };
+
+  // Selected datasets, and whether each is a mergeable kind (label / s3).
+  const selectedItems = useMemo(() => items.filter((d) => selected.has(d.id)), [items, selected]);
+  const allMergeable = selectedItems.every((d) => MERGEABLE_KINDS.has(d.kind));
+  const canMerge = selectedItems.length >= 2 && allMergeable;
+
+  const onMerge = () => {
+    if (!canMerge) return;
+    const ids = selectedItems.map((d) => d.id);
+    router.push(`/datasets/merge?ids=${ids.map(encodeURIComponent).join(",")}`);
+  };
 
   const haystacks = useMemo(() => items.map((d) => ({ d, text: searchableText(d) })), [items]);
   const filtered = useMemo(() => {
@@ -229,7 +259,79 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
             <LayoutGrid className="h-4 w-4" />
           </button>
         </div>
+        {selectMode ? (
+          <button
+            type="button"
+            onClick={exitSelect}
+            className="inline-flex h-10 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm shadow-xs hover:bg-muted"
+          >
+            <X className="h-4 w-4" /> Cancel
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setSelectMode(true)}
+            className="inline-flex h-10 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm shadow-xs hover:bg-muted"
+          >
+            <CheckSquare className="h-4 w-4" /> Select
+          </button>
+        )}
       </div>
+
+      {selectMode && (
+        <div className="mb-3 flex flex-col gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between">
+          <span className="text-muted-foreground">
+            {selected.size} selected
+            {paged.length > 0 && (
+              <>
+                {" "}
+                <button
+                  type="button"
+                  onClick={() => setSelected(new Set(paged.map((d) => d.id)))}
+                  className="ml-2 underline underline-offset-2 hover:text-foreground"
+                >
+                  Select all visible
+                </button>
+                {selected.size > 0 && (
+                  <>
+                    {" · "}
+                    <button
+                      type="button"
+                      onClick={() => setSelected(new Set())}
+                      className="underline underline-offset-2 hover:text-foreground"
+                    >
+                      Clear
+                    </button>
+                  </>
+                )}
+              </>
+            )}
+            {selected.size >= 2 && !allMergeable && (
+              <span className="ml-2 text-amber-600 dark:text-amber-400">
+                · only label &amp; s3 datasets can be merged
+              </span>
+            )}
+          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={onMerge}
+              disabled={!canMerge}
+              title={
+                selected.size < 2
+                  ? "Select 2 or more datasets to merge"
+                  : !allMergeable
+                    ? "Only label & s3 datasets can be merged"
+                    : "Merge selected datasets"
+              }
+              className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium shadow-xs hover:bg-muted disabled:opacity-50"
+            >
+              <GitMerge className="h-3.5 w-3.5" />
+              {`Merge ${canMerge ? selected.size : ""}`.trim()}
+            </button>
+          </div>
+        </div>
+      )}
 
       {hasFilter && (
         <div className="mb-3 text-xs text-muted-foreground">
@@ -266,6 +368,9 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
               <DatasetCard
                 key={d.id}
                 dataset={d}
+                selectMode={selectMode}
+                selected={selected.has(d.id)}
+                onToggle={toggle}
                 onRename={(ds) => {
                   setRenameTarget(ds);
                   setRenameDraft(ds.name);

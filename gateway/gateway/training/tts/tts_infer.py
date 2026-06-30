@@ -5,7 +5,7 @@ transcribe.py). Shipped to the run's VM over SSH and run with the TTS trainer ve
 from S3, generates speech tokens for the given text, NeuCodec-decodes them to a
 waveform, and prints a single structured line:
 
-  @@AUDIO {"wav_b64": "...", "sample_rate": 24000, "device": "cuda", "n_codes": N}  on success
+  @@AUDIO {"wav_b64": "...", "sample_rate": 44100, "device": "cuda", "n_codes": N}  on success
   @@AUDIO {"error": "..."}                                                          on failure
 
 Config (JSON via --config): {model_s3, region, endpoint, access_key, secret_key,
@@ -145,7 +145,8 @@ def main() -> int:
     # forward when labels=None); the saved merged weights are standard Qwen3.
     model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=dtype)
     model = (model.cuda() if use_cuda else model).eval()
-    neu = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
+    # Scicom d20 fork: decoder_depth=20 matches the finetuned depth-20 decoder → 44.1 kHz.
+    neu = NeuCodec._from_pretrained(model_id="Scicom-intl/neucodec-44k-d20", decoder_depth=20).eval()
     neu = neu.cuda() if use_cuda else neu
     log(f"loaded model (vocab {len(tok)}) + NeuCodec in {time.time() - _t:.1f}s")
 
@@ -183,7 +184,7 @@ def main() -> int:
         if use_cuda:
             fsq = fsq.cuda()
         wav = neu.decode_code(fsq).squeeze().detach().cpu().float().numpy()
-    sr = int(getattr(neu, "sample_rate", 24000))
+    sr = int(getattr(neu, "sample_rate", 44100))
     _dur = len(wav) / sr
     log(f"NeuCodec → {_dur:.2f}s audio @ {sr}Hz (RTF {_gen_t / max(_dur, 1e-6):.2f}) on {device}")
     buf = io.BytesIO()

@@ -542,7 +542,7 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                         onClick={() => setTokenMode(m)}
                         className={cn(
                           "px-2.5 py-1 transition-colors",
-                          tokenMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground",
+                          tokenMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground",
                         )}
                       >
                         {m === "paste" ? "Paste" : "From secret"}

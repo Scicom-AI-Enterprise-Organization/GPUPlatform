@@ -305,6 +305,17 @@ export type TrainingStep = {
 
 export type TrainingGpuSample = { t: number; gpus: TrainingGpu[] };
 
+// One auto-created Label-platform recording+MOS project (post-train TTS). `speaker`
+// is set only when projects were split per speaker.
+export type LabelProjectCard = {
+  id: string;
+  url: string;
+  count: number;
+  dataset_id?: string | null;
+  project_name?: string | null;
+  speaker?: string | null;
+};
+
 export type TrainingResult = {
   epochs?: TrainingEpoch[];
   // Per-N-step training loss (@@STEP) for the live loss curve.
@@ -332,13 +343,10 @@ export type TrainingResult = {
   } | null;
   progress?: { step?: string; percent?: number } | null;
   // TTS only: the auto-created Label-platform recording+MOS project (post-train).
-  label_project?: {
-    id: string;
-    url: string;
-    count: number;
-    dataset_id?: string | null;
-    project_name?: string | null;
-  } | null;
+  // label_project is the first project (back-compat); label_projects holds all of
+  // them — one per speaker when "separate project per speaker" was used.
+  label_project?: LabelProjectCard | null;
+  label_projects?: LabelProjectCard[] | null;
   // TTS only: status of an in-flight / finished post-train Label export. While
   // "running" the UI shows "exporting to Label" instead of the run's "done".
   label_export?: {
@@ -507,6 +515,8 @@ export type CreateTrainingRunRequest = {
   label_mos_axes?: string[];
   label_speakers?: string[]; // balance synthesized eval clips across these speaker names
   label_speaker_prefix?: boolean; // prefix each task transcription with the speaker name
+  label_reject_keywords?: string[]; // drop text samples containing any of these phrases
+  label_per_speaker?: boolean; // one project per speaker, each from that speaker's own clips
 };
 
 export type TrainingFile = {
@@ -514,6 +524,28 @@ export type TrainingFile = {
   size: number;
   modified: string;
   download_url: string;
+};
+
+// Where a finished run's "Try it" playground runs inference — chosen at load time,
+// decoupled from where the run trained. "cloud" spins up a fresh RunPod pod with the
+// given GPU; "vm" reuses a registered VM provider. `provider_id` is the RunPod account
+// (cloud) or the VM provider (vm). Mirrors the serverless deploy form's Run-on/Pod cards.
+export type TryItTarget = {
+  target: "cloud" | "vm";
+  provider_id?: string | null;
+  // cloud only — the pod to provision (gpu_type is a GPU_CHOICES catalog value):
+  gpu_type?: string;
+  gpu_count?: number;
+  cloud_type?: "SECURE" | "COMMUNITY";
+};
+
+// Live state of the persistent try-it worker / on-demand try-it pod.
+export type PlaygroundStatus = {
+  running: boolean;
+  ready: boolean;
+  device?: string;
+  kind?: string;
+  logs?: string[];
 };
 
 // An S3 object backing a dataset (Files tab). `name` is relative to the listed
@@ -875,6 +907,8 @@ export type TransformDatasetRequest = {
   hf_repo?: string | null; // required for target=hf (owner/name)
   storage_id?: string | null; // required for target=s3 (a kind=s3 storage)
   s3_folder?: string | null; // target=s3 dest folder; blank → datasets/{id}/transformed
+  test_split_pct?: number | null; // hold out this % of rows as a `test` split (0–100)
+  test_split_count?: number | null; // hold out this many rows as a `test` split (overrides pct)
 };
 
 // NeuCodec-encode + multipack a {audio, transcription} dataset into a packed

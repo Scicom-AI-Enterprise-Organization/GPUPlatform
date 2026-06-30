@@ -44,7 +44,10 @@ import { formatCostUSD, formatRateUSD, useLiveCost } from "@/lib/cost";
 import { BurnFlame } from "@/components/burn-flame";
 import { JsonView } from "@/components/json-view";
 import { cn } from "@/lib/utils";
-import type { DatasetRecord, GlobalEnvRecord, StorageRecord, TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
+import type { DatasetRecord, StorageRecord, TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
+import { LabelExportTab } from "./label-export-tab";
+import { TryItCompute, defaultCompute, type ComputeChoice } from "./tryit-compute";
+import { gpuTypeToChoice } from "@/lib/gpu-catalog";
 
 // Distinct colours for per-trial sweep loss curves.
 const TRIAL_COLORS = ["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9", "#ec4899", "#84cc16"];
@@ -235,15 +238,15 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   // A pack-only run (NeuCodec encode + multipack, no training) has no loss curve
   // or per-epoch eval — hide those empty panels for it.
   const packOnly = run.config_json?.pack_only === true;
-  // Try-it playground: a finished run on a VM (inference runs on that VM) — ASR
-  // transcribes an uploaded clip; TTS synthesizes speech from text.
-  // VM runs serve try-it on the persistent VM. Cloud runs (training pod gone) can
-  // still try-it for ASR — Load spins up a temporary pod on demand (auto-torn-down).
+  // Try-it playground — ASR transcribes an uploaded clip; TTS synthesizes speech.
+  // The compute target is chosen at load time (a fresh RunPod pod or a registered
+  // VM — see TryItCompute), decoupled from where the run trained, so ASR + TTS can
+  // try-it regardless of provider. LLM (vLLM) try-it stays VM-only for now.
   const isVmRun = run.provider_kind === "vm";
   const canTryIt =
     run.status === "done" &&
     !!run.result_json?.artifact?.s3_uri &&
-    (isVmRun || (run.task_type ?? "asr") === "asr");
+    ((run.task_type ?? "asr") === "asr" || run.task_type === "tts" || (run.task_type === "llm" && isVmRun));
   const metricLabel = run.task_type === "tts"
     ? "loss"
     : String((run.config_json?.eval_metric as string) || "wer").toUpperCase();
@@ -279,78 +282,11 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     }
   }
 
-  // On-demand Label-platform export (retry) for finished TTS runs — the run may
-  // have finished without label creds, or you may want to re-export. Prefilled
-  // from the run's config; the token is never stored back unencrypted.
+  // Label-platform export now lives in its own tab (LabelExportTab) — with a
+  // serverless-style "Run on" picker (VM or a fresh RunPod pod). `lcfg` is still
+  // read below by the HF export.
   const lcfg = (run.config_json ?? {}) as Record<string, unknown>;
-  const [labelOpen, setLabelOpen] = useState(false);
-  // URL + token can each be typed in or referenced from the Secrets page (GlobalEnv),
-  // mirroring the autotrain create form. Prefilled from the run's config.
-  const [labelUrlMode, setLabelUrlMode] = useState<"paste" | "secret">(
-    typeof lcfg.label_base_url_secret === "string" && lcfg.label_base_url_secret ? "secret" : "paste",
-  );
-  const [labelUrl, setLabelUrl] = useState(
-    typeof lcfg.label_base_url === "string" && lcfg.label_base_url ? lcfg.label_base_url : "http://localhost:3002",
-  );
-  const [labelUrlSecret, setLabelUrlSecret] = useState(
-    typeof lcfg.label_base_url_secret === "string" ? lcfg.label_base_url_secret : "",
-  );
-  const [labelTokenMode, setLabelTokenMode] = useState<"paste" | "secret">(
-    typeof lcfg.label_token_secret === "string" && lcfg.label_token_secret ? "secret" : "paste",
-  );
-  const [labelToken, setLabelToken] = useState("");
-  const [labelTokenSecret, setLabelTokenSecret] = useState(
-    typeof lcfg.label_token_secret === "string" ? lcfg.label_token_secret : "",
-  );
-  const [labelSecrets, setLabelSecrets] = useState<GlobalEnvRecord[]>([]);
-  const [labelProject, setLabelProject] = useState(
-    typeof lcfg.label_project_name === "string" ? lcfg.label_project_name : "",
-  );
-  const [labelSamples, setLabelSamples] = useState(
-    typeof lcfg.label_samples === "number" ? lcfg.label_samples : 32,
-  );
-  const [labelAxes, setLabelAxes] = useState(
-    Array.isArray(lcfg.label_mos_axes) ? (lcfg.label_mos_axes as unknown[]).map(String).join(", ") : "Naturalness, Intelligibility, Noise",
-  );
-  const [labelSpeakers, setLabelSpeakers] = useState(
-    Array.isArray(lcfg.label_speakers) ? (lcfg.label_speakers as unknown[]).map(String).join(", ") : "",
-  );
-  const [labelSpeakerPrefix, setLabelSpeakerPrefix] = useState(!!lcfg.label_speaker_prefix);
-  const [labelBusy, setLabelBusy] = useState(false);
-  const [labelErr, setLabelErr] = useState<string | null>(null);
-  const [labelDone, setLabelDone] = useState(false);
-
-  // Load Secrets-page keys the first time the export dialog opens.
-  useEffect(() => {
-    if (!labelOpen || labelSecrets.length) return;
-    gateway.listGlobalEnv().then(setLabelSecrets).catch(() => {});
-  }, [labelOpen, labelSecrets.length]);
-
-  const labelUrlOk = labelUrlMode === "paste" ? !!labelUrl.trim() : !!labelUrlSecret;
-  const labelTokenOk = labelTokenMode === "paste" ? !!labelToken.trim() : !!labelTokenSecret;
-
-  async function submitLabelExport() {
-    setLabelBusy(true);
-    setLabelErr(null);
-    try {
-      await gateway.retryLabelExport(run.id, {
-        base_url: labelUrlMode === "paste" ? (labelUrl.trim() || undefined) : undefined,
-        base_url_secret: labelUrlMode === "secret" ? (labelUrlSecret || null) : null,
-        token: labelTokenMode === "paste" ? (labelToken.trim() || undefined) : undefined,
-        token_secret: labelTokenMode === "secret" ? (labelTokenSecret || null) : null,
-        project_name: labelProject.trim() || null,
-        samples: labelSamples,
-        mos_axes: labelAxes.split(",").map((s) => s.trim()).filter(Boolean),
-        speakers: labelSpeakers.split(",").map((s) => s.trim()).filter(Boolean),
-        speaker_prefix: labelSpeakerPrefix,
-      });
-      setLabelDone(true);
-    } catch (e) {
-      setLabelErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLabelBusy(false);
-    }
-  }
+  const canLabelExport = run.task_type === "tts" && run.status === "done";
 
   // On-demand "Export to Hugging Face" — pushes the run's best/final model to a HF
   // repo, with the token taken from a selected kind=huggingface storage.
@@ -571,16 +507,6 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <XCircle className="h-4 w-4" />} Terminate
             </Button>
           )}
-          {run.task_type === "tts" && run.status === "done" && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => { setLabelErr(null); setLabelDone(false); setLabelOpen(true); }}
-              title="Synthesize sample clips and create a Label-platform recording+MOS project"
-            >
-              <Upload className="h-4 w-4" /> Export to Label
-            </Button>
-          )}
           {canTryIt && (
             <Button
               variant="outline"
@@ -618,6 +544,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
             <TabsTrigger value="files" asChild><Link href={tabHref("files")} scroll={false}>Files</Link></TabsTrigger>
             <TabsTrigger value="config" asChild><Link href={tabHref("config")} scroll={false}>Config</Link></TabsTrigger>
             {canTryIt && <TabsTrigger value="tryit" asChild><Link href={tabHref("tryit")} scroll={false}>Try it</Link></TabsTrigger>}
+            {canLabelExport && <TabsTrigger value="label" asChild><Link href={tabHref("label")} scroll={false}>Export to Label</Link></TabsTrigger>}
           </TabsList>
         </Tabs>
       </div>
@@ -660,17 +587,22 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </Card>
       )}
 
-      {run.result_json?.label_project && (
-        <Card>
+      {/* One card per Label project (multiple when split per speaker; falls back to
+          the single label_project for runs created before that). */}
+      {(run.result_json?.label_projects
+        ?? (run.result_json?.label_project ? [run.result_json.label_project] : [])
+      ).map((lp) => (
+        <Card key={lp.id}>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm">
               Label project created
-              {run.result_json.label_project.count != null ? ` · ${run.result_json.label_project.count} clips` : ""}
+              {lp.speaker ? ` · ${lp.speaker}` : ""}
+              {lp.count != null ? ` · ${lp.count} clips` : ""}
             </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
             <a
-              href={run.result_json.label_project.url}
+              href={lp.url}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1.5 font-medium text-primary hover:underline"
@@ -678,17 +610,17 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               Open in Label
               <ExternalLink className="h-3.5 w-3.5" />
             </a>
-            {run.result_json.label_project.dataset_id && (
+            {lp.dataset_id && (
               <a
-                href={`/datasets/${run.result_json.label_project.dataset_id}`}
+                href={`/datasets/${lp.dataset_id}`}
                 className="inline-flex items-center gap-1.5 text-muted-foreground hover:text-foreground hover:underline"
               >
-                Linked dataset <span className="font-mono">{run.result_json.label_project.dataset_id}</span>
+                Linked dataset <span className="font-mono">{lp.dataset_id}</span>
               </a>
             )}
           </CardContent>
         </Card>
-      )}
+      ))}
 
       {run.result_json?.hf_export && (
         <Card>
@@ -875,10 +807,19 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         {canTryIt && (
           <TabsContent value="tryit" className="!flex-none">
             {(run.task_type ?? "asr") === "tts"
-              ? <TtsPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
+              ? <TtsPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
+                  runProviderId={run.provider_id ?? null} trainedOnVm={isVmRun}
+                  gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />
               : run.task_type === "llm"
                 ? <LlmPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
-                : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} isCloud={!isVmRun} />}
+                : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
+                    runProviderId={run.provider_id ?? null} trainedOnVm={isVmRun}
+                    gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />}
+          </TabsContent>
+        )}
+        {canLabelExport && (
+          <TabsContent value="label" className="!flex-none">
+            <LabelExportTab run={run} onStarted={() => router.refresh()} />
           </TabsContent>
         )}
       </Tabs>
@@ -910,127 +851,6 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
             >
               {busy ? confirmOpts?.busyLabel : confirmOpts?.confirmLabel}
             </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={labelOpen} onOpenChange={(o) => { if (!labelBusy) setLabelOpen(o); }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Export to Label platform</DialogTitle>
-            <DialogDescription>
-              Synthesize {labelSamples} clip{labelSamples === 1 ? "" : "s"} from this run&apos;s trained model and
-              create a Label-platform recording project with MOS rating, seeded with them. Runs in the background;
-              watch the Logs tab for progress.
-            </DialogDescription>
-          </DialogHeader>
-          {labelDone ? (
-            <p className="flex items-center gap-2 py-2 text-sm text-emerald-600 dark:text-emerald-400">
-              <Check className="h-4 w-4" /> Export started — the status shows “exporting to Label” and the
-              synthesis streams to the Logs tab; an “Open in Label” link appears on this page when it finishes.
-            </p>
-          ) : (
-            <div className="space-y-3">
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-3">
-                  <label className="text-xs uppercase tracking-wide text-muted-foreground">Label platform URL</label>
-                  <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
-                    {(["paste", "secret"] as const).map((m) => (
-                      <button key={m} type="button" onClick={() => setLabelUrlMode(m)}
-                        className={cn("px-2.5 py-1 transition-colors",
-                          labelUrlMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
-                        {m === "paste" ? "Paste" : "From secret"}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                {labelUrlMode === "paste" ? (
-                  <Input className="font-mono" value={labelUrl} placeholder="http://localhost:3002"
-                    onChange={(e) => setLabelUrl(e.target.value)} />
-                ) : (
-                  <Select value={labelUrlSecret} onValueChange={setLabelUrlSecret}>
-                    <SelectTrigger><SelectValue placeholder={labelSecrets.length ? "Choose a secret" : "No secrets configured"} /></SelectTrigger>
-                    <SelectContent>
-                      {labelSecrets.map((s) => (
-                        <SelectItem key={s.key} value={s.key}>{s.key}{s.value_preview ? ` — ${s.value_preview}` : ""}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                )}
-              </div>
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-3">
-                  <label className="text-xs uppercase tracking-wide text-muted-foreground">API token</label>
-                  <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
-                    {(["paste", "secret"] as const).map((m) => (
-                      <button key={m} type="button" onClick={() => setLabelTokenMode(m)}
-                        className={cn("px-2.5 py-1 transition-colors",
-                          labelTokenMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground")}>
-                        {m === "paste" ? "Paste" : "From secret"}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                {labelTokenMode === "paste" ? (
-                  <>
-                    <Input type="password" className="font-mono" value={labelToken} placeholder="lpat_…"
-                      onChange={(e) => setLabelToken(e.target.value)} />
-                    <p className="text-[11px] text-muted-foreground">Admin personal access token. Stored encrypted on the run.</p>
-                  </>
-                ) : (
-                  <Select value={labelTokenSecret} onValueChange={setLabelTokenSecret}>
-                    <SelectTrigger><SelectValue placeholder={labelSecrets.some((s) => s.is_secret) ? "Choose a secret" : "No secrets configured"} /></SelectTrigger>
-                    <SelectContent>
-                      {labelSecrets.filter((s) => s.is_secret).map((s) => (
-                        <SelectItem key={s.key} value={s.key}>{s.key}{s.value_preview ? ` — ${s.value_preview}` : ""}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                )}
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1.5">
-                  <label className="text-xs uppercase tracking-wide text-muted-foreground">Project name</label>
-                  <Input value={labelProject} placeholder={`${run.name}-eval`}
-                    onChange={(e) => setLabelProject(e.target.value)} />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs uppercase tracking-wide text-muted-foreground">Samples</label>
-                  <Input type="number" min={1} value={labelSamples}
-                    onChange={(e) => setLabelSamples(Math.max(1, Number.parseInt(e.target.value, 10) || 1))} />
-                </div>
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs uppercase tracking-wide text-muted-foreground">MOS axes</label>
-                <Input value={labelAxes} placeholder="Naturalness, Intelligibility, Noise"
-                  onChange={(e) => setLabelAxes(e.target.value)} />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs uppercase tracking-wide text-muted-foreground">Speaker names (optional)</label>
-                <Input value={labelSpeakers} placeholder="speakerA, speakerB"
-                  onChange={(e) => setLabelSpeakers(e.target.value)} />
-                <p className="text-xs text-muted-foreground">
-                  Comma-separated. Balances the clips evenly across these voices (e.g. 2 speakers + {labelSamples} samples → {Math.floor(labelSamples / 2)} each). Blank → the dataset&apos;s original voices.
-                </p>
-              </div>
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input type="checkbox" checked={labelSpeakerPrefix} onChange={(e) => setLabelSpeakerPrefix(e.target.checked)}
-                  className="h-4 w-4 accent-primary" />
-                <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
-              </label>
-            </div>
-          )}
-          <DialogFooter>
-            {labelErr && <p className="mr-auto text-sm text-destructive">{labelErr}</p>}
-            <Button variant="outline" onClick={() => setLabelOpen(false)} disabled={labelBusy}>
-              {labelDone ? "Close" : "Cancel"}
-            </Button>
-            {!labelDone && (
-              <Button onClick={submitLabelExport} disabled={labelBusy || !labelUrlOk || !labelTokenOk}>
-                {labelBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-                Start export
-              </Button>
-            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1587,14 +1407,19 @@ function EvalCurve({ epochs, sweep, trials }: { epochs: TrainingEpoch[]; sweep: 
   );
 }
 
-// Try-it playground — upload a clip, pick a GPU the run used (or CPU), and
-// transcribe it with the finetuned model on the run's VM (over SSH).
-function PlaygroundTab({ runId, visibleDevices, isCloud }: { runId: string; visibleDevices: string | null; isCloud?: boolean }) {
-  // Cloud try-it runs on a fresh single-GPU pod (not the run's training GPUs), so
-  // default to "auto" — a training-pin index like "6" wouldn't exist there.
-  const gpuIds = isCloud ? [] : (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+// Try-it playground (ASR) — pick where to run (a fresh RunPod pod or a registered
+// VM, via TryItCompute), load the model, then upload a clip and transcribe it.
+function PlaygroundTab({ runId, visibleDevices, runProviderId, trainedOnVm, gpuType, gpuCount }: {
+  runId: string; visibleDevices: string | null;
+  runProviderId: string | null; trainedOnVm: boolean;
+  gpuType: string | null; gpuCount: number | null;
+}) {
+  const [compute, setCompute] = useState<ComputeChoice>(() => defaultCompute({
+    trainedOnVm, runProviderId, gpuChoice: gpuTypeToChoice(gpuType), gpuCount,
+    pins: (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  }));
+  const [loaded, setLoaded] = useState(false);
   const [file, setFile] = useState<File | null>(null);
-  const [gpu, setGpu] = useState<string>(gpuIds[0] ?? "auto");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ text: string; raw?: string | null; device?: string; logs?: string[] } | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -1605,7 +1430,8 @@ function PlaygroundTab({ runId, visibleDevices, isCloud }: { runId: string; visi
     setErr(null);
     setResult(null);
     try {
-      setResult(await gateway.transcribeTrainingRun(runId, file, gpu));
+      // gpu is the device index for the VM target; "auto" for a cloud pod.
+      setResult(await gateway.transcribeTrainingRun(runId, file, compute.gpu));
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1618,22 +1444,13 @@ function PlaygroundTab({ runId, visibleDevices, isCloud }: { runId: string; visi
       <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — transcribe a clip</CardTitle></CardHeader>
       <CardContent className="space-y-4">
         <p className="text-xs text-muted-foreground">
-          {isCloud ? (
-            <>
-              This run trained on a cloud pod (gone after training), so <span className="font-medium">Load model</span> first —
-              it spins up a <span className="font-medium">temporary GPU pod</span> for this run (first load ~10 min: provision +
-              install + download). Then upload a short clip (≤ 25 MB) and transcribe. The pod auto-stops after 15 min idle, or
-              when you click Unload — so it can&apos;t keep billing.
-            </>
-          ) : (
-            <>
-              Runs the finetuned model on this run&apos;s VM. Pick a GPU the run used (or CPU), upload a short
-              audio clip (≤ 25 MB), and transcribe. The first request downloads the model onto the VM, so it
-              can take a little longer.
-            </>
-          )}
+          Pick where to run, load the model, then upload a short clip (≤ 25 MB) and transcribe. A cloud
+          pod spins up on demand (first load ~10 min) and auto-stops when idle; a VM keeps the model
+          resident. The first request downloads the model onto the box.
         </p>
-        <PersistentControls runId={runId} gpu={gpu} />
+        <TryItCompute value={compute} onChange={setCompute} disabled={loaded}
+          runProviderId={runProviderId} visibleDevices={visibleDevices} />
+        <PersistentControls runId={runId} compute={compute} onRunningChange={setLoaded} />
         <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
           <div className="flex flex-col gap-1">
             <span className="text-xs text-muted-foreground">audio clip</span>
@@ -1643,19 +1460,6 @@ function PlaygroundTab({ runId, visibleDevices, isCloud }: { runId: string; visi
               onChange={(e) => { setFile(e.target.files?.[0] ?? null); setResult(null); }}
               className="flex h-8 items-center rounded-md border border-input bg-transparent text-xs shadow-xs file:mr-3 file:h-8 file:border-0 file:border-r file:border-input file:bg-muted file:px-2.5 file:text-foreground hover:file:bg-muted/70"
             />
-          </div>
-          <div className="flex flex-col gap-1">
-            <span className="text-xs text-muted-foreground">run on</span>
-            <Select value={gpu} onValueChange={setGpu}>
-              <SelectTrigger className="h-8 w-[180px] text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {gpuIds.map((g) => <SelectItem key={g} value={g} className="text-xs">GPU {g}</SelectItem>)}
-                <SelectItem value="auto" className="text-xs">Auto (most-free GPU)</SelectItem>
-                <SelectItem value="cpu" className="text-xs">CPU</SelectItem>
-              </SelectContent>
-            </Select>
           </div>
           <Button type="button" onClick={onTranscribe} disabled={busy || !file} className="ml-auto">
             {busy
@@ -1712,9 +1516,13 @@ function TryItLogs({ lines }: { lines: string[] }) {
   );
 }
 
-// Persistent worker controls — load the model once on the VM (resident on the GPU)
-// so try-it requests skip the per-call model load, with Load / Restart / Unload.
-function PersistentControls({ runId, gpu }: { runId: string; gpu: string }) {
+// Persistent worker controls — load the model once on the chosen compute (a fresh
+// RunPod pod or a registered VM, per `compute`) so try-it requests skip the per-call
+// model load, with Load / Restart / Unload. Reports running state up so the parent
+// can lock the compute picker while something is loaded.
+function PersistentControls({ runId, compute, onRunningChange }: {
+  runId: string; compute: ComputeChoice; onRunningChange?: (running: boolean) => void;
+}) {
   const [st, setSt] = useState<{ running: boolean; ready: boolean; device?: string; logs?: string[] } | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -1722,12 +1530,15 @@ function PersistentControls({ runId, gpu }: { runId: string; gpu: string }) {
     try { setSt(await gateway.playgroundStatus(runId)); } catch { /* transient */ }
   }, [runId]);
   useEffect(() => { poll(); }, [poll]);
-  // While loading, poll until ready (the model load takes ~10-15s).
+  // While loading, poll until ready (the model load takes ~10-15s on a VM, ~10 min
+  // on a fresh cloud pod).
   useEffect(() => {
     if (!st?.running || st.ready) return;
     const t = setInterval(poll, 3000);
     return () => clearInterval(t);
   }, [st, poll]);
+  // Lock the compute picker whenever a worker/pod is loading or loaded.
+  useEffect(() => { onRunningChange?.(!!st?.running); }, [st?.running, onRunningChange]);
 
   async function act(fn: () => Promise<unknown>) {
     setBusy(true); setErr(null);
@@ -1748,11 +1559,11 @@ function PersistentControls({ runId, gpu }: { runId: string; gpu: string }) {
         {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
         {!st?.running ? (
           <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
-            onClick={() => act(() => gateway.playgroundStart(runId, gpu))}>Load model</Button>
+            onClick={() => act(() => gateway.playgroundStart(runId, compute))}>Load model</Button>
         ) : (
           <>
             <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
-              onClick={() => act(async () => { await gateway.playgroundStop(runId); await gateway.playgroundStart(runId, gpu); })}>Restart</Button>
+              onClick={() => act(async () => { await gateway.playgroundStop(runId); await gateway.playgroundStart(runId, compute); })}>Restart</Button>
             <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
               onClick={() => act(() => gateway.playgroundStop(runId))}>Unload</Button>
           </>
@@ -1922,7 +1733,7 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
             {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
             {!st?.running ? (
               <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy || !gpus.trim()}
-                onClick={() => ctl(() => gateway.playgroundStart(runId, gpus.trim() || undefined, vllmArgs))}>Load model</Button>
+                onClick={() => ctl(() => gateway.playgroundStart(runId, { gpu: gpus.trim() || undefined, vllmArgs }))}>Load model</Button>
             ) : (
               <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
                 onClick={() => ctl(() => gateway.playgroundStop(runId))}>Unload</Button>
@@ -2087,11 +1898,18 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
 
 // Try-it playground (TTS) — type text, pick a GPU the run used (or CPU), and
 // synthesize speech with the finetuned model on the run's VM (over SSH), then play it.
-function TtsPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevices: string | null }) {
-  const gpuIds = (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+function TtsPlaygroundTab({ runId, visibleDevices, runProviderId, trainedOnVm, gpuType, gpuCount }: {
+  runId: string; visibleDevices: string | null;
+  runProviderId: string | null; trainedOnVm: boolean;
+  gpuType: string | null; gpuCount: number | null;
+}) {
+  const [compute, setCompute] = useState<ComputeChoice>(() => defaultCompute({
+    trainedOnVm, runProviderId, gpuChoice: gpuTypeToChoice(gpuType), gpuCount,
+    pins: (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  }));
+  const [loaded, setLoaded] = useState(false);
   const [text, setText] = useState("");
   const [speaker, setSpeaker] = useState("");
-  const [gpu, setGpu] = useState<string>(gpuIds[0] ?? "auto");
   const [busy, setBusy] = useState(false);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [device, setDevice] = useState<string | undefined>();
@@ -2110,7 +1928,7 @@ function TtsPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
     if (audioUrl) { URL.revokeObjectURL(audioUrl); setAudioUrl(null); }
     try {
       const r = await gateway.synthesizeTrainingRun(runId, text.trim(), {
-        speaker: speaker.trim() || undefined, gpu,
+        speaker: speaker.trim() || undefined, gpu: compute.gpu,
       });
       setAudioUrl(r.url);
       setDevice(r.device);
@@ -2129,11 +1947,13 @@ function TtsPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
       <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — synthesize speech</CardTitle></CardHeader>
       <CardContent className="space-y-4">
         <p className="text-xs text-muted-foreground">
-          Runs the finetuned TTS model on this run&apos;s VM. Type text, optionally a speaker name (as the
-          data was packed), pick a GPU the run used (or CPU), and synthesize. The first request downloads the
-          model onto the VM, so it can take a little longer.
+          Pick where to run, load the model, then type text (optionally a speaker name, as the data was
+          packed) and synthesize. A cloud pod spins up on demand (first load ~10 min) and auto-stops when
+          idle; a VM keeps the model resident. The first request downloads the model onto the box.
         </p>
-        <PersistentControls runId={runId} gpu={gpu} />
+        <TryItCompute value={compute} onChange={setCompute} disabled={loaded}
+          runProviderId={runProviderId} visibleDevices={visibleDevices} />
+        <PersistentControls runId={runId} compute={compute} onRunningChange={setLoaded} />
         <div className="flex flex-col gap-1">
           <span className="text-xs text-muted-foreground">text</span>
           <Textarea
@@ -2153,19 +1973,6 @@ function TtsPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
               placeholder="(default)"
               className="h-8 w-[200px] text-sm"
             />
-          </div>
-          <div className="flex flex-col gap-1">
-            <span className="text-xs text-muted-foreground">run on</span>
-            <Select value={gpu} onValueChange={setGpu}>
-              <SelectTrigger className="h-8 w-[180px] text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {gpuIds.map((g) => <SelectItem key={g} value={g} className="text-xs">GPU {g}</SelectItem>)}
-                <SelectItem value="auto" className="text-xs">Auto (most-free GPU)</SelectItem>
-                <SelectItem value="cpu" className="text-xs">CPU</SelectItem>
-              </SelectContent>
-            </Select>
           </div>
           <Button type="button" onClick={onSynthesize} disabled={busy || !text.trim()} className="ml-auto">
             {busy

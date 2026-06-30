@@ -32,6 +32,7 @@ import { deployEndpoint } from "../actions";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
+import { GPU_CHOICES, GPU_COUNT_CHOICES, capacityHint } from "@/lib/gpu-catalog";
 import type { ProviderRecord, ProviderBalance, VmAvailability } from "@/lib/types";
 
 // vLLM is what the live RunPod template runs. SGLang is a placeholder for a
@@ -40,67 +41,6 @@ const FRAMEWORKS = [
   { value: "vllm", label: "vLLM", available: true },
   { value: "sglang", label: "SGLang (coming soon)", available: false },
 ] as const;
-
-// Curated RunPod GPU catalog — values match runpod_provider._GPU_NAME_MAP.
-// vramGb feeds the dynamic capacity hint (recomputed with gpuCount).
-// Catalog last reviewed: 2026-05.
-type GpuChoice = { value: string; label: string; group: string; vramGb: number };
-const GPU_CHOICES: GpuChoice[] = [
-  // Datacenter — current gen
-  { value: "B200", label: "B200 (180 GB)", group: "Datacenter — current", vramGb: 180 },
-  { value: "H200", label: "H200 (141 GB)", group: "Datacenter — current", vramGb: 141 },
-  { value: "H100", label: "H100 SXM (80 GB)", group: "Datacenter — current", vramGb: 80 },
-  { value: "H100-PCIe", label: "H100 PCIe (80 GB)", group: "Datacenter — current", vramGb: 80 },
-  { value: "H100-NVL", label: "H100 NVL (94 GB)", group: "Datacenter — current", vramGb: 94 },
-  { value: "MI300X", label: "MI300X (192 GB)", group: "Datacenter — current", vramGb: 192 },
-  // Datacenter — Ampere
-  { value: "A100", label: "A100 PCIe (80 GB)", group: "Datacenter — Ampere", vramGb: 80 },
-  { value: "A100-SXM", label: "A100 SXM (80 GB)", group: "Datacenter — Ampere", vramGb: 80 },
-  { value: "A100-40G", label: "A100 (40 GB)", group: "Datacenter — Ampere", vramGb: 40 },
-  { value: "A40", label: "A40 (48 GB)", group: "Datacenter — Ampere", vramGb: 48 },
-  { value: "A10", label: "A10 (24 GB)", group: "Datacenter — Ampere", vramGb: 24 },
-  // Datacenter — Ada
-  { value: "L40S", label: "L40S (48 GB)", group: "Datacenter — Ada", vramGb: 48 },
-  { value: "L40", label: "L40 (48 GB)", group: "Datacenter — Ada", vramGb: 48 },
-  { value: "L4", label: "L4 (24 GB)", group: "Datacenter — Ada", vramGb: 24 },
-  // Workstation
-  { value: "RTX6000-Ada", label: "RTX 6000 Ada (48 GB)", group: "Workstation", vramGb: 48 },
-  { value: "A6000", label: "RTX A6000 (48 GB)", group: "Workstation", vramGb: 48 },
-  { value: "A5000", label: "RTX A5000 (24 GB)", group: "Workstation", vramGb: 24 },
-  { value: "A4000", label: "RTX A4000 (16 GB)", group: "Workstation", vramGb: 16 },
-  // Consumer
-  { value: "RTX5090", label: "RTX 5090 (32 GB)", group: "Consumer", vramGb: 32 },
-  { value: "RTX4090", label: "RTX 4090 (24 GB)", group: "Consumer", vramGb: 24 },
-  { value: "RTX3090Ti", label: "RTX 3090 Ti (24 GB)", group: "Consumer", vramGb: 24 },
-  { value: "RTX3090", label: "RTX 3090 (24 GB)", group: "Consumer", vramGb: 24 },
-];
-
-const GPU_COUNT_CHOICES = [1, 2, 4, 8] as const;
-
-// Estimate the largest model that fits given VRAM budget. Rough formula
-// calibrated against vLLM defaults at moderate context (~4-8k) and small
-// batches; assumes ~45% of total VRAM is consumed by KV cache, activations,
-// and framework overhead, leaving ~55% for weights.
-//
-//   weights_budget = total_vram * 0.55
-//   FP16: 2 bytes/param  → max_B = budget / 2
-//   4-bit (AWQ/GPTQ ~0.6 effective): max_B = budget / 0.6
-//
-// Real-world capacity drops fast at long context — these are upper bounds.
-function capacityHint(vramPerGpu: number, count: number): string {
-  const total = vramPerGpu * count;
-  const weightsBudget = total * 0.55;
-  const fp16B = weightsBudget / 2;
-  const q4B = weightsBudget / 0.6;
-  const fp16Str = fp16B >= 100 ? `${Math.round(fp16B / 10) * 10}B` : `${Math.round(fp16B)}B`;
-  const q4Str = q4B >= 100 ? `${Math.round(q4B / 10) * 10}B` : `${Math.round(q4B)}B`;
-  const totalStr = total >= 100 ? `${Math.round(total)} GB` : `${total} GB`;
-  const tpHint =
-    count === 1
-      ? ""
-      : ` · TP=${count} sharding`;
-  return `${totalStr} VRAM${tpHint} · fits ~${fp16Str} FP16 / ~${q4Str} 4-bit (KV-cache budgeted)`;
-}
 
 const MAX_WORKERS = 1;
 

@@ -51,14 +51,19 @@ function slugify(s: string): string {
 }
 
 export function MergeCard({
-  labelDatasets,
+  mergeableDatasets,
   s3Storages,
+  initialSelected = [],
 }: {
-  labelDatasets: DatasetRecord[];
+  mergeableDatasets: DatasetRecord[];
   s3Storages: StorageRecord[];
+  initialSelected?: string[];
 }) {
   const router = useRouter();
-  const [selected, setSelected] = useState<string[]>([]);
+  // Seed from the ?ids= preselection, kept in list order (stable concat order).
+  const [selected, setSelected] = useState<string[]>(() =>
+    mergeableDatasets.map((d) => d.id).filter((id) => initialSelected.includes(id)),
+  );
   const [name, setName] = useState("");
   const [target, setTarget] = useState<"hf" | "s3">("s3");
   const [outRepo, setOutRepo] = useState("");
@@ -103,10 +108,10 @@ export function MergeCard({
     if (running && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [log, running]);
 
-  const byId = new Map(labelDatasets.map((d) => [d.id, d]));
+  const byId = new Map(mergeableDatasets.map((d) => [d.id, d]));
   const triggerLabel =
     selected.length === 0
-      ? "Pick label datasets"
+      ? "Pick datasets"
       : selected.length === 1
         ? byId.get(selected[0])?.name ?? selected[0]
         : `${selected.length} datasets`;
@@ -125,7 +130,7 @@ export function MergeCard({
   async function run() {
     setErr(null);
     if (selected.length < 2) {
-      setErr("Select at least 2 label datasets to merge.");
+      setErr("Select at least 2 datasets to merge.");
       return;
     }
     if (target === "hf" && (!outRepo.trim() || !outRepo.includes("/"))) {
@@ -169,30 +174,31 @@ export function MergeCard({
       <CardHeader className="flex flex-col gap-0.5">
         <CardTitle className="text-base">Merge → one combined audio dataset</CardTitle>
         <span className="text-xs text-muted-foreground">
-          Each selected label dataset&apos;s clips are downloaded and paired with their transcription,
+          Each selected dataset&apos;s clips are downloaded and paired with their transcription,
           then concatenated and written as a single dataset. Runs on the gateway; watch progress below.
         </span>
       </CardHeader>
       <CardContent>
         <div className="space-y-4">
-          {labelDatasets.length < 2 && (
+          {mergeableDatasets.length < 2 && (
             <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-              You need at least 2 <span className="font-mono">label</span> datasets to merge. Import each
-              labeling-platform project on{" "}
+              You need at least 2 <span className="font-mono">label</span> or{" "}
+              <span className="font-mono">s3</span> datasets to merge. Import a labeling project or
+              materialize an audio dataset on{" "}
               <Link href="/datasets/new" className="font-medium underline underline-offset-2">
                 New dataset
               </Link>{" "}
-              (kind = Labeling platform) first.
+              first.
             </p>
           )}
 
           <div className="space-y-1">
-            <Label className="text-xs">Label datasets to merge</Label>
+            <Label className="text-xs">Datasets to merge</Label>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
                   variant="outline"
-                  disabled={running || labelDatasets.length === 0}
+                  disabled={running || mergeableDatasets.length === 0}
                   className="h-9 w-full justify-between px-3 text-xs font-normal sm:w-96"
                 >
                   <span className="truncate">{triggerLabel}</span>
@@ -200,7 +206,7 @@ export function MergeCard({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" className="max-h-72 w-80 overflow-y-auto">
-                {labelDatasets.map((d) => (
+                {mergeableDatasets.map((d) => (
                   <DropdownMenuCheckboxItem
                     key={d.id}
                     checked={selected.includes(d.id)}
@@ -209,12 +215,15 @@ export function MergeCard({
                       setSelected((prev) => {
                         const next = c ? [...prev, d.id] : prev.filter((x) => x !== d.id);
                         // keep selection in list order (stable concat order)
-                        return labelDatasets.map((x) => x.id).filter((x) => next.includes(x));
+                        return mergeableDatasets.map((x) => x.id).filter((x) => next.includes(x));
                       });
                     }}
                     className="text-xs"
                   >
                     <span className="truncate">{d.name}</span>
+                    <span className="ml-1 shrink-0 rounded bg-muted px-1 font-mono text-[10px] uppercase text-muted-foreground">
+                      {d.kind}
+                    </span>
                     {typeof d.num_rows === "number" ? (
                       <span className="ml-1 text-muted-foreground">· {d.num_rows} rows</span>
                     ) : null}
@@ -350,7 +359,7 @@ export function MergeCard({
             <ArrowRight className="h-3.5 w-3.5" />
           </Link>
         )}
-        <Button onClick={run} disabled={running || starting || labelDatasets.length < 2}>
+        <Button onClick={run} disabled={running || starting || mergeableDatasets.length < 2}>
           {running || starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <GitMerge className="h-4 w-4" />}
           {running ? "Merging…" : "Merge datasets"}
         </Button>

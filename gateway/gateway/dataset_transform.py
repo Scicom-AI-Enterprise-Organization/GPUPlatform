@@ -67,6 +67,8 @@ async def start_transform(
     hf_repo: Optional[str],
     storage_id: Optional[str],
     s3_folder: Optional[str] = None,
+    test_split_pct: Optional[float] = None,
+    test_split_count: Optional[int] = None,
 ) -> None:
     """Mark the dataset running and kick off the background job."""
     async with session_factory()() as s:
@@ -76,7 +78,10 @@ async def start_transform(
         d.transform_status = "running"
         d.transform_log = _append_log(None, f"transform queued (target={target})")
         await s.commit()
-    task = asyncio.create_task(_run(dataset_id, target, hf_repo, storage_id, s3_folder))
+    task = asyncio.create_task(_run(
+        dataset_id, target, hf_repo, storage_id, s3_folder,
+        test_split_pct=test_split_pct, test_split_count=test_split_count,
+    ))
     _active[dataset_id] = task
     task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
 
@@ -209,6 +214,8 @@ async def _run(
     hf_repo: Optional[str],
     storage_id: Optional[str],
     s3_folder: Optional[str] = None,
+    test_split_pct: Optional[float] = None,
+    test_split_count: Optional[int] = None,
 ) -> None:
     from fastapi.concurrency import run_in_threadpool
     from sqlalchemy import select
@@ -289,6 +296,14 @@ async def _run(
                 return
         await _log(dataset_id, f"matched {len(pairs)} rows to audio; building output …")
 
+        # Optional held-out test split: reassign each row's split to train/test.
+        if test_split_pct is not None or test_split_count is not None:
+            pairs, n_test = _apply_test_split(pairs, test_split_pct, test_split_count)
+            await _log(
+                dataset_id,
+                f"test split → {n_test} test / {len(pairs) - n_test} train rows",
+            )
+
         # Non-destructive: build the output, then create a NEW "-audio" dataset
         # pointing at it. The source dataset is left intact + re-runnable.
         if target == "hf":
@@ -349,7 +364,7 @@ async def start_merge(
             return
         d.transform_status = "running"
         d.transform_log = _append_log(
-            None, f"merge queued · {len(source_ids)} label source(s) → {target}")
+            None, f"merge queued · {len(source_ids)} source(s) → {target}")
         await s.commit()
     task = asyncio.create_task(_run_merge(
         output_id, source_ids=source_ids, target=target, hf_repo=hf_repo,
@@ -404,17 +419,30 @@ async def _run_merge(
                 if sd is None:
                     await _finish(output_id, "failed", f"source dataset {sid} not found")
                     return
-                if sd.kind != "label":
+                if sd.kind not in ("label", "s3"):
                     await _finish(output_id, "failed",
-                                  f"source {sid} is kind={sd.kind}; merge supports kind=label sources only")
+                                  f"source {sid} is kind={sd.kind}; merge supports kind=label and kind=s3 sources")
                     return
-                sources.append({
-                    "id": sid, "name": sd.name,
-                    "base_url": sd.label_base_url, "project_id": sd.label_project_id,
-                    "status": sd.label_status or "approved",
-                    "until": sd.label_updated_until,
-                    "token": await _label_token(sd, s),
-                })
+                if sd.kind == "label":
+                    sources.append({
+                        "id": sid, "name": sd.name, "kind": "label",
+                        "base_url": sd.label_base_url, "project_id": sd.label_project_id,
+                        "status": sd.label_status or "approved",
+                        "until": sd.label_updated_until,
+                        "token": await _label_token(sd, s),
+                    })
+                else:  # s3 — read its materialised metadata.csv + audio/ folder.
+                    src_storage = await s.get(Storage, sd.storage_id) if sd.storage_id else None
+                    src_target, _src_prefix = (
+                        _s3_target_and_prefix(src_storage) if src_storage else (None, "")
+                    )
+                    sources.append({
+                        "id": sid, "name": sd.name, "kind": "s3",
+                        "s3_target": src_target,
+                        "s3_metadata_uri": sd.s3_metadata_uri,
+                        "audio_field": sd.audio_field or "audio",
+                        "transcription_field": sd.transcription_field or "transcription",
+                    })
 
         if target == "hf" and not (hf_repo and "/" in hf_repo):
             await _finish(output_id, "failed", "target HF repo must be owner/name")
@@ -425,20 +453,33 @@ async def _run_merge(
 
         all_pairs: list[tuple[str, str, str, dict]] = []
         for idx, src in enumerate(sources):
-            if not (src["base_url"] and src["project_id"] and src["token"]):
-                await _finish(output_id, "failed",
-                              f"source '{src['name']}' is not a fully-configured label dataset "
-                              f"(base URL, project, token)")
-                return
-            _cut = f", until={src['until']}" if src.get("until") else ""
-            await _log(output_id,
-                       f"[{idx + 1}/{len(sources)}] exporting '{src['name']}' "
-                       f"(project {src['project_id']}, status={src['status']}{_cut}) …")
             sub = os.path.join(work, f"src-{idx}")
-            pairs = await run_in_threadpool(
-                _label_pairs, src["base_url"], src["project_id"], src["token"],
-                src["status"], sub, f"s{idx}-", src["until"],
-            )
+            if src["kind"] == "label":
+                if not (src["base_url"] and src["project_id"] and src["token"]):
+                    await _finish(output_id, "failed",
+                                  f"source '{src['name']}' is not a fully-configured label dataset "
+                                  f"(base URL, project, token)")
+                    return
+                _cut = f", until={src['until']}" if src.get("until") else ""
+                await _log(output_id,
+                           f"[{idx + 1}/{len(sources)}] exporting '{src['name']}' "
+                           f"(project {src['project_id']}, status={src['status']}{_cut}) …")
+                pairs = await run_in_threadpool(
+                    _label_pairs, src["base_url"], src["project_id"], src["token"],
+                    src["status"], sub, f"s{idx}-", src["until"],
+                )
+            else:  # s3
+                if not (src["s3_target"] and src["s3_metadata_uri"]):
+                    await _finish(output_id, "failed",
+                                  f"source '{src['name']}' is an s3 dataset without storage / a metadata file")
+                    return
+                await _log(output_id,
+                           f"[{idx + 1}/{len(sources)}] reading s3 dataset '{src['name']}' "
+                           f"({src['s3_metadata_uri']}) …")
+                pairs = await run_in_threadpool(
+                    _s3_pairs, src["s3_target"], src["s3_metadata_uri"],
+                    src["audio_field"], src["transcription_field"], sub, f"s{idx}-", progress,
+                )
             await _log(output_id, f"  ↳ {len(pairs)} clip(s) from '{src['name']}'")
             all_pairs.extend(pairs)
 
@@ -925,6 +966,85 @@ def _label_pairs(
     return pairs
 
 
+def _s3_pairs(
+    s3_target,
+    s3_metadata_uri: str,
+    audio_field: str,
+    transcription_field: str,
+    work: str,
+    name_prefix: str = "",
+    progress: Optional[Callable[..., None]] = None,
+) -> list[tuple[str, str, str, dict]]:
+    """Read a materialised S3 audio dataset (a metadata CSV + an `audio/` folder,
+    the layout `_materialise_s3` writes) and download each clip into `work/audio`,
+    returning [(split, abs_audio_path, transcription, extra)] — the SAME shape
+    `_label_pairs` produces, so the merge's HF/S3 writers are reused.
+
+    Audio keys are resolved as `{base}/audio/{basename}` under the metadata file's
+    folder; the CSV's audio cell may be a presigned URL, an s3:// uri, or a path —
+    only its basename matters. `name_prefix` keeps basenames unique across sources
+    (S3 keys collide on basename), matching `_label_pairs`'s merge contract."""
+    import csv
+    import io as _io
+    from urllib.parse import unquote, urlparse
+
+    from . import bench
+
+    u = urlparse(s3_metadata_uri or "")
+    meta_key = (u.path if u.scheme == "s3" else (s3_metadata_uri or "")).lstrip("/")
+    if not meta_key:
+        raise RuntimeError(f"unusable s3 metadata uri: {s3_metadata_uri!r}")
+    base = meta_key.rsplit("/", 1)[0] if "/" in meta_key else ""
+
+    text = bench.s3_get_text(meta_key, s3_target)
+    if not text:
+        raise RuntimeError(f"could not read metadata at {s3_metadata_uri}")
+    reader = csv.DictReader(_io.StringIO(text))
+    cols = reader.fieldnames or []
+    a_col = audio_field if audio_field in cols else ("audio" if "audio" in cols else None)
+    t_col = transcription_field if transcription_field in cols else (
+        "transcription" if "transcription" in cols else None
+    )
+    if not a_col:
+        raise RuntimeError(f"audio column '{audio_field}' not found in {meta_key} (have {cols})")
+
+    audio_dir = Path(work) / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    rows = list(reader)
+    total = len(rows)
+    every = max(1, total // 50)
+    skip = {a_col, t_col, "split"}
+    pairs: list[tuple[str, str, str, dict]] = []
+    for i, r in enumerate(rows):
+        ref = (r.get(a_col) or "").strip()
+        if not ref:
+            continue
+        basename = unquote(os.path.basename(urlparse(ref).path)) or f"row-{i}.wav"
+        # Prefer the {base}/audio/{basename} key (re-signed by our own client, so
+        # an expired URL in the CSV doesn't bite); fall back to the raw URL.
+        key = f"{base}/audio/{basename}" if base else f"audio/{basename}"
+        data = bench.s3_get_bytes(key, s3_target)
+        if data is None and ref.lower().startswith(("http://", "https://")):
+            try:
+                import httpx
+                rr = httpx.get(ref, timeout=120)
+                rr.raise_for_status()
+                data = rr.content
+            except Exception:  # noqa: BLE001 — skip a row we can't fetch
+                data = None
+        if data is None:
+            continue
+        dest = audio_dir / f"{name_prefix}{basename}"
+        dest.write_bytes(data)
+        text_val = (r.get(t_col) or "") if t_col else ""
+        split = (r.get("split") or "train").strip() or "train"
+        extra = {k: v for k, v in r.items() if k not in skip and isinstance(v, str) and v != ""}
+        pairs.append((split, str(dest), str(text_val), extra))
+        if progress and (i % every == 0 or i == total - 1):
+            progress("download_s3", i + 1, total)
+    return pairs
+
+
 def _extract_archives(work: str) -> int:
     """Unzip/untar every archive under `work` in place. Idempotent: an archive
     already expanded on a previous run (a sibling `.extracted` marker exists) is
@@ -1143,6 +1263,37 @@ def _build_pairs(
         extra = {str(k): s for k, v in r.items() if k not in skip and (s := _scalar(v)) is not None}
         pairs.append((str(split), path, str(text), extra))
     return pairs
+
+
+def _apply_test_split(
+    pairs: list[tuple[str, str, str, dict]],
+    pct: Optional[float],
+    count: Optional[int],
+    seed: int = 42,
+) -> tuple[list[tuple[str, str, str, dict]], int]:
+    """Reassign each pair's split to `train`/`test`, carving out a random held-out
+    subset (collapsing any source splits). `count` (absolute) wins over `pct`
+    (percentage of all matched rows). Deterministic for a given `seed` so re-runs
+    reproduce the same split. Returns (pairs, n_test)."""
+    import random
+
+    n = len(pairs)
+    if count is not None:
+        k = count
+    elif pct is not None:
+        k = round(n * pct / 100.0)
+    else:
+        return pairs, 0
+    k = max(0, min(k, n))
+    if k == 0:
+        return [("train", path, text, extra) for _split, path, text, extra in pairs], 0
+    idx = list(range(n))
+    random.Random(seed).shuffle(idx)
+    test_idx = set(idx[:k])
+    return [
+        ("test" if i in test_idx else "train", path, text, extra)
+        for i, (_split, path, text, extra) in enumerate(pairs)
+    ], k
 
 
 def _push_hf(pairs: list[tuple[str, str, str, dict]], transcription_field: str, out_repo: str, token: Optional[str]) -> None:

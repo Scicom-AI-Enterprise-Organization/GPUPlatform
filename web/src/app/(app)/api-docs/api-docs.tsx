@@ -1073,9 +1073,9 @@ data: end` }],
   --data-urlencode "text=Hello, this is a test." --data-urlencode "gpu=auto"`,
     },
     responses: [
-      { code: 200, codeLabel: "OK", doc: <>Decode <code>audio_b64</code> to a <code>.wav</code> (PCM16 at <code>sample_rate</code>, typically 24 kHz). <code>gen_text</code> is the raw speech-token generation before NeuCodec.</>, sample: `{
+      { code: 200, codeLabel: "OK", doc: <>Decode <code>audio_b64</code> to a <code>.wav</code> (PCM16 at <code>sample_rate</code>, 44.1 kHz with the d20 NeuCodec decoder). <code>gen_text</code> is the raw speech-token generation before NeuCodec.</>, sample: `{
   "audio_b64": "UklGR…",
-  "sample_rate": 24000,
+  "sample_rate": 44100,
   "device": "cuda",
   "prompt": "<|im_start|>Hello, this is a test.<|speech_start|>",
   "gen_text": "<|s_123|><|s_456|>…<|im_end|>",

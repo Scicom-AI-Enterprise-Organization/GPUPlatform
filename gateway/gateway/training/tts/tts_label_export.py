@@ -23,6 +23,10 @@ Config (JSON via --config):
    split_subdir,               # "" (flat root) | "train" | "test" — subdir under packed_uri with index.json
    random,                     # true → random.sample N (train); false → first N (test)
    n_samples, seed,
+   reject_keywords?,           # phrases to drop from the text pool (case-insensitive, space-collapsed)
+   label_speakers?,            # speaker names to voice / group by
+   per_speaker?,               # true → N clips from EACH speaker's own utterances (else round-robin)
+   label_speaker_prefix?,      # prefix each task transcript with the speaker name
    speaker?, gpu?, max_new_tokens?,
    upload_bucket, upload_prefix}   # upload_prefix = full key prefix, no trailing slash
 """
@@ -62,20 +66,57 @@ def _upload_client(cfg: dict):
 def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
     """Download the chosen packed split + decode utterances → [(prompt_text, ref_text, speaker)].
     For the train split a random sample of N is taken (scanning a bounded pool);
-    for the test split the first N well-formed utterances are used. When
-    cfg["label_speakers"] is given, the N clips are balanced round-robin across
-    those speaker names (speaker is "" otherwise)."""
+    for the test split the first N well-formed utterances are used.
+
+    Two optional filters/groupings (config):
+      * reject_keywords — drop any utterance whose transcript contains one of these
+        phrases (case-insensitive, whitespace-collapsed, so "E M G S" matches any
+        spacing). Applied before sampling, in every mode.
+      * label_speakers + per_speaker — see below.
+
+    Speaker handling:
+      * per_speaker=true (and label_speakers given): take N clips from EACH listed
+        speaker's OWN utterances (matched on the packed "<|im_start|>{speaker}:"
+        prefix, case-insensitive). The gateway later groups these into one project
+        per speaker. Total returned ≈ N × len(speakers).
+      * label_speakers given, per_speaker=false: balance N clips round-robin across
+        the names (re-voicing arbitrary transcripts) — the original behaviour.
+      * no speakers: keep each clip's original packed voice (speaker recovered from
+        the prefix so the optional transcription prefix can still tag it)."""
     import random as _random
+    import re as _re
 
     from transformers import AutoTokenizer
     # tts_eval lives in the same shipped dir; importing it pulls only stdlib.
-    from tts_eval import _read_packed, _utterance_parts
+    from tts_eval import _read_packed, _utterance_parts, _IM_START, _SPEECH_START
     from tts_infer import _download_model
 
     n = max(1, int(cfg.get("n_samples") or 8))
     packed_uri = cfg["packed_uri"]
     subdir = (cfg.get("split_subdir") or "").strip("/")
     is_random = bool(cfg.get("random"))
+    if is_random:
+        _random.seed(int(cfg.get("seed") or 42))
+
+    # Reject keywords: case-insensitive substring match on the transcript, with
+    # whitespace collapsed on BOTH sides so a spaced keyword ("E M G S") still
+    # matches a differently-spaced occurrence.
+    def _norm(s: str) -> str:
+        return _re.sub(r"\s+", " ", s or "").strip().lower()
+
+    reject = [k for k in (_norm(x) for x in (cfg.get("reject_keywords") or [])) if k]
+
+    def _rejected(text: str) -> bool:
+        t = _norm(text)
+        return any(k in t for k in reject)
+
+    # Recover a clip's source speaker from its "<|im_start|>{speaker}: …" prefix.
+    def _spk(pt: str) -> str:
+        left = pt.split(_SPEECH_START, 1)[0].replace(_IM_START, "").strip()
+        return left.split(":", 1)[0].strip() if ":" in left else ""
+
+    speakers = [str(s).strip() for s in (cfg.get("label_speakers") or []) if str(s).strip()]
+    per_speaker = bool(cfg.get("per_speaker")) and bool(speakers)
 
     # Reuse the model download helper to pull the packed shards (same listing /
     # size-cached fetch); point it at the packed prefix instead of the model.
@@ -100,11 +141,50 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
             pick = next((s for s in ("train", "default") if s in subs), subs[0] if subs else None)
             if pick:
                 read_dir = os.path.join(packed_dir, pick)
-    log(f"reading texts from {read_dir} (random={is_random}, want {n})")
+    log(f"reading texts from {read_dir} (random={is_random}, want {n}"
+        f"{', per-speaker' if per_speaker else ''}{f', rejecting {len(reject)} keyword(s)' if reject else ''})")
 
     tok = AutoTokenizer.from_pretrained(cfg["model_dir"])
-    # Scan a bounded pool of utterances (a packed record holds several) so a huge
-    # train split doesn't decode end-to-end just to sample N.
+
+    if per_speaker:
+        # Bucket utterances by their source speaker (case-insensitive match to the
+        # requested names), then take N from each speaker's own clips. Scan a
+        # bounded pool per speaker so a huge split doesn't decode end-to-end.
+        per_pool = n if not is_random else max(n * 20, 500)
+        want = {s.lower(): s for s in speakers}             # lower → canonical name
+        buckets: dict[str, list[tuple[str, str, str]]] = {s: [] for s in speakers}
+        scan_cap = per_pool * len(speakers)
+        scanned = 0
+        for utt in _read_packed(read_dir):
+            if scanned >= scan_cap or all(len(buckets[s]) >= per_pool for s in speakers):
+                break
+            parts = _utterance_parts(tok, utt)
+            if parts is None:
+                continue
+            prompt_text, _ref_codes, ref_text = parts
+            ref_text = (ref_text or "").strip()
+            if not ref_text or _rejected(ref_text):
+                continue
+            canon = want.get(_spk(prompt_text).lower())
+            if canon is None or len(buckets[canon]) >= per_pool:
+                continue
+            buckets[canon].append((prompt_text, ref_text, canon))
+            scanned += 1
+        out: list[tuple[str, str, str]] = []
+        for spk in speakers:
+            b = buckets[spk]
+            if not b:
+                log(f"speaker {spk!r}: no matching clips in the dataset — skipped")
+                continue
+            sel = _random.sample(b, min(n, len(b))) if is_random else b[:n]
+            out.extend(sel)
+        from collections import Counter
+        bal = ", ".join(f"{s}×{c}" for s, c in sorted(Counter(s for _, _, s in out).items()))
+        log(f"per-speaker selection ({len(out)} clip(s)): {bal or 'none'}")
+        return out
+
+    # Single-pool modes: scan a bounded pool of utterances (a packed record holds
+    # several) so a huge train split doesn't decode end-to-end just to sample N.
     pool_cap = n if not is_random else max(n * 20, 500)
     pool: list[tuple[str, str]] = []
     for utt in _read_packed(read_dir):
@@ -113,27 +193,21 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
             continue
         prompt_text, _ref_codes, ref_text = parts
         ref_text = (ref_text or "").strip()
-        if not ref_text:
+        if not ref_text or _rejected(ref_text):
             continue
         pool.append((prompt_text, ref_text))
         if len(pool) >= pool_cap:
             break
     if not pool:
         return []
-    if is_random:
-        _random.seed(int(cfg.get("seed") or 42))
-        selected = _random.sample(pool, min(n, len(pool)))
-    else:
-        selected = pool[:n]
+    selected = _random.sample(pool, min(n, len(pool))) if is_random else pool[:n]
 
     # Balance the generation across named speakers: reassign each clip's voice
     # round-robin so e.g. 2 speakers + 32 samples → 16 each. The model is
     # speaker-name-conditioned (prompt "<|im_start|>{speaker}: {text}<|speech_start|>",
     # mirrors pack_stage1.py / tts_infer), so we keep each clip's transcript but
     # swap in the chosen speaker name. No speakers given → original packed voices.
-    speakers = [str(s).strip() for s in (cfg.get("label_speakers") or []) if str(s).strip()]
     if speakers:
-        from tts_eval import _IM_START, _SPEECH_START
         out = []
         for i, (_pt, ref_text) in enumerate(selected):
             spk = speakers[i % len(speakers)]
@@ -142,15 +216,7 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
         bal = ", ".join(f"{s}×{c}" for s, c in sorted(Counter(s for _, _, s in out).items()))
         log(f"balancing {len(out)} clip(s) across {len(speakers)} speaker(s): {bal}")
         return out
-    # No balancing: keep each clip's original packed voice, but recover its speaker
-    # name (the "<|im_start|>{speaker}: …" prefix) so the optional transcription
-    # prefix can still tag it.
-    from tts_eval import _IM_START, _SPEECH_START
-
-    def _spk(pt: str) -> str:
-        left = pt.split(_SPEECH_START, 1)[0].replace(_IM_START, "").strip()
-        return left.split(":", 1)[0].strip() if ":" in left else ""
-
+    # No balancing: keep each clip's original packed voice.
     return [(pt, rt, _spk(pt)) for (pt, rt) in selected]
 
 
@@ -173,7 +239,8 @@ def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
     tok = AutoTokenizer.from_pretrained(cfg["model_dir"])
     model = AutoModelForCausalLM.from_pretrained(cfg["model_dir"], torch_dtype=dtype)
     model = (model.cuda() if use_cuda else model).eval()
-    neu = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
+    # Scicom d20 fork: decoder_depth=20 matches the finetuned depth-20 decoder → 44.1 kHz.
+    neu = NeuCodec._from_pretrained(model_id="Scicom-intl/neucodec-44k-d20", decoder_depth=20).eval()
     neu = neu.cuda() if use_cuda else neu
     im_end_id = tok.convert_tokens_to_ids(_IM_END)
     max_new = int(cfg.get("max_new_tokens") or 1024)

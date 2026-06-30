@@ -32,7 +32,7 @@ export function ScopeToggle({ scope }: { scope: "mine" | "all" }) {
         className={cn(
           "inline-flex items-center gap-1.5 whitespace-nowrap rounded px-2.5 py-1 font-medium transition-colors",
           scope === "mine"
-            ? "bg-foreground text-background"
+            ? "bg-primary text-primary-foreground"
             : "text-muted-foreground hover:text-foreground",
         )}
       >
@@ -45,7 +45,7 @@ export function ScopeToggle({ scope }: { scope: "mine" | "all" }) {
         className={cn(
           "inline-flex items-center gap-1.5 whitespace-nowrap rounded px-2.5 py-1 font-medium transition-colors",
           scope === "all"
-            ? "bg-foreground text-background"
+            ? "bg-primary text-primary-foreground"
             : "text-muted-foreground hover:text-foreground",
         )}
       >

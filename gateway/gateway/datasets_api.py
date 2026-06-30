@@ -120,6 +120,11 @@ class TransformRequest(BaseModel):
     # target=s3: destination folder within the storage (under its configured
     # prefix). Blank → datasets/{id}/transformed.
     s3_folder: Optional[str] = None
+    # Optional held-out test split: carve a random subset of the matched rows into
+    # a `test` split (the rest become `train`), collapsing any source splits. Set
+    # at most one — a percentage (0–100) OR an absolute row count.
+    test_split_pct: Optional[float] = None
+    test_split_count: Optional[int] = None
 
 
 class TtsPackRequest(BaseModel):
@@ -189,11 +194,11 @@ class LlmPackRequest(BaseModel):
 
 
 class DatasetMergeRequest(BaseModel):
-    """Concatenate several existing kind=label datasets into ONE combined audio
+    """Concatenate several existing kind=label/s3 datasets into ONE combined audio
     dataset (their clips downloaded + paired with transcription, then written to
     HF or S3 — the SAME output a single-project transform produces). The merge
     runs as an in-process background job; status/log live on the NEW dataset."""
-    source_ids: list[str]                  # >= 2 kind=label datasets to concatenate
+    source_ids: list[str]                  # >= 2 kind=label/s3 datasets to concatenate
     target: str = "s3"                     # "hf" | "s3"
     hf_repo: Optional[str] = None          # owner/name (target=hf)
     storage_id: Optional[str] = None       # kind=s3 storage (target=s3)
@@ -2377,11 +2382,18 @@ async def transform_dataset(
         st = await session.get(Storage, req.storage_id)
         if st is None or st.kind != "s3":
             raise HTTPException(status_code=400, detail="storage_id must reference a kind=s3 storage")
+    if req.test_split_pct is not None and req.test_split_count is not None:
+        raise HTTPException(status_code=400, detail="set a test split by percentage OR by count, not both")
+    if req.test_split_pct is not None and not (0 <= req.test_split_pct < 100):
+        raise HTTPException(status_code=400, detail="test_split_pct must be ≥ 0 and < 100")
+    if req.test_split_count is not None and req.test_split_count < 0:
+        raise HTTPException(status_code=400, detail="test_split_count must be ≥ 0")
 
     from . import dataset_transform
     await dataset_transform.start_transform(
         dataset_id, req.target, (req.hf_repo or "").strip() or None, req.storage_id,
         s3_folder=(req.s3_folder or "").strip() or None,
+        test_split_pct=req.test_split_pct, test_split_count=req.test_split_count,
     )
     await audit_module.record(user, "dataset.transform", "dataset", dataset_id, d.name, details={"target": req.target})
     await session.refresh(d)
@@ -2558,7 +2570,7 @@ async def merge_datasets(
     user: User = Depends(require_section("datasets")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Concatenate >=2 kind=label datasets into one new audio dataset (HF or S3).
+    """Concatenate >=2 kind=label/s3 datasets into one new audio dataset (HF or S3).
     Creates the merged dataset row up front (transform_status=running) and runs
     the export+download+write in-process — poll GET /{new_id}."""
     ids: list[str] = []
@@ -2572,10 +2584,15 @@ async def merge_datasets(
     sources: list[Dataset] = []
     for sid in ids:
         d = await _require_dataset(session, sid, user)  # 404 / 403 as needed
-        if d.kind != "label":
+        if d.kind not in ("label", "s3"):
             raise HTTPException(
                 status_code=400,
-                detail=f"source {sid} is kind={d.kind}; merge currently supports kind=label datasets only",
+                detail=f"source {sid} is kind={d.kind}; merge supports kind=label and kind=s3 datasets",
+            )
+        if d.kind == "s3" and not d.s3_metadata_uri:
+            raise HTTPException(
+                status_code=400,
+                detail=f"source {sid} is an s3 dataset without a metadata file (s3_metadata_uri)",
             )
         sources.append(d)
 
@@ -2595,7 +2612,7 @@ async def merge_datasets(
         id=_gen_id(),
         owner_id=user.id,
         name=name[:255],
-        description=f"Merge of {len(sources)} label datasets ({', '.join(s.id for s in sources)})",
+        description=f"Merge of {len(sources)} datasets ({', '.join(s.id for s in sources)})",
         kind=("hf" if req.target == "hf" else "s3"),
         storage_id=(req.storage_id if req.target == "s3" else None),
         hf_repo=((req.hf_repo or "").strip() or None) if req.target == "hf" else None,

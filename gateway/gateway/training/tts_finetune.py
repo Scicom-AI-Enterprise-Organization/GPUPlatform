@@ -98,7 +98,11 @@ DEFAULT_VENV = "/share/autotrain-tts"
 DEPS = [
     "torch==2.9.1", "torchaudio==2.9.1", "transformers==4.57.3", "accelerate",
     "librosa", "soundfile", "datasets", "wandb", "boto3",
-    "neucodec", "pandas", "pyarrow", "multiprocess", "liger-kernel",
+    # Scicom neucodec fork — adds NeuCodec._from_pretrained(decoder_depth=…) + the
+    # 44.1 kHz depth-20 decoder used at encode/decode (model: Scicom-intl/neucodec-44k-d20).
+    # Imports as `neucodec`; bare git URL so pip derives the dist name from the repo.
+    "git+https://github.com/Scicom-AI-Enterprise-Organization/neucodec-44k.git",
+    "pandas", "pyarrow", "multiprocess", "liger-kernel",
     "git+https://github.com/apple/ml-cross-entropy",
     "peft>=0.11",  # LoRA (all-linear adapters, merged into base at save)
     "kernels",  # HF kernel-hub loader for the flash-attn-3 attn impl (fresh venvs)
@@ -122,9 +126,20 @@ def _ensure_venv(cfg: dict) -> str:
         pkgs.append("mlflow")
 
     def _present() -> bool:
+        # Also assert neucodec was installed from the Scicom fork (PEP 610
+        # direct_url.json carries the git URL) — a venv built with the old PyPI
+        # neucodec imports fine but lacks _from_pretrained(decoder_depth=…), so it
+        # must be reinstalled. Scan all dists for the org URL (the fork's dist name
+        # may differ from the `neucodec` import name); plain PyPI installs have none.
+        probe = (
+            "import torch, torchaudio, transformers, neucodec, pyarrow, boto3; "
+            "import importlib.metadata as _m; "
+            "assert any('Scicom-AI-Enterprise-Organization' in (d.read_text('direct_url.json') or '') "
+            "for d in _m.distributions()), 'neucodec not the Scicom fork'"
+        )
         try:
             subprocess.check_call(
-                [py, "-c", "import torch, torchaudio, transformers, neucodec, pyarrow, boto3"],
+                [py, "-c", probe],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             return True
