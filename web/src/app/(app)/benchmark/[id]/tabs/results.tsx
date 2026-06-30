@@ -680,6 +680,7 @@ function SweepChart({
 type SortKey =
   | "input_len"
   | "concurrency"
+  | "reasoning_effort"
   | "total_token_throughput"
   | "output_throughput"
   | "individual_tps"
@@ -688,6 +689,23 @@ type SortKey =
   | "itl"
   | "e2el"
   | "duration_s";
+
+// Order reasoning levels sensibly (none < low < medium < high) for sorting;
+// unknown labels sort after the known ones, "no reasoning control" first.
+const REASONING_RANK: Record<string, number> = {
+  none: 0,
+  minimal: 1,
+  low: 2,
+  medium: 3,
+  high: 4,
+  xhigh: 5,
+  max: 6,
+  on: 7,
+};
+function reasoningRank(v: string | null): number {
+  if (v == null) return -1;
+  return REASONING_RANK[v] ?? 50;
+}
 
 // Known result.json keys we render with friendly labels in the full-metrics
 // panel. Anything numeric NOT in here (or already shown elsewhere) is listed
@@ -817,11 +835,19 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
       return n;
     });
 
+  // Only show the reasoning column when at least one row carries a reasoning
+  // control (reasoning-effort sweeps) — keeps the table clean for plain runs.
+  const showReasoning = useMemo(
+    () => rows.some((r) => r.reasoning_effort != null),
+    [rows],
+  );
+
   const sorted = useMemo(() => {
     const get = (r: Row): number => {
       switch (sortKey) {
         case "input_len": return r.input_len;
         case "concurrency": return r.concurrency;
+        case "reasoning_effort": return reasoningRank(r.reasoning_effort);
         case "total_token_throughput": return r.total_token_throughput ?? -Infinity;
         case "output_throughput": return r.output_throughput ?? -Infinity;
         case "individual_tps": return perStreamOutputTps(r) ?? -Infinity;
@@ -862,6 +888,7 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
             <th className="w-8 px-2 py-2" />
             {header("input_len", "input_len", "left")}
             {header("concurrency", "concurrency")}
+            {showReasoning && header("reasoning", "reasoning_effort", "left")}
             {header("total tok/s", "total_token_throughput")}
             {header("output tok/s", "output_throughput")}
             {header("indiv tok/s", "individual_tps")}
@@ -891,6 +918,11 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
                   </td>
                   <td className="px-3 py-1.5 font-mono text-xs">in={r.input_len} · out={r.output_len}</td>
                   <td className="px-3 py-1.5 text-right font-mono text-xs">{r.concurrency}</td>
+                  {showReasoning && (
+                    <td className="px-3 py-1.5 font-mono text-xs">
+                      {r.reasoning_effort ?? "—"}
+                    </td>
+                  )}
                   <td className="px-3 py-1.5 text-right tabular-nums">
                     {r.total_token_throughput != null
                       ? Math.round(r.total_token_throughput).toLocaleString()
@@ -920,7 +952,7 @@ function SummaryTable({ rows, statMode }: { rows: Row[]; statMode: StatMode }) {
                 </tr>
                 {isOpen && (
                   <tr>
-                    <td colSpan={11} className="p-0">
+                    <td colSpan={showReasoning ? 12 : 11} className="p-0">
                       <RunMetricsPanel row={r} />
                     </td>
                   </tr>
