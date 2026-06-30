@@ -370,6 +370,25 @@ async def _run_bench_config(
         **_stat_block("itl", itls_flat),
         **_stat_block("e2el", e2els),
     }
+    # Surface the reasoning control (from extra_body) so the results table can
+    # label each sweep row (none/low/high/...) instead of every row looking
+    # identical. Only set when the config actually specifies one, so the web
+    # shows the column only for reasoning sweeps.
+    reasoning_label: Optional[str] = None
+    if extra_body:
+        _re = extra_body.get("reasoning_effort")
+        if _re is not None:
+            reasoning_label = str(_re)
+        else:
+            _ctk = extra_body.get("chat_template_kwargs")
+            if isinstance(_ctk, dict):
+                _et = _ctk.get("enable_thinking", _ctk.get("thinking"))
+                if _et is False:
+                    reasoning_label = "none"
+                elif _et is True:
+                    reasoning_label = "on"
+    if reasoning_label is not None:
+        result["reasoning_effort"] = reasoning_label
     # Heavy per-request arrays — only when save_detailed; the gateway strips these
     # before the DB anyway, but they bloat the streamed/stored file otherwise.
     if bench_cfg.get("_save_detailed"):

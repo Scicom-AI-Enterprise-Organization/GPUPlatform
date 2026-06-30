@@ -14,6 +14,9 @@ export type Row = {
   output_len: number;
   num_prompts: number;
   concurrency: number;
+  // Reasoning control for this sweep cell (from the bench config's extra_body):
+  // "none" | "low" | "medium" | "high" | "on" | … . null when not a reasoning sweep.
+  reasoning_effort: string | null;
   duration_s: number | null;
   output_throughput: number | null;
   request_throughput: number | null;
@@ -94,6 +97,8 @@ export function rowFromJson(filename: string, json: Record<string, unknown>): Ro
     output_len: dims.output_len,
     num_prompts: (num(json.num_prompts) ?? dims.num_prompts) || 0,
     concurrency: (num(json.max_concurrency) ?? dims.concurrency) || 0,
+    reasoning_effort:
+      typeof json.reasoning_effort === "string" ? json.reasoning_effort : null,
     duration_s: num(json.duration),
     output_throughput: num(json.output_throughput),
     request_throughput: num(json.request_throughput),
