@@ -75,6 +75,14 @@ export function LabelExportTab({
   const [rejectKeywords, setRejectKeywords] = useState(arr("label_reject_keywords"));
   const [perSpeaker, setPerSpeaker] = useState(!!lcfg.label_per_speaker);
 
+  // ---- LLM label export (task_type=llm): generate responses from the trained model
+  // and seed a Label-platform human_mos project instead of synthesizing audio clips. ----
+  const isLlm = run.task_type === "llm";
+  const [llmEvalDatasetId, setLlmEvalDatasetId] = useState(str("llm_label_eval_dataset_id"));
+  const [llmSamples, setLlmSamples] = useState(num("llm_label_samples", 110));
+  const [llmAxes, setLlmAxes] = useState(arr("llm_label_mos_axes") || "Relevance, Accuracy, Helpfulness, Tone");
+  const [llmMaxNewTokens, setLlmMaxNewTokens] = useState(num("llm_label_max_new_tokens", 512));
+
   // ---- Run-on (pod card) ----
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [target, setTarget] = useState<"cloud" | "vm">(str("label_run_on") === "cloud" ? "cloud" : "vm");
@@ -178,13 +186,22 @@ export function LabelExportTab({
         token: tokenMode === "paste" ? (token.trim() || undefined) : undefined,
         token_secret: tokenMode === "secret" ? (tokenSecret || null) : null,
         project_name: project.trim() || null,
-        samples,
-        mos_axes: axes.split(",").map((s) => s.trim()).filter(Boolean),
-        speakers: speakers.split(",").map((s) => s.trim()).filter(Boolean),
-        speaker_prefix: speakerPrefix,
-        reject_keywords: rejectKeywords.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
-        per_speaker: perSpeaker,
-        tts_codec: codec,
+        ...(isLlm
+          ? {
+              llm_eval_dataset_id: llmEvalDatasetId.trim() || null,
+              llm_samples: llmSamples,
+              llm_mos_axes: llmAxes.split(",").map((s) => s.trim()).filter(Boolean),
+              llm_max_new_tokens: llmMaxNewTokens,
+            }
+          : {
+              samples,
+              mos_axes: axes.split(",").map((s) => s.trim()).filter(Boolean),
+              speakers: speakers.split(",").map((s) => s.trim()).filter(Boolean),
+              speaker_prefix: speakerPrefix,
+              reject_keywords: rejectKeywords.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
+              per_speaker: perSpeaker,
+              tts_codec: codec,
+            }),
         run_on: target,
         provider_id: target === "vm" ? vmProviderId : runpodProviderId,
         gpu_type: gpuType,
@@ -246,8 +263,9 @@ export function LabelExportTab({
   return (
     <div className="space-y-5">
       <p className="text-sm text-muted-foreground">
-        Synthesize {samples} clip{samples === 1 ? "" : "s"} from this run&apos;s trained model and create a
-        Label-platform recording project (MOS rating), seeded with them. Runs in the background; watch the Logs tab.
+        {isLlm
+          ? `Generate ${llmSamples} response${llmSamples === 1 ? "" : "s"} from this run's trained model and create a Label-platform human_mos project seeded with them. Runs in the background; watch the Logs tab.`
+          : `Synthesize ${samples} clip${samples === 1 ? "" : "s"} from this run's trained model and create a Label-platform recording project (MOS rating), seeded with them. Runs in the background; watch the Logs tab.`}
       </p>
 
       {/* Run on — same card as serverless/new */}
@@ -502,45 +520,74 @@ export function LabelExportTab({
             </Select>
           )}
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="space-y-1.5">
-            <label className="text-xs uppercase tracking-wide text-muted-foreground">Project name</label>
-            <Input value={project} placeholder={`${run.name}-eval`} onChange={(e) => setProject(e.target.value)} />
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-xs uppercase tracking-wide text-muted-foreground">Samples</label>
-            <Input type="number" min={1} value={samples}
-              onChange={(e) => setSamples(Math.max(1, Number.parseInt(e.target.value, 10) || 1))} />
-          </div>
-        </div>
         <div className="space-y-1.5">
-          <label className="text-xs uppercase tracking-wide text-muted-foreground">MOS axes</label>
-          <Input value={axes} placeholder="Naturalness, Intelligibility, Noise" onChange={(e) => setAxes(e.target.value)} />
+          <label className="text-xs uppercase tracking-wide text-muted-foreground">Project name</label>
+          <Input value={project} placeholder={`${run.name}-eval`} onChange={(e) => setProject(e.target.value)} />
         </div>
-        <div className="space-y-1.5">
-          <label className="text-xs uppercase tracking-wide text-muted-foreground">Reject keywords (optional)</label>
-          <Input value={rejectKeywords} placeholder="EMGS, E M G S, Husein" onChange={(e) => setRejectKeywords(e.target.value)} />
-          <p className="text-xs text-muted-foreground">
-            Comma- or newline-separated. Text samples containing any phrase are dropped (case-insensitive, spacing-agnostic).
-          </p>
-        </div>
-        <div className="space-y-1.5">
-          <label className="text-xs uppercase tracking-wide text-muted-foreground">Speaker names (optional)</label>
-          <Input value={speakers} placeholder="speakerA, speakerB" onChange={(e) => setSpeakers(e.target.value)} />
-          <p className="text-xs text-muted-foreground">
-            {perSpeaker
-              ? `Comma-separated. One project per speaker, each from that speaker's own clips (${samples} per speaker). Names must match the dataset's speaker labels.`
-              : `Comma-separated. Balances the clips evenly across these voices (e.g. 2 speakers + ${samples} samples → ${Math.floor(samples / 2)} each). Blank → the dataset's original voices.`}
-          </p>
-        </div>
-        <label className="flex cursor-pointer items-center gap-2 text-sm">
-          <input type="checkbox" checked={perSpeaker} onChange={(e) => setPerSpeaker(e.target.checked)} className="h-4 w-4 accent-primary" />
-          <span>Separate project per speaker <span className="text-muted-foreground">(each from that speaker&apos;s own clips)</span></span>
-        </label>
-        <label className="flex cursor-pointer items-center gap-2 text-sm">
-          <input type="checkbox" checked={speakerPrefix} onChange={(e) => setSpeakerPrefix(e.target.checked)} className="h-4 w-4 accent-primary" />
-          <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
-        </label>
+        {isLlm ? (
+          <>
+            <div className="space-y-1.5">
+              <label className="text-xs uppercase tracking-wide text-muted-foreground">Eval dataset ID</label>
+              <Input className="font-mono" value={llmEvalDatasetId} placeholder="ds-xxxxxxxx"
+                onChange={(e) => setLlmEvalDatasetId(e.target.value)} />
+              <p className="text-xs text-muted-foreground">
+                Dataset ID of the kind=hf benchmark dataset (its JSONL rows are the prompts). Register it on the Datasets page after HF push.
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <label className="text-xs uppercase tracking-wide text-muted-foreground">Responses</label>
+                <Input type="number" min={1} value={llmSamples}
+                  onChange={(e) => setLlmSamples(Math.max(1, Number.parseInt(e.target.value, 10) || 1))} />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs uppercase tracking-wide text-muted-foreground">Max new tokens</label>
+                <Input type="number" min={64} step={64} value={llmMaxNewTokens}
+                  onChange={(e) => setLlmMaxNewTokens(Math.max(64, Number.parseInt(e.target.value, 10) || 512))} />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs uppercase tracking-wide text-muted-foreground">MOS axes</label>
+              <Input value={llmAxes} placeholder="Relevance, Accuracy, Helpfulness, Tone" onChange={(e) => setLlmAxes(e.target.value)} />
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="space-y-1.5">
+              <label className="text-xs uppercase tracking-wide text-muted-foreground">Samples</label>
+              <Input type="number" min={1} value={samples}
+                onChange={(e) => setSamples(Math.max(1, Number.parseInt(e.target.value, 10) || 1))} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs uppercase tracking-wide text-muted-foreground">MOS axes</label>
+              <Input value={axes} placeholder="Naturalness, Intelligibility, Noise" onChange={(e) => setAxes(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs uppercase tracking-wide text-muted-foreground">Reject keywords (optional)</label>
+              <Input value={rejectKeywords} placeholder="EMGS, E M G S, Husein" onChange={(e) => setRejectKeywords(e.target.value)} />
+              <p className="text-xs text-muted-foreground">
+                Comma- or newline-separated. Text samples containing any phrase are dropped (case-insensitive, spacing-agnostic).
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs uppercase tracking-wide text-muted-foreground">Speaker names (optional)</label>
+              <Input value={speakers} placeholder="speakerA, speakerB" onChange={(e) => setSpeakers(e.target.value)} />
+              <p className="text-xs text-muted-foreground">
+                {perSpeaker
+                  ? `Comma-separated. One project per speaker, each from that speaker's own clips (${samples} per speaker). Names must match the dataset's speaker labels.`
+                  : `Comma-separated. Balances the clips evenly across these voices (e.g. 2 speakers + ${samples} samples → ${Math.floor(samples / 2)} each). Blank → the dataset's original voices.`}
+              </p>
+            </div>
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input type="checkbox" checked={perSpeaker} onChange={(e) => setPerSpeaker(e.target.checked)} className="h-4 w-4 accent-primary" />
+              <span>Separate project per speaker <span className="text-muted-foreground">(each from that speaker&apos;s own clips)</span></span>
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input type="checkbox" checked={speakerPrefix} onChange={(e) => setSpeakerPrefix(e.target.checked)} className="h-4 w-4 accent-primary" />
+              <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
+            </label>
+          </>
+        )}
         </div>
       </Section>
 

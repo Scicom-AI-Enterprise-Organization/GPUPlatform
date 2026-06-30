@@ -316,6 +316,8 @@ export type LabelProjectCard = {
   dataset_id?: string | null;
   project_name?: string | null;
   speaker?: string | null;
+  // human_mos (LLM label export) projects carry a type discriminator.
+  project_type?: string | null;
 };
 
 export type TrainingResult = {

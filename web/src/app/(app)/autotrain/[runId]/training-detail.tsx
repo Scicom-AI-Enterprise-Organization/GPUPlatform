@@ -286,7 +286,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   // serverless-style "Run on" picker (VM or a fresh RunPod pod). `lcfg` is still
   // read below by the HF export.
   const lcfg = (run.config_json ?? {}) as Record<string, unknown>;
-  const canLabelExport = run.task_type === "tts" && run.status === "done";
+  const canLabelExport = (run.task_type === "tts" || run.task_type === "llm") && run.status === "done";
 
   // On-demand "Export to Hugging Face" — pushes the run's best/final model to a HF
   // repo, with the token taken from a selected kind=huggingface storage.
@@ -597,7 +597,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
             <CardTitle className="text-sm">
               Label project created
               {lp.speaker ? ` · ${lp.speaker}` : ""}
-              {lp.count != null ? ` · ${lp.count} clips` : ""}
+              {lp.count != null
+                ? ` · ${lp.count} ${lp.project_type === "human_mos" ? "conversations" : "clips"}`
+                : ""}
             </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
@@ -868,7 +870,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           {hfDone ? (
             <p className="flex items-center gap-2 py-2 text-sm text-emerald-600 dark:text-emerald-400">
               <Check className="h-4 w-4" /> Push started — the model downloads from S3 then uploads to HF; the
-              status shows “pushing to Hugging Face” and an “Open on HF” link appears on this page when done.
+              status shows "pushing to Hugging Face" and an "Open on HF" link appears on this page when done.
             </p>
           ) : (
             <div className="space-y-3">
