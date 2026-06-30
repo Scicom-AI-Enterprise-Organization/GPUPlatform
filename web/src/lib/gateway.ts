@@ -433,6 +433,14 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/label-export`,
       { method: "POST", body: JSON.stringify(body) },
     ),
+  /** Stop a running Label export: cancels the gateway task, kills the box-side synth,
+   * and tears down any cloud pod it spawned. Use when it looks stuck (or was orphaned
+   * by a gateway restart, which leaves the status pinned at "running"). */
+  cancelLabelExport: (id: string) =>
+    request<{ status: string }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/label-export/cancel`,
+      { method: "POST" },
+    ),
   /** Push a finished run's best/final model to a Hugging Face repo. Token comes
    * from the selected kind=huggingface storage (or the platform HF_TOKEN). Runs in
    * the background; status + link land in result_json.hf_export. */

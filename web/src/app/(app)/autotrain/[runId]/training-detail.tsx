@@ -811,7 +811,8 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
                   runProviderId={run.provider_id ?? null} trainedOnVm={isVmRun}
                   gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />
               : run.task_type === "llm"
-                ? <LlmPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null} />
+                ? <LlmPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
+                    runProviderId={run.provider_id ?? null} />
                 : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
                     runProviderId={run.provider_id ?? null} trainedOnVm={isVmRun}
                     gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />}
@@ -1440,16 +1441,17 @@ function PlaygroundTab({ runId, visibleDevices, runProviderId, trainedOnVm, gpuT
   }
 
   return (
-    <Card>
+    <div className="space-y-5">
+      <TryItCompute value={compute} onChange={setCompute} disabled={loaded}
+        runProviderId={runProviderId} visibleDevices={visibleDevices} />
+      <Card>
       <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — transcribe a clip</CardTitle></CardHeader>
       <CardContent className="space-y-4">
         <p className="text-xs text-muted-foreground">
-          Pick where to run, load the model, then upload a short clip (≤ 25 MB) and transcribe. A cloud
-          pod spins up on demand (first load ~10 min) and auto-stops when idle; a VM keeps the model
-          resident. The first request downloads the model onto the box.
+          Load the model, then upload a short clip (≤ 25 MB) and transcribe. A cloud pod spins up on
+          demand (first load ~10 min) and auto-stops when idle; a VM keeps the model resident. The
+          first request downloads the model onto the box.
         </p>
-        <TryItCompute value={compute} onChange={setCompute} disabled={loaded}
-          runProviderId={runProviderId} visibleDevices={visibleDevices} />
         <PersistentControls runId={runId} compute={compute} onRunningChange={setLoaded} />
         <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
           <div className="flex flex-col gap-1">
@@ -1491,7 +1493,8 @@ function PlaygroundTab({ runId, visibleDevices, runProviderId, trainedOnVm, gpuT
         )}
         {result && <TryItLogs lines={result.logs ?? []} />}
       </CardContent>
-    </Card>
+      </Card>
+    </div>
   );
 }
 
@@ -1609,7 +1612,9 @@ const LLM_SAMPLE_TOOLS = JSON.stringify([
 
 // Try-it playground (LLM, gemma-4) — load the finetuned model via vLLM (eager) on
 // the run's VM (download LoRA → merge → save → serve), then stream chat completions.
-function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDevices: string | null }) {
+function LlmPlaygroundTab({ runId, visibleDevices, runProviderId }: {
+  runId: string; visibleDevices: string | null; runProviderId: string | null;
+}) {
   type Role = "user" | "assistant" | "tool";
   type Msg = { role: Role; content: string; toolCalls?: LlmToolCall[] };
   const [st, setSt] = useState<{ running: boolean; ready: boolean; device?: string; logs?: string[] } | null>(null);
@@ -1620,8 +1625,12 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
   const [streaming, setStreaming] = useState(false);
   const [temperature, setTemperature] = useState(0.7);
   const [maxTokens, setMaxTokens] = useState(512);
-  const [gpus, setGpus] = useState((visibleDevices ?? "").trim());
-  const [vllmArgs, setVllmArgs] = useState("");
+  // Compute target (VM-only for LLM): provider + GPU list + vLLM args, picked in the
+  // Run-on / Pod cards (TryItCompute) above and passed verbatim to playgroundStart.
+  const [compute, setCompute] = useState<ComputeChoice>(() => defaultCompute({
+    llm: true, trainedOnVm: true, runProviderId,
+    pins: (visibleDevices ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  }));
   const [toolsJson, setToolsJson] = useState("");
   const [toolChoice, setToolChoice] = useState("auto");
   const [chatErr, setChatErr] = useState<string | null>(null);
@@ -1721,7 +1730,10 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
   const label = !st?.running ? "not loaded" : st.ready ? `ready${st.device ? ` · GPU ${st.device}` : ""}` : "loading…";
 
   return (
-    <Card>
+    <div className="space-y-5">
+      <TryItCompute value={compute} onChange={setCompute} disabled={!!st?.running} llm
+        runProviderId={runProviderId} visibleDevices={visibleDevices} />
+      <Card>
       <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — chat (vLLM, eager)</CardTitle></CardHeader>
       <CardContent className="space-y-3">
         <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
@@ -1732,38 +1744,13 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
           <div className="ml-auto flex items-center gap-2">
             {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
             {!st?.running ? (
-              <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy || !gpus.trim()}
-                onClick={() => ctl(() => gateway.playgroundStart(runId, { gpu: gpus.trim() || undefined, vllmArgs }))}>Load model</Button>
+              <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy || !String(compute.gpu ?? "").trim()}
+                onClick={() => ctl(() => gateway.playgroundStart(runId, compute))}>Load model</Button>
             ) : (
               <Button type="button" variant="outline" className="h-7 text-xs" disabled={busy}
                 onClick={() => ctl(() => gateway.playgroundStop(runId))}>Unload</Button>
             )}
           </div>
-          {!st?.running && (
-            <div className="flex w-full flex-wrap items-end gap-3">
-              <div>
-                <label className="pr-3 text-[11px] text-muted-foreground">GPUs</label>
-                <Input value={gpus} onChange={(e) => setGpus(e.target.value)} disabled={busy}
-                  placeholder="6,7" className="h-8 w-28 font-mono text-xs" />
-              </div>
-              <span className="pb-1.5 text-[10px] text-muted-foreground">
-                comma-separated indices the vLLM server runs on (tensor-parallel = count);
-                defaults to the GPUs the run trained on.
-              </span>
-            </div>
-          )}
-          {!st?.running && (
-            <div className="w-full">
-              <label className="text-[11px] text-muted-foreground">Custom vLLM args (optional)</label>
-              <Input value={vllmArgs} onChange={(e) => setVllmArgs(e.target.value)} disabled={busy}
-                placeholder="--enable-auto-tool-choice --tool-call-parser hermes --max-model-len 32768"
-                className="h-8 font-mono text-[11px]" />
-              <span className="text-[10px] text-muted-foreground">
-                Appended to <span className="font-mono">vllm serve</span> verbatim (overrides defaults). The
-                platform-set flags (model / port / served-name / tensor-parallel) are rejected.
-              </span>
-            </div>
-          )}
           {ctlErr && <span className="w-full text-destructive">{ctlErr}</span>}
           {st?.running && (st.logs?.length ?? 0) > 0 && (
             <div className="terminal-block max-h-48 w-full overflow-y-auto rounded-md border border-border bg-zinc-950 p-2 font-mono text-[10px] leading-snug text-zinc-300">
@@ -1892,7 +1879,8 @@ function LlmPlaygroundTab({ runId, visibleDevices }: { runId: string; visibleDev
           </div>
         </div>
       </CardContent>
-    </Card>
+      </Card>
+    </div>
   );
 }
 
@@ -1943,16 +1931,17 @@ function TtsPlaygroundTab({ runId, visibleDevices, runProviderId, trainedOnVm, g
   }
 
   return (
-    <Card>
+    <div className="space-y-5">
+      <TryItCompute value={compute} onChange={setCompute} disabled={loaded}
+        runProviderId={runProviderId} visibleDevices={visibleDevices} />
+      <Card>
       <CardHeader className="pb-2"><CardTitle className="text-sm">Try it — synthesize speech</CardTitle></CardHeader>
       <CardContent className="space-y-4">
         <p className="text-xs text-muted-foreground">
-          Pick where to run, load the model, then type text (optionally a speaker name, as the data was
-          packed) and synthesize. A cloud pod spins up on demand (first load ~10 min) and auto-stops when
-          idle; a VM keeps the model resident. The first request downloads the model onto the box.
+          Load the model, then type text (optionally a speaker name, as the data was packed) and
+          synthesize. A cloud pod spins up on demand (first load ~10 min) and auto-stops when idle; a VM
+          keeps the model resident. The first request downloads the model onto the box.
         </p>
-        <TryItCompute value={compute} onChange={setCompute} disabled={loaded}
-          runProviderId={runProviderId} visibleDevices={visibleDevices} />
         <PersistentControls runId={runId} compute={compute} onRunningChange={setLoaded} />
         <div className="flex flex-col gap-1">
           <span className="text-xs text-muted-foreground">text</span>
@@ -2004,7 +1993,8 @@ function TtsPlaygroundTab({ runId, visibleDevices, runProviderId, trainedOnVm, g
         )}
         <TryItLogs lines={logs} />
       </CardContent>
-    </Card>
+      </Card>
+    </div>
   );
 }
 

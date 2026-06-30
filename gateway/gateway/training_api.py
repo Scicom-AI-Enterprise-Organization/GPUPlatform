@@ -37,6 +37,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    or_,
     select,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -678,6 +679,28 @@ async def _terminate_pod(api_key: str, runpod_id: str) -> None:
         logger.warning("training: pod %s teardown failed: %s", runpod_id, e)
 
 
+async def _reap_label_pod(run_id: str, provider_id: Optional[str]) -> bool:
+    """Best-effort: tear down an orphaned cloud label-export pod (named
+    sgpu-label-<run_id>) on `provider_id` (a RunPod account) — the one
+    _create_label_project_for_run spawns. Used by cancel + startup reconcile so a
+    pod whose task died (cancel / gateway restart) can't bill on. True if one was
+    torn down."""
+    if not provider_id:
+        return False
+    try:
+        api_key = await compute._resolve_api_key(provider_id)
+        async with compute._client(api_key=api_key) as cli:
+            data = (await cli.get("/pods")).json()
+        pods = data if isinstance(data, list) else (data.get("pods") or data.get("data") or [])
+        for p in pods:
+            if p.get("name") == f"sgpu-label-{run_id}" and p.get("id"):
+                await _terminate_pod(api_key, p["id"])
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 # ---------- the runner ---------------------------------------------------
 
 
@@ -826,6 +849,49 @@ async def _set_label_export_state(run_id: str, state: dict) -> None:
         await s.commit()
 
 
+async def _resolve_label_creds(cfg: dict) -> tuple[Optional[str], Optional[str]]:
+    """(base_url, token) for the Label platform from a run cfg — resolving a
+    Secrets-page (GlobalEnv) key when one was picked, else the pasted value (token =
+    Fernet-encrypted label_token_enc). Either may be None when unconfigured."""
+    genv = await _resolve_global_env()
+    url_secret = (cfg.get("label_base_url_secret") or "").strip()
+    base_url = ((genv.get(url_secret) or "").strip().rstrip("/") if url_secret
+                else (cfg.get("label_base_url") or "").strip().rstrip("/"))
+    tok_secret = (cfg.get("label_token_secret") or "").strip()
+    if tok_secret:
+        token = (genv.get(tok_secret) or "").strip() or None
+    else:
+        token = None
+        enc = cfg.get("label_token_enc")
+        if enc:
+            try:
+                token = (json.loads(crypto.decrypt(enc)) or {}).get("token")
+            except Exception:  # noqa: BLE001
+                token = None
+    return (base_url or None), token
+
+
+async def _verify_label_platform(base_url: str, token: str) -> Optional[str]:
+    """Pre-flight before spending a pod / touching the VM: confirm the Label platform
+    is reachable and the token isn't rejected. Returns None on success, else a short
+    error string. Tolerant of route shape — only a connection failure, an explicit
+    401/403, or a 5xx is fatal (a 404/405 still proves the server is up + the token
+    passed). Hits the read-only project list (any authenticated member can list)."""
+    import httpx
+
+    url = f"{base_url.rstrip('/')}/api/projects"
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as cli:
+            r = await cli.get(url, headers={"Authorization": f"Bearer {token}"})
+    except Exception as e:  # noqa: BLE001
+        return f"can't reach the Label platform at {base_url} ({e.__class__.__name__})"
+    if r.status_code in (401, 403):
+        return f"Label platform rejected the token (HTTP {r.status_code}) — needs an admin PAT"
+    if r.status_code >= 500:
+        return f"Label platform unhealthy (HTTP {r.status_code}) at {base_url}"
+    return None
+
+
 async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, redis) -> None:
     """Post-train: synthesize N clips from the finished TTS model on the run's VM,
     upload them to the run's S3 storage, then create a Label-platform *recording*
@@ -834,28 +900,20 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
     result_json.label_project. VM-provider runs only (synthesis needs the box)."""
     # URL + token each resolve from a Secrets-page (GlobalEnv) key when one was
     # picked, else from the pasted value (token = Fernet-encrypted label_token_enc).
-    genv = await _resolve_global_env()
-    url_secret = (cfg.get("label_base_url_secret") or "").strip()
-    if url_secret:
-        base_url = (genv.get(url_secret) or "").strip().rstrip("/")
-    else:
-        base_url = (cfg.get("label_base_url") or "").strip().rstrip("/")
+    base_url, token = await _resolve_label_creds(cfg)
     tok_secret = (cfg.get("label_token_secret") or "").strip()
-    token = None
-    if tok_secret:
-        token = (genv.get(tok_secret) or "").strip() or None
-    else:
-        enc = cfg.get("label_token_enc")
-        if enc:
-            try:
-                token = (json.loads(crypto.decrypt(enc)) or {}).get("token")
-            except Exception:  # noqa: BLE001
-                token = None
     if not base_url:
         await _push_log(redis, run_id, "[gateway] label export: base_url missing/unresolved — skipped")
         return
     if not token:
         await _push_log(redis, run_id, "[gateway] label export: token missing/unresolved — skipped")
+        return
+    # Verify connectivity + auth to the Label platform BEFORE spending a pod / touching
+    # the VM — a bad URL or token fails here, not after a multi-minute synth.
+    verr = await _verify_label_platform(base_url, token)
+    if verr:
+        await _push_log(redis, run_id, f"[gateway] label export: {verr} — skipped (no pod/VM used)")
+        await _set_label_export_state(run_id, {"status": "failed", "error": verr})
         return
     model_s3 = ((result or {}).get("artifact") or {}).get("s3_uri")
     if not model_s3:
@@ -879,15 +937,12 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
         storage_id = row.storage_id
     # Where to synthesize: an explicit Run-on target chosen in the export tab —
     # "vm" (a registered VM provider) or "cloud" (a fresh RunPod pod) — else the
-    # run's own VM (back-compat for the auto post-train export).
+    # run's own box. For the AUTO post-train export the training box is still alive
+    # (its teardown happens after this), so a cloud run reuses its own training pod
+    # via _resolve_run_ssh below — no new pod. Only a later manual retry, once that
+    # pod is gone, needs an explicit Run-on target.
     run_on = (cfg.get("label_run_on") or "").strip().lower()
     exp_provider_id = (cfg.get("label_provider_id") or "").strip() or None
-    if not run_on and (prov is None or prov.kind != "vm"):
-        await _push_log(redis, run_id,
-                        "[gateway] label export needs a VM provider or a Run-on target (skipped)")
-        await _set_label_export_state(run_id, {"status": "failed",
-                                               "error": "no VM provider — pick a Run-on target (VM or cloud)"})
-        return
 
     creds = _s3_creds_from_storage(storage)
     if not creds.get("bucket"):
@@ -925,7 +980,9 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
 
     # Mark in-flight up front (cloud provisioning takes minutes) so the UI shows
     # "exporting to Label" instead of the run's terminal "done" the whole time.
-    await _set_label_export_state(run_id, {"status": "running"})
+    # Clear any prior error so a retry doesn't carry a stale failure message (state
+    # is merged, so an explicit None resets it).
+    await _set_label_export_state(run_id, {"status": "running", "error": None})
     # CUDA pin for the synthesis (Run-on → CUDA_VISIBLE_DEVICES), else all GPUs.
     gpu_for_synth = (cfg.get("label_visible_devices") or "").strip() or "auto"
     # A pod we spawn for the "cloud" target → (api_key, runpod_id) to tear down after.
@@ -963,8 +1020,11 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
         else:
             ssh = await _resolve_run_ssh(row)
             if ssh is None:
-                await _push_log(redis, run_id, "[gateway] label export: can't reach the run's VM (skipped)")
-                await _set_label_export_state(run_id, {"status": "failed", "error": "can't reach the run's VM"})
+                await _push_log(redis, run_id,
+                                "[gateway] label export: the run's box is gone — open the Export to Label "
+                                "tab and pick a Run-on target (VM or cloud) to retry (skipped)")
+                await _set_label_export_state(run_id, {"status": "failed",
+                                                       "error": "the training box is gone — pick a Run-on target (VM or cloud) and retry"})
                 return
     except asyncio.CancelledError:
         if spawned:
@@ -1121,6 +1181,83 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
         # Flush any lines the pump hadn't mirrored yet.
+        while _sent["n"] < len(export_lines):
+            try:
+                await _push_log(redis, run_id, export_lines[_sent["n"]])
+            except Exception:  # noqa: BLE001
+                pass
+            _sent["n"] += 1
+
+
+async def _auto_hf_push(run_id: str, cfg: dict, result: dict, redis) -> None:
+    """Post-train: push the run's best/final model to the Hugging Face repo named in
+    cfg['hf_push_repo'], from the run's still-alive training box (no new pod). The
+    gateway-side twin of the manual /hf-export — used for the auto push after a
+    successful TTS/ASR run. (LLM already self-pushes from its trainer.) Best-effort:
+    a failure here never marks the run failed. Token: the run's HF token, else the
+    org HF_TOKEN secret; pushes to huggingface.co."""
+    repo = (cfg.get("hf_push_repo") or "").strip()
+    model_s3 = ((result or {}).get("artifact") or {}).get("s3_uri")
+    if not repo or not model_s3:
+        return
+    token = (cfg.get("hf_token") or "").strip() or (await _resolve_global_env()).get("HF_TOKEN")
+    if not token:
+        await _push_log(redis, run_id,
+                        "[gateway] HF export: no token (set an HF token on the run or HF_TOKEN in Secrets) — skipped")
+        return
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        storage = await s.get(Storage, row.storage_id) if row and row.storage_id else None
+    if row is None:
+        return
+    creds = _s3_creds_from_storage(storage)
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        await _push_log(redis, run_id,
+                        "[gateway] HF export: the run's box is gone — use the Export to Hugging Face button later (skipped)")
+        return
+    private = bool(cfg.get("hf_push_private", True))
+
+    # Stream the VM-side download/upload to the run log (the script runs in a thread;
+    # an async pump mirrors its buffered lines to Redis), like the manual /hf-export.
+    export_lines: list[str] = []
+    _sent = {"n": 0}
+
+    async def _pump() -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            while _sent["n"] < len(export_lines):
+                await _push_log(redis, run_id, export_lines[_sent["n"]])
+                _sent["n"] += 1
+
+    pump_task = asyncio.create_task(_pump())
+    await _set_hf_export_state(run_id, {"status": "running", "repo": repo, "url": None, "error": None})
+    try:
+        await _push_log(redis, run_id,
+                        f"[gateway] exporting best model to Hugging Face → {repo} (from the run's box) …")
+        res = await asyncio.to_thread(
+            _run_hf_export_ssh, *ssh, run_id, model_s3, creds, repo, token, private, dict(cfg),
+            None, export_lines.append)
+        async with session_factory()() as s:
+            r2 = await s.get(TrainingRun, run_id)
+            if r2 is not None:
+                rj = dict(r2.result_json or {})
+                rj["hf_export"] = {"status": "done", "repo": res.get("repo", repo), "url": res.get("url")}
+                art = dict(rj.get("artifact") or {})
+                art["hf_repo"] = res.get("repo", repo)
+                rj["artifact"] = art
+                r2.result_json = rj
+                await s.commit()
+        await _push_log(redis, run_id, f"[gateway] pushed to Hugging Face: {res.get('url')}")
+    except Exception as e:  # noqa: BLE001
+        await _set_hf_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
+        await _push_log(redis, run_id, f"[gateway] HF export failed: {e}")
+    finally:
+        pump_task.cancel()
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         while _sent["n"] < len(export_lines):
             try:
                 await _push_log(redis, run_id, export_lines[_sent["n"]])
@@ -1732,6 +1869,16 @@ async def run_training(redis, run_id: str) -> None:
         except Exception as e:  # noqa: BLE001
             await _push_log(redis, run_id, f"[gateway] label export failed: {e}")
 
+    # After a successful run with an HF repo configured, push the best model to
+    # Hugging Face from the run's still-alive box (no new pod). LLM self-pushes from
+    # its trainer, so skip it here. Best-effort: never fails the run.
+    if (status == "done" and (cfg.get("hf_push_repo") or "").strip()
+            and (cfg.get("task_type") or "").lower() != "llm"):
+        try:
+            await _auto_hf_push(run_id, cfg, result, redis)
+        except Exception as e:  # noqa: BLE001
+            await _push_log(redis, run_id, f"[gateway] HF export failed: {e}")
+
     if runpod_id and api_key:
         await _terminate_pod(api_key, runpod_id)
         await _push_log(redis, run_id, f"[gateway] pod {runpod_id} torn down")
@@ -1952,7 +2099,55 @@ async def cleanup_orphaned_running(redis) -> int:
         await _reap_idle_tryit_pods(force_all=True)
     except Exception as e:  # noqa: BLE001
         logger.warning("try-it startup reaper: %s", e)
+    # Un-stick label/HF exports left "running" by the restart (their task is gone).
+    try:
+        await _reconcile_orphaned_exports(redis)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("orphaned-export reconcile: %s", e)
     return n
+
+
+async def _reconcile_orphaned_exports(redis) -> None:
+    """On startup, un-stick a label/HF export left 'running' by a gateway restart:
+    its in-memory task is gone, but result_json.{label,hf}_export.status stays
+    'running' → the UI sticks on 'exporting to Label' / 'pushing to HF' forever. Mark
+    such orphans failed and tear down any orphaned cloud label pod so it can't bill."""
+    try:
+        async with session_factory()() as s:
+            rows = (await s.execute(select(TrainingRun).where(or_(
+                TrainingRun.result_json["label_export"]["status"].as_string() == "running",
+                TrainingRun.result_json["hf_export"]["status"].as_string() == "running",
+            )))).scalars().all()
+    except Exception as e:  # noqa: BLE001 — JSON-path query unsupported? skip (never break boot)
+        logger.warning("training: orphaned-export reconcile query failed: %s", e)
+        return
+    for row in rows:
+        rj = dict(row.result_json or {})
+        changed: list[str] = []
+        for k in ("label_export", "hf_export"):
+            st = rj.get(k)
+            if isinstance(st, dict) and st.get("status") == "running":
+                rj[k] = {**st, "status": "failed", "error": "interrupted by a gateway restart"}
+                changed.append(k)
+        if not changed:
+            continue
+        async with session_factory()() as s:
+            r2 = await s.get(TrainingRun, row.id)
+            if r2 is not None:
+                r2.result_json = rj
+                await s.commit()
+        if "label_export" in changed:
+            cfg = row.config_json or {}
+            prov_id = (cfg.get("label_provider_id") or "").strip() or row.provider_id
+            if await _reap_label_pod(row.id, prov_id):
+                try:
+                    await _push_log(redis, row.id, "[gateway] label export: orphaned pod torn down on restart")
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            await _push_log(redis, row.id, "[gateway] export was interrupted by a gateway restart — marked failed")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def training_janitor_loop(redis, interval: int = 90) -> None:
@@ -2732,6 +2927,15 @@ async def retry_label_export(
     if not has_tok:
         raise HTTPException(status_code=400, detail="provide a Label platform API token (or pick a secret)")
 
+    # Pre-flight: confirm the Label platform is reachable + the token is accepted
+    # BEFORE we spawn a pod / touch the VM / run synthesis. Fails the request fast so
+    # the error shows in the export dialog, not after a multi-minute synth.
+    pf_base_url, pf_token = await _resolve_label_creds(cfg)
+    verr = (await _verify_label_platform(pf_base_url, pf_token)
+            if (pf_base_url and pf_token) else "Label platform URL/token unresolved")
+    if verr:
+        raise HTTPException(status_code=502, detail=f"Label platform check failed — {verr}")
+
     # Persist the (merged) label_* fields so the run remembers them for next time.
     result = dict(row.result_json or {})
     async with session_factory()() as s:
@@ -2768,6 +2972,59 @@ async def retry_label_export(
     task = asyncio.create_task(_bg())
     _active_label_exports[run_id] = task
     return {"status": "started"}
+
+
+@router.post("/{run_id}/label-export/cancel")
+async def cancel_label_export(
+    run_id: str,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stop a running Label export. Cancels the in-memory task (its finally tears down
+    any pod it spawned + stops the synthesis), kills the box-side synth process (it
+    runs over SSH, outliving the task — and a gateway restart leaves it orphaned with
+    status stuck on 'running'), and best-effort tears down an orphaned cloud
+    sgpu-label-<run_id> pod so it can't bill on."""
+    row = await _owned(run_id, user, session)
+    redis = request.app.state.redis
+
+    # 1. Cancel the in-memory task — its finally tears down a spawned cloud pod and
+    #    aborts the project-creation step. (No-op after a gateway restart.)
+    t = _active_label_exports.pop(run_id, None)
+    if t is not None and not t.done():
+        t.cancel()
+
+    # 2. Kill the box-side synth by script name (handles a VM run, where there's no
+    #    pod to tear down, and the orphaned case). The config path is per-export so
+    #    this can't outlive into another run's synth on a shared box.
+    ssh = await _resolve_run_ssh(row)
+    if ssh is not None:
+        host, port, suser, key = ssh
+
+        def _kill() -> None:
+            cli = _ssh_connect(host, int(port), suser, key)
+            try:
+                _ssh_exec(cli, "pkill -9 -f tts_label_export.py 2>/dev/null; "
+                               "rm -f /tmp/sgpu_tts_label_cfg.json 2>/dev/null || true")
+            finally:
+                cli.close()
+
+        try:
+            await asyncio.to_thread(_kill)
+        except Exception as e:  # noqa: BLE001
+            await _push_log(redis, run_id, f"[gateway] label export: box kill attempt failed: {e}")
+
+    # 3. Orphan cleanup: tear down a spawned cloud pod (sgpu-label-<run_id>) the
+    #    cancelled task couldn't (gateway restarted mid-export) — else it bills on.
+    cfg = dict(row.config_json or {})
+    label_prov_id = (cfg.get("label_provider_id") or "").strip() or row.provider_id
+    if await _reap_label_pod(run_id, label_prov_id):
+        await _push_log(redis, run_id, "[gateway] label export: cloud pod torn down")
+
+    await _set_label_export_state(run_id, {"status": "cancelled", "error": "stopped by user"})
+    await _push_log(redis, run_id, "[gateway] label export stopped by user.")
+    return {"status": "cancelled"}
 
 
 async def _set_hf_export_state(run_id: str, state: dict) -> None:

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Check, Cpu, Loader2, RefreshCw, Server, Upload } from "lucide-react";
+import { AlertTriangle, Check, Cpu, Loader2, Server, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -15,6 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { VmAvailabilityRow, type VmAvailState } from "@/components/vm-availability-row";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
@@ -23,7 +24,6 @@ import type {
   GpuTypeOption,
   ProviderRecord,
   TrainingRunRecord,
-  VmAvailability,
 } from "@/lib/types";
 
 const GPU_COUNT_CHOICES = [1, 2, 4, 8] as const;
@@ -42,11 +42,6 @@ function gpuHint(vramGb: number, count: number): string {
   return `${total >= 100 ? Math.round(total) : total} GB VRAM${count > 1 ? ` · ×${count}` : ""}`;
 }
 
-type VmAvailState =
-  | { status: "idle" }
-  | { status: "loading" }
-  | { status: "ok"; data: VmAvailability }
-  | { status: "error"; message: string };
 
 // Export-to-Label as a tab: synthesize N clips from the finished TTS model and seed
 // a Label-platform recording + MOS project. "Run on" mirrors serverless/new — a
@@ -100,6 +95,7 @@ export function LabelExportTab({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   const [vmAvail, setVmAvail] = useState<VmAvailState>({ status: "idle" });
   const refreshVmAvail = useCallback(async (id: string) => {
@@ -203,13 +199,41 @@ export function LabelExportTab({
     }
   }
 
+  async function cancel() {
+    setErr(null);
+    setCancelling(true);
+    try {
+      await gateway.cancelLabelExport(run.id);
+      setDone(false);
+      onStarted?.(); // parent refreshes → label_export.status flips off "running"
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   if (done || running) {
     return (
-      <p className="flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2.5 text-sm text-emerald-700 dark:text-emerald-400">
-        <Check className="h-4 w-4 shrink-0" />
-        Export {running ? "is running" : "started"} — the run status shows “exporting to Label” and synthesis streams to
-        the Logs tab; an “Open in Label” link appears on the Metrics tab when it finishes.
-      </p>
+      <div className="space-y-3">
+        <p className="flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2.5 text-sm text-emerald-700 dark:text-emerald-400">
+          <Check className="h-4 w-4 shrink-0" />
+          Export {running ? "is running" : "started"} — the run status shows “exporting to Label” and synthesis streams to
+          the Logs tab; an “Open in Label” link appears on the Metrics tab when it finishes.
+        </p>
+        {running && (
+          <div className="flex items-center gap-3">
+            <Button variant="destructive" onClick={cancel} disabled={cancelling}>
+              {cancelling ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+              Cancel export
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Stops the synthesis, tears down any pod it spawned, and clears the “exporting to Label” status.
+            </span>
+            {err && <p className="text-sm text-destructive">{err}</p>}
+          </div>
+        )}
+      </div>
     );
   }
 
@@ -254,117 +278,139 @@ export function LabelExportTab({
           ? "GPU, count, and cloud tier for the synthesis pod."
           : "Which registered VM the synthesis runs on. Hardware is fixed by the VM."}
       >
-        <div className="space-y-3">
-      {target === "vm" ? (
-        <div className="space-y-1.5">
-          <Label className="text-xs">VM provider</Label>
-          {vmProviders.length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              No VM providers registered. Add one at{" "}
-              <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">GPU Providers → New provider</a>.
-            </p>
+        <div className="space-y-5">
+          {target === "cloud" ? (
+            <Field label="RunPod account" hint="Which registered RunPod provider to run the synthesis on.">
+              {runpodProviders.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No RunPod providers registered.{" "}
+                  <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add one</a>{" "}
+                  under GPU Providers.
+                </p>
+              ) : (
+                <Select value={runpodProviderId} onValueChange={setRunpodProviderId}>
+                  <SelectTrigger><SelectValue placeholder="Choose a RunPod account…" /></SelectTrigger>
+                  <SelectContent>
+                    {runpodProviders.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.name}{p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+            </Field>
           ) : (
-            <Select value={vmProviderId} onValueChange={setVmProviderId}>
-              <SelectTrigger className="text-xs"><SelectValue placeholder="Pick a VM…" /></SelectTrigger>
-              <SelectContent>
-                {vmProviders.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name}{p.gpu_count ? ` · ${p.gpu_count} GPU` : ""}{p.host ? ` · ${p.host}` : ""}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Field label="VM provider" hint="The registered VM the synthesis SSHes onto. Hardware is fixed by the VM.">
+              {vmProviders.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No VM providers registered. Add one at{" "}
+                  <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">GPU Providers → New provider</a>.
+                </p>
+              ) : (
+                <Select value={vmProviderId} onValueChange={setVmProviderId}>
+                  <SelectTrigger><SelectValue placeholder="Pick a VM…" /></SelectTrigger>
+                  <SelectContent>
+                    {vmProviders.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.name}{p.gpu_count ? ` · ${p.gpu_count} GPU` : ""}{p.host ? ` · ${p.host}` : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+              {vmProviderId && (
+                <div className="mt-1.5">
+                  <VmAvailabilityRow state={vmAvail} onRefresh={() => refreshVmAvail(vmProviderId)} />
+                </div>
+              )}
+            </Field>
           )}
-          {vmProviderId && <VmAvailabilityRow state={vmAvail} onRefresh={() => refreshVmAvail(vmProviderId)} />}
-        </div>
-      ) : (
-        <div className="space-y-3">
-          <div className="space-y-1.5">
-            <Label className="text-xs">RunPod account</Label>
-            <Select value={runpodProviderId} onValueChange={setRunpodProviderId}>
-              <SelectTrigger className="text-xs"><SelectValue placeholder="Choose a RunPod account…" /></SelectTrigger>
-              <SelectContent>
-                {runpodProviders.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name}{p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {runpodProviders.length === 0 && (
-              <p className="text-[11px] text-muted-foreground">
-                None registered. <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add a RunPod account →</a>
-              </p>
-            )}
-          </div>
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <Label className="text-xs">GPU</Label>
-              <AvailabilityBadge state={availability} count={gpuCount} />
-            </div>
-            <div className="flex gap-2">
-              <SearchableSelect
-                className="flex-1"
-                value={gpuType}
-                onChange={setGpuType}
-                options={gpuOptions.map((g) => ({ value: g.id, label: g.label, hint: gpuHint(g.vram_gb, 1) }))}
-                placeholder="Choose a GPU"
-                searchPlaceholder="Search GPUs (e.g. h100, 24gb)…"
-              />
-              <Select value={String(gpuCount)} onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}>
-                <SelectTrigger className="w-20 shrink-0"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {GPU_COUNT_CHOICES.map((n) => <SelectItem key={n} value={String(n)}>×{n}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          <div className="grid grid-cols-3 gap-3">
-            <div className="space-y-1.5">
-              <Label className="text-xs">Cloud tier</Label>
-              <Select value={secureCloud ? "secure" : "community"} onValueChange={(v) => setSecureCloud(v === "secure")}>
-                <SelectTrigger className="text-xs"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="secure">Secure</SelectItem>
-                  <SelectItem value="community">Community</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">Disk (GB)</Label>
-              <NumberField min={20} value={diskGb} onChange={setDiskGb} />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">Volume (GB)</Label>
-              <NumberField min={0} value={volumeGb} onChange={setVolumeGb} />
-            </div>
-          </div>
-        </div>
-      )}
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <div className="space-y-1.5">
-          <Label className="text-xs">uv venv path (TTS)</Label>
-          <Input className="font-mono text-xs" placeholder="/share/autotrain-tts"
-            value={venvPath} onChange={(e) => setVenvPath(e.target.value)} />
-        </div>
-        <div className="space-y-1.5">
-          <Label className="text-xs">CUDA_VISIBLE_DEVICES (optional)</Label>
-          <Input className={cn("font-mono text-xs", vdError && "border-destructive focus-visible:ring-destructive")}
-            placeholder="e.g. 0 (empty = all GPUs)"
-            value={visibleDevices} onChange={(e) => setVisibleDevices(e.target.value)} />
-          {vdError ? (
-            <p className="text-[11px] text-destructive">{vdError}</p>
-          ) : (
-            gpuBound > 0 && (
-              <p className="text-[11px] text-muted-foreground">
-                {target === "vm" ? "This VM" : "The pod"} has {gpuBound} GPU{gpuBound === 1 ? "" : "s"} — valid indices{" "}
-                <span className="font-mono">0–{gpuBound - 1}</span>.
-              </p>
-            )
+          {target === "cloud" && (
+            <>
+              <Field label="Cloud tier" hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity.">
+                <div className="grid grid-cols-2 gap-2">
+                  {([true, false] as const).map((secure) => (
+                    <button
+                      key={String(secure)}
+                      type="button"
+                      onClick={() => setSecureCloud(secure)}
+                      className={cn(
+                        "rounded-md border p-3 text-left transition-colors",
+                        secureCloud === secure
+                          ? "border-foreground/60 ring-1 ring-foreground/20"
+                          : "border-border hover:border-foreground/40",
+                      )}
+                    >
+                      <div className="text-sm font-medium">{secure ? "Secure" : "Community"}</div>
+                      <div className="mt-0.5 text-xs text-muted-foreground">
+                        {secure ? "vetted hosts, more capacity" : "cheaper, variable hosts"}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </Field>
+
+              <Field
+                label="GPU"
+                hint={(() => {
+                  const g = gpuOptions.find((o) => o.id === gpuType);
+                  return g ? gpuHint(g.vram_gb, gpuCount) : undefined;
+                })()}
+                extra={<AvailabilityBadge state={availability} count={gpuCount} />}
+              >
+                <div className="flex gap-2">
+                  <SearchableSelect
+                    className="flex-1"
+                    value={gpuType}
+                    onChange={setGpuType}
+                    options={gpuOptions.map((g) => ({ value: g.id, label: g.label, hint: gpuHint(g.vram_gb, 1) }))}
+                    placeholder="Choose a GPU"
+                    searchPlaceholder="Search GPUs (e.g. h100, 24gb)…"
+                  />
+                  <Select value={String(gpuCount)} onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}>
+                    <SelectTrigger className="w-24 shrink-0"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {GPU_COUNT_CHOICES.map((n) => <SelectItem key={n} value={String(n)}>×{n}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </Field>
+
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Container disk (GB)" hint="Ephemeral workspace. Resets when the pod stops.">
+                  <NumberField min={20} value={diskGb} onChange={setDiskGb} />
+                </Field>
+                <Field label="Volume (GB)" hint="Persistent volume for the model cache. 0 = no persistent storage.">
+                  <NumberField min={0} value={volumeGb} onChange={setVolumeGb} />
+                </Field>
+              </div>
+
+              <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>Pick a GPU with enough VRAM to load the trained model and NeuCodec for synthesis.</span>
+              </div>
+            </>
           )}
-        </div>
-      </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field label="uv venv path (TTS)">
+              <Input className="font-mono text-xs" placeholder="/share/autotrain-tts"
+                value={venvPath} onChange={(e) => setVenvPath(e.target.value)} />
+            </Field>
+            <Field
+              label="CUDA_VISIBLE_DEVICES (optional)"
+              hint={!vdError && gpuBound > 0
+                ? `${target === "vm" ? "This VM" : "The pod"} has ${gpuBound} GPU${gpuBound === 1 ? "" : "s"} — valid indices 0–${gpuBound - 1}.`
+                : undefined}
+            >
+              <Input className={cn("font-mono text-xs", vdError && "border-destructive focus-visible:ring-destructive")}
+                placeholder="e.g. 0 (empty = all GPUs)"
+                value={visibleDevices} onChange={(e) => setVisibleDevices(e.target.value)} />
+              {vdError && <p className="text-[11px] text-destructive">{vdError}</p>}
+            </Field>
+          </div>
         </div>
       </Section>
 
@@ -505,56 +551,28 @@ function Section({
   );
 }
 
-function VmAvailabilityRow({ state, onRefresh }: { state: VmAvailState; onRefresh: () => void }) {
-  if (state.status === "idle") return null;
-  if (state.status === "loading") {
-    return (
-      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-        <Loader2 className="h-3 w-3 animate-spin" /> Checking availability via SSH…
-      </div>
-    );
-  }
-  if (state.status === "error") {
-    return (
-      <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive">
-        <span className="truncate" title={state.message}>{state.message}</span>
-        <button type="button" onClick={onRefresh} className="inline-flex items-center gap-1 underline-offset-2 hover:underline">
-          <RefreshCw className="h-3 w-3" /> Retry
-        </button>
-      </div>
-    );
-  }
-  const { data } = state;
-  if (!data.ok) {
-    return (
-      <div className="flex items-center justify-between gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400">
-        <span className="truncate" title={data.message}>{data.message}</span>
-        <button type="button" onClick={onRefresh} className="inline-flex items-center gap-1 underline-offset-2 hover:underline">
-          <RefreshCw className="h-3 w-3" /> Retry
-        </button>
-      </div>
-    );
-  }
-  const totalFreeMib = data.gpus.reduce((s, g) => s + g.mem_free_mib, 0);
-  const totalMib = data.gpus.reduce((s, g) => s + g.mem_total_mib, 0);
-  const busy = data.gpus.filter((g) => g.mem_free_mib < g.mem_total_mib * 0.2 || g.util_pct > 50).length;
-  const allFree = busy === 0;
+// Labelled field matching serverless/new's Field (uppercase label + hint + optional
+// right-aligned `extra`).
+function Field({
+  label,
+  hint,
+  children,
+  extra,
+}: {
+  label: string;
+  hint?: string;
+  children: ReactNode;
+  extra?: ReactNode;
+}) {
   return (
-    <div className={cn("flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs",
-      allFree ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
-        : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400")}>
-      <span>
-        {data.gpus.length} GPU{data.gpus.length === 1 ? "" : "s"} · {fmtMib(totalFreeMib)} free / {fmtMib(totalMib)}
-        {!allFree && ` · ${busy} busy`}
-      </span>
-      <button type="button" onClick={onRefresh} className="inline-flex items-center gap-1 underline-offset-2 hover:underline">
-        <RefreshCw className="h-3 w-3" /> Refresh
-      </button>
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <Label className="text-xs uppercase tracking-wide text-muted-foreground">{label}</Label>
+        {extra}
+      </div>
+      {children}
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>
   );
 }
 
-function fmtMib(mib: number): string {
-  if (mib >= 1024) return `${(mib / 1024).toFixed(1)} GiB`;
-  return `${mib} MiB`;
-}
