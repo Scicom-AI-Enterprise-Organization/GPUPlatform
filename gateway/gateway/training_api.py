@@ -5070,16 +5070,10 @@ def _run_llm_label_export_ssh(host: str, port: int, user: str, key_filename: str
                 "secret_key": s3_creds.get("secret_key"),
             },
         }
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            f.write(json.dumps(tconf))
-            local_cfg = f.name
-        try:
-            _ssh_put(cli, local_cfg, "/tmp/sgpu_llm_label_cfg.json")
-        finally:
-            try:
-                os.unlink(local_cfg)
-            except OSError:
-                pass
+        # Stream over stdin (no argv-length limit): the cfg embeds the eval rows,
+        # so it scales with row count and easily exceeds _ssh_put's ~128 KB
+        # MAX_ARG_STRLEN base64-argv cap (→ "/bin/bash: Argument list too long").
+        _ssh_put_bytes(cli, json.dumps(tconf).encode("utf-8"), "/tmp/sgpu_llm_label_cfg.json")
         user_env = _render_env_exports(cfg.get("env_vars") or {})
         # Use the same arch venv that training used — it already has torch + transformers.
         venv_path = (cfg.get("venv_path") or f"/share/autotrain-llm-{arch}").rstrip("/")
