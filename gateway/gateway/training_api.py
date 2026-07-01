@@ -530,19 +530,20 @@ def _ssh_put_dir_tar(cli, local_dir: str, remote_dir: str) -> None:
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         tar.add(local_dir, arcname=".", filter=_filter)
     _ssh_put_bytes(cli, buf.getvalue(), "/tmp/_sgpu_ship.tar.gz")
-    rc, out = _ssh_exec_out(
+    lines: list[str] = []
+    rc = _ssh_run_stream(
         cli,
         # --no-same-owner: don't restore archived ownership (we run as root on the
         # pod; a chown to a nonexistent uid is a hard rc=2 even though the file
         # content extracts fine).
         f"mkdir -p {_shlex.quote(remote_dir)} && "
-        f"tar --no-same-owner -xzf /tmp/_sgpu_ship.tar.gz -C {_shlex.quote(remote_dir)} && rm -f /tmp/_sgpu_ship.tar.gz",
+        f"tar --no-same-owner -xzf /tmp/_sgpu_ship.tar.gz -C {_shlex.quote(remote_dir)} 2>&1; "
+        f"_rc=$?; rm -f /tmp/_sgpu_ship.tar.gz; exit $_rc",
+        lines.append,
     )
     if rc != 0:
-        # Surface tar/gzip's own stderr — an opaque rc=2 was undebuggable.
-        raise RuntimeError(
-            f"failed to ship/untar {local_dir} → {remote_dir} (rc={rc}): {out.strip()[:500]}"
-        )
+        detail = "; ".join(lines[-5:]) if lines else "(no output)"
+        raise RuntimeError(f"failed to ship/untar {local_dir} → {remote_dir} (rc={rc}): {detail}")
 
 
 def _render_env_exports(env: dict) -> str:
@@ -896,6 +897,281 @@ async def _verify_label_platform(base_url: str, token: str) -> Optional[str]:
     if r.status_code >= 500:
         return f"Label platform unhealthy (HTTP {r.status_code}) at {base_url}"
     return None
+
+
+async def _fetch_eval_rows_from_catalog(dataset_id: str) -> list[dict]:
+    """Read JSONL rows from a kind=hf Dataset that was pushed to the platform catalog.
+    Looks up the CatalogRepo by ds.hf_repo, downloads the .jsonl blob from S3, and
+    returns a list of parsed row dicts. Raises RuntimeError on any failure."""
+    from sqlalchemy import select as _sa_select
+    from .db import CatalogRepo as _CatalogRepo
+
+    async with session_factory()() as s:
+        ds = await s.get(Dataset, dataset_id)
+        repo = None
+
+        if ds is not None:
+            if ds.kind not in ("hf", "hosted"):
+                raise RuntimeError(
+                    f"eval dataset must be kind=hf or kind=hosted (got {ds.kind!r})"
+                )
+            # Prefer the explicit catalog_repo_id FK; fall back to full_id lookup.
+            repo_id_attr = getattr(ds, "catalog_repo_id", None)
+            if repo_id_attr:
+                repo = await s.get(_CatalogRepo, repo_id_attr)
+            if repo is None and ds.hf_repo:
+                res = await s.execute(
+                    _sa_select(_CatalogRepo).where(_CatalogRepo.full_id == ds.hf_repo).limit(1)
+                )
+                repo = res.scalar_one_or_none()
+        else:
+            # No Dataset record — treat dataset_id as a CatalogRepo ID directly.
+            # This happens when a kind=hosted catalog repo is picked from the Datasets page.
+            repo = await s.get(_CatalogRepo, dataset_id)
+
+        if repo is None:
+            raise RuntimeError(
+                f"no platform catalog repo found for {dataset_id!r}. "
+                "Upload the JSONL via HF push first."
+            )
+        storage = await s.get(Storage, repo.storage_id) if repo.storage_id else None
+
+    creds = _s3_creds_from_storage(storage)
+    if not creds.get("bucket"):
+        raise RuntimeError("catalog repo storage has no S3 bucket")
+
+    manifest = repo.manifest or []
+    jsonl_entry = next(
+        (e for e in manifest if isinstance(e, dict) and (e.get("path") or "").endswith(".jsonl")),
+        None,
+    )
+    if jsonl_entry is None:
+        paths = [e.get("path") for e in manifest[:10] if isinstance(e, dict)]
+        raise RuntimeError(
+            f"no .jsonl file in catalog repo {repo.full_id!r} manifest "
+            f"(found: {paths})"
+        )
+
+    prefix = (repo.prefix or "").rstrip("/")
+    oid = jsonl_entry.get("oid") or ""
+    if repo.versioned and oid:
+        s3_key = f"{prefix}/blobs/{oid}" if prefix else f"blobs/{oid}"
+    else:
+        path = jsonl_entry.get("path", "")
+        s3_key = f"{prefix}/{path}" if prefix else path
+
+    import boto3
+    from botocore.client import Config as _BotoConfig
+
+    cli = boto3.client(
+        "s3", region_name=creds.get("region") or "us-east-1",
+        endpoint_url=creds.get("endpoint") or None,
+        aws_access_key_id=creds.get("access_key") or None,
+        aws_secret_access_key=creds.get("secret_key") or None,
+        config=_BotoConfig(signature_version="s3v4"),
+    )
+    try:
+        resp = await asyncio.to_thread(
+            lambda: cli.get_object(Bucket=creds["bucket"], Key=s3_key)
+        )
+        content = resp["Body"].read().decode("utf-8")
+    except Exception as e:
+        raise RuntimeError(
+            f"failed to download eval JSONL from s3://{creds['bucket']}/{s3_key}: {e}"
+        ) from e
+
+    rows = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+async def _create_llm_label_project_for_run(run_id: str, cfg: dict, result: dict, redis) -> None:
+    """Post-train: generate responses for eval rows using the finetuned LLM on the
+    run's VM, then create a Label-platform *human_mos* project seeded with them.
+    Records the project under result_json.label_project. VM-provider runs only."""
+    # Resolve Label platform URL + token (same logic as _create_label_project_for_run).
+    genv = await _resolve_global_env()
+    url_secret = (cfg.get("label_base_url_secret") or "").strip()
+    base_url = (genv.get(url_secret) or "").strip().rstrip("/") if url_secret else (
+        (cfg.get("label_base_url") or "").strip().rstrip("/")
+    )
+    tok_secret = (cfg.get("label_token_secret") or "").strip()
+    token = None
+    if tok_secret:
+        token = (genv.get(tok_secret) or "").strip() or None
+    else:
+        enc = cfg.get("label_token_enc")
+        if enc:
+            try:
+                token = (json.loads(crypto.decrypt(enc)) or {}).get("token")
+            except Exception:  # noqa: BLE001
+                token = None
+    if not base_url:
+        await _push_log(redis, run_id, "[gateway] llm label export: base_url missing — skipped")
+        return
+    if not token:
+        await _push_log(redis, run_id, "[gateway] llm label export: token missing — skipped")
+        return
+
+    model_s3 = ((result or {}).get("artifact") or {}).get("s3_uri")
+    if not model_s3:
+        await _push_log(redis, run_id, "[gateway] llm label export: no model artifact — skipped")
+        return
+
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None:
+            return
+        prov = await s.get(Provider, row.provider_id) if row.provider_id else None
+        storage = await s.get(Storage, row.storage_id) if row.storage_id else None
+        owner_id = row.owner_id
+        run_name = row.name or run_id
+        storage_id = row.storage_id
+    if prov is None or prov.kind != "vm":
+        await _push_log(redis, run_id, "[gateway] llm label export needs a VM provider (skipped)")
+        return
+
+    eval_dataset_id = cfg.get("llm_label_eval_dataset_id")
+    if not eval_dataset_id:
+        await _push_log(redis, run_id, "[gateway] llm label export: no eval dataset configured — skipped")
+        return
+
+    await _push_log(redis, run_id, f"[gateway] llm label export: fetching eval rows from {eval_dataset_id} …")
+    try:
+        all_rows = await _fetch_eval_rows_from_catalog(eval_dataset_id)
+    except Exception as e:
+        await _push_log(redis, run_id, f"[gateway] llm label export: failed to fetch eval rows: {e}")
+        await _set_label_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
+        return
+
+    n = int(cfg.get("llm_label_samples") or 0) or len(all_rows)
+    eval_rows = all_rows[:n]
+    await _push_log(redis, run_id,
+                    f"[gateway] llm label export: {len(eval_rows)} rows ({len(all_rows)} total in dataset)")
+
+    creds = _s3_creds_from_storage(storage)
+    ssh = await _resolve_run_ssh(row)
+    if ssh is None:
+        await _push_log(redis, run_id, "[gateway] llm label export: can't reach the run's VM (skipped)")
+        await _set_label_export_state(run_id, {"status": "failed", "error": "can't reach the run's VM"})
+        return
+
+    await _set_label_export_state(run_id, {"status": "running"})
+    export_lines: list[str] = []
+    _sent = {"n": 0}
+
+    async def _export_pump() -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            while _sent["n"] < len(export_lines):
+                await _push_log(redis, run_id, export_lines[_sent["n"]])
+                _sent["n"] += 1
+
+    pump_task = asyncio.create_task(_export_pump())
+    try:
+        await _push_log(redis, run_id,
+                        f"[gateway] llm label export: generating {len(eval_rows)} response(s) on VM …")
+        manifest = await asyncio.to_thread(
+            _run_llm_label_export_ssh, *ssh, run_id, model_s3, cfg, creds,
+            eval_rows, export_lines.append,
+        )
+        items = manifest.get("items") or []
+        if not items:
+            await _push_log(redis, run_id, "[gateway] llm label export: no items generated")
+            await _set_label_export_state(run_id, {"status": "failed", "error": "no items generated"})
+            return
+
+        # ---- Label platform: create human_mos project → set MOS axes → import tasks ----
+        import httpx
+
+        proj_name = (cfg.get("label_project_name") or f"{run_name}-eval")[:200]
+        axes = [a for a in (cfg.get("llm_label_mos_axes") or []) if a] or [
+            "Relevance", "Accuracy", "Helpfulness", "Tone"
+        ]
+        base_model_name = (cfg.get("base_model") or "").split("/")[-1] or "llm"
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as cli:
+            r = await cli.post(f"{base_url}/api/projects", headers=headers, json={
+                "name": proj_name, "type": "human_mos",
+                "description": f"Autotrain LLM eval — {run_name} ({run_id})",
+            })
+            r.raise_for_status()
+            pid = ((r.json() or {}).get("project") or {}).get("id")
+            if not pid:
+                raise RuntimeError(f"create project returned no id: {r.text[:200]}")
+            # human_mos supports mos_axes via PATCH
+            r = await cli.patch(f"{base_url}/api/projects/{pid}", headers=headers,
+                                json={"mos_enabled": True, "mos_axes": axes})
+            r.raise_for_status()
+            # Each task: human_mos_data.messages (last = assistant) + model field.
+            # Encode lov/language in the model field as JSON so labellers can filter.
+            tasks = []
+            for it in items:
+                meta_str = json.dumps({
+                    "model": base_model_name,
+                    "lov": it.get("lov", ""),
+                    "language": it.get("language", ""),
+                })
+                tasks.append({
+                    "human_mos_data": {"messages": it.get("messages") or []},
+                    "model": meta_str,
+                })
+            r = await cli.post(f"{base_url}/api/projects/{pid}/tasks",
+                               headers=headers, json={"tasks": tasks})
+            r.raise_for_status()
+
+        # Round-trip kind=label Dataset pointing at the new project.
+        label_ds_id = "ds-" + os.urandom(4).hex()
+        async with session_factory()() as s:
+            s.add(Dataset(
+                id=label_ds_id, owner_id=owner_id,
+                name=(f"{run_name}-llm-eval-labels")[:255],
+                description=(f"Human MOS labels for autotrain LLM run {run_id}")[:2048],
+                kind="label", storage_id=storage_id,
+                label_base_url=base_url, label_project_id=pid,
+                label_token_secret=(tok_secret or None),
+                label_token_enc=(None if tok_secret else crypto.encrypt(json.dumps({"token": token}))),
+                label_status="approved",
+                audio_field="audio_url", transcription_field="transcription",
+            ))
+            run2 = await s.get(TrainingRun, run_id)
+            if run2 is not None:
+                rj = dict(run2.result_json or {})
+                rj["label_project"] = {
+                    "id": pid, "url": f"{base_url}/dashboard/projects/{pid}",
+                    "count": len(tasks), "dataset_id": label_ds_id,
+                    "project_name": proj_name, "project_type": "human_mos",
+                }
+                rj["label_export"] = {"status": "done"}
+                run2.result_json = rj
+            await s.commit()
+        await _push_log(redis, run_id,
+                        f"[gateway] llm label project created: {base_url}/dashboard/projects/{pid} "
+                        f"({len(tasks)} conversations) + dataset {label_ds_id}")
+    except Exception as e:  # noqa: BLE001
+        await _set_label_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
+        raise
+    finally:
+        pump_task.cancel()
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        while _sent["n"] < len(export_lines):
+            try:
+                await _push_log(redis, run_id, export_lines[_sent["n"]])
+            except Exception:  # noqa: BLE001
+                pass
+            _sent["n"] += 1
+
+
 
 
 async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, redis) -> None:
@@ -1895,12 +2171,17 @@ async def run_training(redis, run_id: str) -> None:
         else:
             await _set_dataset_transform(src_id, "failed", err or f"pack failed (rc={rc})")
 
-    # After a successful TTS run, optionally synthesize a handful of clips from the
-    # trained model and seed a Label-platform recording+MOS project with them.
-    # Best-effort: a failure here never marks the run failed.
-    if status == "done" and (cfg.get("task_type") == "tts") and cfg.get("label_export"):
+    # After a successful run, optionally create a Label-platform project seeded with
+    # model outputs for human evaluation. TTS → recording+MOS project (synthesized
+    # clips); LLM → human_mos project (generated text responses). Best-effort: a
+    # failure here never marks the run failed.
+    if status == "done" and cfg.get("label_export"):
+        _tt = cfg.get("task_type")
         try:
-            await _create_label_project_for_run(run_id, cfg, result, redis)
+            if _tt == "tts":
+                await _create_label_project_for_run(run_id, cfg, result, redis)
+            elif _tt == "llm":
+                await _create_llm_label_project_for_run(run_id, cfg, result, redis)
         except Exception as e:  # noqa: BLE001
             await _push_log(redis, run_id, f"[gateway] label export failed: {e}")
 
@@ -2342,6 +2623,13 @@ class CreateTrainingRunRequest(BaseModel):
     # only from that speaker's own clips (label_samples is then per speaker). Else
     # the speakers are round-robin'd into one combined project.
     label_per_speaker: bool = False
+    # ---- LLM label export (task_type=llm only) ----
+    # kind=hf benchmark dataset (uploaded via HF push to the platform catalog) whose
+    # user-turn messages are used as prompts for generation after training completes.
+    llm_label_eval_dataset_id: Optional[str] = None
+    llm_label_samples: Optional[int] = None          # default: all rows in the dataset
+    llm_label_max_new_tokens: Optional[int] = None   # default: 512
+    llm_label_mos_axes: Optional[list[str]] = None   # default: Relevance/Accuracy/Helpfulness/Tone
     precision: str = "fp32-bf16"        # "<load>-<amp>", e.g. fp32-bf16
     language: Optional[str] = None
     task: str = "transcribe"
@@ -2679,9 +2967,9 @@ async def create_training_run(
         "eval_test_per_speaker": int(body.eval_test_per_speaker or 25),
         "attn_implementation": (body.attn_implementation or "flex_attention"),
         "batch_tokens": body.batch_tokens,
-        # Post-train Label-platform export (TTS only). The token is stored Fernet-
+        # Post-train Label-platform export (TTS + LLM). The token is stored Fernet-
         # encrypted (label_token_enc) like the kind=label dataset's — never raw.
-        "label_export": bool(body.label_export and body.task_type == "tts"),
+        "label_export": bool(body.label_export and body.task_type in ("tts", "llm")),
         "label_base_url": (body.label_base_url or "").strip().rstrip("/") or "http://localhost:3002",
         "label_base_url_secret": (body.label_base_url_secret or "").strip() or None,
         # Token: a Secrets-page key reference wins; else the pasted token Fernet-encrypted.
@@ -2698,6 +2986,14 @@ async def create_training_run(
         "label_speaker_prefix": bool(body.label_speaker_prefix),
         "label_reject_keywords": [str(k).strip() for k in (body.label_reject_keywords or []) if str(k).strip()],
         "label_per_speaker": bool(body.label_per_speaker),
+        # LLM-only label export fields (ignored for TTS/ASR).
+        "llm_label_eval_dataset_id": body.llm_label_eval_dataset_id if body.task_type == "llm" else None,
+        "llm_label_samples": int(body.llm_label_samples or 0) or None,
+        "llm_label_max_new_tokens": int(body.llm_label_max_new_tokens or 512),
+        "llm_label_mos_axes": (
+            [a.strip() for a in (body.llm_label_mos_axes or []) if str(a).strip()]
+            or ["Relevance", "Accuracy", "Helpfulness", "Tone"]
+        ) if body.task_type == "llm" else [],
         "precision": body.precision, "language": body.language, "task": body.task,
         "base_model": body.base_model,
         # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab
@@ -2862,6 +3158,11 @@ class LabelExportRequest(BaseModel):
     volume_gb: Optional[int] = None        # run_on=cloud
     visible_devices: Optional[str] = None  # CUDA_VISIBLE_DEVICES pin for the synth
     venv_path: Optional[str] = None        # TTS uv venv on the box (default /share/autotrain-tts)
+    # LLM-only override fields
+    llm_eval_dataset_id: Optional[str] = None   # override eval dataset for LLM
+    llm_samples: Optional[int] = None           # override response count
+    llm_mos_axes: Optional[list[str]] = None    # override rating axes
+    llm_max_new_tokens: Optional[int] = None    # override generation length
 
 
 @router.post("/{run_id}/label-export")
@@ -2879,8 +3180,8 @@ async def retry_label_export(
     result_json.label_project card appears when done. Runs on the chosen Run-on
     target: a registered VM provider, or a fresh RunPod pod (spawned + torn down)."""
     row = await _owned(run_id, user, session)
-    if (row.task_type or "asr") != "tts":
-        raise HTTPException(status_code=400, detail="label export is for TTS runs")
+    if (row.task_type or "asr") not in ("tts", "llm"):
+        raise HTTPException(status_code=400, detail="label export is for TTS and LLM runs")
     if row.status != "done":
         raise HTTPException(status_code=400, detail="the run must finish successfully first")
     if not (((row.result_json or {}).get("artifact") or {}).get("s3_uri")):
@@ -2961,6 +3262,15 @@ async def retry_label_export(
         cfg["label_visible_devices"] = body.visible_devices.strip() or None
     if body.venv_path is not None:
         cfg["venv_path"] = body.venv_path.strip() or cfg.get("venv_path")
+    # LLM-only overrides
+    if body.llm_eval_dataset_id is not None:
+        cfg["llm_label_eval_dataset_id"] = body.llm_eval_dataset_id.strip() or None
+    if body.llm_samples is not None:
+        cfg["llm_label_samples"] = max(1, int(body.llm_samples))
+    if body.llm_mos_axes is not None:
+        cfg["llm_label_mos_axes"] = [a.strip() for a in body.llm_mos_axes if str(a).strip()]
+    if body.llm_max_new_tokens is not None:
+        cfg["llm_label_max_new_tokens"] = max(1, int(body.llm_max_new_tokens))
     cfg["label_export"] = True
 
     has_url = bool((cfg.get("label_base_url_secret") or "").strip() or (cfg.get("label_base_url") or "").strip())
@@ -2969,6 +3279,9 @@ async def retry_label_export(
         raise HTTPException(status_code=400, detail="provide the Label platform URL")
     if not has_tok:
         raise HTTPException(status_code=400, detail="provide a Label platform API token (or pick a secret)")
+    # For LLM runs, an eval dataset is required.
+    if (row.task_type or "asr") == "llm" and not cfg.get("llm_label_eval_dataset_id"):
+        raise HTTPException(status_code=400, detail="provide an eval dataset ID for LLM label export")
 
     # Pre-flight: confirm the Label platform is reachable + the token is accepted
     # BEFORE we spawn a pod / touch the VM / run synthesis. Fails the request fast so
@@ -2990,17 +3303,23 @@ async def retry_label_export(
                       "label_samples", "label_mos_axes", "label_speakers", "label_speaker_prefix",
                       "label_reject_keywords", "label_per_speaker", "label_run_on", "label_provider_id",
                       "label_gpu_type", "label_gpu_count", "label_secure_cloud", "label_data_center_id",
-                      "label_disk_gb", "label_volume_gb", "label_visible_devices", "venv_path", "tts_codec"):
+                      "label_disk_gb", "label_volume_gb", "label_visible_devices", "venv_path", "tts_codec",
+                      "llm_label_eval_dataset_id", "llm_label_samples",
+                      "llm_label_max_new_tokens", "llm_label_mos_axes"):
                 merged[k] = cfg.get(k)
             r2.config_json = merged
             await s.commit()
 
     redis = request.app.state.redis
+    task_type = row.task_type or "asr"
 
     async def _bg() -> None:
         try:
             await _push_log(redis, run_id, "[gateway] label export: retrying on request …")
-            await _create_label_project_for_run(run_id, cfg, result, redis)
+            if task_type == "llm":
+                await _create_llm_label_project_for_run(run_id, cfg, result, redis)
+            else:
+                await _create_label_project_for_run(run_id, cfg, result, redis)
         except asyncio.CancelledError:
             await _push_log(redis, run_id, "[gateway] label export: cancelled (superseded)")
             raise
@@ -4713,6 +5032,85 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
         if not out["manifest"]:
             tail = "\n".join(out["lines"][-15:])
             raise RuntimeError(f"label export produced no manifest (rc={rc}):\n{tail}")
+        return out["manifest"]
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _run_llm_label_export_ssh(host: str, port: int, user: str, key_filename: str,
+                              run_id: str, model_s3: str, cfg: dict, s3_creds: dict,
+                              eval_rows: list, line_sink=None) -> dict:
+    """SSH to the run's VM, ship the llm/ dir, generate responses for eval_rows
+    from the finetuned LLM, and return the parsed @@LABEL manifest {items, count}.
+    Blocking — call via to_thread. `line_sink(str)` receives every VM-side log line."""
+    import tempfile
+
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        _ssh_put_dir_tar(cli, str(base / "llm"), "/tmp/sgpu_llm_label")
+        work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
+        arch = _llm_arch(cfg.get("base_model"))
+        tconf = {
+            "model_s3": model_s3,
+            "base_model": cfg.get("base_model") or "",
+            "arch": arch,
+            "eval_rows": eval_rows,
+            "n_samples": int(cfg.get("llm_label_samples") or 0) or len(eval_rows),
+            "max_new_tokens": int(cfg.get("llm_label_max_new_tokens") or 512),
+            "lora_r": cfg.get("lora_r") or 16,
+            "lora_alpha": cfg.get("lora_alpha") or 32,
+            "run_id": run_id,
+            "work_dir": work_dir,
+            "hf_home": f"{work_dir}/huggingface",
+            "s3_creds": {
+                "bucket": s3_creds.get("bucket"), "region": s3_creds.get("region"),
+                "endpoint": s3_creds.get("endpoint"), "access_key": s3_creds.get("access_key"),
+                "secret_key": s3_creds.get("secret_key"),
+            },
+        }
+        # Stream over stdin (no argv-length limit): the cfg embeds the eval rows,
+        # so it scales with row count and easily exceeds _ssh_put's ~128 KB
+        # MAX_ARG_STRLEN base64-argv cap (→ "/bin/bash: Argument list too long").
+        _ssh_put_bytes(cli, json.dumps(tconf).encode("utf-8"), "/tmp/sgpu_llm_label_cfg.json")
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        # Use the same arch venv that training used — it already has torch + transformers.
+        venv_path = (cfg.get("venv_path") or f"/share/autotrain-llm-{arch}").rstrip("/")
+        py = f"{venv_path}/bin/python"
+        out: dict = {"manifest": None, "error": None, "lines": []}
+
+        def on_line(line: str) -> None:
+            j = line.find("@@LABEL ")
+            if j < 0:
+                if line_sink is not None:
+                    try:
+                        line_sink(line)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if len(out["lines"]) < 400:
+                    out["lines"].append(line)
+                return
+            try:
+                obj = json.loads(line[j + len("@@LABEL "):])
+            except Exception:  # noqa: BLE001
+                return
+            if obj.get("error"):
+                out["error"] = obj["error"]
+            else:
+                out["manifest"] = obj
+
+        cmd = (f'{user_env}PY="{py}"; '
+               f'if [ ! -x "$PY" ]; then echo "venv python not found at $PY — train this run first"; exit 1; fi; '
+               f'"$PY" -u /tmp/sgpu_llm_label/llm_label_export.py --config /tmp/sgpu_llm_label_cfg.json')
+        rc = _ssh_run_stream(cli, cmd, on_line)
+        if out["error"]:
+            raise RuntimeError(out["error"])
+        if not out["manifest"]:
+            tail = "\n".join(out["lines"][-15:])
+            raise RuntimeError(f"llm label export produced no manifest (rc={rc}):\n{tail}")
         return out["manifest"]
     finally:
         try:

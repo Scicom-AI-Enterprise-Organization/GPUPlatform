@@ -51,6 +51,7 @@ import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 import type {
+  CatalogRecord,
   CreateTrainingRunRequest,
   DatasetRecord,
   GlobalEnvRecord,
@@ -260,6 +261,7 @@ export function TrainingForm() {
   const initialTask: "asr" | "tts" | "llm" =
     _qtask === "tts" ? "tts" : _qtask === "llm" ? "llm" : "asr";
   const [datasets, setDatasets] = useState<DatasetRecord[]>([]);
+  const [catalogDatasets, setCatalogDatasets] = useState<CatalogRecord[]>([]);
   const [storages, setStorages] = useState<StorageRecord[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -386,6 +388,11 @@ export function TrainingForm() {
   // Make a separate Label project per speaker (each from that speaker's own clips).
   const [labelPerSpeaker, setLabelPerSpeaker] = useState(false);
   const [labelMosAxes, setLabelMosAxes] = useState("Naturalness, Intelligibility, Noise");
+  // Post-train (LLM): generate responses on an eval dataset + auto-create a human_mos project.
+  const [llmLabelEvalDatasetId, setLlmLabelEvalDatasetId] = useState("");
+  const [llmLabelSamples, setLlmLabelSamples] = useState(110);
+  const [llmLabelMosAxes, setLlmLabelMosAxes] = useState("Relevance, Accuracy, Helpfulness, Tone");
+  const [llmLabelMaxNewTokens, setLlmLabelMaxNewTokens] = useState(512);
   // experiment tracking — named credentials from the Secrets page (picked per run)
   const [trackingCreds, setTrackingCreds] = useState<TrackingCredentialRecord[]>([]);
   const [wandbCredId, setWandbCredId] = useState("");
@@ -417,6 +424,7 @@ export function TrainingForm() {
 
   useEffect(() => {
     gateway.listDatasets().then(setDatasets).catch(() => {});
+    gateway.listCatalog("mine", "dataset").then(setCatalogDatasets).catch(() => {});
     gateway.listStorage().then(setStorages).catch(() => {});
     gateway
       .listProviders()
@@ -533,6 +541,11 @@ export function TrainingForm() {
         if (Array.isArray(c.label_reject_keywords) && c.label_reject_keywords.length)
           setLabelRejectKeywords(arr(c.label_reject_keywords).map(String).join(", "));
         if (c.label_per_speaker != null) setLabelPerSpeaker(!!c.label_per_speaker);
+        if (typeof c.llm_label_eval_dataset_id === "string") setLlmLabelEvalDatasetId(c.llm_label_eval_dataset_id);
+        if (c.llm_label_samples != null) setLlmLabelSamples(num(c.llm_label_samples, 110));
+        if (Array.isArray(c.llm_label_mos_axes) && c.llm_label_mos_axes.length)
+          setLlmLabelMosAxes(arr(c.llm_label_mos_axes).map(String).join(", "));
+        if (c.llm_label_max_new_tokens != null) setLlmLabelMaxNewTokens(num(c.llm_label_max_new_tokens, 512));
         // run on
         if (r.provider_kind === "vm") { setTarget("vm"); setProviderId(r.provider_id || ""); }
         else if (r.provider_id) { setTarget("cloud"); setRunpodProviderId(r.provider_id); }
@@ -845,7 +858,7 @@ export function TrainingForm() {
       // dataset + base model, so they're not sent from the form. The chosen
       // audio-eval methods (CER / MOS / similarity) run on the test set.
       ...(isTts ? { eval_methods: evalMethods, eval_max_samples: evalMaxSamples } : {}),
-      ...(isTts && labelExport
+      ...((isTts || isLlm) && labelExport
         ? {
             label_export: true,
             label_base_url: labelUrlMode === "paste" ? (labelBaseUrl.trim() || "http://localhost:3002") : "",
@@ -853,13 +866,22 @@ export function TrainingForm() {
             label_token: labelTokenMode === "paste" ? (labelToken.trim() || null) : null,
             label_token_secret: labelTokenMode === "secret" ? (labelTokenSecret || null) : null,
             label_project_name: labelProjectName.trim() || null,
-            label_samples: labelSamples,
-            label_mos_axes: labelMosAxes.split(",").map((s) => s.trim()).filter(Boolean),
-            label_speakers: labelSpeakers.split(",").map((s) => s.trim()).filter(Boolean),
-            label_speaker_prefix: labelSpeakerPrefix,
-            // Split on comma/newline only — a keyword may contain spaces ("E M G S").
-            label_reject_keywords: labelRejectKeywords.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
-            label_per_speaker: labelPerSpeaker,
+            ...(isTts
+              ? {
+                  label_samples: labelSamples,
+                  label_mos_axes: labelMosAxes.split(",").map((s) => s.trim()).filter(Boolean),
+                  label_speakers: labelSpeakers.split(",").map((s) => s.trim()).filter(Boolean),
+                  label_speaker_prefix: labelSpeakerPrefix,
+                  // Split on comma/newline only — a keyword may contain spaces ("E M G S").
+                  label_reject_keywords: labelRejectKeywords.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
+                  label_per_speaker: labelPerSpeaker,
+                }
+              : {
+                  llm_label_eval_dataset_id: llmLabelEvalDatasetId.trim() || null,
+                  llm_label_samples: llmLabelSamples,
+                  llm_label_mos_axes: llmLabelMosAxes.split(",").map((s) => s.trim()).filter(Boolean),
+                  llm_label_max_new_tokens: llmLabelMaxNewTokens,
+                }),
           }
         : {}),
       ...(sweepOn && Object.keys(sweepGrid).length
@@ -1409,14 +1431,14 @@ export function TrainingForm() {
             </div>
           </div>
         )}
-        {isTts && (
+        {(isTts || isLlm) && (
           <div className="mt-5 space-y-1.5 border-t border-border pt-4">
             <Label className="text-xs uppercase tracking-wide text-muted-foreground">Human evaluation (Label platform)</Label>
             <p className="text-xs text-muted-foreground">
-              After a successful run, synthesize a few clips from the trained model and auto-create a
-              Label-platform <span className="font-medium">recording</span> project with MOS rating enabled,
-              seeded with them. Texts come from the held-out test split if present, else a random sample of the
-              train split. Runs on the VM only (synthesis needs the box).
+              {isTts
+                ? <>After a successful run, synthesize a few clips from the trained model and auto-create a Label-platform <span className="font-medium">recording</span> project with MOS rating enabled, seeded with them. Texts come from the held-out test split if present, else a random sample of the train split. Runs on the VM only (synthesis needs the box).</>
+                : <>After a successful run, generate model responses on an evaluation dataset and auto-create a Label-platform <span className="font-medium">human_mos</span> project seeded with them. Requires a kind=hf dataset registered on the Datasets page. Runs on the VM only.</>
+              }
             </p>
             <label className="flex cursor-pointer items-center gap-2 pt-1 text-sm">
               <input type="checkbox" checked={labelExport} onChange={(e) => setLabelExport(e.target.checked)}
@@ -1479,43 +1501,87 @@ export function TrainingForm() {
                     </Select>
                   )}
                 </div>
-                <FieldWrap label="Project name" hint="Defaults to “<run name>-eval”.">
-                  <Input value={labelProjectName} placeholder={`${name || "tts-finetune"}-eval`}
+                <FieldWrap label="Project name" hint={`Defaults to "${name || (isTts ? "tts-finetune" : "llm-finetune")}-eval".`}>
+                  <Input value={labelProjectName} placeholder={`${name || (isTts ? "tts-finetune" : "llm-finetune")}-eval`}
                     onChange={(e) => setLabelProjectName(e.target.value)} />
                 </FieldWrap>
-                <FieldWrap label="Number of samples" hint="How many clips to synthesize + import as tasks.">
-                  <NumberField min={1} value={labelSamples} onChange={setLabelSamples} />
-                </FieldWrap>
-                <div className="sm:col-span-2">
-                  <FieldWrap label="MOS axes" hint="Comma-separated 1–5 rating axes for the recording project.">
-                    <Input value={labelMosAxes} placeholder="Naturalness, Intelligibility, Noise"
-                      onChange={(e) => setLabelMosAxes(e.target.value)} />
-                  </FieldWrap>
-                </div>
-                <div className="sm:col-span-2">
-                  <FieldWrap label="Reject keywords (optional)" hint="Comma- or newline-separated phrases. Text samples whose transcript contains any are dropped (case-insensitive, spacing-agnostic — “E M G S” matches any spacing).">
-                    <Input value={labelRejectKeywords} placeholder="EMGS, E M G S, Husein"
-                      onChange={(e) => setLabelRejectKeywords(e.target.value)} />
-                  </FieldWrap>
-                </div>
-                <div className="sm:col-span-2">
-                  <FieldWrap label="Speaker names (optional)" hint={labelPerSpeaker
-                    ? "Comma-separated. One project is created per speaker, each seeded only from that speaker's own clips. Names must match the dataset's speaker labels."
-                    : "Comma-separated. Balances the clips evenly across these voices — e.g. 2 speakers + 32 samples → 16 each. Blank → the dataset's original voices."}>
-                    <Input value={labelSpeakers} placeholder="speakerA, speakerB"
-                      onChange={(e) => setLabelSpeakers(e.target.value)} />
-                  </FieldWrap>
-                </div>
-                <label className="flex cursor-pointer items-center gap-2 text-sm sm:col-span-2">
-                  <input type="checkbox" checked={labelPerSpeaker} onChange={(e) => setLabelPerSpeaker(e.target.checked)}
-                    className="h-4 w-4 accent-primary" />
-                  <span>Separate project per speaker <span className="text-muted-foreground">(each from that speaker&apos;s own clips · {labelSamples} per speaker)</span></span>
-                </label>
-                <label className="flex cursor-pointer items-center gap-2 text-sm sm:col-span-2">
-                  <input type="checkbox" checked={labelSpeakerPrefix} onChange={(e) => setLabelSpeakerPrefix(e.target.checked)}
-                    className="h-4 w-4 accent-primary" />
-                  <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
-                </label>
+                {isTts ? (
+                  <>
+                    <FieldWrap label="Number of samples" hint="How many clips to synthesize + import as tasks.">
+                      <NumberField min={1} value={labelSamples} onChange={setLabelSamples} />
+                    </FieldWrap>
+                    <div className="sm:col-span-2">
+                      <FieldWrap label="MOS axes" hint="Comma-separated 1–5 rating axes for the recording project.">
+                        <Input value={labelMosAxes} placeholder="Naturalness, Intelligibility, Noise"
+                          onChange={(e) => setLabelMosAxes(e.target.value)} />
+                      </FieldWrap>
+                    </div>
+                    <div className="sm:col-span-2">
+                      <FieldWrap label="Reject keywords (optional)" hint="Comma- or newline-separated phrases. Text samples whose transcript contains any are dropped (case-insensitive, spacing-agnostic — “E M G S” matches any spacing).">
+                        <Input value={labelRejectKeywords} placeholder="EMGS, E M G S, Husein"
+                          onChange={(e) => setLabelRejectKeywords(e.target.value)} />
+                      </FieldWrap>
+                    </div>
+                    <div className="sm:col-span-2">
+                      <FieldWrap label="Speaker names (optional)" hint={labelPerSpeaker
+                        ? "Comma-separated. One project is created per speaker, each seeded only from that speaker's own clips. Names must match the dataset's speaker labels."
+                        : "Comma-separated. Balances the clips evenly across these voices — e.g. 2 speakers + 32 samples → 16 each. Blank → the dataset's original voices."}>
+                        <Input value={labelSpeakers} placeholder="speakerA, speakerB"
+                          onChange={(e) => setLabelSpeakers(e.target.value)} />
+                      </FieldWrap>
+                    </div>
+                    <label className="flex cursor-pointer items-center gap-2 text-sm sm:col-span-2">
+                      <input type="checkbox" checked={labelPerSpeaker} onChange={(e) => setLabelPerSpeaker(e.target.checked)}
+                        className="h-4 w-4 accent-primary" />
+                      <span>Separate project per speaker <span className="text-muted-foreground">(each from that speaker&apos;s own clips · {labelSamples} per speaker)</span></span>
+                    </label>
+                    <label className="flex cursor-pointer items-center gap-2 text-sm sm:col-span-2">
+                      <input type="checkbox" checked={labelSpeakerPrefix} onChange={(e) => setLabelSpeakerPrefix(e.target.checked)}
+                        className="h-4 w-4 accent-primary" />
+                      <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
+                    </label>
+                  </>
+                ) : (
+                  <>
+                    <div className="sm:col-span-2">
+                      {(() => {
+                        const hfDatasets = datasets.filter((d) => d.kind === "hf");
+                        const linkedRepoIds = new Set(datasets.map((d) => d.catalog_repo_id).filter(Boolean));
+                        const standaloneHosted = catalogDatasets.filter((r) => !linkedRepoIds.has(r.id));
+                        const hasAny = hfDatasets.length > 0 || standaloneHosted.length > 0;
+                        return (
+                          <FieldWrap label="Eval dataset" hint="Dataset containing JSONL rows with {messages, lov, language} — either a registered kind=hf dataset or a catalog repo pushed via the hf CLI.">
+                            <Select value={llmLabelEvalDatasetId} onValueChange={setLlmLabelEvalDatasetId}>
+                              <SelectTrigger>
+                                <SelectValue placeholder={hasAny ? "Pick an eval dataset…" : "No datasets yet — push via hf CLI first"} />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {hfDatasets.map((d) => (
+                                  <SelectItem key={d.id} value={d.id}>{d.name || d.hf_repo || d.id}</SelectItem>
+                                ))}
+                                {standaloneHosted.map((r) => (
+                                  <SelectItem key={r.id} value={r.id}>{r.full_id}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </FieldWrap>
+                        );
+                      })()}
+                    </div>
+                    <FieldWrap label="Responses" hint="How many eval rows to generate responses for.">
+                      <NumberField min={1} value={llmLabelSamples} onChange={setLlmLabelSamples} />
+                    </FieldWrap>
+                    <FieldWrap label="Max new tokens" hint="Token budget per generated response.">
+                      <NumberField min={64} value={llmLabelMaxNewTokens} onChange={setLlmLabelMaxNewTokens} />
+                    </FieldWrap>
+                    <div className="sm:col-span-2">
+                      <FieldWrap label="MOS axes" hint="Comma-separated 1–5 rating axes for the human_mos project.">
+                        <Input value={llmLabelMosAxes} placeholder="Relevance, Accuracy, Helpfulness, Tone"
+                          onChange={(e) => setLlmLabelMosAxes(e.target.value)} />
+                      </FieldWrap>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>

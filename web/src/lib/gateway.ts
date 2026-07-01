@@ -430,6 +430,11 @@ export const gateway = {
       volume_gb?: number;
       visible_devices?: string | null;
       venv_path?: string | null;
+      // LLM-only override fields
+      llm_eval_dataset_id?: string | null;
+      llm_samples?: number;
+      llm_mos_axes?: string[];
+      llm_max_new_tokens?: number;
     },
   ) =>
     request<{ status: string }>(
