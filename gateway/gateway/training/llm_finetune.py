@@ -68,7 +68,12 @@ def _fa_mode(arch: str, cfg: dict) -> str:
     """Which attention stack to install/run: gemma DEFAULTS to 'fa4' (the head_dim-512
     cute fork — faster, long context) and can opt out with cfg.gemma_fa4=False (→ the
     FA3 wheel + dynamic_attention SDPA-tiled path). minimax/mistral always 'fa3' (stock
-    FA, head_dim 128)."""
+    FA, head_dim 128). qwen uses 'kernels' — the GatedDeltaNet hybrid runs the FlashQLA
+    chunk_gated_delta_rule kernel + causal_conv1d for the full-attn layers, and
+    attn_implementation="kernels-community/flash-attn3" auto-fetched by the `kernels`
+    package at model load (no prebuilt FA3 wheel)."""
+    if arch == "qwen":
+        return "kernels"
     if arch == "gemma":
         return "fa4" if cfg.get("gemma_fa4", True) else "fa3"
     return "fa3"
@@ -118,6 +123,28 @@ _ARCH = {
         # the Triton per-tensor FP8 dequant fast path (bit-identical; 7-13x).
         "run_env": {"MISTRAL_DEQUANT_TRITON": "1"},
     },
+    "qwen": {
+        # Qwen3.5/3.6 (dense + MoE) — GatedDeltaNet hybrid. The trainer auto-detects dense
+        # (Qwen3_5ForConditionalGeneration) vs MoE (Qwen3_5MoeForConditionalGeneration)
+        # from the config, so this one entry serves Qwen/Qwen3.6-27B and Qwen/Qwen3.6-35B-A3B.
+        "trainer": os.path.join("qwen", "qwen3_5.py"),
+        # No cheap CPU pre-flight: the custom forward (LinearLoRA B=0 + the GatedDeltaNet
+        # chunk_gated_delta_rule contiguous patch) needs the real 27B/35B model to check
+        # (compare_logits.py is owed — see autotrain/qwen3.5/CLAUDE.md). The practical gate
+        # is the smoke run (loss decreases, no NaN). Skipped like the gemma FA4 path.
+        "preflight": None,
+        "preflight_cwd": os.path.join(LLM_DIR, "qwen"),
+        "preflight_env": {},
+        "model_env": "MODEL_ID",
+        "default_model": "Qwen/Qwen3.6-27B",
+        # torch 2.10 + cu13 is the verified Qwen3.5 stack (NOT the FA3-wheel 2.12 the other
+        # archs pin — qwen uses kernels-community/flash-attn3 for its full-attn layers, so it
+        # doesn't need the 2.12 FA3-wheel ABI). transformers 5.12.1 ships qwen3_5 / qwen3_5_moe
+        # + liger's apply_liger_kernel_to_qwen3_5(_moe). kernels<=0.14.0 for the attn fetch.
+        "torch": "2.10.0",
+        "torchvision": "0.25.0",
+        "deps": ["transformers==5.12.1", "kernels<=0.14.0"],
+    },
 }
 
 
@@ -130,17 +157,21 @@ def emit(tag: str, obj: dict) -> None:
 
 
 def detect_arch(model_id: str) -> str:
-    """gemma | minimax | mistral from the base model id. Raises on anything else."""
+    """gemma | minimax | mistral | qwen from the base model id. Raises on anything else."""
     n = (model_id or "").lower()
     if "minimax" in n:
         return "minimax"
     if "mistral" in n:
         return "mistral"
+    if "qwen" in n:
+        # Qwen3.5 / Qwen3.6 (dense + MoE) — the trainer auto-detects dense vs MoE from
+        # the config, so one arch entry serves Qwen/Qwen3.6-27B and Qwen/Qwen3.6-35B-A3B.
+        return "qwen"
     if "gemma" in n:
         return "gemma"
     raise RuntimeError(
         f"unsupported LLM base model '{model_id}' — task_type=llm supports gemma-4, "
-        f"minimax-m2 and mistral-small models (the trainer is chosen by name)")
+        f"minimax-m2, mistral-small and qwen3.5/3.6 models (the trainer is chosen by name)")
 
 
 def _venv_path(cfg: dict, arch: str) -> str:
@@ -184,6 +215,41 @@ def _install_fa3_wheel(cu: str, venv: str, _pip) -> None:
         log(f"[deps] downloading FA3 wheel {whl} …")
         urllib.request.urlretrieve(url, whl_path)
     _pip(whl_path)
+
+
+def _install_qwen_kernels(py: str, env: dict, _pip) -> None:
+    """Qwen3.5/3.6 GatedDeltaNet stack: the FlashQLA `chunk_gated_delta_rule` kernel
+    (pure-python, from git) + `causal_conv1d` (a CUDA extension for the short conv).
+    torch/torchvision are already installed (per-arch, cu13). The full-attn layers'
+    attention (kernels-community/flash-attn3) is fetched by the `kernels` package at
+    model load — no install step here. Mirrors autotrain/qwen3.5/run.sh.
+
+    ⚠ causal_conv1d MUST build `--no-build-isolation` so it links the venv's cu13
+    torch: under uv's default build isolation it pulls the default (cu12) torch into
+    the build env and the resulting `causal_conv1d_cuda.so` links libcudart.so.12 →
+    ImportError at runtime against the cu13 torch (the load-bearing gotcha from
+    autotrain/qwen3.5/CLAUDE.md). Needs nvcc on PATH (CUDA_HOME, set in _ensure_venv)."""
+    # Fast path: both kernels already import in this venv (e.g. a reused
+    # /share/qwen3.5-venv) → skip the git fetch + the nvcc source build.
+    try:
+        subprocess.check_call(
+            [py, "-c", "import flash_qla, causal_conv1d"],
+            cwd="/tmp", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
+        log("[deps] qwen: flash_qla + causal_conv1d already present — skipping rebuild")
+        return
+    except Exception:
+        pass
+    # Build deps for the --no-build-isolation CUDA extension below.
+    _pip("setuptools", "wheel", "packaging", "ninja")
+    # FlashQLA: the GatedDeltaNet linear-attention kernel (pure python).
+    _pip("git+https://github.com/QwenLM/FlashQLA.git")
+    # causal_conv1d: CUDA extension, --no-build-isolation so it links the venv's cu13 torch.
+    _pip("--no-build-isolation", "causal_conv1d")
+    subprocess.check_call(
+        [py, "-c", "import flash_qla, causal_conv1d; print('qwen kernels import OK')"],
+        cwd="/tmp", env=env,
+    )
 
 
 def _install_fa4(cfg: dict, py: str, env: dict, _pip) -> None:
@@ -318,16 +384,30 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
         # We proactively clear stale locks (below) AND fail fast if one is contended.
         "UV_LOCK_TIMEOUT": os.environ.get("UV_LOCK_TIMEOUT", "60"),
     }
+    # qwen's causal_conv1d builds a CUDA extension from source → nvcc must be on PATH
+    # and CUDA_HOME set (matches autotrain/qwen3.5/run.sh). No-op when the kernels are
+    # already built (the skip-if-present fast path in _install_qwen_kernels).
+    if arch == "qwen" and os.path.isdir("/usr/local/cuda/bin"):
+        env.setdefault("CUDA_HOME", "/usr/local/cuda")
+        env["PATH"] = "/usr/local/cuda/bin" + os.pathsep + env.get("PATH", "")
     pkgs = list(_ARCH[arch]["deps"]) + list(_COMMON_DEPS)
     fa = _fa_mode(arch, cfg)
-    # FA4 installs as the `flash_attn.cute` namespace pkg; FA3 as `flash_attn_interface`.
-    attn_import = "flash_attn.cute" if fa == "fa4" else "flash_attn_interface"
+    # FA4 installs as the `flash_attn.cute` namespace pkg; FA3 as `flash_attn_interface`;
+    # qwen ('kernels') has no prebuilt attn wheel — verify its GatedDeltaNet kernels
+    # (flash_qla + causal_conv1d) AND boto3 (a reused /share/qwen3.5-venv carries the
+    # training stack but not the orchestrator's S3 deps → force a top-up install).
+    if fa == "fa4":
+        attn_import = "flash_attn.cute"
+    elif fa == "kernels":
+        attn_import = "flash_qla, causal_conv1d, boto3"
+    else:
+        attn_import = "flash_attn_interface"
 
     def _present() -> bool:
         try:
             subprocess.check_call(
                 [py, "-c", f"import torch, transformers, liger_kernel, {attn_import}"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
             )
             return True
         except Exception:
@@ -386,12 +466,22 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
             time.sleep(wait)
 
     # torch 2.12 is the common base (the FA3-wheel ABI + torch._grouped_mm for MoE; the
-    # FA4 cute fork also runs on it). The attention kernel then differs by mode.
+    # FA4 cute fork also runs on it). qwen overrides to torch 2.10 (its verified cu13
+    # GatedDeltaNet stack — it uses kernels-community/flash-attn3, not the FA3 wheel, so
+    # it needn't share the 2.12 ABI). The attention kernel then differs by mode.
     cu = _pick_cuda_backend()
-    log(f"[deps] {arch} ({fa}): CUDA backend {cu}; torch=={TORCH_VERSION} …")
-    _pip(f"torch=={TORCH_VERSION}", "--index-url", f"https://download.pytorch.org/whl/{cu}")
+    torch_ver = _ARCH[arch].get("torch", TORCH_VERSION)
+    log(f"[deps] {arch} ({fa}): CUDA backend {cu}; torch=={torch_ver} …")
+    _pip(f"torch=={torch_ver}", "--index-url", f"https://download.pytorch.org/whl/{cu}")
+    torchvision_ver = _ARCH[arch].get("torchvision")
+    if torchvision_ver:
+        # qwen is multimodal (Qwen3_5ForConditionalGeneration ships vision blocks);
+        # transformers pulls torchvision for the image processor. Match torch's cu13.
+        _pip(f"torchvision=={torchvision_ver}", "--index-url", f"https://download.pytorch.org/whl/{cu}")
     if fa == "fa4":
         _install_fa4(cfg, py, env, _pip)
+    elif fa == "kernels":
+        _install_qwen_kernels(py, env, _pip)  # FlashQLA + causal_conv1d (torch already in place)
     else:
         _install_fa3_wheel(cu, venv, _pip)
     _pip(*pkgs)
@@ -458,6 +548,21 @@ def _nproc(cfg: dict) -> int:
     return max(1, int(cfg.get("gpu_count") or 1))
 
 
+def _master_port() -> int:
+    """A per-run torchrun rendezvous port so two runs on the SAME box (e.g. a dense
+    Qwen3.6-27B on GPUs 0-3 and a MoE Qwen3.6-35B-A3B on GPUs 4-7) don't both bind the
+    default 29500 → `EADDRINUSE`. Derive it from the first pinned GPU index: disjoint
+    GPU pins (the only way two runs coexist on one box) get disjoint ports. Concurrent
+    runs on OVERLAPPING GPUs would collide on the GPUs first, so this is sufficient."""
+    cvd = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if cvd:
+        try:
+            return 29500 + (int(cvd.split(",")[0]) % 100)
+        except ValueError:
+            pass
+    return 29500
+
+
 def _lora_dims(cfg: dict) -> tuple[int, int]:
     """(r, alpha) from the form. The form's LoRA-strength control is lora_alpha_RATIO
     (the UI shows "alpha = round(r × ratio)"), so it WINS — `lora_alpha` carries a
@@ -491,6 +596,29 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
         "--target_modules", ",".join(targets),
         "--batch_size", "1",  # the collator packs the whole batch into ONE sequence → must be 1
         "--lr", str(float(cfg.get("learning_rate") or 5e-5)),
+        "--max_epochs", str(int(cfg.get("max_epochs") or 3)),
+        "--max_steps", str(int(cfg.get("max_steps") or 0)),
+        "--checkpointing_step", str(int(cfg.get("save_steps") or cfg.get("logging_steps") or 100)),
+    ]
+    return cmd
+
+
+def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
+    """Qwen3.5/3.6 trainer CLI (qwen/qwen3_5.py). Like gemma it reads ./packed_data
+    and writes ./checkpointing (cwd=work); the model (dense Qwen3.6-27B vs MoE
+    Qwen3.6-35B-A3B) is selected via the MODEL_ID env (spec['model_env']), auto-detected
+    from the config. LoRA wraps only attention q/k/v/o (the MoE experts are untouched),
+    so there's no --target_modules. `--lora_r` (long form) sidesteps the torchrun
+    bare-`--r` "ambiguous option" clash on torch 2.12.x (the trainer aliases it)."""
+    r, alpha = _lora_dims(cfg)
+    if not cfg.get("lora_r"):
+        r, alpha = 256, 512  # qwen proven default (scaling 2.0), matches the standalone
+    cmd = [
+        py, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
+        os.path.join(LLM_DIR, _ARCH["qwen"]["trainer"]),
+        "--lora_r", str(r), "--alpha", str(alpha),
+        "--batch_size", "1",  # the collator packs the whole batch into ONE sequence → must be 1
+        "--lr", str(float(cfg.get("learning_rate") or 1e-4)),
         "--max_epochs", str(int(cfg.get("max_epochs") or 3)),
         "--max_steps", str(int(cfg.get("max_steps") or 0)),
         "--checkpointing_step", str(int(cfg.get("save_steps") or cfg.get("logging_steps") or 100)),
@@ -626,6 +754,10 @@ def run(cfg: dict) -> None:
         rc = subprocess.call([py, preflight], cwd=spec["preflight_cwd"], env=pf_env)
         if rc != 0:
             raise RuntimeError(f"{arch} correctness pre-flight ({preflight}) failed (rc={rc}) — refusing to train")
+    elif arch == "qwen":
+        log(f"[preflight] {arch} ({fa}): no cheap pre-flight — the custom forward "
+            f"(LinearLoRA B=0 + GatedDeltaNet contiguous patch) needs the real model; "
+            f"compare_logits.py is owed (see autotrain/qwen3.5/CLAUDE.md). Gate = the smoke run.")
     else:
         log(f"[preflight] {arch} ({fa}): no cheap pre-flight (FA4 cute kernel pre-validated; "
             f"run compare_logits_fa4.py manually for a full check)")
@@ -633,8 +765,14 @@ def run(cfg: dict) -> None:
     nproc = _nproc(cfg)
     if arch == "gemma":
         cmd = _gemma_cmd(py, cfg, nproc)
+    elif arch == "qwen":
+        cmd = _qwen_cmd(py, cfg, nproc)  # reads ./packed_data, writes ./checkpointing (like gemma)
     else:  # minimax + mistral share the FP8-MoE CLI
         cmd = _moe_cmd(py, cfg, nproc, packed, ckpt_dir, arch)
+    # Unique torchrun rendezvous port per run so two runs on one box don't collide on
+    # 29500 (EADDRINUSE). Injected as a torchrun optional right after --nproc_per_node,
+    # before the trainer-script positional. Applies to every arch.
+    cmd = cmd[:4] + [f"--master_port={_master_port()}"] + cmd[4:]
     if "wandb" in report_to:
         cmd += ["--wandb"]
         if cfg.get("wandb_project"):

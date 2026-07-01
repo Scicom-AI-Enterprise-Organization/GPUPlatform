@@ -490,8 +490,13 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # `--lora_r` is the long form the gateway orchestrator passes (llm_finetune._qwen_cmd);
+    # `--rank` is the standalone alias. NOT a bare `--r`: torchrun (torch.distributed.run)
+    # prefix-matches a bare `--r` against its own options and aborts "ambiguous option" on
+    # torch 2.12.x (see gemma4). dest="rank" keeps main(args.rank) working.
     parser.add_argument(
-        "--rank",
+        "--lora_r", "--rank",
+        dest="rank",
         type=int,
         default=256,
         help="LoRA rank"
@@ -546,7 +551,10 @@ if __name__ == "__main__":
     parser.add_argument("--mlflow_experiment", default="qwen3.5-autotrain", help="mlflow experiment name.")
     parser.add_argument(
         "--model_id",
-        default="Qwen/Qwen3.6-27B",
+        # The gateway orchestrator (llm_finetune.run) selects the model via the MODEL_ID
+        # env var (spec["model_env"]="MODEL_ID"), like the minimax/mistral trainers, so a
+        # run picks dense (Qwen3.6-27B) vs MoE (Qwen3.6-35B-A3B) without a CLI flag.
+        default=os.environ.get("MODEL_ID", "Qwen/Qwen3.6-27B"),
         help="HF model id to finetune. Dense (Qwen3_5ForConditionalGeneration) or MoE "
              "(Qwen3_5MoeForConditionalGeneration) is auto-detected from the config. "
              "Qwen3.6 reuses the Qwen3.5 arch: Qwen/Qwen3.6-27B (dense), Qwen/Qwen3.6-35B-A3B (MoE).",

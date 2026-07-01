@@ -68,17 +68,28 @@ _REASONING_GUARDS: dict[str, tuple[str, str]] = {
         "if reasoning_content and loop.index0 > ns.last_user_index",
         "if reasoning_content",
     ),
+    # Qwen3.5 (legacy) template guards reasoning to turns after the last user query.
+    # Qwen3.6 combines it with a `preserve_thinking` clause (so this exact substring is
+    # absent) — there build_chat_template falls back to stock and pack_rows passes
+    # preserve_thinking=True instead (see tokenize_row). Harmless either way.
+    "qwen": (
+        "{%- if loop.index0 > ns.last_query_index %}",
+        "{%- if loop.index0 >= 0 %}",
+    ),
 }
 
 
 def detect_arch(tokenizer_name: Optional[str]) -> str:
     """Map a tokenizer/model id to a packing arch: 'gemma' | 'minimax' | 'mistral' |
-    'generic'. Drives the reasoning relaxation + per-turn message normalization."""
+    'qwen' | 'generic'. Drives the reasoning relaxation + per-turn message
+    normalization. Keep in sync with llm_finetune.detect_arch + training_api._llm_arch."""
     n = (tokenizer_name or "").lower()
     if "minimax" in n:
         return "minimax"
     if "mistral" in n:
         return "mistral"
+    if "qwen" in n:
+        return "qwen"
     if "gemma" in n:
         return "gemma"
     return "generic"
@@ -155,6 +166,44 @@ def _normalize_minimax_turn(turn: dict) -> dict:
     return turn
 
 
+def _normalize_qwen_turn(turn: dict) -> dict:
+    """Qwen3.5/3.6 template quirks (mirrors autotrain/qwen3.5/pack_dataset.py):
+    - GLM `role: observation` → `tool`; `content: null` → `""` (null crashes the template).
+    - The template reads `reasoning_content` (the dataset stores per-turn `reasoning`) to
+      render `<think>…</think>` — map it on assistant turns.
+    - It iterates `tool_call.function.arguments | items`, so `arguments` MUST be a plain
+      dict, never a JSON string — parse it; wrap a bare GLM `{name, arguments}` call into
+      the OpenAI `{type:function, function:{…}}` shape."""
+    turn = dict(turn)
+    if turn.get("role") == "observation":
+        turn["role"] = "tool"
+    if turn.get("content") is None:
+        turn["content"] = ""
+    if turn.get("role") in ("assistant", "model") and turn.get("reasoning") and not turn.get("reasoning_content"):
+        turn["reasoning_content"] = turn["reasoning"]
+    tcs = turn.get("tool_calls")
+    if isinstance(tcs, (list, tuple)):
+        norm = []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            tc = dict(tc)
+            fn = dict(tc["function"]) if isinstance(tc.get("function"), dict) else {
+                "name": tc.get("name"), "arguments": tc.get("arguments", {})}
+            a = fn.get("arguments")
+            if isinstance(a, str):
+                try:
+                    fn["arguments"] = json.loads(a)
+                except (json.JSONDecodeError, ValueError):
+                    fn["arguments"] = {}
+            elif a is None:
+                fn["arguments"] = {}
+            tc["function"] = fn
+            norm.append(tc)
+        turn["tool_calls"] = norm
+    return turn
+
+
 def _as_thinking_content(content: Any, reasoning: Any) -> list:
     """Rewrite an assistant turn's content into a [thinking, text] block list so the
     Mistral-Small-4 template renders `[THINK]<reasoning>[/THINK]<text>`."""
@@ -220,6 +269,8 @@ def extract_messages(value: Any, arch: str = "generic", all_reasoning: bool = Tr
             out.append(_normalize_minimax_turn(turn))
         elif arch == "mistral":
             out.append(_normalize_mistral_turn(turn, all_reasoning))
+        elif arch == "qwen":
+            out.append(_normalize_qwen_turn(turn))
         else:
             out.append(dict(turn))
     return out or None
@@ -255,18 +306,23 @@ def extract_tools(value: Any) -> list:
     return tools
 
 
-def tokenize_row(tokenizer, messages, tools=None, chat_template=None, reasoning_effort=None):
+def tokenize_row(tokenizer, messages, tools=None, chat_template=None, reasoning_effort=None,
+                 preserve_thinking=False):
     """Render + tokenize one conversation; return (input_ids, labels, used_mask).
 
     Prefers assistant-only labels via `return_assistant_tokens_mask=True`; falls
     back to `labels = input_ids` when the template lacks `{% generation %}` (mask
     all-zero) or the kwarg is unsupported. `reasoning_effort` (mistral) is passed
-    to the template only when set."""
+    to the template only when set. `preserve_thinking` (qwen3.6) makes the template
+    render EVERY assistant turn's `<think>` block (templates that don't reference the
+    variable ignore it)."""
     kw: dict[str, Any] = {}
     if tools:
         kw["tools"] = tools
     if reasoning_effort is not None:
         kw["reasoning_effort"] = reasoning_effort
+    if preserve_thinking:
+        kw["preserve_thinking"] = True
     if chat_template is not None:
         kw["chat_template"] = chat_template
 
@@ -353,6 +409,10 @@ def pack_rows(
     # mistral relaxes reasoning by folding [THINK] blocks in extract_messages (not a
     # template guard swap) AND passing reasoning_effort to the template.
     reasoning_effort = ("high" if all_reasoning else "none") if arch == "mistral" else None
+    # qwen3.6's template renders every turn's reasoning when preserve_thinking=True
+    # (its guard is combined with a preserve_thinking clause, so the substring swap in
+    # build_chat_template is a no-op there — this kwarg is the real control).
+    preserve_thinking = bool(all_reasoning and arch == "qwen")
 
     ParquetWriter = _import_parquet_writer()
 
@@ -386,7 +446,7 @@ def pack_rows(
                 try:
                     ids, labels, used_mask = tokenize_row(
                         tokenizer, messages, tools=tools, chat_template=chat_template,
-                        reasoning_effort=reasoning_effort,
+                        reasoning_effort=reasoning_effort, preserve_thinking=preserve_thinking,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("llm_pack: row %d tokenize failed (%s); skipping", i, e)

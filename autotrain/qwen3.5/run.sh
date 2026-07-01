@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Qwen3.5-27B LoRA finetune — FSDP2 on N GPUs (verified on the tm 8× H20-3e box).
+# Qwen3.6 LoRA finetune (dense + MoE) — FSDP2 on N GPUs (tm 8× H20-3e box).
+# Qwen3.6 reuses the Qwen3.5 arch; qwen3_5.py auto-detects dense vs MoE from the config:
+#   MODEL_ID=Qwen/Qwen3.6-27B      (dense, Qwen3_5ForConditionalGeneration)      [default]
+#   MODEL_ID=Qwen/Qwen3.6-35B-A3B  (MoE,   Qwen3_5MoeForConditionalGeneration)
 #
 # Pre-flight: creates/activates a uv venv, installs torch 2.10 + the Qwen3.5 stack (transformers,
 # FlashQLA GatedDeltaNet kernel, causal_conv1d, liger-kernel, kernels<=0.14 for the
@@ -7,7 +10,8 @@
 #
 # Usage on the box:
 #   export HF_TOKEN=hf_...            # for the (gated) Scicom-intl/Function-Call-TaaS dataset
-#   bash run.sh                       # full run (deps + pack + train, default args)
+#   bash run.sh                       # full run of Qwen/Qwen3.6-27B (deps + pack + train)
+#   MODEL_ID=Qwen/Qwen3.6-35B-A3B bash run.sh        # train the MoE model instead
 #   QWEN_DEPS_ONLY=1 bash run.sh      # install deps only (no pack, no train)
 #   bash run.sh --max_steps 50 --limit_samples 10   # short smoke -> a LoRA checkpoint
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 bash run.sh         # pin specific GPUs
@@ -25,10 +29,15 @@ export HF_HOME="${HF_HOME:-/share/huggingface}"
 
 TORCH_VERSION="${TORCH_VERSION:-2.10.0}"
 TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.25.0}"
-MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-27B}"
+# Qwen3.6 reuses the Qwen3.5 arch. Train either: Qwen/Qwen3.6-27B (dense) or
+# Qwen/Qwen3.6-35B-A3B (MoE) — qwen3_5.py auto-detects dense vs MoE from the config.
+MODEL_ID="${MODEL_ID:-Qwen/Qwen3.6-27B}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-50000}"          # pack_dataset.py --max-seq-len (50k fits the H20 activation budget)
 QWEN_DEPS_ONLY="${QWEN_DEPS_ONLY:-0}"
 VENV_PATH="${VENV_PATH:-.venv}"              # uv venv to install into (created if absent & no venv active)
+# Per-model checkpoint dir so 27B and 35B-A3B runs don't clobber each other's lora.pt.
+_MODEL_SLUG="$(printf '%s' "$MODEL_ID" | sed 's#.*/##' | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpointing-${_MODEL_SLUG}}"
 
 # NCCL: disable NVLink-SHARP (NVLS) multicast — the bind fails inside these containers and crashes
 # the first FSDP all-gather; ring/tree over NVLink/PCIe works fine.
@@ -72,7 +81,7 @@ PIP="uv pip install"
 # ---------- deps (the proven Qwen3.5 stack) ----------
 $PIP "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" --index-url "$TORCH_INDEX_URL"
 $PIP setuptools wheel packaging ninja   # build deps for the --no-build-isolation CUDA extension below
-$PIP huggingface_hub transformers ipykernel liger-kernel wandb mlflow pandas pyarrow tqdm
+$PIP huggingface_hub transformers ipykernel liger-kernel wandb mlflow pandas pyarrow tqdm accelerate
 $PIP "kernels<=0.14.0"                                                  # for attn_implementation=kernels-community/flash-attn3
 $PIP "git+https://github.com/QwenLM/FlashQLA.git"                       # chunk_gated_delta_rule (GatedDeltaNet linear attn; pure-python)
 # causal_conv1d builds a CUDA extension and MUST be --no-build-isolation so it links the venv's
@@ -89,8 +98,8 @@ if [ "$QWEN_DEPS_ONLY" = "1" ]; then echo ">> QWEN_DEPS_ONLY=1 — deps installe
 if [ "${SKIP_DATA_PACK:-0}" = "1" ] && [ -d ./packed_data ]; then
   echo ">> SKIP_DATA_PACK=1 — reusing existing ./packed_data"
 else
-  echo ">> packing dataset (max-seq-len=$MAX_SEQ_LEN)"
-  python pack_dataset.py --out ./packed_data --max-seq-len "$MAX_SEQ_LEN"
+  echo ">> packing dataset (max-seq-len=$MAX_SEQ_LEN, tokenizer=$MODEL_ID)"
+  python pack_dataset.py --out ./packed_data --max-seq-len "$MAX_SEQ_LEN" --tokenizer "$MODEL_ID"
 fi
 
 # ---------- model (download ONCE into the shared HF cache; the torchrun ranks then read it) ----------
@@ -102,5 +111,7 @@ if [ "${SKIP_MODEL_DOWNLOAD:-0}" != "1" ]; then
 fi
 
 # ---------- train ----------
-echo ">> launching training on $NPROC GPUs"
-torchrun --nproc_per_node="$NPROC" qwen3_5.py "$@"
+# --model_id/--checkpoint_dir come first so an explicit override in "$@" wins (argparse: last).
+echo ">> launching training on $NPROC GPUs (model=$MODEL_ID, checkpoint_dir=$CHECKPOINT_DIR)"
+torchrun --nproc_per_node="$NPROC" qwen3_5.py \
+  --model_id "$MODEL_ID" --checkpoint_dir "$CHECKPOINT_DIR" "$@"

@@ -64,21 +64,26 @@ IGNORE_INDEX = -100
 
 DEFAULT_REPO = "Scicom-intl/Function-Call-TaaS"
 DEFAULT_FILE = "glm5.1-fp8-test/test-00000-of-00001.parquet"
-DEFAULT_TOKENIZER = "Qwen/Qwen3.5-27B"
+# Qwen3.6-27B and Qwen3.6-35B-A3B share the SAME tokenizer + chat template, so one pack
+# serves both. (It differs from Qwen3.5-27B — different template — so a 3.5 pack is NOT valid
+# for 3.6 and vice versa.)
+DEFAULT_TOKENIZER = "Qwen/Qwen3.6-27B"
 
 # --- Reasoning rendering ------------------------------------------------------
-# Qwen3.5's stock template only emits <think>...</think> on assistant turns AFTER
-# `ns.last_query_index` (the last real user query, not a tool-response turn).
-# In a multi-step agentic trajectory every intermediate assistant turn is before
-# that index, so their reasoning is silently dropped.
+# Both Qwen3.5 and Qwen3.6 stock templates only emit <think>...</think> on assistant
+# turns AFTER `ns.last_query_index` (the last real user query, not a tool-response turn).
+# In a multi-step agentic trajectory every intermediate assistant turn is before that
+# index, so their reasoning is silently dropped. We enable ALL turns' reasoning two ways
+# (whichever the loaded template supports; harmless if it doesn't):
 #
-# We relax this by replacing the guard:
-#   STOCK : loop.index0 > ns.last_query_index
-#   ALL   : loop.index0 >= 0   (always true)
-#
-# This is a surgical substring swap on the stock template string. If the template
-# changes upstream the swap fails to find the string, warns, and returns the stock
-# template rather than crashing.
+#   1. Qwen3.6 (preferred): the template guards on
+#        (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)
+#      so we simply pass `preserve_thinking=True` to apply_chat_template (see tokenize_row).
+#   2. Qwen3.5 (legacy): the template has no preserve_thinking hook, so we surgically swap
+#        STOCK : loop.index0 > ns.last_query_index   ->   ALL : loop.index0 >= 0  (always true)
+#      on the template string. If the guard string is absent (e.g. Qwen3.6) the swap is a
+#      no-op that warns and returns the stock template rather than crashing — the
+#      preserve_thinking kwarg carries the all-reasoning behaviour there.
 _REASONING_GUARD_STOCK = (
     "{%- if loop.index0 > ns.last_query_index %}"
 )
@@ -102,11 +107,9 @@ def build_chat_template(tokenizer, all_reasoning: bool):
         return stock
     if _REASONING_GUARD_STOCK not in stock:
         print(
-            "[pack_dataset] WARN: could not find the Qwen3.5 reasoning guard in "
-            "the chat template. Either the template changed upstream or "
-            "_REASONING_GUARD_STOCK needs updating. Inspect "
-            "tokenizer.chat_template and update the constant. Falling back to "
-            "the stock template (native-reasoning behaviour).",
+            "[pack_dataset] INFO: Qwen3.5 reasoning-guard string not found in the chat "
+            "template (expected for Qwen3.6). Using the stock template + passing "
+            "preserve_thinking=True to render ALL turns' reasoning.",
             file=sys.stderr,
         )
         return stock
@@ -289,14 +292,18 @@ def extract_tools(value):
     return tools
 
 
-def tokenize_row(tokenizer, messages, tools=None, chat_template=None):
+def tokenize_row(tokenizer, messages, tools=None, chat_template=None,
+                 preserve_thinking=False):
     """Render+tokenize one conversation; return (input_ids, labels, used_mask).
 
-    ``tools``         : OpenAI-wrapped tool list (from extract_tools) -- rendered
-                        into the system block so the model conditions on the
-                        available functions. An empty list means no tool defs.
-    ``chat_template`` : the template string to render with (stock or
-                        reasoning-relaxed); None uses the tokenizer's default.
+    ``tools``            : OpenAI-wrapped tool list (from extract_tools) -- rendered
+                           into the system block so the model conditions on the
+                           available functions. An empty list means no tool defs.
+    ``chat_template``    : the template string to render with (stock or
+                           reasoning-relaxed); None uses the tokenizer's default.
+    ``preserve_thinking``: pass ``preserve_thinking=True`` to apply_chat_template so
+                           Qwen3.6 renders EVERY turn's <think> block (templates that
+                           don't reference the variable ignore it).
 
     PREFERS assistant-only labels via ``return_assistant_tokens_mask=True``; falls
     back to ``labels = input_ids`` when the template lacks ``{% generation %}``
@@ -307,6 +314,8 @@ def tokenize_row(tokenizer, messages, tools=None, chat_template=None):
         kw["tools"] = tools
     if chat_template is not None:
         kw["chat_template"] = chat_template
+    if preserve_thinking:
+        kw["preserve_thinking"] = True
 
     # First attempt: assistant-token mask.
     try:
@@ -372,7 +381,7 @@ def assert_invariants(sample):
 
 
 def pack(df, tokenizer, out_dir, max_seq_len, max_rows=None,
-         chat_template=None, enable_tools=True):
+         chat_template=None, enable_tools=True, preserve_thinking=False):
     """Tokenize + multipack ``df`` into a ChiniDataset at ``out_dir``.
 
     Each row is rendered with its ``messages`` AND (when ``enable_tools``) the
@@ -421,7 +430,8 @@ def pack(df, tokenizer, out_dir, max_seq_len, max_rows=None,
 
             try:
                 ids, labels, used_mask = tokenize_row(
-                    tokenizer, messages, tools=tools, chat_template=chat_template
+                    tokenizer, messages, tools=tools, chat_template=chat_template,
+                    preserve_thinking=preserve_thinking,
                 )
             except Exception as e:  # noqa: BLE001
                 print(f"[pack_dataset] row {i}: tokenize failed "
@@ -535,7 +545,8 @@ def main():
               flush=True)
 
     stats = pack(df, tokenizer, args.out, args.max_seq_len, max_rows=args.max_rows,
-                 chat_template=chat_template, enable_tools=not args.no_tools)
+                 chat_template=chat_template, enable_tools=not args.no_tools,
+                 preserve_thinking=all_reasoning)
 
     # ----- Summary -----------------------------------------------------------
     print("\n========== PACK SUMMARY ==========", flush=True)

@@ -227,7 +227,7 @@ async def _resolve_global_env() -> dict:
 
 
 def _llm_arch(model_id: Optional[str]) -> str:
-    """gemma | minimax | mistral from an LLM base model id (mirrors
+    """gemma | minimax | mistral | qwen from an LLM base model id (mirrors
     llm_finetune.detect_arch + llm_pack.detect_arch). Drives the per-arch venv +
     trainer choice. Unknown → gemma (the default LLM base) so the venv path is still
     well-formed; the trainer raises a clear error on a truly unsupported model."""
@@ -236,6 +236,8 @@ def _llm_arch(model_id: Optional[str]) -> str:
         return "minimax"
     if "mistral" in n:
         return "mistral"
+    if "qwen" in n:
+        return "qwen"  # Qwen3.5/3.6 dense + MoE (auto-detected by the trainer from config)
     return "gemma"
 
 
@@ -2573,7 +2575,7 @@ async def create_training_run(
         # pack arch (a gemma-packed dataset trained as minimax = garbage ids).
         _pack_arch = _pm.get("arch")
         _model_arch = _llm_arch(body.base_model)
-        if _pack_arch and _pack_arch in ("gemma", "minimax", "mistral") and _pack_arch != _model_arch:
+        if _pack_arch and _pack_arch in ("gemma", "minimax", "mistral", "qwen") and _pack_arch != _model_arch:
             raise HTTPException(
                 status_code=400,
                 detail=(f"base model arch '{_model_arch}' ≠ dataset pack arch '{_pack_arch}'. "
