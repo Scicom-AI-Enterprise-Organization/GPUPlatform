@@ -1,0 +1,91 @@
+# =============================================================================
+# Autotrain pipeline — declarative config (EXAMPLE / template)
+# =============================================================================
+# Copy to config.yaml and fill in your values:
+#     cp automation/config.yaml.example automation/config.yaml
+# config.yaml is git-ignored (it holds an API key) — never commit it.
+#
+# Drives the whole flow through the gateway HTTP API (see run_pipeline.py):
+#   1. import each Label-platform project  -> a kind=label dataset
+#   2. transform each to S3 (per-dataset held-out test split)
+#   3. merge all transformed datasets into ONE combined audio dataset
+#   4. fine-tune each model on the merged dataset (RunPod secure H100 SXM)
+#
+# Re-runs are idempotent: add more `datasets:` or `models:` and re-run — already
+# created resources are skipped (a state file tracks them), only the new work +
+# a re-merge run. Delete the state file (or pass --fresh) to start over.
+# -----------------------------------------------------------------------------
+
+# ---- Gateway connection -----------------------------------------------------
+gateway_url: http://localhost:8080            # gateway to hit
+api_key: sgpu_REPLACE_ME                      # a gateway API key
+# ^ overridable with --gateway-url / --api-key or the AUTOTRAIN_API_KEY env var.
+
+# ---- Where the audio datasets land (S3) -------------------------------------
+# A kind=s3 storage id. Leave blank to auto-pick the first enabled S3 storage.
+storage_id:                                   # e.g. store-xxxxxxxx (blank = auto)
+
+# ---- Label platform (import source) -----------------------------------------
+label_base_url: https://your-label-host.example.com
+label_token_secret: LABEL_PROD                # gateway global-secret holding the lpat_ token
+label_status: approved                        # approved | rejected | not_reviewed | all
+
+# ---- Default import cutoff --------------------------------------------------
+# Point-in-time snapshot: only tasks last updated at/before this are imported.
+# Override for the whole run with `--cutoff "..."`; override per-dataset below.
+# Naive timestamps (no offset) are read in `timezone_offset`.
+cutoff: "2026-07-01 11:59PM"
+timezone_offset: "+08:00"                     # applied to a cutoff with no offset
+
+# ---- Datasets to import + transform -----------------------------------------
+# Each becomes: kind=label dataset -> transform to S3 -> a kind=s3 "-audio" dataset.
+# test split: set test_split_pct (0-100) OR test_split_count (absolute), or omit
+#             both for NO held-out test set. Optional per-dataset `cutoff` /
+#             `label_status` override the defaults above.
+datasets:
+  - name: asr-proj-1
+    project_id: 00000000-0000-0000-0000-000000000001
+    # no test set
+
+  - name: asr-proj-2
+    project_id: 00000000-0000-0000-0000-000000000002
+    test_split_pct: 5
+
+  - name: asr-proj-3
+    project_id: 00000000-0000-0000-0000-000000000003
+    test_split_pct: 5
+
+# ---- Merge ------------------------------------------------------------------
+# Concatenate all transformed datasets into one. Their per-source train/test
+# splits are preserved, so the trainer evaluates on the combined test rows.
+merge:
+  enabled: true
+  name: asr-merged
+
+# ---- Training ---------------------------------------------------------------
+# `train` = shared hyperparameters; each entry in `models` may override any of
+# them (e.g. a different gpu_type or batch_size per model).
+train:
+  task_type: asr
+  max_epochs: 5
+  # max_steps > 0 caps optimizer steps (overrides max_epochs) — a quick smoke
+  # test. 0 = run the full epochs. For a 10-step smoke run set max_steps: 10
+  # AND eval_strategy: steps (the trainer auto-shrinks eval_steps to <= max_steps).
+  max_steps: 0
+  # eval_strategy: steps
+  # eval_steps: 10
+  # save_steps: 10
+  patience: 2                    # early stop (needs a test split)
+  augment_techniques: all        # all 8: telephone,noise,dropout,gain,pitch,speed,reverb,bandpass
+  augment_prob: 0.5
+  warmup_steps: 0                # no warmup
+  batch_size: 8                  # default
+  # learning_rate: 1e-5          # omit -> gateway default (1e-5)
+  # provider_id: prov-xxxxxxxx   # omit -> auto-pick the first enabled RunPod provider
+  gpu_type: NVIDIA H100 80GB HBM3 # H100 SXM
+  gpu_count: 1
+  secure_cloud: true             # RunPod Secure Cloud
+
+models:
+  - base_model: openai/whisper-large-v3
+  - base_model: openai/whisper-large-v3-turbo

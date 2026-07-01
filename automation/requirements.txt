@@ -1,0 +1,3 @@
+# The repo .venv already has both. Only needed to run this script standalone.
+httpx>=0.27
+PyYAML>=6.0

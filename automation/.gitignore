@@ -1,0 +1,4 @@
+# Real config holds an API key — keep it local. Commit config.yaml.example instead.
+config.yaml
+# Per-run state (created dataset / run ids) — machine-local, not source.
+state/
