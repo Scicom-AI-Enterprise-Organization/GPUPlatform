@@ -29,6 +29,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { RegionSelect } from "@/components/region-select";
 import { ProgressEta } from "@/components/progress-eta";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { cn } from "@/lib/utils";
@@ -109,6 +110,7 @@ export function TtsPackCard({
   const [gpuType, setGpuType] = useState(isOmni ? "NVIDIA H100 80GB HBM3" : "NVIDIA L40S");
   const [gpuCount, setGpuCount] = useState(1);
   const [secureCloud, setSecureCloud] = useState(true);
+  const [dataCenterId, setDataCenterId] = useState("");  // RunPod region ("" = Auto)
   const [diskGb, setDiskGb] = useState(60);
   const [volumeGb, setVolumeGb] = useState(80);
   const [visibleDevices, setVisibleDevices] = useState("");
@@ -229,6 +231,7 @@ export function TtsPackCard({
         gpu_count: gpuCount,
         gpu_type: gpuType,
         secure_cloud: secureCloud,
+        data_center_id: dataCenterId || undefined,
         disk_gb: diskGb,
         volume_gb: volumeGb,
         visible_devices: vd || null,
@@ -377,6 +380,10 @@ export function TtsPackCard({
                 </SelectContent>
               </Select>
             </div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Region</Label>
+            <RegionSelect value={dataCenterId} onChange={setDataCenterId} disabled={running} />
           </div>
           <div className="grid grid-cols-3 gap-3">
             <div className="space-y-1.5">

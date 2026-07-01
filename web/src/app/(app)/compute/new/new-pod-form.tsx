@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/select";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { RegionSelect } from "@/components/region-select";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
 import type {
@@ -127,6 +128,8 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const [imageOverride, setImageOverride] = useState<string | null>(null);
   // Default to Secure cloud — vetted hosts, more capacity.
   const [secureCloud, setSecureCloud] = useState(true);
+  // RunPod data center to pin ("" = Auto). RunPod-only (PI pins its DC differently).
+  const [dataCenterId, setDataCenterId] = useState("");
   const [providerId, setProviderId] = useState<string>("");
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [piImages, setPiImages] = useState<PiImageOption[]>([]);
@@ -297,6 +300,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         template_id: templateId,
         image: imageOverride,
         cloud_type: secureCloud ? "SECURE" : "COMMUNITY",
+        data_center_id: providerKind === "runpod" ? (dataCenterId || undefined) : undefined,
         idle_terminate_after_s: idleSeconds,
         provider_id: providerId,
       });
@@ -386,6 +390,15 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
               />
             </div>
           </Field>
+
+          {providerKind === "runpod" && (
+            <Field
+              label="Region"
+              hint="Pin the pod to a RunPod data center, or Auto to let RunPod pick any region with capacity."
+            >
+              <RegionSelect value={dataCenterId} onChange={setDataCenterId} className="text-sm" />
+            </Field>
+          )}
 
           <Field
             label="GPU"

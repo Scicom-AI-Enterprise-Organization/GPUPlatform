@@ -144,6 +144,9 @@ class App(Base):
     # default (RUNPOD_CLOUD_TYPE env var, typically COMMUNITY). Only meaningful
     # for the RunPod provider; ignored by Fake/PI.
     cloud_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # RunPod region allowlist (dataCenterIds) — comma-separated ids, or NULL/empty →
+    # auto (RunPod picks any DC with capacity). RunPod-only; ignored by Fake/PI/VM.
+    data_center_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     # Per-worker disk sizing. NULL = use provider defaults
     # (RUNPOD_CONTAINER_DISK_GB / RUNPOD_VOLUME_GB).
     container_disk_gb: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -795,6 +798,20 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS cloud_type VARCHAR(16)"
+        ))
+        # RunPod region allowlist (comma-separated dataCenterIds). ADD first (fresh
+        # DBs get 255); the widen ALTERs bump any column left at the earlier 32 width.
+        await conn.execute(text(
+            "ALTER TABLE apps ADD COLUMN IF NOT EXISTS data_center_id VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE apps ALTER COLUMN data_center_id TYPE VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS data_center_id VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ALTER COLUMN data_center_id TYPE VARCHAR(255)"
         ))
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS container_disk_gb INTEGER"

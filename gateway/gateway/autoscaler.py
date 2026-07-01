@@ -458,6 +458,7 @@ async def _reconcile_app(rdb: "redis_async.Redis", provider: "Provider", app: Ap
                     cloud_type=getattr(app, "cloud_type", None),
                     container_disk_gb=getattr(app, "container_disk_gb", None),
                     volume_gb=getattr(app, "volume_gb", None),
+                    data_center_id=getattr(app, "data_center_id", None),
                 )
                 machine_id = result.machine_id
                 _metrics.PROVISION_TOTAL.labels(provider=provider.name, ok="true").inc()

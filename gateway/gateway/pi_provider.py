@@ -139,6 +139,7 @@ class PrimeIntellectProvider(Provider):
         cloud_type: Optional[str] = None,  # noqa: ARG002 — PI has no equivalent
         container_disk_gb: Optional[int] = None,  # noqa: ARG002
         volume_gb: Optional[int] = None,  # noqa: ARG002
+        data_center_id: Optional[str] = None,  # noqa: ARG002 — PI pins its DC separately
     ) -> ProvisionResult:
         import uuid as _uuid
 

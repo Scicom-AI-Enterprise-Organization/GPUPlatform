@@ -619,6 +619,7 @@ def _ssh_run_stream(cli, command: str, on_line) -> int:
 async def _provision_pod(
     api_key: str, name: str, image: str, gpu_type: str, gpu_count: int,
     secure_cloud: bool, disk_gb: int, volume_gb: int, pub_key: str,
+    data_center_id: Optional[str] = None,
 ) -> tuple[str, str, int, Optional[float]]:
     """Create a RunPod pod and poll until SSH lands. Returns
     (runpod_id, ip, port, cost_per_hr). Mirrors compute._provision_runpod."""
@@ -636,6 +637,9 @@ async def _provision_pod(
     cuda_v = compute._extract_cuda_version(image or "")
     if cuda_v:
         body["allowedCudaVersions"] = [cuda_v]
+    dc = compute._data_center_ids(data_center_id)
+    if dc:
+        body["dataCenterIds"] = dc
 
     async with compute._client(api_key=api_key) as cli:
         r = await cli.post("/pods", json=body)
@@ -998,7 +1002,8 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
             runpod_id, host, port, _cost = await _provision_pod(
                 api_key, f"sgpu-label-{run_id}", cfg.get("image") or DEFAULT_IMAGE,
                 gpu_type, gpu_count, bool(cfg.get("label_secure_cloud", True)),
-                int(cfg.get("label_disk_gb", 60)), int(cfg.get("label_volume_gb", 80)), pub)
+                int(cfg.get("label_disk_gb", 60)), int(cfg.get("label_volume_gb", 80)), pub,
+                data_center_id=cfg.get("label_data_center_id"))
             spawned = (api_key, runpod_id)
             await _push_log(redis, run_id,
                             "[gateway] label export: installing the TTS stack on the pod (first build is slow) …")
@@ -1498,6 +1503,7 @@ async def run_training(redis, run_id: str) -> None:
                 api_key, f"sgpu-train-{run_id}", cfg.get("image") or DEFAULT_IMAGE,
                 gpu_type, gpu_count, bool(cfg.get("secure_cloud", True)),
                 int(cfg.get("disk_gb", 60)), int(cfg.get("volume_gb", 80)), pub,
+                data_center_id=cfg.get("data_center_id"),
             )
             user = "root"
             _RUN_STATE[run_id] = {"runpod_id": runpod_id, "api_key": api_key}
@@ -2342,6 +2348,7 @@ class CreateTrainingRunRequest(BaseModel):
     gpu_type: str = "NVIDIA L40S"
     gpu_count: int = 1
     secure_cloud: bool = True
+    data_center_id: Optional[str] = None  # RunPod region pin; blank/None → auto
     disk_gb: int = 60
     volume_gb: int = 80
     # RunPod pod image. Sets the CUDA host (the allowedCudaVersions filter is parsed
@@ -2695,6 +2702,7 @@ async def create_training_run(
         # matches reality (VM hardware is fixed; gpu_type reflects the VM).
         **({} if is_vm_run else {
             "secure_cloud": body.secure_cloud,
+            "data_center_id": (body.data_center_id or "").strip() or None,
             "disk_gb": body.disk_gb, "volume_gb": body.volume_gb,
             "image": (body.image or "").strip() or None,
         }),
@@ -2838,6 +2846,7 @@ class LabelExportRequest(BaseModel):
     speaker_prefix: Optional[bool] = None  # prefix transcription with the speaker name
     reject_keywords: Optional[list[str]] = None  # drop text samples containing these phrases
     per_speaker: Optional[bool] = None    # one project per speaker (from each speaker's own clips)
+    tts_codec: Optional[str] = None       # "neucodec" (upstream 24 kHz) | "neucodec-44k" (Scicom 44.1 kHz)
     # Run-on target for the synthesis (mirrors serverless/new). "vm" → a registered
     # VM provider; "cloud" → spawn a fresh RunPod pod (provision → synth → teardown).
     # Absent → the run's own VM (back-compat).
@@ -2846,6 +2855,7 @@ class LabelExportRequest(BaseModel):
     gpu_type: Optional[str] = None         # run_on=cloud
     gpu_count: Optional[int] = None        # run_on=cloud
     secure_cloud: Optional[bool] = None    # run_on=cloud
+    data_center_id: Optional[str] = None   # run_on=cloud — RunPod region pin; blank → auto
     disk_gb: Optional[int] = None          # run_on=cloud
     volume_gb: Optional[int] = None        # run_on=cloud
     visible_devices: Optional[str] = None  # CUDA_VISIBLE_DEVICES pin for the synth
@@ -2928,6 +2938,8 @@ async def retry_label_export(
         cfg["label_reject_keywords"] = [k.strip() for k in body.reject_keywords if str(k).strip()]
     if body.per_speaker is not None:
         cfg["label_per_speaker"] = bool(body.per_speaker)
+    if body.tts_codec is not None:
+        cfg["tts_codec"] = (body.tts_codec.strip() or "neucodec")
     # Run-on target (where to synthesize) + the cloud pod spec.
     cfg["label_run_on"] = run_on or None
     cfg["label_provider_id"] = exp_provider_id
@@ -2937,6 +2949,8 @@ async def retry_label_export(
         cfg["label_gpu_count"] = max(1, int(body.gpu_count))
     if body.secure_cloud is not None:
         cfg["label_secure_cloud"] = bool(body.secure_cloud)
+    if body.data_center_id is not None:
+        cfg["label_data_center_id"] = body.data_center_id.strip() or None
     if body.disk_gb is not None:
         cfg["label_disk_gb"] = max(20, int(body.disk_gb))
     if body.volume_gb is not None:
@@ -2973,8 +2987,8 @@ async def retry_label_export(
                       "label_token_secret", "label_token_enc", "label_project_name",
                       "label_samples", "label_mos_axes", "label_speakers", "label_speaker_prefix",
                       "label_reject_keywords", "label_per_speaker", "label_run_on", "label_provider_id",
-                      "label_gpu_type", "label_gpu_count", "label_secure_cloud", "label_disk_gb",
-                      "label_volume_gb", "label_visible_devices", "venv_path"):
+                      "label_gpu_type", "label_gpu_count", "label_secure_cloud", "label_data_center_id",
+                      "label_disk_gb", "label_volume_gb", "label_visible_devices", "venv_path", "tts_codec"):
                 merged[k] = cfg.get(k)
             r2.config_json = merged
             await s.commit()
@@ -3709,7 +3723,9 @@ def _label_build_tts_venv_ssh(host: str, port: int, user: str, key_filename: str
         base = _trainer_script_path().parent  # gateway/gateway/training/
         _ssh_put(cli, str(base / "tts_finetune.py"), "/tmp/sgpu_label_tts.py")
         dconf = {"venv_path": (cfg.get("venv_path") or "/share/autotrain-tts").rstrip("/"),
-                 "work_dir": (cfg.get("work_dir") or "/share").rstrip("/")}
+                 "work_dir": (cfg.get("work_dir") or "/share").rstrip("/"),
+                 # codec variant drives which neucodec pkg the venv installs.
+                 "tts_codec": (cfg.get("tts_codec") or "neucodec")}
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(dconf)); local = f.name
         try:
@@ -4648,6 +4664,8 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
             # true → N clips from EACH speaker's own utterances (gateway then makes
             # one project per speaker); false → round-robin re-voicing into one project.
             "per_speaker": bool(cfg.get("label_per_speaker")),
+            # NeuCodec decoder variant: "neucodec" (upstream 24 kHz) | "neucodec-44k".
+            "tts_codec": (cfg.get("tts_codec") or "neucodec"),
         }
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(tconf))

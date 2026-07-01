@@ -106,6 +106,7 @@ class Provider(ABC):
         cloud_type: Optional[str] = None,
         container_disk_gb: Optional[int] = None,
         volume_gb: Optional[int] = None,
+        data_center_id: Optional[str] = None,
     ) -> ProvisionResult:
         """Spawn a worker for `app_id`. Returns a ProvisionResult with the
         machine_id plus the hourly cost the provider quoted at spawn time
@@ -195,6 +196,7 @@ class FakeProvider(Provider):
         cloud_type: Optional[str] = None,  # noqa: ARG002 — fake doesn't care
         container_disk_gb: Optional[int] = None,  # noqa: ARG002
         volume_gb: Optional[int] = None,  # noqa: ARG002
+        data_center_id: Optional[str] = None,  # noqa: ARG002
     ) -> ProvisionResult:
         machine_id = f"m-fake-{uuid.uuid4().hex[:8]}"
         task = asyncio.create_task(

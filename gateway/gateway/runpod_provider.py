@@ -277,6 +277,7 @@ class RunPodProvider(Provider):
         cloud_type: Optional[str] = None,
         container_disk_gb: Optional[int] = None,
         volume_gb: Optional[int] = None,
+        data_center_id: Optional[str] = None,
     ) -> "ProvisionResult":
         machine_id = f"m-rp-{uuid.uuid4().hex[:8]}"
         pod_name = f"{self.name_prefix}-{app_id}-{machine_id}"
@@ -307,6 +308,11 @@ class RunPodProvider(Provider):
             "containerDiskInGb": effective_disk,
             "volumeInGb": effective_volume,
         }
+        # Region allowlist (dataCenterIds) — comma-separated ids; blank/"auto" → omit
+        # so RunPod picks any DC. RunPod places the pod in whichever listed DC has room.
+        _dc = [t.strip() for t in (data_center_id or "").split(",") if t.strip() and t.strip().lower() != "auto"]
+        if _dc:
+            body["dataCenterIds"] = _dc
         if self.reverse_tunnel:
             # Point the worker at the pod's own loopback (the tunnel forwards it to
             # the gateway+redis) and run the vLLM fleet from the venv we build on

@@ -182,6 +182,8 @@ class CreateAppRequest(BaseModel):
     is_public: bool = False
     # RunPod cloud tier. None = provider default. Only "COMMUNITY" / "SECURE".
     cloud_type: Optional[str] = None
+    # RunPod data center to pin (dataCenterIds). None/blank = auto (RunPod picks).
+    data_center_id: Optional[str] = None
     # Per-worker disk sizing. None = provider default.
     container_disk_gb: Optional[int] = None
     volume_gb: Optional[int] = None
@@ -1697,6 +1699,7 @@ async def create_app(
         request_timeout_s=req.request_timeout_s,
         vllm_args=(req.vllm_args or "").strip(),
         cloud_type=cloud_type_norm,
+        data_center_id=(req.data_center_id or "").strip() or None,
         container_disk_gb=req.container_disk_gb,
         volume_gb=req.volume_gb,
         provider_id=req.provider_id,

@@ -19,6 +19,7 @@ import type {
   ComputeSshInfo,
   ComputeTemplate,
   GpuTypeOption,
+  RegionOption,
   PiImageOption,
   RunpodTemplateSearchResult,
   CreateAppRequest,
@@ -418,11 +419,13 @@ export const gateway = {
       speaker_prefix?: boolean;
       reject_keywords?: string[];
       per_speaker?: boolean;
+      tts_codec?: string;
       run_on?: "vm" | "cloud";
       provider_id?: string | null;
       gpu_type?: string;
       gpu_count?: number;
       secure_cloud?: boolean;
+      data_center_id?: string | null;
       disk_gb?: number;
       volume_gb?: number;
       visible_devices?: string | null;
@@ -620,6 +623,8 @@ export const gateway = {
   },
   listRunpodGpuTypes: () =>
     request<GpuTypeOption[]>("/compute/runpod/gpu-types"),
+  listRunpodRegions: () =>
+    request<RegionOption[]>("/compute/runpod/regions"),
   listPiGpuTypes: () => request<GpuTypeOption[]>("/compute/pi/gpu-types"),
   listPiImages: () => request<PiImageOption[]>("/compute/pi/images"),
   listPiCompatibleImages: (params: {

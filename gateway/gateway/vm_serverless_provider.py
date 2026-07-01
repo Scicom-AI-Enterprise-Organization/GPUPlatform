@@ -151,6 +151,7 @@ class VMProvider(Provider):
         cloud_type: Optional[str] = None,  # noqa: ARG002
         container_disk_gb: Optional[int] = None,  # noqa: ARG002
         volume_gb: Optional[int] = None,  # noqa: ARG002
+        data_center_id: Optional[str] = None,  # noqa: ARG002 — VM hardware is fixed
     ) -> ProvisionResult:
         machine_id = f"m-vm-{uuid.uuid4().hex[:8]}"
         worker_env = self._build_worker_env(app_id, machine_id, model, env)

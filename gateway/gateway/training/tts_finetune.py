@@ -104,14 +104,25 @@ DEPS = [
     # range numba 0.61 supports, still fine for torch/transformers) makes it resolve.
     "numba>=0.61", "numpy<2.3",
     "librosa", "soundfile", "datasets", "wandb", "boto3",
-    # Upstream neucodec (neuphonic/neucodec, 24 kHz). The encode/decode paths load
-    # `NeuCodec.from_pretrained("neuphonic/neucodec")`.
-    "neucodec",
+    # neucodec is added per-codec-variant in _ensure_venv (upstream vs the Scicom
+    # 44k-d20 fork) — see _neucodec_pkg / TTS_CODEC.
     "pandas", "pyarrow", "multiprocess", "liger-kernel",
     "git+https://github.com/apple/ml-cross-entropy",
     "peft>=0.11",  # LoRA (all-linear adapters, merged into base at save)
     "kernels",  # HF kernel-hub loader for the flash-attn-3 attn impl (fresh venvs)
 ]
+
+
+# NeuCodec variant (decoder only — the encoder/FSQ codes are identical, so a model
+# trained with either decodes with either; this just sets synthesis output fidelity):
+#   "neucodec"     → upstream neuphonic/neucodec, 24 kHz  (default)
+#   "neucodec-44k" → Scicom-intl/neucodec-44k-d20 fork, 44.1 kHz
+_NEUCODEC_FORK_PKG = "git+https://github.com/Scicom-AI-Enterprise-Organization/neucodec-44k.git"
+
+
+def wants_neucodec_fork(cfg: dict) -> bool:
+    return (str(cfg.get("tts_codec") or "neucodec").strip().lower()
+            in ("neucodec-44k", "scicom-44k", "44k", "fork"))
 
 
 def _ensure_venv(cfg: dict) -> str:
@@ -126,21 +137,22 @@ def _ensure_venv(cfg: dict) -> str:
     # base wheels and rejects torch 2.9.1's nvidia-nccl dep ("do not match the
     # hashes from the requirements file"). A fresh venv has no such constraint.
     env = {**os.environ, "PIP_CONSTRAINT": "", "PIP_REQUIRE_HASHES": "0"}
-    pkgs = list(DEPS)
+    want_fork = wants_neucodec_fork(cfg)
+    pkgs = list(DEPS) + [_NEUCODEC_FORK_PKG if want_fork else "neucodec"]
     if "mlflow" in ((cfg.get("tracking") or {}).get("report_to") or []):
         pkgs.append("mlflow")
 
     def _present() -> bool:
-        # Require UPSTREAM neucodec (neuphonic/neucodec), NOT the old Scicom 44k fork:
-        # a venv still carrying the fork (PEP 610 direct_url.json with the org git URL)
-        # must be reinstalled so the encode/decode paths load neuphonic/neucodec. Plain
-        # PyPI installs have no such direct_url → pass. (Scan all dists — the fork's
-        # dist name may differ from the `neucodec` import name.)
+        # The installed neucodec must MATCH the requested variant — the fork carries a
+        # PEP 610 direct_url.json with the org git URL; upstream PyPI has none. If the
+        # venv has the wrong one, reinstall. (Scan all dists — the fork's dist name may
+        # differ from the `neucodec` import name.)
+        op = "" if want_fork else "not "
         probe = (
             "import torch, torchaudio, transformers, neucodec, pyarrow, boto3; "
             "import importlib.metadata as _m; "
-            "assert not any('Scicom-AI-Enterprise-Organization' in (d.read_text('direct_url.json') or '') "
-            "for d in _m.distributions()), 'neucodec is still the Scicom fork'"
+            f"assert {op}any('Scicom-AI-Enterprise-Organization' in (d.read_text('direct_url.json') or '') "
+            "for d in _m.distributions()), 'neucodec variant mismatch'"
         )
         try:
             subprocess.check_call(

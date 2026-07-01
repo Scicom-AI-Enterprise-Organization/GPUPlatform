@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/select";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { VmAvailabilityRow, type VmAvailState } from "@/components/vm-availability-row";
+import { RegionSelect } from "@/components/region-select";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
@@ -86,10 +87,13 @@ export function LabelExportTab({
   const [gpuType, setGpuType] = useState(str("label_gpu_type") || run.gpu_type || "NVIDIA L40S");
   const [gpuCount, setGpuCount] = useState(num("label_gpu_count", 1));
   const [secureCloud, setSecureCloud] = useState(typeof lcfg.label_secure_cloud === "boolean" ? (lcfg.label_secure_cloud as boolean) : true);
+  const [dataCenterId, setDataCenterId] = useState(str("label_data_center_id"));
   const [diskGb, setDiskGb] = useState(num("label_disk_gb", 60));
   const [volumeGb, setVolumeGb] = useState(num("label_volume_gb", 80));
   const [visibleDevices, setVisibleDevices] = useState(str("label_visible_devices"));
   const [venvPath, setVenvPath] = useState(str("venv_path") || "/share/autotrain-tts");
+  // NeuCodec decoder: upstream neuphonic/neucodec (24 kHz) or the Scicom 44k-d20 fork.
+  const [codec, setCodec] = useState(str("tts_codec") || "neucodec");
   const [gpuOptions, setGpuOptions] = useState<GpuTypeOption[]>(RUNPOD_GPU_FALLBACK);
 
   const [busy, setBusy] = useState(false);
@@ -180,11 +184,13 @@ export function LabelExportTab({
         speaker_prefix: speakerPrefix,
         reject_keywords: rejectKeywords.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
         per_speaker: perSpeaker,
+        tts_codec: codec,
         run_on: target,
         provider_id: target === "vm" ? vmProviderId : runpodProviderId,
         gpu_type: gpuType,
         gpu_count: gpuCount,
         secure_cloud: secureCloud,
+        data_center_id: dataCenterId.trim() || null,
         disk_gb: diskGb,
         volume_gb: volumeGb,
         visible_devices: visibleDevices.trim() || null,
@@ -352,6 +358,10 @@ export function LabelExportTab({
                 </div>
               </Field>
 
+              <Field label="Region" hint="Pin the synthesis pod to a RunPod data center, or Auto to let RunPod pick any region with capacity.">
+                <RegionSelect value={dataCenterId} onChange={setDataCenterId} className="text-sm" />
+              </Field>
+
               <Field
                 label="GPU"
                 hint={(() => {
@@ -411,6 +421,21 @@ export function LabelExportTab({
               {vdError && <p className="text-[11px] text-destructive">{vdError}</p>}
             </Field>
           </div>
+
+          <Field
+            label="NeuCodec (audio decoder)"
+            hint={codec === "neucodec-44k"
+              ? "Scicom 44k-d20 fork — 44.1 kHz output (installs from git; slower first build)."
+              : "Upstream neuphonic/neucodec — 24 kHz output. Same speech tokens, so either decodes the model fine."}
+          >
+            <Select value={codec} onValueChange={setCodec}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="neucodec">neuphonic/neucodec — 24 kHz (upstream)</SelectItem>
+                <SelectItem value="neucodec-44k">Scicom neucodec-44k-d20 — 44.1 kHz</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
         </div>
       </Section>
 

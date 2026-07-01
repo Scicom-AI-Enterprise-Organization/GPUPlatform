@@ -145,6 +145,7 @@ class TtsPackRequest(BaseModel):
     # RunPod pod knobs (ignored for a VM provider).
     gpu_type: str = "NVIDIA L40S"
     secure_cloud: bool = True
+    data_center_id: Optional[str] = None   # RunPod region pin; blank/None → auto
     disk_gb: int = 60
     volume_gb: int = 80
 
@@ -167,6 +168,7 @@ class OmnivoicePackRequest(BaseModel):
     gpu_type: str = "NVIDIA H100 80GB HBM3"
     image: Optional[str] = None             # None → a cu128 pytorch image (set by the endpoint)
     secure_cloud: bool = True
+    data_center_id: Optional[str] = None    # RunPod region pin; blank/None → auto
     disk_gb: int = 80
     volume_gb: int = 80
 
@@ -2433,7 +2435,8 @@ async def pack_tts_dataset(
         task_type="tts",
         provider_id=req.provider_id, storage_id=req.storage_id,
         gpu_type=req.gpu_type, gpu_count=req.gpu_count,
-        secure_cloud=req.secure_cloud, disk_gb=req.disk_gb, volume_gb=req.volume_gb,
+        secure_cloud=req.secure_cloud, data_center_id=req.data_center_id,
+        disk_gb=req.disk_gb, volume_gb=req.volume_gb,
         visible_devices=req.visible_devices,
         venv_path=(req.venv_path or "").strip() or "/share/neucodec-tts",
         tokenizer=req.tokenizer or None,
@@ -2490,7 +2493,8 @@ async def pack_omnivoice_dataset(
         gpu_type=req.gpu_type, gpu_count=req.gpu_count,
         # OmniVoice pins torch 2.8/cu128 → a CUDA-12.8 pod image (NOT the cu13 one).
         image=(req.image or "").strip() or "runpod/pytorch:1.0.7-cu1281-torch280-ubuntu2404",
-        secure_cloud=req.secure_cloud, disk_gb=req.disk_gb, volume_gb=req.volume_gb,
+        secure_cloud=req.secure_cloud, data_center_id=req.data_center_id,
+        disk_gb=req.disk_gb, volume_gb=req.volume_gb,
         visible_devices=req.visible_devices,
         venv_path=(req.venv_path or "").strip() or "/share/autotrain-omnivoice",
         tokenizer=req.tokenizer or "eustlb/higgs-audio-v2-tokenizer",

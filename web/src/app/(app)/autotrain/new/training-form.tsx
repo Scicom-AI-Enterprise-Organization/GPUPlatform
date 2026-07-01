@@ -46,6 +46,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { RegionSelect } from "@/components/region-select";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
@@ -335,6 +336,7 @@ export function TrainingForm() {
   const [gpuType, setGpuType] = useState("NVIDIA L40S");
   const [gpuCount, setGpuCount] = useState(1);
   const [secureCloud, setSecureCloud] = useState(true);
+  const [dataCenterId, setDataCenterId] = useState("");  // RunPod region ("" = Auto)
   const [diskGb, setDiskGb] = useState(60);
   const [volumeGb, setVolumeGb] = useState(80);
   const [visibleDevices, setVisibleDevices] = useState("");
@@ -537,6 +539,7 @@ export function TrainingForm() {
         if (r.gpu_type) setGpuType(r.gpu_type);
         if (r.gpu_count != null) setGpuCount(r.gpu_count);
         if (c.secure_cloud != null) setSecureCloud(!!c.secure_cloud);
+        if (c.data_center_id != null) setDataCenterId(String(c.data_center_id));
         if (c.disk_gb != null) setDiskGb(num(c.disk_gb, 60));
         if (c.volume_gb != null) setVolumeGb(num(c.volume_gb, 80));
         setVisibleDevices(r.visible_devices || "");
@@ -866,6 +869,7 @@ export function TrainingForm() {
       gpu_type: gpuType,
       gpu_count: gpuCount,
       secure_cloud: secureCloud,
+      data_center_id: dataCenterId.trim() || undefined,
       disk_gb: diskGb,
       volume_gb: volumeGb,
       visible_devices: visibleDevices.trim() || null,
@@ -1687,6 +1691,10 @@ export function TrainingForm() {
                   },
                 )}
               </div>
+            </FieldWrap>
+
+            <FieldWrap label="Region" hint="Pin the training pod to a RunPod data center, or Auto to let RunPod pick any region with capacity.">
+              <RegionSelect value={dataCenterId} onChange={setDataCenterId} className="text-sm" />
             </FieldWrap>
 
             <FieldWrap label="GPU"

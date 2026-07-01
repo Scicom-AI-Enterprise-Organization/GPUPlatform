@@ -219,6 +219,9 @@ class ComputePod(Base):
     image: Mapped[str] = mapped_column(String(255))
     template_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     cloud_type: Mapped[str] = mapped_column(String(16), default="COMMUNITY")
+    # RunPod region allowlist (dataCenterIds) — comma-separated ids, or NULL/empty
+    # → auto (RunPod picks any DC with capacity).
+    data_center_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     # creating | running | failed | terminated | auto_terminated | pending_approval | rejected
     # (auto_terminated = killed by the idle sweep; terminated = manual delete)
     status: Mapped[str] = mapped_column(String(20), default="creating", index=True)
@@ -477,6 +480,42 @@ PI_GPU_TYPES: list[dict[str, Any]] = [
     {"id": "B200_180GB", "label": "B200", "vram_gb": 180, "hint": "Blackwell datacenter"},
     {"id": "MI300X_192GB", "label": "MI300X", "vram_gb": 192, "hint": "AMD"},
 ]
+
+
+# Curated RunPod data centers (region pinning). `id` is the RunPod `dataCenterIds`
+# value sent on pod-create; empty/absent (the "Auto" choice in the UI) → we omit
+# it and RunPod picks any region with capacity. Static list (mirrors the GPU
+# catalog above) — RunPod occasionally adds DCs; extend as needed. Reviewed 2026-07.
+RUNPOD_REGIONS: list[dict[str, Any]] = [
+    {"id": "US-KS-2", "label": "US · Kansas", "country": "US"},
+    {"id": "US-CA-2", "label": "US · California", "country": "US"},
+    {"id": "US-GA-1", "label": "US · Georgia", "country": "US"},
+    {"id": "US-GA-2", "label": "US · Georgia 2", "country": "US"},
+    {"id": "US-IL-1", "label": "US · Illinois", "country": "US"},
+    {"id": "US-TX-3", "label": "US · Texas", "country": "US"},
+    {"id": "US-NC-1", "label": "US · North Carolina", "country": "US"},
+    {"id": "US-WA-1", "label": "US · Washington", "country": "US"},
+    {"id": "US-DE-1", "label": "US · Delaware", "country": "US"},
+    {"id": "CA-MTL-1", "label": "Canada · Montreal", "country": "CA"},
+    {"id": "CA-MTL-3", "label": "Canada · Montreal 3", "country": "CA"},
+    {"id": "EU-RO-1", "label": "EU · Romania", "country": "EU"},
+    {"id": "EU-CZ-1", "label": "EU · Czechia", "country": "EU"},
+    {"id": "EU-NL-1", "label": "EU · Netherlands", "country": "EU"},
+    {"id": "EU-SE-1", "label": "EU · Sweden", "country": "EU"},
+    {"id": "EU-FR-1", "label": "EU · France", "country": "EU"},
+    {"id": "AP-JP-1", "label": "Asia · Japan", "country": "AP"},
+    {"id": "OC-AU-1", "label": "Oceania · Australia", "country": "AP"},
+]
+
+
+def _data_center_ids(region: Optional[str]) -> Optional[list[str]]:
+    """Normalize a region choice into RunPod's `dataCenterIds` allowlist. Accepts a
+    single id or a comma-separated list ("US-KS-2,US-CA-2"); blank / "auto" tokens →
+    None (omit the field → RunPod picks any region with capacity). RunPod deploys the
+    pod into whichever listed DC has capacity — multiple = broader placement, one DC."""
+    ids = [t.strip() for t in (region or "").split(",")]
+    ids = [t for t in ids if t and t.lower() != "auto"]
+    return ids or None
 
 
 # Back-compat: rows created before the per-provider catalog (or via the old
@@ -1075,6 +1114,9 @@ async def _create_pod(pod_id: str) -> None:
     cuda_v = _extract_cuda_version(row.image or "")
     if cuda_v:
         body["allowedCudaVersions"] = [cuda_v]
+    dc = _data_center_ids(row.data_center_id)
+    if dc:
+        body["dataCenterIds"] = dc
 
     async with _client(api_key=api_key) as cli:
         try:
@@ -1466,6 +1508,8 @@ class CreateComputeRequest(BaseModel):
     # IS the template id, an enum value).
     image: Optional[str] = Field(default=None, max_length=512)
     cloud_type: str = Field(default="SECURE", pattern=r"^(COMMUNITY|SECURE)$")
+    # RunPod data center to pin (from RUNPOD_REGIONS). Blank/"auto" → RunPod picks.
+    data_center_id: Optional[str] = Field(default=None, max_length=32)
     # Auto-terminate after this many idle seconds (no GPU compute AND no GPU
     # memory used). 0 = disabled. Capped at 24h so a typo can't strand a pod
     # billing "forever".
@@ -1485,6 +1529,7 @@ class ComputeRecord(BaseModel):
     image: str
     template_id: Optional[str] = None
     cloud_type: str
+    data_center_id: Optional[str] = None
     status: str
     runpod_pod_id: Optional[str] = None
     public_ip: Optional[str] = None
@@ -1566,6 +1611,7 @@ def _to_record(p: ComputePod, owner_username: str) -> ComputeRecord:
         image=p.image,
         template_id=p.template_id,
         cloud_type=p.cloud_type,
+        data_center_id=p.data_center_id,
         status=p.status,
         runpod_pod_id=p.runpod_pod_id,
         public_ip=p.public_ip,
@@ -1606,6 +1652,12 @@ class GpuTypeOption(BaseModel):
     hint: str = ""
 
 
+class RegionOption(BaseModel):
+    id: str
+    label: str
+    country: str = ""
+
+
 # Static GPU catalogs (just names + VRAM) — any authenticated user can read them
 # (the Benchmark form needs them too, not only Compute users).
 @router.get("/runpod/gpu-types", response_model=list[GpuTypeOption])
@@ -1616,6 +1668,13 @@ async def list_runpod_gpu_types(_: User = Depends(current_user)):
 @router.get("/pi/gpu-types", response_model=list[GpuTypeOption])
 async def list_pi_gpu_types(_: User = Depends(current_user)):
     return [GpuTypeOption(**g) for g in PI_GPU_TYPES]
+
+
+@router.get("/runpod/regions", response_model=list[RegionOption])
+async def list_runpod_regions(_: User = Depends(current_user)):
+    """Curated RunPod data centers for region pinning. The UI prepends an "Auto"
+    choice (empty id) that omits the region so RunPod picks any with capacity."""
+    return [RegionOption(**r) for r in RUNPOD_REGIONS]
 
 
 @router.get("/runpod/templates", response_model=list[RunpodTemplateSearchResult])
@@ -2029,6 +2088,7 @@ async def create_compute(
         image=image_resolved,
         template_id=template_id_resolved,
         cloud_type=body.cloud_type,
+        data_center_id=(body.data_center_id or "").strip() or None,
         status="pending_approval" if needs_approval else "creating",
         idle_terminate_after_s=body.idle_terminate_after_s,
         owner_id=user.id,

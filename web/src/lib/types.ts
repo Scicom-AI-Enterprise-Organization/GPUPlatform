@@ -85,6 +85,8 @@ export type CreateAppRequest = {
   // false = private. Same flag the /apps/{id}/visibility toggle flips.
   is_public?: boolean;
   cloud_type?: "COMMUNITY" | "SECURE";
+  // RunPod data center to pin (empty/omitted → auto). See RegionOption.
+  data_center_id?: string;
   container_disk_gb?: number;
   volume_gb?: number;
   provider_id?: string | null;
@@ -466,6 +468,8 @@ export type CreateTrainingRunRequest = {
   gpu_type?: string;
   gpu_count?: number;
   secure_cloud?: boolean;
+  // RunPod data center to pin (empty/omitted → Auto). Cloud-only.
+  data_center_id?: string;
   disk_gb?: number;
   volume_gb?: number;
   visible_devices?: string | null;
@@ -671,6 +675,8 @@ export type CreateComputeRequest = {
   // resolved imageName from the RunPod templates search.
   image?: string | null;
   cloud_type?: "COMMUNITY" | "SECURE";
+  // RunPod data center to pin (empty/omitted → Auto). RunPod-only.
+  data_center_id?: string;
   // Auto-terminate after this many idle seconds. 0 = off (default).
   idle_terminate_after_s?: number;
   provider_id?: string | null;
@@ -696,6 +702,14 @@ export type GpuTypeOption = {
   label: string;
   vram_gb: number;
   hint: string;
+};
+
+// A curated RunPod data center for region pinning (GET /compute/runpod/regions).
+// `id` is the RunPod `dataCenterIds` value; empty selection ("Auto") pins nothing.
+export type RegionOption = {
+  id: string;
+  label: string;
+  country?: string;
 };
 
 export type ComputeTemplate = {
@@ -925,6 +939,7 @@ export type TtsPackRequest = {
   // RunPod pod knobs (ignored for a VM provider)
   gpu_type?: string;
   secure_cloud?: boolean;
+  data_center_id?: string; // RunPod region pin ("" / omitted → Auto)
   disk_gb?: number;
   volume_gb?: number;
 };
@@ -945,6 +960,7 @@ export type OmnivoicePackRequest = {
   gpu_type?: string;
   image?: string | null;
   secure_cloud?: boolean;
+  data_center_id?: string; // RunPod region pin ("" / omitted → Auto)
   disk_gb?: number;
   volume_gb?: number;
 };

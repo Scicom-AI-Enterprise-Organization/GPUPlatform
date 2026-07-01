@@ -30,6 +30,7 @@ import { parseGpuIds, suggestPacking } from "@/lib/gpu-pin";
 import { cleanVllmArgs } from "@/lib/vllm-args";
 import { deployEndpoint } from "../actions";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { RegionSelect } from "@/components/region-select";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
 import { GPU_CHOICES, GPU_COUNT_CHOICES, capacityHint } from "@/lib/gpu-catalog";
@@ -162,6 +163,8 @@ export function InferenceForm() {
   const [gpu, setGpu] = useState("RTX3090");
   const [gpuCount, setGpuCount] = useState<number>(1);
   const [cloudType, setCloudType] = useState<"COMMUNITY" | "SECURE">("SECURE");
+  // RunPod data center to pin ("" = Auto → RunPod picks). Cloud-only.
+  const [dataCenterId, setDataCenterId] = useState("");
   const [containerDisk, setContainerDisk] = useState<string>("50");
   const [volumeGb, setVolumeGb] = useState<string>("50");
   const [idleInput, setIdleInput] = useState("120"); // 2 min scale-to-zero (single-model only; multi VM fleets are always-on)
@@ -556,6 +559,7 @@ export function InferenceForm() {
             gpu,
             gpu_count: gpuCount,
             cloud_type: cloudType,
+            data_center_id: dataCenterId || undefined,
             container_disk_gb: parsedDisk,
             volume_gb: parsedVolume,
             provider_id: providerId || null,
@@ -637,7 +641,7 @@ export function InferenceForm() {
             ...(vllmInstallArgs.trim() ? { vllm_install_args: vllmInstallArgs.trim() } : {}),
             ...(preScript.trim() ? { pre_script: preScript } : {}),
           }
-        : { cloud_type: cloudType, container_disk_gb: parsedDisk, volume_gb: parsedVolume }),
+        : { cloud_type: cloudType, data_center_id: dataCenterId || undefined, container_disk_gb: parsedDisk, volume_gb: parsedVolume }),
     };
     startTransition(async () => applyResult(await deployEndpoint(body)));
   }
@@ -866,6 +870,13 @@ export function InferenceForm() {
                   </button>
                 ))}
               </div>
+            </Field>
+
+            <Field
+              label="Region"
+              hint="Pin the pod to a RunPod data center, or Auto to let RunPod pick any region with capacity."
+            >
+              <RegionSelect value={dataCenterId} onChange={setDataCenterId} className="text-sm" />
             </Field>
 
             <Field

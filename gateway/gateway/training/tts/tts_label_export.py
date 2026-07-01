@@ -239,8 +239,12 @@ def _synthesize_all(cfg: dict, utts: list[tuple[str, str]]) -> list[dict]:
     tok = AutoTokenizer.from_pretrained(cfg["model_dir"])
     model = AutoModelForCausalLM.from_pretrained(cfg["model_dir"], torch_dtype=dtype)
     model = (model.cuda() if use_cuda else model).eval()
-    # Upstream neucodec (neuphonic/neucodec, 24 kHz).
-    neu = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
+    # NeuCodec decoder per the run's codec choice (cfg["tts_codec"]): upstream
+    # neuphonic/neucodec (24 kHz, default) or the Scicom 44k-d20 fork (44.1 kHz).
+    if str(cfg.get("tts_codec") or "neucodec").strip().lower() in ("neucodec-44k", "scicom-44k", "44k", "fork"):
+        neu = NeuCodec._from_pretrained(model_id="Scicom-intl/neucodec-44k-d20", decoder_depth=20).eval()
+    else:
+        neu = NeuCodec.from_pretrained("neuphonic/neucodec").eval()
     neu = neu.cuda() if use_cuda else neu
     im_end_id = tok.convert_tokens_to_ids(_IM_END)
     max_new = int(cfg.get("max_new_tokens") or 1024)

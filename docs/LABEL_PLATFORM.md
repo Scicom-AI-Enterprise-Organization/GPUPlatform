@@ -128,6 +128,7 @@ Body (all optional — unset fields fall back to the run's stored config):
 | `project_name`, `samples`, `mos_axes[]` | project name, #clips, 1–5 MOS rating axes |
 | `speakers[]`, `per_speaker`, `speaker_prefix` | voices to use; one project per speaker (each from that speaker's own clips); prefix transcript with the speaker name |
 | `reject_keywords[]` | drop text samples containing any phrase (case-insensitive, spacing-agnostic) |
+| `tts_codec` | NeuCodec decoder: `neucodec` (upstream neuphonic, 24 kHz — default) or `neucodec-44k` (Scicom 44k-d20 fork, 44.1 kHz). Same speech tokens, so either decodes the model — just output fidelity. |
 | `run_on` (`cloud`\|`vm`), `provider_id` | where to synthesize — a fresh RunPod pod (needs a RunPod `provider_id`) or a registered VM. Omitted → the run's own box (the auto post-train export reuses the still-alive training pod). |
 | `gpu_type`, `gpu_count`, `secure_cloud`, `disk_gb`, `volume_gb`, `visible_devices`, `venv_path` | cloud-pod hardware + the TTS venv path |
 
