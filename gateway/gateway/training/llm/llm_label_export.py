@@ -229,6 +229,83 @@ def _load_model_and_tok(arch: str, base_model: str, lora_path: str, meta: dict, 
     )
 
 
+def _generate_vllm(cfg: dict, arch: str, base_model: str, lora_path: str,
+                   eval_rows: list, max_new: int) -> list:
+    """Merge the LoRA to a dir (arch-aware), then batch-generate with vLLM offline in the
+    dedicated vLLM venv. Returns the items list; raises on any failure so the caller falls
+    back to transformers. Streams the child's log lines through to the gateway."""
+    import subprocess
+    import tempfile
+
+    # llm_playground ships alongside this file (both under llm/); reuse its merge + venv helpers.
+    from llm_playground import merge_lora_to_dir, ensure_vllm_venv
+
+    merged = cfg["merged_dir"]
+    llm_dir = cfg["llm_dir"]
+    gpus = str(cfg.get("visible_devices") or "").strip()
+    gpu_ids = [g for g in gpus.split(",") if g.strip()]
+    tp = max(1, len(gpu_ids))
+    env = dict(os.environ)
+    if gpus:
+        env["CUDA_VISIBLE_DEVICES"] = gpus
+
+    if not os.path.exists(os.path.join(merged, "config.json")):
+        log(f"merging LoRA -> {merged} (arch={arch}, dtype={cfg.get('merge_dtype', 'fp16')}) …")
+        rc = merge_lora_to_dir(base_model, lora_path, merged, sys.executable, llm_dir,
+                               dtype=cfg.get("merge_dtype", "fp16"), env=env)
+        if rc != 0:
+            raise RuntimeError(f"merge failed (rc={rc})")
+    else:
+        log(f"reusing merged model at {merged}")
+
+    vpy = ensure_vllm_venv(cfg["vllm_venv"], version=cfg.get("vllm_version") or "0.23.0")
+
+    infer_cfg = {
+        "merged_dir": merged,
+        "eval_rows": eval_rows,
+        "n_samples": len(eval_rows),
+        "max_new_tokens": max_new,
+        "tp": tp,
+        "gpu_mem_util": float(cfg.get("gpu_mem_util") or 0.85),
+        "max_model_len": int(cfg.get("max_model_len") or 32768),
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(infer_cfg, f)
+        infer_path = f.name
+
+    serve_env = dict(env)
+    serve_env["PATH"] = os.path.join(cfg["vllm_venv"], "bin") + os.pathsep + serve_env.get("PATH", "")
+    manifest, err = None, None
+    try:
+        proc = subprocess.Popen(
+            [vpy, "-u", os.path.join(llm_dir, "llm_vllm_infer.py"), "--config", infer_path],
+            env=serve_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        for line in proc.stdout:  # type: ignore[union-attr]
+            line = line.rstrip("\n")
+            j = line.find("@@LABEL ")
+            if j >= 0:
+                try:
+                    obj = json.loads(line[j + len("@@LABEL "):])
+                except Exception:  # noqa: BLE001
+                    continue
+                if obj.get("error"):
+                    err = obj["error"]
+                elif obj.get("items") is not None:
+                    manifest = obj
+            else:
+                print(line, flush=True)  # stream child progress to the gateway log
+        proc.wait()
+    finally:
+        try:
+            os.unlink(infer_path)
+        except OSError:
+            pass
+    if manifest is None:
+        raise RuntimeError(err or f"vLLM infer produced no manifest (rc={getattr(proc, 'returncode', '?')})")
+    return manifest.get("items") or []
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -256,8 +333,6 @@ def main() -> int:
     meta = load_meta(lora_path)
     base_model = cfg.get("base_model") or meta.get("model_id") or "google/gemma-4-31B-it"
 
-    model, tok = _load_model_and_tok(arch, base_model, lora_path, meta, cfg)
-
     eval_rows = cfg.get("eval_rows") or []
     n = int(cfg.get("n_samples") or 0) or len(eval_rows)
     eval_rows = eval_rows[:n]
@@ -267,8 +342,22 @@ def main() -> int:
         emit({"error": "no eval rows in config — check that the eval dataset is non-empty"})
         return 1
 
+    # Prefer fast vLLM-offline generation: merge the LoRA → a plain checkpoint, then
+    # batch-generate with vLLM in its own venv. Fall back to transformers on any failure.
+    if cfg.get("use_vllm", True) and cfg.get("vllm_venv") and cfg.get("merged_dir") and cfg.get("llm_dir"):
+        try:
+            items = _generate_vllm(cfg, arch, base_model, lora_path, eval_rows, max_new)
+            if items:
+                emit({"items": items, "count": len(items)})
+                return 0
+            log("vLLM path produced no items — falling back to transformers")
+        except Exception as e:  # noqa: BLE001
+            log(f"vLLM path failed ({e}) — falling back to transformers generation")
+
+    model, tok = _load_model_and_tok(arch, base_model, lora_path, meta, cfg)
+
     items = []
-    log(f"generating {len(eval_rows)} response(s) (max_new_tokens={max_new}) …")
+    log(f"generating {len(eval_rows)} response(s) (max_new_tokens={max_new}) via transformers …")
     for i, row in enumerate(eval_rows):
         msgs = list(row.get("messages") or [])
         if not msgs:

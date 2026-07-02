@@ -25,7 +25,7 @@ import type { ProviderRecord, ProviderBalance, TryItTarget } from "@/lib/types";
 // meaningless for the cloud target (the fresh pod has its own single device). In
 // LLM mode `gpu` holds a comma-separated GPU list (tensor-parallel, e.g. "6,7") and
 // `vllmArgs` is appended to `vllm serve` verbatim.
-export type ComputeChoice = TryItTarget & { gpu: string; vllmArgs?: string };
+export type ComputeChoice = TryItTarget & { gpu: string; vllmArgs?: string; vllmVersion?: string };
 
 // Radix <Select> forbids an empty value, so use sentinels.
 const AUTO = "auto";
@@ -49,6 +49,7 @@ export function defaultCompute(opts: {
       provider_id: opts.runProviderId ?? null,
       gpu: opts.pins.join(","),
       vllmArgs: "",
+      vllmVersion: "0.23.0",
     };
   }
   if (opts.trainedOnVm) {
@@ -198,7 +199,7 @@ export function TryItCompute({
       ? value.provider_id
       : (vms.find((p) => p.id === runProviderId)?.id ?? vms[0]?.id ?? null);
     // LLM stays VM-only — preserve the GPU list + vLLM args; non-LLM resets the device.
-    if (llm) { onChange({ target: "vm", provider_id, gpu: value.gpu, vllmArgs: value.vllmArgs }); return; }
+    if (llm) { onChange({ target: "vm", provider_id, gpu: value.gpu, vllmArgs: value.vllmArgs, vllmVersion: value.vllmVersion }); return; }
     onChange({ target: "vm", provider_id, gpu: AUTO });
   }
 
@@ -369,6 +370,19 @@ export function TryItCompute({
                       />
                       <p className="text-[11px] text-muted-foreground">
                         Comma-separated GPU indices the vLLM server runs on (tensor-parallel = count). Defaults to the run&apos;s training GPUs.
+                      </p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">vLLM version</Label>
+                      <Input
+                        value={value.vllmVersion ?? ""}
+                        onChange={(e) => onChange({ ...value, vllmVersion: e.target.value })}
+                        disabled={disabled}
+                        placeholder="0.23.0"
+                        className="w-32 font-mono text-xs"
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Installed in the serve venv (default 0.23.0). The LoRA is merged (FP8→fp16 for MiniMax/Mistral) then served.
                       </p>
                     </div>
                     <div className="space-y-1.5">

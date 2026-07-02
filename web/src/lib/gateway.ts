@@ -435,6 +435,7 @@ export const gateway = {
       llm_samples?: number;
       llm_mos_axes?: string[];
       llm_max_new_tokens?: number;
+      vllm_version?: string | null;
     },
   ) =>
     request<{ status: string }>(
@@ -513,7 +514,7 @@ export const gateway = {
    * (subsequent transcribe/synthesize skip the per-request model load). The
    * compute target (a fresh RunPod pod or a registered VM) is chosen per-call —
    * see TryItTarget; omitting it preserves the legacy run's-own-box behaviour. */
-  playgroundStart: (id: string, opts?: Partial<TryItTarget> & { gpu?: string; vllmArgs?: string }) => {
+  playgroundStart: (id: string, opts?: Partial<TryItTarget> & { gpu?: string; vllmArgs?: string; vllmVersion?: string }) => {
     const qs = new URLSearchParams();
     if (opts?.target) qs.set("target", opts.target);
     if (opts?.target === "cloud") {
@@ -523,9 +524,10 @@ export const gateway = {
     }
     // provider_id = the RunPod account (cloud) or the chosen VM provider (vm).
     if (opts?.provider_id) qs.set("provider_id", opts.provider_id);
-    // GPU device index (vm target) + vLLM args (llm) — ignored by the cloud path.
+    // GPU device index (vm target) + vLLM args/version (llm) — ignored by the cloud path.
     if (opts?.gpu) qs.set("gpu", opts.gpu);
     if (opts?.vllmArgs && opts.vllmArgs.trim()) qs.set("vllm_args", opts.vllmArgs.trim());
+    if (opts?.vllmVersion && opts.vllmVersion.trim()) qs.set("vllm_version", opts.vllmVersion.trim());
     const q = qs.toString();
     return request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
       `/v1/training-runs/${encodeURIComponent(id)}/playground/start${q ? `?${q}` : ""}`,

@@ -86,6 +86,9 @@ export function LabelExportTab({
   const [llmSamples, setLlmSamples] = useState(num("llm_label_samples", 110));
   const [llmAxes, setLlmAxes] = useState(arr("llm_label_mos_axes") || "Relevance, Accuracy, Helpfulness, Tone");
   const [llmMaxNewTokens, setLlmMaxNewTokens] = useState(num("llm_label_max_new_tokens", 512));
+  // vLLM version for the merge→serve venv (the export merges the LoRA + generates with
+  // vLLM offline). Default 0.23.0, like serverless/new.
+  const [vllmVersion, setVllmVersion] = useState(str("label_vllm_version") || "0.23.0");
 
   // ---- Run-on (pod card) ----
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -220,6 +223,7 @@ export function LabelExportTab({
               llm_samples: llmSamples,
               llm_mos_axes: llmAxes.split(",").map((s) => s.trim()).filter(Boolean),
               llm_max_new_tokens: llmMaxNewTokens,
+              vllm_version: vllmVersion.trim() || null,
             }
           : {
               samples,
@@ -589,6 +593,13 @@ export function LabelExportTab({
             <div className="space-y-1.5">
               <label className="text-xs uppercase tracking-wide text-muted-foreground">MOS axes</label>
               <Input value={llmAxes} placeholder="Relevance, Accuracy, Helpfulness, Tone" onChange={(e) => setLlmAxes(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs uppercase tracking-wide text-muted-foreground">vLLM version</label>
+              <Input className="font-mono sm:max-w-xs" value={vllmVersion} placeholder="0.23.0" onChange={(e) => setVllmVersion(e.target.value)} />
+              <p className="text-xs text-muted-foreground">
+                The LoRA is merged (FP8→fp16 for MiniMax/Mistral) and served with vLLM offline. Version installed in the serve venv.
+              </p>
             </div>
           </>
         ) : (

@@ -529,7 +529,12 @@ def _ssh_put_dir_tar(cli, local_dir: str, remote_dir: str) -> None:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         tar.add(local_dir, arcname=".", filter=_filter)
-    _ssh_put_bytes(cli, buf.getvalue(), "/tmp/_sgpu_ship.tar.gz")
+    # Unique per-call remote path — a fixed name races when two runs ship to the SAME
+    # box concurrently (e.g. two finetunes on different GPUs of one VM), corrupting
+    # each other's tarball ("remote write … truncated").
+    import secrets as _secrets
+    remote_tar = f"/tmp/_sgpu_ship_{_secrets.token_hex(6)}.tar.gz"
+    _ssh_put_bytes(cli, buf.getvalue(), remote_tar)
     lines: list[str] = []
     rc = _ssh_run_stream(
         cli,
@@ -537,8 +542,8 @@ def _ssh_put_dir_tar(cli, local_dir: str, remote_dir: str) -> None:
         # pod; a chown to a nonexistent uid is a hard rc=2 even though the file
         # content extracts fine).
         f"mkdir -p {_shlex.quote(remote_dir)} && "
-        f"tar --no-same-owner -xzf /tmp/_sgpu_ship.tar.gz -C {_shlex.quote(remote_dir)} 2>&1; "
-        f"_rc=$?; rm -f /tmp/_sgpu_ship.tar.gz; exit $_rc",
+        f"tar --no-same-owner -xzf {_shlex.quote(remote_tar)} -C {_shlex.quote(remote_dir)} 2>&1; "
+        f"_rc=$?; rm -f {_shlex.quote(remote_tar)}; exit $_rc",
         lines.append,
     )
     if rc != 0:
@@ -3207,6 +3212,7 @@ class LabelExportRequest(BaseModel):
     llm_samples: Optional[int] = None           # override response count
     llm_mos_axes: Optional[list[str]] = None    # override rating axes
     llm_max_new_tokens: Optional[int] = None    # override generation length
+    vllm_version: Optional[str] = None          # LLM: vLLM version for the merge→serve venv (default 0.23.0)
 
 
 @router.post("/{run_id}/label-export")
@@ -3315,6 +3321,8 @@ async def retry_label_export(
         cfg["llm_label_mos_axes"] = [a.strip() for a in body.llm_mos_axes if str(a).strip()]
     if body.llm_max_new_tokens is not None:
         cfg["llm_label_max_new_tokens"] = max(1, int(body.llm_max_new_tokens))
+    if body.vllm_version is not None:
+        cfg["label_vllm_version"] = body.vllm_version.strip() or None
     cfg["label_export"] = True
 
     has_url = bool((cfg.get("label_base_url_secret") or "").strip() or (cfg.get("label_base_url") or "").strip())
@@ -4347,10 +4355,13 @@ def _playground_paths(cfg: dict, run_id: str, kind: str) -> dict:
         "cfg": f"/tmp/sgpu_tryit_{run_id}.server.json",
     }
     if kind == "llm":
-        # LLM (gemma-4): merge LoRA → save → serve with vLLM. The training venv runs
-        # the merge; vLLM serves from its own dedicated venv. Merged model is cached.
+        # LLM: merge LoRA → save → serve with vLLM. The training venv runs the merge;
+        # vLLM serves from its own dedicated venv. Merged model is cached. Default to
+        # the run's ARCH venv (/share/autotrain-llm-<arch>, where training built its
+        # deps) — the generic /share/autotrain-llm doesn't exist for arch runs.
         tdir = f"{work}/sgpu-llm-tryit/{run_id}"
-        venv = (cfg.get("venv_path") or "/share/autotrain-llm").rstrip("/")
+        _arch = _llm_arch(cfg.get("base_model"))
+        venv = (cfg.get("venv_path") or f"/share/autotrain-llm-{_arch}").rstrip("/")
         return {
             **base,
             "tryit_dir": tdir,                   # the whole per-run tree (merged + ckpt) — swept on unload
@@ -4391,10 +4402,10 @@ def _persistent_status(cli, paths: dict) -> dict:
            f'if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then '
            f'if [ -f {paths["ready"]} ]; then echo "READY $(cat {paths["ready"]})"; '
            f'else echo LOADING; fi; else echo DOWN; fi; '
-           f'echo "@@STATUSLOG@@"; tail -n 14 {paths["log"]} 2>/dev/null')
+           f'echo "@@STATUSLOG@@"; tail -n 300 {paths["log"]} 2>/dev/null')
     head, _, logpart = _ssh_capture(cli, cmd).partition("@@STATUSLOG@@")
     line = next((x for x in head.strip().splitlines() if x.startswith(("READY", "LOADING", "DOWN"))), "DOWN")
-    logs = [x for x in logpart.splitlines() if x.strip()][-14:]
+    logs = [x for x in logpart.splitlines() if x.strip()][-300:]
     base = {"logs": logs}
     if line.startswith("READY"):
         try:
@@ -4516,7 +4527,8 @@ def _playground_status_ssh(host, port, user, key_filename, run_id, cfg, kind):
 
 
 def _llm_playground_start_ssh(host, port, user, key_filename, run_id, model_s3, creds, cfg,
-                              base_model, gpus, served_name, max_model_len=16384, vllm_args=""):
+                              base_model, gpus, served_name, max_model_len=16384, vllm_args="",
+                              vllm_version="0.23.0", merge_dtype="fp16"):
     """LLM try-it: launch the detached orchestrator (download LoRA → merge → save →
     vLLM serve eager) on the VM and record its pid. The orchestrator logs every step
     to paths['log'] (the status tab tails it) and writes paths['ready'] once vLLM is
@@ -4546,6 +4558,8 @@ def _llm_playground_start_ssh(host, port, user, key_filename, run_id, model_s3, 
             "max_model_len": int(max_model_len), "gpu_mem_util": 0.90,
             "served_model_name": served_name, "ready_file": paths["ready"],
             "vllm_args": vllm_args or "",
+            "vllm_version": (vllm_version or "0.23.0"),
+            "merge_dtype": (merge_dtype or "fp16"),
         }
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(sconf)); local_cfg = f.name
@@ -5115,6 +5129,17 @@ def _run_llm_label_export_ssh(host: str, port: int, user: str, key_filename: str
                 "endpoint": s3_creds.get("endpoint"), "access_key": s3_creds.get("access_key"),
                 "secret_key": s3_creds.get("secret_key"),
             },
+            # vLLM-offline generation (fast path; transformers is the fallback): merge the
+            # LoRA → serve the merged model with vLLM in its own venv, batched.
+            "use_vllm": True,
+            "llm_dir": "/tmp/sgpu_llm_label",       # where the llm/ dir ships (below)
+            "merged_dir": f"{work_dir}/sgpu-llm-label/{run_id}/merged",
+            "vllm_venv": "/share/autotrain-llm-vllm",   # shared with the try-it playground
+            "vllm_version": (cfg.get("label_vllm_version") or "0.23.0"),
+            "merge_dtype": "fp16",
+            "visible_devices": (cfg.get("label_visible_devices") or cfg.get("visible_devices") or ""),
+            "gpu_mem_util": 0.85,
+            "max_model_len": int(cfg.get("label_max_model_len") or 32768),
         }
         # Stream over stdin (no argv-length limit): the cfg embeds the eval rows,
         # so it scales with row count and easily exceeds _ssh_put's ~128 KB
@@ -5447,6 +5472,8 @@ async def playground_start(
         description="LLM only: extra vLLM serve CLI args, verbatim (e.g. '--enable-auto-tool-choice "
                     "--tool-call-parser hermes --max-model-len 32768'). Appended last so they override "
                     "the defaults; the platform-set flags (model/port/served-name/tp) are rejected."),
+    vllm_version: Optional[str] = Query(None,
+        description="LLM only: vLLM version to install in the serve venv (default 0.23.0), like serverless/new."),
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -5527,10 +5554,11 @@ async def playground_start(
             # the flags the platform sets itself: model/port/served-name/tp/pp/sleep).
             from .main import _validate_vllm_args, _VLLM_RESERVED_MULTI
             _validate_vllm_args(va, label="vLLM args", reserved=_VLLM_RESERVED_MULTI)
+        vver = (vllm_version or "").strip() or "0.23.0"
         try:
             st = await asyncio.to_thread(_llm_playground_start_ssh, *ssh, run_id, model_s3, creds, cfg,
                                          (row.base_model or cfg.get("base_model") or "google/gemma-4-31B-it"),
-                                         gpus, run_id, 16384, va)
+                                         gpus, run_id, 16384, va, vver)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"could not start the vLLM server: {e}")
         return PlaygroundStatus(**st)

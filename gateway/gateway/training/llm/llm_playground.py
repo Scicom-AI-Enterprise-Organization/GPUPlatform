@@ -74,12 +74,14 @@ def s3_download(spec: dict, s3_uri: str, dest_dir: str) -> None:
     log(f"[playground] downloaded {n} file(s) from {s3_uri}")
 
 
-def ensure_vllm_venv(venv: str) -> str:
-    """Create the dedicated vLLM venv (uv) if missing; return its python. Idempotent
-    via a marker file. NEVER touches a venv that already has a working vllm."""
+def ensure_vllm_venv(venv: str, version: str = "0.23.0") -> str:
+    """Create the dedicated vLLM venv (uv) if missing; return its python. Installs
+    `vllm=={version}` (default 0.23.0). Reuses an existing venv when its vLLM already
+    matches the requested version; reinstalls if a different version is pinned."""
     import shutil
     py = os.path.join(venv, "bin", "python")
     marker = os.path.join(venv, ".sgpu_llm_vllm")
+    want = (version or "").strip()
     have_uv = shutil.which("uv") is not None
     pip = (["uv", "pip", "install", "--python", py] if have_uv else [py, "-m", "pip", "install"])
 
@@ -90,74 +92,156 @@ def ensure_vllm_venv(venv: str) -> str:
         except Exception:
             return False
 
+    def _vllm_ver() -> "str | None":
+        try:
+            out = subprocess.check_output(
+                [py, "-c", "import vllm,sys;sys.stdout.write(getattr(vllm,'__version__',''))"],
+                stderr=subprocess.DEVNULL).decode().strip()
+            return out or None
+        except Exception:
+            return None
+
+    def _pkg_ver(mod: str) -> "str | None":
+        try:
+            return subprocess.check_output(
+                [py, "-c", f"import {mod},sys;sys.stdout.write(getattr({mod},'__version__',''))"],
+                stderr=subprocess.DEVNULL).decode().strip() or None
+        except Exception:
+            return None
+
     def _ensure_build_tools() -> None:
         # vLLM's gemma-4 path JIT-compiles kernels (flashinfer/triton) at runtime →
         # needs `ninja` + `cmake` on PATH, else "[Errno 2] No such file: 'ninja'".
-        # Idempotent: installs into the venv (also covers a venv built before this fix).
         if not (_imp("ninja") and _imp("cmake")):
             log("[playground] installing build tools (ninja, cmake) for runtime JIT kernels …")
             _run_stream([*pip, "ninja", "cmake"])
+        # Mistral-Small-4 / Mistral3 need mistral_common>=1.11.0 for vLLM to resolve the
+        # model — older versions fail with "No model architectures are specified" on the
+        # inner LM. Idempotent: only (re)install when missing or < 1.11.
+        mv = _pkg_ver("mistral_common")
+        def _lt(v, lo=(1, 11)):
+            try:
+                return tuple(int(x) for x in v.split(".")[:2]) < lo
+            except Exception:
+                return True
+        if mv is None or _lt(mv):
+            log(f"[playground] installing mistral_common>=1.11.0 (was {mv}) for Mistral model support …")
+            _run_stream([*pip, "-U", "mistral_common>=1.11.0"])
 
-    if os.path.exists(py) and _imp("vllm"):
+    cur = _vllm_ver() if os.path.exists(py) else None
+    if cur and (not want or cur == want):
         _ensure_build_tools()
-        log(f"[playground] vLLM venv ready: {venv}")
+        log(f"[playground] vLLM venv ready: {venv} (vllm {cur})")
         return py
+    if cur and want and cur != want:
+        log(f"[playground] vLLM {cur} present but {want} requested — reinstalling …")
     if not os.path.exists(py):
         log(f"[playground] creating vLLM venv {venv} (uv) …")
         if have_uv:
             _run_stream(["uv", "venv", venv, "--python", "3.12"])
         else:
             _run_stream([sys.executable, "-m", "venv", venv])
-    log("[playground] installing vLLM (this is a one-time ~15-20 min build) …")
-    # CUDA-13 host → let uv resolve the matching torch backend. gemma-4 needs a recent vLLM.
-    rc = _run_stream([*pip, "vllm", "--torch-backend=auto"])
+    spec = f"vllm=={want}" if want else "vllm"
+    log(f"[playground] installing {spec} (this is a one-time ~15-20 min build) …")
+    # CUDA-13 host → let uv resolve the matching torch backend.
+    rc = _run_stream([*pip, spec, "--torch-backend=auto"])
     if rc != 0:
         # retry without the torch-backend hint (older uv / non-uv path)
-        _run_stream([*pip, "vllm"])
+        _run_stream([*pip, spec])
     # 0.23.0 ships a prometheus instrumentator that 500s every route incl. /health.
     _run_stream([*pip, "-U", "prometheus-fastapi-instrumentator>=7"])
     _ensure_build_tools()
     if not _imp("vllm"):
         raise RuntimeError("vLLM did not import after install — see the install log above")
-    open(marker, "w").write("ok")
-    log(f"[playground] vLLM venv ready: {venv}")
+    open(marker, "w").write(want or "ok")
+    log(f"[playground] vLLM venv ready: {venv} (vllm {want or 'latest'})")
     return py
 
 
+def _arch(model_id: str) -> str:
+    """gemma | qwen | minimax | mistral (mirror of training_api._llm_arch)."""
+    n = (model_id or "").lower()
+    if "minimax" in n:
+        return "minimax"
+    if "mistral" in n:
+        return "mistral"
+    if "qwen" in n:
+        return "qwen"
+    return "gemma"
+
+
+def merge_lora_to_dir(base_model, lora, merged, train_py, llm_dir, dtype="fp16", env=None):
+    """Per-arch merge-to-disk (shared by the try-it playground + the label export).
+    gemma folds bf16 via merge_infer.py; qwen (bf16) via qwen/merge_to_disk.py;
+    minimax/mistral dequant FP8→{dtype} via {arch}/merge_to_bf16.py. Each runs from its
+    own dir (flat imports) with MODEL_ID set. Returns the subprocess rc (0 = ok)."""
+    arch = _arch(base_model)
+    menv = dict(env or os.environ)
+    menv["MODEL_ID"] = base_model or ""
+    if arch == "gemma":
+        cmd = [train_py, "merge_infer.py", "--lora", lora, "--merged-out", merged, "--no-generate"]
+        cwd = llm_dir
+    elif arch == "qwen":
+        cmd = [train_py, "merge_to_disk.py", "--lora", lora, "--out", merged,
+               "--dtype", dtype, "--model-id", base_model]
+        cwd = os.path.join(llm_dir, "qwen")
+    else:  # minimax / mistral (FP8 MoE)
+        cmd = [train_py, "merge_to_bf16.py", "--lora", lora, "--out", merged,
+               "--dtype", dtype, "--model-id", base_model]
+        cwd = os.path.join(llm_dir, arch)
+    log(f"[merge] arch={arch} → {merged} (dtype={dtype if arch != 'gemma' else 'bf16'})")
+    return _run_stream(cmd, env=menv, cwd=cwd)
+
+
 def ensure_processor_configs(base_model: str, merged: str) -> None:
-    """gemma-4 is multimodal; vLLM refuses to load the served dir without
-    processor_config.json + preprocessor_config.json (the image feature extractor),
-    and model.save_pretrained writes NEITHER. Source processor_config.json from the
-    local HF cache (the base was already downloaded for the merge — avoids needing a
-    token for the gated repo), and derive preprocessor_config.json from its embedded
-    `image_processor` block (gemma-4 has no standalone preprocessor_config.json)."""
+    """Multimodal bases (gemma-4, Mistral3/Pixtral) need the image-processor config in
+    the served dir or vLLM refuses to start; model.save_pretrained writes NONE of it.
+    Copy whatever processor/preprocessor/chat-template JSONs the base repo has from the
+    local HF cache (already downloaded for the merge — no token needed) into the merged
+    dir. For a base like gemma-4 that has NO standalone preprocessor_config.json, derive
+    it from processor_config.json's embedded `image_processor` block."""
     import glob
     import shutil
-    dst = os.path.join(merged, "processor_config.json")
-    if not os.path.exists(dst):
-        repo = "models--" + base_model.replace("/", "--")
-        roots = [os.environ.get("HF_HOME", ""), os.path.expanduser("~/.cache/huggingface"),
-                 "/share/huggingface", "/root/.cache/huggingface"]
-        found = None
-        for r in roots:
-            if not r:
-                continue
-            hits = glob.glob(os.path.join(r, "hub", repo, "snapshots", "*", "processor_config.json"))
-            if hits:
-                found = hits[0]
-                break
-        if found:
-            shutil.copy(found, dst)
-        else:  # not in cache → try a download (needs HF_TOKEN for the gated repo)
-            from huggingface_hub import hf_hub_download
-            shutil.copy(hf_hub_download(base_model, "processor_config.json"), dst)
-    with open(dst) as f:
-        pj = json.load(f)
-    img = pj.get("image_processor")
-    if not isinstance(img, dict):
-        raise RuntimeError("processor_config.json has no image_processor block to derive preprocessor_config.json from")
-    with open(os.path.join(merged, "preprocessor_config.json"), "w") as f:
-        json.dump(img, f, indent=2)
+    repo = "models--" + base_model.replace("/", "--")
+    roots = [os.environ.get("HF_HOME", ""), os.path.expanduser("~/.cache/huggingface"),
+             "/share/huggingface", "/root/.cache/huggingface"]
+    snap = None
+    for r in roots:
+        if not r:
+            continue
+        hits = glob.glob(os.path.join(r, "hub", repo, "snapshots", "*"))
+        if hits:
+            snap = hits[0]
+            break
+    copied = []
+    for fn in ("processor_config.json", "preprocessor_config.json", "chat_template.json", "chat_template.jinja"):
+        dst = os.path.join(merged, fn)
+        if os.path.exists(dst):
+            continue
+        src = os.path.join(snap, fn) if snap else None
+        if src and os.path.exists(src):
+            shutil.copy(src, dst)
+            copied.append(fn)
+        elif not snap:
+            try:
+                from huggingface_hub import hf_hub_download
+                shutil.copy(hf_hub_download(base_model, fn), dst)
+                copied.append(fn)
+            except Exception:  # noqa: BLE001 — optional file may not exist in the repo
+                pass
+    # gemma-4: no standalone preprocessor_config.json → derive from processor_config's
+    # image_processor block.
+    pc = os.path.join(merged, "processor_config.json")
+    pp = os.path.join(merged, "preprocessor_config.json")
+    if os.path.exists(pc) and not os.path.exists(pp):
+        with open(pc) as f:
+            pj = json.load(f)
+        img = pj.get("image_processor")
+        if isinstance(img, dict):
+            with open(pp, "w") as f:
+                json.dump(img, f, indent=2)
+            copied.append("preprocessor_config.json(derived)")
+    log(f"[playground] processor configs ensured: {copied or 'none needed'}")
 
 
 def wait_health(port: int, timeout: int = 2400) -> bool:
@@ -187,6 +271,11 @@ def main():
     port = int(cfg["port"])
     served = cfg.get("served_model_name") or "model"
     ready_file = cfg["ready_file"]
+    base_model = cfg.get("base_model") or ""
+    arch = _arch(base_model)
+    # FP8 (minimax/mistral) + qwen merge to a plain checkpoint at this dtype (fp16 by
+    # default — we don't infer in bf16); gemma folds in its base bf16 via merge_infer.
+    merge_dtype = cfg.get("merge_dtype") or "fp16"
 
     base_env = dict(os.environ)
     if gpus:
@@ -204,29 +293,29 @@ def main():
         if not os.path.exists(lora):
             raise RuntimeError(f"lora.pt not found under {cfg['model_s3']} (got: {os.listdir(work)})")
 
-        log(f"[playground] step 2/5: merging LoRA into {cfg['base_model']} (subprocess; GPUs={gpus or 'auto'}) …")
-        merge_cmd = [cfg["train_py"], os.path.join(cfg["llm_dir"], "merge_infer.py"),
-                     "--lora", lora, "--merged-out", merged, "--no-generate"]
-        rc = _run_stream(merge_cmd, env=base_env, cwd=cfg["llm_dir"])
+        log(f"[playground] step 2/5: merging LoRA into {cfg['base_model']} "
+            f"(arch={arch}, subprocess; GPUs={gpus or 'auto'}) …")
+        rc = merge_lora_to_dir(base_model, lora, merged, cfg["train_py"], cfg["llm_dir"],
+                               dtype=merge_dtype, env=base_env)
         if rc != 0:
-            raise RuntimeError(f"merge_infer.py failed (rc={rc})")
+            raise RuntimeError(f"merge for arch={arch} failed (rc={rc})")
         log(f"[playground] step 3/5: merged model saved to {merged}")
 
-    # ---- ensure the multimodal processor configs are in the merged dir ----
-    # gemma-4 is multimodal; vLLM refuses to start without preprocessor_config.json
-    # (the feature extractor), which model.save_pretrained does NOT write. Idempotent
-    # so a re-load of a previously-merged dir (made before this fix) is repaired too.
-    if not os.path.exists(os.path.join(merged, "preprocessor_config.json")):
-        log("[playground] writing gemma-4 processor/preprocessor config (vLLM multimodal requirement) …")
+    # ---- ensure multimodal processor configs are in the merged dir (gemma + mistral) ----
+    # gemma-4 and Mistral3/Pixtral are multimodal; vLLM refuses to start without the
+    # image-processor config, which model.save_pretrained does NOT write. minimax/qwen
+    # are text-only, so skip it there.
+    if arch in ("gemma", "mistral") and not os.path.exists(os.path.join(merged, "preprocessor_config.json")):
+        log(f"[playground] ensuring {arch} processor/preprocessor config (vLLM multimodal requirement) …")
         try:
             ensure_processor_configs(cfg["base_model"], merged)
-            log(f"[playground] processor configs written: {sorted(f for f in os.listdir(merged) if 'process' in f)}")
+            log(f"[playground] processor configs present: {sorted(f for f in os.listdir(merged) if 'process' in f or 'template' in f)}")
         except Exception as e:  # noqa: BLE001
             log(f"[playground] WARN: processor-config setup failed — vLLM may refuse to start: {e}")
 
-    # ---- step 4: ensure the vLLM venv ----
-    log(f"[playground] step 4/5: preparing vLLM venv {cfg['vllm_venv']} …")
-    vpy = ensure_vllm_venv(cfg["vllm_venv"])
+    # ---- step 4: ensure the vLLM venv (pinned version) ----
+    log(f"[playground] step 4/5: preparing vLLM venv {cfg['vllm_venv']} (vllm {cfg.get('vllm_version') or '0.23.0'}) …")
+    vpy = ensure_vllm_venv(cfg["vllm_venv"], version=cfg.get("vllm_version") or "0.23.0")
 
     # ---- step 5: serve with vLLM (eager) ----
     log(f"[playground] step 5/5: launching vLLM (eager, TP={tp}, GPUs={gpus or 'auto'}, port={port}) on {merged} …")
