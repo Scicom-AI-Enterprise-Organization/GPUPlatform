@@ -329,7 +329,7 @@ export function DatasetDetail({
               </CardContent>
             </Card>
 
-            {isUpload && <UploadCard datasetId={dataset.id} hasFile={!!dataset.metadata_filename} />}
+            {isUpload && <UploadCard datasetId={dataset.id} hasFile={!!dataset.metadata_filename} messagesField={dataset.messages_field} />}
             {isUpload && (
               <SyncCard datasetId={dataset.id} canSync={!!dataset.metadata_filename} currentRepo={dataset.hf_repo} />
             )}

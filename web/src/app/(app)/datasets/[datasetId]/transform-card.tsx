@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowRight, Loader2, Wand2, X } from "lucide-react";
@@ -57,6 +57,21 @@ export function TransformCard({
   const [testSplitOn, setTestSplitOn] = useState(false);
   const [testSplitMode, setTestSplitMode] = useState<"pct" | "count">("pct");
   const [testSplitValue, setTestSplitValue] = useState("10");
+  // Min transcription length (chars) for a row to be eligible for the test split.
+  // Blank/0 → no minimum. Keeps junk transcripts ("[silent]") out of eval.
+  const [testMinChars, setTestMinChars] = useState("");
+  // Regex; transcripts matching it are excluded from the test split (kept in train).
+  // e.g. ^\s*\[.*\]\s*$ drops bracketed placeholder tags like [silent].
+  const [testExcludeRegex, setTestExcludeRegex] = useState("");
+  const regexError = useMemo(() => {
+    if (!testExcludeRegex.trim()) return null;
+    try {
+      new RegExp(testExcludeRegex);
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  }, [testExcludeRegex]);
   const [status, setStatus] = useState<string | null>(initialStatus);
   const [log, setLog] = useState<string | null>(initialLog);
   const [err, setErr] = useState<string | null>(null);
@@ -104,7 +119,7 @@ export function TransformCard({
       setErr("Pick an S3 storage.");
       return;
     }
-    let testSplit: Pick<TransformDatasetRequest, "test_split_pct" | "test_split_count"> = {};
+    let testSplit: Pick<TransformDatasetRequest, "test_split_pct" | "test_split_count" | "test_min_chars" | "test_exclude_regex"> = {};
     if (testSplitOn) {
       const v = Number(testSplitValue);
       if (!Number.isFinite(v) || v < 0) {
@@ -119,6 +134,21 @@ export function TransformCard({
         testSplit = { test_split_pct: v };
       } else {
         testSplit = { test_split_count: Math.round(v) };
+      }
+      const mc = Number(testMinChars);
+      if (testMinChars.trim()) {
+        if (!Number.isFinite(mc) || mc < 0) {
+          setErr("Enter a valid minimum transcription length.");
+          return;
+        }
+        if (mc > 0) testSplit.test_min_chars = Math.round(mc);
+      }
+      if (testExcludeRegex.trim()) {
+        if (regexError) {
+          setErr(`Fix the test-exclude regex: ${regexError}`);
+          return;
+        }
+        testSplit.test_exclude_regex = testExcludeRegex.trim();
       }
     }
     setStarting(true);
@@ -292,6 +322,59 @@ export function TransformCard({
                 <span className="font-mono">test</span> split; the rest become{" "}
                 <span className="font-mono">train</span>. Any source splits are collapsed.
               </p>
+              <div className="flex items-center gap-2 pt-1">
+                <label className="text-xs text-muted-foreground">Min transcription length</label>
+                <Input
+                  type="number"
+                  min={0}
+                  placeholder="0"
+                  value={testMinChars}
+                  onChange={(e) => setTestMinChars(e.target.value)}
+                  disabled={running}
+                  className="h-8 w-20 text-xs"
+                />
+                <span className="text-xs text-muted-foreground">chars</span>
+              </div>
+              {testMinChars.trim() && Number(testMinChars) > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  Only rows whose transcription is ≥ {Math.round(Number(testMinChars))} characters are
+                  eligible for <span className="font-mono">test</span> — shorter transcripts stay in{" "}
+                  <span className="font-mono">train</span>.
+                </p>
+              )}
+              <div className="space-y-1 pt-1">
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-muted-foreground">Exclude from test (regex)</label>
+                  <button
+                    type="button"
+                    disabled={running}
+                    onClick={() => setTestExcludeRegex("^\\s*\\[.*\\]\\s*$")}
+                    className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                    title="Match transcripts that are entirely a [bracketed] tag"
+                  >
+                    [bracket] tags
+                  </button>
+                </div>
+                <Input
+                  value={testExcludeRegex}
+                  onChange={(e) => setTestExcludeRegex(e.target.value)}
+                  disabled={running}
+                  placeholder="^\s*\[.*\]\s*$"
+                  className="h-8 font-mono text-xs"
+                />
+                {regexError ? (
+                  <p className="text-xs text-destructive">Invalid regex: {regexError}</p>
+                ) : (
+                  testExcludeRegex.trim() && (
+                    <p className="text-xs text-muted-foreground">
+                      Transcripts matching <span className="font-mono">/{testExcludeRegex}/</span> stay in{" "}
+                      <span className="font-mono">train</span> — e.g. <span className="font-mono">[silent]</span>,{" "}
+                      <span className="font-mono">[unintelligible]</span> are kept out of{" "}
+                      <span className="font-mono">test</span>.
+                    </p>
+                  )
+                )}
+              </div>
             </div>
           )}
         </div>

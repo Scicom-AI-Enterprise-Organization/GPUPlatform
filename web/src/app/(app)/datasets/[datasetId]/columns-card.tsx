@@ -58,16 +58,21 @@ export function ColumnsCard({
   const isHf = kind === "hf";
   // Any dataset with messages_field set is treated as a chat dataset in the viewer.
   const hasMessages = !!(messagesField ?? "").trim();
+  // A pure-chat dataset has ONLY a messages column (no audio): the legacy kind=llm,
+  // or any non-hf dataset with a messages column mapped (e.g. an uploaded chat file
+  // — kind=upload + messages_field). A kind=hf dataset can carry BOTH audio (TTS)
+  // and a messages column, so it keeps the mode toggle below instead.
+  const isChatOnly = isLlm || (!isHf && hasMessages);
   // A kind=hf dataset can carry BOTH audio (TTS) and a messages column (LLM/chat) —
   // e.g. a multimodal function-call set. A mode toggle declutters the mapping:
   //   LLM → messages + audio only;  TTS → everything except messages.
-  // kind=llm is always LLM; audio-only kinds (s3/upload) are always TTS. Saves are
-  // scoped to the visible fields so switching modes never clobbers the other side.
+  // Pure-chat kinds are always LLM; audio-only kinds (s3/upload) are always TTS.
+  // Saves are scoped to the visible fields so switching modes never clobbers the other side.
   const [mode, setMode] = useState<"llm" | "tts">(hasMessages ? "llm" : "tts");
-  const effMode: "llm" | "tts" = isLlm ? "llm" : isHf ? mode : "tts";
+  const effMode: "llm" | "tts" = isChatOnly ? "llm" : isHf ? mode : "tts";
   const showMessages = effMode === "llm";
-  const showAudio = !isLlm;                       // every kind but pure-llm has audio
-  const showTts = effMode === "tts" && !isLlm;    // transcription (per-split) + speaker
+  const showAudio = !isChatOnly;                     // every kind but pure-chat has audio
+  const showTts = effMode === "tts" && !isChatOnly;  // transcription (per-split) + speaker
   const [editing, setEditing] = useState(false);
   const [audio, setAudio] = useState(audioField);
   const [transcription, setTranscription] = useState(transcriptionField);
@@ -153,7 +158,7 @@ export function ColumnsCard({
 
   async function save() {
     setErr(null);
-    if (isLlm) {
+    if (isChatOnly) {
       if (!messages.trim()) {
         setErr("Messages column is required.");
         return;
@@ -326,8 +331,9 @@ export function ColumnsCard({
               </div>
             )}
           </div>
-        ) : isLlm ? (
-          // LLM kind: only the messages column matters
+        ) : isChatOnly ? (
+          // Pure-chat dataset (kind=llm, or an uploaded chat file): only the
+          // messages column matters.
           <div className="space-y-3">
             <div className="space-y-1 sm:max-w-xs">
               <Label htmlFor="ds-messages" className="text-xs">Messages column</Label>

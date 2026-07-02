@@ -7,8 +7,17 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { DatasetUploadResult } from "@/lib/types";
 
-export function UploadCard({ datasetId, hasFile }: { datasetId: string; hasFile: boolean }) {
+export function UploadCard({
+  datasetId,
+  hasFile,
+  messagesField,
+}: {
+  datasetId: string;
+  hasFile: boolean;
+  messagesField?: string | null;
+}) {
   const router = useRouter();
+  const isChat = !!(messagesField ?? "").trim();
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
@@ -45,19 +54,28 @@ export function UploadCard({ datasetId, hasFile }: { datasetId: string; hasFile:
     <Card>
       <CardHeader>
         <CardTitle className="text-base">
-          {hasFile ? "Replace metadata file" : "Upload metadata file"}
+          {hasFile ? "Replace file" : "Upload file"}
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         <p className="text-sm text-muted-foreground">
-          A CSV / JSON / JSONL with an audio column (audio / audio_path / audio_url / url)
-          and a transcription column (transcription / text / sentence / transcript).
+          {isChat ? (
+            <>
+              A JSON / JSONL / Parquet file whose rows carry a{" "}
+              <span className="font-mono">{messagesField}</span> column ([{"{"}role, content{"}"}] — OpenAI chat format).
+            </>
+          ) : (
+            <>
+              A CSV / JSON / JSONL with an audio column (audio / audio_path / audio_url / url)
+              and a transcription column (transcription / text / sentence / transcript).
+            </>
+          )}
         </p>
         <div className="flex flex-wrap items-center gap-3">
           <input
             ref={inputRef}
             type="file"
-            accept=".csv,.json,.jsonl,.ndjson"
+            accept={isChat ? ".json,.jsonl,.ndjson,.parquet" : ".csv,.json,.jsonl,.ndjson"}
             onChange={(e) => setFile(e.target.files?.[0] ?? null)}
             className="block text-sm file:mr-3 file:rounded-md file:border file:border-border file:bg-muted/40 file:px-3 file:py-1.5 file:text-sm file:text-foreground hover:file:bg-muted"
           />
@@ -77,8 +95,15 @@ export function UploadCard({ datasetId, hasFile }: { datasetId: string; hasFile:
           <div className="rounded-md border border-border p-3 text-sm">
             <div className="mb-2 text-xs text-muted-foreground">
               Parsed {result.num_rows} rows · {result.format.toUpperCase()} · columns:{" "}
-              {result.columns.join(", ")} · audio=<span className="font-mono">{result.audio_field}</span>,
-              transcription=<span className="font-mono">{result.transcription_field}</span>
+              {result.columns.join(", ")}
+              {isChat ? (
+                <> · messages=<span className="font-mono">{messagesField}</span></>
+              ) : (
+                <>
+                  {" "}· audio=<span className="font-mono">{result.audio_field}</span>,
+                  transcription=<span className="font-mono">{result.transcription_field}</span>
+                </>
+              )}
             </div>
             <pre className="max-h-48 overflow-auto rounded bg-muted/40 p-2 text-xs">
               {JSON.stringify(result.preview, null, 2)}

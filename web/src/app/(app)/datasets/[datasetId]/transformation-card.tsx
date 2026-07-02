@@ -33,10 +33,10 @@ export function TransformationCard({
   initialLog: string | null;
   initialSplit?: string | null;
 }) {
-  // A chat dataset = kind=llm, OR a kind=hf dataset with a messages column mapped
-  // (a chat dataset registered as plain hf — that's what shows a chat preview).
+  // A chat dataset = kind=llm, OR a kind=hf / kind=upload dataset with a messages
+  // column mapped (a chat dataset registered as hf, or an uploaded chat file).
   // Prefer the LLM pack over audio extraction in the ambiguous hf case.
-  const isChat = kind === "llm" || (kind === "hf" && !!messagesField);
+  const isChat = kind === "llm" || ((kind === "hf" || kind === "upload") && !!messagesField);
   if (isChat) {
     return (
       <LlmPackCard

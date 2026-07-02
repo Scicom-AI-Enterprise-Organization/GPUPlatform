@@ -19,15 +19,26 @@ import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { DatasetKind, GlobalEnvRecord, StorageRecord } from "@/lib/types";
 
-const KINDS: { value: DatasetKind; label: string; description: string }[] = [
+// `upload_chat` is a UI-only pseudo-kind: it maps to kind=upload with a messages
+// column set (an uploaded chat dataset). Everything else is a real DatasetKind.
+type FormKind = DatasetKind | "upload_chat";
+
+const KINDS: { value: FormKind; label: string; description: string }[] = [
   { value: "upload", label: "Upload metadata", description: "Upload a CSV / JSON / JSONL with {audio, transcription} rows to an S3 storage." },
+  { value: "upload_chat", label: "Chat dataset (upload)", description: "Upload a JSON / JSONL / Parquet file whose rows carry a messages column ([{role, content}] — OpenAI chat format) to an S3 storage." },
   { value: "s3", label: "Existing S3 metadata", description: "Reference a metadata file that already lives in S3 (s3://bucket/key)." },
-  { value: "hf", label: "HuggingFace dataset", description: "Reference an existing HuggingFace dataset repo by id (owner/name)." },
-  { value: "llm", label: "LLM / chat dataset", description: "HuggingFace dataset whose rows contain a messages column ([{role, content}] — OpenAI chat format)." },
+  { value: "hf", label: "HuggingFace dataset", description: "Reference an existing HuggingFace dataset repo (owner/name). Set a messages column for a chat dataset; leave it empty for audio." },
   { value: "label", label: "Labeling platform", description: "Import {audio, transcription} from a labeling-platform project using its API token." },
   { value: "tts_packed", label: "TTS packed (existing S3 shards)", description: "Register ChiniDataset parquet shards (NeuCodec multipack) already in S3 by their prefix." },
   { value: "llm_packed", label: "LLM packed (existing S3 shards)", description: "Register chat-multipack ChiniDataset parquet shards already in S3 by their prefix." },
 ];
+
+// The selected source card lives in the URL (?source=…) so it's shareable +
+// survives refresh. Anything unknown falls back to the first card.
+const SOURCE_VALUES = KINDS.map((k) => k.value) as string[];
+function normSource(s: string | undefined): FormKind {
+  return SOURCE_VALUES.includes(s ?? "") ? (s as FormKind) : "upload";
+}
 
 // Pull the base URL + project id out of a pasted project URL like
 // http://localhost:3002/dashboard/projects/<uuid>.
@@ -42,10 +53,16 @@ function parseLabelProjectUrl(raw: string): { base: string; id: string } | null 
   }
 }
 
-export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
+export function DatasetForm({
+  storages,
+  initialSource,
+}: {
+  storages: StorageRecord[];
+  initialSource?: string;
+}) {
   const router = useRouter();
 
-  const [kind, setKind] = useState<DatasetKind>("upload");
+  const [kind, setKind] = useState<FormKind>(() => normSource(initialSource));
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [storageId, setStorageId] = useState("");
@@ -60,8 +77,11 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
   const [llmPackTokenizer, setLlmPackTokenizer] = useState("");
   const [llmPackSeqLen, setLlmPackSeqLen] = useState(32768);
   const [llmPackSubset, setLlmPackSubset] = useState("");
-  // llm / llm_packed: which column holds the messages array (default "messages")
-  const [messagesField, setMessagesField] = useState("messages");
+  // hf / upload_chat / llm_packed: which column holds the messages array. Default
+  // empty — on an hf dataset an empty value means "audio dataset, no chat".
+  const [messagesField, setMessagesField] = useState("");
+  // upload_chat: the chat file to upload in-form (json / jsonl / parquet).
+  const [chatFile, setChatFile] = useState<File | null>(null);
   // label: paste the project URL + a token (typed, or from a global secret)
   const [labelProjectUrl, setLabelProjectUrl] = useState("");
   const [labelToken, setLabelToken] = useState("");
@@ -83,24 +103,25 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
     gateway.listGlobalEnv().then((rows) => setSecrets(rows.filter((r) => r.is_secret))).catch(() => {});
   }, []);
 
-  // s3 storages back upload/s3; huggingface storages (optional, for the token)
-  // back the hf / llm kinds.
+  // s3 storages back upload / upload_chat / s3; huggingface storages (optional,
+  // for the token) back the hf kind.
   const storageOptions = useMemo(
     () =>
       storages.filter((s) =>
-        kind === "hf" || kind === "llm" ? s.kind === "huggingface" : s.kind === "s3" && s.enabled,
+        kind === "hf" ? s.kind === "huggingface" : s.kind === "s3" && s.enabled,
       ),
     [storages, kind],
   );
 
   const validate = (): string | null => {
     if (!name.trim()) return "Name is required.";
-    if (kind === "upload" || kind === "s3" || kind === "tts_packed" || kind === "llm_packed") {
+    if (kind === "upload" || kind === "upload_chat" || kind === "s3" || kind === "tts_packed" || kind === "llm_packed") {
       if (!storageId) return "Pick an S3 storage backend.";
       if (kind === "s3" && !s3MetadataUri.trim()) return "S3 metadata URI is required.";
       if ((kind === "tts_packed" || kind === "llm_packed") && !s3MetadataUri.trim()) return "S3 shards prefix is required.";
+      if (kind === "upload_chat" && !chatFile) return "Choose a JSON / JSONL / Parquet file to upload.";
     }
-    if ((kind === "hf" || kind === "llm") && !hfRepo.trim()) return "HuggingFace repo (owner/name) is required.";
+    if (kind === "hf" && !hfRepo.trim()) return "HuggingFace repo (owner/name) is required.";
     if (kind === "label") {
       if (!parseLabelProjectUrl(labelProjectUrl)) return "Enter a valid project URL (…/projects/<id>).";
       if (tokenMode === "paste" && !labelToken.trim()) return "API token (lpat_…) is required.";
@@ -120,9 +141,12 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
     setSubmitting(true);
     try {
       const labelParsed = kind === "label" ? parseLabelProjectUrl(labelProjectUrl) : null;
+      // upload_chat is a UI-only kind → a kind=upload dataset with a messages column.
+      const isChatUpload = kind === "upload_chat";
+      const realKind: DatasetKind = isChatUpload ? "upload" : (kind as DatasetKind);
       const created = await gateway.createDataset({
         name: name.trim(),
-        kind,
+        kind: realKind,
         storage_id: storageId || null,
         description: description.trim() || null,
         audio_prefix: audioPrefix.trim() || null,
@@ -136,10 +160,14 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
           : kind === "llm_packed" ? llmPackSeqLen
           : null,
         subset: kind === "llm_packed" ? llmPackSubset.trim() || null : null,
-        hf_repo: kind === "hf" || kind === "llm" ? hfRepo.trim() : null,
-        hf_revision: kind === "hf" || kind === "llm" ? hfRevision.trim() || null : null,
+        hf_repo: kind === "hf" ? hfRepo.trim() : null,
+        hf_revision: kind === "hf" ? hfRevision.trim() || null : null,
         messages_field:
-          kind === "llm" || kind === "llm_packed" ? messagesField.trim() || "messages" : null,
+          isChatUpload || kind === "llm_packed"
+            ? messagesField.trim() || "messages"
+            : kind === "hf"
+              ? messagesField.trim() || null
+              : null,
         label_base_url: labelParsed?.base ?? null,
         label_project_id: labelParsed?.id ?? null,
         label_token: kind === "label" && tokenMode === "paste" ? labelToken.trim() : null,
@@ -148,6 +176,24 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
         label_updated_until:
           kind === "label" && labelUpdatedUntil ? new Date(labelUpdatedUntil).toISOString() : null,
       });
+      // In-form file upload: push the chat file straight to the new dataset's
+      // /upload endpoint (same multipart call the detail-page UploadCard makes —
+      // the route expects a `file` form field, not a raw body).
+      if (isChatUpload && chatFile) {
+        const fd = new FormData();
+        fd.append("file", chatFile);
+        const res = await fetch(`/api/datasets/${encodeURIComponent(created.id)}/upload`, {
+          method: "POST",
+          body: fd,
+        });
+        if (!res.ok) {
+          // The dataset was created but the file didn't land — send the user to
+          // its detail page, where the Upload card surfaces the error and lets
+          // them retry without re-creating the dataset.
+          router.push(`/datasets/${encodeURIComponent(created.id)}?view=details`);
+          return;
+        }
+      }
       router.push(`/datasets/${encodeURIComponent(created.id)}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -197,6 +243,13 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                   onClick={() => {
                     setKind(k.value);
                     setStorageId("");
+                    // Reflect the selected source in the URL (?source=…) without a
+                    // navigation / server re-fetch — mirrors the detail page's ?view=.
+                    if (typeof window !== "undefined") {
+                      const params = new URLSearchParams(window.location.search);
+                      params.set("source", k.value);
+                      window.history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
+                    }
                   }}
                   className={cn(
                     "rounded-md border p-3 text-left transition-colors",
@@ -408,6 +461,18 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
                 />
               </div>
               <div className="space-y-2">
+                <Label htmlFor="ds-hf-messages" className="text-xs uppercase tracking-wide text-muted-foreground">Messages column <span className="normal-case text-muted-foreground">(optional)</span></Label>
+                <Input
+                  id="ds-hf-messages"
+                  value={messagesField}
+                  onChange={(e) => setMessagesField(e.target.value)}
+                  placeholder="messages"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Set for a chat / LLM dataset (OpenAI-format array, usually <span className="font-mono">messages</span>). Leave empty for an audio dataset.
+                </p>
+              </div>
+              <div className="space-y-2">
                 <Label className="text-xs uppercase tracking-wide text-muted-foreground">HuggingFace storage (optional, for private repos)</Label>
                 <Select value={storageId} onValueChange={setStorageId}>
                   <SelectTrigger>
@@ -435,48 +500,51 @@ export function DatasetForm({ storages }: { storages: StorageRecord[] }) {
             </div>
           )}
 
-          {kind === "llm" && (
+          {kind === "upload_chat" && (
             <div className="grid items-start gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="ds-llm-repo" className="text-xs uppercase tracking-wide text-muted-foreground">HuggingFace repo</Label>
-                <Input
-                  id="ds-llm-repo"
-                  value={hfRepo}
-                  onChange={(e) => setHfRepo(e.target.value)}
-                  placeholder="owner/dataset-name"
-                />
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">S3 storage</Label>
+                <Select value={storageId} onValueChange={setStorageId}>
+                  <SelectTrigger>
+                    <SelectValue placeholder={storageOptions.length ? "Choose a storage" : "No S3 storage configured"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {storageOptions.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>
+                        {s.name}
+                        {s.bucket ? ` — s3://${s.bucket}${s.prefix ? "/" + s.prefix.replace(/^\/+|\/+$/g, "") : ""}` : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {storageOptions.length === 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    Add an S3 storage under <a href="/storage/new" className="underline">Storage</a> first.
+                  </p>
+                )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="ds-llm-messages" className="text-xs uppercase tracking-wide text-muted-foreground">Messages column</Label>
+                <Label htmlFor="ds-chat-messages" className="text-xs uppercase tracking-wide text-muted-foreground">Messages column</Label>
                 <Input
-                  id="ds-llm-messages"
+                  id="ds-chat-messages"
                   value={messagesField}
                   onChange={(e) => setMessagesField(e.target.value)}
                   placeholder="messages"
                 />
-                <p className="text-xs text-muted-foreground">Column holding the OpenAI-format chat array. Usually <span className="font-mono">messages</span>.</p>
+                <p className="text-xs text-muted-foreground">Column in the file holding the OpenAI-format chat array. Usually <span className="font-mono">messages</span>.</p>
               </div>
-              <div className="space-y-2">
-                <Label className="text-xs uppercase tracking-wide text-muted-foreground">HuggingFace storage <span className="normal-case text-muted-foreground">(optional, for private repos)</span></Label>
-                <Select value={storageId} onValueChange={setStorageId}>
-                  <SelectTrigger>
-                    <SelectValue placeholder={storageOptions.length ? "Choose a HuggingFace storage (optional)" : "No HuggingFace storage configured"} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {storageOptions.map((s) => (
-                      <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="ds-llm-rev" className="text-xs uppercase tracking-wide text-muted-foreground">Revision <span className="normal-case text-muted-foreground">(optional)</span></Label>
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="ds-chat-file" className="text-xs uppercase tracking-wide text-muted-foreground">Chat file</Label>
                 <Input
-                  id="ds-llm-rev"
-                  value={hfRevision}
-                  onChange={(e) => setHfRevision(e.target.value)}
-                  placeholder="main, v1.0.0, or a commit SHA"
+                  id="ds-chat-file"
+                  type="file"
+                  accept=".json,.jsonl,.ndjson,.parquet"
+                  onChange={(e) => setChatFile(e.target.files?.[0] ?? null)}
                 />
+                <p className="text-xs text-muted-foreground">
+                  JSON / JSONL / Parquet. Each row carries a <span className="font-mono">{messagesField.trim() || "messages"}</span> column
+                  ({`[{role, content}]`}). Uploaded to the selected storage on submit.
+                </p>
               </div>
             </div>
           )}

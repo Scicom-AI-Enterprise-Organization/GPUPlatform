@@ -925,6 +925,8 @@ export type TransformDatasetRequest = {
   s3_folder?: string | null; // target=s3 dest folder; blank → datasets/{id}/transformed
   test_split_pct?: number | null; // hold out this % of rows as a `test` split (0–100)
   test_split_count?: number | null; // hold out this many rows as a `test` split (overrides pct)
+  test_min_chars?: number | null; // min transcription length (chars) to be eligible for the test split; short/junk transcripts stay in train
+  test_exclude_regex?: string | null; // regex; transcripts matching it (re.search) are excluded from the test split (kept in train)
 };
 
 // NeuCodec-encode + multipack a {audio, transcription} dataset into a packed

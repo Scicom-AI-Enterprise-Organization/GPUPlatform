@@ -86,26 +86,31 @@ const DEFAULT_TTS_BASE = "Scicom-intl/Multilingual-TTS-1.7B-Base";
 const isOmnivoice = (model: string) => /omnivoice/i.test(model);
 // LLM finetune (FSDP2 LoRA) over a packed chat dataset (kind=llm_packed). The
 // trainer is auto-detected from the base model: gemma-4 (custom dual-head_dim
-// attention), MiniMax-M2 (230B FP8 MoE) or Mistral-Small-4 (119B FP8 MoE, MLA) —
-// the latter two use QLoRA-style on-the-fly FP8 dequant LoRA.
+// attention), Qwen3.6 (dense 27B / MoE 35B-A3B), MiniMax-M2 (230B FP8 MoE) or
+// Mistral-Small-4 (119B FP8 MoE, MLA) — the FP8 archs use QLoRA-style dequant LoRA.
 const LLM_BASE_MODELS = [
   "google/gemma-4-31B-it",
-  "MiniMaxAI/MiniMax-M2",
+  "Qwen/Qwen3.6-27B",
+  "Qwen/Qwen3.6-35B-A3B",
+  "MiniMaxAI/MiniMax-M2.7",
   "mistralai/Mistral-Small-4-119B-2603",
 ];
 const DEFAULT_LLM_BASE = "google/gemma-4-31B-it";
-// LLM base-model arch (mirrors the gateway's detect_arch). Drives the per-arch venv
-// + LoRA defaults.
-function llmArch(model: string): "gemma" | "minimax" | "mistral" {
+// LLM base-model arch (mirrors the gateway's _llm_arch / detect_arch). Drives the
+// per-arch venv + LoRA defaults.
+function llmArch(model: string): "gemma" | "qwen" | "minimax" | "mistral" {
   const n = model.toLowerCase();
   if (n.includes("minimax")) return "minimax";
   if (n.includes("mistral")) return "mistral";
+  if (n.includes("qwen")) return "qwen";
   return "gemma";
 }
-// Per-arch LoRA defaults (gemma: r=256 scaling 2.0; the FP8-MoE archs: r=16 scaling
-// 1.0 — 100s of experts × dozens of layers make the MoE LoRA huge, see their CLAUDE.md).
+// Per-arch LoRA defaults. Dense archs (gemma, qwen): r=256 scaling 2.0. The FP8-MoE
+// archs (minimax, mistral): r=16 scaling 1.0 — 100s of experts × dozens of layers
+// make the MoE LoRA huge (see their CLAUDE.md).
 function llmLoraDefaults(model: string): { r: number; ratio: number } {
-  return llmArch(model) === "gemma" ? { r: 256, ratio: 2 } : { r: 16, ratio: 1 };
+  const a = llmArch(model);
+  return a === "gemma" || a === "qwen" ? { r: 256, ratio: 2 } : { r: 16, ratio: 1 };
 }
 // Each arch needs a different `kernels` pin → separate uv venvs (matches the
 // gateway's /share/autotrain-llm-<arch> default).
@@ -116,7 +121,8 @@ function llmVenvFor(model: string): string {
 // change); a user-customized path is left untouched.
 const KNOWN_VENVS = [
   "/share/autotrain-whisper", "/share/autotrain-tts", "/share/autotrain-omnivoice", "/share/autotrain-llm",
-  "/share/autotrain-llm-gemma4", "/share/autotrain-llm-minimax", "/share/autotrain-llm-mistral",
+  "/share/autotrain-llm-gemma", "/share/autotrain-llm-gemma4", "/share/autotrain-llm-qwen",
+  "/share/autotrain-llm-minimax", "/share/autotrain-llm-mistral",
 ];
 // LLM LoRA target linear projections. q/k/v/o (attention) are the default; the MLP
 // group (gate/up/down) is opt-in. gemma4 warns at train time for any target that
@@ -936,7 +942,7 @@ export function TrainingForm() {
           {isTts
             ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM. Eval loss runs on the held-out test split per epoch or every N steps; CER / MOS / speaker-similarity score generated audio at the end."
             : isLlm
-              ? "Finetune an LLM (Gemma-4, MiniMax-M2 or Mistral-Small-4 — auto-detected from the base model) on a packed chat dataset (kind=llm_packed) with FSDP2 LoRA. The pre-tokenized bins train directly as a causal LM; loss is logged per step."
+              ? "Finetune an LLM (Gemma-4, Qwen3.6, MiniMax-M2 or Mistral-Small-4 — auto-detected from the base model) on a packed chat dataset (kind=llm_packed) with FSDP2 LoRA. The pre-tokenized bins train directly as a causal LM; loss is logged per step."
               : "Finetune a Whisper model on a dataset. WER + CER are evaluated on a held-out split — per epoch or every N steps — and training stops at the epoch / max-step cap or early on patience."}
         </p>
         {fromId && (
@@ -976,7 +982,7 @@ export function TrainingForm() {
               isLlm ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
             <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
-              <div className="font-medium">LLM — Gemma-4 / MiniMax / Mistral</div>
+              <div className="font-medium">LLM — Gemma-4 / Qwen3.6 / MiniMax / Mistral</div>
               <div className="text-xs text-muted-foreground">Chat finetune. Pack first → FSDP2 LoRA (loss-only).</div>
             </div>
           </button>
@@ -988,7 +994,7 @@ export function TrainingForm() {
         description={isTts
           ? "The base Qwen3 model + the {audio, transcription} dataset to finetune on."
           : isLlm
-            ? "The base LLM (Gemma-4, MiniMax-M2 or Mistral-Small-4) + the packed chat dataset (kind=llm_packed) to finetune on."
+            ? "The base LLM (Gemma-4, Qwen3.6, MiniMax-M2 or Mistral-Small-4) + the packed chat dataset (kind=llm_packed) to finetune on."
             : "The base Whisper checkpoint and the dataset to finetune on."}>
         <Grid>
           <FieldWrap label={isTts ? "Base TTS model" : isLlm ? "Base LLM model" : "Base Whisper model"}>
@@ -1000,7 +1006,7 @@ export function TrainingForm() {
               </SelectContent>
             </Select>
             {modelChoice === CUSTOM && (
-              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-…, MiniMaxAI/MiniMax-M2, mistralai/Mistral-Small-4-…" : "org/whisper-variant"}
+              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-…, MiniMaxAI/MiniMax-M2.7, mistralai/Mistral-Small-4-…" : "org/whisper-variant"}
                 value={customModel} onChange={(e) => setCustomModel(e.target.value)} />
             )}
           </FieldWrap>
@@ -1010,20 +1016,20 @@ export function TrainingForm() {
           <FieldWrap label="Training dataset"
             hint={isTts ? "A NeuCodec-packed dataset (kind=tts_packed) from the Datasets page."
               : isLlm ? "A packed chat dataset (kind=llm_packed) from the Datasets page." : "From the Datasets page."}>
-            <Select value={datasetId} onValueChange={setDatasetId}>
-              <SelectTrigger className="w-full min-w-0 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate">
-                <SelectValue placeholder={
-                  pickDatasets.length ? "Pick a dataset…" : ((isTts || isLlm) ? "No packed datasets — pack one first" : "No datasets yet")
-                } />
-              </SelectTrigger>
-              <SelectContent>
-                {pickDatasets.map((d) => (
-                  <SelectItem key={d.id} value={d.id}>
-                    {d.name}{d.num_rows != null ? ` · ${d.num_rows} rows` : ""} · {d.kind}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <SearchableSelect
+              value={datasetId}
+              onChange={setDatasetId}
+              options={pickDatasets.map((d) => ({
+                value: d.id,
+                label: d.name,
+                hint: `${d.num_rows != null ? `${d.num_rows} rows · ` : ""}${d.kind}`,
+                group: d.kind,
+              }))}
+              placeholder={
+                pickDatasets.length ? "Pick a dataset…" : ((isTts || isLlm) ? "No packed datasets — pack one first" : "No datasets yet")
+              }
+              searchPlaceholder="Search datasets by name…"
+            />
             {(isTts || isLlm) && pickDatasets.length === 0 && (
               <p className="mt-1.5 text-[11px] text-muted-foreground">
                 {isTts ? "TTS" : "LLM"} trains on a packed dataset. Create one with{" "}
@@ -1035,23 +1041,25 @@ export function TrainingForm() {
             hint={isTts
               ? "Use this dataset's own test split (if it was packed with one), pick another packed dataset, or auto-split a hold-out for eval loss."
               : "Held out for per-epoch WER/CER. Auto-split if none."}>
-            <Select value={testDatasetId} onValueChange={setTestDatasetId}>
-              <SelectTrigger className="w-full min-w-0 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={AUTO_SPLIT}>— Auto-split from training set —</SelectItem>
-                <SelectItem value={NO_TEST}>— No test set (skip eval) —</SelectItem>
-                {/* TTS: a split-aware packed dataset can be its own test set (its
-                    `test` subdir); other packed datasets are also selectable. */}
-                {pickDatasets
+            <SearchableSelect
+              value={testDatasetId}
+              onChange={setTestDatasetId}
+              options={[
+                { value: AUTO_SPLIT, label: "— Auto-split from training set —" },
+                { value: NO_TEST, label: "— No test set (skip eval) —" },
+                // TTS: a split-aware packed dataset can be its own test set (its
+                // `test` subdir); other packed datasets are also selectable.
+                ...pickDatasets
                   .filter((d) => !isTts || d.id !== datasetId || packTestSplit(d))
-                  .map((d) => (
-                    <SelectItem key={d.id} value={d.id}>
-                      {d.name}{d.num_rows != null ? ` · ${d.num_rows} rows` : ""} · {d.kind}
-                      {d.id === datasetId ? " — its own test split" : ""}
-                    </SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
+                  .map((d) => ({
+                    value: d.id,
+                    label: `${d.name}${d.id === datasetId ? " — its own test split" : ""}`,
+                    hint: `${d.num_rows != null ? `${d.num_rows} rows · ` : ""}${d.kind}`,
+                    group: d.kind,
+                  })),
+              ]}
+              searchPlaceholder="Search datasets by name…"
+            />
             {testDatasetId === AUTO_SPLIT && (
               <div className="mt-2 flex items-center gap-2">
                 <Label className="text-xs uppercase tracking-wide text-muted-foreground">Hold-out %</Label>
@@ -1097,7 +1105,9 @@ export function TrainingForm() {
             : isLlm
               ? (llmArch(baseModel) === "gemma"
                   ? "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Batch forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
-                  : `${llmArch(baseModel) === "mistral" ? "Mistral-Small-4" : "MiniMax-M2"} FSDP2 LoRA hyperparameters (FP8 MoE, on-the-fly dequant LoRA; loss-only, no eval). Batch forced to 1. Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large).`)
+                  : llmArch(baseModel) === "qwen"
+                    ? "Qwen3.6 FSDP2 LoRA hyperparameters (dense 27B / MoE 35B-A3B; loss-only, no eval). Batch forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
+                    : `${llmArch(baseModel) === "mistral" ? "Mistral-Small-4" : "MiniMax-M2"} FSDP2 LoRA hyperparameters (FP8 MoE, on-the-fly dequant LoRA; loss-only, no eval). Batch forced to 1. Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large).`)
               : "Epochs, early stopping, and core hyperparameters.")}>
         <div className="mb-5 grid max-w-xl grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-2">
           {taskType === "asr" && (

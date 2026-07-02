@@ -1,5 +1,6 @@
-"""Parsers for the {audio, transcription} metadata files users upload through
-the datasets UI. Supports CSV, JSON, and JSONL.
+"""Parsers for the metadata files users upload through the datasets UI —
+{audio, transcription} rows for audio datasets, or a `messages` column for chat
+datasets. Supports CSV, JSON, JSONL, and Parquet.
 
 Python port of the AutoTrain web app's `src/lib/dataset-metadata.ts`. Callers
 hand us the raw bytes + the filename so we can detect the format and validate
@@ -13,7 +14,7 @@ import json
 import os
 from typing import Any
 
-DatasetFormat = str  # "csv" | "json" | "jsonl"
+DatasetFormat = str  # "csv" | "json" | "jsonl" | "parquet"
 
 PREVIEW_ROWS = 5
 
@@ -42,8 +43,10 @@ def detect_format(filename: str) -> DatasetFormat:
         return "jsonl"
     if ext == ".json":
         return "json"
+    if ext == ".parquet":
+        return "parquet"
     raise DatasetParseError(
-        f"unsupported file extension {ext or '(none)'} — use .csv, .json, or .jsonl"
+        f"unsupported file extension {ext or '(none)'} — use .csv, .json, .jsonl, or .parquet"
     )
 
 
@@ -96,6 +99,21 @@ def _parse_csv(text: str) -> list[dict[str, Any]]:
     return [dict(row) for row in reader]
 
 
+def _parse_parquet(body: bytes) -> list[dict[str, Any]]:
+    """Read a parquet file (binary) into a list of row dicts. Nested columns
+    (e.g. a `messages` array of {role, content}) come back as native Python
+    lists/dicts via `to_pylist()`."""
+    try:
+        import pyarrow.parquet as pq  # lazy — only chat/parquet uploads need it
+    except Exception as e:  # noqa: BLE001
+        raise DatasetParseError(f"parquet support unavailable: {e}") from e
+    try:
+        table = pq.read_table(io.BytesIO(body))
+    except Exception as e:  # noqa: BLE001
+        raise DatasetParseError(f"invalid parquet file: {e}") from e
+    return table.to_pylist()
+
+
 def _parse_rows_by_format(fmt: DatasetFormat, text: str) -> list[dict[str, Any]]:
     if fmt == "csv":
         return _parse_csv(text)
@@ -104,17 +122,49 @@ def _parse_rows_by_format(fmt: DatasetFormat, text: str) -> list[dict[str, Any]]
     return _parse_json(text)
 
 
-def parse_metadata_bytes(filename: str, body: bytes) -> dict[str, Any]:
-    """Parse + validate an uploaded metadata file. Returns
-    {format, columns, num_rows, preview, audio_field, transcription_field}.
+def parse_rows_any(filename: str, body: bytes, limit: int) -> list[dict[str, Any]]:
+    """Like `parse_rows`, but handles parquet (binary) in addition to the text
+    formats. Returns up to `limit` rows without column validation."""
+    fmt = detect_format(filename)
+    rows = _parse_parquet(body) if fmt == "parquet" else _parse_rows_by_format(fmt, _decode(body))
+    return rows[: max(0, limit)]
+
+
+def parse_metadata_bytes(
+    filename: str, body: bytes, messages_field: str | None = None
+) -> dict[str, Any]:
+    """Parse + validate an uploaded metadata file.
+
+    Audio datasets (``messages_field`` unset) return
+    {format, columns, num_rows, preview, audio_field, transcription_field} and
+    require an audio + transcription column. Chat datasets (``messages_field``
+    set) instead validate that the messages column exists and return
+    {format, columns, num_rows, preview, messages_field} — no audio required.
     Raises DatasetParseError on any problem (bad format, empty, missing columns).
     """
     fmt = detect_format(filename)
-    rows = _parse_rows_by_format(fmt, _decode(body))
+    rows = _parse_parquet(body) if fmt == "parquet" else _parse_rows_by_format(fmt, _decode(body))
     if not rows:
         raise DatasetParseError("file is empty — no rows parsed")
 
     columns = list(rows[0].keys())
+
+    # Chat upload: validate the messages column, skip the audio/transcription
+    # requirement entirely.
+    if messages_field:
+        if messages_field not in columns:
+            raise DatasetParseError(
+                f"messages column '{messages_field}' not found. Columns: "
+                + ", ".join(columns)
+            )
+        return {
+            "format": fmt,
+            "columns": columns,
+            "num_rows": len(rows),
+            "preview": rows[:PREVIEW_ROWS],
+            "messages_field": messages_field,
+        }
+
     audio_field = _pick_field(columns, REQUIRED_FIELDS_FALLBACK["audio"])
     transcription_field = _pick_field(columns, REQUIRED_FIELDS_FALLBACK["transcription"])
     speaker_field = _pick_field(columns, SPEAKER_FIELD_FALLBACK)

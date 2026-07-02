@@ -307,6 +307,50 @@ def s3_put_files(
         raise err
 
 
+def s3_copy_many(
+    items: list[tuple[str, str, str]],
+    target: Optional[S3Target] = None,
+    *,
+    max_workers: int = 16,
+    on_done: Optional["Callable[[int], None]"] = None,
+) -> None:
+    """Server-side copy many (dest_key, src_bucket, src_key) objects into `target`'s
+    bucket — the bytes move S3→S3 (CopyObject), never through the gateway. Reuses ONE
+    dest client. Requires that client's creds to read the source bucket (same account,
+    or a granted cross-account policy). Calls on_done(n_completed) as each finishes;
+    raises the first error (parity with s3_put_files)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not items:
+        return
+    t = target or _env_s3_target()
+    workers = max(1, min(max_workers, len(items)))
+    cli = _s3_client(t, max_pool_connections=workers)
+
+    def _cp(item: tuple[str, str, str]) -> None:
+        dest_key, src_bucket, src_key = item
+        cli.copy_object(
+            Bucket=t.bucket, Key=dest_key,
+            CopySource={"Bucket": src_bucket, "Key": src_key},
+        )
+
+    err: Optional[BaseException] = None
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for fut in as_completed([ex.submit(_cp, it) for it in items]):
+            done += 1
+            exc = fut.exception()
+            if exc is not None and err is None:
+                err = exc
+            if on_done is not None:
+                try:
+                    on_done(done)
+                except Exception:  # noqa: BLE001 — progress is best-effort
+                    pass
+    if err is not None:
+        raise err
+
+
 def s3_presign_many(
     keys: list[str], expires: int = 3600, target: Optional[S3Target] = None
 ) -> dict[str, str]:

@@ -899,12 +899,56 @@ async def _verify_label_platform(base_url: str, token: str) -> Optional[str]:
     return None
 
 
+async def _fetch_eval_rows_from_upload(
+    storage, dataset_id: str, filename: str, messages_field: str
+) -> list[dict]:
+    """Read eval prompt rows from a kind=upload dataset's OWN uploaded S3 file
+    (json / jsonl / parquet). Remaps a custom messages column to `messages` and
+    parses any JSON-string messages back to a list — what the on-VM generator and
+    the human_mos import both expect."""
+    from . import bench, dataset_metadata
+    from .datasets_api import _metadata_key, _s3_target_and_prefix
+
+    target, _ = _s3_target_and_prefix(storage)
+    key = _metadata_key(storage, dataset_id, filename)
+    body = await asyncio.to_thread(bench.s3_get_bytes, key, target)
+    if not body:
+        raise RuntimeError(f"eval file {filename!r} not found in storage")
+    rows = await asyncio.to_thread(dataset_metadata.parse_rows_any, filename, body, 10 ** 9)
+    for r in rows:
+        if messages_field != "messages" and messages_field in r and "messages" not in r:
+            r["messages"] = r[messages_field]
+        v = r.get("messages")
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    r["messages"] = parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return rows
+
+
 async def _fetch_eval_rows_from_catalog(dataset_id: str) -> list[dict]:
-    """Read JSONL rows from a kind=hf Dataset that was pushed to the platform catalog.
-    Looks up the CatalogRepo by ds.hf_repo, downloads the .jsonl blob from S3, and
-    returns a list of parsed row dicts. Raises RuntimeError on any failure."""
+    """Read JSONL rows from a kind=hf Dataset that was pushed to the platform catalog
+    (or a standalone catalog repo), OR the uploaded file of a kind=upload dataset.
+    Returns a list of parsed row dicts. Raises RuntimeError on any failure."""
     from sqlalchemy import select as _sa_select
     from .db import CatalogRepo as _CatalogRepo
+
+    # kind=upload eval dataset: rows live in the dataset's own uploaded S3 file
+    # (not a catalog repo). Resolve + read it directly.
+    async with session_factory()() as s:
+        ds_up = await s.get(Dataset, dataset_id)
+        if ds_up is not None and ds_up.kind == "upload":
+            up_storage = await s.get(Storage, ds_up.storage_id) if ds_up.storage_id else None
+            if up_storage is None or up_storage.kind != "s3":
+                raise RuntimeError("uploaded eval dataset has no S3 storage")
+            if not ds_up.metadata_filename:
+                raise RuntimeError("uploaded eval dataset has no file — upload one first")
+            up_mf = getattr(ds_up, "messages_field", None) or "messages"
+            up_name = ds_up.metadata_filename
+            return await _fetch_eval_rows_from_upload(up_storage, dataset_id, up_name, up_mf)
 
     async with session_factory()() as s:
         ds = await s.get(Dataset, dataset_id)

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NumberField } from "@/components/ui/number-field";
-import { SearchableSelect } from "@/components/ui/searchable-select";
+import { SearchableSelect, type SearchableOption } from "@/components/ui/searchable-select";
 import {
   Select,
   SelectContent,
@@ -21,6 +21,8 @@ import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type {
+  CatalogRecord,
+  DatasetRecord,
   GlobalEnvRecord,
   GpuTypeOption,
   ProviderRecord,
@@ -79,6 +81,8 @@ export function LabelExportTab({
   // and seed a Label-platform human_mos project instead of synthesizing audio clips. ----
   const isLlm = run.task_type === "llm";
   const [llmEvalDatasetId, setLlmEvalDatasetId] = useState(str("llm_label_eval_dataset_id"));
+  const [datasets, setDatasets] = useState<DatasetRecord[]>([]);
+  const [catalogDatasets, setCatalogDatasets] = useState<CatalogRecord[]>([]);
   const [llmSamples, setLlmSamples] = useState(num("llm_label_samples", 110));
   const [llmAxes, setLlmAxes] = useState(arr("llm_label_mos_axes") || "Relevance, Accuracy, Helpfulness, Tone");
   const [llmMaxNewTokens, setLlmMaxNewTokens] = useState(num("llm_label_max_new_tokens", 512));
@@ -99,7 +103,12 @@ export function LabelExportTab({
   const [diskGb, setDiskGb] = useState(num("label_disk_gb", 60));
   const [volumeGb, setVolumeGb] = useState(num("label_volume_gb", 80));
   const [visibleDevices, setVisibleDevices] = useState(str("label_visible_devices"));
-  const [venvPath, setVenvPath] = useState(str("venv_path") || "/share/autotrain-tts");
+  // LLM export runs from the run's LLM venv (/share/autotrain-llm-<arch>, filled
+  // from the run config); leave the fallback empty so the gateway picks the arch
+  // venv. TTS export uses the NeuCodec venv.
+  const [venvPath, setVenvPath] = useState(
+    str("venv_path") || (run.task_type === "llm" ? "" : "/share/autotrain-tts"),
+  );
   // NeuCodec decoder: upstream neuphonic/neucodec (24 kHz) or the Scicom 44k-d20 fork.
   const [codec, setCodec] = useState(str("tts_codec") || "neucodec");
   const [gpuOptions, setGpuOptions] = useState<GpuTypeOption[]>(RUNPOD_GPU_FALLBACK);
@@ -161,7 +170,26 @@ export function LabelExportTab({
         setGpuType((cur) => (rows.some((g) => g.id === cur) ? cur : rows[0].id));
       })
       .catch(() => {});
+    // Eval-dataset picker source (LLM export): registered kind=hf datasets +
+    // standalone catalog repos pushed via the hf CLI. Mirrors autotrain/new.
+    gateway.listDatasets().then(setDatasets).catch(() => {});
+    gateway.listCatalog("mine", "dataset").then(setCatalogDatasets).catch(() => {});
   }, []);
+
+  // Eval-dataset options for the LLM label export (search-select): registered
+  // kind=hf datasets, uploaded chat datasets (kind=upload with a messages column),
+  // and standalone catalog repos pushed via the hf CLI.
+  const evalDatasetOptions = useMemo<SearchableOption[]>(() => {
+    const hfDatasets = datasets.filter((d) => d.kind === "hf");
+    const uploadChat = datasets.filter((d) => d.kind === "upload" && !!d.messages_field);
+    const linkedRepoIds = new Set(datasets.map((d) => d.catalog_repo_id).filter(Boolean));
+    const standaloneHosted = catalogDatasets.filter((r) => !linkedRepoIds.has(r.id));
+    return [
+      ...hfDatasets.map((d) => ({ value: d.id, label: d.name || d.hf_repo || d.id, hint: d.hf_repo || undefined })),
+      ...uploadChat.map((d) => ({ value: d.id, label: d.name || d.id, hint: "uploaded chat" })),
+      ...standaloneHosted.map((r) => ({ value: r.id, label: r.full_id })),
+    ];
+  }, [datasets, catalogDatasets]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -417,14 +445,18 @@ export function LabelExportTab({
 
               <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
                 <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>Pick a GPU with enough VRAM to load the trained model and NeuCodec for synthesis.</span>
+                <span>
+                  {isLlm
+                    ? "Pick a GPU with enough VRAM to load the trained model for text generation."
+                    : "Pick a GPU with enough VRAM to load the trained model and NeuCodec for synthesis."}
+                </span>
               </div>
             </>
           )}
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field label="uv venv path (TTS)">
-              <Input className="font-mono text-xs" placeholder="/share/autotrain-tts"
+            <Field label={isLlm ? "uv venv path (LLM)" : "uv venv path (TTS)"}>
+              <Input className="font-mono text-xs" placeholder={isLlm ? "/share/autotrain-llm-<arch>" : "/share/autotrain-tts"}
                 value={venvPath} onChange={(e) => setVenvPath(e.target.value)} />
             </Field>
             <Field
@@ -440,20 +472,22 @@ export function LabelExportTab({
             </Field>
           </div>
 
-          <Field
-            label="NeuCodec (audio decoder)"
-            hint={codec === "neucodec-44k"
-              ? "Scicom 44k-d20 fork — 44.1 kHz output (installs from git; slower first build)."
-              : "Upstream neuphonic/neucodec — 24 kHz output. Same speech tokens, so either decodes the model fine."}
-          >
-            <Select value={codec} onValueChange={setCodec}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="neucodec">neuphonic/neucodec — 24 kHz (upstream)</SelectItem>
-                <SelectItem value="neucodec-44k">Scicom neucodec-44k-d20 — 44.1 kHz</SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
+          {!isLlm && (
+            <Field
+              label="NeuCodec (audio decoder)"
+              hint={codec === "neucodec-44k"
+                ? "Scicom 44k-d20 fork — 44.1 kHz output (installs from git; slower first build)."
+                : "Upstream neuphonic/neucodec — 24 kHz output. Same speech tokens, so either decodes the model fine."}
+            >
+              <Select value={codec} onValueChange={setCodec}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="neucodec">neuphonic/neucodec — 24 kHz (upstream)</SelectItem>
+                  <SelectItem value="neucodec-44k">Scicom neucodec-44k-d20 — 44.1 kHz</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          )}
         </div>
       </Section>
 
@@ -527,11 +561,17 @@ export function LabelExportTab({
         {isLlm ? (
           <>
             <div className="space-y-1.5">
-              <label className="text-xs uppercase tracking-wide text-muted-foreground">Eval dataset ID</label>
-              <Input className="font-mono" value={llmEvalDatasetId} placeholder="ds-xxxxxxxx"
-                onChange={(e) => setLlmEvalDatasetId(e.target.value)} />
+              <label className="text-xs uppercase tracking-wide text-muted-foreground">Eval dataset</label>
+              <SearchableSelect
+                value={llmEvalDatasetId}
+                onChange={setLlmEvalDatasetId}
+                options={evalDatasetOptions}
+                placeholder={evalDatasetOptions.length ? "Pick an eval dataset…" : "No datasets yet — push via hf CLI first"}
+                searchPlaceholder="Search datasets by name…"
+              />
               <p className="text-xs text-muted-foreground">
-                Dataset ID of the kind=hf benchmark dataset (its JSONL rows are the prompts). Register it on the Datasets page after HF push.
+                The chat dataset whose rows are the prompts — a kind=hf dataset (HF push) or an uploaded
+                chat file (kind=upload with a messages column). Register / upload it on the Datasets page.
               </p>
             </div>
             <div className="grid grid-cols-2 gap-3">

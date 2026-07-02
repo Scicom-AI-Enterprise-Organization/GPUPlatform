@@ -69,6 +69,8 @@ async def start_transform(
     s3_folder: Optional[str] = None,
     test_split_pct: Optional[float] = None,
     test_split_count: Optional[int] = None,
+    test_min_chars: Optional[int] = None,
+    test_exclude_regex: Optional[str] = None,
 ) -> None:
     """Mark the dataset running and kick off the background job."""
     async with session_factory()() as s:
@@ -81,6 +83,7 @@ async def start_transform(
     task = asyncio.create_task(_run(
         dataset_id, target, hf_repo, storage_id, s3_folder,
         test_split_pct=test_split_pct, test_split_count=test_split_count,
+        test_min_chars=test_min_chars, test_exclude_regex=test_exclude_regex,
     ))
     _active[dataset_id] = task
     task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
@@ -216,6 +219,8 @@ async def _run(
     s3_folder: Optional[str] = None,
     test_split_pct: Optional[float] = None,
     test_split_count: Optional[int] = None,
+    test_min_chars: Optional[int] = None,
+    test_exclude_regex: Optional[str] = None,
 ) -> None:
     from fastapi.concurrency import run_in_threadpool
     from sqlalchemy import select
@@ -298,10 +303,19 @@ async def _run(
 
         # Optional held-out test split: reassign each row's split to train/test.
         if test_split_pct is not None or test_split_count is not None:
-            pairs, n_test = _apply_test_split(pairs, test_split_pct, test_split_count)
+            pairs, n_test = _apply_test_split(
+                pairs, test_split_pct, test_split_count,
+                min_chars=int(test_min_chars or 0), exclude_regex=(test_exclude_regex or None),
+            )
+            _filters = []
+            if test_min_chars:
+                _filters.append(f"≥ {int(test_min_chars)} chars")
+            if test_exclude_regex:
+                _filters.append(f"excl /{test_exclude_regex}/")
+            _f = f" (test eligibility: {', '.join(_filters)})" if _filters else ""
             await _log(
                 dataset_id,
-                f"test split → {n_test} test / {len(pairs) - n_test} train rows",
+                f"test split → {n_test} test / {len(pairs) - n_test} train rows{_f}",
             )
 
         # Non-destructive: build the output, then create a NEW "-audio" dataset
@@ -473,13 +487,27 @@ async def _run_merge(
                     await _finish(output_id, "failed",
                                   f"source '{src['name']}' is an s3 dataset without storage / a metadata file")
                     return
-                await _log(output_id,
-                           f"[{idx + 1}/{len(sources)}] reading s3 dataset '{src['name']}' "
-                           f"({src['s3_metadata_uri']}) …")
-                pairs = await run_in_threadpool(
-                    _s3_pairs, src["s3_target"], src["s3_metadata_uri"],
-                    src["audio_field"], src["transcription_field"], sub, f"s{idx}-", progress,
-                )
+                # Fast path: when the source and destination S3 are the same account
+                # (same creds/region/endpoint) and we're writing to S3, copy the audio
+                # objects server-side (S3→S3) instead of pulling every clip down through
+                # the gateway and re-uploading. Falls back to download for target=hf or
+                # a cross-account source.
+                if target == "s3" and _same_account(src["s3_target"], s3_target):
+                    await _log(output_id,
+                               f"[{idx + 1}/{len(sources)}] copying s3 dataset '{src['name']}' "
+                               f"server-side ({src['s3_metadata_uri']}) …")
+                    pairs = await run_in_threadpool(
+                        _s3_copy_pairs, src["s3_target"], src["s3_metadata_uri"],
+                        src["audio_field"], src["transcription_field"], f"s{idx}-",
+                    )
+                else:
+                    await _log(output_id,
+                               f"[{idx + 1}/{len(sources)}] reading s3 dataset '{src['name']}' "
+                               f"({src['s3_metadata_uri']}) …")
+                    pairs = await run_in_threadpool(
+                        _s3_pairs, src["s3_target"], src["s3_metadata_uri"],
+                        src["audio_field"], src["transcription_field"], sub, f"s{idx}-", progress,
+                    )
             await _log(output_id, f"  ↳ {len(pairs)} clip(s) from '{src['name']}'")
             all_pairs.extend(pairs)
 
@@ -638,6 +666,7 @@ async def _run_llm_pack(
             src_repo = d.hf_repo
             src_revision = d.hf_revision
             src_name = d.name
+            src_metadata_filename = d.metadata_filename
             messages_field = (getattr(d, "messages_field", None) or "messages")
             # HF token + endpoint: prefer the dataset's OWN storage when it's a
             # huggingface backend (carries the token for a gated repo), else fall
@@ -650,46 +679,87 @@ async def _run_llm_pack(
             hf_endpoint = await _hf_endpoint(hf_store, s)
             out_storage = await s.get(Storage, storage_id)
 
-        if not (src_repo and "/" in src_repo):
-            await _finish(dataset_id, "failed", "dataset has no source HuggingFace repo (owner/name)")
-            return
         if out_storage is None or out_storage.kind != "s3":
             await _finish(dataset_id, "failed", "pick a kind=s3 storage for the packed output")
             return
         target, base_prefix = _s3_target_and_prefix(out_storage)
 
-        # 1. Resolve each chosen subset → (config, split) + its parquet files. Several
-        #    subsets are concatenated into one packed dataset (one combined URL list,
-        #    so the download step indexes filenames globally → no collisions).
-        want = subsets or [None]
-        labels: list[str] = []
-        urls: list[str] = []
-        for sub in want:
-            await _log(dataset_id, f"resolving subset {sub or '(first)'} on {src_repo} …")
-            config, split, label = await run_in_threadpool(
-                _resolve_hf_subset, src_repo, token, sub, src_revision)
-            sub_urls = await run_in_threadpool(
-                _hf_parquet_files, src_repo, token, config, split, src_revision)
-            if not sub_urls:
+        has_hf = bool(src_repo and "/" in src_repo)
+        has_file = bool(own is not None and own.kind == "s3" and src_metadata_filename)
+        if not (has_hf or has_file):
+            await _finish(dataset_id, "failed",
+                          "dataset has no source HuggingFace repo or uploaded file to pack")
+            return
+
+        if has_hf:
+            # 1. Resolve each chosen subset → (config, split) + its parquet files. Several
+            #    subsets are concatenated into one packed dataset (one combined URL list,
+            #    so the download step indexes filenames globally → no collisions).
+            want = subsets or [None]
+            labels: list[str] = []
+            urls: list[str] = []
+            for sub in want:
+                await _log(dataset_id, f"resolving subset {sub or '(first)'} on {src_repo} …")
+                config, split, label = await run_in_threadpool(
+                    _resolve_hf_subset, src_repo, token, sub, src_revision)
+                sub_urls = await run_in_threadpool(
+                    _hf_parquet_files, src_repo, token, config, split, src_revision)
+                if not sub_urls:
+                    await _finish(dataset_id, "failed",
+                                  f"no parquet files for subset '{label}' (config={config}, split={split}) "
+                                  f"on the HF datasets-server")
+                    return
+                labels.append(label)
+                urls.extend(sub_urls)
+                await _log(dataset_id,
+                           f"subset '{label}' → config={config} split={split}; {len(sub_urls)} parquet file(s)")
+            label = ", ".join(labels)
+            if len(labels) > 1:
+                await _log(dataset_id, f"{len(labels)} subsets [{label}] → {len(urls)} parquet file(s) total")
+
+            # 2. Download the parquet shards (auth via the HF token).
+            await _log(dataset_id, "downloading source parquet …")
+            paths = await run_in_threadpool(_download_parquet_urls, urls, token, work, progress)
+
+            # 3. Read messages (+ tools) columns → rows.
+            cols = [messages_field] + ([tools_field] if tools_field else [])
+            rows = await run_in_threadpool(_read_split_columns, paths, cols)
+        else:
+            # S3-backed upload: read the uploaded chat file (json / jsonl / parquet)
+            # directly from the dataset's own storage — no HF datasets-server.
+            import json
+
+            from . import bench, dataset_metadata
+            from .datasets_api import _metadata_key
+
+            src_target, _ = _s3_target_and_prefix(own)
+            key = _metadata_key(own, dataset_id, src_metadata_filename)
+            await _log(dataset_id, f"reading uploaded chat file {src_metadata_filename} from S3 …")
+            body = await run_in_threadpool(bench.s3_get_bytes, key, src_target)
+            if not body:
                 await _finish(dataset_id, "failed",
-                              f"no parquet files for subset '{label}' (config={config}, split={split}) "
-                              f"on the HF datasets-server")
+                              f"uploaded file {src_metadata_filename} not found in storage")
                 return
-            labels.append(label)
-            urls.extend(sub_urls)
-            await _log(dataset_id,
-                       f"subset '{label}' → config={config} split={split}; {len(sub_urls)} parquet file(s)")
-        label = ", ".join(labels)
-        if len(labels) > 1:
-            await _log(dataset_id, f"{len(labels)} subsets [{label}] → {len(urls)} parquet file(s) total")
+            rows = await run_in_threadpool(
+                dataset_metadata.parse_rows_any, src_metadata_filename, body, 10 ** 9)
+            if rows and messages_field not in rows[0]:
+                await _finish(dataset_id, "failed",
+                              f"no column '{messages_field}' in {src_metadata_filename} — "
+                              f"check the messages column mapping")
+                return
+            # Some exports store the messages array as a JSON string — parse it back
+            # to a real list so pack_rows sees a conversation (matches the preview).
+            for r in rows:
+                v = r.get(messages_field)
+                if isinstance(v, str):
+                    try:
+                        parsed = json.loads(v)
+                        if isinstance(parsed, list):
+                            r[messages_field] = parsed
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            label = src_name
 
-        # 2. Download the parquet shards (auth via the HF token).
-        await _log(dataset_id, "downloading source parquet …")
-        paths = await run_in_threadpool(_download_parquet_urls, urls, token, work, progress)
-
-        # 3. Read messages (+ tools) columns → rows.
-        cols = [messages_field] + ([tools_field] if tools_field else [])
-        rows = await run_in_threadpool(_read_split_columns, paths, cols)
         if not rows:
             await _finish(dataset_id, "failed",
                           f"no rows read for column '{messages_field}' — check the messages column mapping")
@@ -734,7 +804,8 @@ async def _run_llm_pack(
             dataset_id, new_id=new_id,
             name=f"{src_name}-llm-packed",
             description=(f"Chat multipack (seq_len {sequence_length}, tokenizer {tokenizer}, "
-                         f"subset {label}, arch {stats.get('arch')}) of {src_repo} → {n_bins} bins"),
+                         f"subset {label}, arch {stats.get('arch')}) of "
+                         f"{src_repo or src_metadata_filename} → {n_bins} bins"),
             storage_id=storage_id, s3_uri=s3_uri, num_rows=n_bins,
             messages_field=messages_field, tokenizer=tokenizer,
             sequence_length=int(sequence_length), subset=label, arch=stats.get("arch"),
@@ -963,6 +1034,71 @@ def _label_pairs(
             text = "" if text is None else str(text)
             split = str(r.get("split") or "train")
             pairs.append((split, str(dest), text, {}))
+    return pairs
+
+
+def _same_account(a, b) -> bool:
+    """Whether two S3Targets can server-side copy between each other — same creds,
+    region, and endpoint, so a CopyObject issued by the dest client can read the
+    source bucket. Bucket may differ (cross-bucket copy in one account is fine)."""
+    if a is None or b is None:
+        return False
+    return (
+        (a.access_key or "") == (b.access_key or "")
+        and (a.region or "") == (b.region or "")
+        and (a.endpoint or "") == (b.endpoint or "")
+    )
+
+
+def _s3_copy_pairs(
+    s3_target,
+    s3_metadata_uri: str,
+    audio_field: str,
+    transcription_field: str,
+    name_prefix: str = "",
+) -> list[tuple[str, tuple, str, dict]]:
+    """Like `_s3_pairs`, but does NOT download: read the source metadata CSV and
+    return copy-markers so `_materialise_s3` server-side copies each clip S3→S3.
+    Each pair's audio element is an ("s3cp", src_bucket, src_key, dest_basename)
+    tuple. `name_prefix` keeps dest basenames unique across merged sources — the
+    SAME contract as `_s3_pairs`, so the two can be mixed in one merge."""
+    import csv
+    import io as _io
+    from urllib.parse import unquote, urlparse
+
+    from . import bench
+
+    u = urlparse(s3_metadata_uri or "")
+    meta_key = (u.path if u.scheme == "s3" else (s3_metadata_uri or "")).lstrip("/")
+    if not meta_key:
+        raise RuntimeError(f"unusable s3 metadata uri: {s3_metadata_uri!r}")
+    base = meta_key.rsplit("/", 1)[0] if "/" in meta_key else ""
+    src_bucket = getattr(s3_target, "bucket", "")
+
+    text = bench.s3_get_text(meta_key, s3_target)
+    if not text:
+        raise RuntimeError(f"could not read metadata at {s3_metadata_uri}")
+    reader = csv.DictReader(_io.StringIO(text))
+    cols = reader.fieldnames or []
+    a_col = audio_field if audio_field in cols else ("audio" if "audio" in cols else None)
+    t_col = transcription_field if transcription_field in cols else (
+        "transcription" if "transcription" in cols else None
+    )
+    if not a_col:
+        raise RuntimeError(f"audio column '{audio_field}' not found in {meta_key} (have {cols})")
+    skip = {a_col, t_col, "split"}
+    pairs: list[tuple[str, tuple, str, dict]] = []
+    for i, r in enumerate(reader):
+        ref = (r.get(a_col) or "").strip()
+        if not ref:
+            continue
+        basename = unquote(os.path.basename(urlparse(ref).path)) or f"row-{i}.wav"
+        src_key = f"{base}/audio/{basename}" if base else f"audio/{basename}"
+        marker = ("s3cp", src_bucket, src_key, f"{name_prefix}{basename}")
+        text_val = (r.get(t_col) or "") if t_col else ""
+        split = (r.get("split") or "train").strip() or "train"
+        extra = {k: v for k, v in r.items() if k not in skip and isinstance(v, str) and v != ""}
+        pairs.append((split, marker, str(text_val), extra))
     return pairs
 
 
@@ -1270,26 +1406,46 @@ def _apply_test_split(
     pct: Optional[float],
     count: Optional[int],
     seed: int = 42,
+    min_chars: int = 0,
+    exclude_regex: Optional[str] = None,
 ) -> tuple[list[tuple[str, str, str, dict]], int]:
     """Reassign each pair's split to `train`/`test`, carving out a random held-out
     subset (collapsing any source splits). `count` (absolute) wins over `pct`
-    (percentage of all matched rows). Deterministic for a given `seed` so re-runs
-    reproduce the same split. Returns (pairs, n_test)."""
+    (percentage of all matched rows). A row is ELIGIBLE to become test only if its
+    transcription (after stripping) is at least `min_chars` characters AND does not
+    match `exclude_regex` (a Python regex, `re.search`). So junk/placeholder
+    transcripts (e.g. `[silent]`, `[unintelligible]`, matched by `^\\s*\\[.*\\]\\s*$`)
+    stay in train instead of polluting eval; ineligible rows are never chosen as
+    test. Deterministic for a given `seed`. Returns (pairs, n_test)."""
     import random
+    import re
 
     n = len(pairs)
+    mc = max(0, int(min_chars or 0))
+    pat = re.compile(exclude_regex) if exclude_regex else None
+
+    def _eligible(text: str) -> bool:
+        t = (text or "").strip()
+        if len(t) < mc:
+            return False
+        if pat is not None and pat.search(t):
+            return False
+        return True
+
+    # Indices eligible to become test (mc=0 + no regex → all rows).
+    eligible = [i for i, (_s, _p, text, _e) in enumerate(pairs) if _eligible(text)]
     if count is not None:
         k = count
     elif pct is not None:
         k = round(n * pct / 100.0)
     else:
         return pairs, 0
-    k = max(0, min(k, n))
+    # Can't hold out more than the eligible pool (short transcripts stay in train).
+    k = max(0, min(k, len(eligible)))
     if k == 0:
         return [("train", path, text, extra) for _split, path, text, extra in pairs], 0
-    idx = list(range(n))
-    random.Random(seed).shuffle(idx)
-    test_idx = set(idx[:k])
+    random.Random(seed).shuffle(eligible)
+    test_idx = set(eligible[:k])
     return [
         ("test" if i in test_idx else "train", path, text, extra)
         for i, (_split, path, text, extra) in enumerate(pairs)
@@ -1347,22 +1503,44 @@ def _materialise_s3(
     except Exception:  # noqa: BLE001 — best-effort; fall back to always uploading
         pass
     expires = 7 * 24 * 3600
-    # Unique source files (the same clip can repeat across splits) → S3 key.
-    key_of: dict[str, str] = {}
-    for _split, path, _text, _extra in pairs:
-        key_of.setdefault(path, f"{base}/audio/{os.path.basename(path)}")
+    # Each unique audio source (same clip can repeat across splits) → its S3 dest key.
+    # A source is either a local file path (str, uploaded) or an
+    # ("s3cp", src_bucket, src_key, dest_basename) marker (server-side copied S3→S3,
+    # no bytes through the gateway — emitted by _s3_copy_pairs for a same-account merge).
+    def _dest_key(src) -> str:
+        if isinstance(src, tuple) and src and src[0] == "s3cp":
+            return f"{base}/audio/{src[3]}"
+        return f"{base}/audio/{os.path.basename(src)}"
 
-    # Upload concurrently, reusing one client; re-runs skip clips already present.
-    to_upload = [(key, path) for path, key in key_of.items() if key not in existing]
-    total_up = len(to_upload)
-    if total_up:
-        every = max(1, total_up // 50)  # ~50 progress markers over the upload
+    key_of: dict = {}
+    for _split, src, _text, _extra in pairs:
+        key_of.setdefault(src, _dest_key(src))
 
-        def _on_done(done: int) -> None:
-            if progress and (done % every == 0 or done == total_up):
-                progress("upload_s3", done, total_up)
+    # Re-runs skip clips already in the bucket. Split the rest into local uploads
+    # and server-side copies.
+    to_upload: list[tuple[str, str]] = []      # (dest_key, local_path)
+    to_copy: list[tuple[str, str, str]] = []   # (dest_key, src_bucket, src_key)
+    for src, dest_key in key_of.items():
+        if dest_key in existing:
+            continue
+        if isinstance(src, tuple) and src and src[0] == "s3cp":
+            to_copy.append((dest_key, src[1], src[2]))
+        else:
+            to_upload.append((dest_key, src))
 
-        bench.s3_put_files(to_upload, s3_target, max_workers=16, on_done=_on_done)
+    total = len(to_copy) + len(to_upload)
+    every = max(1, total // 50) if total else 1  # ~50 progress markers overall
+
+    def _tick(done: int) -> None:
+        if progress and (done % every == 0 or done == total):
+            progress("upload_s3", done, total)
+
+    # Server-side copies first (fast metadata ops), then local uploads.
+    if to_copy:
+        bench.s3_copy_many(to_copy, s3_target, max_workers=16, on_done=_tick)
+    if to_upload:
+        offset = len(to_copy)
+        bench.s3_put_files(to_upload, s3_target, max_workers=16, on_done=lambda n: _tick(offset + n))
 
     # Presign every unique key (local signing, one client), then write the CSV
     # with the carried-through columns (e.g. speaker) after audio/text/split.
@@ -1371,8 +1549,8 @@ def _materialise_s3(
     buf = _io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["audio", transcription_field, "split"] + extra_cols)
-    for split, path, text, extra in pairs:
-        writer.writerow([urls[key_of[path]], text, split] + [extra.get(c, "") for c in extra_cols])
+    for split, src, text, extra in pairs:
+        writer.writerow([urls[key_of[src]], text, split] + [extra.get(c, "") for c in extra_cols])
     meta_key = f"{base}/metadata.csv"
     bench.s3_put_text(meta_key, buf.getvalue(), s3_target)
     bucket = getattr(s3_target, "bucket", "")

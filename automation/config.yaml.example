@@ -42,6 +42,12 @@ timezone_offset: "+08:00"                     # applied to a cutoff with no offs
 # test split: set test_split_pct (0-100) OR test_split_count (absolute), or omit
 #             both for NO held-out test set. Optional per-dataset `cutoff` /
 #             `label_status` override the defaults above.
+# Keep junk out of the test split (both optional, they compose; per-dataset or a
+# top-level default):
+#   test_exclude_regex: transcripts matching this Python regex are EXCLUDED from
+#                       test (kept in train). e.g. '^\s*\[.*\]\s*$' drops bracketed
+#                       placeholder tags like [silent] / [unintelligible].
+#   test_min_chars:     only transcripts >= this many characters are eligible for test.
 datasets:
   - name: asr-proj-1
     project_id: 00000000-0000-0000-0000-000000000001
@@ -50,10 +56,12 @@ datasets:
   - name: asr-proj-2
     project_id: 00000000-0000-0000-0000-000000000002
     test_split_pct: 5
+    test_exclude_regex: '^\s*\[.*\]\s*$'
 
   - name: asr-proj-3
     project_id: 00000000-0000-0000-0000-000000000003
     test_split_pct: 5
+    test_exclude_regex: '^\s*\[.*\]\s*$'
 
 # ---- Merge ------------------------------------------------------------------
 # Concatenate all transformed datasets into one. Their per-source train/test

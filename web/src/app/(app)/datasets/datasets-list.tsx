@@ -8,6 +8,8 @@ import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { DatasetKind, DatasetRecord } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -50,6 +52,9 @@ function searchableText(d: DatasetRecord): string {
 
 // Kinds the gateway's /datasets/merge can concatenate into one audio dataset.
 const MERGEABLE_KINDS = new Set<DatasetKind>(["label", "s3"]);
+// Kinds whose files live in OUR S3 storage, so delete can optionally purge them
+// (mirrors [datasetId]/delete-button.tsx). hf/label/llm have nothing here.
+const PURGEABLE_KINDS = new Set<DatasetKind>(["s3", "tts_packed", "llm_packed", "upload"]);
 
 const SOURCE_OPTIONS: Array<{ value: "all" | DatasetKind; label: string }> = [
   { value: "all", label: "All sources" },
@@ -79,6 +84,10 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
   const [deleteTarget, setDeleteTarget] = useState<DatasetRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Purge (also delete S3 files) — offered for S3-backed kinds, gated behind
+  // typing the exact dataset name since it's irreversible.
+  const [purge, setPurge] = useState(false);
+  const [purgeConfirm, setPurgeConfirm] = useState("");
   const [renameTarget, setRenameTarget] = useState<DatasetRecord | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [renaming, setRenaming] = useState(false);
@@ -152,9 +161,11 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
       if (deleteTarget.kind === "hosted") {
         await gateway.deleteCatalogRepo(deleteTarget.id);
       } else {
-        await gateway.deleteDataset(deleteTarget.id);
+        await gateway.deleteDataset(deleteTarget.id, purge && PURGEABLE_KINDS.has(deleteTarget.kind));
       }
       setDeleteTarget(null);
+      setPurge(false);
+      setPurgeConfirm("");
       router.refresh();
     } catch (e) {
       setDeleteError(e instanceof Error ? e.message : String(e));
@@ -404,6 +415,8 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
           if (!deleting && !o) {
             setDeleteTarget(null);
             setDeleteError(null);
+            setPurge(false);
+            setPurgeConfirm("");
           }
         }}
       >
@@ -412,9 +425,54 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
             <DialogTitle>Delete dataset</DialogTitle>
             <DialogDescription>
               Delete <span className="font-medium text-foreground">{deleteTarget?.name}</span>? This removes the
-              dataset record. Files already written to storage are not deleted.
+              dataset record.{" "}
+              {purge && deleteTarget && PURGEABLE_KINDS.has(deleteTarget.kind) ? (
+                <span className="text-destructive">
+                  Its files in S3 storage will also be <span className="font-medium">permanently deleted</span>.
+                </span>
+              ) : (
+                <>Files already written to storage are not deleted.</>
+              )}
             </DialogDescription>
           </DialogHeader>
+
+          {deleteTarget && PURGEABLE_KINDS.has(deleteTarget.kind) && (
+            <div className="space-y-3">
+              <label className="flex items-start gap-2 text-sm">
+                <Checkbox
+                  checked={purge}
+                  onCheckedChange={(v) => {
+                    setPurge(v === true);
+                    setPurgeConfirm("");
+                  }}
+                  disabled={deleting}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="font-medium">Also delete the files in storage (S3)</span> — removes this
+                  dataset&apos;s objects under its storage prefix. This cannot be undone.
+                </span>
+              </label>
+
+              {purge && (
+                <div className="space-y-1.5">
+                  <p className="text-xs text-muted-foreground">
+                    Type <span className="font-mono text-foreground">{deleteTarget.name}</span> to confirm
+                  </p>
+                  <Input
+                    value={purgeConfirm}
+                    onChange={(e) => setPurgeConfirm(e.target.value)}
+                    placeholder={deleteTarget.name}
+                    autoComplete="off"
+                    aria-label="Type the dataset name to confirm deletion"
+                    disabled={deleting}
+                    className="text-sm"
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
           {deleteError && (
             <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               {deleteError}
@@ -424,8 +482,12 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
             <Button variant="ghost" onClick={() => setDeleteTarget(null)} disabled={deleting}>
               Cancel
             </Button>
-            <Button variant="destructive" onClick={onDelete} disabled={deleting}>
-              {deleting ? "Deleting…" : "Delete"}
+            <Button
+              variant="destructive"
+              onClick={onDelete}
+              disabled={deleting || (purge && purgeConfirm.trim() !== deleteTarget?.name)}
+            >
+              {deleting ? "Deleting…" : purge ? "Delete + purge files" : "Delete"}
             </Button>
           </DialogFooter>
         </DialogContent>

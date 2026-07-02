@@ -6,7 +6,11 @@ import { gateway } from "@/lib/gateway";
 import type { StorageRecord } from "@/lib/types";
 import { DatasetForm } from "./dataset-form";
 
-export default async function NewDatasetPage() {
+export default async function NewDatasetPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ source?: string }>;
+}) {
   const me = await getMe();
   if (!me) redirect("/login");
   if (!me.sections?.datasets) redirect("/datasets");
@@ -18,6 +22,7 @@ export default async function NewDatasetPage() {
     storages = [];
   }
   const username = await currentUsername();
+  const { source } = await searchParams;
 
   return (
     <div className="flex h-full flex-col">
@@ -34,7 +39,7 @@ export default async function NewDatasetPage() {
             link an existing HuggingFace dataset.
           </p>
         </div>
-        <DatasetForm storages={storages} />
+        <DatasetForm storages={storages} initialSource={source} />
       </div>
     </div>
   );

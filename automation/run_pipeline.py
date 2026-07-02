@@ -121,7 +121,21 @@ class Gateway:
         )
 
     def request(self, method: str, path: str, **kw) -> Any:
-        r = self.cli.request(method, path, **kw)
+        # Retry on connection-refused / connect-timeout so a gateway restart
+        # mid-run (e.g. picking up a backend edit) doesn't kill the pipeline. A
+        # ConnectError means the request never reached the server, so retrying is
+        # safe for any method (no risk of a double POST).
+        attempts = 0
+        while True:
+            try:
+                r = self.cli.request(method, path, **kw)
+                break
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                attempts += 1
+                if attempts > 30:  # ~150s of gateway downtime tolerance
+                    raise
+                log(f"gateway unreachable ({e}); retry {attempts}/30 in 5s…")
+                time.sleep(5)
         if r.status_code >= 400:
             raise GatewayError(f"{method} {path} -> HTTP {r.status_code}: {r.text[:600]}")
         if not r.content:
@@ -165,18 +179,16 @@ class State:
 def wait_dataset(gw: Gateway, ds_id: str, *, timeout: float, label: str) -> dict:
     """Poll a dataset until its transform/merge finishes. Prints new log tail lines."""
     deadline = time.monotonic() + timeout
-    seen = ""
+    emitted: set[str] = set()  # dedup by content — the gateway log is a rolling
+    #                            buffer, so a prefix diff re-prints once it truncates.
     while True:
         rec = gw.get(f"/v1/datasets/{ds_id}")
         status = rec.get("transform_status") or ""
-        tail = rec.get("transform_log") or ""
-        if tail and tail != seen:
-            # print only the newly appended portion
-            new = tail[len(seen):] if tail.startswith(seen) else tail
-            for line in new.splitlines():
-                if line.strip() and "[AUTOTRAIN_PROGRESS]" not in line:
-                    log(f"    {label}: {line.strip()}")
-            seen = tail
+        for line in (rec.get("transform_log") or "").splitlines():
+            s = line.strip()
+            if s and "[AUTOTRAIN_PROGRESS]" not in s and s not in emitted:
+                emitted.add(s)
+                log(f"    {label}: {s}")
         if status in DATASET_TERMINAL:
             return rec
         if time.monotonic() > deadline:
@@ -241,14 +253,22 @@ def resolve_provider(gw: Gateway, want: Optional[str]) -> Optional[str]:
     return runpods[0]["id"]
 
 
-def dataset_signature(ds: dict, cutoff: Optional[str], status: str) -> dict:
-    return {
+def dataset_signature(ds: dict, cutoff: Optional[str], status: str,
+                      min_chars: Any, exclude_regex: Any) -> dict:
+    sig = {
         "project_id": ds.get("project_id"),
         "cutoff": cutoff,
         "status": status,
         "test_split_pct": ds.get("test_split_pct"),
         "test_split_count": ds.get("test_split_count"),
     }
+    # Only record these when set, so datasets created before the option existed
+    # (and those not using it) still match their stored signature.
+    if min_chars:
+        sig["test_min_chars"] = int(min_chars)
+    if exclude_regex:
+        sig["test_exclude_regex"] = str(exclude_regex)
+    return sig
 
 
 def ensure_dataset(
@@ -263,18 +283,45 @@ def ensure_dataset(
     raw_cutoff = ds.get("cutoff") or cli_cutoff or cfg.get("cutoff")
     cutoff = parse_cutoff(raw_cutoff, cfg.get("timezone_offset", "+00:00"))
     status = (ds.get("label_status") or cfg.get("label_status") or "approved").strip()
-    sig = dataset_signature(ds, cutoff, status)
+    pct = ds.get("test_split_pct")
+    cnt = ds.get("test_split_count")
+    # Min transcription length (chars) for a row to be eligible for the test split;
+    # per-dataset value, else the config-level default. Keeps junk transcripts
+    # ("[silent]", "[unintelligible]") out of eval. Only applies when there's a test split.
+    min_chars = ds.get("test_min_chars")
+    if min_chars is None:
+        min_chars = cfg.get("test_min_chars")
+    # Regex; transcripts matching it are excluded from the test split (kept in train).
+    exclude_regex = ds.get("test_exclude_regex")
+    if exclude_regex is None:
+        exclude_regex = cfg.get("test_exclude_regex")
+    exclude_regex = (str(exclude_regex).strip() if exclude_regex else "") or None
+    if exclude_regex:
+        import re as _re
+        try:
+            _re.compile(exclude_regex)
+        except _re.error as e:
+            die(f"[{name}] test_exclude_regex is not a valid regex: {e}")
+    has_test = pct not in (None, 0) or cnt not in (None, 0)
+    sig = dataset_signature(
+        ds, cutoff, status,
+        min_chars if has_test else None, exclude_regex if has_test else None,
+    )
 
     entry = state.data["datasets"].get(name) or {}
     if entry.get("transformed_id") and entry.get("signature") == sig:
         log(f"[{name}] up-to-date (transformed={entry['transformed_id']}) — skipping")
         return entry["transformed_id"]
 
-    pct = ds.get("test_split_pct")
-    cnt = ds.get("test_split_count")
+    _notes = []
+    if has_test and min_chars:
+        _notes.append(f"min {int(min_chars)} chars")
+    if has_test and exclude_regex:
+        _notes.append(f"excl /{exclude_regex}/")
+    _n = (", " + ", ".join(_notes)) if _notes else ""
     test_desc = (
-        f"{pct}% test" if pct not in (None, 0) else
-        f"{cnt} test rows" if cnt not in (None, 0) else "no test set"
+        f"{pct}% test{_n}" if pct not in (None, 0) else
+        f"{cnt} test rows{_n}" if cnt not in (None, 0) else "no test set"
     )
     log(f"[{name}] import project {project_id} (status={status}, cutoff={cutoff}) + transform to S3 [{test_desc}]")
 
@@ -303,6 +350,10 @@ def ensure_dataset(
         body["test_split_pct"] = float(pct)
     elif cnt not in (None, 0):
         body["test_split_count"] = int(cnt)
+    if has_test and min_chars not in (None, 0):
+        body["test_min_chars"] = int(min_chars)
+    if has_test and exclude_regex:
+        body["test_exclude_regex"] = exclude_regex
     gw.post(f"/v1/datasets/{label_id}/transform", body)
     log(f"[{name}] transform started; waiting…")
     rec = wait_dataset(gw, label_id, timeout=poll_timeout, label=name)
@@ -446,6 +497,8 @@ def main() -> None:
     ap.add_argument("--gateway-url", default=None, help="override gateway_url from the config")
     ap.add_argument("--api-key", default=None, help="override api_key (or set AUTOTRAIN_API_KEY)")
     ap.add_argument("--state", default=None, help="state file path (default: automation/state/<config-stem>.json)")
+    ap.add_argument("--until", choices=["transform", "merge", "train"], default="train",
+                    help="stop after this stage: 'transform' (per-dataset only), 'merge' (through the merge, no training), or 'train' (full, default)")
     ap.add_argument("--fresh", action="store_true", help="ignore + overwrite existing state (recreate everything)")
     ap.add_argument("--dry-run", action="store_true", help="print what would happen, make no changes")
     ap.add_argument("--no-run-watch", action="store_true", help="launch training runs but don't wait for them")
@@ -489,6 +542,35 @@ def main() -> None:
     if not datasets:
         die("config has no `datasets`")
 
+    # Preflight: make sure the running gateway supports every transform field the
+    # config uses. Older gateways silently drop unknown request fields (pydantic
+    # extra=ignore), which would quietly put junk transcripts back in the test set —
+    # fail loudly instead of misbehaving silently.
+    def _needed_fields(d: dict) -> set:
+        has_test = d.get("test_split_pct") not in (None, 0) or d.get("test_split_count") not in (None, 0)
+        if not has_test:
+            return set()
+        out: set = set()
+        mc = d.get("test_min_chars")
+        if (mc if mc is not None else cfg.get("test_min_chars")):
+            out.add("test_min_chars")
+        rx = d.get("test_exclude_regex")
+        rx = rx if rx is not None else cfg.get("test_exclude_regex")
+        if rx and str(rx).strip():
+            out.add("test_exclude_regex")
+        return out
+    needed: set = set().union(*(_needed_fields(d) for d in datasets)) if datasets else set()
+    if needed and not args.dry_run:
+        try:
+            props = (gw.get("/openapi.json").get("components", {}).get("schemas", {})
+                     .get("TransformRequest", {}).get("properties", {}))
+        except GatewayError as e:
+            die(f"could not read the gateway OpenAPI to verify transform support: {e}")
+        missing = sorted(f for f in needed if f not in props)
+        if missing:
+            die(f"the running gateway doesn't support {', '.join(missing)} yet — restart it "
+                "(.venv/bin/gateway) to pick up the new code, then re-run")
+
     # 1 + 2. import + transform each dataset
     log("=" * 70)
     log(f"STEP 1/3 — importing + transforming {len(datasets)} dataset(s)")
@@ -500,6 +582,11 @@ def main() -> None:
         )
         transformed_ids.append(tid)
 
+    if args.until == "transform":
+        log("=" * 70)
+        log(f"stopping after transform (--until transform) — transformed: {', '.join(transformed_ids)}")
+        return
+
     # 3. merge
     log("=" * 70)
     log("STEP 2/3 — merging")
@@ -507,6 +594,11 @@ def main() -> None:
         gw, cfg, transformed_ids, state, storage_id,
         dry_run=args.dry_run, poll_timeout=args.transform_timeout,
     )
+
+    if args.until == "merge":
+        log("=" * 70)
+        log(f"stopping after merge (--until merge) — merged dataset: {training_dataset_id}")
+        return
 
     # 4. train
     log("=" * 70)

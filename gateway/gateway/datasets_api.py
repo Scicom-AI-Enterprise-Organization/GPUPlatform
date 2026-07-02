@@ -45,7 +45,7 @@ logger = logging.getLogger("gateway.datasets")
 router = APIRouter(prefix="/v1/datasets", tags=["datasets"])
 
 KINDS = ("upload", "s3", "hf", "label", "tts_packed", "llm", "llm_packed")
-_UPLOAD_EXTS = (".csv", ".json", ".jsonl", ".ndjson")
+_UPLOAD_EXTS = (".csv", ".json", ".jsonl", ".ndjson", ".parquet")
 
 
 # ---------- request / response models ----------------------------------
@@ -125,6 +125,15 @@ class TransformRequest(BaseModel):
     # at most one — a percentage (0–100) OR an absolute row count.
     test_split_pct: Optional[float] = None
     test_split_count: Optional[int] = None
+    # Minimum transcription length (characters, after stripping) for a row to be
+    # ELIGIBLE for the test split. Short/junk transcripts (e.g. "[silent]",
+    # "[unintelligible]") below this stay in train instead of polluting eval.
+    # None/0 = no minimum. Only affects which rows can be picked as test.
+    test_min_chars: Optional[int] = None
+    # A Python regex; transcripts matching it (re.search) are EXCLUDED from the
+    # test split (kept in train). E.g. r"^\s*\[.*\]\s*$" drops bracketed placeholder
+    # tags like "[silent]" / "[unintelligible]". None/blank = no exclusion.
+    test_exclude_regex: Optional[str] = None
 
 
 class TtsPackRequest(BaseModel):
@@ -701,6 +710,12 @@ async def create_dataset(
         # We don't introspect HF up front (same as kind=hf) — preview does it lazily.
         mf = (req.messages_field or "").strip() or "messages"
         row.messages_field = mf
+    elif req.kind in ("hf", "upload"):
+        # A HF-repo or uploaded dataset is a CHAT dataset when a messages column is
+        # mapped; empty → a plain audio dataset. (kind=hf and kind=llm are otherwise
+        # identical downstream — preview/pack already treat hf+messages_field as chat.
+        # Upload rows are introspected later by /upload; HF rows lazily by preview.)
+        row.messages_field = (req.messages_field or "").strip() or None
     elif req.kind == "tts_packed":
         # Register existing ChiniDataset shards: introspect the prefix for splits +
         # per-split counts + total size, and stamp the _tts_pack metadata so preview
@@ -1179,8 +1194,12 @@ async def upload_metadata(
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="empty upload")
+    # A dataset with a messages column mapped is a CHAT dataset — validate the
+    # messages column instead of {audio, transcription}. Otherwise it's an audio
+    # metadata file (the original path).
+    mf = getattr(d, "messages_field", None) or None
     try:
-        parsed = dataset_metadata.parse_metadata_bytes(fname, body)
+        parsed = dataset_metadata.parse_metadata_bytes(fname, body, messages_field=mf)
     except dataset_metadata.DatasetParseError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -1198,11 +1217,13 @@ async def upload_metadata(
     d.metadata_filename = fname
     d.format = parsed["format"]
     d.num_rows = parsed["num_rows"]
-    d.audio_field = parsed["audio_field"]
-    d.transcription_field = parsed["transcription_field"]
-    # Auto-detect the speaker column too (None when absent → single speaker); a
-    # re-upload re-detects against the new file.
-    d.speaker_field = parsed.get("speaker_field")
+    if not mf:
+        # audio dataset — stamp the detected {audio, transcription, speaker} columns.
+        d.audio_field = parsed["audio_field"]
+        d.transcription_field = parsed["transcription_field"]
+        # Auto-detect the speaker column too (None when absent → single speaker); a
+        # re-upload re-detects against the new file.
+        d.speaker_field = parsed.get("speaker_field")
     d.size_bytes = len(body)
     d.hf_synced_at = None  # content changed → mark out of sync
     await session.commit()
@@ -1215,10 +1236,26 @@ async def upload_metadata(
         format=parsed["format"],
         num_rows=parsed["num_rows"],
         columns=parsed["columns"],
-        audio_field=parsed["audio_field"],
-        transcription_field=parsed["transcription_field"],
+        # Chat uploads have no audio/transcription columns — echo the dataset's
+        # own fields (defaults) so the response model stays populated.
+        audio_field=parsed.get("audio_field") or d.audio_field,
+        transcription_field=parsed.get("transcription_field") or d.transcription_field,
         preview=parsed["preview"],
     )
+
+
+def _parse_messages(v: Any) -> Any:
+    """A chat `messages` cell is an array of {role, content}. HF parquet (and
+    some uploads) store it as a JSON string — auto-parse to a real list so the
+    chat viewer always gets an array regardless of how it was stored."""
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return v
 
 
 def _audio_str(v: Any) -> Optional[str]:
@@ -1866,18 +1903,6 @@ async def preview_dataset(
             # materialised to S3, resolve audio by basename through the proxy.
             resolver = await _source_audio_resolver(session, d)
 
-            def _parse_messages(v: Any) -> Any:
-                """HF parquet often stores the messages array as a JSON string.
-                Auto-parse to a list so the viewer always gets a real array."""
-                if isinstance(v, str):
-                    try:
-                        parsed = json.loads(v)
-                        if isinstance(parsed, list):
-                            return parsed
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                return v
-
             rows = []
             for r in raw:
                 tcol = sfmap.get(r.get("__split") or used_split or "") or tf
@@ -1912,26 +1937,30 @@ async def preview_dataset(
             key = _metadata_key(storage, dataset_id, d.metadata_filename)
             mdname = d.metadata_filename
 
-        text = await _run_sync(bench.s3_get_text, key, t)
-        if text is None:
+        body = await _run_sync(bench.s3_get_bytes, key, t)
+        if body is None:
             return _resp(rows=[], error="metadata file not found in storage")
         # Metadata tables are small (text + URLs) → parse all to get the true row
-        # count, then slice the requested page.
-        all_rows = dataset_metadata.parse_rows(mdname, text.encode("utf-8"), 10**9)
-        # Self-heal a stale record: an s3-metadata import can't know the columns up
-        # front (CreateDatasetRequest has no field hints), so format/num_rows stay
-        # null and the field mappings fall to defaults that may not match the file
-        # (e.g. `transcription` when the column is `text`). Backfill from the actual
-        # columns now — only filling nulls / repairing broken mappings — so this page
-        # and the trainers see the right columns. Cheap: the file is already parsed.
-        try:
-            _fmt = dataset_metadata.detect_format(mdname)
-        except dataset_metadata.DatasetParseError:
-            _fmt = None
-        _cols = list(all_rows[0].keys()) if all_rows else []
-        if _stamp_detected_fields(d, _cols, len(all_rows), _fmt):
-            await session.commit()
-            af, tf = d.audio_field, d.transcription_field
+        # count, then slice the requested page. parse_rows_any also handles parquet.
+        all_rows = dataset_metadata.parse_rows_any(mdname, body, 10**9)
+        # A chat upload carries a messages column; surface it (parsed to a list) and
+        # skip the audio-oriented self-heal / speaker filter entirely.
+        mf = getattr(d, "messages_field", None) or None
+        if not mf:
+            # Self-heal a stale record: an s3-metadata import can't know the columns up
+            # front (CreateDatasetRequest has no field hints), so format/num_rows stay
+            # null and the field mappings fall to defaults that may not match the file
+            # (e.g. `transcription` when the column is `text`). Backfill from the actual
+            # columns now — only filling nulls / repairing broken mappings — so this page
+            # and the trainers see the right columns. Cheap: the file is already parsed.
+            try:
+                _fmt = dataset_metadata.detect_format(mdname)
+            except dataset_metadata.DatasetParseError:
+                _fmt = None
+            _cols = list(all_rows[0].keys()) if all_rows else []
+            if _stamp_detected_fields(d, _cols, len(all_rows), _fmt):
+                await session.commit()
+                af, tf = d.audio_field, d.transcription_field
         excluded = {int(x) for x in (d.excluded_rows or [])}
         # Pair each row with its stable GLOBAL index (file order) before any split
         # filtering — that's the identity the trainers use (they read the same
@@ -1949,31 +1978,44 @@ async def preview_dataset(
         # Speaker filter: materialised datasets carry a speaker column. Expose the
         # distinct speakers (within the current split) for a dropdown, and page
         # within the chosen one. Computed before applying the filter so the
-        # dropdown always lists every speaker, not just the selected one.
+        # dropdown always lists every speaker, not just the selected one. (Audio
+        # datasets only — chat uploads have no speaker column.)
         spk_col = getattr(d, "speaker_field", None) or "speaker"
         speakers_list: Optional[list[str]] = None
         used_speaker: Optional[str] = None
-        if all_rows and spk_col in all_rows[0]:
+        if not mf and all_rows and spk_col in all_rows[0]:
             speakers_list = sorted({str(r.get(spk_col)) for _gi, r in indexed if str(r.get(spk_col) or "").strip()})
             if speaker and speaker in speakers_list:
                 used_speaker = speaker
                 indexed = [(gi, r) for gi, r in indexed if str(r.get(spk_col)) == used_speaker]
         total = len(indexed)
         page = indexed[offset:offset + limit]
-        rows = [
-            {
-                # Proxy the presigned URL through the gateway (avoids S3 CORS in
-                # the browser). _audio_str drops bare filenames first.
-                "audio_url": _proxy_audio_url(
-                    dataset_id, _audio_str(_resolve_audio_url(target, base, d.audio_prefix, r.get(af)))
-                ),
-                "transcription": r.get(tf),
-                "row_index": gi,
-                "included": gi not in excluded,
-                **r,
-            }
-            for gi, r in page
-        ]
+        if mf:
+            # Chat upload: surface the messages array (parsed to a list) — no audio.
+            rows = [
+                {
+                    "messages": _parse_messages(r.get(mf)),
+                    "row_index": gi,
+                    "included": gi not in excluded,
+                    **r,
+                }
+                for gi, r in page
+            ]
+        else:
+            rows = [
+                {
+                    # Proxy the presigned URL through the gateway (avoids S3 CORS in
+                    # the browser). _audio_str drops bare filenames first.
+                    "audio_url": _proxy_audio_url(
+                        dataset_id, _audio_str(_resolve_audio_url(target, base, d.audio_prefix, r.get(af)))
+                    ),
+                    "transcription": r.get(tf),
+                    "row_index": gi,
+                    "included": gi not in excluded,
+                    **r,
+                }
+                for gi, r in page
+            ]
         return _resp(rows=rows, total=total, split=used_split, splits=splits_list,
                      speakers=speakers_list, speaker=used_speaker, excluded_count=len(excluded))
     except dataset_metadata.DatasetParseError as e:
@@ -2390,12 +2432,22 @@ async def transform_dataset(
         raise HTTPException(status_code=400, detail="test_split_pct must be ≥ 0 and < 100")
     if req.test_split_count is not None and req.test_split_count < 0:
         raise HTTPException(status_code=400, detail="test_split_count must be ≥ 0")
+    if req.test_min_chars is not None and req.test_min_chars < 0:
+        raise HTTPException(status_code=400, detail="test_min_chars must be ≥ 0")
+    if (req.test_exclude_regex or "").strip():
+        import re as _re
+        try:
+            _re.compile(req.test_exclude_regex)
+        except _re.error as e:
+            raise HTTPException(status_code=400, detail=f"test_exclude_regex is not a valid regex: {e}")
 
     from . import dataset_transform
     await dataset_transform.start_transform(
         dataset_id, req.target, (req.hf_repo or "").strip() or None, req.storage_id,
         s3_folder=(req.s3_folder or "").strip() or None,
         test_split_pct=req.test_split_pct, test_split_count=req.test_split_count,
+        test_min_chars=req.test_min_chars,
+        test_exclude_regex=(req.test_exclude_regex or "").strip() or None,
     )
     await audit_module.record(user, "dataset.transform", "dataset", dataset_id, d.name, details={"target": req.target})
     await session.refresh(d)
@@ -2528,14 +2580,20 @@ async def pack_llm_dataset(
     (CPU tokenization — no GPU box). The source dataset's transform_status /
     transform_log track progress (poll GET /{id})."""
     d = await _require_dataset(session, dataset_id, user)
-    # A kind=llm dataset, OR any HF-backed dataset with a messages column mapped.
-    if not (d.kind == "llm" or (d.kind in ("hf",) and getattr(d, "messages_field", None))):
+    # A kind=llm dataset, OR any hf / uploaded dataset with a messages column mapped.
+    if not (d.kind == "llm" or (d.kind in ("hf", "upload") and getattr(d, "messages_field", None))):
         raise HTTPException(
             status_code=400,
-            detail="LLM pack needs a kind=llm dataset (or an hf dataset with a messages column set)",
+            detail="LLM pack needs a kind=llm dataset (or an hf / uploaded dataset with a messages column set)",
         )
-    if not (d.hf_repo and "/" in d.hf_repo):
-        raise HTTPException(status_code=400, detail="LLM pack needs a source HuggingFace repo (owner/name)")
+    # Source rows come from a HuggingFace repo, OR an uploaded chat file in S3.
+    has_hf = bool(d.hf_repo and "/" in d.hf_repo)
+    has_file = bool(d.kind == "upload" and d.metadata_filename and d.storage_id)
+    if not (has_hf or has_file):
+        raise HTTPException(
+            status_code=400,
+            detail="LLM pack needs a source HuggingFace repo (owner/name) or an uploaded chat file",
+        )
     if d.transform_status == "running":
         raise HTTPException(status_code=409, detail="a transform is already running for this dataset")
     if not (req.tokenizer or "").strip():

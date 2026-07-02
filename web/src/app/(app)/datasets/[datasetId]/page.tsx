@@ -52,13 +52,16 @@ export default async function DatasetDetailPage({
   // Pack {audio, transcription} → NeuCodec + multipack ChiniDataset (TTS). Only
   // for datasets that already have a real audio column (s3 / upload). hf / label
   // sources must extract an audio column first, then pack the resulting dataset.
-  const canPack = dataset?.kind === "s3" || dataset?.kind === "upload";
+  // A chat upload (kind=upload with a messages column) has no audio → not TTS-packable.
+  const canPack =
+    (dataset?.kind === "s3" || dataset?.kind === "upload") && !dataset?.messages_field;
   // Chat → multipack: a chat dataset's messages column → a ChiniDataset
   // (kind=llm_packed) for LLM finetuning. In-process (CPU tokenization, no GPU).
   // A kind=llm dataset, OR a kind=hf dataset with a messages column mapped (a chat
   // dataset registered as plain hf) — the latter is what surfaces a chat preview.
   const canPackLlm =
-    dataset?.kind === "llm" || (dataset?.kind === "hf" && !!dataset?.messages_field);
+    dataset?.kind === "llm" ||
+    ((dataset?.kind === "hf" || dataset?.kind === "upload") && !!dataset?.messages_field);
   let s3Storages: StorageRecord[] = [];
   if (canTransform || canPack || canPackLlm) {
     try {

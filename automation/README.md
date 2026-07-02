@@ -26,7 +26,12 @@ cp automation/config.yaml.example automation/config.yaml   # then edit api_key e
 
 # launch training but don't block waiting for it
 .venv/bin/python automation/run_pipeline.py --no-run-watch
+
+# run import + transform + merge only, skip training
+.venv/bin/python automation/run_pipeline.py --until merge
 ```
+
+`--until {transform,merge,train}` stops after that stage (default `train`).
 
 ## Config (`config.yaml`)
 
@@ -39,7 +44,7 @@ cp automation/config.yaml.example automation/config.yaml   # then edit api_key e
 | `label_status` | `approved` (default) / `rejected` / `not_reviewed` / `all` |
 | `cutoff` | default import cutoff; naive times use `timezone_offset` |
 | `timezone_offset` | offset applied to a cutoff with no zone (e.g. `+08:00`) |
-| `datasets[]` | `name`, `project_id`, and `test_split_pct` **or** `test_split_count` (omit both = no test set); optional per-dataset `cutoff`, `label_status` |
+| `datasets[]` | `name`, `project_id`, and `test_split_pct` **or** `test_split_count` (omit both = no test set); `test_exclude_regex` (transcripts matching the regex are kept out of test, e.g. `'^\s*\[.*\]\s*$'` for `[silent]`/`[unintelligible]`) and/or `test_min_chars` (min transcription length for test eligibility); optional per-dataset `cutoff`, `label_status` |
 | `merge` | `enabled`, `name` |
 | `train` | shared hyperparameters (see below) |
 | `models[]` | `base_model` + any per-model overrides of the `train` block |
