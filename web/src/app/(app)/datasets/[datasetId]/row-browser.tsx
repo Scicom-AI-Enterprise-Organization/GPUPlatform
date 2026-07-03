@@ -589,7 +589,7 @@ function PackedRowItem({
         <div className="space-y-2 border-t border-border p-3 text-xs">
           {loading && (
             <span className="inline-flex items-center gap-1.5 text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" /> decoding with the TTS tokenizer…
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> decoding with the tokenizer…
             </span>
           )}
           {err && <span className="text-destructive">{err}</span>}

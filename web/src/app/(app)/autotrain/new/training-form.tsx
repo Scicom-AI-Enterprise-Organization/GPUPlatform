@@ -1235,7 +1235,7 @@ export function TrainingForm() {
             <FieldWrap label="Grad-accum steps" hint="e.g. 1, 4">
               <Input className="font-mono" placeholder="1, 4" value={sweepGradAccum} onChange={(e) => setSweepGradAccum(e.target.value)} />
             </FieldWrap>
-          ) : isTts ? (
+          ) : !isLlm ? (
             <FieldWrap label="Grad accumulation"><NumberField min={1} value={gradAccum} onChange={setGradAccum} /></FieldWrap>
           ) : null}
           {sweepOn ? (
