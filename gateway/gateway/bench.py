@@ -2925,6 +2925,11 @@ async def list_files(
     if not _can_read(b, user):
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
     target = await _bench_s3_target(b.storage_id)
+    # No bucket resolvable here (this deployment has no BENCHMARK_S3_BUCKET and the
+    # run's storage row is null/deleted) → there's nothing we can list. Degrade to
+    # an empty list rather than 500ing the results/files tabs.
+    if not target.bucket:
+        return []
     items = s3_list(b.s3_prefix, target=target)
     out: list[FileRecord] = []
     for it in items:
@@ -2959,6 +2964,9 @@ async def get_file_content(
     if not rel or ".." in rel:
         raise HTTPException(status_code=400, detail={"error": "invalid path"})
     target = await _bench_s3_target(b.storage_id)
+    if not target.bucket:
+        # No resolvable bucket on this deployment → the file isn't reachable here.
+        raise HTTPException(status_code=404, detail={"error": "file not found"})
     txt = s3_get_text(f"{b.s3_prefix}{rel}", target=target)
     if txt is None:
         raise HTTPException(status_code=404, detail={"error": "file not found"})
@@ -2987,8 +2995,10 @@ async def export_benchmark(
 
     files: list[dict] = []
     omitted: list[dict] = []
-    if include_files:
-        target = await _bench_s3_target(b.storage_id)
+    # No bucket resolvable here (no BENCHMARK_S3_BUCKET + null/deleted storage row)
+    # → export the metadata without inlined files instead of 500ing.
+    target = await _bench_s3_target(b.storage_id) if include_files else None
+    if include_files and target and target.bucket:
         total = 0
         for it in s3_list(b.s3_prefix, target=target):
             key = it["key"]

@@ -34,6 +34,14 @@ The **Benchmark** section (`web/.../benchmark/new/benchmark-form.tsx` → `POST 
 `git+…/llm-benchmaq`) to spin up a target and run vLLM/SGLang throughput + accuracy benches. Two backends:
 - **RunPod (cloud)** — `benchmaq runpod bench`: benchmaq deploys a pod, SSHes in, `uv pip install`s
   `remote.dependencies`, serves + benches. The pod install runs via **pyremote** (`@remote`).
+  ⚠ **Needs the `runpodctl` binary on the gateway's PATH** — benchmaq shells out to it to poll pod
+  readiness (`No such file or directory: 'runpodctl'` → the pod spawns but the run hangs, billing the
+  whole time). It's a standalone Go CLI, **not** a pip dep, so it isn't in `pyproject.toml`; install
+  separately: `brew install runpod/runpodctl/runpodctl`, or drop the `runpodctl-darwin-arm64` release
+  binary into `.venv/bin/` (which run_benchmark prepends to the subprocess PATH — no gateway restart).
+  Also: local dev has **`RUNPOD_API_KEY` commented out** in `gateway/.env` — pass a **runpod-kind
+  provider_id** so creds resolve from `providers.config` (`env["RUNPOD_API_KEY"]` for the subprocess),
+  or uncomment the env key + restart.
 - **VM (bare-metal)** — `remote.backend: ssh` via the gateway's **`pyremote_shim`** (reconnect-per-command
   paramiko; TM's SSH proxy allows only one exec channel per TCP connection, hence the shim).
 

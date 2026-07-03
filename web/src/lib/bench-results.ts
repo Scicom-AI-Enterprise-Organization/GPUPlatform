@@ -194,7 +194,15 @@ export async function fetchBenchRows(benchId: string): Promise<Row[]> {
     // fall through to per-config files
   }
 
-  const files = await gateway.listBenchmarkFiles(benchId);
+  // A run whose storage isn't resolvable on this deployment (no bucket configured
+  // / null storage row) makes the files endpoint fail — treat that as "no files"
+  // so the results tab renders empty instead of throwing.
+  let files: Awaited<ReturnType<typeof gateway.listBenchmarkFiles>> = [];
+  try {
+    files = await gateway.listBenchmarkFiles(benchId);
+  } catch {
+    return [];
+  }
   const jsonFiles = files.filter(
     (f) =>
       f.name.toLowerCase().endsWith(".json") &&

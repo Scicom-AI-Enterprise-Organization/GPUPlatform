@@ -1992,12 +1992,16 @@ async def preview_dataset(
         page = indexed[offset:offset + limit]
         if mf:
             # Chat upload: surface the messages array (parsed to a list) — no audio.
+            # Spread `**r` FIRST, then override `messages` with the parsed list — a
+            # parquet/HF upload stores the column as a JSON string, so letting the
+            # raw `r[mf]` win would ship the string and the chat viewer can't render
+            # it (mirrors the hf/llm branch, which assigns after the spread).
             rows = [
                 {
+                    **r,
                     "messages": _parse_messages(r.get(mf)),
                     "row_index": gi,
                     "included": gi not in excluded,
-                    **r,
                 }
                 for gi, r in page
             ]
