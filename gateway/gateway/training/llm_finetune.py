@@ -788,15 +788,37 @@ def run(cfg: dict) -> None:
     p = subprocess.Popen(cmd, cwd=work, env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, bufsize=1)
     last_loss = None
+    # Gradient accumulation makes a trainer log grad_accum lines per OPTIMIZER step, all
+    # sharing the same step number. Collapse them HERE — once, for EVERY arch (current
+    # and future) — into a single @@STEP per step, loss = mean over the accumulation
+    # window. So the loss curve gets one point per optimizer step without any per-trainer
+    # logic: a new model just needs to log the standard "step: N … loss: L" the parser
+    # already keys on. A step's point is emitted when the step advances (+ a final flush).
+    _acc = {"step": None, "sum": 0.0, "n": 0}
+
+    def _flush_step() -> None:
+        nonlocal last_loss
+        if _acc["step"] is not None and _acc["n"] > 0:
+            last_loss = _acc["sum"] / _acc["n"]
+            emit("STEP", {"step": _acc["step"], "loss": last_loss})
+        _acc["sum"] = 0.0
+        _acc["n"] = 0
+
     for line in p.stdout:  # type: ignore[union-attr]
         print(line, end="", flush=True)
         m = _STEP_RE.search(line)
         if m:
             try:
-                last_loss = float(m.group(2))
-                emit("STEP", {"step": int(m.group(1)), "loss": last_loss})
+                step_i = int(m.group(1))
+                loss_f = float(m.group(2))
             except ValueError:
-                pass
+                continue
+            if _acc["step"] is not None and step_i != _acc["step"]:
+                _flush_step()  # step advanced → emit the previous step's mean
+            _acc["step"] = step_i
+            _acc["sum"] += loss_f
+            _acc["n"] += 1
+    _flush_step()  # emit the final step
     p.wait()
     if p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, cmd)

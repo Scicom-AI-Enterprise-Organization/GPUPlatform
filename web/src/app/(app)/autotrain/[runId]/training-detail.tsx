@@ -1253,16 +1253,33 @@ function LossCurve({ steps, epochs, live, sweep, trials }: { steps: TrainingStep
     );
   }
 
-  const data = steps
-    .filter((s) => typeof s.loss === "number")
-    .map((s) => ({ step: s.step, loss: s.loss as number, eval_loss: null as number | null, epoch: s.epoch ?? undefined }));
-  // Per-epoch eval_loss is sparse; pin each to the last training step within that
-  // epoch so it overlays the per-step train loss on the same step axis.
+  // Collapse duplicate optimizer-step numbers into ONE point. With gradient
+  // accumulation the trainer emits a @@STEP per microbatch, all sharing the same
+  // opt-step number (grad_accum entries per step); plotting them raw draws a
+  // vertical zig-zag at each x. Average the window → the standard per-step train
+  // loss, one point per optimizer step (also makes the "N pts" count correct).
+  const byStep = new Map<number, { step: number; sum: number; n: number; epoch?: number }>();
+  for (const s of steps) {
+    if (typeof s.loss !== "number") continue;
+    const cur = byStep.get(s.step);
+    if (cur) {
+      cur.sum += s.loss;
+      cur.n += 1;
+      if (s.epoch != null) cur.epoch = s.epoch;
+    } else {
+      byStep.set(s.step, { step: s.step, sum: s.loss, n: 1, epoch: s.epoch ?? undefined });
+    }
+  }
+  const data = [...byStep.values()]
+    .sort((a, b) => a.step - b.step)
+    .map((r) => ({ step: r.step, loss: r.sum / r.n, eval_loss: null as number | null, epoch: r.epoch }));
+  // Per-epoch eval_loss is sparse; pin each to the last (collapsed) training point
+  // within that epoch so it overlays the per-step train loss on the same step axis.
   for (const e of epochs) {
     if (typeof e.eval_loss !== "number") continue;
     let idx = -1;
-    for (let i = 0; i < steps.length; i++) {
-      if ((steps[i].epoch ?? 0) <= (e.epoch ?? 0) + 1e-6) idx = i;
+    for (let i = 0; i < data.length; i++) {
+      if ((data[i].epoch ?? 0) <= (e.epoch ?? 0) + 1e-6) idx = i;
     }
     if (idx < 0) idx = data.length - 1;
     if (data[idx]) data[idx].eval_loss = e.eval_loss;
