@@ -28,7 +28,7 @@ from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import (
     JSON,
@@ -51,6 +51,8 @@ from .bench import (
     S3Target,
     _s3_client,
     s3_put_text,
+    s3_get_bytes,
+    s3_put_bytes,
     s3_list,
     s3_presign_get,
 )
@@ -2391,6 +2393,109 @@ async def _redispatch_run(redis, run_id: str, reason: str) -> str:
     return "requeued"
 
 
+async def _apply_log_to_result(run_id: str, full_log: str) -> None:
+    """Rebuild result_json (steps/epochs/best/…) from the full remote log and persist
+    it, preserving gpu_samples/progress already recorded. Idempotent — the log is the
+    source of truth, so re-parsing it each poll never double-counts (unlike appending)."""
+    _rc, result = _parse_remote_log(full_log or "")
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None or row.status != "running":
+            return
+        existing = row.result_json or {}
+        # gpu_samples come from a separate sampler (not the log) → keep what we had.
+        if existing.get("gpu_samples") and not result.get("gpu_samples"):
+            result["gpu_samples"] = existing["gpu_samples"]
+        if existing.get("progress") and not result.get("progress"):
+            result["progress"] = existing["progress"]
+        row.result_json = result
+        await s.commit()
+
+
+async def _resume_orphan_stream(redis, run_id: str) -> None:
+    """Re-attach LIVE streaming to a detached run that survived a gateway restart.
+    The trainer keeps running (setsid on the box), but the coroutine that tailed its
+    log died with the old gateway — so the Logs tab + loss chart FREEZE until the run
+    exits (they'd only backfill at finalize). This re-adopts the run: it polls the
+    remote log, pushes NEW lines to Redis (live log resumes) and re-parses it into
+    result_json (loss/epoch charts resume), then finalizes when the trainer exits.
+    Idempotent: only one streamer per run (the caller guards on _active_runners), and
+    result_json is REBUILT from the full log each poll so it never double-counts. A few
+    log lines emitted during the brief gateway-down window may be absent from the LIVE
+    view but are in the saved S3 log. Registered in _active_runners by the caller."""
+    rlog, rpid, _sh = _remote_run_paths(run_id)
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+    if row is None or row.status != "running":
+        return
+    try:
+        ssh = await _resolve_run_ssh(row)
+    except Exception:  # noqa: BLE001
+        ssh = None
+    if ssh is None:
+        return  # box unreachable right now — the janitor re-adopts on a later tick
+    host, port, suser, key = ssh
+
+    def _probe() -> tuple[bool, str]:
+        cli = _ssh_connect(host, int(port), suser, key)
+        try:
+            alive = "@@A" in _ssh_capture(
+                cli, f'kill -0 "$(cat {rpid} 2>/dev/null)" 2>/dev/null && echo @@A || echo @@D')
+            return alive, _ssh_capture(cli, f"cat {rlog} 2>/dev/null")
+        finally:
+            try:
+                cli.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        alive, full = await asyncio.to_thread(_probe)
+    except Exception:  # noqa: BLE001
+        return
+    # Anchor the live cursor at the CURRENT end of the log so we don't re-push the
+    # (capped) prefix already in Redis; refresh metrics immediately (gap-free).
+    seen = len((full or "").splitlines())
+    await _push_log(redis, run_id,
+                    "[gateway] re-attached live stream after gateway restart "
+                    "(a few lines during the restart window may be missing here — the saved log is complete)")
+    await _apply_log_to_result(run_id, full)
+
+    while alive:
+        await asyncio.sleep(8)
+        try:
+            alive, full = await asyncio.to_thread(_probe)
+        except Exception:  # noqa: BLE001 — transient SSH blip; retry next tick
+            continue
+        cur = (full or "").splitlines()
+        new = cur[seen:]
+        if new:
+            for ln in new:
+                await _push_redis(redis, run_id, ln)  # live log; S3 copy = full log at finalize
+            seen = len(cur)
+            await _apply_log_to_result(run_id, full)
+
+    # Trainer exited → finalize from the complete log (same logic as _reconcile_orphan).
+    rc, result = _parse_remote_log(full or "")
+    async with session_factory()() as s:
+        r0 = await s.get(TrainingRun, run_id)
+        existing = (r0.result_json or {}) if r0 else {}
+    if existing.get("gpu_samples") and not result.get("gpu_samples"):
+        result["gpu_samples"] = existing["gpu_samples"]
+    _ok = (rc == 0) or (result.get("best") is not None) or bool(result.get("artifact"))
+    status = "done" if (_ok and not result.get("error")) else "failed"
+    err = result.get("error") if status == "failed" else None
+    if status == "failed" and not err:
+        err = f"trainer exited with code {rc}" if rc is not None else "trainer process gone (no exit code captured)"
+    await _finalize(run_id, status, rc, err, result_json=result)
+    await _push_log(redis, run_id, f"[gateway] finalized from log after restart: {status} (rc={rc})")
+    try:
+        s3_target = await _training_s3_target(row.storage_id)
+        s3_put_text((row.s3_prefix or "") + "logs.txt", full or "", target=s3_target)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("training %s: resume-finalize log upload failed: %s", run_id, e)
+    await _cleanup_remote_run_files((host, port, suser, key), run_id)
+
+
 async def _reconcile_orphan(row, redis) -> str:
     """Reconcile one orphaned (gateway-untracked) training run over SSH: the
     detached trainer survives a gateway restart, so check its pid — still alive →
@@ -2424,7 +2529,18 @@ async def _reconcile_orphan(row, redis) -> str:
     except Exception:  # noqa: BLE001 — transient SSH error → retry next janitor tick
         return "running"
     if alive:
-        return "running"  # detached trainer survived; finalize when it exits
+        # Detached trainer survived the restart — re-attach LIVE streaming so the Logs
+        # tab + loss chart resume (they'd otherwise freeze until the run exits). One
+        # streamer per run: register the task in _active_runners here (synchronously,
+        # before the coroutine first runs) so a concurrent reconcile / janitor tick
+        # can't double-adopt; the streamer finalizes the run when the trainer exits.
+        if row.id not in _active_runners:
+            t = asyncio.create_task(_resume_orphan_stream(redis, row.id))
+            _active_runners[row.id] = t
+            t.add_done_callback(
+                lambda _t, rid=row.id: (_active_runners.pop(rid, None)
+                                        if _active_runners.get(rid) is _t else None))
+        return "running"  # detached trainer survived; the streamer finalizes it on exit
     if not (log or "").strip():
         # No process AND no log → the run was cut short before the trainer detached
         # (during config/deps/launch). Re-run it instead of losing it.
@@ -3206,6 +3322,233 @@ async def get_training_run(
             pinned = [x for x in (row.visible_devices or "").split(",") if x.strip()]
             rec.gpu_count = len(pinned) or len(vm_gpus)
     return rec
+
+
+# ---- Portable export/import (move a finished run between deployments) --------
+# Self-contained JSON: the DB row's config + result metrics/loss curves, plus the
+# run's small S3 artifacts (logs, lora_meta, sample outputs) inlined as base64. Big
+# checkpoints (lora.pt / *.safetensors) exceed the cap and only appear in
+# files_omitted — peers import to inspect metrics/loss/config/logs, NOT to re-serve
+# the weights. Import re-creates the row + writes files into THIS deployment's bucket.
+# Mirrors the benchmark export/import in bench.py.
+
+TRAIN_EXPORT_KIND = "gpuplatform.autotrain.export"
+# Never embed control/secret artifacts (SSH keys, the raw config with resolved paths).
+_TRAIN_EXPORT_SKIP = {
+    "vm_key", "vm_key.pub", "rp_key", "rp_key.pub",
+    "id_ed25519", "id_ed25519.pub", "config.yaml", "config.json",
+}
+_TRAIN_PER_FILE_CAP = 25 * 1024 * 1024   # 25 MiB per file
+_TRAIN_TOTAL_CAP = 50 * 1024 * 1024      # 50 MiB total embedded
+
+
+class ImportTrainingData(BaseModel):
+    name: str
+    dataset_id: str = ""
+    test_dataset_id: Optional[str] = None
+    base_model: str = ""
+    task_type: str = "asr"
+    config_json: Optional[dict] = None
+    status: str = "done"
+    exit_code: Optional[int] = None
+    error_text: Optional[str] = None
+    result_json: Optional[dict] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    cost_per_hr: Optional[float] = None
+    gpu_type: Optional[str] = None
+    gpu_count: int = 1
+    visible_devices: Optional[str] = None
+
+
+class ImportTrainingFile(BaseModel):
+    name: str          # path relative to the run's S3 prefix
+    content_b64: str
+
+
+class ImportTrainingBody(BaseModel):
+    kind: str
+    version: int = 1
+    source_run_id: Optional[str] = None
+    run: ImportTrainingData
+    files: list[ImportTrainingFile] = []
+
+
+@router.get("/{run_id}/export")
+async def export_training_run(
+    run_id: str,
+    include_files: bool = True,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Download a finished run as a self-contained JSON: the DB row's config +
+    result metrics/loss, plus the run's small S3 artifacts inlined as base64 (so the
+    destination needs no access to this instance's bucket). Big checkpoints exceed
+    the size cap and are listed in files_omitted. Pair with /v1/training-runs/import
+    on another deployment."""
+    import base64
+
+    row = await _owned(run_id, user, session)
+
+    # Bake the RESOLVED GPU into the export (not the raw stored value): a VM run's
+    # box hardware is authoritative, and the importer drops the provider so it can't
+    # self-heal — without this, a VM run exported before its `gpus` were probed would
+    # import as the stale "NVIDIA L40S"×1 default instead of the box's real GPUs.
+    eff_gpu_type, eff_gpu_count = row.gpu_type, row.gpu_count
+    if row.provider_id:
+        prov = await session.get(Provider, row.provider_id)
+        if prov is not None and prov.kind == "vm":
+            vm_gpus = (prov.config or {}).get("gpus") or []
+            if vm_gpus:
+                eff_gpu_type = vm_gpus[0]
+                pinned = [x for x in (row.visible_devices or "").split(",") if x.strip()]
+                eff_gpu_count = len(pinned) or len(vm_gpus)
+
+    files: list[dict] = []
+    omitted: list[dict] = []
+    # No bucket resolvable (null/deleted storage + no env bucket) → export metadata
+    # without inlined files instead of 500ing.
+    target = None
+    if include_files:
+        try:
+            target = await _training_s3_target(row.storage_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("export %s: no s3 target (%s) — metadata only", run_id, e)
+    if include_files and target and target.bucket and row.s3_prefix:
+        total = 0
+        try:
+            listing = await asyncio.to_thread(s3_list, row.s3_prefix, target)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("export %s: file list failed: %s", run_id, e)
+            listing = []
+        for it in listing:
+            key = it["key"]
+            rel = key[len(row.s3_prefix):] if key.startswith(row.s3_prefix) else key
+            base = rel.rsplit("/", 1)[-1]
+            if not rel or base in _TRAIN_EXPORT_SKIP:
+                continue
+            size = int(it.get("size") or 0)
+            if size > _TRAIN_PER_FILE_CAP or total + size > _TRAIN_TOTAL_CAP:
+                omitted.append({"name": rel, "size": size, "reason": "exceeds export size cap"})
+                continue
+            data = await asyncio.to_thread(s3_get_bytes, key, target)
+            if data is None:
+                omitted.append({"name": rel, "size": size, "reason": "unreadable"})
+                continue
+            total += len(data)
+            files.append({"name": rel, "content_b64": base64.b64encode(data).decode("ascii")})
+
+    export = {
+        "kind": TRAIN_EXPORT_KIND,
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "source_run_id": row.id,
+        "run": {
+            "name": row.name,
+            "dataset_id": row.dataset_id,
+            "test_dataset_id": row.test_dataset_id,
+            "base_model": row.base_model,
+            "task_type": row.task_type,
+            "config_json": row.config_json,
+            "status": row.status,
+            "exit_code": row.exit_code,
+            "error_text": row.error_text,
+            "result_json": row.result_json,
+            "created_at": _iso(row.created_at),
+            "started_at": _iso(row.started_at),
+            "ended_at": _iso(row.ended_at),
+            "cost_per_hr": row.cost_per_hr,
+            "gpu_type": eff_gpu_type,
+            "gpu_count": eff_gpu_count,
+            "visible_devices": row.visible_devices,
+        },
+        "files": files,
+        "files_omitted": omitted,
+    }
+    return Response(
+        content=json.dumps(export),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{row.id}.autotrain.json"'},
+    )
+
+
+@router.post("/import", response_model=TrainingRunRecord)
+async def import_training_run(
+    body: ImportTrainingBody,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Re-create a run exported from another deployment. Mints a fresh id, owns it
+    as the importer, writes any embedded files into THIS deployment's bucket, and
+    stores config/results so the dashboard renders fully. The import is metadata-only
+    — it can't be resumed/served (provider/storage are intentionally dropped); its
+    status reflects the source run."""
+    import base64
+
+    if body.kind != TRAIN_EXPORT_KIND:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"not an autotrain export (kind={body.kind!r})"},
+        )
+    data = body.run
+    new_id = _gen_id()
+    target = await _training_s3_target(None)  # write into this deployment's own bucket
+    prefix = f"{target.prefix_root}{new_id}/"
+
+    written = 0
+    if target.bucket:
+        for f in body.files:
+            rel = (f.name or "").lstrip("/")
+            if not rel or ".." in rel:
+                continue
+            try:
+                raw = base64.b64decode(f.content_b64)
+            except Exception:
+                continue
+            try:
+                await asyncio.to_thread(s3_put_bytes, f"{prefix}{rel}", raw, target)
+                written += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("import %s: failed to write %s: %s", new_id, rel, e)
+
+    def _parse(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    row = TrainingRun(
+        id=new_id,
+        name=(data.name or "imported")[:128],
+        dataset_id=data.dataset_id or "",
+        test_dataset_id=data.test_dataset_id,
+        base_model=data.base_model or "",
+        task_type=data.task_type or "asr",
+        config_json=data.config_json or {},
+        status=data.status or "done",
+        s3_prefix=prefix,
+        exit_code=data.exit_code,
+        error_text=data.error_text,
+        result_json=data.result_json,
+        owner_id=user.id,
+        created_at=_parse(data.created_at) or datetime.now(timezone.utc),
+        started_at=_parse(data.started_at),
+        ended_at=_parse(data.ended_at),
+        cost_per_hr=data.cost_per_hr,
+        runpod_pod_id=None,
+        provider_id=None,
+        storage_id=None,
+        gpu_type=data.gpu_type,
+        gpu_count=data.gpu_count or 1,
+        visible_devices=data.visible_devices,
+    )
+    session.add(row)
+    await session.commit()
+    u = await session.get(User, user.id)
+    return _to_record(row, u.username if u else user.username)
 
 
 class LabelExportRequest(BaseModel):

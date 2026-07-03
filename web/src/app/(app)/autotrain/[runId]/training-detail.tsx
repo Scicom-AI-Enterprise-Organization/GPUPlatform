@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AudioLines, Check, ChevronDown, Copy, Download, ExternalLink, Loader2, Pencil, RotateCcw, Trash2, Upload, X, XCircle } from "lucide-react";
+import { AudioLines, Check, ChevronDown, Copy, Download, ExternalLink, Loader2, PackageOpen, Pencil, RotateCcw, Trash2, Upload, X, XCircle } from "lucide-react";
+import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -380,6 +381,38 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     });
   }
 
+  // Portable export: a self-contained JSON (config + metrics/loss + small S3 files)
+  // to import into another deployment's dashboard via /autotrain/import.
+  const [portExporting, setPortExporting] = useState(false);
+  async function onExport() {
+    setPortExporting(true);
+    try {
+      const data = await gateway.exportTrainingRun(run.id);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${run.id}.autotrain.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      const omitted = Array.isArray((data as { files_omitted?: unknown[] }).files_omitted)
+        ? (data as { files_omitted: unknown[] }).files_omitted.length
+        : 0;
+      toast.success(
+        omitted > 0
+          ? `Exported (${omitted} file${omitted === 1 ? "" : "s"} omitted — over size cap)`
+          : "Run exported",
+        { duration: 3000 },
+      );
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPortExporting(false);
+    }
+  }
+
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(run.name);
   const [renameError, setRenameError] = useState<string | null>(null);
@@ -517,6 +550,10 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
               <Upload className="h-4 w-4" /> Export to HF
             </Button>
           )}
+          <Button variant="outline" size="sm" onClick={onExport} disabled={portExporting}
+            title="Download a portable JSON (config + metrics/loss + logs) to import into another deployment">
+            {portExporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PackageOpen className="h-4 w-4" />} Export
+          </Button>
           <Button variant="outline" size="sm" onClick={onDelete} disabled={busy}>
             <Trash2 className="h-4 w-4" /> Delete
           </Button>

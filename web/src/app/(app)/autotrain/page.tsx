@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Inbox, Plus } from "lucide-react";
+import { Inbox, PackageOpen, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
@@ -69,12 +69,20 @@ export default async function AutotrainPage({
                   {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
-              <Button asChild size="sm">
-                <Link href="/autotrain/new">
-                  <Plus className="h-4 w-4" />
-                  New run
-                </Link>
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button asChild size="sm" variant="outline">
+                  <Link href="/autotrain/import">
+                    <PackageOpen className="h-4 w-4" />
+                    Import
+                  </Link>
+                </Button>
+                <Button asChild size="sm">
+                  <Link href="/autotrain/new">
+                    <Plus className="h-4 w-4" />
+                    New run
+                  </Link>
+                </Button>
+              </div>
             </div>
 
             {items.length === 0 ? (

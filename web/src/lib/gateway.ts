@@ -403,6 +403,23 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/stop-early`,
       { method: "POST" },
     ),
+  /** Self-contained export (config + result metrics/loss + embedded small S3 files as
+   * base64) for moving a finished run to another deployment. Big checkpoints exceed
+   * the cap and are listed in files_omitted. Returns the JSON; the caller downloads it. */
+  exportTrainingRun: (id: string) =>
+    request<Record<string, unknown>>(
+      `/v1/training-runs/${encodeURIComponent(id)}/export`,
+      undefined,
+      120_000,
+    ),
+  /** Re-create a run from an exported JSON (see exportTrainingRun). Mints a new id,
+   * writes embedded files into this deployment's bucket. Metadata-only (no resume). */
+  importTrainingRun: (body: unknown) =>
+    request<TrainingRunRecord>(
+      "/v1/training-runs/import",
+      { method: "POST", body: JSON.stringify(body) },
+      180_000,
+    ),
   /** (Re)run the Label-platform export for a finished TTS run (synthesize N clips +
    * create a recording+MOS project). Runs in the background; progress streams to logs. */
   retryLabelExport: (
