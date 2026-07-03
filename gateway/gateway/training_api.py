@@ -1820,6 +1820,19 @@ async def run_training(redis, run_id: str) -> None:
                 key_filename = str(work / "vm_key")
                 Path(key_filename).write_text(crypto.decrypt(enc))
                 os.chmod(key_filename, 0o600)
+                # Empty visible_devices means "all visible GPUs" (the form's hint). On a
+                # VM the box's GPU inventory is authoritative — without this, gpu_count
+                # keeps the create-time default (1) and the trainer launches nproc=1,
+                # silently using a single GPU on a multi-GPU box. (RunPod pods keep
+                # body.gpu_count, which IS the pod's GPU count.)
+                if not (visible_devices or "").strip():
+                    vm_n = len(pcfg.get("gpus") or []) or int(pcfg.get("gpu_count") or 0)
+                    if vm_n > 0:
+                        gpu_count = vm_n
+                        await _push_log(
+                            redis, run_id,
+                            f"[gateway] no GPU pin → using all {vm_n} GPU(s) on {prov.name}",
+                        )
 
         if not is_vm:
             api_key = await compute._resolve_api_key(provider_id)
@@ -3087,7 +3100,12 @@ async def create_training_run(
         task_type=body.task_type,
         config_json=config, status="queued", s3_prefix=s3_prefix, owner_id=user.id,
         provider_id=body.provider_id, storage_id=body.storage_id,
-        gpu_type=eff_gpu_type, gpu_count=body.gpu_count, visible_devices=body.visible_devices,
+        # A VM's hardware is fixed by the box: record its full GPU count when the run
+        # isn't pinned to a subset (so the row/display reflect what it'll actually use),
+        # else the pinned count. RunPod pods use body.gpu_count (the pod's GPU count).
+        gpu_type=eff_gpu_type,
+        gpu_count=((len(pinned_ids) or gpu_bound or body.gpu_count) if is_vm_run else body.gpu_count),
+        visible_devices=body.visible_devices,
     )
     session.add(row)
     await session.commit()
@@ -3171,12 +3189,23 @@ async def get_training_run(
     u = await session.get(User, row.owner_id)
     prov = await session.get(Provider, row.provider_id) if row.provider_id else None
     store = await session.get(Storage, row.storage_id) if row.storage_id else None
-    return _to_record(
+    rec = _to_record(
         row, u.username if u else "?",
         provider_name=prov.name if prov else None,
         provider_kind=prov.kind if prov else None,
         storage_name=store.name if store else None,
     )
+    # VM hardware is fixed by the box, so the provider's live GPU inventory is
+    # authoritative — override the value stored at create time, which can be stale
+    # (a run created before the VM's `gpus` were probed shows the RunPod default
+    # "NVIDIA L40S"×1). Reflects the GPUs the run actually used: the pin, else all.
+    if prov is not None and prov.kind == "vm":
+        vm_gpus = (prov.config or {}).get("gpus") or []
+        if vm_gpus:
+            rec.gpu_type = vm_gpus[0]
+            pinned = [x for x in (row.visible_devices or "").split(",") if x.strip()]
+            rec.gpu_count = len(pinned) or len(vm_gpus)
+    return rec
 
 
 class LabelExportRequest(BaseModel):

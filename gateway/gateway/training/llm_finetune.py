@@ -594,7 +594,8 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
         # options and aborts "ambiguous option" on torch 2.12.0. gemma4.py aliases it.
         "--lora_r", str(r), "--alpha", str(alpha),
         "--target_modules", ",".join(targets),
-        "--batch_size", "1",  # the collator packs the whole batch into ONE sequence → must be 1
+        "--batch_size", str(int(cfg.get("batch_size") or 1)),  # packed bins concatenated per microbatch
+        "--grad_accum", str(int(cfg.get("grad_accum") or 1)),  # microbatches accumulated per optimizer step
         "--lr", str(float(cfg.get("learning_rate") or 5e-5)),
         "--max_epochs", str(int(cfg.get("max_epochs") or 3)),
         "--max_steps", str(int(cfg.get("max_steps") or 0)),
@@ -617,7 +618,8 @@ def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
         py, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
         os.path.join(LLM_DIR, _ARCH["qwen"]["trainer"]),
         "--lora_r", str(r), "--alpha", str(alpha),
-        "--batch_size", "1",  # the collator packs the whole batch into ONE sequence → must be 1
+        "--batch_size", str(int(cfg.get("batch_size") or 1)),  # packed bins concatenated per microbatch
+        "--grad_accum", str(int(cfg.get("grad_accum") or 1)),  # microbatches accumulated per optimizer step
         "--lr", str(float(cfg.get("learning_rate") or 1e-4)),
         "--max_epochs", str(int(cfg.get("max_epochs") or 3)),
         "--max_steps", str(int(cfg.get("max_steps") or 0)),
@@ -636,7 +638,8 @@ def _moe_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str, arch: str) 
         os.path.join(LLM_DIR, _ARCH[arch]["trainer"]),
         "--attn_r", str(r), "--attn_alpha", str(float(alpha)),
         "--moe_r", str(r), "--moe_alpha", str(float(alpha)),
-        "--batch_size", "1",
+        "--batch_size", str(int(cfg.get("batch_size") or 1)),  # packed bins concatenated per microbatch
+        "--grad_accum", str(int(cfg.get("grad_accum") or 1)),  # microbatches accumulated per optimizer step
         "--lr", str(float(cfg.get("learning_rate") or 1e-5)),
         "--max_epochs", str(int(cfg.get("max_epochs") or 1)),
         "--max_steps", str(int(cfg.get("max_steps") or 0)),

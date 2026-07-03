@@ -300,7 +300,10 @@ export function TrainingForm() {
   const [evalStrategy, setEvalStrategy] = useState<"epoch" | "steps">("epoch");
   const [evalSteps, setEvalSteps] = useState(500);
   const [patience, setPatience] = useState(1);
-  const [batchSize, setBatchSize] = useState(8);
+  // LLM concatenates `batch_size` packed bins into ONE sequence per microbatch (each
+  // bin is already a full-length sequence), so its safe default is 1 — raise the
+  // effective batch with grad-accum instead. ASR/TTS default to 8.
+  const [batchSize, setBatchSize] = useState(initialTask === "llm" ? 1 : 8);
   const [loggingSteps, setLoggingSteps] = useState(10);
   const [learningRate, setLearningRate] = useState("1e-5");
   const [precision, setPrecision] = useState<string>("fp32-bf16");
@@ -662,9 +665,9 @@ export function TrainingForm() {
       ? visibleDevices.split(",").filter((x) => x.trim()).length
       : gpuBound;
     const worldSize = (isTts || isLlm) ? Math.max(1, nGpus) : (useDdp && nGpus > 1 ? nGpus : 1);
-    // LLM (gemma4) packs the whole batch into ONE sequence (batch_size forced to 1)
-    // and doesn't grad-accumulate → one optimizer step per bin per rank.
-    const effBatch = isLlm ? worldSize : Math.max(1, batchSize) * Math.max(1, gradAccum) * worldSize;
+    // Effective batch = batch_size (packed bins concatenated per microbatch, for LLM)
+    // × grad_accum (microbatches per optimizer step) × world_size (ranks).
+    const effBatch = Math.max(1, batchSize) * Math.max(1, gradAccum) * worldSize;
     const perEpoch = Math.ceil(trainRows / effBatch);
     if (!Number.isFinite(perEpoch) || perEpoch <= 0) return null;
     return { perEpoch, total: perEpoch * Math.max(1, maxEpochs), trainRows, worldSize };
@@ -693,6 +696,11 @@ export function TrainingForm() {
     setTaskType(t);
     const modelFor = t === "tts" ? DEFAULT_TTS_BASE : t === "llm" ? DEFAULT_LLM_BASE : DEFAULT_WHISPER;
     setModelChoice(modelFor);
+    // Batch default is task-specific: LLM concatenates packed bins per microbatch →
+    // keep it 1 (raise the effective batch via grad-accum); ASR/TTS default to 8.
+    // Only swap when still at the other task's default, else keep the user's choice.
+    if (t === "llm") setBatchSize((b) => (b === 8 ? 1 : b));
+    else setBatchSize((b) => (b === 1 ? 8 : b));
     // Swap the default uv venv path when the user hasn't customized it (i.e. it's
     // still one of the per-task defaults). LLM venv is arch-specific.
     const venvFor = t === "tts" ? "/share/autotrain-tts" : t === "llm" ? llmVenvFor(modelFor) : "/share/autotrain-whisper";
@@ -1104,10 +1112,10 @@ export function TrainingForm() {
             ? "Qwen3 + NeuCodec finetune hyperparameters (loss-only; no per-epoch WER/CER)."
             : isLlm
               ? (llmArch(baseModel) === "gemma"
-                  ? "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Batch forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
+                  ? "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Effective batch = batch × grad-accum × GPUs (batch concatenates that many packed bins into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
                   : llmArch(baseModel) === "qwen"
-                    ? "Qwen3.6 FSDP2 LoRA hyperparameters (dense 27B / MoE 35B-A3B; loss-only, no eval). Batch forced to 1 (the collator packs each bin into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
-                    : `${llmArch(baseModel) === "mistral" ? "Mistral-Small-4" : "MiniMax-M2"} FSDP2 LoRA hyperparameters (FP8 MoE, on-the-fly dequant LoRA; loss-only, no eval). Batch forced to 1. Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large).`)
+                    ? "Qwen3.6 FSDP2 LoRA hyperparameters (dense 27B / MoE 35B-A3B; loss-only, no eval). Effective batch = batch × grad-accum × GPUs. Recommended: lr 5e-5, 2–3 epochs, r 256."
+                    : `${llmArch(baseModel) === "mistral" ? "Mistral-Small-4" : "MiniMax-M2"} FSDP2 LoRA hyperparameters (FP8 MoE, on-the-fly dequant LoRA; loss-only, no eval). Effective batch = batch × grad-accum × GPUs; keep batch small (each bin is a full sequence). Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large).`)
               : "Epochs, early stopping, and core hyperparameters.")}>
         <div className="mb-5 grid max-w-xl grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-2">
           {taskType === "asr" && (
@@ -1235,9 +1243,9 @@ export function TrainingForm() {
             <FieldWrap label="Grad-accum steps" hint="e.g. 1, 4">
               <Input className="font-mono" placeholder="1, 4" value={sweepGradAccum} onChange={(e) => setSweepGradAccum(e.target.value)} />
             </FieldWrap>
-          ) : !isLlm ? (
+          ) : (
             <FieldWrap label="Grad accumulation"><NumberField min={1} value={gradAccum} onChange={setGradAccum} /></FieldWrap>
-          ) : null}
+          )}
           {sweepOn ? (
             <FieldWrap label="Weight decay" hint="AdamW L2 — e.g. 0, 0.01, 0.1">
               <Input className="font-mono" placeholder="0, 0.01, 0.1" value={sweepWeightDecay} onChange={(e) => setSweepWeightDecay(e.target.value)} />

@@ -64,8 +64,28 @@ in `llm_finetune._ARCH` + `_fa_mode`:
 
 Common to all: **torch 2.12** (the FA3-wheel ABI + `torch._grouped_mm` for fused MoE), transformers
 5.5.0, liger-kernel, the FA3 prebuilt wheel (cu126/130/132 from the host driver) — EXCEPT gemma's
-default FA4 path which swaps the wheel for the cute fork. `--batch_size 1` always (the collator packs
-each bin into ONE sequence). minimax/mistral always pass `--low_cpu_shard_load`.
+default FA4 path which swaps the wheel for the cute fork. **`--batch_size` / `--grad_accum` are now
+configurable** (all four trainers): `batch_size` = how many packed bins the collator concatenates into
+ONE varlen sequence per microbatch (each bin is already a full sequence, so this raises per-step memory),
+`grad_accum` = microbatches accumulated before an optimizer step. **Effective batch = batch_size ×
+grad_accum × world_size.** Grad-accum is the memory-safe lever (step + zero_grad only every N
+microbatches, partial window flushed at epoch end; `max_steps`/checkpointing now count OPTIMIZER steps).
+`llm_finetune.py` passes both from the run config (default 1 each → prior behavior). The UI defaults LLM
+`batch_size` to 1 (ASR/TTS stay 8). minimax/mistral always pass `--low_cpu_shard_load`.
+
+**⚠ Token-weighted loss (grad-accum + DDP), mirrors HF Trainer's `average_tokens_across_devices`.** The
+naive `loss/grad_accum` is a *mean-of-means* — it over-weights short bins and, under FSDP grad averaging,
+mis-weights ranks with fewer tokens. Instead each microbatch back-props the token-**SUM** loss
+(`model_mean_loss × n_tok`, where `n_tok = (labels[:,1:] != -100).sum()` == the LigerFusedLinearCE
+shifted denominator — numerically identical to a `reduction="sum"` loss, no overflow). A running
+`win_tokens` accumulates `n_tok` over the window; at each optimizer step it's `all_reduce(SUM)`'d across
+ranks to `N_total`, and the accumulated `.grad` is scaled by **`world_size / N_total`** (the `world_size`
+factor cancels FSDP's grad averaging; ÷`N_total` is the true token-mean over the whole effective batch —
+all ranks × all accumulation microbatches). Reduces EXACTLY to the old `loss.backward()` for single-GPU
++ `grad_accum=1` (`scale = 1/n_tok`, no cross-rank term). Grads are scaled via
+`optimizer.param_groups` (works for gemma's CPU-offloaded grads too — `scale` is `.item()`'d to a py float
+so there's no CPU↔CUDA device mismatch). Logged loss stays the per-microbatch mean (human-readable / the
+`@@STEP` parser).
 
 ## gemma FA4 (the default, faster, long-context path)
 

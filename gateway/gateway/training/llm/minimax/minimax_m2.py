@@ -334,11 +334,15 @@ def main(args):
         })
         logger.info(f"wandb run: {wandb_run.url}")
 
+    # opt_step counts OPTIMIZER steps (one per grad_accum microbatches).
+    opt_step = 0
     reached_max = False
+    # Running count of contributing (non -100) label tokens in the current accumulation
+    # window on THIS rank; summed across ranks each optimizer step for token-weighted loss.
+    win_tokens = torch.zeros((), device=f"cuda:{rank}", dtype=torch.long)
     for epoch in range(args.max_epochs):
         sampler.set_epoch(epoch)
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader), disable=(rank != 0)):
-            global_step = epoch * len(dataloader) + idx
             if rank == 0:
                 t0 = time.time()
 
@@ -346,9 +350,30 @@ def main(args):
                      for k, v in batch.items()}
 
             out = model(**batch, use_cache=False)
-            out["loss"].backward()
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            # Back-prop the token-SUM loss (mean × #label tokens). Accumulating sums, then
+            # normalizing by the GLOBAL token count at the step below, yields the exact
+            # token-weighted mean over the whole effective batch — not a naive mean-of-means
+            # that mis-weights variable-length bins / ranks (HF grad-accum loss fix).
+            n_tok = (batch["labels"][:, 1:] != -100).sum()  # == the loss_fn's shifted denominator
+            (out["loss"] * n_tok).backward()
+            win_tokens += n_tok
+
+            # Step once every grad_accum microbatches; flush a partial window at epoch
+            # end. grad_accum=1 → step every microbatch (unchanged).
+            do_step = ((idx + 1) % args.grad_accum == 0) or (idx == len(dataloader) - 1)
+            if do_step:
+                # Gather total label tokens over the window AND across ranks, then ÷
+                # world_size to counteract FSDP's gradient averaging → the accumulated
+                # grad becomes the true token-mean (HF average_tokens_across_devices).
+                dist.all_reduce(win_tokens, op=dist.ReduceOp.SUM)
+                scale = (world_size / win_tokens.clamp(min=1)).item()
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        if p.grad is not None:
+                            p.grad.mul_(scale)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                win_tokens.zero_()
 
             tok = torch.tensor(batch["input_ids"].numel(), device=f"cuda:{rank}")
             dist.all_reduce(tok, op=dist.ReduceOp.SUM)
@@ -356,18 +381,20 @@ def main(args):
             if rank == 0:
                 loss = out["loss"].item()
                 tps = tok.item() / (time.time() - t0)
-                logger.info(f"epoch {epoch} step {global_step} loss {loss:.4f} tok/s {tps:.0f}")
-                if wandb_run is not None:
+                logger.info(f"epoch {epoch} step {opt_step} loss {loss:.4f} tok/s {tps:.0f}")
+                if wandb_run is not None and do_step:
                     try:
                         wandb_run.log({"loss": loss, "lr": optimizer.param_groups[0]["lr"],
-                                       "tps": tps, "epoch": epoch}, step=global_step)
+                                       "tps": tps, "epoch": epoch}, step=opt_step)
                     except Exception as e:
                         logger.warning(f"wandb.log failed: {e}")
 
-            reached_max = args.max_steps > 0 and (global_step + 1) >= args.max_steps
+            reached_max = args.max_steps > 0 and do_step and (opt_step + 1) >= args.max_steps
             last = idx == len(dataloader) - 1
-            if last or (idx + 1) % args.checkpointing_step == 0 or reached_max:
+            if last or (do_step and (idx + 1) % args.checkpointing_step == 0) or reached_max:
                 save_lora(model, args, rank, stats)
+            if do_step:
+                opt_step += 1
             if reached_max:
                 logger.info(f"reached max_steps={args.max_steps}, stopping")
                 break
@@ -414,7 +441,10 @@ if __name__ == "__main__":
     p.add_argument("--moe_r", type=int, default=16, help="LoRA rank for MoE expert FFNs.")
     p.add_argument("--moe_alpha", type=float, default=16.0, help="LoRA alpha for MoE experts.")
     p.add_argument("--no_moe_lora", action="store_true", help="Adapt attention only (skip MoE experts).")
-    p.add_argument("--batch_size", type=int, default=1, help="Packed bins per step (keep 1; collator concatenates).")
+    p.add_argument("--batch_size", type=int, default=1, help="Packed bins concatenated into one sequence per microbatch (collator varlen-packs).")
+    p.add_argument("--grad_accum", type=int, default=1,
+                   help="Accumulate gradients over N microbatches before an optimizer step. "
+                        "Effective batch = batch_size × grad_accum × world_size. 1 = off.")
     p.add_argument("--lr", type=float, default=1e-5, help="AdamW LR (gemma4 lesson: 1e-5..5e-5 for LoRA).")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--max_epochs", type=int, default=1)

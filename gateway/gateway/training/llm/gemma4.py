@@ -251,6 +251,7 @@ def main(
         lr:float = 1e-4,
         use_wandb:bool = False,
         wandb_project:str = "gemma4-autotrain",
+        grad_accum:int = 1,
         target_modules=None,
     ):
     rank = int(os.environ["LOCAL_RANK"])
@@ -362,10 +363,16 @@ def main(
         logger.info(f"wandb run: {wandb_run.url}")
 
     # seen_tokens = torch.tensor(0, dtype=torch.long, device=f'cuda:{rank}')
+    # opt_step counts OPTIMIZER steps (one per grad_accum microbatches), so max_steps /
+    # checkpointing / the @@STEP progress track weight updates, not forward passes.
+    opt_step = 0
+    reached_max = False
+    # Running count of contributing (non -100) label tokens in the current accumulation
+    # window on THIS rank; summed across ranks each optimizer step for token-weighted loss.
+    win_tokens = torch.zeros((), device=f'cuda:{rank}', dtype=torch.long)
     for i in range(max_epochs):
         sampler.set_epoch(i)  # reshuffle each epoch
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-            global_step = i * len(dataloader) + idx
             if rank == 0:
                 start_time = time.time()
 
@@ -382,10 +389,30 @@ def main(
                 res_gb   = torch.cuda.memory_reserved(rank)  / 2**30
                 logger.info(f"PRE-FWD: S={S}, allocated={alloc_gb:.2f}GB, reserved={res_gb:.2f}GB")
             output = model(**batch, use_cache=False) # forward pass and calculate losses
-            output["loss"].backward() # calculate gradient 
-            
-            optimizer.step()
-            optimizer.zero_grad()
+            # Back-prop the token-SUM loss (mean × #label tokens). Accumulating sums, then
+            # normalizing by the GLOBAL token count at the step below, yields the exact
+            # token-weighted mean over the whole effective batch — not a naive mean-of-means
+            # that mis-weights variable-length bins / ranks (HF grad-accum loss fix).
+            n_tok = (batch["labels"][:, 1:] != -100).sum()  # == the loss_fn's shifted denominator
+            (output["loss"] * n_tok).backward() # calculate gradient
+            win_tokens += n_tok
+
+            # Step once every grad_accum microbatches; always flush a partial window at
+            # epoch end so no gradient is dropped. grad_accum=1 → step every microbatch.
+            do_step = ((idx + 1) % grad_accum == 0) or (idx == len(dataloader) - 1)
+            if do_step:
+                # Gather total label tokens over the window AND across ranks, then ÷
+                # world_size to counteract FSDP's gradient averaging → the accumulated
+                # grad becomes the true token-mean (HF average_tokens_across_devices).
+                dist.all_reduce(win_tokens, op=dist.ReduceOp.SUM)
+                scale = (world_size / win_tokens.clamp(min=1)).item()
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        if p.grad is not None:
+                            p.grad.mul_(scale)
+                optimizer.step()
+                optimizer.zero_grad()
+                win_tokens.zero_()
 
             # synchronize
             # last_seen_tokens = seen_tokens.item()
@@ -398,16 +425,16 @@ def main(
                 loss = output['loss'].item()
                 delta_time = time.time() - start_time
                 tps = token_count.item() / delta_time
-                logger.info(f"Epoch: {i}, mb: {idx}, step: {global_step}, loss: {loss}, tokens/s: {tps:.2f}")
+                logger.info(f"Epoch: {i}, mb: {idx}, step: {opt_step}, loss: {loss}, tokens/s: {tps:.2f}")
                 metrics = {"loss": loss, "lr": optimizer.param_groups[0]['lr'], "tps": tps, "epoch": i}
-                if wandb_run is not None:
+                if wandb_run is not None and do_step:
                     try:
-                        wandb_run.log(metrics, step=global_step)
+                        wandb_run.log(metrics, step=opt_step)
                     except Exception as e:
                         logger.warning(f"wandb.log failed (continuing): {e}")
 
-            reached_max = max_steps > 0 and (global_step + 1) >= max_steps
-            if idx == len(dataloader)-1 or (idx+1) % checkpointing_step == 0 or reached_max:
+            reached_max = max_steps > 0 and do_step and (opt_step + 1) >= max_steps
+            if idx == len(dataloader)-1 or (do_step and (idx + 1) % checkpointing_step == 0) or reached_max:
                 logger.info("Checkpointing LoRA adapters..")
                 # Save only the trainable LoRA params. full_tensor() is a collective, so every rank
                 # must iterate the SAME params; requires_grad is identical across ranks.
@@ -430,6 +457,8 @@ def main(
                         }, f, indent=2)
                     logger.info(f"Saved LoRA ({len(lora_state_dict)} tensors) to checkpointing/lora.pt")
 
+            if do_step:
+                opt_step += 1
             if reached_max:
                 logger.info(f"Reached max_steps={max_steps}, stopping.")
                 break
@@ -463,7 +492,15 @@ if __name__ == "__main__":
         "--batch_size",
         type=int,
         default=1,
-        help="Batch size"
+        help="Packed bins concatenated into ONE sequence per optimizer microbatch "
+             "(the collator varlen-packs them). 1 = one bin per step."
+    )
+    parser.add_argument(
+        "--grad_accum",
+        type=int,
+        default=1,
+        help="Accumulate gradients over this many microbatches before an optimizer "
+             "step. Effective batch = batch_size × grad_accum × world_size. 1 = off.",
     )
     parser.add_argument(
         "--max_steps",
@@ -519,5 +556,6 @@ if __name__ == "__main__":
         args.lr,
         args.wandb,
         args.wandb_project,
+        grad_accum=args.grad_accum,
         target_modules=[t.strip() for t in (args.target_modules or "").split(",") if t.strip()],
     )
