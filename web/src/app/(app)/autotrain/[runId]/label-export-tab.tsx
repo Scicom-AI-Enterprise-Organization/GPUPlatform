@@ -1,11 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { AlertTriangle, Check, Cpu, Loader2, Server, Upload, X } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Check, Loader2, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { NumberField } from "@/components/ui/number-field";
 import { SearchableSelect, type SearchableOption } from "@/components/ui/searchable-select";
 import {
   Select,
@@ -14,36 +13,20 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { AvailabilityBadge } from "@/components/availability-badge";
-import { VmAvailabilityRow, type VmAvailState } from "@/components/vm-availability-row";
-import { RegionSelect } from "@/components/region-select";
-import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
+import {
+  ComputeTargetPicker,
+  computeVisibleDevicesError,
+  defaultComputeTarget,
+  type ComputeTarget,
+} from "./compute-target-picker";
 import type {
   CatalogRecord,
   DatasetRecord,
   GlobalEnvRecord,
-  GpuTypeOption,
-  ProviderRecord,
   TrainingRunRecord,
 } from "@/lib/types";
-
-const GPU_COUNT_CHOICES = [1, 2, 4, 8] as const;
-
-// Fallback until the live catalog (/compute/runpod/gpu-types) lands.
-const RUNPOD_GPU_FALLBACK: GpuTypeOption[] = [
-  { id: "NVIDIA RTX A5000", label: "RTX A5000", vram_gb: 24, hint: "24 GB" },
-  { id: "NVIDIA RTX A6000", label: "RTX A6000", vram_gb: 48, hint: "48 GB" },
-  { id: "NVIDIA L40S", label: "L40S", vram_gb: 48, hint: "48 GB" },
-  { id: "NVIDIA A100 80GB PCIe", label: "A100 80GB", vram_gb: 80, hint: "datacenter" },
-  { id: "NVIDIA H100 80GB HBM3", label: "H100 80GB", vram_gb: 80, hint: "fastest" },
-];
-
-function gpuHint(vramGb: number, count: number): string {
-  const total = vramGb * count;
-  return `${total >= 100 ? Math.round(total) : total} GB VRAM${count > 1 ? ` · ×${count}` : ""}`;
-}
 
 
 // Export-to-Label as a tab: synthesize N clips from the finished TTS model and seed
@@ -90,89 +73,29 @@ export function LabelExportTab({
   // vLLM offline). Default 0.23.0, like serverless/new.
   const [vllmVersion, setVllmVersion] = useState(str("label_vllm_version") || "0.23.0");
 
-  // ---- Run-on (pod card) ----
-  const [providers, setProviders] = useState<ProviderRecord[]>([]);
-  const [target, setTarget] = useState<"cloud" | "vm">(str("label_run_on") === "cloud" ? "cloud" : "vm");
-  const [vmProviderId, setVmProviderId] = useState(
-    str("label_run_on") === "vm" ? str("label_provider_id") || run.provider_id || "" : run.provider_id || "",
-  );
-  const [runpodProviderId, setRunpodProviderId] = useState(
-    str("label_run_on") === "cloud" ? str("label_provider_id") : "",
-  );
-  const [gpuType, setGpuType] = useState(str("label_gpu_type") || run.gpu_type || "NVIDIA L40S");
-  const [gpuCount, setGpuCount] = useState(num("label_gpu_count", 1));
-  const [secureCloud, setSecureCloud] = useState(typeof lcfg.label_secure_cloud === "boolean" ? (lcfg.label_secure_cloud as boolean) : true);
-  const [dataCenterId, setDataCenterId] = useState(str("label_data_center_id"));
-  const [diskGb, setDiskGb] = useState(num("label_disk_gb", 60));
-  const [volumeGb, setVolumeGb] = useState(num("label_volume_gb", 80));
-  const [visibleDevices, setVisibleDevices] = useState(str("label_visible_devices"));
+  // ---- Run-on (pod card) — shared ComputeTargetPicker ----
   // LLM export runs from the run's LLM venv (/share/autotrain-llm-<arch>, filled
   // from the run config); leave the fallback empty so the gateway picks the arch
   // venv. TTS export uses the NeuCodec venv.
-  const [venvPath, setVenvPath] = useState(
-    str("venv_path") || (run.task_type === "llm" ? "" : "/share/autotrain-tts"),
-  );
+  const [compute, setCompute] = useState<ComputeTarget>(() => {
+    const c = defaultComputeTarget(run);
+    return { ...c, venvPath: c.venvPath || (run.task_type === "llm" ? "" : "/share/autotrain-tts") };
+  });
   // NeuCodec decoder: upstream neuphonic/neucodec (24 kHz) or the Scicom 44k-d20 fork.
   const [codec, setCodec] = useState(str("tts_codec") || "neucodec");
-  const [gpuOptions, setGpuOptions] = useState<GpuTypeOption[]>(RUNPOD_GPU_FALLBACK);
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState(false);
   const [cancelling, setCancelling] = useState(false);
 
-  const [vmAvail, setVmAvail] = useState<VmAvailState>({ status: "idle" });
-  const refreshVmAvail = useCallback(async (id: string) => {
-    if (!id) return setVmAvail({ status: "idle" });
-    setVmAvail({ status: "loading" });
-    try {
-      setVmAvail({ status: "ok", data: await gateway.getVmAvailability(id) });
-    } catch (e) {
-      setVmAvail({ status: "error", message: e instanceof Error ? e.message : String(e) });
-    }
-  }, []);
-
-  const vmProviders = useMemo(() => providers.filter((p) => p.kind === "vm"), [providers]);
-  const runpodProviders = useMemo(() => providers.filter((p) => p.kind === "runpod"), [providers]);
-  const gpuBound = useMemo(
-    () => (target === "vm" ? vmProviders.find((p) => p.id === vmProviderId)?.gpu_count ?? 0 : gpuCount),
-    [target, vmProviders, vmProviderId, gpuCount],
+  const vdError = useMemo(
+    () => computeVisibleDevicesError(compute.visibleDevices, 0),
+    [compute.visibleDevices],
   );
-  const availability = useGpuAvailability(gpuType, gpuCount, target === "cloud", secureCloud ? "SECURE" : "COMMUNITY");
-
-  const vdError = useMemo(() => {
-    const vd = visibleDevices.trim();
-    if (!vd) return null;
-    const toks = vd.split(",").map((t) => t.trim()).filter(Boolean);
-    for (const t of toks) if (!/^\d+$/.test(t)) return `"${t}" isn't a valid GPU index — use non-negative integers like 0,1.`;
-    const ids = toks.map(Number);
-    if (new Set(ids).size !== ids.length) return "Duplicate GPU indices.";
-    if (gpuBound > 0) {
-      const oob = [...new Set(ids.filter((i) => i >= gpuBound))].sort((a, b) => a - b);
-      if (oob.length) return `GPU ${oob.join(", ")} out of range — valid indices are 0–${gpuBound - 1}.`;
-    }
-    return null;
-  }, [visibleDevices, gpuBound]);
 
   useEffect(() => {
     gateway.listGlobalEnv().then(setSecrets).catch(() => {});
-    gateway
-      .listProviders()
-      .then((ps) => {
-        setProviders(ps);
-        // Auto-select the first registered RunPod account — no gateway-default fallback.
-        const firstRunpod = ps.find((p) => p.kind === "runpod");
-        if (firstRunpod) setRunpodProviderId((cur) => cur || firstRunpod.id);
-      })
-      .catch(() => {});
-    gateway
-      .listRunpodGpuTypes()
-      .then((rows) => {
-        if (!rows.length) return;
-        setGpuOptions(rows);
-        setGpuType((cur) => (rows.some((g) => g.id === cur) ? cur : rows[0].id));
-      })
-      .catch(() => {});
     // Eval-dataset picker source (LLM export): registered kind=hf datasets +
     // standalone catalog repos pushed via the hf CLI. Mirrors autotrain/new.
     gateway.listDatasets().then(setDatasets).catch(() => {});
@@ -194,20 +117,14 @@ export function LabelExportTab({
     ];
   }, [datasets, catalogDatasets]);
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (target === "vm" && vmProviderId) refreshVmAvail(vmProviderId);
-    else setVmAvail({ status: "idle" });
-  }, [target, vmProviderId, refreshVmAvail]);
-
   const urlOk = urlMode === "paste" ? !!url.trim() : !!urlSecret;
   const tokenOk = tokenMode === "paste" ? !!token.trim() : !!tokenSecret;
   const running = run.result_json?.label_export?.status === "running";
 
   async function submit() {
     setErr(null);
-    if (target === "vm" && !vmProviderId) return setErr("Pick a VM provider, or switch to cloud.");
-    if (target === "cloud" && !runpodProviderId) return setErr("Select a RunPod provider — add one under GPU Providers.");
+    if (compute.runOn === "vm" && !compute.vmProviderId) return setErr("Pick a VM provider, or switch to cloud.");
+    if (compute.runOn === "cloud" && !compute.runpodProviderId) return setErr("Select a RunPod provider — add one under GPU Providers.");
     if (vdError) return setErr(vdError);
     setBusy(true);
     try {
@@ -234,16 +151,16 @@ export function LabelExportTab({
               per_speaker: perSpeaker,
               tts_codec: codec,
             }),
-        run_on: target,
-        provider_id: target === "vm" ? vmProviderId : runpodProviderId,
-        gpu_type: gpuType,
-        gpu_count: gpuCount,
-        secure_cloud: secureCloud,
-        data_center_id: dataCenterId.trim() || null,
-        disk_gb: diskGb,
-        volume_gb: volumeGb,
-        visible_devices: visibleDevices.trim() || null,
-        venv_path: venvPath.trim() || null,
+        run_on: compute.runOn,
+        provider_id: compute.runOn === "vm" ? compute.vmProviderId : compute.runpodProviderId,
+        gpu_type: compute.gpuType,
+        gpu_count: compute.gpuCount,
+        secure_cloud: compute.secureCloud,
+        data_center_id: compute.dataCenterId.trim() || null,
+        disk_gb: compute.diskGb,
+        volume_gb: compute.volumeGb,
+        visible_devices: compute.visibleDevices.trim() || null,
+        venv_path: compute.venvPath.trim() || null,
       });
       setDone(true);
       onStarted?.();
@@ -300,200 +217,38 @@ export function LabelExportTab({
           : `Synthesize ${samples} clip${samples === 1 ? "" : "s"} from this run's trained model and create a Label-platform recording project (MOS rating), seeded with them. Runs in the background; watch the Logs tab.`}
       </p>
 
-      {/* Run on — same card as serverless/new */}
-      <Section
-        title="Run on"
-        description="Default cloud spawns a fresh RunPod pod for the synthesis, then tears it down. Bare metal runs on a VM you've registered under GPU Providers."
-      >
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-          <button type="button" onClick={() => setTarget("cloud")}
-            className={cn("flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
-              target === "cloud" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
-            <Cpu className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0">
-              <div className="font-medium">Default cloud (RunPod)</div>
-              <div className="text-xs text-muted-foreground">Provision a fresh pod on demand, synthesize, tear down. Pay-per-second.</div>
-            </div>
-          </button>
-          <button type="button" onClick={() => setTarget("vm")}
-            className={cn("flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
-              target === "vm" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
-            <Server className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0">
-              <div className="font-medium">Bare metal (VM)</div>
-              <div className="text-xs text-muted-foreground">SSH onto a registered VM. No spin-up cost.</div>
-            </div>
-          </button>
-        </div>
-      </Section>
+      {/* Run on + Pod — shared serverless-style compute picker */}
+      <ComputeTargetPicker
+        run={run}
+        value={compute}
+        onChange={setCompute}
+        venvLabel={isLlm ? "uv venv path (LLM)" : "uv venv path (TTS)"}
+        venvPlaceholder={isLlm ? "/share/autotrain-llm-<arch>" : "/share/autotrain-tts"}
+        vramHint={isLlm
+          ? "Pick a GPU with enough VRAM to load the trained model for text generation."
+          : "Pick a GPU with enough VRAM to load the trained model and NeuCodec for synthesis."}
+      />
 
-      {/* Pod — provider + hardware (same card as serverless/new) */}
-      <Section
-        title="Pod"
-        description={target === "cloud"
-          ? "GPU, count, and cloud tier for the synthesis pod."
-          : "Which registered VM the synthesis runs on. Hardware is fixed by the VM."}
-      >
-        <div className="space-y-5">
-          {target === "cloud" ? (
-            <Field label="RunPod account" hint="Which registered RunPod provider to run the synthesis on.">
-              {runpodProviders.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No RunPod providers registered.{" "}
-                  <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add one</a>{" "}
-                  under GPU Providers.
-                </p>
-              ) : (
-                <Select value={runpodProviderId} onValueChange={setRunpodProviderId}>
-                  <SelectTrigger><SelectValue placeholder="Choose a RunPod account…" /></SelectTrigger>
-                  <SelectContent>
-                    {runpodProviders.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name}{p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
-            </Field>
-          ) : (
-            <Field label="VM provider" hint="The registered VM the synthesis SSHes onto. Hardware is fixed by the VM.">
-              {vmProviders.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No VM providers registered. Add one at{" "}
-                  <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">GPU Providers → New provider</a>.
-                </p>
-              ) : (
-                <Select value={vmProviderId} onValueChange={setVmProviderId}>
-                  <SelectTrigger><SelectValue placeholder="Pick a VM…" /></SelectTrigger>
-                  <SelectContent>
-                    {vmProviders.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name}{p.gpu_count ? ` · ${p.gpu_count} GPU` : ""}{p.host ? ` · ${p.host}` : ""}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
-              {vmProviderId && (
-                <div className="mt-1.5">
-                  <VmAvailabilityRow state={vmAvail} onRefresh={() => refreshVmAvail(vmProviderId)} />
-                </div>
-              )}
-            </Field>
-          )}
-
-          {target === "cloud" && (
-            <>
-              <Field label="Cloud tier" hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity.">
-                <div className="grid grid-cols-2 gap-2">
-                  {([true, false] as const).map((secure) => (
-                    <button
-                      key={String(secure)}
-                      type="button"
-                      onClick={() => setSecureCloud(secure)}
-                      className={cn(
-                        "rounded-md border p-3 text-left transition-colors",
-                        secureCloud === secure
-                          ? "border-foreground/60 ring-1 ring-foreground/20"
-                          : "border-border hover:border-foreground/40",
-                      )}
-                    >
-                      <div className="text-sm font-medium">{secure ? "Secure" : "Community"}</div>
-                      <div className="mt-0.5 text-xs text-muted-foreground">
-                        {secure ? "vetted hosts, more capacity" : "cheaper, variable hosts"}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </Field>
-
-              <Field label="Region" hint="Pin the synthesis pod to a RunPod data center, or Auto to let RunPod pick any region with capacity.">
-                <RegionSelect value={dataCenterId} onChange={setDataCenterId} className="text-sm" />
-              </Field>
-
-              <Field
-                label="GPU"
-                hint={(() => {
-                  const g = gpuOptions.find((o) => o.id === gpuType);
-                  return g ? gpuHint(g.vram_gb, gpuCount) : undefined;
-                })()}
-                extra={<AvailabilityBadge state={availability} count={gpuCount} />}
-              >
-                <div className="flex gap-2">
-                  <SearchableSelect
-                    className="flex-1"
-                    value={gpuType}
-                    onChange={setGpuType}
-                    options={gpuOptions.map((g) => ({ value: g.id, label: g.label, hint: gpuHint(g.vram_gb, 1) }))}
-                    placeholder="Choose a GPU"
-                    searchPlaceholder="Search GPUs (e.g. h100, 24gb)…"
-                  />
-                  <Select value={String(gpuCount)} onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}>
-                    <SelectTrigger className="w-24 shrink-0"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      {GPU_COUNT_CHOICES.map((n) => <SelectItem key={n} value={String(n)}>×{n}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </Field>
-
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="Container disk (GB)" hint="Ephemeral workspace. Resets when the pod stops.">
-                  <NumberField min={20} value={diskGb} onChange={setDiskGb} />
-                </Field>
-                <Field label="Volume (GB)" hint="Persistent volume for the model cache. 0 = no persistent storage.">
-                  <NumberField min={0} value={volumeGb} onChange={setVolumeGb} />
-                </Field>
-              </div>
-
-              <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>
-                  {isLlm
-                    ? "Pick a GPU with enough VRAM to load the trained model for text generation."
-                    : "Pick a GPU with enough VRAM to load the trained model and NeuCodec for synthesis."}
-                </span>
-              </div>
-            </>
-          )}
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field label={isLlm ? "uv venv path (LLM)" : "uv venv path (TTS)"}>
-              <Input className="font-mono text-xs" placeholder={isLlm ? "/share/autotrain-llm-<arch>" : "/share/autotrain-tts"}
-                value={venvPath} onChange={(e) => setVenvPath(e.target.value)} />
-            </Field>
-            <Field
-              label="CUDA_VISIBLE_DEVICES (optional)"
-              hint={!vdError && gpuBound > 0
-                ? `${target === "vm" ? "This VM" : "The pod"} has ${gpuBound} GPU${gpuBound === 1 ? "" : "s"} — valid indices 0–${gpuBound - 1}.`
-                : undefined}
-            >
-              <Input className={cn("font-mono text-xs", vdError && "border-destructive focus-visible:ring-destructive")}
-                placeholder="e.g. 0 (empty = all GPUs)"
-                value={visibleDevices} onChange={(e) => setVisibleDevices(e.target.value)} />
-              {vdError && <p className="text-[11px] text-destructive">{vdError}</p>}
-            </Field>
-          </div>
-
-          {!isLlm && (
-            <Field
-              label="NeuCodec (audio decoder)"
-              hint={codec === "neucodec-44k"
+      {/* NeuCodec decoder (TTS-only) — stays out of the shared picker. */}
+      {!isLlm && (
+        <Section title="Audio decoder" description="Which NeuCodec decodes the model's speech tokens back to audio.">
+          <div className="space-y-1.5">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">NeuCodec (audio decoder)</Label>
+            <Select value={codec} onValueChange={setCodec}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="neucodec">neuphonic/neucodec — 24 kHz (upstream)</SelectItem>
+                <SelectItem value="neucodec-44k">Scicom neucodec-44k-d20 — 44.1 kHz</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {codec === "neucodec-44k"
                 ? "Scicom 44k-d20 fork — 44.1 kHz output (installs from git; slower first build)."
                 : "Upstream neuphonic/neucodec — 24 kHz output. Same speech tokens, so either decodes the model fine."}
-            >
-              <Select value={codec} onValueChange={setCodec}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="neucodec">neuphonic/neucodec — 24 kHz (upstream)</SelectItem>
-                  <SelectItem value="neucodec-44k">Scicom neucodec-44k-d20 — 44.1 kHz</SelectItem>
-                </SelectContent>
-              </Select>
-            </Field>
-          )}
-        </div>
-      </Section>
+            </p>
+          </div>
+        </Section>
+      )}
 
       {/* Label project — destination + project knobs */}
       <Section
@@ -671,31 +426,6 @@ function Section({
       </div>
       {children}
     </section>
-  );
-}
-
-// Labelled field matching serverless/new's Field (uppercase label + hint + optional
-// right-aligned `extra`).
-function Field({
-  label,
-  hint,
-  children,
-  extra,
-}: {
-  label: string;
-  hint?: string;
-  children: ReactNode;
-  extra?: ReactNode;
-}) {
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <Label className="text-xs uppercase tracking-wide text-muted-foreground">{label}</Label>
-        {extra}
-      </div>
-      {children}
-      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
-    </div>
   );
 }
 

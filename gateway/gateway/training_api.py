@@ -65,6 +65,10 @@ LOG_LIST_TTL_S = 12_960_000  # ~5 months
 POLL_INTERVAL_S = 5.0
 POLL_TIMEOUT_S = 900.0
 DEFAULT_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+# LLM cloud try-it serves via vLLM ≥0.23, which needs a CUDA-13 host (a cu12 image →
+# EngineCore "driver too old" crash — see gateway/gateway/CLAUDE.md). Provision LLM
+# try-it/merge pods on a cu1300 image so allowedCudaVersions pins a ≥580-driver host.
+LLM_VLLM_IMAGE = "runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404"
 # Ensure `uv` exists + is on PATH before the trainer's --deps-only runs, so its
 # venv is built with `uv venv` / `uv pip install` (fast, hash-constraint-free)
 # rather than the slow `python -m venv` + pip fallback. Mirrors the benchmark VM
@@ -715,6 +719,25 @@ async def _reap_label_pod(run_id: str, provider_id: Optional[str]) -> bool:
     return False
 
 
+async def _reap_hf_export_pod(run_id: str, provider_id: Optional[str]) -> bool:
+    """Best-effort: tear down an orphaned cloud HF-export pod (named sgpu-hfexport-<run_id>)
+    on `provider_id` (a RunPod account, or None → env key) — the one export_to_huggingface
+    spawns for a merged export. Used by cancel + startup reconcile so a pod whose task died
+    (cancel / gateway restart) can't bill on. True if one was torn down."""
+    try:
+        api_key = await compute._resolve_api_key(provider_id)
+        async with compute._client(api_key=api_key) as cli:
+            data = (await cli.get("/pods")).json()
+        pods = data if isinstance(data, list) else (data.get("pods") or data.get("data") or [])
+        for p in pods:
+            if p.get("name") == f"sgpu-hfexport-{run_id}" and p.get("id"):
+                await _terminate_pod(api_key, p["id"])
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 # ---------- the runner ---------------------------------------------------
 
 
@@ -1108,6 +1131,12 @@ async def _create_llm_label_project_for_run(run_id: str, cfg: dict, result: dict
                     f"[gateway] llm label export: {len(eval_rows)} rows ({len(all_rows)} total in dataset)")
 
     creds = _s3_creds_from_storage(storage)
+    # The LLM label export merges the LoRA into the (usually gated) base on the box, so the
+    # merge's from_pretrained needs an HF token. Inject the run's token (its referenced
+    # secret, else platform HF_TOKEN) as HF_TOKEN — env_vars is otherwise empty and the
+    # base download would 401 (matches the HF-export merge fix).
+    _hf_tok = (genv.get(cfg["hf_token_secret"]) if cfg.get("hf_token_secret") else None) or genv.get("HF_TOKEN")
+    cfg = _cfg_with_hf_token(cfg, _hf_tok)
     ssh = await _resolve_run_ssh(row)
     if ssh is None:
         await _push_log(redis, run_id, "[gateway] llm label export: can't reach the run's VM (skipped)")
@@ -2638,6 +2667,14 @@ async def _reconcile_orphaned_exports(redis) -> None:
                     await _push_log(redis, row.id, "[gateway] label export: orphaned pod torn down on restart")
                 except Exception:  # noqa: BLE001
                     pass
+        if "hf_export" in changed:
+            he = rj.get("hf_export") or {}
+            if he.get("pod_id") or he.get("run_on") == "cloud":
+                if await _reap_hf_export_pod(row.id, he.get("provider_id")):
+                    try:
+                        await _push_log(redis, row.id, "[gateway] HF export: orphaned pod torn down on restart")
+                    except Exception:  # noqa: BLE001
+                        pass
         try:
             await _push_log(redis, row.id, "[gateway] export was interrupted by a gateway restart — marked failed")
         except Exception:  # noqa: BLE001
@@ -3894,8 +3931,34 @@ def _loopback_endpoint(endpoint: Optional[str]) -> Optional[str]:
 
 class HfExportRequest(BaseModel):
     repo: str
-    storage_id: Optional[str] = None   # a kind=huggingface Storage (provides the token)
+    storage_id: Optional[str] = None   # a kind=huggingface Storage (provides token + custom endpoint)
     private: bool = False
+    # HF token for downloading a GATED BASE MODEL during an LLM merge (e.g. google/gemma-*),
+    # mirrors serverless/new. This is NOT the destination/push token — that comes from the
+    # storage (or platform HF_TOKEN). A pasted token or a referenced global-secret key;
+    # falls back to the push token when unset. Only used for a merge.
+    base_hf_token: Optional[str] = None         # pasted token (hf_…)
+    base_hf_token_secret: Optional[str] = None  # a global-secret key (e.g. "HF_TOKEN")
+    # LLM only: merge the raw LoRA checkpoint into the base model on a GPU and upload a
+    # loadable HF model (safetensors) instead of the adapter. No-op for ASR/TTS (their
+    # artifact is already a merged model). Needs a compute target below.
+    merge: bool = False
+    merge_dtype: Optional[str] = None      # fp16 (default) | bf16; only affects FP8 MoE archs
+    vllm_version: Optional[str] = None     # accepted for symmetry with try-it (unused by export)
+    # Run-on target for the merge (mirrors LabelExportRequest). "cloud" → spin up a fresh
+    # RunPod pod (build the arch venv, merge, upload, tear down); "vm" → a chosen VM;
+    # None → the run's own VM (back-compat).
+    run_on: Optional[str] = None
+    provider_id: Optional[str] = None      # vm provider (run_on=vm) or RunPod account (run_on=cloud)
+    gpu_type: Optional[str] = None
+    gpu_count: Optional[int] = None
+    secure_cloud: Optional[bool] = None
+    data_center_id: Optional[str] = None
+    disk_gb: Optional[int] = None
+    volume_gb: Optional[int] = None
+    visible_devices: Optional[str] = None  # CUDA pin for the merge
+    venv_path: Optional[str] = None        # override the merge venv path
+    image: Optional[str] = None            # cloud pod image; blank → DEFAULT_IMAGE
 
 
 @router.post("/{run_id}/hf-export")
@@ -3906,12 +3969,15 @@ async def export_to_huggingface(
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Push this run's BEST/final model to a Hugging Face repo on demand. The model
-    artifact (result_json.artifact.s3_uri) is the best checkpoint — the trainer only
-    uploads the final/best model to S3, never the intermediate checkpoint-N dirs — so
-    this pushes exactly that. The HF token comes from the selected kind=huggingface
-    Storage (else the platform HF_TOKEN secret). Runs in the background; status +
-    link land in result_json.hf_export. VM-provider runs only."""
+    """Push this run's BEST/final model to a Hugging Face repo on demand.
+
+    ASR/TTS artifacts are already merged models at train-end → uploaded as-is (from a
+    custom-endpoint mirror via the gateway, else the run's VM). LLM artifacts are a raw
+    LoRA checkpoint → must be MERGED into the base on a GPU first; that runs on the run's
+    VM, a chosen VM, or a fresh RunPod pod (Run-on picker), then the merged safetensors
+    are uploaded. The HF token comes from the selected kind=huggingface Storage (else the
+    platform HF_TOKEN secret). Runs in the background; status + link land in
+    result_json.hf_export."""
     row = await _owned(run_id, user, session)
     if row.status != "done":
         raise HTTPException(status_code=400, detail="the run must finish successfully first")
@@ -3921,48 +3987,131 @@ async def export_to_huggingface(
     repo = (body.repo or "").strip()
     if not repo:
         raise HTTPException(status_code=400, detail="a target repo (org/name) is required")
+    # Destination/push token: from the selected HuggingFace storage, else platform HF_TOKEN.
     token = await _hf_token_for_storage(body.storage_id, session)
     if not token:
         token = (await _resolve_global_env()).get("HF_TOKEN")
     if not token:
         raise HTTPException(status_code=400, detail=("no Hugging Face token — pick a HuggingFace storage "
                             "or set HF_TOKEN in Secrets"))
+    # Base-model token: for downloading a GATED base model during a merge (may be a
+    # different HF account than the push target). Pasted > referenced global secret >
+    # (fallback) the push token above.
+    base_token = (body.base_hf_token or "").strip() or None
+    if not base_token and body.base_hf_token_secret:
+        from .global_env_api import load_global_env
+        base_token = (await load_global_env(session)).get(body.base_hf_token_secret)
+    if not base_token:
+        base_token = token
     # Custom HF_ENDPOINT from the same storage (self-hosted mirror), or None → huggingface.co.
     hf_endpoint = await _hf_endpoint_for_storage(body.storage_id, session)
-    # A custom endpoint pushes from the GATEWAY (the control plane reaches the mirror
-    # directly + its huggingface_hub handles the `…/hf` path the VM's older client
-    # mis-parses); the model artifact lives on S3 so no VM is involved. The default
-    # huggingface.co path still runs on the VM (avoids large downloads on the laptop).
-    local_export = bool(hf_endpoint)
-    # For a gateway-side push to our OWN mirror, talk to it over loopback so a
-    # multi-GB LFS PUT bypasses the nginx ingress body-size cap (+ TLS). Keep the
-    # original endpoint for the displayed/stored repo URL.
-    push_endpoint = _loopback_endpoint(hf_endpoint) if local_export else hf_endpoint
+    task_type = (row.task_type or "asr").lower()
+    base_model = row.base_model or (row.config_json or {}).get("base_model") or ""
+    arch = _llm_arch(base_model)
+
+    # Merge only applies to LLM: its S3 artifact is a raw custom-LoRA checkpoint (lora.pt
+    # + meta), not a loadable HF model. ASR/TTS are already merged at train-end → no-op.
+    merge = bool(body.merge) and task_type == "llm"
+    if task_type == "llm" and not merge:
+        raise HTTPException(status_code=400, detail=(
+            "LLM runs are stored as a raw LoRA checkpoint (not loadable by transformers). "
+            "Enable 'Merge LoRA into base model' to upload a loadable model."))
+    if merge and hf_endpoint:
+        raise HTTPException(status_code=400, detail=(
+            "merged export to a custom Hugging Face endpoint isn't supported yet — use a "
+            "huggingface.co token storage (or the platform HF_TOKEN)."))
+    # Imported runs re-home only small files to a NEW prefix and never rewrite
+    # artifact.s3_uri (it still points at the SOURCE deployment's bucket), and the big
+    # checkpoint is dropped by the import size cap → nothing to merge. A normal run's
+    # artifact URI lives under its own s3_prefix; if it doesn't, fast-fail before a pod.
+    if merge and row.s3_prefix and row.s3_prefix not in (model_s3 or ""):
+        raise HTTPException(status_code=400, detail=(
+            "this run was imported — its checkpoint lives on another deployment's storage "
+            "(omitted from the import), so there's nothing to merge here."))
+    merge_dtype = (body.merge_dtype or "fp16").strip().lower()
+    if merge_dtype not in ("fp16", "bf16"):
+        merge_dtype = "fp16"
+
     creds = _s3_creds_from_storage(await session.get(Storage, row.storage_id) if row.storage_id else None)
-    ssh = None
-    if not local_export:
-        prov = await session.get(Provider, row.provider_id) if row.provider_id else None
-        if prov is None or prov.kind != "vm":
-            raise HTTPException(status_code=400, detail=("HF export runs on a VM provider; this run used a "
-                                "cloud pod (gone after training). Re-run on a VM, or use a HuggingFace "
-                                "storage with a custom endpoint (pushes from the gateway)."))
-        ssh = await _resolve_run_ssh(row)
-        if ssh is None:
-            raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
     cfg = dict(row.config_json or {})
     private = bool(body.private)
     redis = request.app.state.redis
+
+    # ---- compute target -------------------------------------------------------------
+    # Non-merge (ASR/TTS): a custom-endpoint storage pushes from the GATEWAY (reaches the
+    # mirror directly + its modern huggingface_hub handles the `…/hf` path the VM's older
+    # client mis-parses); else the run's VM (avoids large downloads on the laptop). Merge
+    # (LLM): a GPU is required → the run's VM, a chosen VM, or a fresh RunPod pod.
+    local_export = bool(hf_endpoint) and not merge
+    # For a gateway-side push to our OWN mirror, talk to it over loopback so a multi-GB
+    # LFS PUT bypasses the nginx ingress body-size cap (+ TLS). Keep the original endpoint
+    # for the displayed/stored repo URL.
+    push_endpoint = _loopback_endpoint(hf_endpoint) if local_export else hf_endpoint
+    run_on = (body.run_on or "").strip().lower()
+    exp_provider_id = (body.provider_id or "").strip() or None
+    ssh = None            # (host, port, user, key) when we run on an existing box
+    cloud_spec = None     # pod spec dict when we must provision a fresh pod in _bg
+    if not local_export:
+        if run_on == "cloud":
+            if not merge:
+                raise HTTPException(status_code=400, detail=(
+                    "cloud export is only for LLM merge — ASR/TTS models export from a VM or "
+                    "a custom-endpoint HuggingFace storage."))
+            prov = await session.get(Provider, exp_provider_id) if exp_provider_id else None
+            if exp_provider_id and (prov is None or prov.kind != "runpod"):
+                raise HTTPException(status_code=400, detail="the chosen cloud provider must be a RunPod account")
+            cloud_spec = {
+                "provider_id": exp_provider_id,
+                "gpu_type": (body.gpu_type or "").strip() or (row.gpu_type or "NVIDIA L40S"),
+                "gpu_count": max(1, int(body.gpu_count or 1)),
+                "secure_cloud": True if body.secure_cloud is None else bool(body.secure_cloud),
+                "data_center_id": (body.data_center_id or "").strip() or None,
+                "disk_gb": int(body.disk_gb or 80),
+                "volume_gb": int(body.volume_gb or 80),
+                "image": (body.image or "").strip() or None,
+            }
+        elif run_on == "vm":
+            vm_id = exp_provider_id or row.provider_id
+            prov = await session.get(Provider, vm_id) if vm_id else None
+            if prov is None or prov.kind != "vm":
+                raise HTTPException(status_code=400, detail="the chosen VM provider was not found")
+            ssh = await _resolve_provider_ssh(prov, run_id)
+            if ssh is None:
+                raise HTTPException(status_code=400, detail="can't reach the chosen VM (SSH coords unavailable)")
+        else:
+            prov = await session.get(Provider, row.provider_id) if row.provider_id else None
+            if prov is None or prov.kind != "vm":
+                if merge:
+                    raise HTTPException(status_code=400, detail=(
+                        "this run's training box is gone — pick a Run-on target (a VM or a fresh "
+                        "cloud pod) to run the merge."))
+                raise HTTPException(status_code=400, detail=(
+                    "HF export runs on a VM provider; this run used a cloud pod (gone after "
+                    "training). Pick a Run-on target, or use a HuggingFace storage with a custom "
+                    "endpoint (pushes from the gateway)."))
+            ssh = await _resolve_run_ssh(row)
+            if ssh is None:
+                raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
+
+    # The merge venv: on a VM it's the arch venv training already built; on a fresh pod
+    # _build_llm_venv_ssh builds it. None for non-merge (uses the run's train venv).
+    venv_path = (body.venv_path or "").strip() or (f"/share/autotrain-llm-{arch}" if merge else None)
+    visible_devices = (body.visible_devices or "").strip() or None
 
     # Re-click supersedes a stuck push (the orphaned upload just finishes + is discarded).
     prev = _active_hf_exports.pop(run_id, None)
     if prev is not None and not prev.done():
         prev.cancel()
         await _push_log(redis, run_id, "[gateway] HF export: superseded by a new request — restarting")
-    await _set_hf_export_state(run_id, {"status": "running", "repo": repo, "url": None, "error": None})
+    await _set_hf_export_state(run_id, {
+        "status": "running", "repo": repo, "url": None, "error": None, "merge": merge,
+        "run_on": (run_on or ("vm" if ssh else None)),
+        "provider_id": exp_provider_id if cloud_spec else None, "pod_id": None,
+    })
 
     async def _bg() -> None:
-        # Stream the VM-side download/upload lines to the run's logs (the script runs
-        # in a thread; it appends to this buffer and an async pump mirrors to Redis)
+        # Stream the box-side build/download/merge/upload lines to the run's logs (the
+        # script runs in a thread; it appends here and an async pump mirrors to Redis)
         # so a multi-minute push isn't silent.
         export_lines: list[str] = []
         _sent = {"n": 0}
@@ -3975,18 +4124,48 @@ async def export_to_huggingface(
                     _sent["n"] += 1
 
         pump_task = asyncio.create_task(_pump())
+        spawned: Optional[tuple[str, str]] = None   # (api_key, pod_id) for cloud teardown
+        run_ssh = ssh
         try:
-            where = "the gateway" if local_export else "the run's VM"
-            await _push_log(redis, run_id, f"[gateway] exporting best model to Hugging Face → {repo} (from {where}) …")
+            # Run-on = cloud: provision a fresh pod + build the arch merge venv on it.
+            if cloud_spec is not None:
+                api_key = await compute._resolve_api_key(cloud_spec["provider_id"])
+                key_filename, pub = _gen_ssh_key(_work_dir(run_id))
+                await _push_log(redis, run_id,
+                                f"[gateway] HF export: provisioning RunPod pod "
+                                f"({cloud_spec['gpu_type']} x{cloud_spec['gpu_count']}) …")
+                runpod_id, phost, pport, _cost = await _provision_pod(
+                    api_key, f"sgpu-hfexport-{run_id}", cloud_spec["image"] or DEFAULT_IMAGE,
+                    cloud_spec["gpu_type"], cloud_spec["gpu_count"], cloud_spec["secure_cloud"],
+                    cloud_spec["disk_gb"], cloud_spec["volume_gb"], pub,
+                    data_center_id=cloud_spec["data_center_id"])
+                spawned = (api_key, runpod_id)
+                await _set_hf_export_state(run_id, {"pod_id": runpod_id})
+                await _push_log(redis, run_id,
+                                "[gateway] HF export: building the LLM stack on the pod (first build is slow) …")
+                await asyncio.to_thread(_build_llm_venv_ssh, phost, int(pport), "root",
+                                        key_filename, run_id, dict(cfg), base_model,
+                                        venv_path, export_lines.append)
+                run_ssh = (phost, int(pport), "root", key_filename)
+
+            where = "the gateway" if local_export else ("a fresh cloud pod" if spawned else "the run's VM")
+            await _push_log(redis, run_id,
+                            f"[gateway] exporting {'merged model' if merge else 'best model'} to Hugging Face "
+                            f"→ {repo} (from {where}) …")
             if local_export:
                 if push_endpoint != hf_endpoint:
                     await _push_log(redis, run_id, f"[gateway] pushing via {push_endpoint} (loopback, bypassing the ingress) …")
                 res = await asyncio.to_thread(
                     _run_hf_export_local, run_id, model_s3, creds, repo, token, private,
                     push_endpoint, export_lines.append)
+            elif merge:
+                res = await asyncio.to_thread(
+                    _run_hf_merge_export_ssh, *run_ssh, run_id, model_s3, creds, repo, token,
+                    private, dict(cfg), base_model, arch, merge_dtype, venv_path,
+                    visible_devices, base_token, export_lines.append)
             else:
                 res = await asyncio.to_thread(
-                    _run_hf_export_ssh, *ssh, run_id, model_s3, creds, repo, token, private, cfg,
+                    _run_hf_export_ssh, *run_ssh, run_id, model_s3, creds, repo, token, private, cfg,
                     hf_endpoint, export_lines.append)
             # The script builds the URL from the endpoint it pushed to; show the
             # public endpoint instead of the loopback one.
@@ -3997,7 +4176,8 @@ async def export_to_huggingface(
                 r2 = await s.get(TrainingRun, run_id)
                 if r2 is not None:
                     rj = dict(r2.result_json or {})
-                    rj["hf_export"] = {"status": "done", "repo": res.get("repo", repo), "url": res_url}
+                    rj["hf_export"] = {"status": "done", "repo": res.get("repo", repo),
+                                       "url": res_url, "merge": merge}
                     art = dict(rj.get("artifact") or {})
                     art["hf_repo"] = res.get("repo", repo)
                     rj["artifact"] = art
@@ -4008,9 +4188,17 @@ async def export_to_huggingface(
             await _push_log(redis, run_id, "[gateway] HF export: cancelled (superseded)")
             raise
         except Exception as e:  # noqa: BLE001
-            await _set_hf_export_state(run_id, {"status": "failed", "error": str(e)[:300]})
+            await _set_hf_export_state(run_id, {"status": "failed", "error": str(e)[:1200]})
             await _push_log(redis, run_id, f"[gateway] HF export failed: {e}")
         finally:
+            # Tear down a pod we spawned so it can't bill past the export (best-effort).
+            if spawned:
+                try:
+                    await _terminate_pod(*spawned)
+                    await _set_hf_export_state(run_id, {"pod_id": None})
+                    await _push_log(redis, run_id, "[gateway] HF export: cloud pod torn down")
+                except Exception:  # noqa: BLE001
+                    logger.warning("HF export %s: pod teardown failed", run_id)
             pump_task.cancel()
             try:
                 await pump_task
@@ -4074,6 +4262,13 @@ async def cancel_huggingface_export(
             killed = await asyncio.to_thread(_kill)
         except Exception as e:  # noqa: BLE001
             await _push_log(redis, run_id, f"[gateway] HF export: VM kill attempt failed: {e}")
+
+    # Tear down a spawned cloud pod (sgpu-hfexport-<run_id>) the cancelled task couldn't
+    # (gateway restarted mid-export), else it bills on.
+    he = (row.result_json or {}).get("hf_export") or {}
+    if he.get("pod_id") or he.get("run_on") == "cloud":
+        if await _reap_hf_export_pod(run_id, he.get("provider_id")):
+            await _push_log(redis, run_id, "[gateway] HF export: cloud pod torn down")
 
     await _set_hf_export_state(run_id, {"status": "cancelled", "error": "stopped by user"})
     await _push_log(redis, run_id, "[gateway] HF export stopped by user.")
@@ -4511,6 +4706,59 @@ def _label_build_tts_venv_ssh(host: str, port: int, user: str, key_filename: str
             pass
 
 
+def _build_llm_venv_ssh(host: str, port: int, user: str, key_filename: str,
+                        run_id: str, cfg: dict, base_model: str,
+                        venv_path: Optional[str] = None, line_sink=None) -> None:
+    """On a freshly-spawned pod: ship llm_finetune.py + the llm/ dir and run `--deps-only`
+    (the exact cloud-training deps phase) to build the per-arch training venv the merge /
+    vLLM-serve needs (torch + transformers + peft + boto3 + huggingface_hub). FA4 is
+    skipped (gemma_fa4=False): the merge folds base bf16 without the flash-attn cute fork,
+    so we avoid its slow git build. On a VM the venv already exists, so this is
+    cloud-only. Blocking — call via to_thread; on failure the RuntimeError carries the
+    install tail (the real pip/uv error, not just an opaque rc). Mirrors
+    `_label_build_tts_venv_ssh` (the TTS twin)."""
+    arch = _llm_arch(base_model)
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        stage = f"/tmp/sgpu_llm_deps_{run_id}"
+        _ssh_exec(cli, f"mkdir -p {stage}")
+        _ssh_put(cli, str(base / "llm_finetune.py"), f"{stage}/llm_finetune.py")
+        _ssh_put_dir_tar(cli, str(base / "llm"), f"{stage}/llm")
+        dconf = {
+            "base_model": base_model,
+            "venv_path": (venv_path or f"/share/autotrain-llm-{arch}").rstrip("/"),
+            "work_dir": (cfg.get("work_dir") or "/share").rstrip("/"),
+            "gemma_fa4": False,   # merge needs no FA4 kernel → skip the slow cute-fork build
+        }
+        _ssh_put_bytes(cli, json.dumps(dconf).encode("utf-8"), f"{stage}/deps.json")
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        deps_cmd = (f"{user_env}{_UV_BOOTSTRAP}"
+                    f"python -u {stage}/llm_finetune.py --deps-only --config {stage}/deps.json")
+        tail: list[str] = []
+
+        def on_line(line: str) -> None:
+            if line_sink is not None:
+                try:
+                    line_sink(line)
+                except Exception:  # noqa: BLE001
+                    pass
+            tail.append(line)            # keep a rolling tail (the error is at the END)
+            if len(tail) > 80:
+                del tail[0]
+
+        rc = _ssh_run_stream(cli, deps_cmd, on_line)
+        if rc != 0:
+            detail = "\n".join(tail[-25:]).strip()
+            raise RuntimeError(f"LLM deps install failed on the pod (rc={rc})"
+                               + (f":\n{detail}" if detail else ""))
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # ---------- cloud try-it pod (ASR): a finished RunPod-cloud run's training pod is
 # torn down, so "Try it" provisions a fresh, short-lived pod on demand, builds the
 # Whisper venv (--deps-only), and keeps it warm for transcribes. It auto-tears-down
@@ -4620,28 +4868,90 @@ def _tryit_build_venv_ssh(host: str, port: int, user: str, key_filename: str,
             pass
 
 
+def _cfg_with_hf_token(cfg: dict, token: Optional[str]) -> dict:
+    """Return a shallow copy of `cfg` with HF_TOKEN merged into env_vars (so the box job's
+    `_render_env_exports` prefix exports it — and its subprocesses inherit it — letting a
+    gated base-model download work). No-op when `token` is empty. NOT persisted: only the
+    local cfg handed to an SSH runner is touched, never written back to the DB."""
+    if not token:
+        return cfg
+    return {**cfg, "env_vars": {**(cfg.get("env_vars") or {}), "HF_TOKEN": token}}
+
+
 async def _tryit_cloud_setup(run_id: str, *, gpu_type: str, gpu_count: int, cloud_type: str,
-                             provider_id: Optional[str], kind: str) -> None:
-    """Provision a fresh pod for a cloud try-it (ASR or TTS) on the chosen GPU /
-    account, build the right venv, and keep it warm. Updates result_json['tryit']
-    .phase as it goes; tears the pod down on failure so a half-provisioned pod can't
-    leak. The pod id lives in tryit state (resolved by _resolve_tryit_ssh)."""
+                             provider_id: Optional[str], kind: str,
+                             base_hf_token: Optional[str] = None) -> None:
+    """Provision a fresh pod for a cloud try-it (ASR / TTS / LLM) on the chosen GPU /
+    account, build the right venv, and keep it warm. ASR/TTS load per-request after the
+    venv build → ready immediately. LLM launches a detached vLLM orchestrator (download
+    LoRA → merge → serve) and polls its ready-file, so it stays 'installing' until vLLM
+    is healthy. Updates result_json['tryit'].phase as it goes; tears the pod down on
+    failure so a half-provisioned pod can't leak. The pod id lives in tryit state
+    (resolved by _resolve_tryit_ssh)."""
     pod_id = None
     try:
         async with session_factory()() as s:
             row = await s.get(TrainingRun, run_id)
             cfg = dict(row.config_json or {})
+            storage = await s.get(Storage, row.storage_id) if row.storage_id else None
+            model_s3 = ((row.result_json or {}).get("artifact") or {}).get("s3_uri")
+        creds = _s3_creds_from_storage(storage)
         await _tryit_save(run_id, target="cloud", provider_id=provider_id, kind=kind,
                           gpu_type=gpu_type, gpu_count=gpu_count, cloud_type=cloud_type,
                           phase="provisioning", message="starting a GPU pod …", expires_at=_tryit_exp())
         api_key = await compute._resolve_api_key(provider_id)
         key_filename, pub = _gen_ssh_key(_work_dir(run_id))
+        # LLM serves via vLLM ≥0.23 → cu1300 image; it also holds the base model for the
+        # merge, so give it generous disk. ASR/TTS keep the small cu1281 default.
+        image = cfg.get("image") or (LLM_VLLM_IMAGE if kind == "llm" else DEFAULT_IMAGE)
+        disk_gb = int(cfg.get("disk_gb") or (250 if kind == "llm" else 60))
+        volume_gb = int(cfg.get("volume_gb") or (250 if kind == "llm" else 80))
         runpod_id, host, port, _cost = await _provision_pod(
-            api_key, f"sgpu-tryit-{run_id}", cfg.get("image") or DEFAULT_IMAGE,
+            api_key, f"sgpu-tryit-{run_id}", image,
             gpu_type, max(1, int(gpu_count)), (cloud_type or "SECURE") == "SECURE",
-            int(cfg.get("disk_gb", 60)), int(cfg.get("volume_gb", 80)), pub,
+            disk_gb, volume_gb, pub,
         )
         pod_id = runpod_id
+        if kind == "llm":
+            await _tryit_save(run_id, pod_id=runpod_id, phase="installing",
+                              message="installing the LLM stack (torch + transformers + vLLM) — first build is slow …",
+                              expires_at=_tryit_exp())
+            async with session_factory()() as s:
+                r = await s.get(TrainingRun, run_id)
+            ti = _tryit_state(r)   # gpus / vllm knobs stashed by playground_start
+            base_model = ti.get("base_model") or cfg.get("base_model") or "google/gemma-4-31B-it"
+            gpus = ti.get("gpus") or ",".join(str(i) for i in range(max(1, int(gpu_count))))
+            # The merge downloads the (usually gated) base model → inject HF_TOKEN into the
+            # orchestrator's env. Fresh pod = no HF cache, so this is required for gated models.
+            cfg = _cfg_with_hf_token(cfg, base_hf_token)
+            # Build the per-arch venv on the fresh pod (the /share venv doesn't exist here),
+            # then launch the same detached orchestrator the VM path uses.
+            await asyncio.to_thread(_build_llm_venv_ssh, host, int(port), "root", key_filename,
+                                    run_id, cfg, base_model, cfg.get("venv_path"))
+            await _tryit_save(run_id, phase="installing",
+                              message="merging LoRA + starting vLLM — first load is slow …",
+                              expires_at=_tryit_exp())
+            await asyncio.to_thread(
+                _llm_playground_start_ssh, host, int(port), "root", key_filename, run_id,
+                model_s3, creds, cfg, base_model, gpus, run_id,
+                int(ti.get("max_model_len") or 16384), ti.get("vllm_args") or "",
+                ti.get("vllm_version") or "0.23.0")
+            # vLLM readiness is async: poll the pod's ready-file, bumping expiry so the idle
+            # reaper can't kill a still-loading pod. This task stays alive until ready.
+            ssh_pod = (host, int(port), "root", key_filename)
+            deadline = time.time() + 45 * 60
+            while time.time() < deadline:
+                await _tryit_save(run_id, expires_at=_tryit_exp())
+                await asyncio.sleep(20)
+                try:
+                    stt = await asyncio.to_thread(_playground_status_ssh, *ssh_pod, run_id, cfg, "llm")
+                except Exception:  # noqa: BLE001
+                    stt = {}
+                if stt.get("ready"):
+                    await _tryit_save(run_id, phase="ready",
+                                      message="ready — type a prompt and chat", expires_at=_tryit_exp())
+                    return
+            raise RuntimeError("vLLM didn't become ready within 45 min")
         stack = "TTS stack (torch + neucodec)" if kind == "tts" else "Whisper stack (torch + fasttext)"
         await _tryit_save(run_id, pod_id=runpod_id, phase="installing",
                           message=f"installing the {stack} — first load ~10 min …",
@@ -5713,6 +6023,90 @@ def _run_hf_export_ssh(host: str, port: int, user: str, key_filename: str,
             pass
 
 
+def _run_hf_merge_export_ssh(host: str, port: int, user: str, key_filename: str,
+                             run_id: str, model_s3: str, creds: dict, repo: str,
+                             token: str, private: bool, cfg: dict, base_model: str,
+                             arch: str, merge_dtype: str, venv_path: Optional[str],
+                             visible_devices: Optional[str], base_token: Optional[str] = None,
+                             line_sink=None) -> dict:
+    """SSH to a box (the run's VM or a fresh pod), ship hf_export.py + the llm/ dir, then
+    download the LoRA checkpoint from S3 → MERGE it into the base model on GPU (per-arch,
+    via the shipped merge scripts) → upload the merged safetensors to a Hugging Face repo,
+    and return the parsed @@HF {repo, url}. Blocking — call via to_thread. `line_sink(str)`
+    streams every box-side line (download / merge / upload) to the run's logs. The whole
+    script runs under the arch venv python (transformers + peft + boto3 + huggingface_hub).
+    `token` pushes to the destination repo; `base_token` (if given) downloads a gated base
+    model for the merge (else the push token is reused). huggingface.co only (v1)."""
+    cli = _ssh_connect(host, int(port), user, key_filename)
+    try:
+        base = _trainer_script_path().parent  # gateway/gateway/training/
+        # Keep the sgpu_hf_export_<run_id> name so cancel_huggingface_export's pkill matches.
+        remote_py = f"/tmp/sgpu_hf_export_{run_id}.py"
+        remote_cfg = f"/tmp/sgpu_hf_export_{run_id}.json"
+        code_dir = f"/tmp/sgpu_llm_hfexport_{run_id}"
+        _ssh_put(cli, str(base / "hf_export.py"), remote_py)
+        _ssh_put_dir_tar(cli, str(base / "llm"), code_dir)
+        work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
+        venv = (venv_path or f"/share/autotrain-llm-{arch}").rstrip("/")
+        py = f"{venv}/bin/python"
+        tconf = {
+            "model_s3": model_s3,
+            "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+            "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+            "model_dir": f"{work_dir}/sgpu-hf-export/{run_id}/merged",  # merged model → uploaded
+            "ckpt_dir": f"{work_dir}/sgpu-hf-export/{run_id}/ckpt",     # raw LoRA download
+            "repo": repo, "token": token, "private": bool(private),
+            "base_hf_token": base_token or token,    # gated base-model download token (merge)
+            "hf_endpoint": None,                     # merged export → huggingface.co only (v1)
+            "merge": True,
+            "base_model": base_model, "arch": arch,
+            "merge_dtype": merge_dtype or "fp16",
+            "llm_dir": code_dir, "train_py": py,     # merge subprocess runs from the arch venv
+            "visible_devices": visible_devices or "",
+        }
+        # Stream the cfg over stdin (token stays out of argv; consistent with the label path).
+        _ssh_put_bytes(cli, json.dumps(tconf).encode("utf-8"), remote_cfg)
+        user_env = _render_env_exports(cfg.get("env_vars") or {})
+        out: dict = {"result": None, "error": None, "lines": []}
+
+        def on_line(line: str) -> None:
+            j = line.find("@@HF ")
+            if j < 0:
+                if line_sink is not None:
+                    try:
+                        line_sink(line)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if len(out["lines"]) < 400:
+                    out["lines"].append(line)
+                return
+            try:
+                obj = json.loads(line[j + len("@@HF "):])
+            except Exception:  # noqa: BLE001
+                return
+            if obj.get("error"):
+                out["error"] = obj["error"]
+            else:
+                out["result"] = obj
+
+        cmd = (f'{user_env}PY="{py}"; '
+               f'if [ ! -x "$PY" ]; then echo "arch venv python not found at $PY — build the venv first"; exit 1; fi; '
+               f'"$PY" -u {remote_py} --config {remote_cfg} 2>&1; '
+               f'rm -rf {remote_py} {remote_cfg} {code_dir}')
+        rc = _ssh_run_stream(cli, cmd, on_line)
+        if out["error"]:
+            raise RuntimeError(out["error"])
+        if not out["result"]:
+            tail = "\n".join(out["lines"][-15:])
+            raise RuntimeError(f"HF merged export produced no result (rc={rc}):\n{tail}")
+        return out["result"]
+    finally:
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class SynthesizeResponse(BaseModel):
     audio_b64: str          # base64-encoded WAV (PCM_16) the browser can play
     sample_rate: int
@@ -5801,15 +6195,13 @@ async def _playground_validate(run_id: str, user: User, session: AsyncSession):
 
 
 async def _playground_ctx(run_id: str, user: User, session: AsyncSession):
-    """Persistent try-it on the run's OWN box (legacy default — must be a VM).
+    """Persistent try-it on the run's try-it compute — the target chosen at load time
+    (a fresh cloud pod, a chosen VM, or the run's own box), resolved by _resolve_tryit_ssh.
     Returns (row, kind, model_s3, creds, ssh, cfg)."""
     row, kind, model_s3, creds, cfg = await _playground_validate(run_id, user, session)
-    prov = await session.get(Provider, row.provider_id) if row.provider_id else None
-    if prov is None or prov.kind != "vm":
-        raise HTTPException(status_code=400, detail="persistent try-it needs a VM provider")
-    ssh = await _resolve_run_ssh(row)
+    ssh = await _resolve_tryit_ssh(row)
     if ssh is None:
-        raise HTTPException(status_code=400, detail="can't reach the run's VM (SSH coords unavailable)")
+        raise HTTPException(status_code=400, detail="can't reach the try-it compute — load it via 'Try it' first")
     return row, kind, model_s3, creds, ssh, cfg
 
 
@@ -5850,6 +6242,11 @@ async def playground_start(
                     "the defaults; the platform-set flags (model/port/served-name/tp) are rejected."),
     vllm_version: Optional[str] = Query(None,
         description="LLM only: vLLM version to install in the serve venv (default 0.23.0), like serverless/new."),
+    hf_token: Optional[str] = Query(None,
+        description="LLM only: HF token to download the (usually gated) base model for the merge. "
+                    "Needed on a fresh cloud pod / a VM without it cached."),
+    hf_token_secret: Optional[str] = Query(None,
+        description="LLM only: a global-secret key holding the HF base-model token (else platform HF_TOKEN)."),
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -5857,10 +6254,11 @@ async def playground_start(
     per-call model load. The COMPUTE target is chosen here, decoupled from where the
     run trained:
       • cloud → spin up a fresh RunPod pod (gpu_type / gpu_count / cloud_type / account),
-        build the venv (ASR or TTS), keep it warm. Returns phase=provisioning→ready.
+        build the venv, keep it warm. ASR/TTS go phase=provisioning→ready; LLM builds
+        the arch venv + serves vLLM (provisioning→installing→ready once vLLM is healthy).
       • vm    → load a persistent worker on the chosen (or the run's) VM provider.
     Switching target/spec while one is loaded tears the old down first. Poll
-    …/playground/status until ready. LLM (gemma-4) is VM-only and serves via vLLM."""
+    …/playground/status until ready. LLM serves via vLLM on either target."""
     row0 = await _owned(run_id, user, session)
     prov0 = await session.get(Provider, row0.provider_id) if row0.provider_id else None
     kind0 = (row0.task_type or "asr").lower()
@@ -5871,10 +6269,19 @@ async def playground_start(
     ti = _tryit_state(row0)
     cur_target = ti.get("target")
 
+    # LLM merges a (usually gated) base model on the box → the merge's from_pretrained
+    # needs an HF token. Resolve one: explicit paste > referenced global secret > the
+    # platform HF_TOKEN secret. Injected as HF_TOKEN into the box job env (below).
+    base_hf_tok: Optional[str] = None
+    if kind0 == "llm":
+        base_hf_tok = (hf_token or "").strip() or None
+        if not base_hf_tok and (hf_token_secret or "").strip():
+            from .global_env_api import load_global_env
+            base_hf_tok = (await load_global_env(session)).get(hf_token_secret.strip())
+        if not base_hf_tok:
+            base_hf_tok = (await _resolve_global_env()).get("HF_TOKEN")
+
     if eff_target == "cloud":
-        if kind0 == "llm":
-            raise HTTPException(status_code=400,
-                detail="LLM try-it needs a VM (vLLM); cloud try-it supports ASR / TTS only")
         if row0.status != "done":
             raise HTTPException(status_code=400, detail="the run must finish training first")
         if not ((row0.result_json or {}).get("artifact") or {}).get("s3_uri"):
@@ -5887,6 +6294,22 @@ async def playground_start(
         ctype = (cloud_type or "").strip().upper()
         if ctype not in ("SECURE", "COMMUNITY"):
             ctype = "SECURE"
+        # LLM: a fresh dedicated pod has exactly `gcount` GPUs → serve tensor-parallel
+        # across all of them; validate the optional vLLM args like the VM path. The knobs
+        # are stashed in try-it state for _tryit_cloud_setup's LLM branch to consume.
+        llm_extra: dict = {}
+        if kind0 == "llm":
+            va = (vllm_args or "").strip()
+            if va:
+                from .main import _validate_vllm_args, _VLLM_RESERVED_MULTI
+                _validate_vllm_args(va, label="vLLM args", reserved=_VLLM_RESERVED_MULTI)
+            llm_extra = {
+                "gpus": ",".join(str(i) for i in range(gcount)),
+                "vllm_args": va,
+                "vllm_version": (vllm_version or "").strip() or "0.23.0",
+                "base_model": row0.base_model or (row0.config_json or {}).get("base_model") or "",
+                "max_model_len": 16384,
+            }
         # Idempotent: same cloud spec already provisioning/ready → just report it.
         same_spec = (cur_target == "cloud" and ti.get("provider_id") == acct
                      and ti.get("gpu_type") == gtype and int(ti.get("gpu_count") or 1) == gcount
@@ -5898,9 +6321,11 @@ async def playground_start(
             await _tryit_teardown(run_id)
         await _tryit_save(run_id, target="cloud", provider_id=acct, kind=kind0,
                           gpu_type=gtype, gpu_count=gcount, cloud_type=ctype,
-                          phase="provisioning", message="starting a GPU pod …", expires_at=_tryit_exp())
+                          phase="provisioning", message="starting a GPU pod …",
+                          expires_at=_tryit_exp(), **llm_extra)
         _tryit_tasks[run_id] = asyncio.create_task(_tryit_cloud_setup(
-            run_id, gpu_type=gtype, gpu_count=gcount, cloud_type=ctype, provider_id=acct, kind=kind0))
+            run_id, gpu_type=gtype, gpu_count=gcount, cloud_type=ctype, provider_id=acct,
+            kind=kind0, base_hf_token=base_hf_tok))
         async with session_factory()() as s:
             row0 = await s.get(TrainingRun, run_id)
         return _tryit_status(row0)
@@ -5931,6 +6356,7 @@ async def playground_start(
             from .main import _validate_vllm_args, _VLLM_RESERVED_MULTI
             _validate_vllm_args(va, label="vLLM args", reserved=_VLLM_RESERVED_MULTI)
         vver = (vllm_version or "").strip() or "0.23.0"
+        cfg = _cfg_with_hf_token(cfg, base_hf_tok)  # merge downloads the gated base
         try:
             st = await asyncio.to_thread(_llm_playground_start_ssh, *ssh, run_id, model_s3, creds, cfg,
                                          (row.base_model or cfg.get("base_model") or "google/gemma-4-31B-it"),
@@ -5957,7 +6383,13 @@ async def playground_status(
 ):
     row0 = await _owned(run_id, user, session)
     prov0 = await session.get(Provider, row0.provider_id) if row0.provider_id else None
-    if (row0.task_type or "asr").lower() == "asr" and (prov0 is None or prov0.kind != "vm"):
+    ti = _tryit_state(row0)
+    # Cloud try-it (any task type, incl. LLM): the setup task owns the phase
+    # (provisioning→installing→ready — including the LLM merge + vLLM readiness), so
+    # report it without SSHing (the pod may not be up yet). Also covers legacy cloud-ASR
+    # runs with no try-it target recorded (never loaded → phase None → not running).
+    if ti.get("target") == "cloud" or (
+            (row0.task_type or "asr").lower() == "asr" and (prov0 is None or prov0.kind != "vm")):
         return _tryit_status(row0)   # cloud try-it pod phase (provisioning/installing/ready/error)
     row, kind, _m, _c, ssh, cfg = await _playground_ctx(run_id, user, session)
     try:
@@ -5977,9 +6409,13 @@ async def playground_stop(
     For a cloud try-it run this terminates the on-demand pod entirely."""
     row0 = await _owned(run_id, user, session)
     prov0 = await session.get(Provider, row0.provider_id) if row0.provider_id else None
-    if (row0.task_type or "asr").lower() == "asr" and (prov0 is None or prov0.kind != "vm"):
+    ti = _tryit_state(row0)
+    # Cloud try-it (any task type): tearing down = terminating the on-demand pod.
+    if ti.get("target") == "cloud" or (
+            (row0.task_type or "asr").lower() == "asr" and (prov0 is None or prov0.kind != "vm")):
         await _tryit_teardown(run_id)
-        return PlaygroundStatus(running=False, ready=False, kind="asr",
+        return PlaygroundStatus(running=False, ready=False,
+                                kind=ti.get("kind") or (row0.task_type or "asr"),
                                 logs=["[try-it] pod torn down"])
     row, kind, _m, _c, ssh, cfg = await _playground_ctx(run_id, user, session)
     try:
@@ -6009,6 +6445,10 @@ async def playground_chat(run_id: str, request: Request):
             raise HTTPException(status_code=400, detail="chat is for LLM runs")
         paths = _playground_paths(cfg, run_id, "llm")
         vport = paths["port"]
+        # Keep a cloud try-it pod alive across chats (else the idle reaper could reap it
+        # mid-conversation — the setup task only bumps expiry until it goes ready).
+        if _tryit_state(row).get("target") == "cloud":
+            await _tryit_save(run_id, expires_at=_tryit_exp())
     host, p, suser, key = ssh
 
     msgs = body.get("messages") or []

@@ -25,7 +25,15 @@ import type { ProviderRecord, ProviderBalance, TryItTarget } from "@/lib/types";
 // meaningless for the cloud target (the fresh pod has its own single device). In
 // LLM mode `gpu` holds a comma-separated GPU list (tensor-parallel, e.g. "6,7") and
 // `vllmArgs` is appended to `vllm serve` verbatim.
-export type ComputeChoice = TryItTarget & { gpu: string; vllmArgs?: string; vllmVersion?: string };
+export type ComputeChoice = TryItTarget & {
+  gpu: string;
+  vllmArgs?: string;
+  vllmVersion?: string;
+  // LLM base-model (gated) download token for the merge — a pasted token or a global
+  // secret key. Needed on a fresh cloud pod. Empty → the platform HF_TOKEN secret.
+  hfToken?: string;
+  hfTokenSecret?: string;
+};
 
 // Radix <Select> forbids an empty value, so use sentinels.
 const AUTO = "auto";
@@ -132,10 +140,23 @@ export function TryItCompute({
   const [balance, setBalance] = useState<ProviderBalance | null>(null);
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [vmAvail, setVmAvail] = useState<VmAvailState>({ status: "idle" });
+  // LLM base-model (gated) download token source (cloud only): reuse the platform
+  // HF_TOKEN, pick a global secret, or paste one.
+  const [tokenSource, setTokenSource] = useState<"reuse" | "secret" | "paste">("reuse");
+  const [secretKeys, setSecretKeys] = useState<string[]>([]);
 
   useEffect(() => {
     gateway.listProviders().then(setProviders).catch(() => {});
   }, []);
+
+  // Global-secret keys the base-model HF token can reference (LLM cloud merge).
+  useEffect(() => {
+    if (!llm) return;
+    fetch("/api/proxy/v1/global-env", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => { if (Array.isArray(rows)) setSecretKeys(rows.map((x: { key: string }) => x.key)); })
+      .catch(() => {});
+  }, [llm]);
 
   const runpods = providers.filter((p) => p.kind === "runpod");
   const vms = providers.filter((p) => p.kind === "vm");
@@ -185,14 +206,16 @@ export function TryItCompute({
   const showPins = value.provider_id && value.provider_id === runProviderId ? pins : [];
 
   function pickCloud() {
-    onChange({
+    const base: ComputeChoice = {
       target: "cloud",
       provider_id: runpods.some((p) => p.id === value.provider_id) ? value.provider_id : (runpods[0]?.id ?? null),
       gpu_type: value.gpu_type || "L40S",
       gpu_count: value.gpu_count || 1,
       cloud_type: value.cloud_type || "SECURE",
       gpu: AUTO,
-    });
+    };
+    // LLM cloud serves via vLLM (TP = pod GPU count) — carry the vLLM knobs across.
+    onChange(llm ? { ...base, vllmArgs: value.vllmArgs, vllmVersion: value.vllmVersion } : base);
   }
   function pickVm() {
     const provider_id = vms.some((p) => p.id === value.provider_id)
@@ -208,19 +231,17 @@ export function TryItCompute({
       {/* Run on — same card as the Export-to-Label tab / serverless/new */}
       <Section
         title="Run on"
-        description={llm
-          ? "LLM serves via vLLM on a registered VM. Cloud pods aren't supported for chat try-it."
-          : "Default cloud spawns a fresh RunPod pod for inference, then auto-stops when idle. Bare metal runs on a VM you've registered under GPU Providers."}
+        description="Default cloud spawns a fresh RunPod pod for inference, then auto-stops when idle. Bare metal runs on a VM you've registered under GPU Providers."
       >
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           <RunOnCard
             active={isCloud}
             onClick={pickCloud}
-            disabled={disabled || llm}
+            disabled={disabled}
             icon={<Cpu className="h-4 w-4" />}
             title="Default cloud (RunPod)"
             subtitle={llm
-              ? "Not available for LLM — vLLM runs on a VM."
+              ? "Fresh pod on demand — builds the LLM stack, merges the LoRA, then serves vLLM. First load is slow; pay-per-second."
               : "Provision a fresh pod on demand, then auto-stop when idle. Pay-per-second."}
           />
           <RunOnCard
@@ -326,6 +347,37 @@ export function TryItCompute({
                     </SelectContent>
                   </Select>
                 </div>
+
+                {llm && (
+                  <>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">vLLM version</Label>
+                      <Input
+                        value={value.vllmVersion ?? ""}
+                        onChange={(e) => onChange({ ...value, vllmVersion: e.target.value })}
+                        disabled={disabled}
+                        placeholder="0.23.0"
+                        className="w-32 font-mono text-xs"
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Installed in the serve venv (default 0.23.0). The LoRA is merged (FP8→fp16 for MiniMax/Mistral) then served tensor-parallel across all {value.gpu_count || 1} pod GPU(s).
+                      </p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Custom vLLM args (optional)</Label>
+                      <Input
+                        value={value.vllmArgs ?? ""}
+                        onChange={(e) => onChange({ ...value, vllmArgs: e.target.value })}
+                        disabled={disabled}
+                        placeholder="--enable-auto-tool-choice --tool-call-parser hermes --max-model-len 32768"
+                        className="font-mono text-[11px]"
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Appended to <span className="font-mono">vllm serve</span> verbatim. Platform-set flags (model / port / served-name / tensor-parallel) are rejected.
+                      </p>
+                    </div>
+                  </>
+                )}
               </div>
             )
           ) : (

@@ -472,7 +472,31 @@ export const gateway = {
    * the background; status + link land in result_json.hf_export. */
   exportToHuggingFace: (
     id: string,
-    body: { repo: string; storage_id?: string | null; private?: boolean },
+    body: {
+      repo: string;
+      storage_id?: string | null;
+      private?: boolean;
+      // HF token for downloading a GATED BASE MODEL during an LLM merge (a pasted token
+      // or a global-secret key). Separate from the storage's push token.
+      base_hf_token?: string;
+      base_hf_token_secret?: string;
+      // Optional GPU-merge + run-on fields (LLM merges its raw LoRA into a loadable
+      // model; ASR/TTS artifacts are already merged). Mirrors retryLabelExport's body.
+      merge?: boolean;
+      merge_dtype?: string;
+      run_on?: "vm" | "cloud";
+      provider_id?: string | null;
+      gpu_type?: string;
+      gpu_count?: number;
+      secure_cloud?: boolean;
+      data_center_id?: string | null;
+      disk_gb?: number;
+      volume_gb?: number;
+      visible_devices?: string | null;
+      venv_path?: string | null;
+      image?: string | null;
+      vllm_version?: string | null;
+    },
   ) =>
     request<{ status: string }>(
       `/v1/training-runs/${encodeURIComponent(id)}/hf-export`,
@@ -531,7 +555,7 @@ export const gateway = {
    * (subsequent transcribe/synthesize skip the per-request model load). The
    * compute target (a fresh RunPod pod or a registered VM) is chosen per-call —
    * see TryItTarget; omitting it preserves the legacy run's-own-box behaviour. */
-  playgroundStart: (id: string, opts?: Partial<TryItTarget> & { gpu?: string; vllmArgs?: string; vllmVersion?: string }) => {
+  playgroundStart: (id: string, opts?: Partial<TryItTarget> & { gpu?: string; vllmArgs?: string; vllmVersion?: string; hfToken?: string; hfTokenSecret?: string }) => {
     const qs = new URLSearchParams();
     if (opts?.target) qs.set("target", opts.target);
     if (opts?.target === "cloud") {
@@ -545,6 +569,9 @@ export const gateway = {
     if (opts?.gpu) qs.set("gpu", opts.gpu);
     if (opts?.vllmArgs && opts.vllmArgs.trim()) qs.set("vllm_args", opts.vllmArgs.trim());
     if (opts?.vllmVersion && opts.vllmVersion.trim()) qs.set("vllm_version", opts.vllmVersion.trim());
+    // LLM base-model (gated) download token for the merge.
+    if (opts?.hfToken && opts.hfToken.trim()) qs.set("hf_token", opts.hfToken.trim());
+    if (opts?.hfTokenSecret && opts.hfTokenSecret.trim()) qs.set("hf_token_secret", opts.hfTokenSecret.trim());
     const q = qs.toString();
     return request<{ running: boolean; ready: boolean; device?: string; kind?: string; logs?: string[] }>(
       `/v1/training-runs/${encodeURIComponent(id)}/playground/start${q ? `?${q}` : ""}`,

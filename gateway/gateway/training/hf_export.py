@@ -14,6 +14,12 @@ Config (JSON via --config):
    private, hf_endpoint}
 `endpoint` is the S3 endpoint; `hf_endpoint` (optional) is a custom Hugging Face
 Hub (HF_ENDPOINT) — None/"" → huggingface.co.
+
+LLM merge mode (merge=true): the S3 artifact is a raw LoRA checkpoint, not a loadable
+model. We download it to `ckpt_dir`, merge it into `base_model` on GPU (per-arch, via
+the shipped llm/ merge scripts run with `train_py`), write the merged HF model to
+`model_dir`, then upload that. Extra keys: {merge, base_model, arch, merge_dtype,
+llm_dir, train_py, ckpt_dir, visible_devices}.
 """
 from __future__ import annotations
 
@@ -86,6 +92,58 @@ def _download_model(cfg: dict) -> str:
     return dest
 
 
+def _merge_lora(cfg: dict) -> str:
+    """LLM merge mode: download the raw LoRA checkpoint from S3, merge it into the base
+    model on GPU (per-arch, via the shipped llm/ merge scripts), and return the merged
+    dir — a loadable HF model folder. Reuses llm_playground.merge_lora_to_dir +
+    ensure_processor_configs (imported from the shipped `llm_dir`)."""
+    import sys as _sys
+
+    # 1) Download the checkpoint (lora.pt + lora_meta.json) into ckpt_dir.
+    ckpt_dir = cfg["ckpt_dir"]
+    _download_model({**cfg, "model_dir": ckpt_dir})
+    lora = os.path.join(ckpt_dir, "lora.pt")
+    if not os.path.exists(lora):
+        pts = [f for f in os.listdir(ckpt_dir) if f.endswith(".pt")]
+        if not pts:
+            raise RuntimeError(f"no LoRA checkpoint (.pt) found under {cfg['model_s3']}")
+        lora = os.path.join(ckpt_dir, pts[0])
+
+    # 2) Merge LoRA → base on GPU. merge_lora_to_dir dispatches per-arch (gemma folds bf16
+    #    via merge_infer.py; qwen/minimax/mistral dequant+fold via their merge scripts).
+    merged = cfg["model_dir"]
+    llm_dir = cfg["llm_dir"]
+    _sys.path.insert(0, llm_dir)
+    from llm_playground import merge_lora_to_dir, ensure_processor_configs
+
+    base_model = cfg.get("base_model") or ""
+    env = dict(os.environ)
+    if cfg.get("visible_devices"):
+        env["CUDA_VISIBLE_DEVICES"] = str(cfg["visible_devices"])
+    # The base model is usually gated (e.g. google/gemma-*) → the merge's from_pretrained
+    # needs an HF token WITH access to the BASE model (a different account than the push
+    # target may own). Use base_hf_token (set by the caller; falls back to the push token).
+    tok = (cfg.get("base_hf_token") or cfg.get("token") or "").strip()
+    if tok:
+        env["HF_TOKEN"] = tok
+        env["HUGGING_FACE_HUB_TOKEN"] = tok
+        env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    train_py = cfg.get("train_py") or _sys.executable
+    log(f"merging LoRA into {base_model} → {merged} (dtype={cfg.get('merge_dtype') or 'fp16'}) …")
+    rc = merge_lora_to_dir(base_model, lora, merged, train_py, llm_dir,
+                           dtype=(cfg.get("merge_dtype") or "fp16"), env=env)
+    if rc != 0:
+        raise RuntimeError(f"LoRA merge failed (rc={rc})")
+    # Multimodal archs (gemma/mistral) need their processor/preprocessor configs alongside
+    # the merged weights for the repo to load + serve downstream.
+    try:
+        ensure_processor_configs(base_model, merged)
+    except Exception as e:  # noqa: BLE001
+        log(f"processor-config fixup skipped: {e}")
+    log(f"merged model ready at {merged}")
+    return merged
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -109,7 +167,7 @@ def main() -> int:
     if hf_endpoint:
         os.environ["HF_HUB_DISABLE_XET"] = "1"
 
-    model_dir = _download_model(cfg)
+    model_dir = _merge_lora(cfg) if cfg.get("merge") else _download_model(cfg)
 
     from huggingface_hub import HfApi
     api = HfApi(token=token, endpoint=hf_endpoint)
