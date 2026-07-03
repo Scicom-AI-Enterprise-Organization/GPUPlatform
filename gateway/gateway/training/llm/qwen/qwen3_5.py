@@ -33,6 +33,7 @@ from functools import partial
 from tqdm import tqdm
 import argparse
 from chinidataset import StreamingDataset
+import _trainer_common as tc
 from flash_qla import chunk_gated_delta_rule
 
 
@@ -279,6 +280,7 @@ def main(
         model_id:str = "Qwen/Qwen3.6-27B",
         checkpoint_dir:str = "checkpointing",
         grad_accum:int = 1,
+        cpu_offload:bool = False,
     ):
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -309,40 +311,18 @@ def main(
     total_trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     logger.info(f"Total trainable parameters: {total_trainable_params/(1024*1024):.2f}M")
 
-    fsdp_kwargs = {}
-    fsdp_kwargs["mp_policy"] = fsdp.MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-    )
-    fsdp_kwargs["offload_policy"] = fsdp.CPUOffloadPolicy()
-    shard_modules = (
-        classes["decoder"],   # Qwen3_5DecoderLayer / Qwen3_5MoeDecoderLayer
-        classes["vision"],    # Qwen3_5VisionBlock  / Qwen3_5MoeVisionBlock
-    )
-
-    for module in model.modules():
-        if isinstance(module, shard_modules):
-            fsdp.fully_shard(module, **fsdp_kwargs, mesh=mesh_device, reshard_after_forward=True) # shard on submodules
-    fsdp.fully_shard(model, **fsdp_kwargs, mesh=mesh_device) # full shard on root module
+    # FSDP2 shard + activation-checkpoint via the shared helper. Qwen3.5 is multimodal —
+    # shard the decoder AND vision blocks (reshard_after_forward), but checkpoint only
+    # the decoder layers (param_dtype=bf16 dense; cpu_offload is the opt-in VRAM knob).
+    kw = tc.fsdp_kwargs(mesh_device, param_dtype=torch.bfloat16, cpu_offload=cpu_offload)
+    tc.shard_layers(model, (classes["decoder"], classes["vision"]), kw, reshard_after_forward=True)
 
     # Get the local shard
     model_sd = model.state_dict()
     local_shard = sum(v.to_local().numel() if hasattr(v, "to_local") else v.numel() for _ , v in model_sd.items())
     logger.info(f"[Rank{rank}]: Total local/shard param: {local_shard/(1024*1024):.2f}M")
 
-    # checkpointing module
-    checkpointing_modules = [
-        classes["decoder"],   # Qwen3_5DecoderLayer / Qwen3_5MoeDecoderLayer
-    ]
-    non_reentrant_wrapper = partial(
-        checkpoint_wrapper,
-        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-    )
-    apply_activation_checkpointing(
-        model,
-        checkpoint_wrapper_fn = non_reentrant_wrapper,
-        check_fn=lambda x: isinstance(x, tuple(checkpointing_modules))
-    )
+    tc.checkpoint_layers(model, classes["decoder"])
 
     def _patched_chunk_gated_delta_rule(q, k, v, *args, **kwargs):
         # TileLang kernel requires v to be contiguous (stride[-1] == 1)
@@ -536,55 +516,10 @@ if __name__ == "__main__":
         default=512,
         help="LoRA alpha scaling factor"
     )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Packed bins concatenated into ONE sequence per optimizer microbatch "
-             "(the collator varlen-packs them). 1 = one bin per step."
-    )
-    parser.add_argument(
-        "--grad_accum",
-        type=int,
-        default=1,
-        help="Accumulate gradients over this many microbatches before an optimizer "
-             "step. Effective batch = batch_size × grad_accum × world_size. 1 = off.",
-    )
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=0,
-        help="Stop after this many optimizer steps (0 = full epoch). Use a small value to "
-             "produce a LoRA checkpoint quickly for merge/inference validation.",
-    )
-    parser.add_argument(
-        "--checkpointing_step",
-        type=int,
-        default=100,
-        help="Save the LoRA adapters every N steps.",
-    )
-    parser.add_argument(
-        "--limit_samples",
-        type=int,
-        default=0,
-        help="Cap the dataset to the first N packed bins (0 = all). Use a small N to deliberately "
-             "overfit a tiny subset as an end-to-end sanity check.",
-    )
-    parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=1,
-        help="Number of epochs over the dataset (set high to overfit a small dataset).",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
-        help="AdamW learning rate.",
-    )
-    parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases.")
+    # batch_size / grad_accum / cpu_offload / max_epochs / max_steps / checkpointing_step
+    # / limit_samples / lr / wandb[_project] — shared across all LLM trainers.
+    tc.add_common_args(parser, lr_default=1e-4, wandb_project="qwen3.5-autotrain")
     parser.add_argument("--mlflow", action="store_true", help="Log metrics to MLflow.")
-    parser.add_argument("--wandb_project", default="qwen3.5-autotrain", help="wandb project name.")
     parser.add_argument("--mlflow_experiment", default="qwen3.5-autotrain", help="mlflow experiment name.")
     parser.add_argument(
         "--model_id",
@@ -619,4 +554,5 @@ if __name__ == "__main__":
         args.model_id,
         args.checkpoint_dir,
         args.grad_accum,
+        args.cpu_offload,
     )

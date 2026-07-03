@@ -2722,6 +2722,9 @@ class CreateTrainingRunRequest(BaseModel):
     split_seed: int = 42
     batch_size: int = 8
     grad_accum: int = 1
+    # LLM FSDP CPU offload (params/optimizer in host RAM: big VRAM saver, PCIe-slow).
+    # None = per-arch default (gemma/qwen ON, minimax/mistral OFF); the form sets it.
+    cpu_offload: Optional[bool] = None
     learning_rate: float = 1e-5
     warmup_steps: int = 0
     # HF LR schedule: linear (warmup→linear decay, the default), cosine,
@@ -3121,7 +3124,8 @@ async def create_training_run(
         "patience": body.patience, "eval_split_pct": body.eval_split_pct,
         "no_eval": bool(body.no_eval),
         "split_seed": body.split_seed, "batch_size": body.batch_size,
-        "grad_accum": body.grad_accum, "learning_rate": body.learning_rate,
+        "grad_accum": body.grad_accum, "cpu_offload": body.cpu_offload,
+        "learning_rate": body.learning_rate,
         "warmup_steps": body.warmup_steps, "lr_scheduler_type": body.lr_scheduler_type,
         "weight_decay": body.weight_decay,
         # LLM finetune (gemma4) is always LoRA — force it on regardless of the toggle.

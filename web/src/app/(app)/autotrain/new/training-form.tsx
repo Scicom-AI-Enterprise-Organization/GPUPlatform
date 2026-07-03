@@ -112,6 +112,13 @@ function llmLoraDefaults(model: string): { r: number; ratio: number } {
   const a = llmArch(model);
   return a === "gemma" || a === "qwen" ? { r: 256, ratio: 2 } : { r: 16, ratio: 1 };
 }
+// FSDP CPU-offload default per arch (matches the gateway's _cpu_offload_on): the dense
+// gemma/qwen trainers hit the VRAM wall at long context → offload ON; the FP8-MoE
+// minimax/mistral fit without it and offload only slows them → OFF.
+function llmCpuOffloadDefault(model: string): boolean {
+  const a = llmArch(model);
+  return a === "gemma" || a === "qwen";
+}
 // Each arch needs a different `kernels` pin → separate uv venvs (matches the
 // gateway's /share/autotrain-llm-<arch> default).
 function llmVenvFor(model: string): string {
@@ -288,6 +295,11 @@ export function TrainingForm() {
   // TTS trains on a pre-packed dataset: block size follows the dataset's
   // sequence_length and the tokenizer is the base model's — neither is asked here.
   const [gradAccum, setGradAccum] = useState(4);
+  // LLM-only: FSDP CPU offload (params/optimizer in host RAM — big VRAM saver, PCIe-slow).
+  // Arch-aware default (gemma/qwen ON, minimax/mistral OFF); set on model/task change.
+  const [cpuOffload, setCpuOffload] = useState(
+    initialTask === "llm" ? llmCpuOffloadDefault(DEFAULT_LLM_BASE) : true,
+  );
   // training
   const [evalMetric, setEvalMetric] = useState<"wer" | "cer">("wer");
   const [normalizeText, setNormalizeText] = useState(true);
@@ -484,6 +496,7 @@ export function TrainingForm() {
         if (c.eval_split_pct != null) setEvalSplitPct(num(c.eval_split_pct, 10));
         // training
         if (c.grad_accum != null) setGradAccum(num(c.grad_accum, 4));
+        if (c.cpu_offload != null) setCpuOffload(!!c.cpu_offload);
         if (c.eval_metric === "wer" || c.eval_metric === "cer") setEvalMetric(c.eval_metric);
         if (c.normalize_text != null) setNormalizeText(!!c.normalize_text);
         if (c.max_epochs != null) setMaxEpochs(num(c.max_epochs, 3));
@@ -690,6 +703,7 @@ export function TrainingForm() {
     const d = llmLoraDefaults(v);
     setLoraR((r) => ([16, 256].includes(r) ? d.r : r));
     setLoraAlphaRatio((a) => ([1, 2].includes(a) ? d.ratio : a));
+    setCpuOffload(llmCpuOffloadDefault(v));  // dense → offload on, FP8-MoE → off
   }
 
   function pickTask(t: "asr" | "tts" | "llm") {
@@ -701,6 +715,8 @@ export function TrainingForm() {
     // Only swap when still at the other task's default, else keep the user's choice.
     if (t === "llm") setBatchSize((b) => (b === 8 ? 1 : b));
     else setBatchSize((b) => (b === 1 ? 8 : b));
+    if (t === "llm") setCpuOffload(llmCpuOffloadDefault(modelFor));  // arch-aware offload default
+
     // Swap the default uv venv path when the user hasn't customized it (i.e. it's
     // still one of the per-task defaults). LLM venv is arch-specific.
     const venvFor = t === "tts" ? "/share/autotrain-tts" : t === "llm" ? llmVenvFor(modelFor) : "/share/autotrain-whisper";
@@ -853,6 +869,8 @@ export function TrainingForm() {
       eval_split_pct: evalSplitPct,
       batch_size: batchSize,
       grad_accum: gradAccum,
+      // LLM-only FSDP CPU offload; null for ASR/TTS (trainers ignore it).
+      cpu_offload: isLlm ? cpuOffload : null,
       learning_rate: Number(learningRate) || (isTts ? 2e-5 : isLlm ? 5e-5 : 1e-5),
       weight_decay: weightDecay,
       warmup_steps: warmupSteps,
@@ -1245,6 +1263,18 @@ export function TrainingForm() {
             </FieldWrap>
           ) : (
             <FieldWrap label="Grad accumulation"><NumberField min={1} value={gradAccum} onChange={setGradAccum} /></FieldWrap>
+          )}
+          {isLlm && !sweepOn && (
+            <FieldWrap label="CPU offload"
+              hint={cpuOffload
+                ? "FSDP keeps params/optimizer in host RAM — fits long context / tight VRAM, but PCIe-bound (slower). Off is faster on big-VRAM GPUs (e.g. H20)."
+                : "Params/optimizer stay on the GPU (faster). Turn on if you OOM at long context / on smaller GPUs."}>
+              <label className="flex h-9 cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={cpuOffload} onChange={(e) => setCpuOffload(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span className="font-medium">{cpuOffload ? "On" : "Off"}</span>
+              </label>
+            </FieldWrap>
           )}
           {sweepOn ? (
             <FieldWrap label="Weight decay" hint="AdamW L2 — e.g. 0, 0.01, 0.1">

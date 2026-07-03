@@ -41,6 +41,7 @@ from transformers import AutoConfig, MiniMaxM2ForCausalLM
 from transformers.models.minimax_m2 import modeling_minimax_m2
 
 from chinidataset import StreamingDataset
+import _trainer_common as tc
 from lora import ATTN_TARGETS, apply_minimax_lora
 
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
@@ -276,17 +277,10 @@ def main(args):
     # param_dtype is left at None: FSDP2 must NOT cast the frozen FP8 weights to bf16 (that
     # would defeat the block-scale dequant). Each param keeps its storage dtype (fp8 frozen,
     # bf16 LoRA/norms, fp32 scales); only gradient reduction is forced to fp32.
-    fsdp_kwargs = {
-        "mp_policy": fsdp.MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32),
-        "mesh": mesh,
-    }
-    if args.cpu_offload:
-        fsdp_kwargs["offload_policy"] = fsdp.CPUOffloadPolicy()
-
-    for module in model.modules():
-        if isinstance(module, modeling_minimax_m2.MiniMaxM2DecoderLayer):
-            fsdp.fully_shard(module, **fsdp_kwargs)
-    fsdp.fully_shard(model, **fsdp_kwargs)
+    # param_dtype=None so FSDP2 does NOT cast the frozen FP8 weights to bf16 (that would
+    # defeat the block-scale dequant); only gradient reduction is forced to fp32.
+    kw = tc.fsdp_kwargs(mesh, param_dtype=None, cpu_offload=args.cpu_offload)
+    tc.shard_layers(model, modeling_minimax_m2.MiniMaxM2DecoderLayer, kw)
 
     # ---- low-CPU path: materialise the sharded meta model, then stream base weights in ----
     if args.low_cpu_shard_load:
@@ -298,12 +292,7 @@ def main(args):
     # ---- activation checkpointing (REQUIRED for the dequant memory trick) ----
     # Each decoder layer's forward (incl. the transient bf16 weight dequant) is recomputed in
     # the backward instead of retained, so peak memory stays ~ one layer's bf16 weights.
-    non_reentrant = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
-    apply_activation_checkpointing(
-        model,
-        checkpoint_wrapper_fn=non_reentrant,
-        check_fn=lambda m: isinstance(m, modeling_minimax_m2.MiniMaxM2DecoderLayer),
-    )
+    tc.checkpoint_layers(model, modeling_minimax_m2.MiniMaxM2DecoderLayer)
 
     model_sd = model.state_dict()
     local_shard = sum(v.to_local().numel() if hasattr(v, "to_local") else v.numel()
@@ -441,23 +430,14 @@ if __name__ == "__main__":
     p.add_argument("--moe_r", type=int, default=16, help="LoRA rank for MoE expert FFNs.")
     p.add_argument("--moe_alpha", type=float, default=16.0, help="LoRA alpha for MoE experts.")
     p.add_argument("--no_moe_lora", action="store_true", help="Adapt attention only (skip MoE experts).")
-    p.add_argument("--batch_size", type=int, default=1, help="Packed bins concatenated into one sequence per microbatch (collator varlen-packs).")
-    p.add_argument("--grad_accum", type=int, default=1,
-                   help="Accumulate gradients over N microbatches before an optimizer step. "
-                        "Effective batch = batch_size × grad_accum × world_size. 1 = off.")
-    p.add_argument("--lr", type=float, default=1e-5, help="AdamW LR (gemma4 lesson: 1e-5..5e-5 for LoRA).")
+    # batch_size / grad_accum / cpu_offload / max_epochs / max_steps / checkpointing_step
+    # / limit_samples / lr / wandb[_project] — shared across all LLM trainers.
+    tc.add_common_args(p, lr_default=1e-5, wandb_project="minimax-m2-autotrain")
     p.add_argument("--weight_decay", type=float, default=0.0)
-    p.add_argument("--max_epochs", type=int, default=1)
-    p.add_argument("--max_steps", type=int, default=0, help="Hard stop after N steps (0 = all epochs).")
-    p.add_argument("--checkpointing_step", type=int, default=100)
-    p.add_argument("--limit_samples", type=int, default=0, help="Cap dataset to first N bins (0 = all).")
     p.add_argument("--data_dir", default="./packed_data")
     p.add_argument("--out_dir", default="./checkpointing")
-    p.add_argument("--cpu_offload", action="store_true", help="FSDP2 CPUOffloadPolicy (slow; for tight VRAM).")
     p.add_argument("--low_cpu_shard_load", action="store_true",
                    help="Meta-init the FP8 structure on every rank + stream base weights from rank 0 "
                         "(DCP broadcast) into each shard. Caps CPU at ~one model copy instead of "
                         "~230GB x world_size. Default path loads the full model on every rank.")
-    p.add_argument("--wandb", action="store_true")
-    p.add_argument("--wandb_project", default="minimax-m2-autotrain")
     main(p.parse_args())

@@ -29,6 +29,7 @@ import argparse
 from typing import Optional
 import mlflow
 from chinidataset import StreamingDataset
+import _trainer_common as tc
 from contextlib import nullcontext
 from attention import dynamic_attention, block_diagonal_concat
 from gemma4_fa4_attention import fa4_attention
@@ -252,6 +253,7 @@ def main(
         use_wandb:bool = False,
         wandb_project:str = "gemma4-autotrain",
         grad_accum:int = 1,
+        cpu_offload:bool = False,
         target_modules=None,
     ):
     rank = int(os.environ["LOCAL_RANK"])
@@ -288,39 +290,17 @@ def main(
     total_trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     logger.info(f"Total trainable parameters: {total_trainable_params/(1024*1024):.2f}M")
 
-    fsdp_kwargs = {}
-    fsdp_kwargs["mp_policy"] = fsdp.MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-    )
-    fsdp_kwargs["offload_policy"] = fsdp.CPUOffloadPolicy()
-    shard_modules = (
-        modeling_gemma4.Gemma4TextDecoderLayer
-    )
-
-    for module in model.modules():
-        if isinstance(module, shard_modules):
-            fsdp.fully_shard(module, **fsdp_kwargs, mesh=mesh_device)
-    fsdp.fully_shard(model, **fsdp_kwargs, mesh=mesh_device) # full shard on root module
+    # FSDP2 shard + activation-checkpoint via the shared helper (param_dtype=bf16 dense;
+    # cpu_offload is the opt-in VRAM↔speed knob — see _trainer_common.fsdp_kwargs).
+    kw = tc.fsdp_kwargs(mesh_device, param_dtype=torch.bfloat16, cpu_offload=cpu_offload)
+    tc.shard_layers(model, modeling_gemma4.Gemma4TextDecoderLayer, kw)
 
     # Get the local shard
     model_sd = model.state_dict()
     local_shard = sum(v.to_local().numel() if hasattr(v, "to_local") else v.numel() for _ , v in model_sd.items())
     logger.info(f"[Rank{rank}]: Total local/shard param: {local_shard/(1024*1024):.2f}M")
 
-    # checkpointing module 
-    checkpointing_modules = [
-        modeling_gemma4.Gemma4TextDecoderLayer
-    ]
-    non_reentrant_wrapper = partial(
-        checkpoint_wrapper,
-        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-    )
-    apply_activation_checkpointing(
-        model, 
-        checkpoint_wrapper_fn = non_reentrant_wrapper,
-        check_fn=lambda x: isinstance(x, tuple(checkpointing_modules))
-    )
+    tc.checkpoint_layers(model, modeling_gemma4.Gemma4TextDecoderLayer)
     
     # max_steps > 0 caps the run regardless of epochs (0 = run all max_epochs). For overfitting a
     # small dataset, set max_epochs high and max_steps 0.
@@ -488,54 +468,9 @@ if __name__ == "__main__":
         default=512,
         help="LoRA alpha scaling factor"
     )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Packed bins concatenated into ONE sequence per optimizer microbatch "
-             "(the collator varlen-packs them). 1 = one bin per step."
-    )
-    parser.add_argument(
-        "--grad_accum",
-        type=int,
-        default=1,
-        help="Accumulate gradients over this many microbatches before an optimizer "
-             "step. Effective batch = batch_size × grad_accum × world_size. 1 = off.",
-    )
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=0,
-        help="Stop after this many optimizer steps (0 = full epoch). Use a small value to "
-             "produce a LoRA checkpoint quickly for merge/inference validation.",
-    )
-    parser.add_argument(
-        "--checkpointing_step",
-        type=int,
-        default=100,
-        help="Save the LoRA adapters every N steps.",
-    )
-    parser.add_argument(
-        "--limit_samples",
-        type=int,
-        default=0,
-        help="Cap the dataset to the first N packed bins (0 = all). Use a small N to deliberately "
-             "overfit a tiny subset as an end-to-end sanity check.",
-    )
-    parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=1,
-        help="Number of epochs over the dataset (set high to overfit a small dataset).",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
-        help="AdamW learning rate.",
-    )
-    parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases.")
-    parser.add_argument("--wandb_project", default="gemma4-autotrain", help="wandb project name.")
+    # batch_size / grad_accum / cpu_offload / max_epochs / max_steps / checkpointing_step
+    # / limit_samples / lr / wandb[_project] — shared across all LLM trainers.
+    tc.add_common_args(parser, lr_default=1e-4, wandb_project="gemma4-autotrain")
     parser.add_argument(
         "--target_modules",
         type=str,
@@ -557,5 +492,6 @@ if __name__ == "__main__":
         args.wandb,
         args.wandb_project,
         grad_accum=args.grad_accum,
+        cpu_offload=args.cpu_offload,
         target_modules=[t.strip() for t in (args.target_modules or "").split(",") if t.strip()],
     )

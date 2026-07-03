@@ -444,6 +444,7 @@ export type CreateTrainingRunRequest = {
   split_seed?: number;
   batch_size?: number;
   grad_accum?: number;
+  cpu_offload?: boolean | null;  // LLM FSDP CPU offload; null = per-arch default
   learning_rate?: number;
   warmup_steps?: number;
   lr_scheduler_type?: "linear" | "cosine" | "constant_with_warmup" | "constant";

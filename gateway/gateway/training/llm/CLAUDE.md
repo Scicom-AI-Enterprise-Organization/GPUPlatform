@@ -18,7 +18,38 @@ llm/minimax/minimax_m2.py    MiniMax-M2 230B FP8 MoE trainer (QLoRA-style dequan
 llm/mistral/mistral_small.py Mistral-Small-4 119B FP8 MoE (MLA) trainer
 llm/minimax/lora.py · mistral/lora.py · */dequant_triton.py · */test_lora.py   per-arch LoRA + FP8 dequant
 llm/chinidataset/      vendored ChiniDataset (Parquet StreamingDataset) — SHARED by all trainers
+llm/_trainer_common.py SHARED scaffolding: add_common_args() (the CLI flags every trainer takes)
+                       + fsdp_kwargs()/shard_layers()/checkpoint_layers() (the identical FSDP2 setup).
+                       Importable by bare name (llm_finetune sets PYTHONPATH=<llm dir>). See below.
 ```
+
+### Shared trainer scaffolding (`_trainer_common.py`) — don't re-copy CLI/FSDP per trainer
+
+The four trainers used to each inline the **same** argparse block and the **same** FSDP2
+shard/checkpoint code, so every new flag (batch_size, grad_accum, cpu_offload…) meant editing four
+files. That's now in `_trainer_common.py`:
+- **`add_common_args(parser, *, lr_default, wandb_project)`** — the flags EVERY trainer takes
+  (`--batch_size --grad_accum --cpu_offload --max_epochs --max_steps --checkpointing_step
+  --limit_samples --lr --wandb --wandb_project`). Arch-specific flags (LoRA dims, model id, data/out
+  dirs) stay in each trainer's parser. **A new common flag is a one-line edit here.**
+- **`fsdp_kwargs(mesh, *, param_dtype, cpu_offload)`** — the `fully_shard` kwargs (mp_policy +
+  optional CPUOffloadPolicy + mesh). THE one place the offload/param_dtype policy lives.
+- **`shard_layers(model, decoder_classes, kw, *, reshard_after_forward=None)`** +
+  **`checkpoint_layers(model, decoder_classes)`** — the shard-loop + non-reentrant activation
+  checkpointing (identical across archs; qwen passes a `(decoder, vision)` tuple + `reshard_after_forward`).
+
+What stays per-trainer (legitimately arch-specific): **`param_dtype`** (bf16 dense; **None** for FP8
+MoE so the fp8 weights aren't cast), the decoder-layer class, and the FP8-MoE steps interleaved with
+sharding (`_promote_scalar_params`, `low_cpu_shard_load`). A new model = call the four helpers + its
+own FP8 bits; no CLI/FSDP copy-paste.
+
+**`--cpu_offload`** (FSDP2 CPUOffloadPolicy — params/optimizer in host RAM: big VRAM saver, PCIe-bound
+so ~7% MFU / slow). **Arch-aware default** (`llm_finetune._cpu_offload_on`): gemma/qwen default **ON**
+(dense — hit the VRAM wall at long context), minimax/mistral default **OFF** (fit without it). The
+form exposes a toggle (arch-aware default via `llmCpuOffloadDefault`); `training_api` carries
+`cpu_offload` (None = per-arch default) → `cfg` → the cmd builders append `--cpu_offload` when on.
+On big-VRAM GPUs (143GB H20) turning it OFF is a large speedup — but only if the context/bins fit
+without it (a 64k-block run was at 99% VRAM *with* offload → can't drop it there without OOM).
 
 These are **copies** of the standalone `autotrain/{gemma4,minimax-m2,mistral-small}/` jobs (the
 authority for the model-specific design — read their CLAUDE.md for the deep details). The gateway

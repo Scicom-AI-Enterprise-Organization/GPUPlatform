@@ -581,6 +581,15 @@ def _lora_dims(cfg: dict) -> tuple[int, int]:
 _MLP_TARGETS = {"gate_proj", "up_proj", "down_proj"}
 
 
+def _cpu_offload_on(cfg: dict, default: bool) -> bool:
+    """Resolve the FSDP CPU-offload choice for a run: an explicit cfg value wins, else
+    the per-arch default. gemma/qwen default ON (dense, they hit the VRAM wall at long
+    context — turning it off there OOMs); the FP8-MoE trainers default OFF (they fit
+    without it, and offload only slows them). The form's toggle sets cfg["cpu_offload"]."""
+    v = cfg.get("cpu_offload")
+    return default if v is None else bool(v)
+
+
 def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     r, alpha = _lora_dims(cfg)
     if not cfg.get("lora_r"):
@@ -601,6 +610,8 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
         "--max_steps", str(int(cfg.get("max_steps") or 0)),
         "--checkpointing_step", str(int(cfg.get("save_steps") or cfg.get("logging_steps") or 100)),
     ]
+    if _cpu_offload_on(cfg, True):  # dense default: offload ON (long-context VRAM)
+        cmd.append("--cpu_offload")
     return cmd
 
 
@@ -625,6 +636,8 @@ def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
         "--max_steps", str(int(cfg.get("max_steps") or 0)),
         "--checkpointing_step", str(int(cfg.get("save_steps") or cfg.get("logging_steps") or 100)),
     ]
+    if _cpu_offload_on(cfg, True):  # dense default: offload ON (long-context VRAM)
+        cmd.append("--cpu_offload")
     return cmd
 
 
@@ -655,6 +668,8 @@ def _moe_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str, arch: str) 
     # (that has no MLP entry and would wrongly disable MoE on every run).
     if cfg.get("no_moe_lora"):
         cmd.append("--no_moe_lora")
+    if _cpu_offload_on(cfg, False):  # MoE default: offload OFF (fits without it; faster)
+        cmd.append("--cpu_offload")
     return cmd
 
 
