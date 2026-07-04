@@ -55,6 +55,7 @@ def merge_lora_(model, lora_path, scaling):
         return prefix
 
     merged, missing = 0, []
+    diffs: dict[str, dict] = {}   # per-layer weight-change report (base W vs merged W+Δ)
     for p in prefixes:
         A = lora[f"{p}.lora_a.weight"].float()   # (r, in)
         B = lora[f"{p}.lora_b.weight"].float()   # (out, r)
@@ -68,12 +69,35 @@ def merge_lora_(model, lora_path, scaling):
             missing.append(base)
             continue
         w = state[target]
-        w.add_(delta.to(dtype=w.dtype, device=w.device))
+        d = delta.to(device=w.device, dtype=torch.float32)   # the exact fold Δ, for reporting
+        # How much the LoRA moved this layer: relative Frobenius change |Δ|/|W| (+ raw
+        # norms + max element). Cheap (Δ is already computed); logged per layer + summarized.
+        wn = w.float().norm().item()
+        dn = d.norm().item()
+        diffs[base] = {"rel": (dn / wn) if wn else float("inf"), "abs": dn, "w": wn,
+                       "max": d.abs().max().item()}
+        print(f"[merge-diff] {base}: |Δ|/|W|={diffs[base]['rel']:.4f} "
+              f"|Δ|={dn:.3e} |W|={wn:.3e} max|Δ|={diffs[base]['max']:.3e}")
+        w.add_(d.to(dtype=w.dtype))
         merged += 1
 
     print(f">> merged {merged}/{len(prefixes)} adapters (scaling={scaling})")
     if missing:
         print(f">> WARNING: no base weight found for {len(missing)} prefixes, e.g. {missing[:3]}")
+    if diffs:
+        import json as _json
+        ranked = sorted(((v["rel"], k) for k, v in diffs.items()), reverse=True)
+        mean_rel = sum(r for r, _ in ranked) / len(ranked)
+        print(f">> [merge-diff] summary: {len(diffs)} layers · mean |Δ|/|W|={mean_rel:.4f} · "
+              f"max={ranked[0][0]:.4f} ({ranked[0][1]}) · min={ranked[-1][0]:.4f} ({ranked[-1][1]})")
+        # Structured one-liner the gateway can capture into the report (not an @@HF marker).
+        print("@@MERGE_DIFF " + _json.dumps({
+            "layers": len(diffs),
+            "mean_rel": round(mean_rel, 6),
+            "max_rel": round(ranked[0][0], 6), "max_layer": ranked[0][1],
+            "min_rel": round(ranked[-1][0], 6), "min_layer": ranked[-1][1],
+            "top": [{"layer": k, "rel": round(r, 6)} for r, k in ranked[:8]],
+        }))
     return merged
 
 

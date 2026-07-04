@@ -172,16 +172,19 @@ def _patch_gdn_layer(layer):
         Hv, Kd, Vd = v.shape[2], q.shape[3], v.shape[3]
         layer._cp_rec_shape = (1, Hv, Kd, Vd)                 # the relayed unit is ONE doc's state
         n_docs = (cu_seqlens.numel() - 1) if cu_seqlens is not None else 1
-        # Recurrent state is PER-DOC ([n_docs, Hv, K, V]). Seed doc 0 with the state relayed from the
-        # previous rank IFF this chunk's first doc continues across the boundary; all other docs start
-        # fresh (zero). The relay unit itself is always one doc's state ([1, ...]).
-        init = None
+        # Recurrent state is PER-DOC ([n_docs, Hv, K, V], fp32). ALWAYS pass a REAL tensor (never None):
+        # the kernel's backward returns dh0 for `initial_state`, and torch>=2.10 raises if that forward
+        # input was None (not a Variable). Seed doc 0 with the state relayed from the previous rank IFF
+        # this chunk's first doc continues across the boundary; every other doc (and the whole tensor
+        # when not a continuation, e.g. rank 0) starts at ZERO — numerically identical to None but a
+        # valid Variable for the dh0 grad. (The relayed unit is always one doc's state, [1, ...].)
+        def _zeros(n):
+            return torch.zeros(n, Hv, Kd, Vd, dtype=torch.float32, device=q.device)
         if _CP.get("first_cont") and st["rec_init"] is not None:
-            rec0 = st["rec_init"]                             # [1, Hv, K, V]
-            init = rec0 if n_docs == 1 else torch.cat(
-                [rec0, torch.zeros(n_docs - 1, Hv, Kd, Vd, dtype=rec0.dtype, device=rec0.device)], dim=0)
-        # When not a continuation, init stays None (all docs fresh); the recv'd rec_init is simply
-        # unused — its backward grad is materialized to zeros, so the relay still fires symmetrically.
+            rec0 = st["rec_init"].to(torch.float32)          # [1, Hv, K, V], carries grad -> prev rank
+            init = rec0 if n_docs == 1 else torch.cat([rec0, _zeros(n_docs - 1)], dim=0)
+        else:
+            init = _zeros(n_docs)                            # fresh start; dh0 grad is unused/ignored
         o, fs = _gdr(q, k, v, g=g, beta=beta, initial_state=init, output_final_state=True,
                      use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, cu_seqlens=cu_seqlens)
         layer._cp_rec_dtype = fs.dtype

@@ -113,6 +113,10 @@ def _merge_lora(cfg: dict) -> str:
     #    via merge_infer.py; qwen/minimax/mistral dequant+fold via their merge scripts).
     merged = cfg["model_dir"]
     llm_dir = cfg["llm_dir"]
+    _lp = os.path.join(llm_dir, "llm_playground.py")
+    if not os.path.exists(_lp):
+        listing = os.listdir(llm_dir) if os.path.isdir(llm_dir) else "MISSING DIR"
+        raise RuntimeError(f"llm_playground.py not shipped to {llm_dir} (contents: {listing})")
     _sys.path.insert(0, llm_dir)
     from llm_playground import merge_lora_to_dir, ensure_processor_configs
 

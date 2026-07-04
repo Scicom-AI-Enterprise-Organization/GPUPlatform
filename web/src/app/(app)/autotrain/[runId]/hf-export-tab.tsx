@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Check, ExternalLink, Loader2, Upload, X } from "lucide-react";
+import { ExternalLink, Loader2, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -54,7 +54,6 @@ export function HfExportTab({
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [done, setDone] = useState(false);
   const [stopping, setStopping] = useState(false);
 
   const vdError = useMemo(
@@ -116,8 +115,7 @@ export function HfExportTab({
             }
           : {}),
       });
-      setDone(true);
-      onStarted?.();
+      onStarted?.();  // parent refreshes → hf_export.status flips to "running" → Cancel appears
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -135,19 +133,6 @@ export function HfExportTab({
     } finally {
       setStopping(false);
     }
-  }
-
-  if (done || running) {
-    return (
-      <div className="space-y-3">
-        <p className="flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2.5 text-sm text-emerald-700 dark:text-emerald-400">
-          <Check className="h-4 w-4 shrink-0" />
-          Export {running ? "is running" : "started"} — the model {isLlm ? "merges then " : ""}downloads from S3 and uploads
-          to Hugging Face; the status shows “pushing to Hugging Face” and streams to the Logs tab.
-        </p>
-        <HfExportStatus run={run} onStop={stop} stopping={stopping} />
-      </div>
-    );
   }
 
   return (
@@ -257,31 +242,27 @@ export function HfExportTab({
 
       <div className="flex items-center justify-end gap-3">
         {err && <p className="mr-auto text-sm text-destructive">{err}</p>}
-        <Button onClick={submit} disabled={busy || !repo.trim()}>
-          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-          {isLlm && merge ? "Merge & push to HF" : "Push to HF"}
+        {running && (
+          <Button variant="destructive" onClick={stop} disabled={stopping}>
+            {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+            Cancel export
+          </Button>
+        )}
+        <Button onClick={submit} disabled={busy || running || !repo.trim()}>
+          {(busy || running) ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+          {running ? "Exporting…" : (isLlm && merge ? "Merge & push to HF" : "Push to HF")}
         </Button>
       </div>
 
-      {/* Latest export status (e.g. a previous cancelled/failed push). */}
-      {hf && (hf.status === "cancelled" || hf.status === "failed" || hf.status === "done") && (
-        <HfExportStatus run={run} onStop={stop} stopping={stopping} />
-      )}
+      {/* Export status — pushing (while running), a link when done, or a failed/cancelled note. */}
+      {hf && <HfExportStatus run={run} />}
     </div>
   );
 }
 
-// The HF-export status card (moved out of the run header): pushing → Stop, done → link,
-// failed/cancelled → message.
-function HfExportStatus({
-  run,
-  onStop,
-  stopping,
-}: {
-  run: TrainingRunRecord;
-  onStop: () => void;
-  stopping: boolean;
-}) {
+// The HF-export status card: pushing (while running), a link when done, or a
+// failed/cancelled note. Cancelling is the "Cancel export" button beside Push above.
+function HfExportStatus({ run }: { run: TrainingRunRecord }) {
   const hf = run.result_json?.hf_export;
   if (!hf) return null;
   return (
@@ -289,15 +270,9 @@ function HfExportStatus({
       <h2 className="mb-3 text-sm font-semibold">Hugging Face export</h2>
       <div className="flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
         {hf.status === "running" && (
-          <>
-            <span className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" /> pushing {hf.repo} …
-            </span>
-            <Button variant="outline" size="sm" onClick={onStop} disabled={stopping}>
-              {stopping ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}
-              Stop
-            </Button>
-          </>
+          <span className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> pushing {hf.repo} …
+          </span>
         )}
         {hf.status === "cancelled" && (
           <span className="flex items-center gap-x-3 text-muted-foreground">

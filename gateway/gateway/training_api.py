@@ -3956,6 +3956,29 @@ def _loopback_endpoint(endpoint: Optional[str]) -> Optional[str]:
     return f"http://127.0.0.1:{port}{ep.path}".rstrip("/")
 
 
+def _s3_uri_has_objects(model_s3: str, creds: dict) -> bool:
+    """True if the s3://bucket/prefix URI lists ≥1 object with these creds. Used to
+    fast-fail a merge whose checkpoint isn't reachable here (e.g. an imported run whose
+    artifact points at another deployment's storage). Blocking — call via to_thread."""
+    try:
+        import boto3
+        from botocore.client import Config as BotoConfig
+        if not (model_s3 or "").startswith("s3://"):
+            return False
+        bucket, _, prefix = model_s3[len("s3://"):].partition("/")
+        cli = boto3.client(
+            "s3", region_name=creds.get("region") or "us-east-1",
+            endpoint_url=creds.get("endpoint") or None,
+            aws_access_key_id=creds.get("access_key") or None,
+            aws_secret_access_key=creds.get("secret_key") or None,
+            config=BotoConfig(signature_version="s3v4"),
+        )
+        r = cli.list_objects_v2(Bucket=bucket, Prefix=prefix.rstrip("/") + "/", MaxKeys=1)
+        return int(r.get("KeyCount") or 0) > 0
+    except Exception:  # noqa: BLE001 — unreachable / no creds / bad bucket → treat as not reachable
+        return False
+
+
 class HfExportRequest(BaseModel):
     repo: str
     storage_id: Optional[str] = None   # a kind=huggingface Storage (provides token + custom endpoint)
@@ -4043,18 +4066,6 @@ async def export_to_huggingface(
         raise HTTPException(status_code=400, detail=(
             "LLM runs are stored as a raw LoRA checkpoint (not loadable by transformers). "
             "Enable 'Merge LoRA into base model' to upload a loadable model."))
-    if merge and hf_endpoint:
-        raise HTTPException(status_code=400, detail=(
-            "merged export to a custom Hugging Face endpoint isn't supported yet — use a "
-            "huggingface.co token storage (or the platform HF_TOKEN)."))
-    # Imported runs re-home only small files to a NEW prefix and never rewrite
-    # artifact.s3_uri (it still points at the SOURCE deployment's bucket), and the big
-    # checkpoint is dropped by the import size cap → nothing to merge. A normal run's
-    # artifact URI lives under its own s3_prefix; if it doesn't, fast-fail before a pod.
-    if merge and row.s3_prefix and row.s3_prefix not in (model_s3 or ""):
-        raise HTTPException(status_code=400, detail=(
-            "this run was imported — its checkpoint lives on another deployment's storage "
-            "(omitted from the import), so there's nothing to merge here."))
     merge_dtype = (body.merge_dtype or "fp16").strip().lower()
     if merge_dtype not in ("fp16", "bf16"):
         merge_dtype = "fp16"
@@ -4064,16 +4075,27 @@ async def export_to_huggingface(
     private = bool(body.private)
     redis = request.app.state.redis
 
+    # A merge re-downloads the checkpoint on a GPU box → fast-fail (before spending a pod)
+    # if it isn't reachable from this deployment. The usual cause is an imported run whose
+    # checkpoint lives on another deployment's storage (dropped by the import size cap).
+    if merge and not await asyncio.to_thread(_s3_uri_has_objects, model_s3, creds):
+        raise HTTPException(status_code=400, detail=(
+            f"the trained checkpoint isn't reachable from this deployment ({model_s3}) — "
+            "likely an imported run whose checkpoint lives elsewhere. Nothing to merge."))
+
     # ---- compute target -------------------------------------------------------------
     # Non-merge (ASR/TTS): a custom-endpoint storage pushes from the GATEWAY (reaches the
     # mirror directly + its modern huggingface_hub handles the `…/hf` path the VM's older
     # client mis-parses); else the run's VM (avoids large downloads on the laptop). Merge
     # (LLM): a GPU is required → the run's VM, a chosen VM, or a fresh RunPod pod.
+    mirror_merge = merge and bool(hf_endpoint)   # merge → a custom / self-hosted HF mirror
     local_export = bool(hf_endpoint) and not merge
-    # For a gateway-side push to our OWN mirror, talk to it over loopback so a multi-GB
-    # LFS PUT bypasses the nginx ingress body-size cap (+ TLS). Keep the original endpoint
-    # for the displayed/stored repo URL.
-    push_endpoint = _loopback_endpoint(hf_endpoint) if local_export else hf_endpoint
+    # Talk to our OWN mirror over loopback (bypass the nginx body cap + TLS). A gateway-side
+    # push reaches it directly; a merge on a GPU box reaches that loopback through a reverse
+    # SSH tunnel (needs_tunnel). Keep the public endpoint for the displayed URL. An external
+    # mirror (different host) is left untouched and pushed to directly from the box.
+    push_endpoint = _loopback_endpoint(hf_endpoint) if (local_export or mirror_merge) else hf_endpoint
+    needs_tunnel = mirror_merge and bool(push_endpoint) and push_endpoint != hf_endpoint
     run_on = (body.run_on or "").strip().lower()
     exp_provider_id = (body.provider_id or "").strip() or None
     ssh = None            # (host, port, user, key) when we run on an existing box
@@ -4152,6 +4174,7 @@ async def export_to_huggingface(
 
         pump_task = asyncio.create_task(_pump())
         spawned: Optional[tuple[str, str]] = None   # (api_key, pod_id) for cloud teardown
+        tunnel_host: Optional[str] = None           # reverse-tunnel host to close on exit
         run_ssh = ssh
         try:
             # Run-on = cloud: provision a fresh pod + build the arch merge venv on it.
@@ -4186,10 +4209,25 @@ async def export_to_huggingface(
                     _run_hf_export_local, run_id, model_s3, creds, repo, token, private,
                     push_endpoint, export_lines.append)
             elif merge:
+                # Push a merged model to a self-hosted mirror? A gateway-local mirror is only
+                # reachable from the gateway (loopback), so open a reverse SSH tunnel on the
+                # merge box (mirrors the RunPod-worker tunnel) — the box then pushes to the
+                # loopback endpoint, which routes back through the tunnel to the gateway mirror.
+                box_endpoint = push_endpoint if mirror_merge else None
+                if needs_tunnel:
+                    from . import vm_tunnel
+                    h, p, u, kf = run_ssh
+                    gw_host, gw_port = vm_tunnel.parse_host_port(os.environ.get("GATEWAY_BIND", "127.0.0.1:8080"), 8080)
+                    await asyncio.to_thread(
+                        vm_tunnel.ensure, h, int(p), u, Path(kf).read_text(),
+                        [vm_tunnel.Forward(gw_port, gw_host, gw_port)])
+                    tunnel_host = h
+                    await _push_log(redis, run_id,
+                                    "[gateway] HF export: reverse SSH tunnel up (box → gateway mirror) …")
                 res = await asyncio.to_thread(
                     _run_hf_merge_export_ssh, *run_ssh, run_id, model_s3, creds, repo, token,
                     private, dict(cfg), base_model, arch, merge_dtype, venv_path,
-                    visible_devices, base_token, export_lines.append)
+                    visible_devices, base_token, box_endpoint, export_lines.append)
             else:
                 res = await asyncio.to_thread(
                     _run_hf_export_ssh, *run_ssh, run_id, model_s3, creds, repo, token, private, cfg,
@@ -4197,7 +4235,7 @@ async def export_to_huggingface(
             # The script builds the URL from the endpoint it pushed to; show the
             # public endpoint instead of the loopback one.
             res_url = res.get("url")
-            if local_export and push_endpoint and push_endpoint != hf_endpoint and res_url:
+            if (local_export or needs_tunnel) and push_endpoint and push_endpoint != hf_endpoint and res_url:
                 res_url = res_url.replace(push_endpoint, hf_endpoint, 1)
             async with session_factory()() as s:
                 r2 = await s.get(TrainingRun, run_id)
@@ -4226,6 +4264,13 @@ async def export_to_huggingface(
                     await _push_log(redis, run_id, "[gateway] HF export: cloud pod torn down")
                 except Exception:  # noqa: BLE001
                     logger.warning("HF export %s: pod teardown failed", run_id)
+            # Close the reverse SSH tunnel (autossh subprocess) so it can't linger.
+            if tunnel_host:
+                try:
+                    from . import vm_tunnel
+                    vm_tunnel.close(tunnel_host)
+                except Exception:  # noqa: BLE001
+                    pass
             pump_task.cancel()
             try:
                 await pump_task
@@ -4277,9 +4322,11 @@ async def cancel_huggingface_export(
             try:
                 out = _ssh_capture(
                     cli,
+                    # Match every per-request tag (sgpu_hf_export_<run_id>-<token>…).
                     f"pkill -9 -f sgpu_hf_export_{run_id} 2>/dev/null; sleep 1; "
-                    f"if pgrep -f sgpu_hf_export_{run_id}.py >/dev/null; then echo ALIVE; else echo DEAD; fi; "
-                    f"rm -rf /tmp/sgpu_hf_export_{run_id}.* {work_dir}/sgpu-hf-export/{run_id} 2>/dev/null || true",
+                    f"if pgrep -f sgpu_hf_export_{run_id} >/dev/null; then echo ALIVE; else echo DEAD; fi; "
+                    f"rm -rf /tmp/sgpu_hf_export_{run_id}* /tmp/sgpu_llm_hfexport_{run_id}* "
+                    f"{work_dir}/sgpu-hf-export/{run_id}* 2>/dev/null || true",
                 )
                 return "DEAD" in out
             finally:
@@ -6055,7 +6102,7 @@ def _run_hf_merge_export_ssh(host: str, port: int, user: str, key_filename: str,
                              token: str, private: bool, cfg: dict, base_model: str,
                              arch: str, merge_dtype: str, venv_path: Optional[str],
                              visible_devices: Optional[str], base_token: Optional[str] = None,
-                             line_sink=None) -> dict:
+                             hf_endpoint: Optional[str] = None, line_sink=None) -> dict:
     """SSH to a box (the run's VM or a fresh pod), ship hf_export.py + the llm/ dir, then
     download the LoRA checkpoint from S3 → MERGE it into the base model on GPU (per-arch,
     via the shipped merge scripts) → upload the merged safetensors to a Hugging Face repo,
@@ -6066,25 +6113,34 @@ def _run_hf_merge_export_ssh(host: str, port: int, user: str, key_filename: str,
     model for the merge (else the push token is reused). huggingface.co only (v1)."""
     cli = _ssh_connect(host, int(port), user, key_filename)
     try:
+        import secrets as _secrets
         base = _trainer_script_path().parent  # gateway/gateway/training/
-        # Keep the sgpu_hf_export_<run_id> name so cancel_huggingface_export's pkill matches.
-        remote_py = f"/tmp/sgpu_hf_export_{run_id}.py"
-        remote_cfg = f"/tmp/sgpu_hf_export_{run_id}.json"
-        code_dir = f"/tmp/sgpu_llm_hfexport_{run_id}"
+        # Per-REQUEST scratch (not per-run): re-clicking "Export to HF" supersedes the
+        # in-flight task, but its box-side merge keeps running in a thread and its trailing
+        # `rm -rf` would otherwise delete the NEW request's shipped llm/ dir mid-merge
+        # (→ "No module named 'llm_playground'"). A unique tag isolates concurrent attempts.
+        # `sgpu_hf_export_<run_id>` stays a prefix so cancel_huggingface_export's pkill matches.
+        tag = f"{run_id}-{_secrets.token_hex(4)}"
+        remote_py = f"/tmp/sgpu_hf_export_{tag}.py"
+        remote_cfg = f"/tmp/sgpu_hf_export_{tag}.json"
+        code_dir = f"/tmp/sgpu_llm_hfexport_{tag}"
         _ssh_put(cli, str(base / "hf_export.py"), remote_py)
         _ssh_put_dir_tar(cli, str(base / "llm"), code_dir)
         work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
+        scratch = f"{work_dir}/sgpu-hf-export/{tag}"
         venv = (venv_path or f"/share/autotrain-llm-{arch}").rstrip("/")
         py = f"{venv}/bin/python"
         tconf = {
             "model_s3": model_s3,
             "region": creds.get("region"), "endpoint": creds.get("endpoint"),
             "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
-            "model_dir": f"{work_dir}/sgpu-hf-export/{run_id}/merged",  # merged model → uploaded
-            "ckpt_dir": f"{work_dir}/sgpu-hf-export/{run_id}/ckpt",     # raw LoRA download
+            "model_dir": f"{scratch}/merged",  # merged model → uploaded
+            "ckpt_dir": f"{scratch}/ckpt",     # raw LoRA download
             "repo": repo, "token": token, "private": bool(private),
             "base_hf_token": base_token or token,    # gated base-model download token (merge)
-            "hf_endpoint": None,                     # merged export → huggingface.co only (v1)
+            # None → huggingface.co; a loopback URL (reached via a reverse tunnel) or an
+            # external URL → push the merged model to that self-hosted HF mirror.
+            "hf_endpoint": hf_endpoint or None,
             "merge": True,
             "base_model": base_model, "arch": arch,
             "merge_dtype": merge_dtype or "fp16",
@@ -6119,7 +6175,9 @@ def _run_hf_merge_export_ssh(host: str, port: int, user: str, key_filename: str,
         cmd = (f'{user_env}PY="{py}"; '
                f'if [ ! -x "$PY" ]; then echo "arch venv python not found at $PY — build the venv first"; exit 1; fi; '
                f'"$PY" -u {remote_py} --config {remote_cfg} 2>&1; '
-               f'rm -rf {remote_py} {remote_cfg} {code_dir}')
+               # Clean up only THIS request's tagged scratch (incl. the merged model, so a VM
+               # isn't left holding tens of GB) — never a sibling request's dir.
+               f'rm -rf {remote_py} {remote_cfg} {code_dir} {scratch}')
         rc = _ssh_run_stream(cli, cmd, on_line)
         if out["error"]:
             raise RuntimeError(out["error"])

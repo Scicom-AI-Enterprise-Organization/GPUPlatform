@@ -252,6 +252,13 @@ linear-attention majority. CP here (in `context_parallel.py`, opt-in via `qwen3_
 - `test_gdn_cp_dist.py` (2 ranks): distributed relay fwd+bwd, out rel 1.4e-4, d_hidden rel 4.9e-4.
 - `test_cp_model.py` (2 ranks): full tiny-Qwen text backbone (GDN + full-attn layers) CP vs non-CP
   hidden states, rel 9.3e-3 — validates multi-layer comm interleaving + the ring + sharding together.
+- `test_cp_model_varlen.py` (2 ranks): **MULTI-DOC varlen** — a packed sequence where one doc SPANS the
+  shard boundary (`first_cont=True` → GDN recurrent state continued across ranks) and another boundary
+  falls INSIDE a chunk (per-doc state reset + multi-segment local cu_seqlens + doc-masked full-attn
+  ring). CP vs non-CP eager-with-block-diagonal-causal-mask, rel 1.33e-2 → **varlen is CORRECT**. (The
+  reference builds with `_attn_implementation="eager"` + an explicit 4D doc mask because tm has no
+  `kernels-community/flash-attn3` and building/switching to `flex_attention` falls back to fa3; and it
+  patches in the REAL `flash_qla` kernel — the model's torch fallback rejects `[n_docs,…]` init_state.)
 
 Verify env: tm box port 1023, `/share/qwen3.5-venv`, `HF_HOME=/share/huggingface`, a PRIVATE
 `TILELANG_CACHE_DIR` (don't clobber the shared cache), a genuinely-free GPU pair (`--master_port` ≠
@@ -270,6 +277,11 @@ the innermost one is still open. **What's SOLVED and committed (keep these — e
 - **GDN relay uses `batch_isend_irecv`, NOT unbatched `dist.isend/irecv`** (`_send_pair`/`_recv_pair`):
   unbatched P2P lazily spawns its OWN NCCL comm, distinct from the full-attn ring's coalesced-P2P comm
   → two P2P comms cross-deadlock. Unified onto one.
+- **`initial_state` is ALWAYS a real zero tensor, never `None`** (`gdr_wrap`, torch≥2.10 correctness):
+  the relay forces `output_final_state=True`, and flash_qla's backward returns `dh0` for `initial_state`
+  (position 6); torch≥2.10 raises "returned a gradient … at position N but the forward input was not a
+  Variable" if that was `None` (torch 2.9.1 silently tolerated it — a likely contributor to the RunPod
+  hang). Fresh-start docs now pass `zeros[n_docs,Hv,K,V]` fp32 (numerically identical to `None`).
 
 **The still-open bug — asymmetric relay vs FSDP, iteration ≥ 1.** With the above, step 0 (fwd+bwd+opt)
 completes; **step 1 hangs**. FSDP2's first iteration does extra lazy-init synchronization that MASKS
