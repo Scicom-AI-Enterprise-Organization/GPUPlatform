@@ -34,6 +34,11 @@ from tqdm import tqdm
 import argparse
 from chinidataset import StreamingDataset
 from flash_qla import chunk_gated_delta_rule
+import context_parallel as cp  # zigzag/contiguous context parallelism (opt-in via --cp_size > 1)
+from transformers import AttentionInterface
+# Full-attention layers under CP use the contiguous position-aware ring; GDN layers relay state
+# (installed on the model in main() when cp_size > 1). Registering the backend is always safe.
+AttentionInterface.register("cp_full_attention", cp.cp_full_attention)
 
 
 logging.basicConfig(
@@ -224,14 +229,22 @@ def make_custom_cls(base_cls):
 
             loss = None
             if labels is not None:
-                # B, S, D -> (B*S, D)
-                shifted_hidden_states = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
-                shifted_labels = labels[:, 1:].contiguous().reshape(-1)
-                loss = self.loss_fn(
-                    self.lm_head.weight,
-                    shifted_hidden_states,
-                    shifted_labels,
-                )
+                if cp.cp_active():
+                    # Context parallel: `labels` are already per-token NEXT-token targets
+                    # (pre-shifted per-doc in cp.shard_batch), because the usual global
+                    # hidden[:-1]/labels[1:] shift is invalid across contiguous rank boundaries.
+                    hs = hidden_states.contiguous().reshape(-1, hidden_states.shape[-1])
+                    lbl = labels.contiguous().reshape(-1)
+                    loss = self.loss_fn(self.lm_head.weight, hs, lbl)
+                else:
+                    # B, S, D -> (B*S, D)
+                    shifted_hidden_states = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
+                    shifted_labels = labels[:, 1:].contiguous().reshape(-1)
+                    loss = self.loss_fn(
+                        self.lm_head.weight,
+                        shifted_hidden_states,
+                        shifted_labels,
+                    )
             else:
                 raise NotImplementedError("Loss calculation is not implemented yet.")
 
@@ -278,6 +291,7 @@ def main(
         mlflow_experiment:str = "qwen3.5-autotrain",
         model_id:str = "Qwen/Qwen3.6-27B",
         checkpoint_dir:str = "checkpointing",
+        cp_size:int = 1,
     ):
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -285,8 +299,16 @@ def main(
     # rank lands on cuda:0 (NCCL hang / OOM).
     torch.cuda.set_device(rank)
     ddp_setup()  # init_process_group(nccl) — required before init_device_mesh / fully_shard
+    # FSDP shards params across ALL ranks (1D mesh). Context parallelism is a SEPARATE process group
+    # over cp_size consecutive ranks (sequence sharded + GDN state / full-attn KV relayed within it);
+    # data parallelism is across CP groups. Orthogonal to FSDP.
     mesh_device = init_device_mesh("cuda", (world_size, ), mesh_dim_names=("shard", ))
-    torch.cuda.memory._record_memory_history()
+    cp_group = dp_size = dp_rank = cp_rank = None
+    attn_impl = "kernels-community/flash-attn3"
+    if cp_size > 1:
+        cp_group, dp_size, dp_rank, cp_rank = cp.setup_cp(world_size, cp_size, rank, torch.device(f"cuda:{rank}"))
+        attn_impl = "cp_full_attention"   # full-attn (softmax) layers ring; GDN layers patched below
+        logger.info(f"[cp] cp_size={cp_size} dp_size={dp_size} (world={world_size})")
 
     # Resolve dense vs MoE classes from the config + apply the matching Liger patches.
     config, is_moe, classes = resolve_arch(model_id)
@@ -295,7 +317,7 @@ def main(
         model_id,
         config=config,
         dtype=torch.bfloat16, # native bf16 training
-        attn_implementation = "kernels-community/flash-attn3"
+        attn_implementation = attn_impl
     )
     # tokenizer = AutoTokenizer.from_pretrained(model_id)
     total_params = sum(p.numel() for p in model.parameters())
@@ -337,11 +359,23 @@ def main(
         checkpoint_wrapper,
         checkpoint_impl=CheckpointImpl.NO_REENTRANT,
     )
-    apply_activation_checkpointing(
-        model,
-        checkpoint_wrapper_fn = non_reentrant_wrapper,
-        check_fn=lambda x: isinstance(x, tuple(checkpointing_modules))
-    )
+    # ⚠ Activation checkpointing is INCOMPATIBLE with the GDN CP relay: NO_REENTRANT recompute re-runs
+    # each decoder layer's forward during backward, which re-fires the layer's cross-rank state P2P
+    # (recv at conv_wrap / send at gdr_wrap). That extra, unplanned round of communication desyncs the
+    # two ranks (one lands in a full-attn RING step while the other is in a GDN send/recv on a DIFFERENT
+    # layer) → NCCL deadlock in backward. Under CP we drop AC (the sequence is already sharded across
+    # ranks, so per-rank activation memory is 1/cp_size — the smoke fits without it). Re-enabling AC for
+    # long-context CP needs a recompute-safe relay (replay cached forward state on recompute, comm only
+    # the grads); tracked as a follow-on.
+    if cp_size <= 1:
+        apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn = non_reentrant_wrapper,
+            check_fn=lambda x: isinstance(x, tuple(checkpointing_modules))
+        )
+    else:
+        logger.info("[cp] activation checkpointing DISABLED under CP (recompute would re-fire the "
+                    "cross-rank relay P2P and deadlock backward); per-rank activations are 1/cp_size.")
 
     def _patched_chunk_gated_delta_rule(q, k, v, *args, **kwargs):
         # TileLang kernel requires v to be contiguous (stride[-1] == 1)
@@ -353,13 +387,21 @@ def main(
         if isinstance(module, classes["gdn"]):
             module.chunk_gated_delta_rule = _patched_chunk_gated_delta_rule
 
+    # Context parallel: wrap each GDN layer's conv + delta-rule kernels to relay their state across
+    # the CP group (one differentiable pair-P2P per layer). Runs AFTER the contiguous-v patch so the
+    # relay wraps the patched kernel.
+    if cp_size > 1:
+        cp.install_gdn_cp(model, classes["gdn"])
+
     # max_steps > 0 caps the run regardless of epochs (0 = run all max_epochs). For overfitting a
     # small dataset, set max_epochs high and max_steps 0.
     dataset = Dataset(limit=limit_samples)
+    # Under CP the whole CP group must see the SAME bin (each rank trains a different contiguous
+    # chunk of it); the sampler splits bins across DATA-PARALLEL groups only.
     sampler = DistributedSampler(
         dataset,
-        num_replicas=mesh_device.size(),
-        rank=mesh_device.get_rank(),
+        num_replicas=(dp_size if cp_size > 1 else mesh_device.size()),
+        rank=(dp_rank if cp_size > 1 else mesh_device.get_rank()),
     )
     dataloader = DataLoader(
         dataset,
@@ -418,6 +460,11 @@ def main(
                 k: (v.to(f'cuda:{rank}', non_blocking=True) if torch.is_tensor(v) else v)
                 for k, v in batch.items()
             }
+
+            # Context parallel: replace the full packed batch with THIS rank's contiguous chunk
+            # (+ set the per-token position/doc ids the full-attn ring reads; labels pre-shifted).
+            if cp_size > 1:
+                batch = cp.shard_batch(batch, cp_size, cp_rank)
 
             output = model(**batch, use_cache=False) # forward pass and calculate losses
             output["loss"].backward() # calculate gradient
@@ -557,6 +604,14 @@ if __name__ == "__main__":
         help="Directory to save the LoRA adapters (lora.pt + lora_meta.json). Use a "
              "per-model dir so multiple models don't clobber each other.",
     )
+    parser.add_argument(
+        "--cp_size",
+        type=int,
+        default=1,
+        help="Context-parallel degree: shard each packed sequence across this many GPUs "
+             "(GatedDeltaNet state + full-attn KV relayed between them) to train context longer "
+             "than one GPU's VRAM. 1 = off. world_size must be divisible by it; dp = world/cp.",
+    )
     args = parser.parse_args()
     main(
         args.rank,
@@ -573,4 +628,5 @@ if __name__ == "__main__":
         args.mlflow_experiment,
         args.model_id,
         args.checkpoint_dir,
+        args.cp_size,
     )

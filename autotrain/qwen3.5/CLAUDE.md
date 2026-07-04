@@ -212,3 +212,81 @@ to dense+MoE, repacked for 3.6, smoked both, and ran the full finetunes.
 
 **STILL TO DO:** `compare_logits.py` (the owed logits gate) is not yet written. No wandb (no key on the
 box) — loss is in the tmux logs.
+
+## Context parallelism — GatedDeltaNet CP (`context_parallel.py`, `--cp_size`), 2026-07-04
+
+Unlike gemma-4 (all-softmax → the zigzag ring ports uniformly), Qwen3.6 is a **GatedDeltaNet hybrid**:
+~3/4 of layers are **linear attention** (a stateful `chunk_gated_delta_rule` recurrence), only ~1/4
+are softmax **full-attention**. Ring CP is a softmax technique — it does NOT apply to the
+linear-attention majority. CP here (in `context_parallel.py`, opt-in via `qwen3_5.py --cp_size N`):
+
+- **Contiguous** sequence sharding (NOT zigzag — the linear recurrence flows chunk 0→1→…→N-1).
+  `shard_batch` also pre-shifts the LM target per-doc (the loss aligns hidden↔labels 1:1; the global
+  `hidden[:-1]/labels[1:]` shift is invalid across rank boundaries) and sets per-token position/doc
+  ids for the ring. It pads the packed total to a multiple of `cp_size`.
+- **GatedDeltaNet layers** (`install_gdn_cp` monkeypatches each): relay TWO stateful pieces across the
+  CP group via ONE differentiable **pair-P2P per layer** (recv both at layer start, send both at end):
+  the delta-rule **recurrent state** (`initial_state`/`final_state`) and the **causal-conv** state
+  (`initial_states`/`return_final_states`). Both kernels expose native state args AND propagate grad
+  through them (FlashQLA is "CP-/bwd-friendly": `backward(do, dht) → dh0`).
+- **Full-attention layers** (`cp_full_attention` AttentionInterface backend): a contiguous
+  position-aware ring, **pure torch** (self-contained here — no flash-attn dep in the Qwen venv).
+
+**Three load-bearing fixes (each cost real debugging — keep them):**
+1. **Deadlock → one pair-op per layer.** Two separate relays per layer let the two ranks' backward
+   autograd graphs fire P2P in incompatible order → NCCL deadlock. Combining conv+recurrent into ONE
+   `_SendPairToNext`/`_RecvPairFromPrev` per layer (fixed internal order) makes the backward comm
+   order identical on every rank. (Blocking `batch_isend_irecv` + a warmup did NOT fix it; this did.)
+2. **Recv op needs a grad-requiring `anchor` input.** An autograd.Function whose inputs are all
+   non-tensors has outputs that don't require grad → its backward is never called → the receiving
+   rank never sends the state-grads → the sender hangs. Passing a grad-requiring anchor forces the
+   backward to fire. (This was the actual cause of the "distributed backward hangs".)
+3. **Multi-doc recurrent state.** The packed data is MULTIPACK (many docs/bin), so `initial_state`
+   must be `[num_docs, Hv, K, V]`, not `[1,…]`: seed doc 0 with the relayed state IFF the chunk starts
+   mid-doc (`_CP["first_cont"]`), the rest zero; send only the last doc's `final_state`. The conv is
+   whole-chunk (the trainer passes no `seq_idx` even non-CP), so its relay stays single-state; conv
+   `initial_states` must be `stride(1)==1` (relay as `(B,k-1,D)` + `.transpose(1,2)`).
+
+**VERIFIED (real Qwen3.6-27B, tm box, FlashQLA + a PRIVATE `TILELANG_CACHE_DIR`):**
+- `test_gdn_cp_relay.py` (1 proc): full == 2-way split with both relays, out AND input-grad, rel ~1e-4.
+- `test_gdn_cp_dist.py` (2 ranks): distributed relay fwd+bwd, out rel 1.4e-4, d_hidden rel 4.9e-4.
+- `test_cp_model.py` (2 ranks): full tiny-Qwen text backbone (GDN + full-attn layers) CP vs non-CP
+  hidden states, rel 9.3e-3 — validates multi-layer comm interleaving + the ring + sharding together.
+
+Verify env: tm box port 1023, `/share/qwen3.5-venv`, `HF_HOME=/share/huggingface`, a PRIVATE
+`TILELANG_CACHE_DIR` (don't clobber the shared cache), a genuinely-free GPU pair (`--master_port` ≠
+29500; the box is shared + VRAM-contended — pick GPUs with real headroom right before launch).
+
+### ⚠ 27B full-model FSDP2 training — the backward/step-1 DEADLOCK (OPEN, 2026-07-04)
+
+The isolated tests above all pass, but a **full 27B `qwen3_5.py --cp_size 2` training run on 2×H100
+(RunPod) deadlocks** — both GPUs pin at 100%, log frozen, no loss line. Fixed several layers of it;
+the innermost one is still open. **What's SOLVED and committed (keep these — each was a real bug):**
+- **`dp==1` must reuse the DEFAULT process group, not `dist.new_group`** (`setup_cp`): a fresh CP
+  communicator over the same 2 GPUs FSDP uses deadlocks the FORWARD. `group=None` fixed forward.
+- **Activation checkpointing is OFF under CP** (`qwen3_5.py`, `if cp_size<=1`): NO_REENTRANT recompute
+  re-runs each layer's forward in backward → re-fires the relay P2P → desync. (Per-rank activations
+  are already 1/cp_size, so dropping AC is affordable for the smoke.)
+- **GDN relay uses `batch_isend_irecv`, NOT unbatched `dist.isend/irecv`** (`_send_pair`/`_recv_pair`):
+  unbatched P2P lazily spawns its OWN NCCL comm, distinct from the full-attn ring's coalesced-P2P comm
+  → two P2P comms cross-deadlock. Unified onto one.
+
+**The still-open bug — asymmetric relay vs FSDP, iteration ≥ 1.** With the above, step 0 (fwd+bwd+opt)
+completes; **step 1 hangs**. FSDP2's first iteration does extra lazy-init synchronization that MASKS
+the race; from iteration 1 the directional GDN relay P2P (rank r→r+1, so a *send*-Function on one rank
+and a *recv*-Function on the other → structurally DIFFERENT autograd graphs) and FSDP's all-gather/
+reduce-scatter co-schedule on the GPU and circular-wait. Adding a `dist.barrier` before each P2P
+(`CP_BARRIER=1`, gated) only relocated it and exposed that the two ranks execute a **different number/
+order of relay P2P ops in backward** — the true root. Tried and RULED OUT: default-PG, unified batched
+P2P, `TORCH_NCCL_BLOCKING_WAIT=1`, `set_modules_to_forward/backward_prefetch([])`,
+`reshard_after_forward=False`, per-P2P barrier. The real fix needs a **symmetric relay** (every rank
+runs the identical Function/comm pattern each layer — like the full-attn ring does — even where the
+data is directional), or PyTorch-native CP (DTensor/`context_parallel`).
+
+**FAST REPRO (the key artifact — no 27B/no RunPod needed):** `cp_fsdp_repro.py` builds a tiny faithful
+hybrid (8–64 layers via `REPRO_LAYERS`, real GDN head dims so cached TileLang kernels load, real
+flash_qla kernel, FSDP2 + CPUOffload, frozen-base + attn-LoRA exactly like the trainer) and runs 2
+train steps. It **reproduces the step-1 hang in ~30 s** on any 2-GPU box (`torchrun --nproc_per_node=2
+cp_fsdp_repro.py`; env toggles `CP_DEBUG/CP_BARRIER/CP_NOPREFETCH/CP_NORESHARD/REPRO_SEQ/REPRO_LAYERS`).
+Iterate the symmetric-relay fix against THIS (runs on the free tm H20), not paid 27B cycles. `CP_DEBUG=1`
+prints every P2P (`SEND2/RECV2/RING` + op#) so the last line per rank pinpoints the desync.

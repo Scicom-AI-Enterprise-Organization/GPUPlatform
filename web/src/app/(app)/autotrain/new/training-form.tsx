@@ -1251,6 +1251,7 @@ export function TrainingForm() {
               )}
             </div>
           </FieldWrap>
+          {/* Batching: batch size + grad accumulation together. */}
           {sweepOn ? (
             <FieldWrap label="Batch sizes" hint="e.g. 8, 16">
               <Input className="font-mono" placeholder="8, 16" value={sweepBatch} onChange={(e) => setSweepBatch(e.target.value)} />
@@ -1259,28 +1260,19 @@ export function TrainingForm() {
             <FieldWrap label="Batch size (per device)"><NumberField min={1} value={batchSize} onChange={setBatchSize} /></FieldWrap>
           )}
           {sweepOn ? (
-            <FieldWrap label="Learning rates" hint="e.g. 1e-5, 2e-5">
-              <Input className="font-mono" placeholder="1e-5, 2e-5" value={sweepLr} onChange={(e) => setSweepLr(e.target.value)} />
-            </FieldWrap>
-          ) : (
-            <FieldWrap label="Learning rate"><Input className="font-mono" value={learningRate} onChange={(e) => setLearningRate(e.target.value)} /></FieldWrap>
-          )}
-          {sweepOn ? (
             <FieldWrap label="Grad-accum steps" hint="e.g. 1, 4">
               <Input className="font-mono" placeholder="1, 4" value={sweepGradAccum} onChange={(e) => setSweepGradAccum(e.target.value)} />
             </FieldWrap>
           ) : (
             <FieldWrap label="Grad accumulation"><NumberField min={1} value={gradAccum} onChange={setGradAccum} /></FieldWrap>
           )}
+          {/* Learning rate + its schedule + warmup together. */}
           {sweepOn ? (
-            <FieldWrap label="Weight decay" hint="AdamW L2 — e.g. 0, 0.01, 0.1">
-              <Input className="font-mono" placeholder="0, 0.01, 0.1" value={sweepWeightDecay} onChange={(e) => setSweepWeightDecay(e.target.value)} />
+            <FieldWrap label="Learning rates" hint="e.g. 1e-5, 2e-5">
+              <Input className="font-mono" placeholder="1e-5, 2e-5" value={sweepLr} onChange={(e) => setSweepLr(e.target.value)} />
             </FieldWrap>
           ) : (
-            <FieldWrap label="Weight decay (AdamW)" hint="L2 regularization. 0 = off.">
-              <Input className="font-mono" type="number" min={0} step={0.01} value={weightDecay}
-                onChange={(e) => setWeightDecay(Math.max(0, Number(e.target.value) || 0))} />
-            </FieldWrap>
+            <FieldWrap label="Learning rate"><Input className="font-mono" value={learningRate} onChange={(e) => setLearningRate(e.target.value)} /></FieldWrap>
           )}
           <FieldWrap label="LR schedule" hint="How the learning rate moves over training (HF lr_scheduler_type).">
             <Select value={lrScheduler} onValueChange={(v) => setLrScheduler(v as typeof lrScheduler)}>
@@ -1299,6 +1291,18 @@ export function TrainingForm() {
               : "Optimizer steps to ramp LR 0 → peak before decay. 0 = no warmup."}>
             <NumberField min={0} value={warmupSteps} onChange={setWarmupSteps} />
           </FieldWrap>
+          {/* Regularization. */}
+          {sweepOn ? (
+            <FieldWrap label="Weight decay" hint="AdamW L2 — e.g. 0, 0.01, 0.1">
+              <Input className="font-mono" placeholder="0, 0.01, 0.1" value={sweepWeightDecay} onChange={(e) => setSweepWeightDecay(e.target.value)} />
+            </FieldWrap>
+          ) : (
+            <FieldWrap label="Weight decay (AdamW)" hint="L2 regularization. 0 = off.">
+              <Input className="font-mono" type="number" min={0} step={0.01} value={weightDecay}
+                onChange={(e) => setWeightDecay(Math.max(0, Number(e.target.value) || 0))} />
+            </FieldWrap>
+          )}
+          {/* Memory / parallelism (LLM). */}
           {isLlm && !sweepOn && (
             <FieldWrap label="CPU offload"
               hint={cpuOffload
