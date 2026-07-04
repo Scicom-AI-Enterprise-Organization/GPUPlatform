@@ -453,6 +453,9 @@ export const gateway = {
       llm_mos_axes?: string[];
       llm_max_new_tokens?: number;
       vllm_version?: string | null;
+      // HF token to download the (gated) base model for the LoRA merge.
+      base_hf_token?: string;
+      base_hf_token_secret?: string | null;
     },
   ) =>
     request<{ status: string }>(

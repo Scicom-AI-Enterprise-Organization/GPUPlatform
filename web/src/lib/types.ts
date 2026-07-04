@@ -445,6 +445,9 @@ export type CreateTrainingRunRequest = {
   batch_size?: number;
   grad_accum?: number;
   cpu_offload?: boolean | null;  // LLM FSDP CPU offload; null = per-arch default
+  // LLM gemma4-only: context parallelism (zigzag ring attention) — shards one long packed
+  // sequence across all GPUs so context longer than one GPU's VRAM can train. Needs >=2 GPUs.
+  context_parallel?: boolean | null;
   learning_rate?: number;
   warmup_steps?: number;
   lr_scheduler_type?: "linear" | "cosine" | "constant_with_warmup" | "constant";

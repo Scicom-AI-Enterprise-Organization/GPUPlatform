@@ -33,6 +33,7 @@ import _trainer_common as tc
 from contextlib import nullcontext
 from attention import dynamic_attention, block_diagonal_concat
 from gemma4_fa4_attention import fa4_attention
+import context_parallel as cp  # zigzag ring context-parallelism (opt-in via --cp_size > 1)
 
 logging.basicConfig(
     level=logging.INFO, 
@@ -55,6 +56,9 @@ MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-31B-it")
 # the FA4 package isn't installed; it only fires when that backend is actually used.
 AttentionInterface.register("dynamic_attention", dynamic_attention)
 AttentionInterface.register("fa4_attention", fa4_attention)
+# Context-parallel hybrid ring backend: head_dim-512 global → fused zigzag ring (cute), head_dim-256
+# sliding → position-aware ring. Selected automatically when cp_size > 1.
+AttentionInterface.register("cp_ring_attention", cp.cp_ring_attention)
 ATTN_IMPL = os.environ.get("GEMMA_ATTN", "fa4_attention")
 
 
@@ -201,14 +205,22 @@ class CustomGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
 
         loss = None
         if labels is not None:
-            # B, S, D -> (B*S, D)
-            shifted_hidden_states = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
-            shifted_labels = labels[:, 1:].contiguous().reshape(-1)
-            loss = self.loss_fn(
-                self.lm_head.weight,
-                shifted_hidden_states, 
-                shifted_labels,
-            )
+            if cp.cp_active():
+                # Context parallel: `labels` are already per-token NEXT-token targets (pre-shifted
+                # per-doc in cp.shard_batch), because the usual global hidden[:-1]/labels[1:] shift
+                # is invalid across zigzag chunk boundaries. So align hidden↔labels 1:1 (no shift).
+                hs = hidden_states.contiguous().reshape(-1, hidden_states.shape[-1])
+                lbl = labels.contiguous().reshape(-1)
+                loss = self.loss_fn(self.lm_head.weight, hs, lbl)
+            else:
+                # B, S, D -> (B*S, D)
+                shifted_hidden_states = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
+                shifted_labels = labels[:, 1:].contiguous().reshape(-1)
+                loss = self.loss_fn(
+                    self.lm_head.weight,
+                    shifted_hidden_states,
+                    shifted_labels,
+                )
         else:
             raise NotImplementedError("Loss calculation is not implemented yet.")
 
@@ -255,6 +267,7 @@ def main(
         grad_accum:int = 1,
         cpu_offload:bool = False,
         target_modules=None,
+        cp_size:int = 1,
     ):
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -262,17 +275,28 @@ def main(
     # rank lands on cuda:0 (NCCL hang / OOM).
     torch.cuda.set_device(rank)
     ddp_setup()  # init_process_group(nccl) — required before init_device_mesh / fully_shard
+    # FSDP shards params across ALL ranks (1D mesh, unchanged). Context parallelism is a SEPARATE
+    # process group over cp_size consecutive ranks (sequence sharded + KV ringed within it);
+    # data parallelism is across CP groups. The two are orthogonal — FSDP all-gathers params over
+    # every rank regardless of the CP grouping.
     mesh_device = init_device_mesh("cuda", (world_size, ), mesh_dim_names=("shard", ))
-    
+    cp_group = dp_size = dp_rank = cp_rank = None
+    attn_impl = ATTN_IMPL
+    if cp_size > 1:
+        cp_group, dp_size, dp_rank, cp_rank = cp.setup_cp(world_size, cp_size, rank)
+        attn_impl = "cp_ring_attention"
+        if rank == 0:
+            logger.info(f"context parallel: cp_size={cp_size} dp_size={dp_size} (world={world_size})")
+
     config = AutoConfig.from_pretrained(MODEL_ID)
     if rank == 0:
-        logger.info(f"attention backend: {ATTN_IMPL}")
+        logger.info(f"attention backend: {attn_impl}")
     # modify the confg
     model = CustomGemma4ForConditionalGeneration.from_pretrained(
         MODEL_ID,
         config=config,
         dtype=torch.bfloat16, # native bf16 training
-        attn_implementation = ATTN_IMPL
+        attn_implementation = attn_impl
     )
     # tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-31B-it")
     total_params = sum(p.numel() for p in model.parameters())
@@ -306,10 +330,12 @@ def main(
     # small dataset, set max_epochs high and max_steps 0.
 
     dataset = Dataset(limit=limit_samples)
+    # Under CP the whole CP group must see the SAME bin (each rank trains a different sequence
+    # chunk of it), so the sampler splits bins across DATA-PARALLEL groups only.
     sampler = DistributedSampler(
         dataset,
-        num_replicas=mesh_device.size(),
-        rank=mesh_device.get_rank(),
+        num_replicas=(dp_size if cp_size > 1 else mesh_device.size()),
+        rank=(dp_rank if cp_size > 1 else mesh_device.get_rank()),
     )
     dataloader = DataLoader(
         dataset,
@@ -363,6 +389,12 @@ def main(
                 for k, v in batch.items()
             }
 
+            # Context parallel: replace the full packed batch with THIS rank's zigzag shard (and
+            # set the local position/doc ids the ring attention masks read). n_tok below then counts
+            # only this rank's real (non -100) targets; summed across ranks for the token-weighted loss.
+            if cp_size > 1:
+                batch = cp.shard_batch(batch, cp_size, cp_rank, pad_id=0)
+
             if rank == 0 and idx == 0:
                 S = batch["input_ids"].shape[-1]
                 alloc_gb = torch.cuda.memory_allocated(rank) / 2**30
@@ -373,7 +405,8 @@ def main(
             # normalizing by the GLOBAL token count at the step below, yields the exact
             # token-weighted mean over the whole effective batch — not a naive mean-of-means
             # that mis-weights variable-length bins / ranks (HF grad-accum loss fix).
-            n_tok = (batch["labels"][:, 1:] != -100).sum()  # == the loss_fn's shifted denominator
+            # CP labels are pre-shifted per-token targets (no [:,1:] shift); non-CP shifts.
+            n_tok = ((batch["labels"] if cp_size > 1 else batch["labels"][:, 1:]) != -100).sum()
             (output["loss"] * n_tok).backward() # calculate gradient
             win_tokens += n_tok
 
@@ -479,6 +512,14 @@ if __name__ == "__main__":
              "projections (q_proj,k_proj,v_proj,o_proj); add MLP/dense layers "
              "(gate_proj,up_proj,down_proj) to adapt those too.",
     )
+    parser.add_argument(
+        "--cp_size",
+        type=int,
+        default=1,
+        help="Context-parallel (zigzag ring) degree: shard each packed sequence across this many "
+             "GPUs (KV ringed between them) to train context longer than one GPU's VRAM. 1 = off. "
+             "world_size must be divisible by it; dp_size = world_size / cp_size.",
+    )
     args = parser.parse_args()
     main(
         args.r,
@@ -494,4 +535,5 @@ if __name__ == "__main__":
         grad_accum=args.grad_accum,
         cpu_offload=args.cpu_offload,
         target_modules=[t.strip() for t in (args.target_modules or "").split(",") if t.strip()],
+        cp_size=args.cp_size,
     )

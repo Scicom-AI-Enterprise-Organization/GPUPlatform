@@ -37,6 +37,22 @@ default), training loss decreasing + wandb logging, `merge_infer.py` merge (230/
 generation. Base function-calling eval (`eval_funccall.py`, SyntheticGen scoring on `glm5.1-fp8-test`):
 `tool_call_f1 ≈ 0.715`.
 
+**Context parallelism — zigzag ring attention (`ring_zigzag_attn.py`), verified 2× H100 SXM
+2026-07-04.** Shards one long packed sequence across GPUs and rings the K/V blocks, combining the
+per-block partials via the online-softmax LSE the FA4 forward returns (`return_lse=True`, natural-log
+with the scale folded in). The head_dim>256 backward can't take an external LSE (the fork's
+`_flash_attn_bwd_large_headdim` re-softmaxes each block *locally*), so the ring backward recomputes
+each partial block with `p = exp(scale·S − LSE_global)` — the same math as the fork's backward, just
+consuming the global LSE. `torchrun --nproc_per_node=2 test_ring_attn.py`: the ring (zigzag layout,
+2 GPUs) **output AND dq/dk/dv match single-GPU non-ring FA4 to rel ~3e-3 and an fp32 ground truth to
+~3e-3** for gemma4-global hd512, sliding-geom hd256, multi-doc varlen, a tiny config, AND the
+**sliding-window** configs (position-aware ring) — `ALL RING CONFIGS PASS ✅`. The hybrid: hd512-global
+→ fused cute zigzag ring; hd256-sliding → position-aware ring (a fused kernel's window is wrong under
+zigzag). Wired into training via `context_parallel.py` + `gemma4.py --cp_size` + the `/autotrain/new`
+Context-parallelism toggle (gemma4-only); the real Gemma4 backbone under CP matches non-CP hidden
+states (2× H100, tiny random model). A full gemma-4-31B CP training run is wired + ready but not yet
+run end-to-end. See `CLAUDE.md` for the design, the interface facts, and the non-contiguous-recv bug.
+
 ⚠️ **Open constraint — long-context training is memory-bound by the head_dim-512 full-attention.** It
 has *no* memory-efficient kernel in PyTorch (flash/efficient/cuDNN all reject head_dim 512; flex
 fails to compile), so it runs SDPA-math = `O(S²)` score matrix, which FSDP2 **cannot shard** (it's an
@@ -63,6 +79,10 @@ at pack time (`pack_dataset.py --max-seq-len`); the bin must still contain the c
 | `bench_decode_kernel.py` | 3-way decode comparison: custom Triton vs vLLM vs FA4-cute |
 | `bench_decode_cudagraph.py` | eager-vs-CUDA-graph decode micro-bench (short-context analysis) |
 | `bench_setup.sh` + `bench_vllm_shim/` | copies vLLM's Triton kernel into a minimal shim (no full vLLM build) |
+| `ring_zigzag_attn.py` | **zigzag ring (context-parallel) attention**: fused cute-512 ring + position-aware sliding ring |
+| `context_parallel.py` | CP trainer glue: CP process group, zigzag `shard_batch`, `cp_ring_attention` backend |
+| `test_ring_attn.py` | 2-GPU test: ring out+dq/dk/dv == non-ring FA4 == fp32 (causal + sliding) |
+| `run_ring_test.sh` | pod bootstrap for the ring test (fork + cutlass-dsl [+ FA3 via GEMMA_FA3=1]; no model needed) |
 | `run.sh` | one-shot pod bootstrap: deps → correctness test → download → train |
 | `CLAUDE.md` | design notes, gotchas, the full runpodctl workflow |
 

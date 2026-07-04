@@ -300,6 +300,9 @@ export function TrainingForm() {
   const [cpuOffload, setCpuOffload] = useState(
     initialTask === "llm" ? llmCpuOffloadDefault(DEFAULT_LLM_BASE) : true,
   );
+  // LLM gemma4-only: context parallelism (zigzag ring attention) — shards the packed sequence
+  // across all GPUs to train context longer than one GPU's VRAM. Needs >=2 GPUs.
+  const [contextParallel, setContextParallel] = useState(false);
   // training
   const [evalMetric, setEvalMetric] = useState<"wer" | "cer">("wer");
   const [normalizeText, setNormalizeText] = useState(true);
@@ -497,6 +500,7 @@ export function TrainingForm() {
         // training
         if (c.grad_accum != null) setGradAccum(num(c.grad_accum, 4));
         if (c.cpu_offload != null) setCpuOffload(!!c.cpu_offload);
+        if (c.context_parallel != null) setContextParallel(!!c.context_parallel);
         if (c.eval_metric === "wer" || c.eval_metric === "cer") setEvalMetric(c.eval_metric);
         if (c.normalize_text != null) setNormalizeText(!!c.normalize_text);
         if (c.max_epochs != null) setMaxEpochs(num(c.max_epochs, 3));
@@ -645,6 +649,8 @@ export function TrainingForm() {
   const hfSecretKeys = secrets.filter((s) => s.is_secret).map((s) => s.key);
   const isTts = taskType === "tts";
   const isLlm = taskType === "llm";
+  // Context parallelism (ring attention) is currently gemma4-only.
+  const isGemma = isLlm && llmArch(baseModel) === "gemma";
   const MODELS = isTts ? TTS_BASE_MODELS : isLlm ? LLM_BASE_MODELS : WHISPER_MODELS;
   // TTS/LLM train directly on a pre-packed ChiniDataset (tts_packed / llm_packed);
   // ASR uses raw audio sources — never a packed dataset.
@@ -871,6 +877,8 @@ export function TrainingForm() {
       grad_accum: gradAccum,
       // LLM-only FSDP CPU offload; null for ASR/TTS (trainers ignore it).
       cpu_offload: isLlm ? cpuOffload : null,
+      // gemma4-only context parallelism (zigzag ring); only meaningful with >=2 GPUs.
+      context_parallel: isGemma && gpuBound >= 2 ? contextParallel : null,
       learning_rate: Number(learningRate) || (isTts ? 2e-5 : isLlm ? 5e-5 : 1e-5),
       weight_decay: weightDecay,
       warmup_steps: warmupSteps,
@@ -1264,18 +1272,6 @@ export function TrainingForm() {
           ) : (
             <FieldWrap label="Grad accumulation"><NumberField min={1} value={gradAccum} onChange={setGradAccum} /></FieldWrap>
           )}
-          {isLlm && !sweepOn && (
-            <FieldWrap label="CPU offload"
-              hint={cpuOffload
-                ? "FSDP keeps params/optimizer in host RAM — fits long context / tight VRAM, but PCIe-bound (slower). Off is faster on big-VRAM GPUs (e.g. H20)."
-                : "Params/optimizer stay on the GPU (faster). Turn on if you OOM at long context / on smaller GPUs."}>
-              <label className="flex h-9 cursor-pointer items-center gap-2 text-sm">
-                <input type="checkbox" checked={cpuOffload} onChange={(e) => setCpuOffload(e.target.checked)}
-                  className="h-4 w-4 accent-primary" />
-                <span className="font-medium">{cpuOffload ? "On" : "Off"}</span>
-              </label>
-            </FieldWrap>
-          )}
           {sweepOn ? (
             <FieldWrap label="Weight decay" hint="AdamW L2 — e.g. 0, 0.01, 0.1">
               <Input className="font-mono" placeholder="0, 0.01, 0.1" value={sweepWeightDecay} onChange={(e) => setSweepWeightDecay(e.target.value)} />
@@ -1303,6 +1299,33 @@ export function TrainingForm() {
               : "Optimizer steps to ramp LR 0 → peak before decay. 0 = no warmup."}>
             <NumberField min={0} value={warmupSteps} onChange={setWarmupSteps} />
           </FieldWrap>
+          {isLlm && !sweepOn && (
+            <FieldWrap label="CPU offload"
+              hint={cpuOffload
+                ? "FSDP keeps params/optimizer in host RAM — fits long context / tight VRAM, but PCIe-bound (slower). Off is faster on big-VRAM GPUs (e.g. H20)."
+                : "Params/optimizer stay on the GPU (faster). Turn on if you OOM at long context / on smaller GPUs."}>
+              <label className="flex h-9 cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={cpuOffload} onChange={(e) => setCpuOffload(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span className="font-medium">{cpuOffload ? "On" : "Off"}</span>
+              </label>
+            </FieldWrap>
+          )}
+          {isGemma && !sweepOn && (
+            <FieldWrap label="Context parallelism"
+              hint={gpuBound >= 2
+                ? (contextParallel
+                    ? "Zigzag ring attention: shards one packed sequence across all GPUs (KV ringed between them) so context longer than a single GPU's VRAM can train. gemma4 only."
+                    : "Off — each GPU trains a whole sequence (data parallel). Turn on for long-context runs that don't fit one GPU.")
+                : "Needs ≥2 GPUs (increase GPU count / pin ≥2 devices)."}>
+              <label className={`flex h-9 items-center gap-2 text-sm ${gpuBound >= 2 ? "cursor-pointer" : "opacity-50"}`}>
+                <input type="checkbox" disabled={gpuBound < 2} checked={contextParallel && gpuBound >= 2}
+                  onChange={(e) => setContextParallel(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span className="font-medium">{contextParallel && gpuBound >= 2 ? "On (zigzag ring)" : "Off"}</span>
+              </label>
+            </FieldWrap>
+          )}
 
           {/* TTS: block size + tokenizer aren't asked here — block size follows the
               packed dataset's sequence_length, and the tokenizer is the base TTS

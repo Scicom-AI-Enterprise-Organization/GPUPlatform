@@ -214,8 +214,10 @@ export function TryItCompute({
       cloud_type: value.cloud_type || "SECURE",
       gpu: AUTO,
     };
-    // LLM cloud serves via vLLM (TP = pod GPU count) — carry the vLLM knobs across.
-    onChange(llm ? { ...base, vllmArgs: value.vllmArgs, vllmVersion: value.vllmVersion } : base);
+    // LLM cloud serves via vLLM (TP = pod GPU count) — carry the vLLM + base-token knobs.
+    onChange(llm
+      ? { ...base, vllmArgs: value.vllmArgs, vllmVersion: value.vllmVersion, hfToken: value.hfToken, hfTokenSecret: value.hfTokenSecret }
+      : base);
   }
   function pickVm() {
     const provider_id = vms.some((p) => p.id === value.provider_id)
@@ -469,6 +471,60 @@ export function TryItCompute({
           )}
         </div>
       </Section>
+
+      {/* HF token for the (usually gated) base-model download during the LoRA merge —
+          shown for LLM on either target (a fresh cloud pod has no HF cache). */}
+      {llm && (
+        <Section
+          title="HF token — base model"
+          description="Downloads the (usually gated) base model to merge the LoRA. A fresh cloud pod has no HF cache, so a gated base needs a token."
+        >
+          <div className="space-y-2">
+            <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+              {(["reuse", "secret", "paste"] as const).map((src) => (
+                <button
+                  key={src}
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => {
+                    setTokenSource(src);
+                    if (src !== "secret") onChange({ ...value, hfTokenSecret: undefined });
+                    if (src !== "paste") onChange({ ...value, hfToken: undefined });
+                  }}
+                  className={cn(
+                    "rounded px-2.5 py-1 transition-colors",
+                    tokenSource === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {src === "reuse" ? "Platform HF_TOKEN" : src === "secret" ? "Global secret" : "Paste a token"}
+                </button>
+              ))}
+            </div>
+            {tokenSource === "secret" ? (
+              secretKeys.length > 0 ? (
+                <Select value={value.hfTokenSecret ?? ""} onValueChange={(v) => onChange({ ...value, hfTokenSecret: v, hfToken: undefined })}>
+                  <SelectTrigger className="text-xs"><SelectValue placeholder="Select a secret (e.g. HF_TOKEN)" /></SelectTrigger>
+                  <SelectContent>
+                    {secretKeys.map((k) => <SelectItem key={k} value={k} className="text-xs">{k}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <p className="text-[11px] text-muted-foreground">
+                  No global secrets yet — add one under{" "}
+                  <a href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</a>{" "}
+                  (e.g. <span className="font-mono">HF_TOKEN</span>), or switch to Paste.
+                </p>
+              )
+            ) : tokenSource === "paste" ? (
+              <Input type="password" value={value.hfToken ?? ""}
+                onChange={(e) => onChange({ ...value, hfToken: e.target.value, hfTokenSecret: undefined })}
+                disabled={disabled} placeholder="hf_…" autoComplete="off" className="font-mono text-xs" />
+            ) : (
+              <p className="text-[11px] text-muted-foreground">Reuses the platform <span className="font-mono">HF_TOKEN</span> secret.</p>
+            )}
+          </div>
+        </Section>
+      )}
     </div>
   );
 }

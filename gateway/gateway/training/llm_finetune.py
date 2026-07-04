@@ -612,6 +612,10 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     ]
     if _cpu_offload_on(cfg, True):  # dense default: offload ON (long-context VRAM)
         cmd.append("--cpu_offload")
+    # Context parallelism (zigzag ring, gemma-only): shard each packed sequence across ALL run GPUs
+    # (one CP group, dp=1). Needs >=2 GPUs; ignored otherwise. The form sets cfg["context_parallel"].
+    if cfg.get("context_parallel") and nproc >= 2:
+        cmd += ["--cp_size", str(nproc)]
     return cmd
 
 

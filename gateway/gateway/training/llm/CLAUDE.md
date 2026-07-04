@@ -233,3 +233,28 @@ epoch is only ~3–4 steps — set `max_epochs` high enough that `max_steps` is 
 **Shared box etiquette** (the `tm` VM): other users run here. Check `nvidia-smi` and use free GPUs;
 H20s are 143GB each so big-model FSDP shards fit alongside small jobs. `--container/share` venvs are
 cached between runs (the per-arch venv + the HF model cache make re-runs fast).
+
+## Context parallelism — zigzag ring attention (gemma-4 only), 2026-07-04
+
+`--cp_size N` (>1) shards ONE packed sequence across N GPUs (a CP group) and computes exact attention
+by ringing K/V — trains context longer than one GPU's VRAM. New files (vendored copies of the
+standalone `autotrain/gemma4/` authorities — **re-sync from there**): `ring_zigzag_attn.py` (the ring
+kernels) + `context_parallel.py` (CP process group, zigzag `shard_batch`, `cp_ring_attention` backend).
+The full design (hybrid cute-512-global + position-aware-256-sliding, the LSE convention, the
+non-contiguous-recv permutation bug, the per-doc loss pre-shift) lives in **`autotrain/gemma4/CLAUDE.md`
+→ "Context parallelism"**. Wiring here:
+
+- **`gemma4.py`** takes `--cp_size`: builds a CP process group (FSDP still shards params over ALL ranks —
+  orthogonal; DP is across CP groups), a dp-based `DistributedSampler` (whole CP group sees the same bin),
+  per-batch `cp.shard_batch`, and a CP loss branch (labels are pre-shifted per-doc targets → no
+  `hidden[:-1]/labels[1:]` shift, which is invalid across zigzag chunk boundaries). All gated on `cp_size>1`.
+- **`llm_finetune._gemma_cmd`** appends `--cp_size {nproc}` when `cfg["context_parallel"]` and nproc≥2
+  (CP over ALL run GPUs, dp=1 — the form's toggle is boolean).
+- **`training_api`** carries `context_parallel` in the run config; the web form
+  (`/autotrain/new?task=llm`) shows a **Context parallelism** toggle, gemma4-only, gated to ≥2 GPUs.
+
+**Verified 2× H100 SXM 2026-07-04:** ring primitives (out+dq/dk/dv == non-ring, causal + sliding),
+`shard_batch` round-trip, and the real Gemma4 backbone under CP == non-CP hidden states (both layer
+types). ⚠ A full gemma-4-31B CP **training run** (optimizer + checkpoint) is wired + ready
+(`HF_TOKEN` in `autotrain/.env`) but NOT yet run end-to-end — needs the 62GB model + an `llm_packed`
+dataset. Only gemma-4 is wired (qwen/minimax/mistral would each need the same hybrid dispatch).

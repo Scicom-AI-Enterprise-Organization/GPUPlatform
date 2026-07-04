@@ -464,3 +464,102 @@ the recipe above didn't exist, so it was rebuilt: torch 2.12 had to install via 
 (`uv pip install torch --index-url https://download.pytorch.org/whl/cu130`; this `uv`'s
 `--torch-backend` caps at cu129), and the box has **no `rsync`** (stage with `tar | ssh 'tar x'`,
 not rsync). gemma-4 is pre-cached in `/share/huggingface`.
+
+## Context parallelism — zigzag ring attention (FA4 head_dim-512), 2026-07-04
+
+To shard ONE long packed sequence across GPUs (context parallelism), `ring_zigzag_attn.py` adds
+zigzag ring attention on top of the FA4 cute kernel. It's the FA4 analogue of
+[ring-flash-attention's `zigzag_ring_flash_attn_varlen`](https://github.com/zhuzilin/ring-flash-attention/blob/main/ring_flash_attn/zigzag_ring_flash_attn_varlen.py):
+the ring control-flow (which chunks attend which, the dK/dV ring reduction) is reproduced verbatim;
+only the per-block fwd/bwd primitives are swapped for the head_dim-512 fork.
+
+```
+ring_zigzag_attn.py   zigzag_ring_flash_attn_varlen_func — autograd Fn; RingComm, online-softmax
+                      combine, get_half_index/lse, the ring fwd/bwd, and _ring_bwd (recompute block).
+test_ring_attn.py     torchrun 2-GPU test: ring (zigzag-sharded) out+dq/dk/dv == non-ring FA4 == fp32.
+run_ring_test.sh      pod bootstrap: install fork + cutlass-dsl, torchrun the test (no model/HF token).
+```
+
+**The two load-bearing facts about the fork's interface (verified in `interface.py`):**
+1. **Forward LSE is natural-log with the scale folded in:** `_flash_attn_fwd(..., return_lse=True)`
+   returns `(out (total_q,H,Dv), lse (H,total_q))` where `lse_i = ln(Σ_j exp(scale·S_ij))` (derived
+   from softmax.py's `(row_max·scale_log2 + log2(row_sum))·LN2` epilogue). That is exactly the
+   convention the reference's `update_out_and_lse` online-softmax combine assumes → the forward is a
+   near-verbatim port.
+2. **The head_dim>256 backward CANNOT be used per-ring-block.** `FlashAttnVarlenFunc.backward` routes
+   hd>256 to `_flash_attn_bwd_large_headdim`, which **re-softmaxes each block LOCALLY and asserts
+   `dlse is None`** — i.e. it refuses an external LSE. A ring's cross-rank *partial* key blocks need
+   the GLOBAL normalisation, so that path is wrong for them. `_ring_bwd` is therefore
+   `_bwd_large_headdim_block`'s exact math (`s=QKᵀ·scale`, `dp=dO·Vᵀ`, `ds=p·(dp−δ)·scale`,
+   `δ=rowsum(dO∘O)`, `dV+=Pᵀ·dO`, `dQ=ds·K`, `dK+=dsᵀ·Q`, fp32 accumulate, GQA-expand-then-reduce)
+   with `softmax(s)` replaced by `p = exp(s − LSE_global)`. It reduces to the fork's own backward when
+   the block spans all keys, and is the correct partial-block contribution otherwise. This is the
+   "get the LSE from the forward and carry it into the backward" the whole design hinges on.
+
+**Verified on 2× H100 SXM (RunPod, US, cu130, torch 2.9.1) 2026-07-04** — `bash run_ring_test.sh`,
+`torchrun --nproc_per_node=2 test_ring_attn.py`. For every config the ring (2 GPUs, zigzag layout)
+**output AND dq/dk/dv match the single-GPU non-ring FA4 to rel ~3e-3 (bf16 rounding) and an fp32
+naive-attention ground truth to rel ~3e-3**: gemma4-global hd512 (32q/4kv), gemma4-sliding-geom
+hd256 (32q/16kv), multi-doc varlen hd512 (8q/2kv), and a tiny fp32-tight config. `ALL RING CONFIGS
+PASS ✅`. The test needs no model/HF token (random tensors on gemma-4 attention geometry).
+
+### Sliding-window layers under CP — the position-aware ring (`posaware_ring_attn_func`)
+
+The fused zigzag ring above is **full-causal only**. gemma-4's head_dim-256 layers are **sliding**
+(window 1024), and a fused kernel's `window_size` is **bottom-right-aligned WITHIN each block call** —
+but zigzag's q1/k0 blocks are non-contiguous global chunks, so a fused window masks the WRONG keys.
+So the sliding layers ring through `posaware_ring_attn_func`: a plain (vanilla) ring where each
+(local-q, ring-kv) block builds its keep-mask from **global per-token `(position_id, doc_id)`** —
+same doc AND causal (`k_pos ≤ q_pos`) AND within the left window (`q_pos − k_pos ≤ window`). Correct
+for ANY sharding; the online-softmax LSE combine gives the global normalisation; the backward
+recomputes each block with that global LSE (same math as `_ring_bwd`, position-masked). Slower (torch
+matmuls) but the window is small. position/doc are **all-gathered once** (static), so only k,v (fwd)
+and dk,dv (bwd) ride the ring — 2-tensor symmetric comms.
+
+⚠ **The bug that ate hours (`RingComm.send_recv`): non-contiguous recv buffers silently PERMUTE.**
+The dk/dv arrive at `send_recv` as `.transpose(0,1)` **views** (non-contiguous). `torch.empty_like`
+PRESERVES strides, so the recv buffer was non-contiguous → NCCL writes the flat P2P payload into a
+strided buffer → the gradient rows get **permuted** (same values, `sorted-cos≈1`, `cos≈0`). It was
+invisible in `out`/`dq` because those are **contractions over the k index** (permutation-invariant);
+only the **k-indexed** `dk`/`dv` showed it. Fix: `to_send = to_send.contiguous()` BEFORE `empty_like`.
+(The fused zigzag path dodged it by using pre-allocated contiguous comm buffers.)
+
+**Verified 2× H100 SXM 2026-07-04:** both sliding configs (`gemma4-sliding hd256 32q/16kv window=300`,
+`multi-doc window=200`) — ring out+dq/dk/dv == non-ring FA + fp32 to rel ~2-4e-3. `ALL RING CONFIGS
+PASS ✅` (4 causal + 2 sliding).
+
+### FA3/FA2 ring — why it isn't gemma-4's path
+
+FA3 (`flash_attn_interface`, the hopper prebuilt wheel — coexists with the cute fork on torch 2.12;
+distinct module names) DOES expose low-level `_flash_attn_forward/backward` whose backward accepts an
+external LSE (the clean reference approach). But it would only be correct for **full-causal ≤256**
+layers under zigzag — and gemma-4 has NONE (its ≤256 layers are all sliding → posaware). So gemma-4
+CP is **cute-512 (fused zigzag) + posaware-256-sliding**; an FA3 fused-ring backend is a general
+option for other models, not built here.
+
+### Trainer + gateway integration (`context_parallel.py`, gemma4.py, the form)
+
+`context_parallel.py` wires CP into training (both this dir and the gateway's vendored `llm/` copy):
+- **`setup_cp(world, cp_size, rank)`** — partitions ranks into `world/cp_size` CP groups of `cp_size`
+  consecutive ranks (a separate PG for the ring). FSDP still shards params over ALL ranks (orthogonal);
+  data parallelism is across CP groups.
+- **`shard_batch(batch, cp_size, cp_rank)`** — pads each doc to a multiple of `2·cp_size`, zigzag-shards
+  input_ids/position/labels into `[chunk r, chunk 2W-1-r]` per doc, builds LOCAL cu_seqlens, and sets the
+  per-token global position/doc ids the posaware masks read. ⚠ **Pre-shifts the LM target per-doc**
+  (`tgt[i]=labels[i+1]`, doc-end→-100): the loss's usual `hidden[:-1]/labels[1:]` shift is invalid across
+  zigzag chunk boundaries (adjacent local tokens aren't globally adjacent), so the CP loss branch aligns
+  hidden↔labels 1:1 with pre-shifted targets. Verified: shard→reconstruct round-trips exactly.
+- **`cp_ring_attention`** — the AttentionInterface backend (same signature as `fa4_attention`) selected
+  when `cp_size>1`: `sliding_window` set → posaware ring; else → fused zigzag ring.
+
+`gemma4.py` gets `--cp_size` (mesh/CP-group setup, dp-based sampler, per-batch `shard_batch`, CP loss
+branch, all gated on `cp_size>1`). `llm_finetune._gemma_cmd` passes `--cp_size {nproc}` when
+`cfg["context_parallel"]` and nproc≥2. `training_api` carries `context_parallel`; the web form
+(`/autotrain/new?task=llm`) shows a **Context parallelism** toggle, gemma4-only, gated to ≥2 GPUs.
+
+**Verified 2× H100 2026-07-04 (tiny random gemma-4, no 62GB ckpt):** the real Gemma4 backbone under CP
+(zigzag-sharded, `cp_ring_attention`) matches the non-CP `fa4_attention` full-sequence hidden states —
+full-attention-only rel 4.5e-3, sliding-only 4.5e-3, mixed 1.6e-2. ⚠ A full gemma-4-31B CP **training
+run** (optimizer + checkpoint end-to-end) is wired + ready (`HF_TOKEN` in `autotrain/.env`) but has NOT
+been run — it needs the 62GB model + an `llm_packed` dataset. Zigzag needs every doc length divisible by
+`2·cp_size` (handled by the collator's padding).

@@ -1132,10 +1132,19 @@ async def _create_llm_label_project_for_run(run_id: str, cfg: dict, result: dict
 
     creds = _s3_creds_from_storage(storage)
     # The LLM label export merges the LoRA into the (usually gated) base on the box, so the
-    # merge's from_pretrained needs an HF token. Inject the run's token (its referenced
-    # secret, else platform HF_TOKEN) as HF_TOKEN — env_vars is otherwise empty and the
-    # base download would 401 (matches the HF-export merge fix).
-    _hf_tok = (genv.get(cfg["hf_token_secret"]) if cfg.get("hf_token_secret") else None) or genv.get("HF_TOKEN")
+    # merge's from_pretrained needs an HF token. Inject one as HF_TOKEN — env_vars is
+    # otherwise empty and the base download would 401 (matches the HF-export merge fix).
+    # Precedence: an explicit base-model token (secret key / pasted, from the export tab) >
+    # the run's own token (its hf_token_secret) > the platform HF_TOKEN secret.
+    _hf_tok = None
+    if cfg.get("base_hf_token_secret"):
+        _hf_tok = genv.get(cfg["base_hf_token_secret"])
+    elif cfg.get("base_hf_token_enc"):
+        try:
+            _hf_tok = (json.loads(crypto.decrypt(cfg["base_hf_token_enc"])) or {}).get("token")
+        except Exception:  # noqa: BLE001
+            _hf_tok = None
+    _hf_tok = _hf_tok or (genv.get(cfg["hf_token_secret"]) if cfg.get("hf_token_secret") else None) or genv.get("HF_TOKEN")
     cfg = _cfg_with_hf_token(cfg, _hf_tok)
     ssh = await _resolve_run_ssh(row)
     if ssh is None:
@@ -2762,6 +2771,9 @@ class CreateTrainingRunRequest(BaseModel):
     # LLM FSDP CPU offload (params/optimizer in host RAM: big VRAM saver, PCIe-slow).
     # None = per-arch default (gemma/qwen ON, minimax/mistral OFF); the form sets it.
     cpu_offload: Optional[bool] = None
+    # LLM gemma4-only: context parallelism (zigzag ring attention) — shards one packed sequence
+    # across all run GPUs so context longer than a single GPU's VRAM can train. Needs >=2 GPUs.
+    context_parallel: Optional[bool] = None
     learning_rate: float = 1e-5
     warmup_steps: int = 0
     # HF LR schedule: linear (warmup→linear decay, the default), cosine,
@@ -3162,6 +3174,7 @@ async def create_training_run(
         "no_eval": bool(body.no_eval),
         "split_seed": body.split_seed, "batch_size": body.batch_size,
         "grad_accum": body.grad_accum, "cpu_offload": body.cpu_offload,
+        "context_parallel": body.context_parallel,
         "learning_rate": body.learning_rate,
         "warmup_steps": body.warmup_steps, "lr_scheduler_type": body.lr_scheduler_type,
         "weight_decay": body.weight_decay,
@@ -3626,6 +3639,10 @@ class LabelExportRequest(BaseModel):
     llm_mos_axes: Optional[list[str]] = None    # override rating axes
     llm_max_new_tokens: Optional[int] = None    # override generation length
     vllm_version: Optional[str] = None          # LLM: vLLM version for the merge→serve venv (default 0.23.0)
+    # LLM: HF token to download the (usually gated) base model for the merge — a pasted
+    # token or a global-secret key. Else the run's own token, else platform HF_TOKEN.
+    base_hf_token: Optional[str] = None
+    base_hf_token_secret: Optional[str] = None
 
 
 @router.post("/{run_id}/label-export")
@@ -3736,6 +3753,15 @@ async def retry_label_export(
         cfg["llm_label_max_new_tokens"] = max(1, int(body.llm_max_new_tokens))
     if body.vllm_version is not None:
         cfg["label_vllm_version"] = body.vllm_version.strip() or None
+    # Base-model (gated) download token for the LLM merge — a referenced global secret
+    # (key stored plainly) or a pasted token (Fernet-encrypted, never raw), mirroring the
+    # Label-platform token handling above.
+    if (body.base_hf_token_secret or "").strip():
+        cfg["base_hf_token_secret"] = body.base_hf_token_secret.strip()
+        cfg["base_hf_token_enc"] = None
+    elif (body.base_hf_token or "").strip():
+        cfg["base_hf_token_enc"] = crypto.encrypt(json.dumps({"token": body.base_hf_token.strip()}))
+        cfg["base_hf_token_secret"] = None
     cfg["label_export"] = True
 
     has_url = bool((cfg.get("label_base_url_secret") or "").strip() or (cfg.get("label_base_url") or "").strip())
@@ -3770,7 +3796,8 @@ async def retry_label_export(
                       "label_gpu_type", "label_gpu_count", "label_secure_cloud", "label_data_center_id",
                       "label_disk_gb", "label_volume_gb", "label_visible_devices", "venv_path", "tts_codec",
                       "llm_label_eval_dataset_id", "llm_label_samples",
-                      "llm_label_max_new_tokens", "llm_label_mos_axes"):
+                      "llm_label_max_new_tokens", "llm_label_mos_axes",
+                      "base_hf_token_secret", "base_hf_token_enc"):
                 merged[k] = cfg.get(k)
             r2.config_json = merged
             await s.commit()

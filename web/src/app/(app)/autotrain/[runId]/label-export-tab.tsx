@@ -72,6 +72,11 @@ export function LabelExportTab({
   // vLLM version for the merge→serve venv (the export merges the LoRA + generates with
   // vLLM offline). Default 0.23.0, like serverless/new.
   const [vllmVersion, setVllmVersion] = useState(str("label_vllm_version") || "0.23.0");
+  // HF token for the (gated) base-model download during the LoRA merge. Defaults to the
+  // run's own token / the platform HF_TOKEN; override with a global secret or a pasted token.
+  const [baseHfTokenMode, setBaseHfTokenMode] = useState<"reuse" | "secret" | "paste">(str("base_hf_token_secret") ? "secret" : "reuse");
+  const [baseHfToken, setBaseHfToken] = useState("");
+  const [baseHfTokenSecret, setBaseHfTokenSecret] = useState(str("base_hf_token_secret"));
 
   // ---- Run-on (pod card) — shared ComputeTargetPicker ----
   // LLM export runs from the run's LLM venv (/share/autotrain-llm-<arch>, filled
@@ -141,6 +146,8 @@ export function LabelExportTab({
               llm_mos_axes: llmAxes.split(",").map((s) => s.trim()).filter(Boolean),
               llm_max_new_tokens: llmMaxNewTokens,
               vllm_version: vllmVersion.trim() || null,
+              base_hf_token: baseHfTokenMode === "paste" ? (baseHfToken.trim() || undefined) : undefined,
+              base_hf_token_secret: baseHfTokenMode === "secret" ? (baseHfTokenSecret || null) : null,
             }
           : {
               samples,
@@ -354,6 +361,35 @@ export function LabelExportTab({
               <Input className="font-mono sm:max-w-xs" value={vllmVersion} placeholder="0.23.0" onChange={(e) => setVllmVersion(e.target.value)} />
               <p className="text-xs text-muted-foreground">
                 The LoRA is merged (FP8→fp16 for MiniMax/Mistral) and served with vLLM offline. Version installed in the serve venv.
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-3">
+                <label className="text-xs uppercase tracking-wide text-muted-foreground">HF token — base model</label>
+                <div className="inline-flex overflow-hidden rounded-md border border-border text-xs">
+                  {(["reuse", "secret", "paste"] as const).map((m) => (
+                    <button key={m} type="button" onClick={() => setBaseHfTokenMode(m)}
+                      className={cn("px-2.5 py-1 transition-colors",
+                        baseHfTokenMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                      {m === "reuse" ? "Run / platform" : m === "secret" ? "From secret" : "Paste"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {baseHfTokenMode === "secret" ? (
+                <Select value={baseHfTokenSecret} onValueChange={setBaseHfTokenSecret}>
+                  <SelectTrigger><SelectValue placeholder={secrets.some((s) => s.is_secret) ? "Choose a secret" : "No secrets configured"} /></SelectTrigger>
+                  <SelectContent>
+                    {secrets.filter((s) => s.is_secret).map((s) => (
+                      <SelectItem key={s.key} value={s.key}>{s.key}{s.value_preview ? ` — ${s.value_preview}` : ""}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : baseHfTokenMode === "paste" ? (
+                <Input type="password" className="font-mono" value={baseHfToken} placeholder="hf_…" onChange={(e) => setBaseHfToken(e.target.value)} />
+              ) : null}
+              <p className="text-xs text-muted-foreground">
+                Downloads the (usually gated) base model to merge the LoRA. Defaults to the run&apos;s HF token (its secret) or the platform <span className="font-mono">HF_TOKEN</span>; override if a different account owns the base model.
               </p>
             </div>
           </>
