@@ -278,57 +278,109 @@ def _mask(qp, qd, kp, kd, window):
     return keep
 
 
-def _fwd_blk(q, k, v, qp, qd, kp, kd, scale, window, qb=1024):
+# Long-context knobs (the fp32/qb=1024 defaults are fine to ~16k tokens/rank; at 128k+/rank the fp32
+# score matrices are both the memory (24×1024×131k×4B ≈ 13GB/block) and the speed (no tensor cores)
+# wall). bf16 matmuls (cuBLAS accumulates fp32 internally; only the score ROUNDING is bf16 — the same
+# trade fused flash kernels make) are ~4× faster on H20/H100 and halve transients. SGPU_RING_FP32=1
+# restores full-fp32 scores; SGPU_RING_QB tunes the q-block (smaller = smaller transients).
+_RING_QB = int(os.environ.get("SGPU_RING_QB", "1024") or 1024)
+_RING_FP32 = os.environ.get("SGPU_RING_FP32") == "1"
+
+
+def _cols(qp_blk, qd_blk, kp, kd, window):
+    """Per-q-block K-column pre-selection: causal (kp ≤ max qp), inside the window (if any), and —
+    the long-context lever on MULTIPACKED bins — belonging to one of the q-block's DOCS (attention
+    never crosses docs, so a ~27k-doc column slice replaces the full 131k chunk). Conservative
+    superset; the exact _mask still applies. Returns a LongTensor index (possibly empty)."""
+    colm = kp <= int(qp_blk.max())
+    if window is not None:
+        colm &= kp >= (int(qp_blk.min()) - window)
+    colm &= torch.isin(kd, torch.unique(qd_blk))
+    return colm.nonzero(as_tuple=False).squeeze(1)
+
+
+def _fwd_blk(q, k, v, qp, qd, kp, kd, scale, window, qb=None):
+    qb = qb or _RING_QB
     Tq, hq, d = q.shape; Tk, hkv, dv = v.shape; g = hq // hkv
-    kf = (k.transpose(0, 1).repeat_interleave(g, 0) if g != 1 else k.transpose(0, 1)).float()
-    vf = (v.transpose(0, 1).repeat_interleave(g, 0) if g != 1 else v.transpose(0, 1)).float()
+    cd = torch.float32 if _RING_FP32 else q.dtype     # score-matmul compute dtype
+    kt = k.transpose(0, 1); vt = v.transpose(0, 1)    # (hkv,Tk,*) — GQA-expand AFTER column select
     out = torch.empty(Tq, hq, dv, dtype=torch.float32, device=q.device)
     lse = torch.empty(hq, Tq, dtype=torch.float32, device=q.device)
     for s0 in range(0, Tq, qb):
         s1 = min(s0 + qb, Tq)
-        sc = torch.matmul(q[s0:s1].transpose(0, 1).float(), kf.transpose(-1, -2)) * scale
-        keep = _mask(qp[s0:s1], qd[s0:s1], kp, kd, window)
+        idx = _cols(qp[s0:s1], qd[s0:s1], kp, kd, window)
+        if idx.numel() == 0:
+            out[s0:s1] = 0.0                          # no reachable columns: identity contribution
+            lse[:, s0:s1] = float("-inf")
+            continue
+        kb = kt.index_select(1, idx); vb = vt.index_select(1, idx)
+        kf = (kb.repeat_interleave(g, 0) if g != 1 else kb).to(cd)   # (hq,|idx|,d)
+        vf = (vb.repeat_interleave(g, 0) if g != 1 else vb).to(cd)
+        keep = _mask(qp[s0:s1], qd[s0:s1], kp[idx], kd[idx], window)
+        sc = torch.matmul(q[s0:s1].transpose(0, 1).to(cd), kf.transpose(-1, -2)).float() * scale
         sc = sc.masked_fill(~keep.unsqueeze(0), float("-inf"))
         m = sc.amax(-1, keepdim=True); m = torch.where(torch.isneginf(m), torch.zeros_like(m), m)
         p = torch.exp(sc - m); den = p.sum(-1, keepdim=True)
-        out[s0:s1] = (torch.matmul(p, vf) / den.clamp(min=1e-20)).transpose(0, 1)
+        out[s0:s1] = (torch.matmul(p.to(cd), vf).float() / den.clamp(min=1e-20)).transpose(0, 1)
         lb = (m + torch.log(den.clamp(min=1e-20))).squeeze(-1)
         lse[:, s0:s1] = torch.where(den.squeeze(-1) == 0, torch.full_like(lb, float("-inf")), lb)
     return out.to(q.dtype), lse
 
 
-def _bwd_blk(dout, q, k, v, out, lse, qp, qd, kp, kd, scale, window, qb=1024):
+def _bwd_blk(dout, q, k, v, out, lse, qp, qd, kp, kd, scale, window, qb=None):
+    qb = qb or _RING_QB
     Tq, hq, d = q.shape; Tk, hkv, dv = v.shape; g = hq // hkv
-    kf = (k.transpose(0, 1).repeat_interleave(g, 0) if g != 1 else k.transpose(0, 1)).float()
-    vf = (v.transpose(0, 1).repeat_interleave(g, 0) if g != 1 else v.transpose(0, 1)).float()
+    cd = torch.float32 if _RING_FP32 else q.dtype
+    kt = k.transpose(0, 1); vt = v.transpose(0, 1)    # (hkv,Tk,*) — GQA-expand AFTER column select
     of = out.float().transpose(0, 1); dof = dout.float().transpose(0, 1)
     delta = (dof * of).sum(-1)
     dq = torch.zeros(hq, Tq, d, dtype=torch.float32, device=q.device)
-    dk_e = torch.zeros(hq, Tk, d, dtype=torch.float32, device=q.device)
-    dv_e = torch.zeros(hq, Tk, dv, dtype=torch.float32, device=q.device)
+    # dk/dv accumulate at KV-HEAD granularity (hkv, Tk, ·) — the per-block g-sum happens before the
+    # index_add_, so the full-width fp32 buffers are g× smaller (0.5GB vs 3.2GB at 131k tokens).
+    dk_e = torch.zeros(hkv, Tk, d, dtype=torch.float32, device=q.device)
+    dv_e = torch.zeros(hkv, Tk, dv, dtype=torch.float32, device=q.device)
     for s0 in range(0, Tq, qb):
         s1 = min(s0 + qb, Tq)
-        qbl = q[s0:s1].transpose(0, 1).float()
-        sc = torch.matmul(qbl, kf.transpose(-1, -2)) * scale
-        keep = _mask(qp[s0:s1], qd[s0:s1], kp, kd, window)
+        idx = _cols(qp[s0:s1], qd[s0:s1], kp, kd, window)
+        if idx.numel() == 0:
+            continue                                   # no reachable columns: zero grads
+        kb = kt.index_select(1, idx); vb = vt.index_select(1, idx)
+        kf = (kb.repeat_interleave(g, 0) if g != 1 else kb).to(cd)   # (hq,|idx|,d)
+        vf = (vb.repeat_interleave(g, 0) if g != 1 else vb).to(cd)
+        keep = _mask(qp[s0:s1], qd[s0:s1], kp[idx], kd[idx], window)
+        qbl = q[s0:s1].transpose(0, 1).to(cd)
+        sc = torch.matmul(qbl, kf.transpose(-1, -2)).float() * scale
         sc = sc.masked_fill(~keep.unsqueeze(0), float("-inf"))
         p = torch.exp(sc - lse[:, s0:s1].unsqueeze(-1))
         dob = dof[:, s0:s1]
-        ds = p * (torch.matmul(dob, vf.transpose(-1, -2)) - delta[:, s0:s1].unsqueeze(-1)) * scale
-        dv_e += torch.matmul(p.transpose(-1, -2), dob)
-        dq[:, s0:s1] = torch.matmul(ds, kf)
-        dk_e += torch.matmul(ds.transpose(-1, -2), qbl)
-    if g != 1:
-        dk = dk_e.view(hkv, g, Tk, d).sum(1); dvv = dv_e.view(hkv, g, Tk, dv).sum(1)
-    else:
-        dk, dvv = dk_e, dv_e
-    return (dq.transpose(0, 1).to(q.dtype), dk.transpose(0, 1).to(q.dtype), dvv.transpose(0, 1).to(q.dtype))
+        ds = (p * (torch.matmul(dob.to(cd), vf.transpose(-1, -2)).float()
+                   - delta[:, s0:s1].unsqueeze(-1)) * scale)
+        bdv = torch.matmul(p.to(cd).transpose(-1, -2), dob.to(cd)).float()   # (hq,|idx|,dv)
+        bdk = torch.matmul(ds.to(cd).transpose(-1, -2), qbl).float()         # (hq,|idx|,d)
+        if g != 1:
+            bdv = bdv.view(hkv, g, -1, dv).sum(1); bdk = bdk.view(hkv, g, -1, d).sum(1)
+        dv_e.index_add_(1, idx, bdv)
+        dk_e.index_add_(1, idx, bdk)
+        dq[:, s0:s1] = torch.matmul(ds.to(cd), kf).float()
+    return (dq.transpose(0, 1).to(q.dtype), dk_e.transpose(0, 1).to(q.dtype), dv_e.transpose(0, 1).to(q.dtype))
 
 
 def _gather_posdoc(pos, doc, W, group):
     pl = [torch.empty_like(pos) for _ in range(W)]; dl = [torch.empty_like(doc) for _ in range(W)]
     dist.all_gather(pl, pos.contiguous(), group=group); dist.all_gather(dl, doc.contiguous(), group=group)
     return pl, dl
+
+
+def _skip_step(pos, all_pos_src, window):
+    """True when the (local-q, src-KV) pair can contribute NOTHING: every src key is causally after
+    every local query (contiguous sharding → whole later chunks), or — with a sliding window — every
+    src key is entirely outside the window. Compute-only decision (each rank skips its own blocks);
+    the ring COMM still rotates every step on every rank, so the comm pattern stays symmetric."""
+    if int(all_pos_src.min()) > int(pos.max()):
+        return True                                    # all keys after all queries → fully non-causal
+    if window is not None and int(pos.min()) - int(all_pos_src.max()) > window:
+        return True                                    # all keys before the window
+    return False
 
 
 def _ring_fwd(group, q, k, v, pos, doc, scale, window):
@@ -339,8 +391,11 @@ def _ring_fwd(group, q, k, v, pos, doc, scale, window):
         if step + 1 != W:
             nk = comm.send_recv(k); nv = comm.send_recv(v); comm.commit()
         src = (rank - step) % W
-        bo, bl = _fwd_blk(q, k, v, pos, doc, all_pos[src], all_doc[src], scale, window)
-        out, lse = _upd(out, lse, bo, bl)
+        # skip compute for chunks that can't contribute (step 0 = the diagonal, never skipped, so
+        # `out` is always initialized before any skippable step).
+        if not _skip_step(pos, all_pos[src], window):
+            bo, bl = _fwd_blk(q, k, v, pos, doc, all_pos[src], all_doc[src], scale, window)
+            out, lse = _upd(out, lse, bo, bl)
         if step + 1 != W:
             comm.wait(); k, v = nk, nv
     return out.to(q.dtype), lse.squeeze(-1).transpose(0, 1).contiguous()
@@ -354,11 +409,16 @@ def _ring_bwd(group, dout, q, k, v, out, lse, pos, doc, scale, window):
         if step + 1 != W:
             nk = kv.send_recv(k); nv = kv.send_recv(v); kv.commit()
         src = (rank - step) % W
-        bdq, bdk, bdv = _bwd_blk(dout, q, k, v, out, lse, pos, doc, all_pos[src], all_doc[src], scale, window)
-        if dq is None:
-            dq, dk, dv = bdq.float(), bdk.float(), bdv.float()
+        if step > 0 and _skip_step(pos, all_pos[src], window):
+            # non-contributing chunk: this KV's grad is untouched — pass the accumulated dk/dv
+            # straight through the dkv ring (dk = 0 + ndk). Step 0 (diagonal) is never skipped.
+            dkv.wait(); dk, dv = ndk, ndv
         else:
-            dq += bdq; dkv.wait(); dk = bdk.float() + ndk; dv = bdv.float() + ndv
+            bdq, bdk, bdv = _bwd_blk(dout, q, k, v, out, lse, pos, doc, all_pos[src], all_doc[src], scale, window)
+            if dq is None:
+                dq, dk, dv = bdq.float(), bdk.float(), bdv.float()
+            else:
+                dq += bdq; dkv.wait(); dk = bdk.float() + ndk; dv = bdv.float() + ndv
         if step + 1 != W:
             kv.wait(); k, v = nk, nv
         ndk = dkv.send_recv(dk); ndv = dkv.send_recv(dv); dkv.commit()

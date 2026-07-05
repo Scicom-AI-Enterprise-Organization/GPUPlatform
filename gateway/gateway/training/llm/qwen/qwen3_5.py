@@ -338,6 +338,8 @@ def main(
         cp_group, dp_size, dp_rank, cp_rank = cp.setup_cp(world_size, cp_size, rank, torch.device(f"cuda:{rank}"))
         attn_impl = "cp_full_attention"   # full-attn (softmax) layers ring; GDN layers patched below
         logger.info(f"[cp] cp_size={cp_size} dp_size={dp_size} (world={world_size})")
+        if os.environ.get("SGPU_MEM_PROFILE") == "1" and rank == 0:
+            torch.cuda.memory._record_memory_history()   # dump: /share/qwen_cp_mem_r0.pickle at i0/idx1
     else:
         torch.cuda.memory._record_memory_history()
 
@@ -553,6 +555,11 @@ def main(
                 delta_time = time.time() - start_time
                 tps = token_count.item() / delta_time
                 logger.info(f"Epoch: {i}, mb: {idx}, step: {opt_step}, loss: {loss}, tokens/s: {tps:.2f}")
+                # Post-microbatch CUDA residue — the leak/retention tell for long-context CP: after
+                # backward+step the allocator should be back near the steady floor; a climbing series
+                # here means graph/activation retention across steps.
+                logger.info(f"[mem] mb {idx}: allocated={torch.cuda.memory_allocated()/2**30:.2f}GB "
+                            f"reserved={torch.cuda.memory_reserved()/2**30:.2f}GB")
                 metrics = {"loss": loss, "lr": optimizer.param_groups[0]['lr'], "tps": tps, "epoch": i}
                 if wandb_run is not None and do_step:
                     try:
@@ -567,6 +574,13 @@ def main(
 
             if i == 0 and idx == 1 and cp_size <= 1:  # history only recorded in the non-CP branch
                 torch.cuda.memory._dump_snapshot(f"memory_profile_{rank}.pickle")
+            # CP memory profiling (SGPU_MEM_PROFILE=1): dump rank 0's allocation history after the
+            # SECOND microbatch — captures whatever step 0 left resident (the OOM residue) with
+            # allocation stacks. Absolute path: the run's workdir is cleaned on failure.
+            if (i == 0 and idx == 1 and cp_size > 1 and rank == 0
+                    and os.environ.get("SGPU_MEM_PROFILE") == "1"):
+                torch.cuda.memory._dump_snapshot("/share/qwen_cp_mem_r0.pickle")
+                logger.info("[mem] snapshot dumped to /share/qwen_cp_mem_r0.pickle")
 
             reached_max = max_steps > 0 and do_step and (opt_step + 1) >= max_steps
             if idx == len(dataloader)-1 or (do_step and (idx + 1) % checkpointing_step == 0) or reached_max:

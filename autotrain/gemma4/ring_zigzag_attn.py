@@ -27,11 +27,20 @@ verbatim from that reference — only the per-block forward/backward primitives 
 Correctness contract (see test_ring_attn.py): for the same q/k/v/dout, the ring out and the
 dq/dk/dv gradients must equal the single-GPU (non-ring) FA4 result up to bf16 noise.
 """
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
 from flash_attn.cute.interface import _flash_attn_fwd
+
+# Long-context knobs for the (pure-torch) POSAWARE sliding ring — the fused zigzag path is
+# untouched. SGPU_RING_QB: q-block rows (smaller = smaller transients). SGPU_RING_FP32=1 restores
+# full-fp32 score matmuls (default: compute in the input dtype, bf16 → tensor cores, cuBLAS
+# accumulates fp32 internally — the same trade fused flash kernels make).
+_RING_QB = int(os.environ.get("SGPU_RING_QB", "1024") or 1024)
+_RING_FP32 = os.environ.get("SGPU_RING_FP32") == "1"
 
 
 # ----------------------------------------------------------------------------------------
@@ -458,30 +467,52 @@ def _posaware_mask(q_pos, q_doc, k_pos, k_doc, window):
     return keep
 
 
-def _posaware_fwd_block(q, k, v, q_pos, q_doc, k_pos, k_doc, scale, window, q_block=1024):
+def _win_cols(q_pos_blk, k_pos, window):
+    """Column pre-selection for a q-block: only k columns with ANY chance of being kept —
+    causal (k_pos <= max q_pos) and, with a sliding window, within it (k_pos >= min q_pos −
+    window). Turns the per-block matmul from O(Tk) columns into O(window + q_block) for sliding
+    layers — THE long-context lever for the posaware path (window ≪ Tk at 128k+ tokens/rank).
+    Returns a LongTensor index (possibly empty). Conservative (a superset of the kept columns:
+    doc boundaries are still enforced by the exact mask afterwards)."""
+    colm = k_pos <= int(q_pos_blk.max())
+    if window is not None:
+        colm &= k_pos >= (int(q_pos_blk.min()) - window)
+    return colm.nonzero(as_tuple=False).squeeze(1)
+
+
+def _posaware_fwd_block(q, k, v, q_pos, q_doc, k_pos, k_doc, scale, window, q_block=None):
     """out (Tq,H,Dv) + lse (H,Tq) for local q vs one ring kv block, global-position masked.
-    Blocked over q so the (H,bm,Tk) score is bounded. Fully-masked rows get lse=-inf (contribute
-    nothing to the online-softmax combine)."""
+    Blocked over q so the (H,bm,·) score is bounded; k columns are pre-selected per block
+    (causal + window superset — exact masking follows). Fully-masked rows get lse=-inf
+    (contribute nothing to the online-softmax combine)."""
+    q_block = q_block or _RING_QB
     Tq, hq, d = q.shape
     Tk, hkv, dv = v.shape
     g = hq // hkv
     dev = q.device
+    cd = torch.float32 if _RING_FP32 else q.dtype                      # score-matmul compute dtype
     kt = k.transpose(0, 1); vt = v.transpose(0, 1)                     # (hkv,Tk,*)
-    kf = kt.repeat_interleave(g, dim=0) if g != 1 else kt              # (hq,Tk,d)
-    vf = vt.repeat_interleave(g, dim=0) if g != 1 else vt
+    kf = (kt.repeat_interleave(g, dim=0) if g != 1 else kt).to(cd)     # (hq,Tk,d)
+    vf = (vt.repeat_interleave(g, dim=0) if g != 1 else vt).to(cd)
     out = torch.empty(Tq, hq, dv, dtype=torch.float32, device=dev)
     lse = torch.empty(hq, Tq, dtype=torch.float32, device=dev)
     for s0 in range(0, Tq, q_block):
         s1 = min(s0 + q_block, Tq)
+        idx = _win_cols(q_pos[s0:s1], k_pos, window)
+        if idx.numel() == 0:
+            out[s0:s1] = 0.0
+            lse[:, s0:s1] = float("-inf")
+            continue
+        kf_b = kf.index_select(1, idx); vf_b = vf.index_select(1, idx)
         qb = q[s0:s1].transpose(0, 1)                                 # (hq,bm,d)
-        sc = torch.matmul(qb.float(), kf.float().transpose(-1, -2)) * scale   # (hq,bm,Tk)
-        keep = _posaware_mask(q_pos[s0:s1], q_doc[s0:s1], k_pos, k_doc, window)  # (bm,Tk)
+        sc = torch.matmul(qb.to(cd), kf_b.transpose(-1, -2)).float() * scale  # (hq,bm,|idx|)
+        keep = _posaware_mask(q_pos[s0:s1], q_doc[s0:s1], k_pos[idx], k_doc[idx], window)
         sc = sc.masked_fill(~keep.unsqueeze(0), float("-inf"))
         m = sc.amax(dim=-1, keepdim=True)
         m = torch.where(torch.isneginf(m), torch.zeros_like(m), m)
         p = torch.exp(sc - m)
         denom = p.sum(dim=-1, keepdim=True)                           # (hq,bm,1)
-        ob = torch.matmul(p, vf.float()) / denom.clamp(min=1e-20)     # (hq,bm,dv)
+        ob = torch.matmul(p.to(cd), vf_b).float() / denom.clamp(min=1e-20)   # (hq,bm,dv)
         lb = (m + torch.log(denom.clamp(min=1e-20))).squeeze(-1)      # (hq,bm) natural-log lse
         lb = torch.where(denom.squeeze(-1) == 0, torch.full_like(lb, float("-inf")), lb)
         out[s0:s1] = ob.transpose(0, 1)
@@ -490,16 +521,20 @@ def _posaware_fwd_block(q, k, v, q_pos, q_doc, k_pos, k_doc, scale, window, q_bl
 
 
 def _posaware_bwd_block(dout, q, k, v, out, lse, q_pos, q_doc, k_pos, k_doc, scale, window,
-                        q_block=1024):
+                        q_block=None):
     """dq (Tq,H,D), dk (Tk,Hkv,D), dv (Tk,Hkv,Dv) for local q vs one ring kv block, using the
-    GLOBAL lse (p = exp(scale*S - lse)). Same math as _ring_bwd, masked by global positions."""
+    GLOBAL lse (p = exp(scale*S - lse)). Same math as _ring_bwd, masked by global positions;
+    k columns pre-selected per q-block (superset — exact mask follows), contributions scattered
+    back with index_add_."""
+    q_block = q_block or _RING_QB
     Tq, hq, d = q.shape
     Tk, hkv, dv = v.shape
     g = hq // hkv
     dev = q.device
+    cd = torch.float32 if _RING_FP32 else q.dtype
     kt = k.transpose(0, 1); vt = v.transpose(0, 1)
-    kf = (kt.repeat_interleave(g, dim=0) if g != 1 else kt).float()   # (hq,Tk,d)
-    vf = (vt.repeat_interleave(g, dim=0) if g != 1 else vt).float()
+    kf = (kt.repeat_interleave(g, dim=0) if g != 1 else kt).to(cd)    # (hq,Tk,d)
+    vf = (vt.repeat_interleave(g, dim=0) if g != 1 else vt).to(cd)
     of = out.float().transpose(0, 1)                                  # (hq,Tq,dv)
     dof = dout.float().transpose(0, 1)                                # (hq,Tq,dv)
     delta = (dof * of).sum(-1)                                        # (hq,Tq)
@@ -508,17 +543,21 @@ def _posaware_bwd_block(dout, q, k, v, out, lse, q_pos, q_doc, k_pos, k_doc, sca
     dv_e = torch.zeros(hq, Tk, dv, dtype=torch.float32, device=dev)
     for s0 in range(0, Tq, q_block):
         s1 = min(s0 + q_block, Tq)
-        qb = q[s0:s1].transpose(0, 1).float()                         # (hq,bm,d)
-        sc = torch.matmul(qb, kf.transpose(-1, -2)) * scale           # (hq,bm,Tk)
-        keep = _posaware_mask(q_pos[s0:s1], q_doc[s0:s1], k_pos, k_doc, window)
+        idx = _win_cols(q_pos[s0:s1], k_pos, window)
+        if idx.numel() == 0:
+            continue                                                  # no kept columns: zero grads
+        kf_b = kf.index_select(1, idx); vf_b = vf.index_select(1, idx)
+        qb = q[s0:s1].transpose(0, 1).to(cd)                          # (hq,bm,d)
+        sc = torch.matmul(qb, kf_b.transpose(-1, -2)).float() * scale  # (hq,bm,|idx|)
+        keep = _posaware_mask(q_pos[s0:s1], q_doc[s0:s1], k_pos[idx], k_doc[idx], window)
         sc = sc.masked_fill(~keep.unsqueeze(0), float("-inf"))
         p = torch.exp(sc - lse[:, s0:s1].unsqueeze(-1))               # global-normalised
         dob = dof[:, s0:s1]                                           # (hq,bm,dv)
-        dp = torch.matmul(dob, vf.transpose(-1, -2))                  # (hq,bm,Tk)
+        dp = torch.matmul(dob.to(cd), vf_b.transpose(-1, -2)).float()  # (hq,bm,|idx|)
         ds = p * (dp - delta[:, s0:s1].unsqueeze(-1)) * scale
-        dv_e += torch.matmul(p.transpose(-1, -2), dob)
-        dq[:, s0:s1] = torch.matmul(ds, kf)
-        dk_e += torch.matmul(ds.transpose(-1, -2), qb)
+        dv_e.index_add_(1, idx, torch.matmul(p.to(cd).transpose(-1, -2), dob.to(cd)).float())
+        dq[:, s0:s1] = torch.matmul(ds.to(cd), kf_b).float()
+        dk_e.index_add_(1, idx, torch.matmul(ds.to(cd).transpose(-1, -2), qb).float())
     if g != 1:
         dk = dk_e.view(hkv, g, Tk, d).sum(1)
         dvv = dv_e.view(hkv, g, Tk, dv).sum(1)
