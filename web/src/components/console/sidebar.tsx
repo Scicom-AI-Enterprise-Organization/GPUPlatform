@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
@@ -71,6 +72,28 @@ export function ConsoleSidebar({
   };
   const pathname = usePathname();
   const { collapsed, mobileOpen, closeMobile } = useSidebarState();
+
+  // The nav hides its scrollbar (scrollbar-none), so scrollability is signalled
+  // with edge FADES instead: a top scrim when there's content above, a bottom
+  // scrim when there's content below. Re-measured on scroll and on any resize
+  // (collapse/expand, window height, admin groups appearing).
+  const navRef = useRef<HTMLElement>(null);
+  const [hint, setHint] = useState({ up: false, down: false });
+  const measure = useCallback(() => {
+    const el = navRef.current;
+    if (!el) return;
+    const up = el.scrollTop > 2;
+    const down = el.scrollTop + el.clientHeight < el.scrollHeight - 2;
+    setHint((h) => (h.up === up && h.down === down ? h : { up, down }));
+  }, []);
+  useEffect(() => {
+    measure();
+    const el = navRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [measure, collapsed]);
 
   const isActive = (href: string) => {
     if (href === "/serverless") {
@@ -221,7 +244,16 @@ export function ConsoleSidebar({
           )}
         </Link>
 
-        <nav className="flex-1 overflow-y-auto py-3 scrollbar-thin">{groups}</nav>
+        <div className="relative min-h-0 flex-1">
+          <nav ref={navRef} onScroll={measure} className="h-full overflow-y-auto py-3 scrollbar-none">{groups}</nav>
+          {/* Scroll affordance: fades appear only when content continues that way. */}
+          {hint.up && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-10 bg-gradient-to-b from-sidebar to-transparent" />
+          )}
+          {hint.down && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-sidebar to-transparent" />
+          )}
+        </div>
 
         {/* Build version — baked in at `next build` from APP_VERSION (git
             short-sha in CI). Defaults to "dev" for local/unversioned builds so

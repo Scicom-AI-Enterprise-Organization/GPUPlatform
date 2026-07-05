@@ -227,6 +227,14 @@
 .scrollbar-thin::-webkit-scrollbar-thumb:hover {
   background: color-mix(in oklch, var(--muted-foreground) 50%, transparent);
 }
+/* No visible scrollbar at all (content stays wheel/touch-scrollable). Used by
+ * the console sidebar nav so it never shows a vertical scrollbar. */
+.scrollbar-none {
+  scrollbar-width: none; /* Firefox */
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none; /* Chrome/Safari */
+}
 
 /* ---- Terminal theme ----------------------------------------------------- */
 /* User-selectable styling for terminal-ish blocks (SSH commands, error
