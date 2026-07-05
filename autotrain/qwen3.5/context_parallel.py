@@ -25,8 +25,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 # CP context (filled by setup_cp) + per-batch state the monkeypatched kernels/attention read.
-_CP = {"group": None, "rank": 0, "world": 1, "prev": None, "next": None, "anchor": None,
-       "active": False, "pos": None, "doc": None, "op": 0}
+# "group" = the ring/collective comm; "relay_group" = a SEPARATE comm for the GDN state relay (see
+# setup_cp — keeping the asymmetric relay P2P off the ring comm is what avoids the backward wedge).
+_CP = {"group": None, "relay_group": None, "rank": 0, "world": 1, "prev": None, "next": None,
+       "anchor": None, "active": False, "pos": None, "doc": None, "op": 0}
 
 _DBG = os.environ.get("CP_DEBUG") == "1"
 
@@ -57,17 +59,30 @@ def setup_cp(world_size, cp_size, global_rank, device):
     (The single-GDN-layer test never hit this: no FSDP, hence no second communicator.)"""
     assert world_size % cp_size == 0, f"world_size {world_size} not divisible by cp_size {cp_size}"
     dp = world_size // cp_size
+    # The GDN state RELAY rides a dedicated process group (relay_group), separate from the ring's group.
+    # The full-attn RING keeps the CP group (default PG when dp==1). Empirically bracketed on 2×H20
+    # (2026-07-05, cp_fsdp_repro.py + gateway):
+    #   - relay on relay_group + ring on default PG (dp==1): step 0 fwd+bwd COMPLETES, step 1 WEDGES
+    #     (FSDP's iter-1 implicit all-gather prefetch reorders vs the ring on the shared default PG).
+    #   - ring ALSO on its own new_group (dp==1): the FORWARD deadlocks (a 2nd collective-comm over the
+    #     same GPUs co-schedules with FSDP's forward all-gather → cross-comm circular wait). So the ring
+    #     CANNOT leave the default PG at dp==1.
+    # ⇒ dp==1 CP+FSDP is the OPEN hard corner (see qwen-cp-deadlock-diagnosis). The robust path is to
+    #   NOT shard a FROZEN base with FSDP at all (replicate it, shard only the sequence) — no FSDP
+    #   collectives to reorder against. dp>1 keeps each CP group's ring+relay on their own subgroup comms.
     if dp == 1:
-        cp_group, base = None, 0                      # default PG — shared with FSDP, one comm order
+        cp_group, base = None, 0                      # ring on the default PG (moving it off deadlocks fwd)
+        relay_group = dist.new_group(list(range(world_size)))
     else:
-        cp_group, base = None, 0
+        cp_group = relay_group = None; base = 0
         for d in range(dp):
             ranks = list(range(d * cp_size, (d + 1) * cp_size))
-            g = dist.new_group(ranks)
+            g = dist.new_group(ranks)                 # ring comm for this CP group
+            rg = dist.new_group(ranks)                # SEPARATE relay comm for this CP group
             if global_rank in ranks:
-                cp_group, base = g, d * cp_size
+                cp_group, relay_group, base = g, rg, d * cp_size
     cp_rank = global_rank % cp_size
-    _CP.update(group=cp_group, rank=cp_rank, world=cp_size,
+    _CP.update(group=cp_group, relay_group=relay_group, rank=cp_rank, world=cp_size,
                prev=(base + cp_rank - 1) if cp_rank > 0 else None,
                next=(base + cp_rank + 1) if cp_rank < cp_size - 1 else None,
                anchor=torch.zeros((), device=device, requires_grad=True),
@@ -99,7 +114,7 @@ def _drain():
 def _send_pair(a, b, dst):
     _dbg("SEND2", dst, a.shape)
     _drain()
-    g = _CP["group"]
+    g = _CP["relay_group"]                            # dedicated relay comm (NOT the ring's group)
     for r in dist.batch_isend_irecv([dist.P2POp(dist.isend, a.contiguous(), dst, group=g),
                                      dist.P2POp(dist.isend, b.contiguous(), dst, group=g)]):
         r.wait()
@@ -107,7 +122,7 @@ def _send_pair(a, b, dst):
 def _recv_pair(sa, da, sb, db, src):
     _dbg("RECV2", src, sa)
     _drain()
-    g = _CP["group"]
+    g = _CP["relay_group"]                            # dedicated relay comm (NOT the ring's group)
     a = torch.empty(sa, dtype=da, device=_CP["device"])
     b = torch.empty(sb, dtype=db, device=_CP["device"])
     for r in dist.batch_isend_irecv([dist.P2POp(dist.irecv, a, src, group=g),
@@ -116,15 +131,28 @@ def _recv_pair(sa, da, sb, db, src):
     return a, b
 
 class _SendPairToNext(torch.autograd.Function):
+    # `anchor` (the rank-local grad-requiring scalar) is an input so this Function's backward ALWAYS
+    # fires — exactly like _RecvPairFromPrev below. Without it, autograd PRUNES the send-backward on
+    # layers whose upstream is entirely FROZEN (LoRA trains only the full-attn q/k/v/o, so every GDN
+    # layer BELOW the first LoRA layer on cp_rank 0 has no grad-requiring input): the sender then never
+    # posts its grad-RECV while the receiver's grad-SEND (anchored) still fires → the rank pair's relay
+    # op COUNTS diverge → NCCL (which matches P2P purely by order, no tags) pairs later ops with the
+    # WRONG payloads and eventually wedges. THE root cause of the qwen CP training deadlock: step 0's
+    # leftover unmatched sends silently corrupt step 1's grads, then the queues jam (found via the
+    # CP_DEBUG op-count mismatch: r0=50 ops vs r1=56). The anchor guarantees every rank runs the same
+    # relay backward ops in the same reverse-layer order. (The received grad flows into frozen-only
+    # paths and is dropped by autograd — numerically a no-op, but the COMM must still happen.)
     @staticmethod
-    def forward(ctx, a, b, dst):
+    def forward(ctx, a, b, anchor, dst):
         ctx.dst = dst; ctx.sa, ctx.da, ctx.sb, ctx.db = a.shape, a.dtype, b.shape, b.dtype
         _send_pair(a, b, dst)
-        return a.new_zeros(())
+        # tie the output to the anchor so it requires grad even when a/b are frozen-derived; cast to
+        # a's dtype so `o + <this>` does NOT type-promote the layer output (anchor is fp32).
+        return (anchor * 0).to(a.dtype)
     @staticmethod
     def backward(ctx, _g):
         ga, gb = _recv_pair(ctx.sa, ctx.da, ctx.sb, ctx.db, ctx.dst)
-        return ga, gb, None
+        return ga, gb, None, None
 
 class _RecvPairFromPrev(torch.autograd.Function):
     # `anchor` (a grad-requiring scalar) forces the outputs to require grad, else this Function's
@@ -190,7 +218,7 @@ def _patch_gdn_layer(layer):
         layer._cp_rec_dtype = fs.dtype
         if _CP["next"] is not None:
             last = fs[-1:].contiguous()                       # last doc's final state -> next rank
-            o = o + _SendPairToNext.apply(st["conv_final"], last, _CP["next"])
+            o = o + _SendPairToNext.apply(st["conv_final"], last, _CP["anchor"], _CP["next"])
         return o, fs
 
     layer._cp_rec_shape = (1, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim)

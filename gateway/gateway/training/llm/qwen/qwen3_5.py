@@ -375,8 +375,15 @@ def main(
     replicate_cp = cp_size > 1 and os.environ.get("SGPU_CP_FSDP") != "1"
     if replicate_cp:
         model = model.to(f"cuda:{rank}")
+        # Replicated training REQUIRES identical params on every rank (grads are all-reduced). The base
+        # comes identically from disk, but each process randomly initializes its LoRA A matrices —
+        # broadcast every trainable param from rank 0 so all replicas start in lockstep.
+        for p in model.parameters():
+            if p.requires_grad:
+                dist.broadcast(p.data, src=0)
         logger.info("[cp] FSDP DISABLED — frozen base REPLICATED per GPU, sequence sharded across the "
-                    "CP group (deadlock-free; no FSDP collectives to reorder against the ring/relay).")
+                    "CP group (deadlock-free; no FSDP collectives to reorder against the ring/relay); "
+                    "LoRA init broadcast from rank 0.")
     else:
         # FSDP2 shard + activation-checkpoint via the shared helper. Qwen3.5 is multimodal — shard the
         # decoder AND vision blocks (reshard_after_forward); param_dtype=bf16 dense; cpu_offload opt-in.

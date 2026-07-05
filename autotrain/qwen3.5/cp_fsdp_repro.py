@@ -77,27 +77,52 @@ for mod in list(model.modules()):
 n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
 log(f"trainable(LoRA)={n_train/1e6:.2f}M")
 
-# ---- FSDP2 fully_shard per decoder layer + root, CPUOffload, AC OFF (the CP path) ----
-fsdp_kwargs = {"mp_policy": fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
-               "offload_policy": fsdp.CPUOffloadPolicy()}
-_RESHARD = os.environ.get("CP_NORESHARD") != "1"      # CP_NORESHARD=1 -> keep params gathered (no re-AG)
-_fsdp_layers = []
-for m in model.modules():
-    if isinstance(m, M.Qwen3_5DecoderLayer):
-        fsdp.fully_shard(m, **fsdp_kwargs, mesh=mesh, reshard_after_forward=_RESHARD)
-        _fsdp_layers.append(m)
-fsdp.fully_shard(model, **fsdp_kwargs, mesh=mesh, reshard_after_forward=_RESHARD)
-log(f"reshard_after_forward={_RESHARD}")
+# ---- parallelism: FSDP2 (default) or REPLICATE (REPRO_NO_FSDP=1 — the LoRA+CP fix path: frozen
+# base replicated per GPU, sequence sharded, LoRA grads all-reduced; NO FSDP collectives at all) ----
+_NO_FSDP = os.environ.get("REPRO_NO_FSDP") == "1"
+if _NO_FSDP:
+    log("REPLICATE mode (REPRO_NO_FSDP=1): no fully_shard; LoRA grads all_reduce at step")
+else:
+    fsdp_kwargs = {"mp_policy": fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+                   "offload_policy": fsdp.CPUOffloadPolicy()}
+    _RESHARD = os.environ.get("CP_NORESHARD") != "1"      # CP_NORESHARD=1 -> keep params gathered (no re-AG)
+    _fsdp_layers = []
+    for m in model.modules():
+        if isinstance(m, M.Qwen3_5DecoderLayer):
+            fsdp.fully_shard(m, **fsdp_kwargs, mesh=mesh, reshard_after_forward=_RESHARD)
+            _fsdp_layers.append(m)
+    fsdp.fully_shard(model, **fsdp_kwargs, mesh=mesh, reshard_after_forward=_RESHARD)
+    log(f"reshard_after_forward={_RESHARD}")
 
-# FIX (toggle CP_NOPREFETCH=1): FSDP2 turns on implicit all-gather prefetch from iteration 1 (it
-# records module order on iter 0). Under CP that prefetched AG gets enqueued ahead of the GDN relay
-# P2P on one rank but after it on the other -> cross-communicator circular wait -> backward/step-1
-# deadlock. Emptying the prefetch lists disables the reordering so the AG stays in-order with the P2P.
-if os.environ.get("CP_NOPREFETCH") == "1":
-    for m in _fsdp_layers + [model]:
-        m.set_modules_to_forward_prefetch([])
-        m.set_modules_to_backward_prefetch([])
-    log("FSDP prefetch DISABLED (CP_NOPREFETCH=1)")
+    # FIX (toggle CP_NOPREFETCH=1): FSDP2 turns on implicit all-gather prefetch from iteration 1 (it
+    # records module order on iter 0). Under CP that prefetched AG gets enqueued ahead of the GDN relay
+    # P2P on one rank but after it on the other -> cross-communicator circular wait -> backward/step-1
+    # deadlock. Emptying the prefetch lists disables the reordering so the AG stays in-order with the P2P.
+    if os.environ.get("CP_NOPREFETCH") == "1":
+        for m in _fsdp_layers + [model]:
+            m.set_modules_to_forward_prefetch([])
+            m.set_modules_to_backward_prefetch([])
+        log("FSDP prefetch DISABLED (CP_NOPREFETCH=1)")
+
+# ---- activation checkpointing (REPRO_AC): "full" wraps whole decoder layers (recompute RE-FIRES the
+# GDN relay + ring P2P — the step-0 hang suspect); "mlp" wraps ONLY each layer's MLP (comm-free
+# recompute, the biggest activation term — safe by construction). default: off. ----
+_AC = os.environ.get("REPRO_AC", "")
+if _AC:
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper, CheckpointImpl)
+    n_wrapped = 0
+    for m in model.modules():
+        if isinstance(m, M.Qwen3_5DecoderLayer):
+            if _AC == "mlp":
+                m.mlp = checkpoint_wrapper(m.mlp, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            n_wrapped += 1
+    if _AC == "full":
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
+        apply_activation_checkpointing(
+            model, checkpoint_wrapper_fn=lambda mod: checkpoint_wrapper(mod, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
+            check_fn=lambda mod: isinstance(mod, M.Qwen3_5DecoderLayer))
+    log(f"AC={_AC} over {n_wrapped} layers")
 
 # ---- inject the REAL flash_qla TileLang kernel + contiguous-v patch, then GDN CP relay (as qwen3_5.py) ----
 from flash_qla import chunk_gated_delta_rule as _flash_gdr
@@ -129,9 +154,14 @@ for step in range(2):
     log(f"FWD_DONE step {step} loss={loss.item():.4f}")
     loss.backward()
     log(f"BWD_DONE step {step}")
+    if _NO_FSDP:
+        # trainer-faithful replicate step: symmetric all_reduce of every LoRA grad on the default PG
+        for p in model.parameters():
+            if p.requires_grad and p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
     opt.step(); opt.zero_grad()
     log(f"STEP_DONE step {step}")
 
-log("REPRO_OK — CP forward+backward+step completed under FSDP2")
+log("REPRO_OK — CP forward+backward+step completed")
 dist.barrier()
 destroy_process_group()

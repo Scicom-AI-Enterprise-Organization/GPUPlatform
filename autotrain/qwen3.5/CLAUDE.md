@@ -264,7 +264,37 @@ Verify env: tm box port 1023, `/share/qwen3.5-venv`, `HF_HOME=/share/huggingface
 `TILELANG_CACHE_DIR` (don't clobber the shared cache), a genuinely-free GPU pair (`--master_port` ≠
 29500; the box is shared + VRAM-contended — pick GPUs with real headroom right before launch).
 
-### ⚠ 27B full-model FSDP2 training — the backward/step-1 DEADLOCK (OPEN, 2026-07-04)
+### ✅ The training deadlock is SOLVED (2026-07-05) — root cause + fix
+
+The step-1 deadlock below is FIXED. **Root cause (found via the CP_DEBUG op-count mismatch, r0=50 vs
+r1=56):** autograd **prunes the un-anchored `_SendPairToNext.backward`** on GDN layers whose upstream is
+all-frozen (every GDN layer below the first LoRA'd full-attn layer on cp_rank 0) → the sender never
+posts its grad-RECV while the receiver's grad-SEND (anchored) still fires → NCCL (which matches P2P
+purely by ORDER, no tags) pairs later ops with the wrong payloads → step 0 "works" with offset queues,
+step 1 wedges. FSDP/AC/offload/PG variations were all red herrings — the mismatch is config-independent.
+
+**Fix (in `context_parallel.py` here + the gateway's vendored copy — kept in sync):**
+1. `_SendPairToNext.apply(a, b, _CP["anchor"], dst)` — the anchor forces the send-backward to fire on
+   every rank; returns `(anchor*0).to(a.dtype)` (dtype cast so `o + scalar` doesn't promote bf16→fp32).
+2. **Replicate-CP** (gateway `qwen3_5.py`, default under cp_size>1; `SGPU_CP_FSDP=1` restores FSDP):
+   frozen base replicated per GPU (27B=54GB fits a 143GB H20), LoRA grads all_reduce(SUM)÷N_total,
+   LoRA init broadcast from rank 0. No FSDP collectives at all.
+3. Relay on a dedicated `relay_group`; ring stays on the default PG at dp==1 (moving it off deadlocks
+   the FORWARD — bracketed empirically).
+
+**Verified:** `cp_fsdp_repro.py` (now takes `CP_SIZE`/`REPRO_NO_FSDP`/`REPRO_AC=full|mlp`) → REPRO_OK
+at 8L and at **64L with FULL activation checkpointing** (op counts 608=608 — AC recompute re-fires the
+data P2P symmetrically, safe once grads are anchored). **Real Qwen3.6-27B trained via the gateway API at
+FULL 32k, cp_size=4 dp=1 on 4×H20** (train-ae4d830e): loss 5.53→0.45 by step 5, ~27s/step. Full AC is
+back ON under CP. Remaining perf item for ≥32k/rank: swap the pure-torch fp32 ring for a fused-FA3
+external-LSE ring (contiguous layout = block-causal by rank order — simpler than gemma's zigzag).
+
+⚠ **Sync debt:** the standalone `qwen3_5.py` here is ~330 diff-lines BEHIND the gateway copy
+(`gateway/gateway/training/llm/qwen/qwen3_5.py` — grad_accum, cpu_offload, token-weighted loss,
+`_trainer_common`, replicate-CP). The gateway copy is the live authority for the trainer right now;
+`context_parallel.py` is identical in both. Merge back before standalone runs.
+
+### ~~27B full-model FSDP2 training — the backward/step-1 DEADLOCK~~ (SOLVED above; history below, 2026-07-04)
 
 The isolated tests above all pass, but a **full 27B `qwen3_5.py --cp_size 2` training run on 2×H100
 (RunPod) deadlocks** — both GPUs pin at 100%, log frozen, no loss line. Fixed several layers of it;
