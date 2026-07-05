@@ -1,14 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { toast } from "sonner";
 import { useListUrlState, readParam } from "@/lib/list-url-state";
 import {
   Cpu,
   Inbox,
   LayoutGrid,
   List,
+  Loader2,
   MoreHorizontal,
   Pencil,
   Search,
@@ -44,7 +46,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-select";
+import { SortSelect, type SortDir } from "@/components/ui/sort-select";
 
 // Status pill — soft tint + matching text + neutral border (matches Benchmark).
 const STATUS_PILL: Record<string, string> = {
@@ -57,27 +59,6 @@ const STATUS_PILL: Record<string, string> = {
 
 const STATUS_OPTIONS = ["all", "queued", "running", "done", "failed", "cancelled"] as const;
 type StatusFilter = (typeof STATUS_OPTIONS)[number];
-
-/** Flat searchable string per run: name, id, status, owner, base model, task,
- * dataset, GPU. Computed once per render via useMemo. */
-function searchableText(r: TrainingRunRecord): string {
-  const gpu = [r.gpu_type, r.gpu_count ? `${r.gpu_count}x` : "", r.visible_devices]
-    .filter(Boolean)
-    .join(" ");
-  return [
-    r.name,
-    r.id,
-    r.status,
-    r.created_by,
-    r.base_model,
-    r.task_type === "tts" ? "tts" : "asr",
-    isSweepRun(r) ? "sweep" : "single",
-    r.dataset_id,
-    gpu,
-  ]
-    .join(" ")
-    .toLowerCase();
-}
 
 function taskLabel(r: TrainingRunRecord): string {
   return r.task_type === "tts" ? "TTS" : "ASR";
@@ -98,16 +79,29 @@ function primaryMetric(r: TrainingRunRecord): { label: string; value: string } |
   return null;
 }
 
-export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
-  const router = useRouter();
+export function AutotrainList({
+  initialItems,
+  initialTotal,
+  scope,
+}: {
+  initialItems: TrainingRunRecord[];
+  initialTotal: number;
+  scope: "mine" | "all";
+}) {
   const sp = useSearchParams();
   // Seed search/status/sort/view from the URL (shareable); mirrored back below.
   const [q, setQ] = useState(() => sp.get("q") ?? "");
+  const [qDebounced, setQDebounced] = useState(q);
   const [status, setStatus] = useState<StatusFilter>(() => readParam(sp, "status", STATUS_OPTIONS, "all"));
   const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
   const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
+
+  // Server-paginated data: SSR delivers page 1, everything after is fetched.
+  const [items, setItems] = useState<TrainingRunRecord[]>(initialItems);
+  const [total, setTotal] = useState(initialTotal);
+  const [loading, setLoading] = useState(false);
 
   const [single, setSingle] = useState<TrainingRunRecord | null>(null);
   const [singleDeleting, setSingleDeleting] = useState(false);
@@ -130,32 +124,58 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
   };
   useListUrlState({ q, status, sort, view });
 
-  const haystacks = useMemo(
-    () => items.map((r) => ({ run: r, text: searchableText(r) })),
-    [items],
-  );
-
-  const filtered = useMemo(() => {
-    const needle = q.trim().toLowerCase();
-    const tokens = needle ? needle.split(/\s+/).filter(Boolean) : [];
-    return haystacks
-      .filter(({ run, text }) => {
-        if (status !== "all" && run.status !== status) return false;
-        if (tokens.length === 0) return true;
-        return tokens.every((t) => text.includes(t));
-      })
-      .map(({ run }) => run);
-  }, [haystacks, q, status]);
-
-  const sorted = useMemo(() => sortByCreated(filtered, sort), [filtered, sort]);
+  // Debounce the search box so each keystroke doesn't hit the gateway.
+  useEffect(() => {
+    const t = setTimeout(() => setQDebounced(q), 300);
+    return () => clearTimeout(t);
+  }, [q]);
 
   const hasFilter = q.trim().length > 0 || status !== "all";
 
-  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
   // Clamp in render so a shrinking result set never strands an empty page; the
   // search/filter handlers reset to page 1 directly.
   const currentPage = Math.min(page, pageCount);
-  const paged = sorted.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
+  // Fetch the current page from the gateway (search/filter/sort run server-side).
+  // seqRef discards out-of-order responses so a slow reply can't clobber a newer one.
+  const seqRef = useRef(0);
+  const load = useCallback(async () => {
+    const seq = ++seqRef.current;
+    setLoading(true);
+    try {
+      const res = await gateway.listTrainingRunsPage({
+        scope,
+        q: qDebounced,
+        status: status === "all" ? "" : status,
+        sort,
+        limit: pageSize,
+        offset: (currentPage - 1) * pageSize,
+      });
+      if (seq !== seqRef.current) return;
+      setItems(res.items);
+      setTotal(res.total);
+    } catch (e) {
+      // Keep the previous page on failure; surface the error once.
+      if (seq === seqRef.current) toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (seq === seqRef.current) setLoading(false);
+    }
+  }, [scope, qDebounced, status, sort, pageSize, currentPage]);
+
+  // Refetch on any query change — except the very first run while state still
+  // equals the SSR defaults (the server already rendered that exact page). A
+  // URL-seeded q/status/sort is non-default, so it does fetch on mount.
+  const bootedRef = useRef(false);
+  useEffect(() => {
+    if (!bootedRef.current) {
+      bootedRef.current = true;
+      const ssrDefaults =
+        qDebounced === "" && status === "all" && sort === "newest" && page === 1 && pageSize === 12;
+      if (ssrDefaults) return;
+    }
+    void load();
+  }, [load, qDebounced, status, sort, page, pageSize]);
 
   const onRename = async () => {
     if (!renameTarget) return;
@@ -169,7 +189,7 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
     try {
       await gateway.renameTrainingRun(renameTarget.id, name);
       setRenameTarget(null);
-      router.refresh();
+      void load();
     } catch (e) {
       setRenameError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -184,7 +204,7 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
     try {
       await gateway.deleteTrainingRun(single.id);
       setSingle(null);
-      router.refresh();
+      void load();
     } catch (e) {
       setSingleError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -278,7 +298,8 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
 
       {hasFilter && (
         <div className="mb-3 text-xs text-muted-foreground">
-          {filtered.length} of {items.length} match
+          {loading && <Loader2 className="mr-1.5 inline h-3 w-3 animate-spin" />}
+          {total} {total === 1 ? "match" : "matches"}
           {q && (
             <>
               {" "}for <span className="font-mono text-foreground">&quot;{q}&quot;</span>
@@ -292,7 +313,7 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
         </div>
       )}
 
-      {filtered.length === 0 ? (
+      {total === 0 ? (
         <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
           <Inbox className="h-6 w-6 text-muted-foreground/60" />
           <p className="text-sm text-muted-foreground">No training runs match your filters.</p>
@@ -301,18 +322,19 @@ export function AutotrainList({ items }: { items: TrainingRunRecord[] }) {
         <>
           <div
             className={cn(
-              "gap-3",
+              "gap-3 transition-opacity",
               view === "rows" ? "flex flex-col" : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
+              loading && "pointer-events-none opacity-60",
             )}
           >
-            {paged.map((r) => (
+            {items.map((r) => (
               <RunItem key={r.id} run={r} onRename={openRename} onDelete={setSingle} />
             ))}
           </div>
           <Pagination
             page={currentPage}
             pageCount={pageCount}
-            total={filtered.length}
+            total={total}
             pageSize={pageSize}
             onPageChange={setPage}
             onPageSizeChange={(n) => {

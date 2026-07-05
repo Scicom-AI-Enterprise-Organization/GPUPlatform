@@ -210,6 +210,33 @@ export type BenchAccuracyResult = {
   metrics?: Record<string, unknown> | null;
 };
 
+/** One page of a server-paginated list (benchmarks / training runs / datasets).
+ * `total` counts ALL matching rows so the pager can show page numbers. */
+export type PageResponse<T> = { total: number; items: T[] };
+
+/** Slim per-run numbers for the /benchmark dashboard KPI row — fetched from
+ * /benchmarks/_stats so the dashboard doesn't need every full record. */
+export type BenchStat = {
+  id: string;
+  status: string;
+  model: string | null;
+  gpu_type: string | null;
+  gpu_count: number | null;
+  output_throughput: number | null;
+  duration_s: number | null;
+};
+
+/** Shared query params for the server-paginated list endpoints. */
+export type PageQuery = {
+  scope?: "mine" | "all";
+  q?: string;
+  status?: string; // benchmarks + training runs (datasets use `kind`)
+  kind?: string; // datasets source filter
+  sort?: "newest" | "oldest";
+  limit?: number;
+  offset?: number;
+};
+
 export type BenchmarkRecord = {
   id: string;
   name: string;

@@ -203,7 +203,7 @@ export function UserProfile({
         </div>
       </Section>
 
-      <section className="rounded-lg border border-destructive/30 bg-destructive/5 p-5">
+      <section data-form-section="Danger zone" className="scroll-mt-6 rounded-lg border border-destructive/30 bg-destructive/5 p-5">
         <div className="flex items-start justify-between gap-4">
           <div>
             <h2 className="text-sm font-semibold text-destructive">Danger zone</h2>
@@ -254,7 +254,7 @@ export function UserProfile({
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="rounded-lg border border-border bg-card p-5">
+    <section data-form-section={title} className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
       <h2 className="mb-4 text-sm font-semibold">{title}</h2>
       <dl className="grid gap-4 sm:grid-cols-2">{children}</dl>
     </section>

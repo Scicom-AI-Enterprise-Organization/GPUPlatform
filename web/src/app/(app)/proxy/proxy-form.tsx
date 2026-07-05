@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { gateway } from "@/lib/gateway";
 import type { ProxyEndpoint, ProxyUpstreamSpec } from "@/lib/types";
+import { FormFooter, FormShell } from "@/components/form-shell";
 
 type KeyMode = "secret" | "paste" | "keep";
 type ModelPair = { alias: string; real: string };
@@ -162,8 +163,9 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   };
 
   return (
+    <FormShell>
     <form onSubmit={onSubmit} className="flex w-full flex-col gap-5">
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section data-form-section="Endpoint" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <h2 className="mb-4 text-base font-medium">Endpoint</h2>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
           <div className="md:col-span-1">
@@ -196,7 +198,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         </div>
       </section>
 
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section data-form-section="Upstreams" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="mb-1 flex items-center justify-between">
           <h2 className="text-base font-medium">Upstreams</h2>
           <Button type="button" variant="outline" size="sm" onClick={() => setUps((a) => [...a, blankUpstream()])}>
@@ -296,15 +298,14 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         <datalist id="px-secret-keys">{secretKeys.map((k) => <option key={k} value={k} />)}</datalist>
       </section>
 
-      {error && <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
-
-      <div className="flex items-center justify-end gap-2">
+      <FormFooter error={error}>
         <Button type="button" variant="ghost" onClick={() => router.push(editing ? `/proxy/${initial!.id}` : "/proxy")}>Cancel</Button>
         <Button type="submit" disabled={submitting}>
           {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
           {editing ? "Save changes" : "Create endpoint"}
         </Button>
-      </div>
+      </FormFooter>
     </form>
+    </FormShell>
   );
 }

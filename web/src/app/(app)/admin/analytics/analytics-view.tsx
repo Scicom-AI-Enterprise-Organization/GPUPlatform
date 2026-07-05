@@ -1978,7 +1978,7 @@ export function AnalyticsView() {
 
       <div className="grid gap-6 lg:grid-cols-2">
       {/* Activity by app (donut) */}
-      <div className="rounded-lg border bg-card p-4">
+      <div data-form-section="Activity by app" className="scroll-mt-6 rounded-lg border bg-card p-4">
         <h2 className="mb-1 text-sm font-semibold">Activity by app</h2>
         <p className="mb-3 text-xs text-muted-foreground">
           Share of jobs / requests per app for the selected period and filters.
@@ -2016,7 +2016,7 @@ export function AnalyticsView() {
       </div>
 
       {/* Daily activity chart */}
-      <div ref={runningNowRef} className="rounded-lg border bg-card p-4">
+      <div ref={runningNowRef} data-form-section="Daily activity" className="scroll-mt-6 rounded-lg border bg-card p-4">
         <h2 className="mb-1 text-sm font-semibold">Daily activity</h2>
         <p className="mb-3 text-xs text-muted-foreground">
           Jobs per day, by app (serverless inference has its own board below). Hover for the
@@ -2057,7 +2057,7 @@ export function AnalyticsView() {
       </div>
 
       {/* ── Running now ────────────────────────────────────────────────────── */}
-      <div className="rounded-lg border bg-card p-4">
+      <div data-form-section="Running now" className="scroll-mt-6 rounded-lg border bg-card p-4">
         <h2 className="mb-1 flex items-center gap-2 text-sm font-semibold">
           Running now
           {runningRows.length > 0 && (
@@ -2149,7 +2149,7 @@ export function AnalyticsView() {
 
       {/* ── Serverless inference board ─────────────────────────────────────── */}
       {apps.has("serverless") && platforms.has("gpuplatform") && (
-        <div className="rounded-lg border bg-card p-4">
+        <div data-form-section="Serverless inference" className="scroll-mt-6 rounded-lg border bg-card p-4">
           <h2 className="mb-1 text-sm font-semibold">Serverless inference</h2>
           <p className="mb-3 text-xs text-muted-foreground">
             Request creations on the serverless API — exact counts from the gateway summary,
@@ -2253,7 +2253,7 @@ export function AnalyticsView() {
 
         {/* Jobs explorer */}
         <TabsContent value="jobs">
-          <div className="rounded-lg border bg-card">
+          <div data-form-section="Jobs explorer" className="scroll-mt-6 rounded-lg border bg-card">
             <div className="flex items-center justify-between px-4 py-3">
               <div>
                 <h2 className="text-sm font-semibold">Jobs explorer</h2>
@@ -2385,7 +2385,7 @@ export function AnalyticsView() {
         {/* GPU hours by source + model */}
         <TabsContent value="gpuhours">
           <div className="grid gap-6 lg:grid-cols-2">
-            <div className="rounded-lg border bg-card p-4">
+            <div data-form-section="GPU hours by source" className="scroll-mt-6 rounded-lg border bg-card p-4">
               <h2 className="mb-1 text-sm font-semibold">GPU hours by source</h2>
               <p className="mb-3 text-xs text-muted-foreground">
                 duration × GPU count, per provider / cloud / partition (job kinds only — API
@@ -2421,7 +2421,7 @@ export function AnalyticsView() {
                 )}
               </div>
             </div>
-            <div className="rounded-lg border bg-card p-4">
+            <div data-form-section="By GPU model" className="scroll-mt-6 rounded-lg border bg-card p-4">
               <h2 className="mb-1 text-sm font-semibold">By GPU model</h2>
               <p className="mb-3 text-xs text-muted-foreground">
                 As reported by nvidia-smi on the serving node (or the requested type).
@@ -2461,7 +2461,7 @@ export function AnalyticsView() {
 
         {/* Node timeline */}
         <TabsContent value="timeline">
-          <div className="rounded-lg border bg-card p-4">
+          <div data-form-section="Node timeline" className="scroll-mt-6 rounded-lg border bg-card p-4">
             <h2 className="mb-1 text-sm font-semibold">Node timeline</h2>
             <p className="mb-3 text-xs text-muted-foreground">
               What ran on each node across the period — one bar per job, colored by app. Hover
@@ -2530,7 +2530,7 @@ export function AnalyticsView() {
 
         {/* GPU Timeline — calendar: one row per day, fluid event blocks per endpoint */}
         <TabsContent value="gputimeline">
-          <div className="relative rounded-lg border bg-card p-4">
+          <div data-form-section="GPU Timeline" className="scroll-mt-6 relative rounded-lg border bg-card p-4">
             <h2 className="mb-1 text-sm font-semibold">GPU Timeline</h2>
             <p className="mb-3 text-xs text-muted-foreground">
               Weekly calendar view: days across, hours downward, similar to Google Calendar.
@@ -2841,7 +2841,7 @@ export function AnalyticsView() {
 
         {/* Node utilization */}
         <TabsContent value="nodes">
-          <div className="rounded-lg border bg-card">
+          <div data-form-section="Node utilization" className="scroll-mt-6 rounded-lg border bg-card">
             <div className="px-4 py-3">
               <h2 className="text-sm font-semibold">Node utilization</h2>
               <p className="text-xs text-muted-foreground">

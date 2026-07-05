@@ -16,6 +16,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { gateway } from "@/lib/gateway";
 import type { StorageKind } from "@/lib/types";
+import { FormFooter, FormShell } from "@/components/form-shell";
 
 type TestState =
   | { status: "idle" }
@@ -206,8 +207,9 @@ export function StorageForm() {
   };
 
   return (
+    <FormShell>
     <form onSubmit={onSubmit} className="flex flex-col gap-5">
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section data-form-section="Storage backend" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="mb-4">
           <h2 className="text-base font-medium">Storage backend</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
@@ -256,7 +258,7 @@ export function StorageForm() {
       </section>
 
       {kind === "s3" && (
-        <section className="rounded-lg border border-border bg-card p-5">
+        <section data-form-section="Bucket" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
           <h2 className="mb-4 text-base font-medium">Bucket</h2>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div>
@@ -428,7 +430,7 @@ export function StorageForm() {
       )}
 
       {kind === "local" && (
-        <section className="rounded-lg border border-border bg-card p-5">
+        <section data-form-section="Local path" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
           <h2 className="mb-4 text-base font-medium">Local path</h2>
           <Label htmlFor="local-path" className="text-xs uppercase tracking-wide text-muted-foreground">Path</Label>
           <Input
@@ -448,7 +450,7 @@ export function StorageForm() {
       )}
 
       {kind === "sftp" && (
-        <section className="rounded-lg border border-border bg-card p-5">
+        <section data-form-section="SFTP server" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
           <h2 className="mb-4 text-base font-medium">SFTP server</h2>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div className="md:col-span-2">
@@ -719,7 +721,7 @@ export function StorageForm() {
         </section>
       )}
 
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section data-form-section="Notes" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <Label htmlFor="storage-notes" className="text-xs uppercase tracking-wide text-muted-foreground">Notes (optional)</Label>
         <Textarea
           id="storage-notes"
@@ -730,34 +732,37 @@ export function StorageForm() {
         />
       </section>
 
-      <div className="flex items-center gap-3">
-        {error && <span className="text-sm text-destructive">{error}</span>}
-        <div className="ml-auto flex items-center gap-3">
-          {test.status === "ok" && (
-            <span className="text-sm text-emerald-600 dark:text-emerald-400">✓ {test.message}</span>
-          )}
-          {test.status === "fail" && (
-            <span className="text-right text-sm text-destructive">✕ {test.message}</span>
-          )}
-          <Button
-            type="button"
-            variant="outline"
-            onClick={onTest}
-            disabled={test.status === "running" || submitting}
-          >
-            {test.status === "running" && <Loader2 className="h-4 w-4 animate-spin" />}
-            {test.status === "running" ? "Testing…" : "Test"}
-          </Button>
-          <Button
-            type="submit"
-            disabled={submitting || test.status !== "ok"}
-            title={test.status !== "ok" ? "Pass the connection test first" : undefined}
-          >
-            {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
-            {submitting ? "Creating…" : "Create storage"}
-          </Button>
-        </div>
-      </div>
+      <FormFooter
+        error={error}
+        hint={
+          test.status === "ok" ? (
+            <span className="text-emerald-600 dark:text-emerald-400">✓ {test.message}</span>
+          ) : test.status === "fail" ? (
+            <span className="text-destructive">✕ {test.message}</span>
+          ) : (
+            "Run Test — Create is enabled once the connection test passes."
+          )
+        }
+      >
+        <Button
+          type="button"
+          variant="outline"
+          onClick={onTest}
+          disabled={test.status === "running" || submitting}
+        >
+          {test.status === "running" && <Loader2 className="h-4 w-4 animate-spin" />}
+          {test.status === "running" ? "Testing…" : "Test"}
+        </Button>
+        <Button
+          type="submit"
+          disabled={submitting || test.status !== "ok"}
+          title={test.status !== "ok" ? "Pass the connection test first" : undefined}
+        >
+          {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
+          {submitting ? "Creating…" : "Create storage"}
+        </Button>
+      </FormFooter>
     </form>
+    </FormShell>
   );
 }

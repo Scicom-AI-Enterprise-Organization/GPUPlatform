@@ -67,6 +67,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { FormFooter, FormShell } from "@/components/form-shell";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkTemplate, GpuTypeOption, ProviderRecord, StorageRecord, VmAvailability } from "@/lib/types";
@@ -1238,6 +1239,7 @@ export function BenchmarkForm({
   }
 
   return (
+    <FormShell>
     <form onSubmit={onSubmit} className="space-y-6">
       {/* Header — plain, no gradient. */}
       <div>
@@ -1250,7 +1252,7 @@ export function BenchmarkForm({
       </div>
 
       {/* Templates */}
-      <Card>
+      <Card data-form-section="Templates" className="scroll-mt-6">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -1317,7 +1319,7 @@ export function BenchmarkForm({
       </Card>
 
       {/* Name */}
-      <Card>
+      <Card data-form-section="Name" className="scroll-mt-6">
         <CardContent className="pt-6">
           <div className="space-y-2">
             <Label htmlFor="benchName" className="text-xs uppercase tracking-wide text-muted-foreground">
@@ -2388,53 +2390,49 @@ export function BenchmarkForm({
         </TabsContent>
       </Tabs>
 
-      {/* Action bar — plain, sits at the bottom of the form (not floating). */}
-      <div className="mt-6 flex items-center justify-between gap-3 border-t border-border pt-4">
-        <div className="text-xs text-muted-foreground">
-          {target === "vm"
-            ? "Runs on your registered VM via SSH. No cloud pod is created."
-            : "A new RunPod pod will be created and torn down automatically."}
-        </div>
-        <div className="flex items-center gap-3">
-          {submitError && (
-            <p className="text-sm text-destructive">{submitError}</p>
-          )}
-          {!hasStorage && !submitError && (
-            <p className="text-sm text-muted-foreground">
+      {/* Action bar — sticky (FormFooter), so submit + errors stay visible. */}
+      <FormFooter
+        error={submitError}
+        hint={
+          !hasStorage ? (
+            <>
               Add an S3 storage at{" "}
               <a href="/storage/new" className="underline underline-offset-2 hover:text-foreground">
                 Storage → New storage
               </a>{" "}
               to create a benchmark.
-            </p>
+            </>
+          ) : target === "vm"
+            ? "Runs on your registered VM via SSH. No cloud pod is created."
+            : "A new RunPod pod will be created and torn down automatically."
+        }
+      >
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => router.push("/benchmark")}
+        >
+          Cancel
+        </Button>
+        <Button
+          type="submit"
+          disabled={submitting || !hasStorage}
+          className="min-w-36"
+          title={!hasStorage ? "Add an S3 storage backend first" : undefined}
+        >
+          {submitting ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Creating…
+            </>
+          ) : (
+            <>
+              <FlaskConical className="h-4 w-4" />
+              Create benchmark
+            </>
           )}
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => router.push("/benchmark")}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="submit"
-            disabled={submitting || !hasStorage}
-            className="min-w-36"
-            title={!hasStorage ? "Add an S3 storage backend first" : undefined}
-          >
-            {submitting ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Creating…
-              </>
-            ) : (
-              <>
-                <FlaskConical className="h-4 w-4" />
-                Create benchmark
-              </>
-            )}
-          </Button>
-        </div>
-      </div>
+        </Button>
+      </FormFooter>
 
       {/* Save-as-template */}
       <Dialog open={saveOpen} onOpenChange={setSaveOpen}>
@@ -2472,6 +2470,7 @@ export function BenchmarkForm({
         </DialogContent>
       </Dialog>
     </form>
+    </FormShell>
   );
 }
 
@@ -2561,7 +2560,9 @@ function SectionCard({
   children: React.ReactNode;
 }) {
   return (
-    <Card>
+    // data-form-section feeds the FormShell scrollspy rail; scroll-mt keeps the
+    // heading visible after a rail jump.
+    <Card data-form-section={title} className="scroll-mt-6">
       <CardHeader className="pb-4">
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-2">

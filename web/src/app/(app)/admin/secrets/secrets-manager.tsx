@@ -145,7 +145,7 @@ export function SecretsManager({ initial }: { initial: GlobalEnvRecord[] }) {
   }
 
   return (
-    <div className="space-y-4">
+    <div data-form-section="Global env" className="scroll-mt-6 space-y-4">
       <div className="flex items-center justify-between">
         <span className="text-xs text-muted-foreground">
           {rows.length} variable{rows.length === 1 ? "" : "s"}

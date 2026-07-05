@@ -37,6 +37,9 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
+    cast,
+    func,
     or_,
     select,
 )
@@ -3380,6 +3383,74 @@ async def list_training_runs(
             u = await session.get(User, row.owner_id)
             names[row.owner_id] = u.username if u else "?"
     return [_to_record(r, names.get(r.owner_id, "?")) for r in rows]
+
+
+class TrainingRunPageResponse(BaseModel):
+    total: int
+    items: list[TrainingRunRecord]
+
+
+@router.get("/_page", response_model=TrainingRunPageResponse)
+async def list_training_runs_page(
+    scope: str = "mine",
+    q: str = "",
+    status: str = "",
+    sort: str = "newest",
+    limit: int = Query(12, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Paged run list — the web list fetches page-by-page so hundreds of runs
+    (each with a steps-heavy result_json) don't ship up front. Search/filter/sort
+    run server-side so they cover ALL runs, not just the loaded page. result_json
+    is slimmed to `best` (the only key the list cards read); the full record
+    comes from GET /{run_id}. Declared before /{run_id} (declaration-order
+    matching); the plain list endpoint above stays for back-compat."""
+    stmt = select(TrainingRun)
+    if not (scope == "all" and user.is_admin):
+        stmt = stmt.where(TrainingRun.owner_id == user.id)
+    if status:
+        stmt = stmt.where(TrainingRun.status == status)
+    # Multi-token search (every token must match), mirroring the old client-side
+    # filter: name/id/status/model/dataset/gpu + owner username + the config JSON
+    # (sweep params, task type, …) as text.
+    for tok in (q or "").lower().split():
+        like = f"%{tok}%"
+        stmt = stmt.where(
+            or_(
+                TrainingRun.id.ilike(like),
+                TrainingRun.name.ilike(like),
+                TrainingRun.status.ilike(like),
+                TrainingRun.base_model.ilike(like),
+                TrainingRun.dataset_id.ilike(like),
+                TrainingRun.task_type.ilike(like),
+                TrainingRun.gpu_type.ilike(like),
+                cast(TrainingRun.config_json, Text).ilike(like),
+                TrainingRun.owner_id.in_(select(User.id).where(User.username.ilike(like))),
+            )
+        )
+    total = (
+        await session.execute(select(func.count()).select_from(stmt.subquery()))
+    ).scalar_one()
+    order = (
+        TrainingRun.created_at.asc() if sort == "oldest" else TrainingRun.created_at.desc()
+    )
+    rows = (await session.execute(stmt.order_by(order).limit(limit).offset(offset))).scalars().all()
+    names: dict[int, str] = {}
+    if rows:
+        urows = await session.execute(
+            select(User.id, User.username).where(User.id.in_({r.owner_id for r in rows}))
+        )
+        names = {uid: uname for uid, uname in urows.all()}
+    items: list[TrainingRunRecord] = []
+    for r in rows:
+        rec = _to_record(r, names.get(r.owner_id, "?"))
+        # steps/epochs/gpu_samples can be thousands of points per run — the list
+        # only shows the headline metric.
+        rec.result_json = {"best": rec.result_json.get("best")} if rec.result_json else None
+        items.append(rec)
+    return TrainingRunPageResponse(total=total, items=items)
 
 
 async def _owned(run_id: str, user: User, session: AsyncSession) -> TrainingRun:

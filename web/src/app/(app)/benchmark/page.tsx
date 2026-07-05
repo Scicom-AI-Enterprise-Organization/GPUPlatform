@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
 import { gateway } from "@/lib/gateway";
-import type { BenchmarkRecord } from "@/lib/types";
+import type { BenchStat, BenchmarkRecord, PageResponse } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { BenchmarkList } from "./benchmark-list";
@@ -12,14 +12,28 @@ import { BenchmarkDashboard } from "./dashboard";
 import { ExplorerCollapsible } from "./explorer-collapsible";
 import { ScopeToggle } from "@/components/scope-toggle";
 
-async function loadBenchmarks(
+// First page rendered server-side; BenchmarkList fetches the rest on demand.
+const PAGE_SIZE = 12;
+
+async function loadFirstPage(
   scope: "mine" | "all",
-): Promise<{ items: BenchmarkRecord[]; error: string | null }> {
+): Promise<{ page: PageResponse<BenchmarkRecord>; error: string | null }> {
   try {
-    const items = await gateway.listBenchmarks(scope);
-    return { items, error: null };
+    const page = await gateway.listBenchmarksPage({ scope, limit: PAGE_SIZE, offset: 0 });
+    return { page, error: null };
   } catch (e) {
-    return { items: [], error: e instanceof Error ? e.message : String(e) };
+    return { page: { total: 0, items: [] }, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+async function loadStats(
+  scope: "mine" | "all",
+): Promise<{ stats: BenchStat[]; error: string | null }> {
+  try {
+    const stats = await gateway.benchmarkStats(scope);
+    return { stats, error: null };
+  } catch (e) {
+    return { stats: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -34,10 +48,21 @@ export default async function BenchmarkPage({
   const scope: "mine" | "all" =
     me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
-  const [{ items, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ items: [], error: null }) : loadBenchmarks(scope),
+  // Fetch the first page and the dashboard stats in parallel; each guards its
+  // own error so one failing endpoint doesn't blank the other.
+  const [{ page, error: pageError }, { stats, error: statsError }, username] = await Promise.all([
+    noAccess
+      ? Promise.resolve<{ page: PageResponse<BenchmarkRecord>; error: string | null }>({
+          page: { total: 0, items: [] },
+          error: null,
+        })
+      : loadFirstPage(scope),
+    noAccess
+      ? Promise.resolve<{ stats: BenchStat[]; error: string | null }>({ stats: [], error: null })
+      : loadStats(scope),
     currentUsername(),
   ]);
+  const error = pageError ?? statsError;
 
   return (
     <div className="flex h-full flex-col">
@@ -62,8 +87,8 @@ export default async function BenchmarkPage({
           </div>
         )}
 
-        {!noAccess && items.length > 0 && <BenchmarkDashboard items={items} />}
-        {!noAccess && items.length > 0 && <ExplorerCollapsible scope={scope} />}
+        {!noAccess && stats.length > 0 && <BenchmarkDashboard stats={stats} />}
+        {!noAccess && page.total > 0 && <ExplorerCollapsible scope={scope} />}
 
         {!noAccess && (
           <section>
@@ -71,7 +96,7 @@ export default async function BenchmarkPage({
               <div className="flex items-baseline gap-3">
                 <h2 className="text-base font-medium">Benchmarks</h2>
                 <span className="text-xs text-muted-foreground">
-                  {items.length} {items.length === 1 ? "run" : "runs"}
+                  {page.total} {page.total === 1 ? "run" : "runs"}
                   {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
@@ -90,7 +115,7 @@ export default async function BenchmarkPage({
                 </Button>
               </div>
             </div>
-            {items.length === 0 ? (
+            {page.total === 0 ? (
               <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
                 <Inbox className="h-6 w-6 text-muted-foreground/60" />
                 <p className="text-sm text-muted-foreground">
@@ -98,7 +123,7 @@ export default async function BenchmarkPage({
                 </p>
               </div>
             ) : (
-              <BenchmarkList items={items} />
+              <BenchmarkList initialItems={page.items} initialTotal={page.total} scope={scope} />
             )}
           </section>
         )}

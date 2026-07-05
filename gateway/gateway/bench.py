@@ -28,7 +28,7 @@ import boto3
 import httpx
 import yaml
 from botocore.client import Config as BotoConfig
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import (
@@ -39,6 +39,8 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    func,
+    or_,
     select,
     update,
 )
@@ -2268,6 +2270,117 @@ async def list_benchmarks(
         # response is small + the json encode doesn't block the event loop.
         rec.result_json = _slim_result_json(rec.result_json)
         out.append(rec)
+    return out
+
+
+# ---------- Paged list + slim stats (lazy pagination) -------------------
+# With hundreds of runs, the full list above is megabytes and the web page pays
+# for all of it up front. The web list now fetches /_page per page (server-side
+# search/filter/sort so results cover ALL runs, not just loaded ones), and the
+# dashboard KPIs read /_stats — a few numbers per run instead of full records.
+# Both are declared BEFORE /{bench_id} (Starlette matches in declaration order);
+# the plain list endpoint stays for back-compat (external API users).
+
+
+class BenchmarkPageResponse(BaseModel):
+    total: int
+    items: list[BenchmarkRecord]
+
+
+def _bench_scope_stmt(user: User, scope: str):
+    stmt = select(Benchmark)
+    if not (user.is_admin and scope == "all"):
+        stmt = stmt.where((Benchmark.owner_id == user.id) | (Benchmark.is_public.is_(True)))
+    return stmt
+
+
+@router.get("/_page", response_model=BenchmarkPageResponse)
+async def list_benchmarks_page(
+    scope: str = "mine",
+    q: str = "",
+    status: str = "",
+    sort: str = "newest",
+    limit: int = Query(12, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = _bench_scope_stmt(user, scope)
+    if status:
+        stmt = stmt.where(Benchmark.status == status)
+    # Multi-token search (every token must match), mirroring the old client-side
+    # filter: name/id/status + owner username + the config YAML text (which is
+    # where model / gpu_type / tp / dp live — it's a plain String column).
+    for tok in (q or "").lower().split():
+        like = f"%{tok}%"
+        stmt = stmt.where(
+            or_(
+                Benchmark.id.ilike(like),
+                Benchmark.name.ilike(like),
+                Benchmark.status.ilike(like),
+                Benchmark.config_yaml.ilike(like),
+                Benchmark.owner_id.in_(select(User.id).where(User.username.ilike(like))),
+            )
+        )
+    total = (
+        await session.execute(select(func.count()).select_from(stmt.subquery()))
+    ).scalar_one()
+    order = Benchmark.created_at.asc() if sort == "oldest" else Benchmark.created_at.desc()
+    rows = await session.execute(stmt.order_by(order).limit(limit).offset(offset))
+    benches = rows.scalars().all()
+    owner_ids = {b.owner_id for b in benches}
+    names: dict[str, str] = {}
+    if owner_ids:
+        urows = await session.execute(select(User.id, User.username).where(User.id.in_(owner_ids)))
+        names = {uid: uname for uid, uname in urows.all()}
+    items: list[BenchmarkRecord] = []
+    for b in benches:
+        rec = _to_record(b, names.get(b.owner_id, ""), is_owner=b.owner_id == user.id)
+        rec.result_json = _slim_result_json(rec.result_json)
+        items.append(rec)
+    return BenchmarkPageResponse(total=total, items=items)
+
+
+class BenchStat(BaseModel):
+    """The handful of numbers the dashboard KPI row needs, per run."""
+
+    id: str
+    status: str
+    model: Optional[str] = None
+    gpu_type: Optional[str] = None
+    gpu_count: Optional[int] = None
+    output_throughput: Optional[float] = None
+    duration_s: Optional[float] = None
+
+
+@router.get("/_stats", response_model=list[BenchStat])
+async def benchmark_stats(
+    scope: str = "mine",
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    rows = await session.execute(_bench_scope_stmt(user, scope))
+    out: list[BenchStat] = []
+    for b in rows.scalars().all():
+        meta = await _bench_gpu_meta(b)
+        rj = b.result_json if isinstance(b.result_json, dict) else {}
+        tput = rj.get("output_throughput")
+        dur = (
+            (b.ended_at - b.started_at).total_seconds()
+            if b.started_at and b.ended_at
+            else None
+        )
+        out.append(
+            BenchStat(
+                id=b.id,
+                status=b.status,
+                model=meta.get("model"),
+                gpu_type=meta.get("gpu_type"),
+                gpu_count=meta.get("gpu_count"),
+                output_throughput=tput if isinstance(tput, (int, float)) else None,
+                duration_s=dur,
+            )
+        )
     return out
 
 

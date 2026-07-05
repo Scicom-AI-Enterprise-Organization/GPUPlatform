@@ -27,6 +27,7 @@ import type {
   RunpodTemplateSearchResult,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { FormFooter, FormShell } from "@/components/form-shell";
 
 // Same option list as the benchmark form so users see one consistent picker.
 // Fallback list rendered if /compute/pi/images is unreachable (e.g. gateway
@@ -318,6 +319,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   }
 
   return (
+    <FormShell>
     <form onSubmit={onSubmit} className="space-y-6">
       {/* Section: identity */}
       <Section title="Pod" description="A short name to remember this pod by.">
@@ -533,10 +535,10 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         </Section>
       )}
 
-      <div className="flex items-center justify-end gap-3 border-t border-border pt-4">
-        {submitError && (
-          <p className="flex-1 text-sm text-destructive">{submitError}</p>
-        )}
+      <FormFooter
+        error={submitError}
+        hint={!providerId ? "Pick a provider to enable create." : undefined}
+      >
         <Button
           type="button"
           variant="ghost"
@@ -549,8 +551,9 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
           {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
           {submitting ? "Creating…" : "Create pod"}
         </Button>
-      </div>
+      </FormFooter>
     </form>
+    </FormShell>
   );
 }
 
@@ -564,7 +567,9 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-lg border border-border bg-card p-5">
+    // data-form-section feeds the FormShell scrollspy rail; scroll-mt keeps the
+    // heading visible after a rail jump.
+    <section data-form-section={title} className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
       <div className="mb-4">
         <h2 className="text-sm font-semibold">{title}</h2>
         {description && (

@@ -30,6 +30,7 @@ import { parseGpuIds, suggestPacking } from "@/lib/gpu-pin";
 import { cleanVllmArgs } from "@/lib/vllm-args";
 import { deployEndpoint } from "../actions";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { FormFooter, FormShell } from "@/components/form-shell";
 import { RegionSelect } from "@/components/region-select";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
@@ -647,6 +648,7 @@ export function InferenceForm() {
   }
 
   return (
+    <FormShell>
     <div className="">
       <div className="mb-6">
         <h1 className="text-2xl font-semibold tracking-tight">Create inference endpoint</h1>
@@ -1721,10 +1723,16 @@ export function InferenceForm() {
         </Section>
       </div>
 
-      <div className="mt-5 flex items-center justify-end gap-3">
-        {submitError && (
-          <p className="mr-auto text-sm text-destructive">{submitError}</p>
-        )}
+      <FormFooter
+        error={submitError}
+        hint={
+          isVm && vdInvalid ? "Fix the GPU IDs pin to enable deploy."
+          : !isVm && explicitlyUnavailable ? "The selected GPU has no capacity — pick another type or region."
+          : !isVm && (idleInvalid || diskInvalid || volumeInvalid) ? "Fix the pod sizing / idle timeout values."
+          : mode === "single" && advancedInvalid ? "Fix the vLLM engine args to enable deploy."
+          : `${isVm ? "Bare metal" : "Cloud"} · ${mode === "single" ? "single model" : mode}`
+        }
+      >
         <Button variant="ghost" onClick={() => router.push("/serverless")} disabled={pending}>
           Cancel
         </Button>
@@ -1742,7 +1750,7 @@ export function InferenceForm() {
           {pending && <Loader2 className="h-4 w-4 animate-spin" />}
           Create endpoint
         </Button>
-      </div>
+      </FormFooter>
 
       <Dialog
         open={unavailableModal !== null}
@@ -1780,6 +1788,7 @@ export function InferenceForm() {
         </DialogContent>
       </Dialog>
     </div>
+    </FormShell>
   );
 }
 
@@ -1793,7 +1802,9 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-lg border border-border bg-card p-5">
+    // data-form-section feeds the FormShell scrollspy rail; scroll-mt keeps the
+    // heading visible after a rail jump.
+    <section data-form-section={title} className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
       <div className="mb-4">
         <h2 className="text-sm font-semibold">{title}</h2>
         {description && (

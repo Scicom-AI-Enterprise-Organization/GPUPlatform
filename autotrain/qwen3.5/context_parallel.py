@@ -285,6 +285,21 @@ def _mask(qp, qd, kp, kd, window):
 # restores full-fp32 scores; SGPU_RING_QB tunes the q-block (smaller = smaller transients).
 _RING_QB = int(os.environ.get("SGPU_RING_QB", "1024") or 1024)
 _RING_FP32 = os.environ.get("SGPU_RING_FP32") == "1"
+# SGPU_RING_FUSED=1: route the full-attn ring blocks through the FUSED FA3 kernel
+# (kernels-community/flash-attn3 — the same kernel the non-CP path uses) instead of the pure-torch
+# blocks: O(S) memory, tensor-core speed. The ring/comm structure is unchanged; only the per-step
+# block math is swapped. Requires the kernel to be resolvable (hub-cached) in the venv.
+_RING_FUSED = os.environ.get("SGPU_RING_FUSED") == "1"
+_FA3I = None
+
+
+def _fa3():
+    """The FA3 low-level interface (lazy; cached by the `kernels` hub the first time)."""
+    global _FA3I
+    if _FA3I is None:
+        from kernels import get_kernel
+        _FA3I = get_kernel("kernels-community/flash-attn3").flash_attn_interface
+    return _FA3I
 
 
 def _cols(qp_blk, qd_blk, kp, kd, window):
@@ -426,20 +441,149 @@ def _ring_bwd(group, dout, q, k, v, out, lse, pos, doc, scale, window):
     return dq.to(q.dtype), ndk.to(q.dtype), ndv.to(q.dtype)
 
 
+# ---- FUSED FA3 ring blocks (SGPU_RING_FUSED=1) --------------------------------------------------
+# Contiguous causal sharding makes the fused decomposition tiny: per ring step at most ONE kernel
+# call — the diagonal (src == rank) is a plain varlen-causal call over the local doc segments; an
+# EARLIER chunk (src < rank) can only contribute through the single doc that straddles from src's
+# chunk into this rank's chunk start (docs are contiguous), i.e. one causal=False block of
+# (my-first-doc rows × that doc's cols in src); LATER chunks contribute nothing. The backward feeds
+# the GLOBAL lse into FA3's `_flash_attn_backward` — the standard ring-flash-attention recipe (the
+# hd≤256 backward consumes the passed lse; only hd>256 paths recompute, see the gemma notes).
+
+def _cu2(n, dev):
+    return torch.tensor([0, n], dtype=torch.int32, device=dev)
+
+
+def _doc_cu(doc):
+    """Local cu_seqlens (int32) from the chunk's contiguous per-token doc ids."""
+    d = doc
+    bounds = [0] + (torch.nonzero(d[1:] != d[:-1]).squeeze(1) + 1).tolist() + [d.numel()]
+    return torch.tensor(bounds, dtype=torch.int32, device=d.device)
+
+
+def _fa3_fwd(q, k, v, cu_q, cu_k, max_q, max_k, scale, causal):
+    fi = _fa3()
+    out, lse, *_ = fi._flash_attn_forward(
+        q, k, v, None, None, None, None, cu_q, cu_k, None, None, None, max_q, max_k,
+        None, None, None, None, None, None, None, None, None, scale,
+        causal=causal, window_size_left=-1, window_size_right=-1,
+        attention_chunk=0, softcap=0.0, num_splits=1, pack_gqa=None, sm_margin=0)
+    return out, lse
+
+
+def _fa3_bwd(dout, q, k, v, out, lse, cu_q, cu_k, max_q, max_k, scale, causal):
+    fi = _fa3()
+    dq = torch.empty_like(q); dk = torch.empty_like(k); dv = torch.empty_like(v)
+    fi._flash_attn_backward(
+        dout, q, k, v, out, lse, cu_q, cu_k, None, None, max_q, max_k, dq, dk, dv,
+        scale, causal=causal, window_size_left=-1, window_size_right=-1,
+        softcap=0.0, deterministic=False, sm_margin=0)
+    return dq, dk, dv
+
+
+def _prev_doc_span(doc, all_doc_src):
+    """(qn, ks, ke): rows of MY chunk's first doc + that doc's contiguous span in the src chunk —
+    the only possible contribution from an earlier chunk. None when the doc doesn't reach back."""
+    d0 = doc[0]
+    hit = torch.nonzero(all_doc_src == d0)
+    if hit.numel() == 0:
+        return None
+    qn = int((doc == d0).sum())
+    return qn, int(hit[0]), int(hit[-1]) + 1
+
+
+def _ring_fwd_fused(group, q, k, v, pos, doc, scale):
+    comm = RingComm(group); W, rank = comm.world_size, comm.rank
+    all_pos, all_doc = _gather_posdoc(pos, doc, W, group)
+    cu_loc = _doc_cu(doc)
+    max_loc = int((cu_loc[1:] - cu_loc[:-1]).max())
+    Tq, hq, _ = q.shape; dv_dim = v.shape[2]
+    out = lse = None; nk = nv = None
+    for step in range(W):
+        if step + 1 != W:
+            nk = comm.send_recv(k); nv = comm.send_recv(v); comm.commit()
+        src = (rank - step) % W
+        bo = bl = None
+        if src == rank:
+            o_, l_ = _fa3_fwd(q, k, v, cu_loc, cu_loc, max_loc, max_loc, scale, True)
+            bo, bl = o_, l_
+        elif src < rank:
+            span = _prev_doc_span(doc, all_doc[src])
+            if span is not None:
+                qn, ks, ke = span
+                o_, l_ = _fa3_fwd(q[:qn], k[ks:ke].contiguous(), v[ks:ke].contiguous(),
+                                  _cu2(qn, q.device), _cu2(ke - ks, q.device), qn, ke - ks, scale, False)
+                bo = q.new_zeros(Tq, hq, dv_dim); bo[:qn] = o_
+                bl = torch.full((hq, Tq), float("-inf"), dtype=torch.float32, device=q.device)
+                bl[:, :qn] = l_
+        if bo is not None:
+            out, lse = _upd(out, lse, bo, bl)
+        if step + 1 != W:
+            comm.wait(); k, v = nk, nv
+    return out.to(q.dtype), lse.squeeze(-1).transpose(0, 1).contiguous()
+
+
+def _ring_bwd_fused(group, dout, q, k, v, out, lse, pos, doc, scale):
+    kv, dkv = RingComm(group), RingComm(group); W, rank = kv.world_size, kv.rank
+    all_pos, all_doc = _gather_posdoc(pos, doc, W, group)
+    cu_loc = _doc_cu(doc)
+    max_loc = int((cu_loc[1:] - cu_loc[:-1]).max())
+    dq = dk = dv = None; ndk = ndv = None; nk = nv = None
+    lse_c = lse.contiguous()
+    for step in range(W):
+        if step + 1 != W:
+            nk = kv.send_recv(k); nv = kv.send_recv(v); kv.commit()
+        src = (rank - step) % W
+        if src == rank:
+            bdq, bdk, bdv = _fa3_bwd(dout, q, k, v, out, lse_c, cu_loc, cu_loc,
+                                     max_loc, max_loc, scale, True)
+            dq, dk, dv = bdq.float(), bdk.float(), bdv.float()   # step 0 = diagonal: initialize
+        else:
+            span = _prev_doc_span(doc, all_doc[src]) if src < rank else None
+            if span is None:
+                dkv.wait(); dk, dv = ndk, ndv                     # nothing to add: pass through
+            else:
+                qn, ks, ke = span
+                bdq, bdk, bdv = _fa3_bwd(
+                    dout[:qn].contiguous(), q[:qn].contiguous(),
+                    k[ks:ke].contiguous(), v[ks:ke].contiguous(),
+                    out[:qn].contiguous(), lse_c[:, :qn].contiguous(),
+                    _cu2(qn, q.device), _cu2(ke - ks, q.device), qn, ke - ks, scale, False)
+                dq[:qn] += bdq.float()
+                dkv.wait()
+                dk, dv = ndk.clone(), ndv.clone()
+                dk[ks:ke] += bdk.float(); dv[ks:ke] += bdv.float()
+        if step + 1 != W:
+            kv.wait(); k, v = nk, nv
+        ndk = dkv.send_recv(dk); ndv = dkv.send_recv(dv); dkv.commit()
+    dkv.wait()
+    return dq.to(q.dtype), ndk.to(q.dtype), ndv.to(q.dtype)
+
+
 class _RingAttn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, pos, doc, scale, window, group):
         k, v = k.contiguous(), v.contiguous()
         pos, doc = pos.long(), doc.long()
-        out, lse = _ring_fwd(group, q, k, v, pos, doc, scale, window)
+        # fused FA3 path: full-causal only (qwen full-attn has no sliding window)
+        fused = _RING_FUSED and window is None
+        if fused:
+            out, lse = _ring_fwd_fused(group, q, k, v, pos, doc, scale)
+        else:
+            out, lse = _ring_fwd(group, q, k, v, pos, doc, scale, window)
         ctx.save_for_backward(q, k, v, out, lse, pos, doc)
-        ctx.scale, ctx.window, ctx.group = scale, window, group
+        ctx.scale, ctx.window, ctx.group, ctx.fused = scale, window, group, fused
         return out
 
     @staticmethod
     def backward(ctx, dout):
         q, k, v, out, lse, pos, doc = ctx.saved_tensors
-        dq, dk, dv = _ring_bwd(ctx.group, dout, q, k, v, out, lse, pos, doc, ctx.scale, ctx.window)
+        if ctx.fused:
+            # saved lse is (hq, Tq) — already FA3's varlen softmax_lse layout
+            dq, dk, dv = _ring_bwd_fused(ctx.group, dout.contiguous(), q, k, v, out,
+                                         lse, pos, doc, ctx.scale)
+        else:
+            dq, dk, dv = _ring_bwd(ctx.group, dout, q, k, v, out, lse, pos, doc, ctx.scale, ctx.window)
         return dq, dk, dv, None, None, None, None, None
 
 

@@ -5,20 +5,22 @@ import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
 import { ScopeToggle } from "@/components/scope-toggle";
 import { gateway } from "@/lib/gateway";
-import type { CatalogRecord, DatasetRecord } from "@/lib/types";
+import type { CatalogRecord, DatasetRecord, PageResponse } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { DatasetsList } from "./datasets-list";
 import { PushHint } from "@/components/catalog/push-hint";
 
-async function loadDatasets(
+const PAGE_SIZE = 12;
+
+async function loadDatasetsPage(
   scope: "mine" | "all",
-): Promise<{ items: DatasetRecord[]; error: string | null }> {
+): Promise<{ page: PageResponse<DatasetRecord>; error: string | null }> {
   try {
-    const items = await gateway.listDatasets(scope);
-    return { items, error: null };
+    const page = await gateway.listDatasetsPage({ scope, limit: PAGE_SIZE, offset: 0 });
+    return { page, error: null };
   } catch (e) {
-    return { items: [], error: e instanceof Error ? e.message : String(e) };
+    return { page: { total: 0, items: [] }, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -63,16 +65,20 @@ export default async function DatasetsPage({
     me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   const hasCatalog = !!me?.sections?.catalog;
-  const [{ items: autotrain, error }, hostedAll, username] = await Promise.all([
-    noAccess ? Promise.resolve({ items: [], error: null }) : loadDatasets(scope),
+  const [{ page, error }, hostedAll, username] = await Promise.all([
+    noAccess
+      ? Promise.resolve({ page: { total: 0, items: [] as DatasetRecord[] }, error: null })
+      : loadDatasetsPage(scope),
     !noAccess && hasCatalog ? loadHosted(scope) : Promise.resolve<CatalogRecord[]>([]),
     currentUsername(),
   ]);
   // Merge HF-mirror dataset repos into the one list, EXCLUDING those already
-  // shown as a published Autotrain dataset (dedup on catalog_repo_id).
-  const linkedRepoIds = new Set(autotrain.map((d) => d.catalog_repo_id).filter(Boolean));
+  // shown as a published Autotrain dataset (dedup on catalog_repo_id). Only the
+  // first page is available here, so a repo linked to a dataset on a later page
+  // may appear twice — acceptable best-effort.
+  const linkedRepoIds = new Set(page.items.map((d) => d.catalog_repo_id).filter(Boolean));
   const standaloneHosted = hostedAll.filter((h) => !linkedRepoIds.has(h.id)).map(hostedToDataset);
-  const items = [...autotrain, ...standaloneHosted];
+  const totalCount = page.total + standaloneHosted.length;
   const gatewayUrl = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
   return (
@@ -106,7 +112,7 @@ export default async function DatasetsPage({
               <div className="flex items-baseline gap-3">
                 <h2 className="text-base font-medium">Datasets</h2>
                 <span className="text-xs text-muted-foreground">
-                  {items.length} {items.length === 1 ? "dataset" : "datasets"}
+                  {totalCount} {totalCount === 1 ? "dataset" : "datasets"}
                   {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
@@ -126,7 +132,7 @@ export default async function DatasetsPage({
               </div>
             </div>
 
-            {items.length === 0 ? (
+            {totalCount === 0 ? (
               <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
                 <Inbox className="h-6 w-6 text-muted-foreground/60" />
                 <p className="text-sm text-muted-foreground">
@@ -136,7 +142,12 @@ export default async function DatasetsPage({
                 </p>
               </div>
             ) : (
-              <DatasetsList items={items} />
+              <DatasetsList
+                initialItems={page.items}
+                initialTotal={page.total}
+                hosted={standaloneHosted}
+                scope={scope}
+              />
             )}
           </section>
         )}

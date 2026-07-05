@@ -116,7 +116,7 @@ export function TrackingCredentialsManager({ initial }: { initial: TrackingCrede
   }
 
   return (
-    <section className="mt-10">
+    <section data-form-section="Tracking credentials" className="scroll-mt-6 mt-10">
       <div className="mb-3 flex items-center justify-between border-b border-border pb-2">
         <div className="flex items-center gap-2">
           <Activity className="h-4 w-4 text-muted-foreground" />

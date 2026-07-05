@@ -391,7 +391,7 @@ function ChartCard({ title, subtitle, empty, loading, children }: {
   title: string; subtitle?: string; empty: boolean; loading: boolean; children: React.ReactElement;
 }) {
   return (
-    <div className="rounded-lg border bg-card p-4">
+    <div data-form-section={title} className="scroll-mt-6 rounded-lg border bg-card p-4">
       <h2 className="mb-1 text-sm font-semibold">{title}</h2>
       {subtitle && <p className="mb-3 text-xs text-muted-foreground">{subtitle}</p>}
       <div className="h-64">
@@ -417,7 +417,7 @@ function RankCard({ title, subtitle, rows }: {
   title: string; subtitle?: string; rows: { label: string; requests: number; tokens: number }[];
 }) {
   return (
-    <div className="rounded-lg border bg-card p-4">
+    <div data-form-section={title} className="scroll-mt-6 rounded-lg border bg-card p-4">
       <h2 className="mb-1 text-sm font-semibold">{title}</h2>
       {subtitle && <p className="mb-3 text-xs text-muted-foreground">{subtitle}</p>}
       {rows.length === 0 ? (

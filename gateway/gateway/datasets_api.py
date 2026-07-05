@@ -32,7 +32,7 @@ from urllib.parse import quote, urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import audit as audit_module
@@ -578,6 +578,62 @@ async def list_datasets(
     owners = await _owner_map(session, rows)
     storages = await _storage_name_map(session, rows)
     return [_to_record(d, owners.get(d.owner_id, "?"), storages.get(d.storage_id or "")) for d in rows]
+
+
+class DatasetPageResponse(BaseModel):
+    total: int
+    items: list[DatasetRecord]
+
+
+@router.get("/_page", response_model=DatasetPageResponse)
+async def list_datasets_page(
+    scope: str = "mine",
+    q: str = "",
+    kind: str = "",
+    sort: str = "newest",
+    limit: int = Query(12, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Paged dataset list — the web list fetches page-by-page so hundreds of
+    datasets don't ship up front. Search/kind-filter/sort run server-side so they
+    cover ALL datasets, not just the loaded page. Declared before /{dataset_id}
+    (declaration-order matching); the plain list endpoint above stays for
+    back-compat."""
+    stmt = select(Dataset)
+    if not (user.is_admin and scope == "all"):
+        stmt = stmt.where(Dataset.owner_id == user.id)
+    if kind:
+        stmt = stmt.where(Dataset.kind == kind)
+    # Multi-token search (every token must match), mirroring the old client-side
+    # filter: name/id/kind/description/hf repo + owner username.
+    for tok in (q or "").lower().split():
+        like = f"%{tok}%"
+        stmt = stmt.where(
+            or_(
+                Dataset.id.ilike(like),
+                Dataset.name.ilike(like),
+                Dataset.kind.ilike(like),
+                Dataset.description.ilike(like),
+                Dataset.hf_repo.ilike(like),
+                Dataset.owner_id.in_(select(User.id).where(User.username.ilike(like))),
+            )
+        )
+    total = (
+        await session.execute(select(func.count()).select_from(stmt.subquery()))
+    ).scalar_one()
+    order = Dataset.created_at.asc() if sort == "oldest" else Dataset.created_at.desc()
+    rows = list((await session.execute(stmt.order_by(order).limit(limit).offset(offset))).scalars().all())
+    owners = await _owner_map(session, rows)
+    storages = await _storage_name_map(session, rows)
+    return DatasetPageResponse(
+        total=total,
+        items=[
+            _to_record(d, owners.get(d.owner_id, "?"), storages.get(d.storage_id or ""))
+            for d in rows
+        ],
+    )
 
 
 @router.post("", response_model=DatasetRecord)

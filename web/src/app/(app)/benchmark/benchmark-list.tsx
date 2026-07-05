@@ -1,10 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import yaml from "js-yaml";
 import { useListUrlState, readParam } from "@/lib/list-url-state";
-import { CheckSquare, Download, GitCompare, Globe, Inbox, LayoutGrid, List, Lock, MoreHorizontal, Search, Trash2, X } from "lucide-react";
+import { CheckSquare, Download, GitCompare, Globe, Inbox, LayoutGrid, List, Loader2, Lock, MoreHorizontal, Search, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
@@ -33,43 +32,21 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-select";
+import { SortSelect, type SortDir } from "@/components/ui/sort-select";
 import { BenchmarkRow } from "./benchmark-row";
-
-/** Pre-compute a flat searchable string per benchmark. Includes name, id,
- * status, owner, model, GPU type, and parallelism so a single query can hit
- * any of those. Done once per render via useMemo. */
-function searchableText(b: BenchmarkRecord): string {
-  let model = "";
-  let gpu = "";
-  let parallelism = "";
-  try {
-    const cfg = yaml.load(b.config_yaml) as
-      | {
-          runpod?: { pod?: { gpu_type?: string; gpu_count?: number } };
-          benchmark?: Array<{
-            model?: { repo_id?: string };
-            serve?: { tensor_parallel_size?: number; data_parallel_size?: number };
-          }>;
-        }
-      | null;
-    gpu = cfg?.runpod?.pod?.gpu_type ?? "";
-    model = cfg?.benchmark?.[0]?.model?.repo_id ?? "";
-    const tp = cfg?.benchmark?.[0]?.serve?.tensor_parallel_size ?? 1;
-    const dp = cfg?.benchmark?.[0]?.serve?.data_parallel_size ?? 1;
-    parallelism = `tp${tp} dp${dp} tp${tp}/dp${dp}`;
-  } catch {
-    // ignore
-  }
-  return [b.name, b.id, b.status, b.created_by, model, gpu, parallelism]
-    .join(" ")
-    .toLowerCase();
-}
 
 const STATUS_OPTIONS = ["all", "queued", "running", "done", "failed", "cancelled"] as const;
 type StatusFilter = (typeof STATUS_OPTIONS)[number];
 
-export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
+export function BenchmarkList({
+  initialItems,
+  initialTotal,
+  scope,
+}: {
+  initialItems: BenchmarkRecord[];
+  initialTotal: number;
+  scope: "mine" | "all";
+}) {
   const router = useRouter();
   const sp = useSearchParams();
   // Initial filter/sort/view/select come from the URL (shareable), falling back to
@@ -94,6 +71,18 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
+  // Server-paginated list state. The server component renders page 1; every
+  // filter/sort/page change after that fetches from the gateway.
+  const [items, setItems] = useState<BenchmarkRecord[]>(initialItems);
+  const [total, setTotal] = useState(initialTotal);
+  const [loading, setLoading] = useState(false);
+  // Debounced copy of `q` — the fetch keys off this so we don't hit the
+  // gateway on every keystroke.
+  const [qDebounced, setQDebounced] = useState(q);
+  useEffect(() => {
+    const t = setTimeout(() => setQDebounced(q), 300);
+    return () => clearTimeout(t);
+  }, [q]);
   useEffect(() => {
     // The URL wins over localStorage (so a shared link shows its view); only fall
     // back to the saved preference when the URL didn't specify one.
@@ -109,6 +98,57 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
   };
   // Mirror the shareable state into the URL (search, status, sort, view, select).
   useListUrlState({ q, status, sort, view, select: selectMode });
+
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  // Clamp in render so a shrinking result set never strands an empty page; the
+  // search/filter handlers reset to page 1 directly.
+  const currentPage = Math.min(page, pageCount);
+
+  // Fetch the current page from the gateway (search/filter/sort run server-side).
+  // On error keep whatever page we already have and surface a toast.
+  const load = useCallback(
+    async (signal?: { cancelled: boolean }) => {
+      setLoading(true);
+      try {
+        const res = await gateway.listBenchmarksPage({
+          scope,
+          q: qDebounced,
+          status: status === "all" ? "" : status,
+          sort,
+          limit: pageSize,
+          offset: (currentPage - 1) * pageSize,
+        });
+        if (signal?.cancelled) return;
+        setItems(res.items);
+        setTotal(res.total);
+      } catch (e) {
+        if (!signal?.cancelled) {
+          toast.error(e instanceof Error ? e.message : String(e), { duration: 4000 });
+        }
+      } finally {
+        if (!signal?.cancelled) setLoading(false);
+      }
+    },
+    [scope, qDebounced, status, sort, pageSize, currentPage],
+  );
+
+  // Refetch whenever a server-side input changes. The ref skips the very first
+  // run when state matches what the server already rendered (page 1, no
+  // filters); a URL-seeded q/status/sort still fetches on mount.
+  const skipInitialLoad = useRef(
+    qDebounced === "" && status === "all" && sort === "newest" && page === 1 && pageSize === 12,
+  );
+  useEffect(() => {
+    if (skipInitialLoad.current) {
+      skipInitialLoad.current = false;
+      return;
+    }
+    const signal = { cancelled: false };
+    load(signal);
+    return () => {
+      signal.cancelled = true;
+    };
+  }, [load]);
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -156,7 +196,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
       } catch (e) {
         failed.push(id);
         // keep going — one bad export shouldn't abort the batch
-        // eslint-disable-next-line no-console
+         
         console.error(`export ${id} failed`, e);
       }
       setExportProgress((p) => p + 1);
@@ -181,8 +221,9 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
     setRenaming(true);
     try {
       await gateway.renameBenchmark(renameTarget.id, name);
+      // Patch the row in place — no need to refetch the page for a label change.
+      setItems((prev) => prev.map((b) => (b.id === renameTarget.id ? { ...b, name } : b)));
       setRenameTarget(null);
-      router.refresh();
     } catch (e) {
       setRenameError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -199,7 +240,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
       toast.success(next ? "Benchmark is now public" : "Benchmark is now private", {
         duration: 2500,
       });
-      router.refresh();
+      load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e), { duration: 4000 });
     }
@@ -226,7 +267,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
       toast.error(`${failures} of ${targets.length} failed`, { duration: 4000 });
     }
     exitSelect();
-    router.refresh();
+    load();
   };
 
   const onSingleDelete = async () => {
@@ -236,6 +277,8 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
     try {
       await gateway.deleteBenchmark(single.id);
       setSingle(null);
+      load();
+      // Header count + dashboard stats are server-rendered; refresh them too.
       router.refresh();
     } catch (e) {
       setSingleError(e instanceof Error ? e.message : String(e));
@@ -255,39 +298,15 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
     if (failures === 0) {
       setConfirmOpen(false);
       exitSelect();
-      router.refresh();
     } else {
       setDeleteError(`${failures} of ${ids.length} failed to delete`);
-      router.refresh();
     }
+    load();
+    // Header count + dashboard stats are server-rendered; refresh them too.
+    router.refresh();
   };
 
-  const haystacks = useMemo(
-    () => items.map((b) => ({ bench: b, text: searchableText(b) })),
-    [items],
-  );
-
-  const filtered = useMemo(() => {
-    const needle = q.trim().toLowerCase();
-    const tokens = needle ? needle.split(/\s+/).filter(Boolean) : [];
-    return haystacks
-      .filter(({ bench, text }) => {
-        if (status !== "all" && bench.status !== status) return false;
-        if (tokens.length === 0) return true;
-        return tokens.every((t) => text.includes(t));
-      })
-      .map(({ bench }) => bench);
-  }, [haystacks, q, status]);
-
-  const sorted = useMemo(() => sortByCreated(filtered, sort), [filtered, sort]);
-
   const hasFilter = q.trim().length > 0 || status !== "all";
-
-  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
-  // Clamp in render so a shrinking result set never strands an empty page; the
-  // search/filter handlers reset to page 1 directly.
-  const currentPage = Math.min(page, pageCount);
-  const paged = sorted.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   return (
     <div>
@@ -389,12 +408,12 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
         <div className="mb-3 flex flex-col gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between">
           <span className="text-muted-foreground">
             {selected.size} selected
-            {filtered.length > 0 && (
+            {items.length > 0 && (
               <>
                 {" "}
                 <button
                   type="button"
-                  onClick={() => setSelected(new Set(paged.map((b) => b.id)))}
+                  onClick={() => setSelected(new Set(items.map((b) => b.id)))}
                   className="ml-2 underline underline-offset-2 hover:text-foreground"
                 >
                   Select all visible
@@ -476,22 +495,25 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
       )}
 
       {hasFilter && (
-        <div className="mb-3 text-xs text-muted-foreground">
-          {filtered.length} of {items.length} match
-          {q && (
-            <>
-              {" "}for <span className="font-mono text-foreground">&quot;{q}&quot;</span>
-            </>
-          )}
-          {status !== "all" && (
-            <>
-              {" "}· status <span className="font-mono text-foreground">{status}</span>
-            </>
-          )}
+        <div className="mb-3 flex items-center gap-2 text-xs text-muted-foreground">
+          <span>
+            {total} {total === 1 ? "run matches" : "runs match"}
+            {q && (
+              <>
+                {" "}for <span className="font-mono text-foreground">&quot;{q}&quot;</span>
+              </>
+            )}
+            {status !== "all" && (
+              <>
+                {" "}· status <span className="font-mono text-foreground">{status}</span>
+              </>
+            )}
+          </span>
+          {loading && <Loader2 className="h-3 w-3 animate-spin" />}
         </div>
       )}
 
-      {filtered.length === 0 ? (
+      {items.length === 0 ? (
         <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
           <Inbox className="h-6 w-6 text-muted-foreground/60" />
           <p className="text-sm text-muted-foreground">No benchmarks match your filters.</p>
@@ -504,9 +526,11 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
               view === "rows"
                 ? "flex flex-col"
                 : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
+              // Dim (but keep rendering) the stale page while the next one loads.
+              loading && "pointer-events-none opacity-60",
             )}
           >
-            {paged.map((b) => {
+            {items.map((b) => {
               const owned = b.is_owner ?? true;
               return (
                 <BenchmarkRow
@@ -535,7 +559,7 @@ export function BenchmarkList({ items }: { items: BenchmarkRecord[] }) {
           <Pagination
             page={currentPage}
             pageCount={pageCount}
-            total={filtered.length}
+            total={total}
             pageSize={pageSize}
             onPageChange={setPage}
             onPageSizeChange={(n) => {

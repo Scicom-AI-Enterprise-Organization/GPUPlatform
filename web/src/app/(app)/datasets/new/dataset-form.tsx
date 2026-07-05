@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { FormFooter, FormShell } from "@/components/form-shell";
 import { gateway } from "@/lib/gateway";
 import type { DatasetKind, GlobalEnvRecord, StorageRecord } from "@/lib/types";
 
@@ -203,8 +204,9 @@ export function DatasetForm({
   };
 
   return (
+    <FormShell>
     <form onSubmit={onSubmit} className="space-y-6">
-      <Card>
+      <Card data-form-section="Dataset" className="scroll-mt-6">
         <CardHeader>
           <CardTitle className="text-base">Dataset</CardTitle>
           <CardDescription>A name and an optional description.</CardDescription>
@@ -227,7 +229,7 @@ export function DatasetForm({
         </CardContent>
       </Card>
 
-      <Card>
+      <Card data-form-section="Source" className="scroll-mt-6">
         <CardHeader>
           <CardTitle className="text-base">Source</CardTitle>
           <CardDescription>Where the {`{audio, transcription}`} rows come from.</CardDescription>
@@ -659,13 +661,7 @@ export function DatasetForm({
         </CardContent>
       </Card>
 
-      {error && (
-        <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
-        </p>
-      )}
-
-      <div className="flex items-center justify-end gap-3">
+      <FormFooter error={error}>
         <Button type="button" variant="ghost" onClick={() => router.push("/datasets")}>
           Cancel
         </Button>
@@ -673,7 +669,8 @@ export function DatasetForm({
           {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
           Register dataset
         </Button>
-      </div>
+      </FormFooter>
     </form>
+    </FormShell>
   );
 }

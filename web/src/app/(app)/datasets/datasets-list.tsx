@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { toast } from "sonner";
 import { CheckSquare, GitMerge, Inbox, LayoutGrid, List, Loader2, Search, X } from "lucide-react";
 import { useListUrlState, readParam } from "@/lib/list-url-state";
 import { cn } from "@/lib/utils";
@@ -30,7 +31,8 @@ import { SortSelect, sortByCreated, type SortDir } from "@/components/ui/sort-se
 import { DatasetCard, KIND_LABEL } from "./dataset-card";
 
 /** Flat searchable string per dataset — name, id, kind, source ref, storage,
- * format, owner — so one query hits any of them. */
+ * format, owner — so one query hits any of them. Only used for the client-side
+ * `hosted` array; DB datasets are searched server-side by /datasets/_page. */
 function searchableText(d: DatasetRecord): string {
   return [
     d.name,
@@ -65,7 +67,17 @@ const SOURCE_OPTIONS: Array<{ value: "all" | DatasetKind; label: string }> = [
   { value: "hosted", label: "HF repo" },
 ];
 
-export function DatasetsList({ items }: { items: DatasetRecord[] }) {
+export function DatasetsList({
+  initialItems,
+  initialTotal,
+  hosted,
+  scope,
+}: {
+  initialItems: DatasetRecord[];
+  initialTotal: number;
+  hosted: DatasetRecord[];
+  scope: "mine" | "all";
+}) {
   const router = useRouter();
   const sp = useSearchParams();
   // Seed search/source/sort/view from the URL (shareable); mirrored back below.
@@ -79,6 +91,18 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
+
+  // Server-paged DB datasets — seeded with the SSR first page, refetched from
+  // /datasets/_page whenever a filter/sort/page changes.
+  const [items, setItems] = useState<DatasetRecord[]>(initialItems);
+  const [total, setTotal] = useState(initialTotal);
+  const [loading, setLoading] = useState(false);
+  // Debounce the search box so we don't hit the gateway on every keystroke.
+  const [qDebounced, setQDebounced] = useState(q);
+  useEffect(() => {
+    const t = setTimeout(() => setQDebounced(q), 300);
+    return () => clearTimeout(t);
+  }, [q]);
 
   // Per-item dialogs
   const [deleteTarget, setDeleteTarget] = useState<DatasetRecord | null>(null);
@@ -122,7 +146,12 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
   };
 
   // Selected datasets, and whether each is a mergeable kind (label / s3).
-  const selectedItems = useMemo(() => items.filter((d) => selected.has(d.id)), [items, selected]);
+  // Looked up in the current page + hosted; a selection made on a page we've
+  // since navigated away from can't be resolved and drops out of the merge set.
+  const selectedItems = useMemo(
+    () => [...items, ...hosted].filter((d) => selected.has(d.id)),
+    [items, hosted, selected],
+  );
   const allMergeable = selectedItems.every((d) => MERGEABLE_KINDS.has(d.kind));
   const canMerge = selectedItems.length >= 2 && allMergeable;
 
@@ -132,25 +161,83 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
     router.push(`/datasets/merge?ids=${ids.map(encodeURIComponent).join(",")}`);
   };
 
-  const haystacks = useMemo(() => items.map((d) => ({ d, text: searchableText(d) })), [items]);
-  const filtered = useMemo(() => {
-    const tokens = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    return haystacks
-      .filter(({ d, text }) => {
-        if (source !== "all" && d.kind !== source) return false;
-        return tokens.every((t) => text.includes(t));
-      })
-      .map(({ d }) => d);
-  }, [haystacks, q, source]);
-
-  const sorted = useMemo(() => sortByCreated(filtered, sort), [filtered, sort]);
+  // What actually renders. DB datasets arrive pre-filtered/sorted/paged from the
+  // server; the hosted array is small and fully loaded, so it's handled here:
+  //   source "hosted" → hosted only, client-filtered/sorted/paged;
+  //   source "all"    → server page, with matching hosted appended on page 1
+  //                     as bonus rows (the pager counts only server rows);
+  //   anything else   → purely server-paged.
+  const { displayItems, displayTotal } = useMemo(() => {
+    const tokens = qDebounced.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const hostedMatches = hosted.filter((d) => {
+      const text = searchableText(d);
+      return tokens.every((t) => text.includes(t));
+    });
+    if (source === "hosted") {
+      const sorted = sortByCreated(hostedMatches, sort);
+      const cur = Math.min(page, Math.max(1, Math.ceil(sorted.length / pageSize)));
+      return {
+        displayItems: sorted.slice((cur - 1) * pageSize, cur * pageSize),
+        displayTotal: sorted.length,
+      };
+    }
+    if (source === "all" && page === 1) {
+      return { displayItems: [...items, ...hostedMatches], displayTotal: total };
+    }
+    return { displayItems: items, displayTotal: total };
+  }, [items, total, hosted, source, qDebounced, sort, page, pageSize]);
 
   const hasFilter = q.trim().length > 0 || source !== "all";
-  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil(displayTotal / pageSize));
   // Clamp in render so a shrinking result set can't strand us on an empty page;
   // searching/filtering resets to page 1 via the change handlers below.
   const currentPage = Math.min(page, pageCount);
-  const paged = sorted.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
+  // Refetch the DB page from the server. A sequence counter drops superseded
+  // responses (fast typing / page hopping); on failure we keep the previous
+  // items and surface a toast.
+  const loadSeq = useRef(0);
+  const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
+    setLoading(true);
+    try {
+      const res = await gateway.listDatasetsPage({
+        scope,
+        q: qDebounced,
+        kind: source === "all" || source === "hosted" ? "" : source,
+        sort,
+        limit: pageSize,
+        offset: (currentPage - 1) * pageSize,
+      });
+      if (seq !== loadSeq.current) return;
+      setItems(res.items);
+      setTotal(res.total);
+    } catch (e) {
+      if (seq !== loadSeq.current) return;
+      toast.error(`Couldn't load datasets: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      if (seq === loadSeq.current) setLoading(false);
+    }
+  }, [scope, qDebounced, source, sort, currentPage, pageSize]);
+
+  // Refetch when a filter/sort/page changes. The SSR payload already covers the
+  // default first page, so the very first run is skipped when state matches the
+  // defaults — but URL-seeded non-defaults DO fetch on mount (the server only
+  // rendered the default page).
+  const firstRun = useRef(true);
+  useEffect(() => {
+    if (firstRun.current) {
+      firstRun.current = false;
+      const isSsrDefault =
+        qDebounced === "" && source === "all" && sort === "newest" && currentPage === 1 && pageSize === 12;
+      if (isSsrDefault) return;
+    }
+    if (source === "hosted") return; // hosted is client-side only — nothing to fetch
+    // Fetching in an effect is the point here; the flagged setState is just
+    // load()'s synchronous setLoading(true) spinner flip.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load, qDebounced, source, sort, currentPage, pageSize]);
 
   const onDelete = async () => {
     if (!deleteTarget) return;
@@ -166,7 +253,10 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
       setDeleteTarget(null);
       setPurge(false);
       setPurgeConfirm("");
+      // refresh() re-renders the server shell (hosted repos, header count);
+      // load() refetches the client-held DB page.
       router.refresh();
+      void load();
     } catch (e) {
       setDeleteError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -187,6 +277,7 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
       await gateway.updateDataset(renameTarget.id, { name });
       setRenameTarget(null);
       router.refresh();
+      void load();
     } catch (e) {
       setRenameError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -293,12 +384,12 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
         <div className="mb-3 flex flex-col gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between">
           <span className="text-muted-foreground">
             {selected.size} selected
-            {paged.length > 0 && (
+            {displayItems.length > 0 && (
               <>
                 {" "}
                 <button
                   type="button"
-                  onClick={() => setSelected(new Set(paged.map((d) => d.id)))}
+                  onClick={() => setSelected(new Set(displayItems.map((d) => d.id)))}
                   className="ml-2 underline underline-offset-2 hover:text-foreground"
                 >
                   Select all visible
@@ -344,27 +435,32 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
         </div>
       )}
 
-      {hasFilter && (
-        <div className="mb-3 text-xs text-muted-foreground">
-          {filtered.length} of {items.length} match
-          {q && (
-            <>
-              {" "}for <span className="font-mono text-foreground">&quot;{q}&quot;</span>
-            </>
-          )}
-          {source !== "all" && (
-            <>
-              {" "}· source <span className="font-mono text-foreground">{source}</span>
-            </>
+      {(hasFilter || loading) && (
+        <div className="mb-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+          {loading && <Loader2 className="h-3 w-3 animate-spin" />}
+          {hasFilter && (
+            <span>
+              {displayTotal} {displayTotal === 1 ? "match" : "matches"}
+              {q && (
+                <>
+                  {" "}for <span className="font-mono text-foreground">&quot;{q}&quot;</span>
+                </>
+              )}
+              {source !== "all" && (
+                <>
+                  {" "}· source <span className="font-mono text-foreground">{source}</span>
+                </>
+              )}
+            </span>
           )}
         </div>
       )}
 
-      {filtered.length === 0 ? (
+      {displayItems.length === 0 ? (
         <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
           <Inbox className="h-6 w-6 text-muted-foreground/60" />
           <p className="text-sm text-muted-foreground">
-            {items.length === 0 ? "No datasets yet." : "No datasets match your filters."}
+            {hasFilter ? "No datasets match your filters." : "No datasets yet."}
           </p>
         </div>
       ) : (
@@ -373,9 +469,10 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
             className={cn(
               "gap-3",
               view === "rows" ? "flex flex-col" : "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3",
+              loading && "pointer-events-none opacity-60",
             )}
           >
-            {paged.map((d) => (
+            {displayItems.map((d) => (
               <DatasetCard
                 key={d.id}
                 dataset={d}
@@ -397,7 +494,7 @@ export function DatasetsList({ items }: { items: DatasetRecord[] }) {
           <Pagination
             page={currentPage}
             pageCount={pageCount}
-            total={filtered.length}
+            total={displayTotal}
             pageSize={pageSize}
             onPageChange={setPage}
             onPageSizeChange={(n) => {

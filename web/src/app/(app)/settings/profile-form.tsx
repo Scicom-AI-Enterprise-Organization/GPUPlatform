@@ -64,7 +64,7 @@ export function ProfileForm({
 
   return (
     <div className="space-y-6">
-      <Card>
+      <Card data-form-section="Profile" className="scroll-mt-6">
         <CardHeader>
           <CardTitle className="text-base font-semibold">Profile</CardTitle>
         </CardHeader>
@@ -75,7 +75,7 @@ export function ProfileForm({
         </CardContent>
       </Card>
 
-      <Card>
+      <Card data-form-section="Change password" className="scroll-mt-6">
         <CardHeader>
           <CardTitle className="text-base font-semibold">Change password</CardTitle>
           <p className="text-xs text-muted-foreground">

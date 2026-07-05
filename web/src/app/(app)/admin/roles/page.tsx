@@ -5,6 +5,7 @@ import { getMe } from "@/lib/me";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import type { PolicyRole } from "@/lib/types";
 import { RolesManager } from "./roles-manager";
+import { FormShell } from "@/components/form-shell";
 
 const GATEWAY = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
@@ -34,6 +35,7 @@ export default async function RolesPage() {
     <div className="flex h-full flex-col">
       <ConsoleTopbar crumbs={[{ label: "Roles" }]} username={me.username} />
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
+        <FormShell>
         <div className="">
         <header className="mb-8">
           <h1 className="text-2xl font-semibold tracking-tight">Roles</h1>
@@ -46,6 +48,7 @@ export default async function RolesPage() {
 
         <RolesManager initial={roles} />
         </div>
+        </FormShell>
       </div>
     </div>
   );

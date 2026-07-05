@@ -16,6 +16,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { gateway } from "@/lib/gateway";
 import type { ProviderKind } from "@/lib/types";
+import { FormFooter, FormShell } from "@/components/form-shell";
 
 type TestState =
   | { status: "idle" }
@@ -149,8 +150,9 @@ export function ProviderForm() {
   };
 
   return (
+    <FormShell>
     <form onSubmit={onSubmit} className="flex flex-col gap-5">
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section data-form-section="Provider" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="mb-4">
           <h2 className="text-base font-medium">Provider</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
@@ -195,7 +197,7 @@ export function ProviderForm() {
       </section>
 
       {kind === "vm" && (
-        <section className="rounded-lg border border-border bg-card p-5">
+        <section data-form-section="SSH access" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
           <div className="mb-4">
             <h2 className="text-base font-medium">SSH access</h2>
             <p className="mt-0.5 text-xs text-muted-foreground">
@@ -282,7 +284,7 @@ export function ProviderForm() {
       )}
 
       {isApiKind && (
-        <section className="rounded-lg border border-border bg-card p-5">
+        <section data-form-section="API key" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
           <div className="mb-4">
             <h2 className="text-base font-medium">API key</h2>
             <p className="mt-0.5 text-xs text-muted-foreground">
@@ -319,13 +321,11 @@ export function ProviderForm() {
         </section>
       )}
 
-      <div className="flex items-center gap-3">
-        {submitError && (
-          <span className="text-sm text-destructive">{submitError}</span>
-        )}
-        <div className="ml-auto flex items-center gap-3">
-          {test.status === "ok" && (
-            <span className="text-sm text-emerald-600 dark:text-emerald-400">
+      <FormFooter
+        error={submitError}
+        hint={
+          test.status === "ok" ? (
+            <span className="text-emerald-600 dark:text-emerald-400">
               ✓ {test.message}
               {test.gpus.length > 0 && (
                 <span className="ml-1 font-mono text-xs text-muted-foreground">
@@ -333,29 +333,32 @@ export function ProviderForm() {
                 </span>
               )}
             </span>
-          )}
-          {test.status === "fail" && (
-            <span className="text-sm text-destructive">✕ {test.message}</span>
-          )}
-          <Button
-            type="button"
-            variant="outline"
-            onClick={onTest}
-            disabled={test.status === "running" || submitting}
-          >
-            {test.status === "running" && <Loader2 className="h-4 w-4 animate-spin" />}
-            {test.status === "running" ? "Testing…" : "Test"}
-          </Button>
-          <Button
-            type="submit"
-            disabled={submitting || test.status !== "ok"}
-            title={test.status !== "ok" ? "Pass the connection test first" : undefined}
-          >
-            {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
-            {submitting ? "Creating…" : "Create provider"}
-          </Button>
-        </div>
-      </div>
+          ) : test.status === "fail" ? (
+            <span className="text-destructive">✕ {test.message}</span>
+          ) : (
+            "Run Test — Create is enabled once the connection test passes."
+          )
+        }
+      >
+        <Button
+          type="button"
+          variant="outline"
+          onClick={onTest}
+          disabled={test.status === "running" || submitting}
+        >
+          {test.status === "running" && <Loader2 className="h-4 w-4 animate-spin" />}
+          {test.status === "running" ? "Testing…" : "Test"}
+        </Button>
+        <Button
+          type="submit"
+          disabled={submitting || test.status !== "ok"}
+          title={test.status !== "ok" ? "Pass the connection test first" : undefined}
+        >
+          {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
+          {submitting ? "Creating…" : "Create provider"}
+        </Button>
+      </FormFooter>
     </form>
+    </FormShell>
   );
 }

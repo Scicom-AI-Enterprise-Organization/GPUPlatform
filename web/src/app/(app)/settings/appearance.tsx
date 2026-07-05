@@ -47,7 +47,7 @@ export function AppearanceSettings() {
   }
 
   return (
-    <section className="rounded-lg border border-border bg-card p-5">
+    <section data-form-section="Terminal appearance" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
       <div className="mb-4">
         <h2 className="text-sm font-semibold">Terminal appearance</h2>
         <p className="mt-0.5 text-xs text-muted-foreground">

@@ -103,7 +103,7 @@ export function ApiKeyPanel() {
   return (
     <div className="space-y-4">
       {/* Create */}
-      <Card>
+      <Card data-form-section="Create a new token" className="scroll-mt-6">
         <CardHeader>
           <CardTitle className="text-base">Create a new token</CardTitle>
         </CardHeader>
@@ -132,7 +132,7 @@ export function ApiKeyPanel() {
       </Card>
 
       {/* List */}
-      <Card>
+      <Card data-form-section="Your tokens" className="scroll-mt-6">
         <CardHeader>
           <CardTitle className="text-base">Your tokens</CardTitle>
         </CardHeader>

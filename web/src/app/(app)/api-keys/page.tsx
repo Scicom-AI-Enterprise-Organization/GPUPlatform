@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { currentUsername } from "@/lib/current-user";
 import { ApiKeyPanel } from "./api-key-panel";
+import { FormShell } from "@/components/form-shell";
 
 export default async function ApiKeysPage() {
   const username = await currentUsername();
@@ -26,7 +27,9 @@ export default async function ApiKeysPage() {
             </Link>
           </Button>
         </div>
-        <ApiKeyPanel />
+        <FormShell>
+          <ApiKeyPanel />
+        </FormShell>
       </div>
     </div>
   );

@@ -7,6 +7,7 @@ import { getMe } from "@/lib/me";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import type { AdminUserRecord, PolicyRole } from "@/lib/types";
 import { UserProfile } from "./user-profile";
+import { FormShell } from "@/components/form-shell";
 
 const GATEWAY = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
@@ -63,11 +64,13 @@ export default async function UserProfilePage({
           <ChevronLeft className="h-3.5 w-3.5" />
           Back to organization
         </Link>
-        <UserProfile
-          user={user}
-          policyRoles={policyRoles}
-          isSelf={user.id === me.user_id}
-        />
+        <FormShell>
+          <UserProfile
+            user={user}
+            policyRoles={policyRoles}
+            isSelf={user.id === me.user_id}
+          />
+        </FormShell>
       </div>
     </div>
   );

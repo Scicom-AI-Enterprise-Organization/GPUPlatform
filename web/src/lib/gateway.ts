@@ -6,6 +6,9 @@
 
 import type {
   AppProxyLink,
+  BenchStat,
+  PageQuery,
+  PageResponse,
   AdminUserRecord,
   AggregatePoint,
   ApiKeyRecord,
@@ -195,6 +198,15 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = 30_000):
   return (text ? JSON.parse(text) : null) as T;
 }
 
+/** Query string for the server-paginated list endpoints (skips empty values). */
+function pageQs(p: PageQuery): string {
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(p)) {
+    if (v !== undefined && v !== null && v !== "") sp.set(k, String(v));
+  }
+  return sp.toString();
+}
+
 export const gateway = {
   baseUrl: PUBLIC_BASE,
   listApps: (scope: "mine" | "all" = "mine") =>
@@ -305,6 +317,12 @@ export const gateway = {
   // ---- Benchmarks ----
   listBenchmarks: (scope: "mine" | "all" = "mine") =>
     request<BenchmarkRecord[]>(`/benchmarks?scope=${scope}`),
+  /** Server-paginated list — fetch page-by-page instead of every record. */
+  listBenchmarksPage: (p: PageQuery = {}) =>
+    request<PageResponse<BenchmarkRecord>>(`/benchmarks/_page?${pageQs(p)}`),
+  /** Slim per-run stats for the dashboard KPI row (all runs, tiny payload). */
+  benchmarkStats: (scope: "mine" | "all" = "mine") =>
+    request<BenchStat[]>(`/benchmarks/_stats?scope=${scope}`),
   getBenchmark: (id: string) =>
     request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}`),
   renameBenchmark: (id: string, name: string) =>
@@ -371,6 +389,9 @@ export const gateway = {
   // ---- Autotrain runs ----
   listTrainingRuns: (scope: "mine" | "all" = "mine") =>
     request<TrainingRunRecord[]>(`/v1/training-runs?scope=${scope}`),
+  /** Server-paginated list — result_json slimmed to `best` per run. */
+  listTrainingRunsPage: (p: PageQuery = {}) =>
+    request<PageResponse<TrainingRunRecord>>(`/v1/training-runs/_page?${pageQs(p)}`),
   getTrainingRun: (id: string) =>
     request<TrainingRunRecord>(`/v1/training-runs/${encodeURIComponent(id)}`),
   /** All persisted metrics in one call: loss steps, per-epoch eval, GPU samples. */
@@ -892,6 +913,9 @@ export const gateway = {
   // ---- Datasets (Autotrain) ----
   listDatasets: (scope: "mine" | "all" = "mine") =>
     request<DatasetRecord[]>(`/v1/datasets?scope=${scope}`),
+  /** Server-paginated list — `kind` filters the dataset source. */
+  listDatasetsPage: (p: PageQuery = {}) =>
+    request<PageResponse<DatasetRecord>>(`/v1/datasets/_page?${pageQs(p)}`),
   getDataset: (id: string) =>
     request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}`),
   createDataset: (body: CreateDatasetRequest) =>

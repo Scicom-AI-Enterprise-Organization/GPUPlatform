@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { gateway } from "@/lib/gateway";
+import { FormFooter, FormShell } from "@/components/form-shell";
 
 export function RepoForm() {
   const router = useRouter();
@@ -93,8 +94,9 @@ export function RepoForm() {
   };
 
   return (
+    <FormShell>
     <form onSubmit={onSubmit} className="flex flex-col gap-5">
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section data-form-section="Repository" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="mb-4">
           <h2 className="text-base font-medium">Repository</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
@@ -127,7 +129,7 @@ export function RepoForm() {
         </div>
       </section>
 
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section data-form-section="Auth & webhook" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="mb-4">
           <h2 className="text-base font-medium">Auth & webhook <span className="text-xs font-normal text-muted-foreground">(optional)</span></h2>
         </div>
@@ -145,7 +147,7 @@ export function RepoForm() {
         </div>
       </section>
 
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section data-form-section="Options" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="flex items-center justify-between gap-4 py-1">
           <div>
             <Label className="text-sm">Prune</Label>
@@ -162,26 +164,22 @@ export function RepoForm() {
         </div>
       </section>
 
-      {error && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
-        </div>
-      )}
-
-      <div className="flex items-center justify-end gap-2">
-        {testState !== "idle" && (
-          <span
-            className={`mr-auto text-xs ${
-              testState === "passed"
-                ? "text-emerald-600"
-                : testState === "failed"
-                  ? "text-destructive"
-                  : "text-muted-foreground"
-            }`}
-          >
-            {testState === "testing" ? "Testing connection…" : testMsg}
-          </span>
-        )}
+      <FormFooter
+        error={error}
+        hint={
+          testState === "idle" ? "Run Test connection — Add is enabled once it passes." : (
+            <span
+              className={
+                testState === "passed" ? "text-emerald-600"
+                : testState === "failed" ? "text-destructive"
+                : undefined
+              }
+            >
+              {testState === "testing" ? "Testing connection…" : testMsg}
+            </span>
+          )
+        }
+      >
         <Button
           type="button"
           variant="outline"
@@ -196,7 +194,8 @@ export function RepoForm() {
           {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
           Add repository
         </Button>
-      </div>
+      </FormFooter>
     </form>
+    </FormShell>
   );
 }

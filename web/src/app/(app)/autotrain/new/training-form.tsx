@@ -46,6 +46,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AvailabilityBadge } from "@/components/availability-badge";
+import { FormFooter, FormShell } from "@/components/form-shell";
 import { RegionSelect } from "@/components/region-select";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
@@ -995,6 +996,7 @@ export function TrainingForm() {
   }
 
   return (
+    <FormShell>
     <form onSubmit={onSubmit} className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">New training run</h1>
@@ -2178,15 +2180,22 @@ export function TrainingForm() {
         </Grid>
       </Section>
 
-      <div className="flex items-center justify-end gap-3 border-t border-border pt-4">
-        {error && <p className="text-sm text-destructive">{error}</p>}
+      <FormFooter
+        error={error}
+        hint={
+          !hasStorage ? "Pick an S3 storage in Artifacts to enable submit."
+          : vdError ? `Fix the GPU pin: ${vdError}`
+          : `${taskType.toUpperCase()} · ${modelChoice === CUSTOM ? (customModel.trim() || "custom model") : modelChoice}`
+        }
+      >
         <Button type="button" variant="outline" onClick={() => router.push("/autotrain")}>Cancel</Button>
         <Button type="submit" disabled={submitting || !hasStorage || !!vdError} className="min-w-36">
           {submitting ? (<><Loader2 className="h-4 w-4 animate-spin" /> Creating…</>)
             : (<><FlaskConical className="h-4 w-4" /> Start training</>)}
         </Button>
-      </div>
+      </FormFooter>
     </form>
+    </FormShell>
   );
 }
 
@@ -2194,7 +2203,9 @@ function Section({ icon, title, description, children }: {
   icon: React.ReactNode; title: string; description?: string; children: React.ReactNode;
 }) {
   return (
-    <Card>
+    // data-form-section feeds the FormShell scrollspy rail; scroll-mt keeps the
+    // heading visible after a rail jump.
+    <Card data-form-section={title} className="scroll-mt-6">
       <CardHeader className="pb-4">
         <div className="flex items-center gap-2">
           <div className="flex h-7 w-7 items-center justify-center rounded-md bg-muted text-muted-foreground">{icon}</div>

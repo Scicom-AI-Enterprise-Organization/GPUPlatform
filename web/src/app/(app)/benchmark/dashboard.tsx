@@ -1,53 +1,8 @@
 "use client";
 
-import { useMemo } from "react";
-import yaml from "js-yaml";
 import { CheckCircle2, Clock, Layers, TrendingUp } from "lucide-react";
 import { shortGpu as formatGpu } from "@/lib/gpu-format";
-import type { BenchmarkRecord } from "@/lib/types";
-
-/** Decorated row used by chart + stats. Pulls out info from result_json + config_yaml
- * once per benchmark so we don't re-parse on every render. */
-type Decorated = {
-  bench: BenchmarkRecord;
-  output_throughput: number | null;
-  median_ttft_ms: number | null;
-  gpu_type: string | null;
-  gpu_count: number | null;
-  model: string | null;
-  durationS: number | null;
-};
-
-function decorate(bench: BenchmarkRecord): Decorated {
-  const r = (bench.result_json ?? {}) as Record<string, unknown>;
-  let gpu_type: string | null = null;
-  let gpu_count: number | null = null;
-  let model: string | null = null;
-  try {
-    const cfg = yaml.load(bench.config_yaml) as
-      | { runpod?: { pod?: { gpu_type?: string; gpu_count?: number } }; benchmark?: Array<{ model?: { repo_id?: string } }> }
-      | null;
-    gpu_type = cfg?.runpod?.pod?.gpu_type ?? null;
-    gpu_count = cfg?.runpod?.pod?.gpu_count ?? null;
-    model = cfg?.benchmark?.[0]?.model?.repo_id ?? null;
-  } catch {
-    // ignore — show "—" in the UI
-  }
-  const start = bench.started_at ? new Date(bench.started_at).getTime() : null;
-  const end = bench.ended_at ? new Date(bench.ended_at).getTime() : null;
-  return {
-    bench,
-    output_throughput:
-      typeof r.output_throughput === "number" ? r.output_throughput : null,
-    median_ttft_ms:
-      typeof r.median_ttft_ms === "number" ? r.median_ttft_ms : null,
-    gpu_type,
-    gpu_count,
-    model,
-    durationS:
-      start != null && end != null ? Math.max(0, Math.round((end - start) / 1000)) : null,
-  };
-}
+import type { BenchStat } from "@/lib/types";
 
 function shortGpu(name: string | null): string {
   return formatGpu(name) || "—";
@@ -58,27 +13,27 @@ function shortModel(name: string | null): string {
   return name.split("/").pop() ?? name;
 }
 
-export function BenchmarkDashboard({ items }: { items: BenchmarkRecord[] }) {
-  const decorated = useMemo(() => items.map(decorate), [items]);
-
-  const total = items.length;
-  const done = items.filter((b) => b.status === "done").length;
-  const failed = items.filter((b) => b.status === "failed").length;
-  const running = items.filter((b) => b.status === "running" || b.status === "queued").length;
+/** KPI row over the slim /benchmarks/_stats payload — one row per run, no
+ * config YAML or result JSON to parse client-side. */
+export function BenchmarkDashboard({ stats }: { stats: BenchStat[] }) {
+  const total = stats.length;
+  const done = stats.filter((s) => s.status === "done").length;
+  const failed = stats.filter((s) => s.status === "failed").length;
+  const running = stats.filter((s) => s.status === "running" || s.status === "queued").length;
   const terminal = done + failed;
   const passRate = terminal > 0 ? (done / terminal) * 100 : null;
 
-  const totalGpuMinutes = decorated.reduce((acc, d) => {
-    if (d.durationS == null) return acc;
-    const gpus = d.gpu_count ?? 1;
-    return acc + (d.durationS * gpus) / 60;
+  const totalGpuMinutes = stats.reduce((acc, s) => {
+    if (s.duration_s == null) return acc;
+    const gpus = s.gpu_count ?? 1;
+    return acc + (s.duration_s * gpus) / 60;
   }, 0);
 
-  const bestRun = decorated
-    .filter((d) => d.output_throughput != null)
+  const bestRun = stats
+    .filter((s) => s.output_throughput != null)
     .sort((a, b) => (b.output_throughput ?? 0) - (a.output_throughput ?? 0))[0];
 
-  if (items.length === 0) return null;
+  if (stats.length === 0) return null;
 
   return (
     <section className="mb-8 space-y-5">
