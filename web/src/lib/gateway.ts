@@ -403,6 +403,14 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/stop-early`,
       { method: "POST" },
     ),
+  /** Strip tqdm/HF download progress-bar lines from a run's stored logs (Redis + on-disk +
+   * S3 logs.txt). Returns how many were removed; reconnect the log stream to see the result. */
+  trimTrainingLogs: (id: string) =>
+    request<{ ok: boolean; removed: number }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/logs/trim`,
+      { method: "POST" },
+      60_000,
+    ),
   /** Self-contained export (config + result metrics/loss + embedded small S3 files as
    * base64) for moving a finished run to another deployment. Big checkpoints exceed
    * the cap and are listed in files_omitted. Returns the JSON; the caller downloads it. */

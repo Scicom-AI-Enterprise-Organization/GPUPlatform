@@ -29,27 +29,36 @@ import argparse
 from typing import Optional
 import mlflow
 from chinidataset import StreamingDataset
+import _trainer_common as tc
 from contextlib import nullcontext
 from attention import dynamic_attention, block_diagonal_concat
 from gemma4_fa4_attention import fa4_attention
+import context_parallel as cp  # zigzag ring context-parallelism (opt-in via --cp_size > 1)
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, 
     handlers=[
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger()
 
+# Base model. Defaults to gemma-4-31B-it (standalone runs unchanged); the gateway
+# autotrain runner overrides it via GEMMA_MODEL_ID so a run can pick a gemma-4 size.
+MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-31B-it")
+
 
 # Two interchangeable packed-attention backends, selected by env GEMMA_ATTN:
-#   "dynamic_attention" (attention.py)  — head_dim-512 via tiled SDPA-math (O(S^2) score → ~32k ceiling)
-#   "fa4_attention" (gemma4_fa4_attention.py) — routes ALL layers through the FA4 head_dim-512 cute
-#       kernel (flash-attention-512 fork): memory-efficient O(S), lifts the ceiling to 128k.
+#   "dynamic_attention" (attention.py)  — head_dim-512 via tiled SDPA-math (O(S^2) score → ~32k ceiling, needs FA3)
+#   "fa4_attention" (gemma4_fa4_attention.py) — ALL layers through the FA4 head_dim-512 cute kernel
+#       (flash-attention-512 fork): memory-efficient O(S), lifts the ceiling to 128k. THE FAST PATH.
 # fa4_attention's flash_attn.cute import is lazy (inside the fn), so registering it is safe even if
 # the FA4 package isn't installed; it only fires when that backend is actually used.
 AttentionInterface.register("dynamic_attention", dynamic_attention)
 AttentionInterface.register("fa4_attention", fa4_attention)
+# Context-parallel hybrid ring backend: head_dim-512 global → fused zigzag ring (cute), head_dim-256
+# sliding → position-aware ring. Selected automatically when cp_size > 1.
+AttentionInterface.register("cp_ring_attention", cp.cp_ring_attention)
 ATTN_IMPL = os.environ.get("GEMMA_ATTN", "fa4_attention")
 
 
@@ -121,22 +130,31 @@ def collator(batch):
         'max_length_k': max_seqlen_q
     }
 
-def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha:int = 16): 
-    # no nn.Linear instance for up_proj, down_proj, gate_proj after attention block
-    linear_layers = [
-        "q_proj", 
-        "k_proj", 
-        "v_proj", 
-        "o_proj"
-    ]
+DEFAULT_LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha: int = 16, target_modules=None):
+    # gemma-4's q/k/v/o are Gemma4ClippableLinear (an nn.Linear subclass), so isinstance
+    # matches them. The MLP projections (gate_proj/up_proj/down_proj) may NOT be plain
+    # nn.Linear on every arch — so any requested target that wraps nothing is reported
+    # (warning) instead of silently ignored, making a bad selection visible.
+    target_modules = list(target_modules or DEFAULT_LORA_TARGETS)
+    wrapped = {t: 0 for t in target_modules}
     for name, module in list(base_model.named_modules()):
         for child_name, child_module in module.named_children():
-            if isinstance(child_module, nn.Linear) and child_name in linear_layers:
+            if isinstance(child_module, nn.Linear) and child_name in target_modules:
                 if 'vision' in name:
-                    continue 
+                    continue
 
                 lora = LinearLoRA(child_module, r, alpha)
                 setattr(module, child_name, lora)
+                wrapped[child_name] = wrapped.get(child_name, 0) + 1
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        logger.info(f"LoRA target_modules={target_modules}; wrapped per module: {wrapped}")
+        zero = [t for t, n in wrapped.items() if n == 0]
+        if zero:
+            logger.warning(f"LoRA targets matched NO nn.Linear modules and will NOT be trained: "
+                           f"{zero} — this architecture may fuse/rename them.")
+    return wrapped
 
 class CustomGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
     def __init__(self, config):
@@ -187,14 +205,22 @@ class CustomGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
 
         loss = None
         if labels is not None:
-            # B, S, D -> (B*S, D)
-            shifted_hidden_states = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
-            shifted_labels = labels[:, 1:].contiguous().reshape(-1)
-            loss = self.loss_fn(
-                self.lm_head.weight,
-                shifted_hidden_states, 
-                shifted_labels,
-            )
+            if cp.cp_active():
+                # Context parallel: `labels` are already per-token NEXT-token targets (pre-shifted
+                # per-doc in cp.shard_batch), because the usual global hidden[:-1]/labels[1:] shift
+                # is invalid across zigzag chunk boundaries. So align hidden↔labels 1:1 (no shift).
+                hs = hidden_states.contiguous().reshape(-1, hidden_states.shape[-1])
+                lbl = labels.contiguous().reshape(-1)
+                loss = self.loss_fn(self.lm_head.weight, hs, lbl)
+            else:
+                # B, S, D -> (B*S, D)
+                shifted_hidden_states = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
+                shifted_labels = labels[:, 1:].contiguous().reshape(-1)
+                loss = self.loss_fn(
+                    self.lm_head.weight,
+                    shifted_hidden_states,
+                    shifted_labels,
+                )
         else:
             raise NotImplementedError("Loss calculation is not implemented yet.")
 
@@ -238,6 +264,10 @@ def main(
         lr:float = 1e-4,
         use_wandb:bool = False,
         wandb_project:str = "gemma4-autotrain",
+        grad_accum:int = 1,
+        cpu_offload:bool = False,
+        target_modules=None,
+        cp_size:int = 1,
     ):
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -245,17 +275,28 @@ def main(
     # rank lands on cuda:0 (NCCL hang / OOM).
     torch.cuda.set_device(rank)
     ddp_setup()  # init_process_group(nccl) — required before init_device_mesh / fully_shard
+    # FSDP shards params across ALL ranks (1D mesh, unchanged). Context parallelism is a SEPARATE
+    # process group over cp_size consecutive ranks (sequence sharded + KV ringed within it);
+    # data parallelism is across CP groups. The two are orthogonal — FSDP all-gathers params over
+    # every rank regardless of the CP grouping.
     mesh_device = init_device_mesh("cuda", (world_size, ), mesh_dim_names=("shard", ))
-    
-    config = AutoConfig.from_pretrained("google/gemma-4-31B-it")
-    # modify the confg
+    cp_group = dp_size = dp_rank = cp_rank = None
+    attn_impl = ATTN_IMPL
+    if cp_size > 1:
+        cp_group, dp_size, dp_rank, cp_rank = cp.setup_cp(world_size, cp_size, rank)
+        attn_impl = "cp_ring_attention"
+        if rank == 0:
+            logger.info(f"context parallel: cp_size={cp_size} dp_size={dp_size} (world={world_size})")
+
+    config = AutoConfig.from_pretrained(MODEL_ID)
     if rank == 0:
-        logger.info(f"attention backend: {ATTN_IMPL}")
+        logger.info(f"attention backend: {attn_impl}")
+    # modify the confg
     model = CustomGemma4ForConditionalGeneration.from_pretrained(
-        "google/gemma-4-31B-it",
+        MODEL_ID,
         config=config,
         dtype=torch.bfloat16, # native bf16 training
-        attn_implementation = ATTN_IMPL
+        attn_implementation = attn_impl
     )
     # tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-31B-it")
     total_params = sum(p.numel() for p in model.parameters())
@@ -267,53 +308,34 @@ def main(
     # preserving clipping. With the lora_b=0 init fix it no longer corrupts the model at start.
     for param in model.parameters():
         param.requires_grad = False
-    apply_linear_lora(model, r=r, alpha=alpha)
+    target_modules = list(target_modules or DEFAULT_LORA_TARGETS)
+    apply_linear_lora(model, r=r, alpha=alpha, target_modules=target_modules)
 
     total_trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     logger.info(f"Total trainable parameters: {total_trainable_params/(1024*1024):.2f}M")
 
-    fsdp_kwargs = {}
-    fsdp_kwargs["mp_policy"] = fsdp.MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-    )
-    fsdp_kwargs["offload_policy"] = fsdp.CPUOffloadPolicy()
-    shard_modules = (
-        modeling_gemma4.Gemma4TextDecoderLayer
-    )
-
-    for module in model.modules():
-        if isinstance(module, shard_modules):
-            fsdp.fully_shard(module, **fsdp_kwargs, mesh=mesh_device)
-    fsdp.fully_shard(model, **fsdp_kwargs, mesh=mesh_device) # full shard on root module
+    # FSDP2 shard + activation-checkpoint via the shared helper (param_dtype=bf16 dense;
+    # cpu_offload is the opt-in VRAM↔speed knob — see _trainer_common.fsdp_kwargs).
+    kw = tc.fsdp_kwargs(mesh_device, param_dtype=torch.bfloat16, cpu_offload=cpu_offload)
+    tc.shard_layers(model, modeling_gemma4.Gemma4TextDecoderLayer, kw)
 
     # Get the local shard
     model_sd = model.state_dict()
     local_shard = sum(v.to_local().numel() if hasattr(v, "to_local") else v.numel() for _ , v in model_sd.items())
     logger.info(f"[Rank{rank}]: Total local/shard param: {local_shard/(1024*1024):.2f}M")
 
-    # checkpointing module 
-    checkpointing_modules = [
-        modeling_gemma4.Gemma4TextDecoderLayer
-    ]
-    non_reentrant_wrapper = partial(
-        checkpoint_wrapper,
-        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-    )
-    apply_activation_checkpointing(
-        model,
-        checkpoint_wrapper_fn = non_reentrant_wrapper,
-        check_fn=lambda x: isinstance(x, tuple(checkpointing_modules))
-    )
+    tc.checkpoint_layers(model, modeling_gemma4.Gemma4TextDecoderLayer)
     
     # max_steps > 0 caps the run regardless of epochs (0 = run all max_epochs). For overfitting a
     # small dataset, set max_epochs high and max_steps 0.
 
     dataset = Dataset(limit=limit_samples)
+    # Under CP the whole CP group must see the SAME bin (each rank trains a different sequence
+    # chunk of it), so the sampler splits bins across DATA-PARALLEL groups only.
     sampler = DistributedSampler(
         dataset,
-        num_replicas=mesh_device.size(),
-        rank=mesh_device.get_rank(),
+        num_replicas=(dp_size if cp_size > 1 else mesh_device.size()),
+        rank=(dp_rank if cp_size > 1 else mesh_device.get_rank()),
     )
     dataloader = DataLoader(
         dataset,
@@ -337,7 +359,7 @@ def main(
         wandb_run = wandb.init(
             project=wandb_project,
             config={
-                "model": "google/gemma-4-31B-it", "r": r, "alpha": alpha,
+                "model": MODEL_ID, "r": r, "alpha": alpha,
                 "batch_size": batch_size, "lr": lr, "max_epochs": max_epochs,
                 "max_steps": max_steps,
                 "limit_samples": limit_samples, "world_size": world_size,
@@ -347,10 +369,16 @@ def main(
         logger.info(f"wandb run: {wandb_run.url}")
 
     # seen_tokens = torch.tensor(0, dtype=torch.long, device=f'cuda:{rank}')
+    # opt_step counts OPTIMIZER steps (one per grad_accum microbatches), so max_steps /
+    # checkpointing / the @@STEP progress track weight updates, not forward passes.
+    opt_step = 0
+    reached_max = False
+    # Running count of contributing (non -100) label tokens in the current accumulation
+    # window on THIS rank; summed across ranks each optimizer step for token-weighted loss.
+    win_tokens = torch.zeros((), device=f'cuda:{rank}', dtype=torch.long)
     for i in range(max_epochs):
         sampler.set_epoch(i)  # reshuffle each epoch
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-            global_step = i * len(dataloader) + idx
             if rank == 0:
                 start_time = time.time()
 
@@ -361,16 +389,43 @@ def main(
                 for k, v in batch.items()
             }
 
+            # Context parallel: replace the full packed batch with THIS rank's zigzag shard (and
+            # set the local position/doc ids the ring attention masks read). n_tok below then counts
+            # only this rank's real (non -100) targets; summed across ranks for the token-weighted loss.
+            if cp_size > 1:
+                batch = cp.shard_batch(batch, cp_size, cp_rank, pad_id=0)
+
             if rank == 0 and idx == 0:
                 S = batch["input_ids"].shape[-1]
                 alloc_gb = torch.cuda.memory_allocated(rank) / 2**30
                 res_gb   = torch.cuda.memory_reserved(rank)  / 2**30
                 logger.info(f"PRE-FWD: S={S}, allocated={alloc_gb:.2f}GB, reserved={res_gb:.2f}GB")
             output = model(**batch, use_cache=False) # forward pass and calculate losses
-            output["loss"].backward() # calculate gradient 
-            
-            optimizer.step()
-            optimizer.zero_grad()
+            # Back-prop the token-SUM loss (mean × #label tokens). Accumulating sums, then
+            # normalizing by the GLOBAL token count at the step below, yields the exact
+            # token-weighted mean over the whole effective batch — not a naive mean-of-means
+            # that mis-weights variable-length bins / ranks (HF grad-accum loss fix).
+            # CP labels are pre-shifted per-token targets (no [:,1:] shift); non-CP shifts.
+            n_tok = ((batch["labels"] if cp_size > 1 else batch["labels"][:, 1:]) != -100).sum()
+            (output["loss"] * n_tok).backward() # calculate gradient
+            win_tokens += n_tok
+
+            # Step once every grad_accum microbatches; always flush a partial window at
+            # epoch end so no gradient is dropped. grad_accum=1 → step every microbatch.
+            do_step = ((idx + 1) % grad_accum == 0) or (idx == len(dataloader) - 1)
+            if do_step:
+                # Gather total label tokens over the window AND across ranks, then ÷
+                # world_size to counteract FSDP's gradient averaging → the accumulated
+                # grad becomes the true token-mean (HF average_tokens_across_devices).
+                dist.all_reduce(win_tokens, op=dist.ReduceOp.SUM)
+                scale = (world_size / win_tokens.clamp(min=1)).item()
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        if p.grad is not None:
+                            p.grad.mul_(scale)
+                optimizer.step()
+                optimizer.zero_grad()
+                win_tokens.zero_()
 
             # synchronize
             # last_seen_tokens = seen_tokens.item()
@@ -383,16 +438,16 @@ def main(
                 loss = output['loss'].item()
                 delta_time = time.time() - start_time
                 tps = token_count.item() / delta_time
-                logger.info(f"Epoch: {i}, mb: {idx}, step: {global_step}, loss: {loss}, tokens/s: {tps:.2f}")
+                logger.info(f"Epoch: {i}, mb: {idx}, step: {opt_step}, loss: {loss}, tokens/s: {tps:.2f}")
                 metrics = {"loss": loss, "lr": optimizer.param_groups[0]['lr'], "tps": tps, "epoch": i}
-                if wandb_run is not None:
+                if wandb_run is not None and do_step:
                     try:
-                        wandb_run.log(metrics, step=global_step)
+                        wandb_run.log(metrics, step=opt_step)
                     except Exception as e:
                         logger.warning(f"wandb.log failed (continuing): {e}")
 
-            reached_max = max_steps > 0 and (global_step + 1) >= max_steps
-            if idx == len(dataloader)-1 or (idx+1) % checkpointing_step == 0 or reached_max:
+            reached_max = max_steps > 0 and do_step and (opt_step + 1) >= max_steps
+            if idx == len(dataloader)-1 or (do_step and (idx + 1) % checkpointing_step == 0) or reached_max:
                 logger.info("Checkpointing LoRA adapters..")
                 # Save only the trainable LoRA params. full_tensor() is a collective, so every rank
                 # must iterate the SAME params; requires_grad is identical across ranks.
@@ -408,13 +463,15 @@ def main(
                     torch.save(lora_state_dict, "checkpointing/lora.pt")
                     with open("checkpointing/lora_meta.json", "w") as f:
                         json.dump({
-                            "model_id": "google/gemma-4-31B-it",
+                            "model_id": MODEL_ID,
                             "r": r, "alpha": alpha, "scaling": alpha / r,
-                            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                            "target_modules": target_modules,
                             "wrapped_attr": "linear",
                         }, f, indent=2)
                     logger.info(f"Saved LoRA ({len(lora_state_dict)} tensors) to checkpointing/lora.pt")
 
+            if do_step:
+                opt_step += 1
             if reached_max:
                 logger.info(f"Reached max_steps={max_steps}, stopping.")
                 break
@@ -428,9 +485,14 @@ def main(
 if __name__ == "__main__": 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--r", 
-        type=int, 
-        default=256, 
+        "--r", "--lora_r",
+        dest="r",
+        type=int,
+        default=256,
+        # `--lora_r` alias: torchrun's argparse prefix-matches the bare `--r` against
+        # its OWN options (--rdzv-*, --role, --run-path …) and aborts with "ambiguous
+        # option" on some torch builds (2.12.0). The gateway passes `--lora_r`, which
+        # collides with nothing; the standalone `--r` still works.
         help="LoRA rank"
     )
     parser.add_argument(
@@ -439,46 +501,25 @@ if __name__ == "__main__":
         default=512,
         help="LoRA alpha scaling factor"
     )
+    # batch_size / grad_accum / cpu_offload / max_epochs / max_steps / checkpointing_step
+    # / limit_samples / lr / wandb[_project] — shared across all LLM trainers.
+    tc.add_common_args(parser, lr_default=1e-4, wandb_project="gemma4-autotrain")
     parser.add_argument(
-        "--batch_size",
+        "--target_modules",
+        type=str,
+        default=",".join(DEFAULT_LORA_TARGETS),
+        help="Comma-separated linear module names to apply LoRA to. Default is the attention "
+             "projections (q_proj,k_proj,v_proj,o_proj); add MLP/dense layers "
+             "(gate_proj,up_proj,down_proj) to adapt those too.",
+    )
+    parser.add_argument(
+        "--cp_size",
         type=int,
         default=1,
-        help="Batch size"
+        help="Context-parallel (zigzag ring) degree: shard each packed sequence across this many "
+             "GPUs (KV ringed between them) to train context longer than one GPU's VRAM. 1 = off. "
+             "world_size must be divisible by it; dp_size = world_size / cp_size.",
     )
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=0,
-        help="Stop after this many optimizer steps (0 = full epoch). Use a small value to "
-             "produce a LoRA checkpoint quickly for merge/inference validation.",
-    )
-    parser.add_argument(
-        "--checkpointing_step",
-        type=int,
-        default=100,
-        help="Save the LoRA adapters every N steps.",
-    )
-    parser.add_argument(
-        "--limit_samples",
-        type=int,
-        default=0,
-        help="Cap the dataset to the first N packed bins (0 = all). Use a small N to deliberately "
-             "overfit a tiny subset as an end-to-end sanity check.",
-    )
-    parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=1,
-        help="Number of epochs over the dataset (set high to overfit a small dataset).",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
-        help="AdamW learning rate.",
-    )
-    parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases.")
-    parser.add_argument("--wandb_project", default="gemma4-autotrain", help="wandb project name.")
     args = parser.parse_args()
     main(
         args.r,
@@ -491,4 +532,8 @@ if __name__ == "__main__":
         args.lr,
         args.wandb,
         args.wandb_project,
+        grad_accum=args.grad_accum,
+        cpu_offload=args.cpu_offload,
+        target_modules=[t.strip() for t in (args.target_modules or "").split(",") if t.strip()],
+        cp_size=args.cp_size,
     )

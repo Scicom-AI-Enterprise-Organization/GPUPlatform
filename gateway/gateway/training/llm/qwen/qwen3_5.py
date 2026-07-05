@@ -35,6 +35,12 @@ import argparse
 from chinidataset import StreamingDataset
 import _trainer_common as tc
 from flash_qla import chunk_gated_delta_rule
+import context_parallel as cp  # GatedDeltaNet-hybrid context parallelism (opt-in via --cp_size > 1)
+from transformers import AttentionInterface
+# Full-attention (softmax) layers under CP use the contiguous position-aware ring; the GatedDeltaNet
+# layers relay their conv+recurrent state across the CP group (installed in main() when cp_size > 1).
+# Registering the ring backend is always safe (only dispatched when attn_implementation selects it).
+AttentionInterface.register("cp_full_attention", cp.cp_full_attention)
 
 
 logging.basicConfig(
@@ -156,6 +162,31 @@ def collator(batch):
         'max_length_k': max_seqlen_q
     }
 
+# Optional hard cap on packed-sequence length (env SGPU_MAX_SEQ_LEN). 0 = off (bins trained as-is).
+# Used to prove the CP path end-to-end at a SMALL context (the 32k-packed bins otherwise blow past
+# memory with AC disabled under CP). Truncates to a multiple of `mult` (the CP size) and rebuilds
+# cu_seqlens to the doc boundaries within the cap (the last doc is cut at the cap).
+_MAX_SEQ_LEN = int(os.environ.get("SGPU_MAX_SEQ_LEN", "0") or 0)
+
+
+def _truncate_packed(batch, n, mult=1):
+    n = (n // mult) * mult
+    if n <= 0 or batch["input_ids"].shape[1] <= n:
+        return batch
+    cu = batch["cu_seq_lens_q"]
+    cu2 = cu[cu <= n]
+    if int(cu2[-1]) < n:                              # cut the straddling doc at the cap
+        cu2 = torch.cat([cu2, torch.tensor([n], dtype=cu.dtype, device=cu.device)])
+    seg = (cu2[1:] - cu2[:-1])
+    out = dict(batch)
+    for k in ("input_ids", "position_ids", "labels", "mm_token_type_ids"):
+        if isinstance(batch.get(k), torch.Tensor):
+            out[k] = batch[k][:, :n].contiguous()
+    out["cu_seq_lens_q"] = out["cu_seq_lens_k"] = cu2
+    out["max_length_q"] = out["max_length_k"] = int(seg.max())
+    return out
+
+
 def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha:int = 16):
     # no nn.Linear instance for up_proj, down_proj, gate_proj after attention block
     linear_layers = [
@@ -225,14 +256,22 @@ def make_custom_cls(base_cls):
 
             loss = None
             if labels is not None:
-                # B, S, D -> (B*S, D)
-                shifted_hidden_states = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
-                shifted_labels = labels[:, 1:].contiguous().reshape(-1)
-                loss = self.loss_fn(
-                    self.lm_head.weight,
-                    shifted_hidden_states,
-                    shifted_labels,
-                )
+                if cp.cp_active():
+                    # Context parallel: `labels` are already per-token NEXT-token targets (pre-shifted
+                    # per-doc in cp.shard_batch), because the usual global hidden[:-1]/labels[1:] shift
+                    # is invalid across contiguous rank boundaries. Align hidden↔labels 1:1.
+                    hs = hidden_states.contiguous().reshape(-1, hidden_states.shape[-1])
+                    lbl = labels.contiguous().reshape(-1)
+                    loss = self.loss_fn(self.lm_head.weight, hs, lbl)
+                else:
+                    # B, S, D -> (B*S, D)
+                    shifted_hidden_states = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
+                    shifted_labels = labels[:, 1:].contiguous().reshape(-1)
+                    loss = self.loss_fn(
+                        self.lm_head.weight,
+                        shifted_hidden_states,
+                        shifted_labels,
+                    )
             else:
                 raise NotImplementedError("Loss calculation is not implemented yet.")
 
@@ -281,6 +320,7 @@ def main(
         checkpoint_dir:str = "checkpointing",
         grad_accum:int = 1,
         cpu_offload:bool = False,
+        cp_size:int = 1,
     ):
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -288,8 +328,18 @@ def main(
     # rank lands on cuda:0 (NCCL hang / OOM).
     torch.cuda.set_device(rank)
     ddp_setup()  # init_process_group(nccl) — required before init_device_mesh / fully_shard
+    # FSDP shards params across ALL ranks (1D mesh). Context parallelism is a SEPARATE process group
+    # over cp_size consecutive ranks (sequence sharded + GDN state / full-attn KV relayed within it);
+    # data parallelism is across CP groups. Orthogonal to FSDP.
     mesh_device = init_device_mesh("cuda", (world_size, ), mesh_dim_names=("shard", ))
-    torch.cuda.memory._record_memory_history()
+    cp_group = dp_size = dp_rank = cp_rank = None
+    attn_impl = "kernels-community/flash-attn3"
+    if cp_size > 1:
+        cp_group, dp_size, dp_rank, cp_rank = cp.setup_cp(world_size, cp_size, rank, torch.device(f"cuda:{rank}"))
+        attn_impl = "cp_full_attention"   # full-attn (softmax) layers ring; GDN layers patched below
+        logger.info(f"[cp] cp_size={cp_size} dp_size={dp_size} (world={world_size})")
+    else:
+        torch.cuda.memory._record_memory_history()
 
     # Resolve dense vs MoE classes from the config + apply the matching Liger patches.
     config, is_moe, classes = resolve_arch(model_id)
@@ -298,7 +348,7 @@ def main(
         model_id,
         config=config,
         dtype=torch.bfloat16, # native bf16 training
-        attn_implementation = "kernels-community/flash-attn3"
+        attn_implementation = attn_impl
     )
     # tokenizer = AutoTokenizer.from_pretrained(model_id)
     total_params = sum(p.numel() for p in model.parameters())
@@ -311,18 +361,38 @@ def main(
     total_trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     logger.info(f"Total trainable parameters: {total_trainable_params/(1024*1024):.2f}M")
 
-    # FSDP2 shard + activation-checkpoint via the shared helper. Qwen3.5 is multimodal —
-    # shard the decoder AND vision blocks (reshard_after_forward), but checkpoint only
-    # the decoder layers (param_dtype=bf16 dense; cpu_offload is the opt-in VRAM knob).
-    kw = tc.fsdp_kwargs(mesh_device, param_dtype=torch.bfloat16, cpu_offload=cpu_offload)
-    tc.shard_layers(model, (classes["decoder"], classes["vision"]), kw, reshard_after_forward=True)
+    # ── Parallelism ────────────────────────────────────────────────────────────────────────────
+    # LoRA + Context Parallel: REPLICATE the frozen base per GPU (NO FSDP) and shard only the sequence.
+    # Rationale (the fix for the dp==1 CP+FSDP deadlock — see qwen-cp-deadlock diagnosis): FSDP-sharding
+    # a FROZEN base saves ~nothing (no base gradient, no base optimizer state — only the tiny LoRA
+    # trains) but its per-layer all-gather/reduce-scatter + iter-1 prefetch get ENQUEUED in a different
+    # order than the CP ring/relay on the shared default PG → NCCL wedges at step 1. Removing FSDP leaves
+    # the default PG carrying ONLY the (symmetric) full-attn ring + the step-end LoRA-grad all-reduce →
+    # nothing can reorder against them → deadlock-free at ANY cp_size (500k = one CP group over N GPUs).
+    # qwen-27B is ~54GB bf16 → fits one 143GB H20 with ample room for the 1/cp_size sequence-sharded,
+    # activation-checkpointed activations. SGPU_CP_FSDP=1 forces the old FSDP path (e.g. a base too big
+    # to replicate — then the deadlock is back; use dp>1 or a smaller cp_size).
+    replicate_cp = cp_size > 1 and os.environ.get("SGPU_CP_FSDP") != "1"
+    if replicate_cp:
+        model = model.to(f"cuda:{rank}")
+        logger.info("[cp] FSDP DISABLED — frozen base REPLICATED per GPU, sequence sharded across the "
+                    "CP group (deadlock-free; no FSDP collectives to reorder against the ring/relay).")
+    else:
+        # FSDP2 shard + activation-checkpoint via the shared helper. Qwen3.5 is multimodal — shard the
+        # decoder AND vision blocks (reshard_after_forward); param_dtype=bf16 dense; cpu_offload opt-in.
+        kw = tc.fsdp_kwargs(mesh_device, param_dtype=torch.bfloat16, cpu_offload=cpu_offload)
+        tc.shard_layers(model, (classes["decoder"], classes["vision"]), kw, reshard_after_forward=True)
+        model_sd = model.state_dict()
+        local_shard = sum(v.to_local().numel() if hasattr(v, "to_local") else v.numel() for _, v in model_sd.items())
+        logger.info(f"[Rank{rank}]: Total local/shard param: {local_shard/(1024*1024):.2f}M")
 
-    # Get the local shard
-    model_sd = model.state_dict()
-    local_shard = sum(v.to_local().numel() if hasattr(v, "to_local") else v.numel() for _ , v in model_sd.items())
-    logger.info(f"[Rank{rank}]: Total local/shard param: {local_shard/(1024*1024):.2f}M")
-
-    tc.checkpoint_layers(model, classes["decoder"])
+    # Activation checkpointing (NO_REENTRANT) — the DOMINANT memory lever (64 layers × intermediate
+    # 17408 MLP intermediates); disabling it is what forced the CP OOM at long context. ON by default
+    # (both the replicate-CP and FSDP paths); SGPU_CP_NO_AC=1 forces it off for A/B debugging.
+    if cp_size <= 1 or os.environ.get("SGPU_CP_NO_AC") != "1":
+        tc.checkpoint_layers(model, classes["decoder"])
+    else:
+        logger.info("[cp] activation checkpointing force-disabled (SGPU_CP_NO_AC=1)")
 
     def _patched_chunk_gated_delta_rule(q, k, v, *args, **kwargs):
         # TileLang kernel requires v to be contiguous (stride[-1] == 1)
@@ -334,13 +404,21 @@ def main(
         if isinstance(module, classes["gdn"]):
             module.chunk_gated_delta_rule = _patched_chunk_gated_delta_rule
 
+    # Context parallel: wrap each GDN layer's conv + delta-rule kernels to relay their state across the
+    # CP group (one differentiable pair-P2P per layer). AFTER the contiguous-v patch so the relay wraps
+    # the patched (flash_qla TileLang) kernel.
+    if cp_size > 1:
+        cp.install_gdn_cp(model, classes["gdn"])
+
     # max_steps > 0 caps the run regardless of epochs (0 = run all max_epochs). For overfitting a
     # small dataset, set max_epochs high and max_steps 0.
     dataset = Dataset(limit=limit_samples)
+    # Under CP the whole CP group must see the SAME bin (each rank trains a different contiguous shard
+    # of it), so the sampler is DP-based: num_replicas = #CP-groups (dp_size), rank = this rank's group.
     sampler = DistributedSampler(
         dataset,
-        num_replicas=mesh_device.size(),
-        rank=mesh_device.get_rank(),
+        num_replicas=(dp_size if cp_size > 1 else mesh_device.size()),
+        rank=(dp_rank if cp_size > 1 else mesh_device.get_rank()),
     )
     dataloader = DataLoader(
         dataset,
@@ -406,12 +484,25 @@ def main(
                 for k, v in batch.items()
             }
 
+            # Optional context cap (SGPU_MAX_SEQ_LEN) — truncate to a multiple of cp_size so the CP
+            # shard is even. Off (0) by default.
+            if _MAX_SEQ_LEN:
+                batch = _truncate_packed(batch, _MAX_SEQ_LEN, mult=max(cp_size, 1))
+
+            # Context parallel: replace the full packed batch with THIS rank's contiguous chunk (+ set
+            # the per-token position/doc ids the full-attn ring reads; labels pre-shifted per-doc).
+            if cp_size > 1:
+                batch = cp.shard_batch(batch, cp_size, cp_rank)
+
             output = model(**batch, use_cache=False) # forward pass and calculate losses
             # Back-prop the token-SUM loss (mean × #label tokens). Accumulating sums, then
             # normalizing by the GLOBAL token count at the step below, yields the exact
             # token-weighted mean over the whole effective batch — not a naive mean-of-means
             # that mis-weights variable-length bins / ranks (HF grad-accum loss fix).
-            n_tok = (batch["labels"][:, 1:] != -100).sum()  # == the loss_fn's shifted denominator
+            # Under CP labels are already pre-shifted per-token targets (1:1), so count them directly;
+            # otherwise count the shifted denominator (labels[:,1:]) the loss_fn uses.
+            n_tok = ((batch["labels"] != -100).sum() if cp_size > 1
+                     else (batch["labels"][:, 1:] != -100).sum())
             (output["loss"] * n_tok).backward() # calculate gradient
             win_tokens += n_tok
 
@@ -419,11 +510,22 @@ def main(
             # epoch end so no gradient is dropped. grad_accum=1 → step every microbatch.
             do_step = ((idx + 1) % grad_accum == 0) or (idx == len(dataloader) - 1)
             if do_step:
-                # Gather total label tokens over the window AND across ranks, then ÷
-                # world_size to counteract FSDP's gradient averaging → the accumulated
-                # grad becomes the true token-mean (HF average_tokens_across_devices).
+                # Token-weighted loss: sum the window's label tokens across ALL ranks → N_total.
                 dist.all_reduce(win_tokens, op=dist.ReduceOp.SUM)
-                scale = (world_size / win_tokens.clamp(min=1)).item()
+                if replicate_cp:
+                    # No FSDP → grads are this rank's chunk grads (NOT averaged). All-reduce-SUM each
+                    # LoRA grad over ALL ranks (default PG), then ÷ N_total → the exact token-mean over
+                    # the whole effective batch (every chunk of every row). Symmetric collective on the
+                    # default PG (no FSDP collectives to interleave) → deadlock-free. No world_size term
+                    # (nothing averaged the grads, unlike FSDP's reduce-scatter-mean).
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    scale = (1.0 / win_tokens.clamp(min=1)).item()
+                else:
+                    # FSDP reduce-scatters grads as a MEAN over world_size; ×world_size cancels that,
+                    # ÷N_total gives the token-mean (HF average_tokens_across_devices).
+                    scale = (world_size / win_tokens.clamp(min=1)).item()
                 for group in optimizer.param_groups:
                     for p in group["params"]:
                         if p.grad is not None:
@@ -456,7 +558,7 @@ def main(
                     except Exception as e:
                         logger.warning(f"mlflow.log_metrics failed (continuing): {e}")
 
-            if i == 0 and idx == 1:
+            if i == 0 and idx == 1 and cp_size <= 1:  # history only recorded in the non-CP branch
                 torch.cuda.memory._dump_snapshot(f"memory_profile_{rank}.pickle")
 
             reached_max = max_steps > 0 and do_step and (opt_step + 1) >= max_steps
@@ -537,6 +639,12 @@ if __name__ == "__main__":
         help="Directory to save the LoRA adapters (lora.pt + lora_meta.json). Use a "
              "per-model dir so multiple models don't clobber each other.",
     )
+    parser.add_argument(
+        "--cp_size", type=int, default=1,
+        help="Context-parallel group size (>1 shards one packed sequence across cp_size GPUs and "
+             "relays GatedDeltaNet state + rings the full-attn KV; data-parallel across CP groups). "
+             "1 = off. The gateway sets it to the GPU count when the run enables context parallelism.",
+    )
     args = parser.parse_args()
     main(
         args.rank,
@@ -555,4 +663,5 @@ if __name__ == "__main__":
         args.checkpoint_dir,
         args.grad_accum,
         args.cpu_offload,
+        args.cp_size,
     )

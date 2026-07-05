@@ -26,7 +26,7 @@ AttentionInterface.register("cp_full_attention", cp.cp_full_attention)
 rank = int(os.environ["RANK"]); world = int(os.environ["WORLD_SIZE"]); lrank = int(os.environ["LOCAL_RANK"])
 torch.cuda.set_device(lrank); dev = torch.device(f"cuda:{lrank}")
 init_process_group(backend="cpu:gloo,cuda:nccl")
-CP_SIZE = world
+CP_SIZE = int(os.environ.get("CP_SIZE", world))   # CP_SIZE<world → dp>1 (matches the gateway's cp_size knob)
 cp_group, dp_size, dp_rank, cp_rank = cp.setup_cp(world, CP_SIZE, rank, dev)
 mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("shard",))
 

@@ -445,9 +445,13 @@ export type CreateTrainingRunRequest = {
   batch_size?: number;
   grad_accum?: number;
   cpu_offload?: boolean | null;  // LLM FSDP CPU offload; null = per-arch default
-  // LLM gemma4-only: context parallelism (zigzag ring attention) — shards one long packed
-  // sequence across all GPUs so context longer than one GPU's VRAM can train. Needs >=2 GPUs.
+  // LLM context parallelism (gemma4 zigzag ring / qwen3.5-3.6 GatedDeltaNet state relay + full-attn
+  // ring) — shards one long packed sequence across all GPUs so context longer than one GPU's VRAM
+  // can train. Needs >=2 GPUs.
   context_parallel?: boolean | null;
+  // CP group size (GPUs per group that shard one sequence). null/0 → all run GPUs (dp=1); when set
+  // it must divide the run's GPU count (dp_size = world / cp_size). Only used when context_parallel.
+  cp_size?: number | null;
   learning_rate?: number;
   warmup_steps?: number;
   lr_scheduler_type?: "linear" | "cosine" | "constant_with_warmup" | "constant";

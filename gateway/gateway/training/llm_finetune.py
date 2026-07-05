@@ -96,6 +96,11 @@ _ARCH = {
         "preflight": "test_attention.py",        # FA3/SDPA kernel test (no model); skipped on the FA4 path
         "preflight_cwd": LLM_DIR,
         "preflight_env": {},
+        # The run's base_model flows into GEMMA_MODEL_ID, so ANY gemma-4 variant works with
+        # this one trainer: dense `google/gemma-4-31B-it` OR the MoE `google/gemma-4-26B-A4B-it`
+        # (128 experts / top-8). Same dual-head_dim attention geometry → FA4 / CP paths unchanged;
+        # MoE is orthogonal to CP (token-local routing) and LoRA wraps only attention q/k/v/o
+        # (the experts are nn.Parameter, skipped). Verified 2026-07-05 (A4B, cp_size=2).
         "model_env": "GEMMA_MODEL_ID",
         "default_model": "google/gemma-4-31B-it",
         "deps": ["transformers==5.5.0", "kernels==0.14.1", "peft"],
@@ -244,8 +249,18 @@ def _install_qwen_kernels(py: str, env: dict, _pip) -> None:
     _pip("setuptools", "wheel", "packaging", "ninja")
     # FlashQLA: the GatedDeltaNet linear-attention kernel (pure python).
     _pip("git+https://github.com/QwenLM/FlashQLA.git")
-    # causal_conv1d: CUDA extension, --no-build-isolation so it links the venv's cu13 torch.
-    _pip("--no-build-isolation", "causal_conv1d")
+    # causal_conv1d: CUDA extension. MUST build FROM SOURCE against the venv's cu13 torch. A plain
+    # install (even with --no-build-isolation) grabs the prebuilt **cu12** wheel, whose
+    # causal_conv1d_cuda.so links libcudart.so.12 → ImportError against our cu13 torch. uv still
+    # prefers a wheel under --no-build-isolation, so --no-binary-package forces the sdist/source build;
+    # --reinstall replaces any bad cu12 wheel a prior attempt left in this venv. (Needs nvcc: CUDA_HOME
+    # is exported in _ensure_venv. The load-bearing gotcha from autotrain/qwen3.5/CLAUDE.md.)
+    # --no-cache is load-bearing: uv otherwise reuses the cached prebuilt cu12 wheel (a ~90ms "install",
+    # no compile) even under --no-binary, so the cu12 .so keeps landing. --no-cache forces a fresh sdist
+    # fetch + source build; --no-binary :all: (bounded to just this pkg by --no-deps) picks the sdist;
+    # --reinstall-package replaces any bad wheel already in the venv without touching torch.
+    _pip("--no-build-isolation", "--no-cache", "--no-binary", ":all:",
+         "--reinstall-package", "causal-conv1d", "--no-deps", "causal_conv1d")
     subprocess.check_call(
         [py, "-c", "import flash_qla, causal_conv1d; print('qwen kernels import OK')"],
         cwd="/tmp", env=env,
@@ -612,11 +627,19 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     ]
     if _cpu_offload_on(cfg, True):  # dense default: offload ON (long-context VRAM)
         cmd.append("--cpu_offload")
-    # Context parallelism (zigzag ring, gemma-only): shard each packed sequence across ALL run GPUs
-    # (one CP group, dp=1). Needs >=2 GPUs; ignored otherwise. The form sets cfg["context_parallel"].
+    # Context parallelism (zigzag ring, gemma-only): shard each packed sequence across a CP group.
+    # cfg["cp_size"] (GPUs per group) defaults to ALL run GPUs (one group, dp=1); when set it must
+    # divide nproc (dp_size = nproc / cp_size). Needs >=2 GPUs. The form sets cfg["context_parallel"].
     if cfg.get("context_parallel") and nproc >= 2:
-        cmd += ["--cp_size", str(nproc)]
+        cmd += ["--cp_size", str(_cp_size(cfg, nproc))]
     return cmd
+
+
+def _cp_size(cfg: dict, nproc: int) -> int:
+    """Resolve the CP group size: user-set cfg['cp_size'] if it evenly divides the run's GPU count
+    (nproc), else fall back to all GPUs (one CP group, dp=1) — the safe default."""
+    cpn = int(cfg.get("cp_size") or 0)
+    return cpn if 2 <= cpn <= nproc and nproc % cpn == 0 else nproc
 
 
 def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
@@ -642,6 +665,12 @@ def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     ]
     if _cpu_offload_on(cfg, True):  # dense default: offload ON (long-context VRAM)
         cmd.append("--cpu_offload")
+    # Context parallelism: shard ONE packed sequence across ALL run GPUs (one CP group, dp=1) — the
+    # GatedDeltaNet hybrid relays its recurrent+conv state and rings the full-attn KV. Needs >=2 GPUs;
+    # ignored otherwise. The form sets cfg["context_parallel"]. (Same knob as gemma's _gemma_cmd.)
+    # cfg["cp_size"] (GPUs per group) defaults to all run GPUs (dp=1); when set it must divide nproc.
+    if cfg.get("context_parallel") and nproc >= 2:
+        cmd += ["--cp_size", str(_cp_size(cfg, nproc))]
     return cmd
 
 
@@ -721,7 +750,20 @@ def run(cfg: dict) -> None:
         "NCCL_NVLS_ENABLE": base_env.get("NCCL_NVLS_ENABLE", "0"),
         "NCCL_CUMEM_ENABLE": base_env.get("NCCL_CUMEM_ENABLE", "0"),
         "PYTORCH_CUDA_ALLOC_CONF": base_env.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+        # Point BOTH the pre-fetch and the trainer at the shared /share cache (the box's default
+        # ~/.cache can hold a stale/incomplete copy — e.g. a half-downloaded Qwen3.6-27B shard —
+        # that snapshot_download then tries to finish over the tm box's throttled uplink and hangs).
+        # work_dir is /share by default → /share/huggingface, where the models are fully cached.
+        "HF_HOME": base_env.get("HF_HOME") or f"{(cfg.get('work_dir') or '/share').rstrip('/')}/huggingface",
+        # Xet stalls big pulls on the tm box (its chunk negotiation amplifies the slow link); disable
+        # it so cache hits + small metadata HEADs don't wedge. Matches the CLAUDE.md HF-on-tm rule.
+        "HF_HUB_DISABLE_XET": base_env.get("HF_HUB_DISABLE_XET", "1"),
         "HF_HUB_ENABLE_HF_TRANSFER": base_env.get("HF_HUB_ENABLE_HF_TRANSFER", "1"),
+        # The run log is a pipe, not a TTY, so tqdm can't rewrite a line in place — every
+        # download refresh becomes a NEW line and the model pre-fetch alone (see below) floods
+        # the log with thousands of `model-*.safetensors: NN%|…| 13.1G/49.9G …` lines. Disable
+        # HF's progress bars entirely (weights still download; there's just no bar to render).
+        "HF_HUB_DISABLE_PROGRESS_BARS": base_env.get("HF_HUB_DISABLE_PROGRESS_BARS", "1"),
     }
     if arch == "gemma":
         # gemma4.py picks the registered backend from GEMMA_ATTN (set it explicitly so the

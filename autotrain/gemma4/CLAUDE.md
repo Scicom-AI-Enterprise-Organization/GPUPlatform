@@ -1,7 +1,17 @@
-# autotrain — Gemma-4 31B LoRA finetune (2× H100 SXM on RunPod)
+# autotrain — Gemma-4 LoRA finetune (FSDP2, dense + MoE variants)
 
-Standalone training job (NOT part of the gateway). Finetunes `google/gemma-4-31B-it`
-with a custom LoRA on a packed dataset, using FSDP2 (`fully_shard`) across 2 GPUs.
+Standalone training job (NOT part of the gateway). Finetunes a **Gemma-4** model with a custom
+LoRA on a packed dataset, using FSDP2 (`fully_shard`). The model is chosen by the **`GEMMA_MODEL_ID`**
+env (default `google/gemma-4-31B-it`); `run.sh` binds it to `MODEL_ID` so
+`MODEL_ID=<repo> bash run.sh` both downloads and trains that repo. Verified variants:
+
+- **`google/gemma-4-31B-it`** — dense bf16, 29.8B params.
+- **`google/gemma-4-26B-A4B-it`** — **MoE** (128 experts, top-8, 24.6B params). Same dual-head_dim
+  attention geometry as the 31B (512 global full-attn + 256 sliding), so the FA4 / CP paths are
+  UNCHANGED. MoE is orthogonal to CP (routing is token-local). LoRA touches only attention q/k/v/o —
+  the experts are `nn.Parameter` (`gate_up_proj`/`down_proj`) and the dense MLP is `gate/up/down_proj`,
+  neither in the target list, so `apply_linear_lora` skips them. Note `attention_k_eq_v=true` fuses
+  k/v in the 5 full-attention layers → only 25 `v_proj` LoRA wraps (30 for q/k/o), which is correct.
 
 ```
 gemma4.py        training entrypoint (torchrun, FSDP2, custom LoRA, packed varlen)
@@ -559,7 +569,25 @@ branch, all gated on `cp_size>1`). `llm_finetune._gemma_cmd` passes `--cp_size {
 
 **Verified 2× H100 2026-07-04 (tiny random gemma-4, no 62GB ckpt):** the real Gemma4 backbone under CP
 (zigzag-sharded, `cp_ring_attention`) matches the non-CP `fa4_attention` full-sequence hidden states —
-full-attention-only rel 4.5e-3, sliding-only 4.5e-3, mixed 1.6e-2. ⚠ A full gemma-4-31B CP **training
-run** (optimizer + checkpoint end-to-end) is wired + ready (`HF_TOKEN` in `autotrain/.env`) but has NOT
-been run — it needs the 62GB model + an `llm_packed` dataset. Zigzag needs every doc length divisible by
-`2·cp_size` (handled by the collator's padding).
+full-attention-only rel 4.5e-3, sliding-only 4.5e-3, mixed 1.6e-2. Zigzag needs every doc length
+divisible by `2·cp_size` (handled by `shard_batch`'s padding).
+
+### Full CP training run — VERIFIED end-to-end (gemma-4-26B-A4B MoE, 2× H20, 2026-07-05)
+
+The full CP **training** loop (optimizer + checkpoint, not just the forward hidden-state match) is now
+run and verified on the real model — the **26B-A4B MoE**, `cp_size=2 dp=1` on 2× H20-3e (GPUs 4,5),
+`GEMMA_MODEL_ID=google/gemma-4-26B-A4B-it`, the 128k `gemma4-multipack` (26 bins, ~86–126k tok → ~43–63k
+per GPU after the zigzag split). Gate first: `MODEL_ID=<repo> compare_logits_fa4.py` → **cosine 0.999340**,
+argmax match (FA4 head_dim-512 correct on the A4B geometry). Then training ran the full loop to
+completion: **loss 6.65 → 1.76 → 1.37 → 1.18 → 1.13 → 0.92** (6 optimizer steps, `max_steps=6`), no
+deadlock/OOM, ~24→90 GB/GPU (bin-length dependent), 175.3M LoRA trainable, and the LoRA checkpoint
+**saved cleanly under CP** — 230 tensors (q30/k30/v25/o30 × a,b) → `checkpointing/lora.pt` (368 MB) +
+`lora_meta.json` (model_id A4B, r256/α512). This is the gemma analogue of the 31B `train-55f29b47`
+result and confirms the full end-to-end loop incl. checkpoint — gemma's **symmetric** ring works with
+activation-checkpointing + backward (unlike qwen's asymmetric relay, which deadlocks at dp=1; see
+[[qwen-cp-deadlock-diagnosis]]). Step 0 is slow (~6.5 min: one-time FA4 CuTeDSL JIT of every kernel
+shape); steady-state ~7–8 min/step here because the 25 **sliding** layers ring through the torch-matmul
+`posaware_ring_attn_func` and only 2 GPUs are used — scale GPUs / `cp_size` for throughput. Recipe +
+venv reuse (`/share/autotrain-llm-gemma4`, torch 2.12.0+cu130 / tf 5.5.0 / FA4 cute / cutlass 4.4.2 +
+`chinidataset`), plus the `train_a4b.sh` helper, live under `/share/autotrain-gemma4-a4b` on the tm box
+(port 1023). ⚠ Kernel JIT means the first step of any NEW context length / geometry recompiles.

@@ -24,6 +24,10 @@ export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 TORCH_VERSION="${TORCH_VERSION:-2.12.0}"   # MUST be 2.12.x — the FA3 wheel is built for torch2.12
 FA3_TAG="${FA3_TAG:-v0.9.18}"
 MODEL_ID="${MODEL_ID:-google/gemma-4-31B-it}"
+# gemma4.py loads whatever GEMMA_MODEL_ID points at (default gemma-4-31B-it). Bind it to MODEL_ID
+# so `MODEL_ID=google/gemma-4-26B-A4B-it bash run.sh` both DOWNLOADS and TRAINS that model — e.g.
+# the 26B-A4B MoE variant. Same dual-head_dim attention geometry, so FA4 / CP paths are unchanged.
+export GEMMA_MODEL_ID="${GEMMA_MODEL_ID:-$MODEL_ID}"
 DATA_ID="${DATA_ID:-huseinzolkepliscicom/gemma4-multipack}"
 GEMMA_DEPS_ONLY="${GEMMA_DEPS_ONLY:-0}"
 

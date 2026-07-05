@@ -405,6 +405,24 @@ async def _push_log(redis, run_id: str, line: str) -> None:
         pass
 
 
+# HuggingFace/tqdm download progress lines, e.g.
+#   "model-00001-of-00002.safetensors:  26%|██▌       | 13.1G/49.9G [09:00<12:14, 50.2MB/s]"
+# Over a pipe (no TTY) tqdm can't rewrite a line in place, so every refresh is captured as a
+# NEW line — one model pull floods the log with tens of thousands of them. The /logs/trim
+# endpoint strips them. Signature = "<pct>%|<bar>| <n>/<total> [" — tqdm-specific enough that
+# it won't hit real trainer/gateway log lines.
+_PROGRESS_RE = re.compile(r"\d{1,3}%\|.*?\|\s*\S+/\S+\s*\[")
+
+
+def _is_progress_line(line: str) -> bool:
+    # Never drop a line carrying a chart payload — a tqdm bar can be \r-prefixed onto the same
+    # captured line as an @@STEP/@@METRIC (see stream_training_logs' \r note).
+    if "@@" in line:
+        return False
+    # A single stored entry may pack several \r-separated refreshes; drop it if ANY is a bar.
+    return any(_PROGRESS_RE.search(seg) for seg in line.split("\r"))
+
+
 # ---------- SSH (paramiko) ----------------------------------------------
 
 
@@ -2684,6 +2702,14 @@ async def _reconcile_orphaned_exports(redis) -> None:
                         await _push_log(redis, row.id, "[gateway] HF export: orphaned pod torn down on restart")
                     except Exception:  # noqa: BLE001
                         pass
+            # Close a leaked reverse tunnel (autossh survives the gateway restart, retrying the
+            # dead pod forever) — the export pod host is recorded in the export state.
+            if he.get("tunnel_host"):
+                try:
+                    from . import vm_tunnel
+                    await asyncio.to_thread(vm_tunnel.close, he["tunnel_host"])
+                except Exception:  # noqa: BLE001
+                    pass
         try:
             await _push_log(redis, row.id, "[gateway] export was interrupted by a gateway restart — marked failed")
         except Exception:  # noqa: BLE001
@@ -2771,9 +2797,13 @@ class CreateTrainingRunRequest(BaseModel):
     # LLM FSDP CPU offload (params/optimizer in host RAM: big VRAM saver, PCIe-slow).
     # None = per-arch default (gemma/qwen ON, minimax/mistral OFF); the form sets it.
     cpu_offload: Optional[bool] = None
-    # LLM gemma4-only: context parallelism (zigzag ring attention) — shards one packed sequence
-    # across all run GPUs so context longer than a single GPU's VRAM can train. Needs >=2 GPUs.
+    # LLM (gemma4 + qwen3.5/3.6): context parallelism — shards one packed sequence across the CP
+    # group so context longer than a single GPU's VRAM can train. Needs >=2 GPUs.
     context_parallel: Optional[bool] = None
+    # CP group size (GPUs that jointly shard ONE sequence). None/0 → all run GPUs (dp=1). When set,
+    # the run's GPU count must be a multiple of it; data parallelism runs across the CP groups
+    # (dp_size = world / cp_size). Only meaningful when context_parallel is on.
+    cp_size: Optional[int] = None
     learning_rate: float = 1e-5
     warmup_steps: int = 0
     # HF LR schedule: linear (warmup→linear decay, the default), cosine,
@@ -3138,6 +3168,17 @@ async def create_training_run(
                 detail=(f"visible_devices out of range: {oob} — {target_label} has {gpu_bound} "
                         f"GPU(s), valid indices are 0–{gpu_bound - 1}"),
             )
+    # Context-parallel group size: must evenly divide the run's GPU count (world = cp_size × dp_size).
+    if body.context_parallel and body.cp_size:
+        eff_world = len(pinned_ids) if pinned_ids else gpu_bound
+        if body.cp_size < 2:
+            raise HTTPException(status_code=400, detail="cp_size must be >= 2 when context parallelism is on")
+        if eff_world and (body.cp_size > eff_world or eff_world % body.cp_size != 0):
+            raise HTTPException(
+                status_code=400,
+                detail=(f"cp_size ({body.cp_size}) must evenly divide the run's GPU count "
+                        f"({eff_world}); data parallelism runs across the {eff_world // body.cp_size if body.cp_size else 0} CP groups"),
+            )
     if not math.isfinite(body.learning_rate) or body.learning_rate <= 0:
         raise HTTPException(
             status_code=400,
@@ -3175,6 +3216,7 @@ async def create_training_run(
         "split_seed": body.split_seed, "batch_size": body.batch_size,
         "grad_accum": body.grad_accum, "cpu_offload": body.cpu_offload,
         "context_parallel": body.context_parallel,
+        "cp_size": body.cp_size,
         "learning_rate": body.learning_rate,
         "warmup_steps": body.warmup_steps, "lr_scheduler_type": body.lr_scheduler_type,
         "weight_decay": body.weight_decay,
@@ -4222,6 +4264,9 @@ async def export_to_huggingface(
                         vm_tunnel.ensure, h, int(p), u, Path(kf).read_text(),
                         [vm_tunnel.Forward(gw_port, gw_host, gw_port)])
                     tunnel_host = h
+                    # Record the host so cancel / restart-reconcile can close the tunnel even
+                    # if this task's finally never runs (gateway restart) or races cancellation.
+                    await _set_hf_export_state(run_id, {"tunnel_host": h})
                     await _push_log(redis, run_id,
                                     "[gateway] HF export: reverse SSH tunnel up (box → gateway mirror) …")
                 res = await asyncio.to_thread(
@@ -4338,11 +4383,19 @@ async def cancel_huggingface_export(
             await _push_log(redis, run_id, f"[gateway] HF export: VM kill attempt failed: {e}")
 
     # Tear down a spawned cloud pod (sgpu-hfexport-<run_id>) the cancelled task couldn't
-    # (gateway restarted mid-export), else it bills on.
+    # (gateway restarted mid-export), else it bills on. Also close its reverse SSH tunnel —
+    # the autossh is detached (survives a gateway restart) and would otherwise retry the
+    # dead pod forever (leaked process). Both are best-effort + idempotent.
     he = (row.result_json or {}).get("hf_export") or {}
     if he.get("pod_id") or he.get("run_on") == "cloud":
         if await _reap_hf_export_pod(run_id, he.get("provider_id")):
             await _push_log(redis, run_id, "[gateway] HF export: cloud pod torn down")
+    if he.get("tunnel_host"):
+        try:
+            from . import vm_tunnel
+            await asyncio.to_thread(vm_tunnel.close, he["tunnel_host"])
+        except Exception:  # noqa: BLE001
+            pass
 
     await _set_hf_export_state(run_id, {"status": "cancelled", "error": "stopped by user"})
     await _push_log(redis, run_id, "[gateway] HF export stopped by user.")
@@ -4608,6 +4661,78 @@ async def stream_training_logs(
             await asyncio.sleep(1.0)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@router.post("/{run_id}/logs/trim")
+async def trim_training_logs(
+    run_id: str,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Strip tqdm/HF download progress-bar lines from a run's stored logs — the live Redis
+    list (what the Logs tab replays), the on-disk canonical log, and, for a finalized run,
+    the S3 logs.txt. One model pull can add tens of thousands of these useless lines. Returns
+    how many were removed; the client should reconnect its log stream to see the trimmed view."""
+    row = await _owned(run_id, user, session)
+    redis = request.app.state.redis
+    terminal = row.status in ("done", "failed", "cancelled")
+    redis_removed = disk_removed = s3_removed = 0
+
+    # 1) Redis live list — rewrite in place (delete + rpush the survivors). This is what the
+    #    Logs tab shows; the SSE cursor is per-connection, so the client reconnects afterwards.
+    key = f"train:logs:{run_id}"
+    try:
+        raw = await redis.lrange(key, 0, -1)
+        kept: list[str] = []
+        for b in raw:
+            s = b.decode("utf-8", "replace") if isinstance(b, bytes) else str(b)
+            if _is_progress_line(s):
+                redis_removed += 1
+            else:
+                kept.append(s)
+        if redis_removed:
+            async with redis.pipeline(transaction=True) as pipe:
+                pipe.delete(key)
+                if kept:
+                    pipe.rpush(key, *kept)
+                if terminal:
+                    pipe.expire(key, LOG_LIST_TTL_S)  # keep the finalized-run retention
+                await pipe.execute()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("trim %s: redis rewrite failed: %s", run_id, e)
+
+    # 2) On-disk canonical log (the source uploaded to S3 for live / restart finalizes).
+    full = _full_log_path(run_id)
+    try:
+        if full.exists():
+            src = full.read_text(errors="replace").splitlines()
+            keep = [ln for ln in src if not _is_progress_line(ln)]
+            disk_removed = len(src) - len(keep)
+            if disk_removed:
+                full.write_text(("\n".join(keep) + "\n") if keep else "")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("trim %s: disk rewrite failed: %s", run_id, e)
+
+    # 3) S3 logs.txt for a finalized run (its local disk copy may be gone after teardown).
+    if terminal and row.s3_prefix:
+        try:
+            target = await _training_s3_target(row.storage_id)
+            s3_key = row.s3_prefix + "logs.txt"
+            data = await asyncio.to_thread(s3_get_bytes, s3_key, target)
+            if data:
+                src = data.decode("utf-8", "replace").splitlines()
+                keep = [ln for ln in src if not _is_progress_line(ln)]
+                s3_removed = len(src) - len(keep)
+                if s3_removed:
+                    await asyncio.to_thread(
+                        s3_put_text, s3_key, ("\n".join(keep) + "\n") if keep else "", target)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("trim %s: S3 logs.txt rewrite failed: %s", run_id, e)
+
+    removed = redis_removed or disk_removed or s3_removed
+    return {"ok": True, "removed": removed,
+            "redis_removed": redis_removed, "disk_removed": disk_removed, "s3_removed": s3_removed}
 
 
 @router.get("/{run_id}/files", response_model=list[TrainingFile])

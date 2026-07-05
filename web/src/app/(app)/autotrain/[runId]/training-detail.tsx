@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AudioLines, Check, ChevronDown, Copy, Download, ExternalLink, Loader2, PackageOpen, Pencil, RotateCcw, Trash2, X, XCircle } from "lucide-react";
+import { AudioLines, Check, ChevronDown, Copy, Download, ExternalLink, Loader2, PackageOpen, Pencil, RotateCcw, Scissors, Trash2, X, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -204,6 +204,10 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   // finalizes, result_json.steps is the authoritative set (see liveSteps use).
   const [lines, setLines] = useState<string[]>([]);
   const [liveSteps, setLiveSteps] = useState<TrainingStep[]>([]);
+  // Bumped after a "Trim logs" — reconnects the stream so it replays the trimmed Redis
+  // list from the start (the SSE cursor is server-side per-connection, so an in-flight
+  // stream can't retroactively drop the lines it already sent).
+  const [logReloadToken, setLogReloadToken] = useState(0);
   useEffect(() => {
     setLines([]);
     setLiveSteps([]);
@@ -227,7 +231,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     };
     es.addEventListener("end", () => es.close());
     return () => es.close();
-  }, [run.id]);
+  }, [run.id, logReloadToken]);
 
   const epochs = run.result_json?.epochs ?? [];
   // Persisted steps win once the run finalizes; until then the live stream feeds the curve.
@@ -705,7 +709,12 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
         </TabsContent>
 
         <TabsContent value="logs" className="!flex-none">
-          <LogsTab lines={lines} status={run.status} />
+          <LogsTab
+            lines={lines}
+            status={run.status}
+            runId={run.id}
+            onTrimmed={() => setLogReloadToken((t) => t + 1)}
+          />
         </TabsContent>
 
         <TabsContent value="files" className="!flex-none">
@@ -740,7 +749,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
             </CardContent>
           </Card>
           <StepEstimate run={run} />
-          <JsonView value={run.config_json} />
+          <ConfigJson config={run.config_json} />
         </TabsContent>
 
         {canTryIt && (
@@ -803,6 +812,45 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   );
 }
 
+// Run config as a readable block: drop the ~60 null/empty/default fields the create-form always
+// sends (label_*, wandb_*, tts/asr knobs on an LLM run, …) so only the values that were actually
+// set show by default; the full raw config stays one click away. Syntax-highlighted + copyable.
+function pruneEmpty(v: unknown): unknown {
+  if (v === null || v === undefined || v === "") return undefined;
+  if (Array.isArray(v)) return v.length ? v : undefined;
+  if (typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      const p = pruneEmpty(val);
+      if (p !== undefined) out[k] = p;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  return v;
+}
+
+function ConfigJson({ config }: { config: unknown }) {
+  const [raw, setRaw] = useState(false);
+  const pruned = useMemo(() => pruneEmpty(config) ?? {}, [config]);
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between pb-2">
+        <CardTitle className="text-sm">Configuration</CardTitle>
+        <button
+          type="button"
+          onClick={() => setRaw((r) => !r)}
+          className="text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        >
+          {raw ? "Show set values only" : "Show all fields (raw)"}
+        </button>
+      </CardHeader>
+      <CardContent>
+        <JsonView value={raw ? config : pruned} />
+      </CardContent>
+    </Card>
+  );
+}
+
 // Estimated optimizer-step count for this run's config. steps/epoch ≈
 // ceil(train_rows / (batch × grad_accum × world_size)). world_size = #GPUs whenever
 // DDP runs: TTS ALWAYS torchruns (nproc = #GPUs), ASR only on multi-GPU with DDP on.
@@ -843,11 +891,21 @@ function StepEstimate({ run }: { run: TrainingRunRecord }) {
   const nGpus = run.visible_devices && run.visible_devices.trim()
     ? run.visible_devices.split(",").filter((x) => x.trim()).length
     : Math.max(1, run.gpu_count || 1);
-  const worldSize = isTts ? Math.max(1, nGpus) : (useDdp && nGpus > 1 ? nGpus : 1);
-  const effBatch = Math.max(1, batch) * gradAccum * worldSize;
+  // Context parallelism: cp_size GPUs jointly shard ONE sequence (they all see the SAME row), so the
+  // effective data-parallel replication is dp_size = nGpus / cp_size — NOT nGpus. cp_size null → all
+  // run GPUs (one CP group, dp=1). So under CP the step count does not shrink with more GPUs.
+  const cpOn = !!c.context_parallel && nGpus >= 2;
+  const cpSize = cpOn ? (numOf(c.cp_size, 0) || nGpus) : 1;
+  const dpSize = Math.max(1, Math.floor(nGpus / cpSize));
+  // data-parallel replication that divides the row count into steps.
+  const dpWorld = isTts ? Math.max(1, nGpus) : cpOn ? dpSize : (useDdp && nGpus > 1 ? nGpus : 1);
+  const effBatch = Math.max(1, batch) * gradAccum * dpWorld;
   const perEpoch = trainRows && trainRows > 0 ? Math.ceil(trainRows / effBatch) : null;
   if (batch <= 0 || perEpoch == null) return null;
   const total = perEpoch * epochs;
+  const worldLabel = cpOn
+    ? `${nGpus} GPUs · CP ${cpSize}${dpSize > 1 ? ` × DP ${dpSize}` : " (dp=1)"}`
+    : dpWorld > 1 ? `${dpWorld} GPUs (DDP)` : "1";
 
   return (
     <Card>
@@ -860,11 +918,12 @@ function StepEstimate({ run }: { run: TrainingRunRecord }) {
             value={maxSteps > 0 ? `≈ ${Math.min(maxSteps, total).toLocaleString()} (cap ${maxSteps.toLocaleString()})` : `≈ ${total.toLocaleString()}`}
           />
           <Stat label="Effective batch" value={`${effBatch.toLocaleString()}`} />
-          <Stat label="World size" value={worldSize > 1 ? `${worldSize} GPUs (DDP)` : "1"} />
+          <Stat label="World size" value={worldLabel} />
         </div>
         <p className="text-[11px] text-muted-foreground">
           {trainRows!.toLocaleString()} train rows ÷ (batch {batch} × grad-accum {gradAccum}
-          {worldSize > 1 ? ` × ${worldSize} GPUs` : ""}) × {epochs} epoch{epochs === 1 ? "" : "s"}.
+          {dpWorld > 1 ? ` × ${dpWorld} ${cpOn ? "data-parallel groups" : "GPUs"}` : ""}) × {epochs} epoch{epochs === 1 ? "" : "s"}
+          {cpOn ? `. ${cpSize} GPU${cpSize === 1 ? "" : "s"} per CP group shard each sequence (same row, different chunk).` : "."}
         </p>
       </CardContent>
     </Card>
@@ -1900,10 +1959,42 @@ function TtsPlaygroundTab({ runId, visibleDevices, runProviderId, trainedOnVm, g
   );
 }
 
-function LogsTab({ lines, status }: { lines: string[]; status: string }) {
+function LogsTab({
+  lines,
+  status,
+  runId,
+  onTrimmed,
+}: {
+  lines: string[];
+  status: string;
+  runId: string;
+  onTrimmed: () => void;
+}) {
   const endRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [trimming, setTrimming] = useState(false);
   const terminal = ["done", "failed", "cancelled"].includes(status);
+
+  // A tqdm/HF download bar over a pipe (no TTY) can't rewrite in place, so every refresh
+  // lands as its own line — one model pull can be tens of thousands of them. Detect the
+  // signature so the button only shows when there's actually noise to strip.
+  const hasProgress = useMemo(
+    () => lines.some((l) => !l.includes("@@") && /\d{1,3}%\|.*?\|\s*\S+\/\S+\s*\[/.test(l)),
+    [lines],
+  );
+
+  async function trim() {
+    setTrimming(true);
+    try {
+      const r = await gateway.trimTrainingLogs(runId);
+      toast.success(r.removed ? `Trimmed ${r.removed.toLocaleString()} progress line${r.removed === 1 ? "" : "s"}` : "No progress lines to trim");
+      onTrimmed(); // reconnect the stream → replay the trimmed log
+    } catch (e) {
+      toast.error(`Trim failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setTrimming(false);
+    }
+  }
 
   // Only stick to the bottom when auto-scroll is on — so you can scroll up to
   // read without being yanked back down as new lines stream in.
@@ -1913,15 +2004,30 @@ function LogsTab({ lines, status }: { lines: string[]; status: string }) {
 
   return (
     <div className="space-y-2">
-      <label className="flex w-fit cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground">
-        <input
-          type="checkbox"
-          checked={autoScroll}
-          onChange={(e) => setAutoScroll(e.target.checked)}
-          className="h-3.5 w-3.5 accent-primary"
-        />
-        Auto-scroll to latest{!autoScroll && lines.length > 0 ? " (paused)" : ""}
-      </label>
+      <div className="flex items-center justify-between gap-2">
+        <label className="flex w-fit cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={autoScroll}
+            onChange={(e) => setAutoScroll(e.target.checked)}
+            className="h-3.5 w-3.5 accent-primary"
+          />
+          Auto-scroll to latest{!autoScroll && lines.length > 0 ? " (paused)" : ""}
+        </label>
+        {hasProgress && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1.5 text-xs"
+            onClick={trim}
+            disabled={trimming}
+            title="Remove tqdm/HuggingFace download progress-bar lines from this run's logs"
+          >
+            {trimming ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Scissors className="h-3.5 w-3.5" />}
+            Trim progress lines
+          </Button>
+        )}
+      </div>
       <div className="terminal-block h-[55vh] overflow-y-auto rounded-md border border-border bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-200">
         {lines.length === 0 ? (
           <div className="text-zinc-500">
