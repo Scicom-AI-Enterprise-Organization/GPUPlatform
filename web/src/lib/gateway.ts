@@ -514,9 +514,11 @@ export const gateway = {
       base_hf_token_secret?: string;
       // Optional GPU-merge + run-on fields (LLM merges its raw LoRA into a loadable
       // model; ASR/TTS artifacts are already merged). Mirrors retryLabelExport's body.
+      // "gateway" (ASR/TTS only): push from the gateway, fetching the model from S3 — no
+      // dependency on the run's training box still existing.
       merge?: boolean;
       merge_dtype?: string;
-      run_on?: "vm" | "cloud";
+      run_on?: "vm" | "cloud" | "gateway";
       provider_id?: string | null;
       gpu_type?: string;
       gpu_count?: number;

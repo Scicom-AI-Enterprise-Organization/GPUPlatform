@@ -47,8 +47,8 @@ export default async function AutotrainPage({
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Autotrain</h1>
             <p className="mt-1 text-sm text-muted-foreground">
-              Finetune a Whisper model on a dataset. WER + CER are evaluated every
-              epoch; training stops at the max-epoch cap or early on patience.
+              Finetune ASR (Whisper), TTS, and LLM models on a dataset. Runs are
+              evaluated every epoch and stop at the max-epoch cap or early on patience.
             </p>
           </div>
           {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}

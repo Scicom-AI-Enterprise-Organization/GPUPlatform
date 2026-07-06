@@ -261,6 +261,27 @@ def _tts_arch(model_id: Optional[str]) -> str:
     return "qwen3"
 
 
+def _train_venv_default(task_type: Optional[str], base_model: Optional[str]) -> str:
+    """The shared box venv a run's trainer creates/reuses, keyed by task_type + arch.
+    Single source of truth for run_training AND every box-side op that runs AFTER a
+    run trained (HF export, …). The resolved venv is only shipped to the box in the
+    remote config — it is NOT written back to the run's config_json — so anything that
+    later re-derives it MUST use this same mapping. A hardcoded /share/autotrain-tts
+    (as the export path used to) silently misses OmniVoice's own /share/autotrain-omnivoice
+    and ASR's /share/autotrain-whisper → "venv python not found" on a run that trained fine."""
+    tt = (task_type or "asr").lower()
+    if tt == "llm":
+        # gemma vs minimax need different `kernels` pins (transformers 5.5.0 import
+        # crashes outside each range) → SEPARATE venvs per arch.
+        return f"/share/autotrain-llm-{_llm_arch(base_model)}"
+    if tt == "tts":
+        # OmniVoice (torch 2.8/cu128 + its own repo) gets a SEPARATE venv from the
+        # Qwen3+NeuCodec TTS stack (cu13/2.9). Selected by base model.
+        return ("/share/autotrain-omnivoice"
+                if _tts_arch(base_model) == "omnivoice" else "/share/autotrain-tts")
+    return "/share/autotrain-whisper"
+
+
 async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str] = None) -> dict:
     """Turn a Dataset row into the trainer's dataset spec, with creds inlined."""
     label_token = None
@@ -2064,20 +2085,11 @@ async def run_training(redis, run_id: str) -> None:
         # Isolated uv venv per task (mirrors serverless's vLLM venv_path) so the
         # heavy stack never clobbers the box's system python or another task's
         # deps. The trainer's --deps-only creates/installs it; the run phase
-        # launches from {venv}/bin/python.
-        if task_type == "llm":
-            # gemma vs minimax need different `kernels` pins (transformers 5.5.0
-            # import crashes outside each range) → SEPARATE venvs per arch.
-            _default_venv = f"/share/autotrain-llm-{_llm_arch(cfg.get('base_model'))}"
-        elif task_type == "tts":
-            # OmniVoice (torch 2.8/cu128 + its own repo) gets a SEPARATE venv from
-            # the Qwen3+NeuCodec TTS stack (cu13/2.9). Selected by base model.
-            _default_venv = ("/share/autotrain-omnivoice"
-                             if _tts_arch(cfg.get("base_model")) == "omnivoice"
-                             else "/share/autotrain-tts")
-        else:
-            _default_venv = "/share/autotrain-whisper"
-        venv_path = (cfg.get("venv_path") or _default_venv).rstrip("/")
+        # launches from {venv}/bin/python. Arch/task → venv lives in one helper so
+        # post-train box ops (HF export) resolve the SAME venv (venv_path isn't
+        # persisted to config_json — see _train_venv_default).
+        venv_path = (cfg.get("venv_path")
+                     or _train_venv_default(task_type, cfg.get("base_model"))).rstrip("/")
         cfg["venv_path"] = venv_path
         venv_py = shlex.quote(f"{venv_path}/bin/python")
         # Sweep mode: a sweep orchestrator schedules GPU-pinned trials. Resolve
@@ -4173,8 +4185,9 @@ async def export_to_huggingface(
 ):
     """Push this run's BEST/final model to a Hugging Face repo on demand.
 
-    ASR/TTS artifacts are already merged models at train-end → uploaded as-is (from a
-    custom-endpoint mirror via the gateway, else the run's VM). LLM artifacts are a raw
+    ASR/TTS artifacts are already merged models at train-end → uploaded as-is, either from
+    the GATEWAY (run_on="gateway", or a custom-endpoint mirror — box-independent, the model
+    is fetched from S3 here) or the run's VM. LLM artifacts are a raw
     LoRA checkpoint → must be MERGED into the base on a GPU first; that runs on the run's
     VM, a chosen VM, or a fresh RunPod pod (Run-on picker), then the merged safetensors
     are uploaded. The HF token comes from the selected kind=huggingface Storage (else the
@@ -4236,19 +4249,31 @@ async def export_to_huggingface(
             "likely an imported run whose checkpoint lives elsewhere. Nothing to merge."))
 
     # ---- compute target -------------------------------------------------------------
-    # Non-merge (ASR/TTS): a custom-endpoint storage pushes from the GATEWAY (reaches the
-    # mirror directly + its modern huggingface_hub handles the `…/hf` path the VM's older
-    # client mis-parses); else the run's VM (avoids large downloads on the laptop). Merge
-    # (LLM): a GPU is required → the run's VM, a chosen VM, or a fresh RunPod pod.
+    # Non-merge (ASR/TTS): push from the GATEWAY when asked (run_on="gateway") or when the
+    # storage has a custom endpoint (its modern huggingface_hub handles the `…/hf` path the
+    # VM's older client mis-parses) — the model is fetched from S3 here + pushed directly, so
+    # it does NOT need the run's training box (whose shared uv venv is often gone weeks after
+    # the run). Otherwise the run's VM. Merge (LLM): a GPU is required → the run's VM, a chosen
+    # VM, or a fresh RunPod pod.
     mirror_merge = merge and bool(hf_endpoint)   # merge → a custom / self-hosted HF mirror
-    local_export = bool(hf_endpoint) and not merge
+    run_on = (body.run_on or "").strip().lower()
+    if run_on == "gateway" and merge:
+        raise HTTPException(status_code=400, detail=(
+            "gateway export can't merge — an LLM merge needs a GPU (Run-on: a VM or a fresh cloud pod)."))
+    local_export = (bool(hf_endpoint) or run_on == "gateway") and not merge
+    # A gateway push re-downloads the checkpoint here (like merge) → fast-fail if the artifact
+    # isn't reachable from this deployment (an imported run whose checkpoint lives elsewhere)
+    # before streaming a doomed download. (The custom-endpoint local_export path is unchanged.)
+    if run_on == "gateway" and not await asyncio.to_thread(_s3_uri_has_objects, model_s3, creds):
+        raise HTTPException(status_code=400, detail=(
+            f"the trained model isn't reachable from this deployment ({model_s3}) — likely an "
+            "imported run whose checkpoint lives elsewhere. Push it from its VM instead."))
     # Talk to our OWN mirror over loopback (bypass the nginx body cap + TLS). A gateway-side
     # push reaches it directly; a merge on a GPU box reaches that loopback through a reverse
     # SSH tunnel (needs_tunnel). Keep the public endpoint for the displayed URL. An external
     # mirror (different host) is left untouched and pushed to directly from the box.
     push_endpoint = _loopback_endpoint(hf_endpoint) if (local_export or mirror_merge) else hf_endpoint
     needs_tunnel = mirror_merge and bool(push_endpoint) and push_endpoint != hf_endpoint
-    run_on = (body.run_on or "").strip().lower()
     exp_provider_id = (body.provider_id or "").strip() or None
     ssh = None            # (host, port, user, key) when we run on an existing box
     cloud_spec = None     # pod spec dict when we must provision a fresh pod in _bg
@@ -6291,7 +6316,13 @@ def _run_hf_export_ssh(host: str, port: int, user: str, key_filename: str,
             except OSError:
                 pass
         user_env = _render_env_exports(cfg.get("env_vars") or {})
-        venv = (cfg.get("venv_path") or "/share/autotrain-tts").rstrip("/")
+        # hf_export.py is arch-agnostic (S3 download → HF push), but it still needs a
+        # venv on the box with huggingface_hub + boto3 — namely the one this run TRAINED
+        # in. venv_path isn't persisted to config_json, so re-derive it by task/arch
+        # (OmniVoice → autotrain-omnivoice, ASR → autotrain-whisper); a hardcoded
+        # autotrain-tts default made OmniVoice/ASR pushes fail with "venv not found".
+        venv = (cfg.get("venv_path")
+                or _train_venv_default(cfg.get("task_type"), cfg.get("base_model"))).rstrip("/")
         py = f"{venv}/bin/python"
         out: dict = {"result": None, "error": None, "lines": []}
 

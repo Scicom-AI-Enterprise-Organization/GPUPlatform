@@ -24,7 +24,8 @@ import type { StorageRecord, TrainingRunRecord } from "@/lib/types";
 // Export-to-HF as a tab: push the finished run's best/final model to a Hugging Face
 // repo. For LLM the artifact is a raw LoRA checkpoint, so merging it into the base
 // (GPU work) is required — that adds a "Run on" compute picker. ASR/TTS artifacts are
-// already merged models, so they export straight from the gateway/VM (no compute pick).
+// already merged models, so no GPU is needed — they push from the gateway (default,
+// fetched from S3 — box-independent) or the run's VM (a small "Run on" toggle).
 export function HfExportTab({
   run,
   onStarted,
@@ -48,6 +49,11 @@ export function HfExportTab({
   const [secretKeys, setSecretKeys] = useState<string[]>([]);
   // Merge only applies to LLM (raw LoRA → loadable model); default on + required there.
   const [merge, setMerge] = useState(isLlm);
+
+  // ASR/TTS: where the (already-merged) model is pushed from. "gateway" (default) fetches
+  // it from S3 and pushes here — no dependency on the training box still existing; "vm"
+  // pushes from the box this run trained on (needs that box + its training uv venv).
+  const [ttsRunOn, setTtsRunOn] = useState<"gateway" | "vm">("gateway");
 
   // Compute target for the LLM merge job (leave venv blank → gateway picks the arch venv).
   const [compute, setCompute] = useState<ComputeTarget>(() => defaultComputeTarget(run));
@@ -95,7 +101,9 @@ export function HfExportTab({
         repo: repo.trim(),
         storage_id: storageId || null,
         private: isPrivate,
-        // Merge + compute target are LLM-only; ASR/TTS export straight from the gateway/VM.
+        // Merge + compute target are LLM-only. ASR/TTS pick where the push runs: the
+        // gateway (run_on="gateway") or the run's own VM (omit run_on → back-compat path).
+        ...(!isLlm && ttsRunOn === "gateway" ? { run_on: "gateway" as const } : {}),
         ...(isLlm
           ? {
               merge,
@@ -172,6 +180,35 @@ export function HfExportTab({
           </label>
         </div>
       </Section>
+
+      {/* Run on — ASR/TTS only. No GPU needed (the artifact is already a full model), so the
+          choice is just gateway (box-independent) vs the run's original VM. */}
+      {!isLlm && (
+        <Section title="Run on" description="Where the push runs. The artifact is already a complete model — no GPU required.">
+          <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+            {([
+              ["gateway", "Gateway (recommended)"],
+              ["vm", "Run's VM"],
+            ] as const).map(([val, label]) => (
+              <button
+                key={val}
+                type="button"
+                onClick={() => setTtsRunOn(val)}
+                className={`rounded px-2.5 py-1 transition-colors ${
+                  ttsRunOn === val ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            {ttsRunOn === "gateway"
+              ? "Pushes from the gateway — the model is fetched from S3 and uploaded here. Works even if the training box (and its uv venv) is gone."
+              : "Pushes from the box this run trained on. Requires that VM — and its training uv venv — to still exist; older runs' boxes are often recycled."}
+          </p>
+        </Section>
+      )}
 
       {/* Merge + compute target — LLM only (raw LoRA needs a GPU merge to become loadable). */}
       {isLlm && (
