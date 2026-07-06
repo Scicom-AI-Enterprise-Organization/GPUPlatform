@@ -162,3 +162,43 @@ S3 layout) stays *flat* (`versioned=False`): single `main`, path-addressed `{pre
 client (huggingface_hub 1.17.0). Blob GC (orphans from overwrites/deletes) is NOT implemented yet.
 ⚠️ Still **different from a `kind=hf` Dataset's `hf_revision`**, which pins a real commit/branch/tag
 on `huggingface.co` — don't conflate.
+
+### Quantization (llm-compressor) — `quantization_api.py` + `training/quantize.py`
+
+The **Quantization** section (`/quantization` → `POST /v1/quantization-jobs`) compresses an LLM
+with llm-compressor (compressed-tensors, loadable by vLLM): pull from HF → quantize on a VM/pod →
+model to S3 → optional HF push. It's a deliberate **sibling of autotrain**: `quantization_api.py`
+imports `training_api as ta` and reuses its SSH/pod/dataset/creds plumbing (`_provision_pod`,
+`_ssh_*`, `_resolve_dataset_spec`, `_hf_token_for_storage`, …) rather than duplicating it — only
+the DB row (`QuantizationJob`, registered in `db.init_db` like TrainingRun), the scheme recipes,
+and the worker contract live here. Section key `quantization` in `auth.SECTIONS`.
+
+- **Restart rules**: `training/quantize.py` is SFTP'd from disk per job — worker edits need **NO
+  gateway restart**. `quantization_api.py` edits DO (GATEWAY_RELOAD=0).
+- **Schemes** live in TWO synced places: `_SCHEMES` (api — labels + needs_calibration, served by
+  `GET /v1/quantization-jobs/schemes`, which the web form reads so it never drifts) and
+  `QUANT_SCHEMES` + `_build_recipe()` (worker — the actual llm-compressor modifiers). Add a scheme
+  → touch both. Data-free: `fp8-dynamic`. Calibrated: `w4a16` (GPTQ), `w8a8-int8`
+  (SmoothQuant→GPTQ), `fp8` (static), `nvfp4`, `awq`. All six verified e2e on tm-2 (Qwen3-0.6B).
+- **Worker venv**: one shared uv venv `/share/quant-llmcompressor` (built by `--deps-only`;
+  llmcompressor + compressed-tensors + transformers + boto3 + huggingface_hub). Jobs on the same
+  box MUST run sequentially-ish on first use (parallel venv builds race).
+- **Calibration datasets**: kinds `hf`/`llm`/`upload`/`s3` (`_CALIB_DATASET_KINDS`). Note
+  `_resolve_dataset_spec` (training_api) resolves **kind=llm like kind=hf** with `messages_field`
+  carried — added for quantization; autotrain never passes kind=llm to it. ⚠️ **Script-based HF
+  datasets fail** ("Dataset scripts are no longer supported" — `datasets>=3`); only parquet-native
+  repos work (e.g. `roneneldan/TinyStories`). The worker falls back to guessing the text column
+  when the dataset's `transcription_field` doesn't exist on the rows; `calib_text_field` /
+  `calib_messages_field` in the job config override.
+- **HF export** (`POST /{id}/hf-export`): `run_on="gateway"` (default — in-process
+  `_hf_push_local`, no GPU) or `"vm"` (reuses `ta._run_hf_export_ssh` + the quant venv). Storage
+  resolution mirrors autotrain: `ta._hf_token_for_storage` (handles `hf_token_secret` global-secret
+  refs, not just inline `credentials_enc`) + `ta._hf_endpoint_for_storage` (custom endpoint = the
+  self-hosted mirror) + `ta._loopback_endpoint` for gateway pushes. ⚠️ **Mirror pushes need Xet
+  disabled**: modern huggingface_hub probes `{endpoint}/api/models/{repo}/xet-write-token/{rev}`,
+  404s on the mirror, and aborts — `_hf_push_local` sets `HF_HUB_DISABLE_XET=1` **and patches
+  `huggingface_hub.constants` on the live module** (hf_hub is usually already imported in the
+  gateway process, so env-only is too late — same trick as `dataset_transform.py`). VM pushes to
+  the own-mirror endpoint are rejected with a 400 (the box can't reach it without a tunnel).
+- **Restart semantics**: `cleanup_orphaned_running` marks queued/running jobs **failed** on gateway
+  startup — quant jobs are short and are NOT log-reconciled like autotrain runs; re-run instead.

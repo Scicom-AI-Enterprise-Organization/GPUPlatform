@@ -12,9 +12,12 @@ This root file is the always-loaded, cross-cutting stuff. Area-specific gotchas 
 code and are pulled in automatically only when you touch that subtree:
 - **`gateway/gateway/CLAUDE.md`** — gateway internals: benchmaq + the `HOME`-breaks-RunPod-SSH /
   cu1300 / fork-install / crash-abort gotchas, the provider metrics page (NVML + `/proc`), the VM
-  reverse tunnel, Activity + proxy-mode recording, the Label platform, the HF catalog/mirror.
+  reverse tunnel, Activity + proxy-mode recording, the Label platform, the HF catalog/mirror, and
+  Quantization (llm-compressor — scheme sync, calib datasets, mirror-push Xet gotcha).
 - **`worker-agent/worker_agent/CLAUDE.md`** — the multi-model fleet: vLLM venv self-bootstrap,
   `vllm_version` / `vllm_install_args` / git forks / `pre_script`, and serving Whisper/audio.
+- **`web/src/app/(app)/quantization/CLAUDE.md`** — the Quantization UI: mirrors Autotrain 1:1
+  (the file↔file mapping table), server-driven scheme dropdown, HF-export tab conventions.
 
 ### What's already running / configured
 

@@ -22,6 +22,7 @@ Users bring their own provider credentials; the gateway routes each workload to 
   - [Operate it — the endpoint console](#operate-it--the-endpoint-console)
 - [Multi-model fleets (VM or cloud RunPod)](#multi-model-fleets-vm-or-cloud-runpod)
 - [Autotrain (finetuning)](#autotrain-finetuning)
+- [Quantization (llm-compressor)](#quantization-llm-compressor)
 - [Datasets](#datasets)
 - [Models (self-hosted Hugging Face catalog)](#models-self-hosted-hugging-face-catalog)
 - [Benchmark](#benchmark)
@@ -279,6 +280,27 @@ curl -s -X POST "$GATEWAY/v1/training-runs" -H "Authorization: Bearer $KEY" -H '
 curl -s -H "Authorization: Bearer $KEY" "$GATEWAY/v1/training-runs/<id>/metrics"
 ```
 
+## Quantization (llm-compressor)
+
+Compress an LLM with [llm-compressor](https://github.com/vllm-project/llm-compressor) — pull a model from Hugging Face, quantize it on a `vm` provider or a RunPod pod the gateway spawns, store the **compressed-tensors** model on S3 (vLLM loads it directly), and optionally push it back to the Hub or the self-hosted [Models](#models-self-hosted-hugging-face-catalog) mirror. Create a job in the form at `/quantization/new` or via `POST /v1/quantization-jobs`.
+
+- **Six schemes** — data-free **FP8-dynamic**, plus calibrated **W4A16 (GPTQ)**, **W8A8-INT8 (SmoothQuant + GPTQ)**, **FP8-static**, **NVFP4**, and **AWQ**. Calibrated schemes fit their quantization scales on a few hundred text samples drawn from a [dataset](#datasets) (kinds `hf` / `llm` / `upload` / `s3` — chat datasets render through the tokenizer's chat template). The scheme list + which need calibration is served by `GET /v1/quantization-jobs/schemes`, so the form always matches the backend.
+- **Recipe knobs** — ignored layers (`lm_head` by default), SmoothQuant strength, GPTQ dampening fraction, calibration sample count + max sequence length, and a text/messages column override for the calibration dataset.
+- **Same compute + ops model as Autotrain** — run on a registered VM (GPU pinning via `CUDA_VISIBLE_DEVICES`) or a fresh RunPod pod (torn down after), live SSE logs + stage progress (`loading-model → calibrating → quantizing → saving → uploading`), artifacts to a chosen S3 [storage](#storage), and a tabbed detail page (**Overview / Logs / Files / Config / Export to HF**) with rename / terminate / delete.
+- **Export to HF** — push the compressed model to huggingface.co **or the self-hosted mirror** (an HF [storage](#storage) supplies the token — inline, or a global-secret reference — and any custom endpoint), from the gateway (no GPU needed) or the job's VM. Running pushes are cancellable.
+
+```bash
+curl -s -X POST "$GATEWAY/v1/quantization-jobs" -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{
+    "name":"qwen3-8b-w4a16", "source_model":"Qwen/Qwen3-8B", "scheme":"w4a16",
+    "calibration_dataset_id":"ds-...", "num_calibration_samples":512, "max_seq_length":2048,
+    "provider_id":"prov-...", "visible_devices":"0", "storage_id":"store-...",
+    "hf_push_repo":"you/qwen3-8b-w4a16", "hf_push_private":true
+  }'
+# poll status / artifact / sizes:
+curl -s -H "Authorization: Bearer $KEY" "$GATEWAY/v1/quantization-jobs/<id>"
+```
+
 ## Datasets
 
 A dataset is a named pointer to a metadata table of rows that Autotrain consumes — `{audio, transcription}` (optionally `speaker`) for speech, or chat `messages` for LLM. Manage them at `/datasets` or `POST /v1/datasets`. Kinds:
@@ -501,11 +523,11 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 
 ## Repo layout
 
-- **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/training-runs`, `/v1/datasets`, `/v1/catalog` + `/hf` (HF mirror), `/v1/proxy` + `/proxy/*` (LLM proxy), `/v1/gitops`, `/v1/history` (activity), `/v1/providers`, `/v1/storage`, `/v1/global-env`, `/v1/tracking-credentials`, `/api-keys`, `/auth`, `/admin/*`, `/metrics`
-- **Trainers** (`gateway/gateway/training/`) — standalone runner scripts shipped over SSH per run: `whisper_finetune.py` (ASR), `tts_finetune.py` (the TTS pipeline — NeuCodec-encode → multipack into a ChiniDataset → Qwen3 causal-LM train → CER/MOS/similarity eval, with a **pack-only** mode that powers the dataset Pack-for-TTS step), and `sweep_runner.py` (GPU-pinned multi-trial orchestrator)
+- **Gateway** (`gateway/`) — FastAPI control plane: `/apps`, `/run`, `/stream`, `/v1/*`, `/workers`, `/compute`, `/benchmarks`, `/v1/training-runs`, `/v1/quantization-jobs`, `/v1/datasets`, `/v1/catalog` + `/hf` (HF mirror), `/v1/proxy` + `/proxy/*` (LLM proxy), `/v1/gitops`, `/v1/history` (activity), `/v1/providers`, `/v1/storage`, `/v1/global-env`, `/v1/tracking-credentials`, `/api-keys`, `/auth`, `/admin/*`, `/metrics`
+- **Trainers** (`gateway/gateway/training/`) — standalone runner scripts shipped over SSH per run: `whisper_finetune.py` (ASR), `tts_finetune.py` (the TTS pipeline — NeuCodec-encode → multipack into a ChiniDataset → Qwen3 causal-LM train → CER/MOS/similarity eval, with a **pack-only** mode that powers the dataset Pack-for-TTS step), and `sweep_runner.py` (GPU-pinned multi-trial orchestrator); plus `quantize.py` (the llm-compressor quantization worker — same ship-over-SSH model)
 - **Worker agent** (`worker-agent/`) — `BRPOP`s jobs from Redis, runs vLLM, publishes streaming tokens via pub/sub (and rebuilds the multipart upload for Whisper `/v1/audio/*`); also drives the **multi-model fleet** on a VM **or a reverse-tunnelled RunPod pod** — wave-loads each vLLM, sleeps/wakes them per request, skips cancelled jobs before waking a model, runs operator commands (sleep/restart/kill), and ships per-model + scheduler logs to the gateway. The RunPod reverse-tunnel provisioning lives in `gateway/gateway/runpod_provider.py`.
 - **SDK + CLI** (`sdk/serverlessgpu/`) — `@endpoint` decorator, `QueueDepthAutoscaler`, and the `serverlessgpu` CLI
-- **Web** (`web/`) — Next.js UI: Serverless, Autotrain, Datasets, Models, Benchmark, Compute, LLM Proxy, GitOps, Activity, Providers, Storage, API tokens, Organization, Settings, API Docs, Admin (users / roles / audit / approvals / provisioned / secrets / analytics)
+- **Web** (`web/`) — Next.js UI: Serverless, Autotrain, Quantization, Datasets, Models, Benchmark, Compute, LLM Proxy, GitOps, Activity, Providers, Storage, API tokens, Organization, Settings, API Docs, Admin (users / roles / audit / approvals / provisioned / secrets / analytics)
 - **Helm chart** (`deploy/helm/serverlessgpu/`) — gateway + web + Postgres + Redis + Ingress (SSE-safe) + ServiceMonitor
 - **Grafana dashboard** (`deploy/grafana/`) — metrics panels wired to the gateway's Prometheus exporter
 - **CI** (`.github/workflows/ci.yml`) — helm lint + e2e (kind), and matrix multi-arch image builds (gateway + web → amd64/arm64 → merged manifest; PI worker → amd64)
