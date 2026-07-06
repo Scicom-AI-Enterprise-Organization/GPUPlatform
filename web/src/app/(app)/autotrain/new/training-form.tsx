@@ -93,6 +93,7 @@ const isOmnivoice = (model: string) => /omnivoice/i.test(model);
 const LLM_BASE_MODELS = [
   "google/gemma-4-31B-it",
   "google/gemma-4-26B-A4B-it",
+  "Qwen/Qwen3.5-122B-A10B",
   "Qwen/Qwen3.6-27B",
   "Qwen/Qwen3.6-35B-A3B",
   "MiniMaxAI/MiniMax-M2.7",
