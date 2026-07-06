@@ -12,6 +12,7 @@ const SECTION_LABEL: Record<SectionKey, string> = {
   benchmark: "Benchmark",
   compute: "Compute",
   datasets: "Datasets",
+  quantization: "Quantization",
   catalog: "Models",
 };
 

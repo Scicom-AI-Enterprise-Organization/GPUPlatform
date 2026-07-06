@@ -319,7 +319,10 @@ async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str
             "rows": spec_rows,
         }
 
-    if ds.kind == "hf":
+    if ds.kind in ("hf", "llm"):
+        # kind=llm is an HF chat dataset (hf_repo + messages_field) — same spec as
+        # kind=hf, just with the chat column carried along. Autotrain never resolves
+        # kind=llm here (it trains on llm_packed), but quantization calibrates on it.
         hf_token = None
         if storage is not None and storage.kind == "huggingface":
             enc = (storage.config or {}).get("credentials_enc")
@@ -332,6 +335,7 @@ async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str
             "hf_token": hf_token,
             "audio_field": ds.audio_field,
             "transcription_field": ds.transcription_field,
+            "messages_field": ds.messages_field,
             "split_fields": ds.split_fields or {},
         }
 

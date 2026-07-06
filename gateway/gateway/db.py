@@ -663,6 +663,7 @@ async def init_db() -> None:
     from . import bench  # noqa: F401
     from . import compute  # noqa: F401
     from . import training_api  # noqa: F401
+    from . import quantization_api  # noqa: F401  # registers QuantizationJob
     from . import proxy_api  # noqa: F401  # registers ProxyEndpoint / ProxyRequest
     # Explicit pool sizing — the SQLAlchemy async default (pool_size=5,
     # max_overflow=10 → 15 conns, pool_timeout=30s) is small; under load a burst

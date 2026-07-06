@@ -48,6 +48,7 @@ from . import storage_api as storage_module
 from . import datasets_api as datasets_module
 from . import global_env_api as global_env_module
 from . import training_api as training_module
+from . import quantization_api as quantization_module
 from . import tracking_creds_api as tracking_creds_module
 from . import gitops_api as gitops_module
 from . import proxy_api as proxy_module
@@ -584,6 +585,14 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         logger.exception("autotrain: orphan reconcile failed")
+    # Quantization: same detached-run reconcile as autotrain — a restart leaves
+    # llm-compressor jobs running on the box; finalize/keep them from their log.
+    try:
+        q_orphaned = await quantization_module.cleanup_orphaned_running(app.state.redis)
+        if q_orphaned:
+            logger.warning("quantization: finalized %d orphaned job(s) after gateway restart", q_orphaned)
+    except Exception:
+        logger.exception("quantization: orphan reconcile failed")
     # GitOps: reconcile platform resources declared in registered git repos.
     # The loop self-disables with GITOPS_POLL=0; manual sync + webhook always work.
     try:
@@ -723,6 +732,7 @@ app.include_router(storage_module.router)
 app.include_router(datasets_module.router)
 app.include_router(global_env_module.router)
 app.include_router(training_module.router)
+app.include_router(quantization_module.router)
 app.include_router(tracking_creds_module.router)
 app.include_router(gitops_module.router)
 app.include_router(proxy_module.router)

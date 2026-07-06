@@ -70,6 +70,9 @@ import type {
   TrainingMetrics,
   CreateTrainingRunRequest,
   TrainingFile,
+  QuantizationJobRecord,
+  CreateQuantizationJobRequest,
+  QuantizationSchemesResponse,
   TryItTarget,
   TrackingCredentialRecord,
   CreateTrackingCredentialRequest,
@@ -557,6 +560,62 @@ export const gateway = {
     request<TrainingGpuResponse>(`/v1/training-runs/${encodeURIComponent(id)}/gpu`),
   trainingLogsStreamUrl: (id: string) =>
     `/api/proxy/v1/training-runs/${encodeURIComponent(id)}/logs/stream`,
+
+  // ---- Quantization jobs (llm-compressor) ----
+  listQuantizationSchemes: () =>
+    request<QuantizationSchemesResponse>("/v1/quantization-jobs/schemes"),
+  listQuantizationJobs: (scope: "mine" | "all" = "mine") =>
+    request<QuantizationJobRecord[]>(`/v1/quantization-jobs?scope=${scope}`),
+  listQuantizationJobsPage: (p: PageQuery = {}) =>
+    request<PageResponse<QuantizationJobRecord>>(`/v1/quantization-jobs/_page?${pageQs(p)}`),
+  getQuantizationJob: (id: string) =>
+    request<QuantizationJobRecord>(`/v1/quantization-jobs/${encodeURIComponent(id)}`),
+  renameQuantizationJob: (id: string, name: string) =>
+    request<QuantizationJobRecord>(`/v1/quantization-jobs/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    }),
+  createQuantizationJob: (body: CreateQuantizationJobRequest) =>
+    request<QuantizationJobRecord>("/v1/quantization-jobs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteQuantizationJob: (id: string) =>
+    request<{ ok: boolean; id: string }>(
+      `/v1/quantization-jobs/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+  terminateQuantizationJob: (id: string) =>
+    request<QuantizationJobRecord>(
+      `/v1/quantization-jobs/${encodeURIComponent(id)}/terminate`,
+      { method: "POST" },
+    ),
+  exportQuantizationToHuggingface: (
+    id: string,
+    body: { repo: string; private?: boolean; storageId?: string | null; token?: string | null; runOn?: "gateway" | "vm" },
+  ) =>
+    request<QuantizationJobRecord>(
+      `/v1/quantization-jobs/${encodeURIComponent(id)}/hf-export`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          repo: body.repo,
+          private: body.private ?? true,
+          storage_id: body.storageId ?? null,
+          token: body.token ?? null,
+          run_on: body.runOn ?? "gateway",
+        }),
+      },
+    ),
+  cancelQuantizationHfExport: (id: string) =>
+    request<QuantizationJobRecord>(
+      `/v1/quantization-jobs/${encodeURIComponent(id)}/hf-export/cancel`,
+      { method: "POST" },
+    ),
+  listQuantizationFiles: (id: string) =>
+    request<TrainingFile[]>(`/v1/quantization-jobs/${encodeURIComponent(id)}/files`),
+  quantizationLogsStreamUrl: (id: string) =>
+    `/api/proxy/v1/quantization-jobs/${encodeURIComponent(id)}/logs/stream`,
   /** Try-it playground: transcribe a clip with the run's finetuned model (runs
    * on the run's VM over SSH). `gpu` is a GPU index, "cpu", or "auto". */
   transcribeTrainingRun: async (id: string, file: File, gpu?: string) => {

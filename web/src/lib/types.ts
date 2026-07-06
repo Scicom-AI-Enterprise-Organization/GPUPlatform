@@ -438,6 +438,81 @@ export type TrainingRunRecord = {
   visible_devices?: string | null;
 };
 
+// ---- Quantization (llm-compressor) ----
+
+export type QuantizationSchemesResponse = {
+  // scheme id → {label, whether it needs a calibration dataset}
+  schemes: Record<string, { label: string; needs_calibration: boolean }>;
+  calib_dataset_kinds: string[];
+};
+
+export type QuantizationResult = {
+  artifact?: string | null; // s3:// uri of the compressed model
+  hf_repo?: string | null;
+  sizes?: { source_gb?: number; quantized_gb?: number } | null;
+  progress?: { stage?: string; percent?: number } | null;
+  hf_export?: { status?: string; repo?: string; url?: string; error?: string } | null;
+  error?: string;
+};
+
+export type QuantizationJobRecord = {
+  id: string;
+  name: string;
+  status: "queued" | "running" | "done" | "failed" | "cancelled";
+  source_model: string;
+  scheme: string;
+  calibration_dataset_id?: string | null;
+  s3_prefix: string;
+  config_json: Record<string, unknown>;
+  exit_code?: number | null;
+  error_text?: string | null;
+  result_json?: QuantizationResult | null;
+  created_by: string;
+  created_at: string;
+  started_at?: string | null;
+  ended_at?: string | null;
+  cost_per_hr?: number | null;
+  provider_id?: string | null;
+  provider_name?: string | null;
+  provider_kind?: string | null;
+  storage_id?: string | null;
+  storage_name?: string | null;
+  gpu_type?: string | null;
+  gpu_count: number;
+  visible_devices?: string | null;
+};
+
+export type CreateQuantizationJobRequest = {
+  name: string;
+  source_model: string;
+  scheme: string;
+  calibration_dataset_id?: string | null;
+  num_calibration_samples?: number;
+  max_seq_length?: number;
+  calib_text_field?: string | null;
+  calib_messages_field?: string | null;
+  ignore_layers?: string[];
+  smoothing_strength?: number;
+  dampening_frac?: number;
+  hf_push_repo?: string | null;
+  hf_push_private?: boolean;
+  hf_token?: string | null;
+  hf_token_secret?: string | null;
+  provider_id?: string | null;
+  storage_id?: string | null;
+  gpu_type?: string;
+  gpu_count?: number;
+  visible_devices?: string | null;
+  secure_cloud?: boolean;
+  data_center_id?: string | null;
+  disk_gb?: number;
+  volume_gb?: number;
+  image?: string | null;
+  work_dir?: string | null;
+  venv_path?: string | null;
+  env_vars?: Record<string, string>;
+};
+
 export type CreateTrainingRunRequest = {
   name: string;
   dataset_id: string;
@@ -1208,7 +1283,7 @@ export type ProviderBandwidth = {
 
 // ---- Admin: roles + audit ----
 
-export type SectionKey = "inference" | "benchmark" | "compute" | "datasets" | "catalog";
+export type SectionKey = "inference" | "benchmark" | "compute" | "datasets" | "catalog" | "quantization";
 
 // ---- Model/Dataset catalog (self-hosted HuggingFace mirror) ----
 

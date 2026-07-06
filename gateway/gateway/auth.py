@@ -159,7 +159,7 @@ async def require_admin(user: User = Depends(current_user)) -> User:
 # who bypasses) can ever access platform sections, then per-user
 # section_permissions narrows it further. Existing developers (pre-migration)
 # default to all-true via the migration backfill.
-SECTIONS = ("inference", "benchmark", "compute", "datasets", "autotrain", "catalog")
+SECTIONS = ("inference", "benchmark", "compute", "datasets", "autotrain", "quantization", "catalog")
 
 
 def _disabled_sections() -> set[str]:

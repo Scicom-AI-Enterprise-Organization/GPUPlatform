@@ -35,3 +35,4 @@ scicom
 *.mp3
 whisper-tiny
 *.pt
+*.log

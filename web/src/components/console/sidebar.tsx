@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { Activity, BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, Package, ScrollText, Server, Settings, Shield, Sparkles, Users } from "lucide-react";
+import { Activity, BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, Package, ScrollText, Server, Settings, Shield, Shrink, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ScicomLogo } from "@/components/scicom-logo";
 import { useSidebarState } from "./sidebar-state";
@@ -26,6 +26,7 @@ const RESOURCES: Item[] = [
   { label: "Models", href: "/models", icon: Package, section: "catalog" },
   { label: "Datasets", href: "/datasets", icon: Library, section: "datasets" },
   { label: "Autotrain", href: "/autotrain", icon: Sparkles },
+  { label: "Quantization", href: "/quantization", icon: Shrink },
   { label: "Compute", href: "/compute", icon: Box, section: "compute" },
   { label: "GPU Providers", href: "/providers", icon: Cloud },
   { label: "LLM API Proxy", href: "/proxy", icon: Network },
@@ -119,6 +120,9 @@ export function ConsoleSidebar({
     }
     if (href === "/autotrain") {
       return pathname === "/autotrain" || pathname.startsWith("/autotrain/");
+    }
+    if (href === "/quantization") {
+      return pathname === "/quantization" || pathname.startsWith("/quantization/");
     }
     if (href === "/gitops") {
       return pathname === "/gitops" || pathname.startsWith("/gitops/");
