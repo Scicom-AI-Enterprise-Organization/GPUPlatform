@@ -2991,17 +2991,56 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
+def _best_from_epochs(result: Optional[dict], config: Optional[dict]) -> Optional[dict]:
+    """The genuinely-best epoch, chosen by the run's selection metric — always
+    LOWEST wins (WER/CER for ASR, eval_loss for TTS/LLM). Derived from the same
+    per-epoch points the metrics table shows, so the headline "best" and the table
+    can never disagree.
+
+    Why recompute on read: the trainer's own `best` came from a final
+    trainer.evaluate() of whatever weights load_best_model_at_end left loaded, so a
+    run trained before greater_is_better was pinned False (HF's default treated a
+    higher WER as "better") reported the WORST epoch as "best". Recomputing here
+    fixes those finished runs without a re-run. Returns None for sweeps (best is
+    per-trial, not per-epoch) or when no epoch carries the metric — caller falls
+    back to the stored value."""
+    result = result or {}
+    if result.get("trials"):            # sweep: keep the sweep-level best trial
+        return None
+    epochs = result.get("epochs") or []
+    if not epochs:
+        return None
+    task = str((config or {}).get("task_type") or "").lower()
+    metric = "eval_loss" if task in ("tts", "llm") \
+        else str((config or {}).get("eval_metric") or "wer").lower()
+    scored = [e for e in epochs if isinstance(e.get(metric), (int, float))]
+    if not scored:
+        return None
+    b = min(scored, key=lambda e: e[metric])
+    return {
+        "epoch": int(round(float(b.get("epoch") or 0))),
+        "wer": b.get("wer"),
+        "cer": b.get("cer"),
+        "eval_loss": b.get("eval_loss"),
+    }
+
+
 def _to_record(
     row: TrainingRun, owner_username: str,
     provider_name: Optional[str] = None, provider_kind: Optional[str] = None,
     storage_name: Optional[str] = None,
 ) -> TrainingRunRecord:
+    result_json = row.result_json
+    if result_json:
+        corrected = _best_from_epochs(result_json, row.config_json)
+        if corrected is not None and corrected != result_json.get("best"):
+            result_json = {**result_json, "best": corrected}
     return TrainingRunRecord(
         id=row.id, name=row.name, status=row.status, dataset_id=row.dataset_id,
         test_dataset_id=row.test_dataset_id, base_model=row.base_model,
         task_type=row.task_type,
         s3_prefix=row.s3_prefix, config_json=row.config_json or {},
-        exit_code=row.exit_code, error_text=row.error_text, result_json=row.result_json,
+        exit_code=row.exit_code, error_text=row.error_text, result_json=result_json,
         created_by=owner_username, created_at=_iso(row.created_at) or "",
         started_at=_iso(row.started_at), ended_at=_iso(row.ended_at),
         cost_per_hr=row.cost_per_hr, provider_id=row.provider_id,
@@ -4492,7 +4531,9 @@ async def training_metrics(
         "epochs": r.get("epochs") or [],
         "gpu_samples": r.get("gpu_samples") or [],
         "trials": r.get("trials"),  # sweep plan + per-trial status; None for single runs
-        "best": r.get("best"),
+        # best = lowest-metric epoch (recomputed from `epochs` so it's correct even
+        # for runs whose stored `best` predates the greater_is_better fix).
+        "best": _best_from_epochs(r, row.config_json) or r.get("best"),
         "artifact": r.get("artifact"),
         "stopped_early": bool(r.get("stopped_early")),
         "error": r.get("error") or row.error_text,

@@ -1052,13 +1052,33 @@ def run(cfg: dict) -> None:
     if no_eval:
         best = {"epoch": epochs_ran, "wer": None, "cer": None, "eval_loss": None}
     else:
-        final = trainer.evaluate()
-        best = {
-            "epoch": epochs_ran,
-            "wer": final.get("eval_wer"),
-            "cer": final.get("eval_cer"),
-            "eval_loss": final.get("eval_loss"),
-        }
+        # Report the best *observed* epoch by the selection metric (lower is better),
+        # read from the eval history — NOT a fresh evaluate() of whatever weights are
+        # loaded at the end. Those can disagree: if load_best_model_at_end selects the
+        # wrong checkpoint (e.g. HF's pre-fix default treated a higher WER as "better"),
+        # a final re-eval reports a metric WORSE than an epoch the run already beat —
+        # exactly how a finished run's "Best WER" ended up above an epoch it had passed.
+        # log_history is identical across DDP ranks, so this needs no collective op.
+        mkey = f"eval_{metric_name}"
+        evals = [h for h in trainer.state.log_history if isinstance(h.get(mkey), (int, float))]
+        if evals:
+            b = min(evals, key=lambda h: h[mkey])
+            best = {
+                "epoch": int(round(float(b.get("epoch") or epochs_ran))),
+                "wer": b.get("eval_wer"),
+                "cer": b.get("eval_cer"),
+                "eval_loss": b.get("eval_loss"),
+            }
+        else:
+            # No eval metric logged (shouldn't happen with eval on) — fall back to a
+            # final evaluate() so we still report something (all ranks call it → safe).
+            final = trainer.evaluate()
+            best = {
+                "epoch": epochs_ran,
+                "wer": final.get("eval_wer"),
+                "cer": final.get("eval_cer"),
+                "eval_loss": final.get("eval_loss"),
+            }
     if not _IS_MAIN:
         return  # non-main DDP ranks: nothing more to do; rank 0 saves/uploads.
 
