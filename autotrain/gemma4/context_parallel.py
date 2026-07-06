@@ -36,15 +36,24 @@ def cp_active() -> bool:
 
 def setup_cp(world_size: int, cp_size: int, global_rank: int):
     """Partition ranks into world_size/cp_size CP groups of cp_size CONSECUTIVE ranks. Returns
-    (cp_group, dp_size, dp_rank, cp_rank). Every rank must call this (new_group is collective)."""
+    (cp_group, dp_size, dp_rank, cp_rank). Every rank must call this (new_group is collective).
+
+    ⚠ dp==1 (cp_size == world_size) REUSES THE DEFAULT process group (None): the ring must share
+    FSDP's communicator so there is ONE global comm ordering. A separate all-rank `new_group` puts
+    the ring P2P and FSDP's all-gather/reduce-scatter on TWO NCCL comms over the same GPUs; their
+    per-rank enqueue orders differ → cross-communicator circular wait. Empirically: gemma cp4
+    survived the race, cp8 @512k WEDGED every step-0 backward (all ranks blocked in the autograd
+    engine, GPU memory flat at 100% util). Same class as the qwen deadlock — default-PG sharing is
+    the proven fix (see qwen/context_parallel.py). RingComm already handles group=None."""
     assert world_size % cp_size == 0, f"world_size {world_size} not divisible by cp_size {cp_size}"
     dp_size = world_size // cp_size
     cp_group = None
-    for d in range(dp_size):
-        ranks = list(range(d * cp_size, (d + 1) * cp_size))
-        g = dist.new_group(ranks)          # collective: all ranks create all groups
-        if global_rank in ranks:
-            cp_group = g
+    if dp_size > 1:
+        for d in range(dp_size):
+            ranks = list(range(d * cp_size, (d + 1) * cp_size))
+            g = dist.new_group(ranks)      # collective: all ranks create all groups
+            if global_rank in ranks:
+                cp_group = g
     dp_rank = global_rank // cp_size
     cp_rank = global_rank % cp_size
     _CP["group"] = cp_group

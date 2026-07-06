@@ -41,6 +41,12 @@ from flash_attn.cute.interface import _flash_attn_fwd
 # accumulates fp32 internally — the same trade fused flash kernels make).
 _RING_QB = int(os.environ.get("SGPU_RING_QB", "1024") or 1024)
 _RING_FP32 = os.environ.get("SGPU_RING_FP32") == "1"
+# The posaware (sliding) blocks get their OWN q-block size: their transients are column-windowed
+# (~window+qb columns → hundreds of MB at qb=1024), so unlike the global backward they never need a
+# small qb — and a small qb is actively HARMFUL there: the per-(block, ring-step, layer) python +
+# sync overhead scales with S/qb × layers (at 512k×52 sliding layers × qb=256 it reached ~75k
+# iterations per forward ≈ minutes of pure overhead — the "cp8 wedge" that wasn't).
+_POSAWARE_QB = int(os.environ.get("SGPU_POSAWARE_QB", "1024") or 1024)
 
 
 # ----------------------------------------------------------------------------------------
@@ -170,7 +176,7 @@ def _fa4_fwd(q, k, v, cu_q, cu_k, max_q, max_k, scale, causal, window_size):
 
 
 def _ring_bwd(dout, q, k, v, out, lse, scale, causal, window_size, cu_q, cu_k,
-              dq_buf, dk_buf, dv_buf, q_block=1024):
+              dq_buf, dk_buf, dv_buf, q_block=None):
     """Exact backward for ONE ring key-block, consuming the GLOBAL lse.
 
     Mirrors flash_attn.cute.interface._bwd_large_headdim_block but with the block-local
@@ -180,6 +186,7 @@ def _ring_bwd(dout, q, k, v, out, lse, scale, causal, window_size, cu_q, cu_k,
     Writes dq into dq_buf[:Tq], dk into dk_buf[:Tk], dv into dv_buf[:Tk] (matching the
     reference's pre-allocated-buffer convention) and returns those views.
     """
+    q_block = q_block or _RING_QB                           # SGPU_RING_QB bounds the fp32 transients
     Tq, hq, d = q.shape
     Tk, hkv, _ = k.shape
     dv_dim = v.shape[-1]
@@ -195,9 +202,10 @@ def _ring_bwd(dout, q, k, v, out, lse, scale, causal, window_size, cu_q, cu_k,
         doc_q = torch.repeat_interleave(torch.arange(cuq.numel() - 1, device=dev), cuq[1:] - cuq[:-1])
         doc_k = torch.repeat_interleave(torch.arange(cuk.numel() - 1, device=dev), cuk[1:] - cuk[:-1])
 
-    # (b=1, h, s, d)
+    # (b=1, h, s, d) — bf16 views only; NO full-width fp32 copies (at 131k tokens × hd512 a single
+    # fp32 (1,32,Tk,512) materialization is 8.6GB — delta is instead computed per q-block in fp32).
     qb_all = q.unsqueeze(0).transpose(1, 2)                 # (1,hq,Tq,d)
-    of = out.float().unsqueeze(0).transpose(1, 2)           # (1,hq,Tq,dv)
+    of_all = out.unsqueeze(0).transpose(1, 2)               # (1,hq,Tq,dv) bf16 view
     dob_all = dout.unsqueeze(0).transpose(1, 2)             # (1,hq,Tq,dv)
     kt = k.unsqueeze(0).transpose(1, 2)                     # (1,hkv,Tk,d)
     vt = v.unsqueeze(0).transpose(1, 2)                     # (1,hkv,Tk,dv)
@@ -205,10 +213,11 @@ def _ring_bwd(dout, q, k, v, out, lse, scale, causal, window_size, cu_q, cu_k,
     vf_e = vt.repeat_interleave(g, dim=1) if g != 1 else vt
     lse_all = lse.unsqueeze(0).unsqueeze(-1)                # (1,hq,Tq,1)
 
-    delta = (dob_all.float() * of).sum(-1)                  # (1,hq,Tq)  = rowsum(dO . O)
     dq = torch.empty((1, hq, Tq, d), dtype=q.dtype, device=dev)
-    dk_e = torch.zeros((1, hq, Tk, d), dtype=torch.float32, device=dev)
-    dv_e = torch.zeros((1, hq, Tk, dv_dim), dtype=torch.float32, device=dev)
+    # dk/dv accumulate at KV-HEAD granularity (per-block g-sum before the scatter) — g× smaller
+    # full-width fp32 buffers (2.2GB vs 17GB at 131k×hd512×32q/4kv).
+    dk_e = torch.zeros((1, hkv, Tk, d), dtype=torch.float32, device=dev)
+    dv_e = torch.zeros((1, hkv, Tk, dv_dim), dtype=torch.float32, device=dev)
 
     offset = Tk - Tq                                        # bottom-right causal alignment
     pure_causal = causal and wl is None and wr is None
@@ -216,18 +225,45 @@ def _ring_bwd(dout, q, k, v, out, lse, scale, causal, window_size, cu_q, cu_k,
     j_full = torch.arange(Tk, device=dev).view(1, Tk)
     for q0 in range(0, Tq, q_block):
         q1 = min(q0 + q_block, Tq)
-        kmax = min(Tk, q1 + offset) if pure_causal else Tk
+        kmax = min(Tk, q1 + offset) if causal else Tk       # causal bound holds with or without varlen
         qb = qb_all[:, :, q0:q1]                            # (1,hq,bm,d)
         dob = dob_all[:, :, q0:q1]
-        deltab = delta[:, :, q0:q1].unsqueeze(-1)           # (1,hq,bm,1)
+        # delta = rowsum(dO · O), fp32, computed per block (identical numerics to the old full-width
+        # fp32 product — just never materializes the two 8.6GB fp32 copies).
+        deltab = (dob.float() * of_all[:, :, q0:q1].float()).sum(-1, keepdim=True)  # (1,hq,bm,1)
         lseb = lse_all[:, :, q0:q1]                         # (1,hq,bm,1) global lse
-        kf_b, vf_b = kf_e[:, :, :kmax], vf_e[:, :, :kmax]
+
+        # Column pre-selection — THE long-context lever (the dense q_block × Tk matmul is quadratic
+        # in tokens/rank and dominates 100k+-token steps): keep only k columns inside the causal
+        # bound that share a DOC with this q-block (multipacked bins are block-diagonal; a ~30k-doc
+        # column slice replaces the full chunk) and, when sliding, inside the window. Conservative
+        # superset — the exact mask below still applies.
+        idx = None
+        if is_varlen_mask or wl is not None:
+            colm = torch.ones(kmax, dtype=torch.bool, device=dev)
+            if is_varlen_mask:
+                colm &= torch.isin(doc_k[:kmax], torch.unique(doc_q[q0:q1]))
+            if wl is not None:
+                colm &= j_full[0, :kmax] >= (q0 + offset - wl)
+            idx = colm.nonzero(as_tuple=False).squeeze(1)
+            if idx.numel() == 0:
+                dq[:, :, q0:q1] = 0
+                continue
+            if idx.numel() == kmax:
+                idx = None                                  # nothing pruned: use the cheap slice path
+        if idx is None:
+            kf_b, vf_b = kf_e[:, :, :kmax], vf_e[:, :, :kmax]
+            j_idx = j_full[:, :kmax]
+            dk_j = doc_k[:kmax] if is_varlen_mask else None
+        else:
+            kf_b, vf_b = kf_e.index_select(2, idx), vf_e.index_select(2, idx)
+            j_idx = idx.view(1, -1)
+            dk_j = doc_k[idx] if is_varlen_mask else None
 
         mask = None
         if masked:
             i_idx = torch.arange(q0, q1, device=dev).view(-1, 1) + offset
-            j_idx = j_full[:, :kmax]
-            mask = torch.zeros((q1 - q0, kmax), dtype=torch.bool, device=dev)
+            mask = torch.zeros((q1 - q0, j_idx.shape[1]), dtype=torch.bool, device=dev)
             if causal or wr is not None:
                 wr_eff = wr if (wr is not None and not causal) else 0
                 if causal and wr is None:
@@ -237,25 +273,31 @@ def _ring_bwd(dout, q, k, v, out, lse, scale, causal, window_size, cu_q, cu_k,
             if wl is not None:
                 mask |= j_idx < i_idx - wl
             if is_varlen_mask:
-                mask |= doc_q[q0:q1].view(-1, 1) != doc_k[:kmax].view(1, -1)
-            mask = mask.view(1, 1, q1 - q0, kmax)
+                mask |= doc_q[q0:q1].view(-1, 1) != dk_j.view(1, -1)
+            mask = mask.view(1, 1, q1 - q0, -1)
 
-        s = torch.matmul(qb, kf_b.transpose(-1, -2)).float() * scale   # (1,hq,bm,kmax)
+        s = torch.matmul(qb, kf_b.transpose(-1, -2)).float() * scale   # (1,hq,bm,|cols|)
         if mask is not None:
             s = s.masked_fill(mask, float("-inf"))
         p = torch.exp(s - lseb)                             # GLOBAL-normalised probabilities
         p_cast = p.to(q.dtype)
         dp = torch.matmul(dob, vf_b.transpose(-1, -2)).float()
         ds = (p * (dp - deltab) * scale).to(q.dtype)
-        dv_e[:, :, :kmax] += torch.matmul(p_cast.transpose(-1, -2), dob).float()
+        bdv = torch.matmul(p_cast.transpose(-1, -2), dob).float()      # (1,hq,|cols|,dv)
+        bdk = torch.matmul(ds.transpose(-1, -2), qb).float()           # (1,hq,|cols|,d)
         dq[:, :, q0:q1] = torch.matmul(ds, kf_b)
-        dk_e[:, :, :kmax] += torch.matmul(ds.transpose(-1, -2), qb).float()
+        if g != 1:  # reduce expanded kv-head grads to hkv heads per block
+            ncols = bdv.shape[2]
+            bdv = bdv.view(1, hkv, g, ncols, dv_dim).sum(2)
+            bdk = bdk.view(1, hkv, g, ncols, d).sum(2)
+        if idx is None:
+            dv_e[:, :, :kmax] += bdv
+            dk_e[:, :, :kmax] += bdk
+        else:
+            dv_e.index_add_(2, idx, bdv)
+            dk_e.index_add_(2, idx, bdk)
 
-    if g != 1:  # reduce expanded kv-head grads back to hkv heads
-        dk = dk_e.view(1, hkv, g, Tk, d).sum(2)
-        dvv = dv_e.view(1, hkv, g, Tk, dv_dim).sum(2)
-    else:
-        dk, dvv = dk_e, dv_e
+    dk, dvv = dk_e, dv_e
 
     dq_buf[:Tq] = dq.transpose(1, 2).squeeze(0).to(q.dtype)
     dk_buf[:Tk] = dk.transpose(1, 2).squeeze(0).to(q.dtype)
@@ -467,25 +509,79 @@ def _posaware_mask(q_pos, q_doc, k_pos, k_doc, window):
     return keep
 
 
-def _win_cols(q_pos_blk, k_pos, window):
-    """Column pre-selection for a q-block: only k columns with ANY chance of being kept —
-    causal (k_pos <= max q_pos) and, with a sliding window, within it (k_pos >= min q_pos −
-    window). Turns the per-block matmul from O(Tk) columns into O(window + q_block) for sliding
+def _cpu_of(t):
+    """Cached CPU copy of a (static per-batch) position tensor — block min/max bounds then cost
+    zero GPU syncs. Attached to the tensor so its lifetime (one batch) is the cache's lifetime."""
+    c = getattr(t, "_sgpu_cpu_copy", None)
+    if c is None:
+        c = t.detach().to("cpu")
+        t._sgpu_cpu_copy = c
+    return c
+
+
+def _pos_segments(q_pos, Tq):
+    """Contiguous-POSITION runs of the local (zigzag) layout, cached on the tensor. Blocking the
+    posaware q-loop per segment is what makes the window column-bound actually bind: under zigzag
+    the local rows are per-doc chunk pairs (front, back), so a row-index block that CROSSES a
+    segment seam has qmax−qmin ≈ the whole doc — its column window degenerates to ~doc_len columns
+    (~27k-130k instead of window+block ≈ 5k) and the sliding layers go quadratic again (the 512k
+    'step never lands' crawl, round two). Segments end wherever positions jump (¬(+1))."""
+    segs = getattr(q_pos, "_sgpu_segments", None)
+    if segs is None:
+        qc = _cpu_of(q_pos)
+        jump = (qc[1:] != qc[:-1] + 1).nonzero(as_tuple=False).squeeze(1)
+        bounds = [0] + (jump + 1).tolist() + [Tq]
+        segs = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+        q_pos._sgpu_segments = segs
+    return segs
+
+
+def _seg_blocks(q_pos, Tq, q_block):
+    """(s0, s1) q-blocks that never cross a contiguous-position segment boundary."""
+    for a, b in _pos_segments(q_pos, Tq):
+        for s0 in range(a, b, q_block):
+            yield s0, min(s0 + q_block, b)
+
+
+def _win_cols(q_pos, q_doc, s0, s1, k_pos, k_doc, window):
+    """Column pre-selection for the q-block rows [s0:s1): only k columns with ANY chance of being
+    kept — causal (k_pos <= max q_pos), with a sliding window inside it (k_pos >= min q_pos −
+    window), and SHARING A DOC with the block. The doc filter is load-bearing on multipacked bins:
+    positions RESTART per doc, so a numeric window like [qmin−1024, qmax] near a doc start matches
+    that position range in EVERY doc of the chunk (~19 docs × ~1.3k ≈ 26k columns → 13.8GB fp32
+    ds blocks, the v5 OOM); intersecting with the block's docs restores O(window + q_block) columns.
+    Turns the per-block matmul from O(Tk) columns into O(window + q_block) for sliding
     layers — THE long-context lever for the posaware path (window ≪ Tk at 128k+ tokens/rank).
     Returns a LongTensor index (possibly empty). Conservative (a superset of the kept columns:
-    doc boundaries are still enforced by the exact mask afterwards)."""
-    colm = k_pos <= int(q_pos_blk.max())
-    if window is not None:
-        colm &= k_pos >= (int(q_pos_blk.min()) - window)
-    return colm.nonzero(as_tuple=False).squeeze(1)
+    doc boundaries are still enforced by the exact mask afterwards).
+
+    CACHED on the k_pos tensor keyed by (s0, s1, window): positions are per-BATCH static and every
+    sliding LAYER (plus the AC recompute and the backward) re-walks the same blocks — one compute
+    serves all ~52 layers. The cache dies with the tensor (new batch → new gathered tensors), so no
+    explicit invalidation; block bounds come from a cached CPU copy (no GPU syncs)."""
+    cache = getattr(k_pos, "_sgpu_win_cols", None)
+    if cache is None:
+        cache = {}
+        k_pos._sgpu_win_cols = cache
+    key = (s0, s1, window)
+    idx = cache.get(key)
+    if idx is None:
+        qc = _cpu_of(q_pos)[s0:s1]
+        colm = k_pos <= int(qc.max())
+        if window is not None:
+            colm &= k_pos >= (int(qc.min()) - window)
+        colm &= torch.isin(k_doc, torch.unique(q_doc[s0:s1]))
+        idx = colm.nonzero(as_tuple=False).squeeze(1)
+        cache[key] = idx
+    return idx
 
 
-def _posaware_fwd_block(q, k, v, q_pos, q_doc, k_pos, k_doc, scale, window, q_block=None):
+def _posaware_fwd_block(q, k, v, q_pos, q_doc, k_pos, k_doc, scale, window, q_block=None):  # noqa: E501
     """out (Tq,H,Dv) + lse (H,Tq) for local q vs one ring kv block, global-position masked.
     Blocked over q so the (H,bm,·) score is bounded; k columns are pre-selected per block
     (causal + window superset — exact masking follows). Fully-masked rows get lse=-inf
     (contribute nothing to the online-softmax combine)."""
-    q_block = q_block or _RING_QB
+    q_block = q_block or _POSAWARE_QB
     Tq, hq, d = q.shape
     Tk, hkv, dv = v.shape
     g = hq // hkv
@@ -496,9 +592,8 @@ def _posaware_fwd_block(q, k, v, q_pos, q_doc, k_pos, k_doc, scale, window, q_bl
     vf = (vt.repeat_interleave(g, dim=0) if g != 1 else vt).to(cd)
     out = torch.empty(Tq, hq, dv, dtype=torch.float32, device=dev)
     lse = torch.empty(hq, Tq, dtype=torch.float32, device=dev)
-    for s0 in range(0, Tq, q_block):
-        s1 = min(s0 + q_block, Tq)
-        idx = _win_cols(q_pos[s0:s1], k_pos, window)
+    for s0, s1 in _seg_blocks(q_pos, Tq, q_block):
+        idx = _win_cols(q_pos, q_doc, s0, s1, k_pos, k_doc, window)
         if idx.numel() == 0:
             out[s0:s1] = 0.0
             lse[:, s0:s1] = float("-inf")
@@ -526,7 +621,7 @@ def _posaware_bwd_block(dout, q, k, v, out, lse, q_pos, q_doc, k_pos, k_doc, sca
     GLOBAL lse (p = exp(scale*S - lse)). Same math as _ring_bwd, masked by global positions;
     k columns pre-selected per q-block (superset — exact mask follows), contributions scattered
     back with index_add_."""
-    q_block = q_block or _RING_QB
+    q_block = q_block or _POSAWARE_QB
     Tq, hq, d = q.shape
     Tk, hkv, dv = v.shape
     g = hq // hkv
@@ -541,9 +636,8 @@ def _posaware_bwd_block(dout, q, k, v, out, lse, q_pos, q_doc, k_pos, k_doc, sca
     dq = torch.zeros(hq, Tq, d, dtype=torch.float32, device=dev)
     dk_e = torch.zeros(hq, Tk, d, dtype=torch.float32, device=dev)
     dv_e = torch.zeros(hq, Tk, dv, dtype=torch.float32, device=dev)
-    for s0 in range(0, Tq, q_block):
-        s1 = min(s0 + q_block, Tq)
-        idx = _win_cols(q_pos[s0:s1], k_pos, window)
+    for s0, s1 in _seg_blocks(q_pos, Tq, q_block):
+        idx = _win_cols(q_pos, q_doc, s0, s1, k_pos, k_doc, window)
         if idx.numel() == 0:
             continue                                                  # no kept columns: zero grads
         kf_b = kf.index_select(1, idx); vf_b = vf.index_select(1, idx)
@@ -578,11 +672,22 @@ def _gather_posdoc(group, pos, doc, world_size):
     pattern the fused zigzag path is verified with. Returns lists indexed by GROUP rank; the block
     at ring step `s` uses the shard from src rank (rank - s) mod world_size.
     """
+    # CACHED per batch on the pos tensor: every sliding layer (fwd + AC recompute + bwd) gathers the
+    # SAME static positions — one collective per batch serves them all, and (critically) the returned
+    # tensors are then IDENTITY-STABLE across layers, so the _win_cols per-block index cache attached
+    # to them actually hits (a fresh gather per layer = fresh tensors = a cold cache every layer —
+    # the 512k "step never lands" crawl). Cache-hit/miss is identical on every rank (same batch, same
+    # layer order), so the collective count stays symmetric.
+    cached = getattr(pos, "_sgpu_gathered", None)
+    if cached is not None:
+        return cached
+    orig = pos                                 # attach to the CALLER's tensor (.contiguous() may copy)
     pos = pos.contiguous(); doc = doc.contiguous()
     pl = [torch.empty_like(pos) for _ in range(world_size)]
     dl = [torch.empty_like(doc) for _ in range(world_size)]
     dist.all_gather(pl, pos, group=group)
     dist.all_gather(dl, doc, group=group)
+    orig._sgpu_gathered = (pl, dl)
     return pl, dl
 
 
