@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import subprocess
 import time
 
 import httpx
@@ -17,6 +18,52 @@ from .config import MemberModel
 from . import vllm_ctl
 
 logger = logging.getLogger("worker-agent.launcher")
+
+
+# ---- Huawei Ascend (NPU) support -------------------------------------------
+# An Ascend box is detected by the driver's manager device (present on every
+# CANN install; processes hold THIS device, never /dev/davinciN). On Ascend the
+# venv installs vllm + vllm-ascend (the form supplies vllm_install_args), the
+# venv python must be >=3.10 (Euler boxes ship 3.9), members pin NPUs via
+# ASCEND_RT_VISIBLE_DEVICES, and every install/launch subprocess needs the CANN
+# env (LD_LIBRARY_PATH/ASCEND_*/PYTHONPATH from set_env.sh).
+_ASCEND_SETUP_SCRIPTS = (
+    "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+    "/usr/local/Ascend/nnal/atb/set_env.sh",  # optional (ATB); absent on some boxes
+)
+ASCEND_VENV_PYTHON = "3.11"
+
+
+def is_ascend() -> bool:
+    return os.path.exists("/dev/davinci_manager")
+
+
+_ascend_env_cache: dict | None = None
+
+
+def ascend_env() -> dict:
+    """Environment after sourcing the CANN setup scripts (cached). Captured via
+    `bash -c 'source …; env -0'` so multi-line values survive."""
+    global _ascend_env_cache
+    if _ascend_env_cache is not None:
+        return _ascend_env_cache
+    scripts = [s for s in _ASCEND_SETUP_SCRIPTS if os.path.exists(s)]
+    env: dict = {}
+    if scripts:
+        src = "; ".join(f"source {s}" for s in scripts)
+        try:
+            out = subprocess.run(
+                ["bash", "-c", f"{src}; env -0"], capture_output=True, timeout=30,
+            ).stdout
+            for chunk in out.split(b"\0"):
+                if b"=" in chunk:
+                    k, _, v = chunk.partition(b"=")
+                    env[k.decode()] = v.decode()
+        except Exception:
+            logger.exception("failed to capture Ascend CANN env — vLLM may not find libascendcl")
+            env = {}
+    _ascend_env_cache = env
+    return env
 
 # Cold model load can take many minutes: a large MoE (e.g. 35B-A3B) at a long
 # max-model-len re-downloads tens of GB (no persistent volume) and then spends
@@ -138,8 +185,11 @@ def read_failure_reason(log_path: str, tail_bytes: int = 65536) -> str | None:
         if re.search(r"(Repository Not Found|Entry Not Found|GatedRepo|401 Client Error|"
                      r"403 Client Error|does not appear to have|is not a valid model)", line):
             return f"Model could not be loaded from Hugging Face: {_clean_line(line)}"[:300]
-    # 5) Missing dependency in the venv.
+    # 5) Missing dependency in the venv. (Skip vllm-ascend's benign triton probe —
+    #    see _BENIGN_ERROR_RE.)
     for line in lines:
+        if _BENIGN_ERROR_RE.search(line):
+            continue
         if "ModuleNotFoundError" in line or "No module named" in line or "ImportError" in line:
             return _clean_line(line)[:300]
     # 6) Any explicit exception line (last one — closest to the crash), skipping
@@ -165,7 +215,12 @@ async def launch_member(
     fixed file."""
     os.makedirs(log_dir, exist_ok=True)
     env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in member.gpu_indices)
+    devices = ",".join(str(g) for g in member.gpu_indices)
+    if is_ascend():
+        env.update(ascend_env())  # CANN libs; without this vLLM can't load libascendcl
+        env["ASCEND_RT_VISIBLE_DEVICES"] = devices
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = devices
     env["VLLM_SERVER_DEV_MODE"] = "1"  # exposes /sleep, /wake_up, /collective_rpc
     # Put the venv's bin dir on PATH (running {venv}/bin/python directly does NOT
     # activate the venv). flashinfer JIT-compiles sampling/attention kernels at
@@ -185,7 +240,10 @@ async def launch_member(
         # Pipeline parallel: split the model's layers across pp GPU groups. Total
         # GPUs used = tp * pp (the member's gpu_indices). Omitted when pp == 1.
         *(["--pipeline-parallel-size", str(member.pp)] if member.pp > 1 else []),
-        "--enable-sleep-mode",
+        # Sleep mode is skipped on Ascend: vllm-ascend's CaMeM allocator
+        # (aclrtMallocPhysical) OOMs on hosts without hugepages configured —
+        # members stay resident instead of sleep/wake time-sharing.
+        *([] if is_ascend() else ["--enable-sleep-mode"]),
         *member.extra_args,
     ]
     log_path = log_path or new_log_path(member, log_dir)
@@ -194,8 +252,9 @@ async def launch_member(
     # unique per launch. The shipper follows the current file + tags its session.
     logf = open(log_path, "wb", buffering=0)
     logger.info(
-        "launching vllm: model=%s gpus=%s tp=%d pp=%d port=%d → %s",
-        member.model, env["CUDA_VISIBLE_DEVICES"], member.tp, member.pp, member.port, log_path,
+        "launching vllm: model=%s %s=%s tp=%d pp=%d port=%d → %s",
+        member.model, "npus" if is_ascend() else "gpus", devices,
+        member.tp, member.pp, member.port, log_path,
     )
     # start_new_session=True puts the engine + its tp worker children in their
     # own process group so terminate() can SIGKILL the whole group (no orphans).
@@ -276,6 +335,10 @@ _UV_ENV_DEFAULTS = {
 
 def _uv_env() -> dict:
     env = dict(os.environ)
+    if is_ascend():
+        # CANN env for installs too — a vllm-ascend sdist build compiles custom
+        # ops against the toolkit (harmless overlay when a wheel is picked).
+        env.update(ascend_env())
     for k, v in _UV_ENV_DEFAULTS.items():
         env.setdefault(k, v)
     return env
@@ -379,19 +442,29 @@ async def ensure_venv(
                 os.makedirs(parent, exist_ok=True)
             except OSError:
                 logger.exception("could not create parent dir %s for venv", parent)
-        if not await _uv_run(uv, ["venv", venv_path], f"create venv {venv_path}"):
+        # Ascend: vllm-ascend needs python >=3.10 but Euler boxes ship 3.9 — pin
+        # the venv to a uv-managed 3.11 (uv downloads a standalone build).
+        venv_args = ["venv", venv_path]
+        if is_ascend():
+            venv_args = ["venv", "--python", ASCEND_VENV_PYTHON, venv_path]
+        if not await _uv_run(uv, venv_args, f"create venv {venv_path}"):
             return
     else:
         logger.info("venv %s exists but vLLM not importable — (re)installing %s", venv_path, desc)
     if custom:
-        # Operator-provided install command (e.g. a nightly with extra index URLs,
-        # or a git fork). Run verbatim — no --torch-backend injection, no fallback.
-        try:
-            extra = shlex.split(custom)
-        except ValueError as e:
-            logger.error("vllm_install_args is not a valid shell arg string (%s) — skipping install", e)
-            extra = None
-        if extra:
+        # Operator-provided install command(s). MULTI-LINE: each non-empty line runs
+        # as its OWN `uv pip install`, in order — needed when one resolution can't
+        # express the stack (Ascend: vllm and vllm-ascend pin conflicting torch
+        # versions, so they only install sequentially; a trailing pin line can also
+        # downgrade a dep, e.g. z3-solver for an old-glibcxx host). Run verbatim —
+        # no --torch-backend injection, no fallback.
+        for line_no, line in enumerate(
+                (ln.strip() for ln in custom.splitlines() if ln.strip()), start=1):
+            try:
+                extra = shlex.split(line)
+            except ValueError as e:
+                logger.error("vllm_install_args line %d is not a valid shell arg string (%s) — skipping line", line_no, e)
+                continue
             # Leading NAME=VALUE tokens are environment assignments for the install
             # subprocess (shell-style), e.g. "VLLM_USE_PRECOMPILED=1 git+https://…@ref":
             # lets a git-fork install reuse precompiled vLLM binaries (fast, no CUDA
@@ -407,12 +480,21 @@ async def ensure_venv(
                 i += 1
             pip_args = extra[i:]
             if not pip_args:
-                logger.error("vllm_install_args has no install target after env assignments — skipping")
-            else:
-                await _uv_run(uv, ["pip", "install", "--python", py, *pip_args],
-                              f"install vLLM (custom) into {venv_path}", env_extra=env_extra or None)
+                logger.error("vllm_install_args line %d has no install target after env assignments — skipping line", line_no)
+                continue
+            await _uv_run(uv, ["pip", "install", "--python", py, *pip_args],
+                          f"install vLLM (custom, line {line_no}) into {venv_path}",
+                          env_extra=env_extra or None)
     else:
         spec = f"vllm=={vllm_version}" if vllm_version else "vllm"
+        if is_ascend():
+            # A plain CUDA vLLM can't serve NPUs — the endpoint should carry an
+            # Ascend vllm_install_args (vllm==X + vllm-ascend==Y with the Huawei
+            # extra index; the create form generates it). Install anyway so the
+            # failure is visible in the model log, but say why loudly.
+            logger.error(
+                "Ascend NPU box but no vllm_install_args — installing plain %s, which "
+                "CANNOT serve NPUs. Set the Ascend install line on the endpoint.", spec)
         # --torch-backend=auto lets uv pick the PyTorch CUDA build matching the VM's
         # driver (important on bleeding-edge GPUs); retry without it for older uv
         # that doesn't recognise the flag.
@@ -563,9 +645,16 @@ _FATAL_MARKERS = (
     "No module named",
 )
 
+# Log lines that LOOK fatal but aren't: vllm-ascend probes optional Triton kernels
+# at import ("Failed to import Triton kernels … No module named 'triton.…'") and
+# serves fine without them — killing the launch on that line aborts a healthy boot.
+_BENIGN_ERROR_RE = re.compile(r"Failed to import Triton kernels")
+
 
 def has_fatal_error(log_path: str | None, tail_bytes: int = 32768) -> bool:
-    """True if the model's log already shows an unrecoverable engine error."""
+    """True if the model's log already shows an unrecoverable engine error.
+    Per-line so known-benign errors (_BENIGN_ERROR_RE) can be skipped without
+    masking a real marker elsewhere in the tail."""
     if not log_path:
         return False
     try:
@@ -576,7 +665,12 @@ def has_fatal_error(log_path: str | None, tail_bytes: int = 32768) -> bool:
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return False
-    return any(marker in text for marker in _FATAL_MARKERS)
+    for line in text.splitlines():
+        if _BENIGN_ERROR_RE.search(line):
+            continue
+        if any(marker in line for marker in _FATAL_MARKERS):
+            return True
+    return False
 
 
 async def terminate(proc: asyncio.subprocess.Process | None, grace_s: float = 10.0) -> None:

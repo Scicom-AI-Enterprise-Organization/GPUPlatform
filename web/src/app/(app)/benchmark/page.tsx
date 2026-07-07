@@ -123,7 +123,7 @@ export default async function BenchmarkPage({
                 </p>
               </div>
             ) : (
-              <BenchmarkList initialItems={page.items} initialTotal={page.total} scope={scope} />
+              <BenchmarkList initialItems={page.items} initialTotal={page.total} scope={scope} isAdmin={!!me?.is_admin} />
             )}
           </section>
         )}

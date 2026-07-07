@@ -42,7 +42,7 @@ const STATUS_STYLES: Record<string, string> = {
 type BenchTab = (typeof TABS)[number]["value"];
 const BENCH_TAB_VALUES = TABS.map((t) => t.value) as readonly string[];
 
-export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) {
+export function BenchmarkDetail({ bench: initial, isAdmin = false }: { bench: BenchmarkRecord; isAdmin?: boolean }) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -53,6 +53,9 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
   const [bench, setBench] = useState(initial);
   // is_owner is undefined on older payloads — treat as owned for back-compat.
   const owned = bench.is_owner ?? true;
+  // Admins may rename anyone's benchmark (the gateway authorizes it); delete /
+  // visibility stay owner-only.
+  const canRename = owned || isAdmin;
   const [tab, setTabState] = useState<BenchTab>(initialTab);
   const setTab = (v: BenchTab) => {
     setTabState(v);
@@ -261,7 +264,7 @@ export function BenchmarkDetail({ bench: initial }: { bench: BenchmarkRecord }) 
               ) : (
                 <>
                   <h1 className="text-xl font-semibold tracking-tight">{bench.name}</h1>
-                  {owned && (
+                  {canRename && (
                     <button
                       type="button"
                       onClick={startRename}

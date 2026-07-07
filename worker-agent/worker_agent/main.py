@@ -73,6 +73,19 @@ def node_meta() -> dict[str, Any]:
                 meta["driver_version"] = gpus[0][2]
     except Exception:  # noqa: BLE001 — nvidia-smi absent/broken: report without GPUs
         pass
+    if "gpu_name" not in meta:
+        # Huawei Ascend box: name the NPUs from the npu-smi table instead
+        # (rows pair as "<id> <name> | health | …" — grab the first chip row).
+        try:
+            out = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=10).stdout
+            import re as _re
+            names = [n for n in _re.findall(r"^\|\s*\d+\s+(\S+)\s*\|\s*\S+\s*\|", out, _re.M)
+                     if not n.isdigit()]  # drop process-table rows ("| 0  0 | pid |…")
+            if names:
+                meta["gpu_name"] = f"Ascend {names[0]}"
+                meta["gpu_count"] = len(names)
+        except Exception:  # noqa: BLE001 — npu-smi absent: report without NPUs
+            pass
     _NODE_META = meta
     return meta
 

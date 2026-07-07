@@ -42,10 +42,12 @@ export function BenchmarkList({
   initialItems,
   initialTotal,
   scope,
+  isAdmin = false,
 }: {
   initialItems: BenchmarkRecord[];
   initialTotal: number;
   scope: "mine" | "all";
+  isAdmin?: boolean;
 }) {
   const router = useRouter();
   const sp = useSearchParams();
@@ -539,11 +541,11 @@ export function BenchmarkList({
                   selectMode={selectMode}
                   selected={selected.has(b.id)}
                   onToggle={toggle}
-                  // Only the owner can mutate a run; public runs from others are
-                  // read-only (no delete/rename/visibility actions offered).
+                  // Only the owner can delete / change visibility; admins may also
+                  // rename anyone's run (the gateway authorizes admin on rename).
                   onDelete={owned ? (bench) => setSingle(bench) : undefined}
                   onRename={
-                    owned
+                    owned || isAdmin
                       ? (bench) => {
                           setRenameTarget(bench);
                           setRenameDraft(bench.name);

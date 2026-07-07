@@ -297,16 +297,26 @@ async def resolve_app_provider(session, app, *, redis, fallback: Optional[Provid
 
     if row.kind == "vm":
         from .vm_serverless_provider import VMProvider
+        # Lazy import — providers_api imports this module, so a top-level import
+        # here would be circular.
+        from .providers_api import _vm_conn_from_cfg
         cfg = row.config or {}
-        enc = cfg.get("private_key_enc")
-        if not enc:
-            raise RuntimeError(f"vm provider {pid} has no stored private key")
+        try:
+            conn = _vm_conn_from_cfg(cfg)  # decrypts key/password + jump credentials
+        except Exception as e:
+            raise RuntimeError(f"vm provider {pid} has no usable stored credentials: {e}") from e
         inst: Provider = VMProvider(
             provider_id=pid,
-            host=cfg.get("host", ""),
-            port=int(cfg.get("port") or 22),
-            user=cfg.get("user", "root"),
-            private_key_pem=crypto.decrypt(enc),
+            host=conn["host"],
+            port=conn["port"],
+            user=conn["user"],
+            private_key_pem=conn.get("private_key"),
+            password=conn.get("password"),
+            jump_host=conn.get("jump_host"),
+            jump_port=int(conn.get("jump_port") or 22),
+            jump_user=conn.get("jump_user"),
+            jump_private_key=conn.get("jump_private_key"),
+            jump_password=conn.get("jump_password"),
             gpu_count=int(cfg.get("gpu_count") or 0),
             rdb=redis,
             # Local dev / single-gateway: forward gateway+redis to the VM over

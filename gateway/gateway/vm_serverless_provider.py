@@ -81,19 +81,31 @@ class VMProvider(Provider):
         host: str,
         port: int,
         user: str,
-        private_key_pem: str,
+        private_key_pem: Optional[str],
         gpu_count: int,
         rdb,
         gateway_public_url: Optional[str] = None,
         worker_redis_url: Optional[str] = None,
         install_spec: Optional[str] = None,
         reverse_tunnel: bool = False,
+        password: Optional[str] = None,
+        jump_host: Optional[str] = None,
+        jump_port: int = 22,
+        jump_user: Optional[str] = None,
+        jump_private_key: Optional[str] = None,
+        jump_password: Optional[str] = None,
     ) -> None:
         self._provider_id = provider_id
         self._host = host
         self._port = int(port or 22)
         self._user = user or "root"
         self._private_key_pem = private_key_pem
+        self._password = password
+        self._jump_host = (jump_host or "").strip() or None
+        self._jump_port = int(jump_port or 22)
+        self._jump_user = jump_user or "root"
+        self._jump_private_key = jump_private_key
+        self._jump_password = jump_password
         self._gpu_count = int(gpu_count or 0)
         self._rdb = rdb
         # Where workers phone home. Same reachability caveat as RunPod: localhost
@@ -289,6 +301,30 @@ class VMProvider(Provider):
             await self._ensure_tunnel()
         await self._ensure_proxy_forwards()
 
+    def _tunnel_jump(self):
+        """vm_tunnel.Jump for this provider, or None. Tunnels run OpenSSH in
+        BatchMode, so both hops need KEY auth — password-only creds can't tunnel
+        (that's also why the worker path requires a key on the VM)."""
+        if not self._jump_host:
+            return None
+        from . import vm_tunnel
+        if not self._jump_private_key:
+            raise RuntimeError(
+                "jump host has no private key — SSH tunnels (reverse/forward) need key auth on both hops"
+            )
+        return vm_tunnel.Jump(
+            host=self._jump_host, port=self._jump_port,
+            user=self._jump_user, pkey_pem=self._jump_private_key,
+        )
+
+    def _require_key(self) -> str:
+        if not self._private_key_pem:
+            raise RuntimeError(
+                "VM provider has password-only credentials — serverless tunnels need key auth; "
+                "add a private key to the provider"
+            )
+        return self._private_key_pem
+
     async def _ensure_tunnel(self) -> None:
         if not self._reverse_tunnel:
             return
@@ -300,7 +336,8 @@ class VMProvider(Provider):
             vm_tunnel.Forward(self._tunnel_redis[1], self._tunnel_redis[0], self._tunnel_redis[1]),
         ]
         await asyncio.to_thread(
-            vm_tunnel.ensure, self._host, self._port, self._user, self._private_key_pem, forwards,
+            vm_tunnel.ensure, self._host, self._port, self._user, self._require_key(), forwards,
+            self._tunnel_jump(),
         )
 
     @staticmethod
@@ -331,7 +368,8 @@ class VMProvider(Provider):
             return
         local_port = await asyncio.to_thread(
             vm_tunnel.ensure_forward,
-            self._host, self._port, self._user, self._private_key_pem, port,
+            self._host, self._port, self._user, self._require_key(), port,
+            "127.0.0.1", self._tunnel_jump(),
         )
         upstream = f"http://127.0.0.1:{local_port}"
         await self._rdb.set(f"proxy:{app_id}:upstream", upstream)
@@ -354,7 +392,8 @@ class VMProvider(Provider):
             try:
                 local_port = await asyncio.to_thread(
                     vm_tunnel.ensure_forward,
-                    self._host, self._port, self._user, self._private_key_pem, int(vmport),
+                    self._host, self._port, self._user, self._require_key(), int(vmport),
+                    "127.0.0.1", self._tunnel_jump(),
                 )
             except Exception as e:
                 logger.warning("vm-proxy: app=%s forward re-ensure failed: %s", app_id, e)
@@ -386,38 +425,43 @@ class VMProvider(Provider):
         return worker_env
 
     def _connect_sync(self, attempts: int = 4):
+        """Open SSH to the VM (optionally via jump host / password auth — the
+        vm_probe._connect helper). Returns a client whose .close() also closes
+        the jump connection, so existing call sites stay single-handle."""
         import time
 
-        import paramiko
-
-        pkey = vm_probe._load_pkey(self._private_key_pem)
         last_err: Exception | None = None
         for i in range(attempts):
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             try:
-                client.connect(
-                    hostname=self._host,
-                    port=self._port,
-                    username=self._user,
-                    pkey=pkey,
-                    timeout=SSH_TIMEOUT_S,
-                    banner_timeout=SSH_TIMEOUT_S,
-                    auth_timeout=SSH_TIMEOUT_S,
-                    look_for_keys=False,
-                    allow_agent=False,
+                client, jump = vm_probe._connect(
+                    self._host, self._port, self._user,
+                    private_key=self._private_key_pem, password=self._password,
+                    jump_host=self._jump_host, jump_port=self._jump_port,
+                    jump_user=self._jump_user, jump_private_key=self._jump_private_key,
+                    jump_password=self._jump_password,
                 )
+                if jump is not None:
+                    # Chain the jump client's close onto the target's so the
+                    # `client.close()` in every finally block tears down both.
+                    orig_close = client.close
+
+                    def _close_both(_orig=orig_close, _jump=jump):
+                        try:
+                            _orig()
+                        finally:
+                            try:
+                                _jump.close()
+                            except Exception:
+                                pass
+
+                    client.close = _close_both  # type: ignore[method-assign]
                 return client
-            except (paramiko.SSHException, EOFError, OSError) as e:
+            except RuntimeError as e:
                 # Proxied SSH front-ends (e.g. Alibaba PAI DSW) drop handshakes
                 # under concurrent connection load with "EOF during negotiation".
                 # Retry with backoff — these are transient and a clean retry
                 # usually lands once the reverse-tunnel handshake isn't racing.
                 last_err = e
-                try:
-                    client.close()
-                except Exception:
-                    pass
                 if i < attempts - 1:
                     logger.warning("ssh connect to %s failed (%s), retry %d/%d", self._host, e, i + 1, attempts)
                     time.sleep(1.5 * (i + 1))
@@ -491,7 +535,10 @@ class VMProvider(Provider):
             script = (
                 f"set -e; mkdir -p {REMOTE_DIR}; "
                 f"if [ ! -x {venv}/bin/python ]; then "
-                f"  (command -v uv >/dev/null 2>&1 && uv venv {venv}) "
+                # worker-agent needs python >=3.10 but some boxes ship 3.9 (the TM
+                # NPU box's EulerOS) — prefer a uv-managed 3.11 (downloads a
+                # standalone build), fall back to the box python.
+                f"  (command -v uv >/dev/null 2>&1 && (uv venv --python 3.11 {venv} || uv venv {venv})) "
                 f"  || python3 -m venv {venv}; "
                 f"fi; "
                 + install_block +

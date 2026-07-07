@@ -108,8 +108,18 @@ procs with commands from `/proc` (`@@NPUPROCCMD`). ⚠ In NPU mode the `@@FDPROC
 Ascend procs hold `/dev/davinci_manager`, never `/dev/davinciN`, so fd→device mapping is impossible
 and the heavy-fallback would attach every proc to every NPU; npu-smi's table is complete (bare
 metal). Verified e2e on the TM box (8× 910B3 via ssh.tma01.gpu.tm.com.my). Metrics UI renders
-"NPUs" cards with AICore%/HBM/power/health; jump/password providers only cover the metrics
-surface — training/serverless/tunnel paths still assume direct key SSH.
+"NPUs" cards with AICore%/HBM/power/health.
+
+**Serverless through a jump host** (added same day, verified e2e with endpoint `npu-qwen3`):
+`VMProvider` + `vm_tunnel` are jump-aware — provisioning SSH goes through
+`vm_probe._connect` (jump = paramiko direct-tcpip), and the autossh reverse/forward tunnels
+add `-o ProxyCommand=ssh -i <jumpkey> -W %h:%p …` (`vm_tunnel.Jump`; ProxyJump can't take a
+per-hop `-i`). ⚠ Tunnels run OpenSSH **BatchMode → key auth required on BOTH hops** —
+password-only VM providers get a clear RuntimeError from `_require_key`/`_tunnel_jump`.
+`resolve_app_provider` decrypts the full conn (incl. jump) via `providers_api._vm_conn_from_cfg`
+(lazy import — circular otherwise). The worker venv (`~/.sgpu/venv`) is created with
+`uv venv --python 3.11` (worker-agent needs ≥3.10; the TM NPU box ships 3.9). Training paths
+still assume direct key SSH. Ascend serving specifics live in **worker-agent CLAUDE.md**.
 
 Benchmark results show an **"individual TPS"** KPI = output tok/s ÷ concurrency (per-stream decode rate;
 `perStreamOutputTps` in `web/src/lib/bench-results.ts`, surfaced in `benchmark/[id]/tabs/results.tsx`).

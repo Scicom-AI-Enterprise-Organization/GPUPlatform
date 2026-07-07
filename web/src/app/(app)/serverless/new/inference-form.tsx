@@ -88,6 +88,27 @@ const VLLM_NIGHTLY_ARGS =
   "-U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130 --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match";
 // Default vLLM version installed into the VM/pod venv when none is pinned.
 const DEFAULT_VLLM_VERSION = "0.23.0";
+// Huawei Ascend NPU (vllm-ascend) — matched pair verified on CANN 8.5.2 (the TM
+// 910B3 box). One uv command: vLLM (its python layer; the NPU platform plugin
+// comes from vllm-ascend) + vllm-ascend from the Huawei wheel index. The worker
+// detects Ascend itself (venv python 3.11, CANN env, ASCEND_RT_VISIBLE_DEVICES).
+// Three sequential installs (one per line — the worker runs each line as its own
+// `uv pip install`): vllm and vllm-ascend pin conflicting torch versions so they
+// can't co-resolve; the trailing pins fix runtime imports on the TM box —
+// setuptools<81 restores pkg_resources (torchair needs it) and the older
+// z3-solver is a manylinux2014 build (newer wheels need GLIBCXX_3.4.29, which
+// EulerOS hosts don't have). v0.18.0 is the newest STABLE pair for CANN 8.5.x —
+// the 0.22.1rc1 wheels are built against CANN 9.0 and die at runtime on 8.5.
+const ASCEND_INSTALL_ARGS = [
+  "VLLM_TARGET_DEVICE=empty vllm==0.18.0",
+  "vllm-ascend==0.18.0 " +
+    "--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/variant " +
+    "--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi " +
+    "--index-strategy unsafe-best-match",
+  "setuptools<81 z3-solver==4.12.2.0",
+].join("\n");
+// Big-disk default on the TM NPU box; editable like any venv path.
+const ASCEND_VENV_PATH = "/data/nvme0/sgpu/vllm-ascend-venv";
 // Custom vLLM fork (git) — the Gemma-4 FA4 "CUTE" fork + what it needs to run.
 const GEMMA4_FA4_FORK_URL = "https://github.com/Scicom-AI-Enterprise-Organization/vllm-gemma4-fa4-cute";
 const GEMMA4_FA4_REF = "main";
@@ -339,6 +360,17 @@ export function InferenceForm() {
     isVm ? (vmKind === "proxy" ? "proxy" : "multi") : cloudMulti ? "multi" : "single";
   const selectedProvider = providers.find((p) => p.id === vmProviderId) || null;
   const vmGpuCount = selectedProvider?.gpu_count ?? 0;
+  // Huawei Ascend NPU provider (probed accelerator names start "Ascend"). The
+  // worker self-detects Ascend on the box; the form's job is the right install
+  // line + hiding CUDA-only affordances.
+  const isAscend = isVm && !!selectedProvider?.gpus?.[0]?.startsWith("Ascend");
+  // Picking an Ascend provider pre-fills the proven vllm-ascend install line +
+  // a big-disk venv path — only when the user hasn't customised them.
+  useEffect(() => {
+    if (!isAscend) return;
+    setVllmInstallArgs((s) => (s.trim() ? s : ASCEND_INSTALL_ARGS));
+    setVenvPath((p) => (!p.trim() || p === "/share/vllm-venv" ? ASCEND_VENV_PATH : p));
+  }, [isAscend]);
   // Optional GPU pin. vdIds = chosen physical ids; vdInvalid flags bad input;
   // effectiveVmGpuCount (pin length, or all VM GPUs) drives TP choices + packing.
   const vdRaw = visibleDevices.trim();
@@ -551,7 +583,9 @@ export function InferenceForm() {
             ...(hasEnvVars ? { env_vars: envVars } : {}),
             ...(vdRaw ? { visible_devices: vdRaw } : {}),
             ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
-            ...(vllmVersion.trim() ? { vllm_version: vllmVersion.trim() } : {}),
+            // Ascend: the install args own the whole stack — the (hidden) CUDA
+            // version field must not leak into the app.
+            ...(vllmVersion.trim() && !isAscend ? { vllm_version: vllmVersion.trim() } : {}),
             ...(vllmInstallArgs.trim() ? { vllm_install_args: vllmInstallArgs.trim() } : {}),
             ...(preScript.trim() ? { pre_script: preScript } : {}),
           }
@@ -638,7 +672,9 @@ export function InferenceForm() {
         ? {
             ...(vdRaw ? { visible_devices: vdRaw } : {}),
             ...(venvPath.trim() ? { venv_path: venvPath.trim() } : {}),
-            ...(vllmVersion.trim() ? { vllm_version: vllmVersion.trim() } : {}),
+            // Ascend: the install args own the whole stack — the (hidden) CUDA
+            // version field must not leak into the app.
+            ...(vllmVersion.trim() && !isAscend ? { vllm_version: vllmVersion.trim() } : {}),
             ...(vllmInstallArgs.trim() ? { vllm_install_args: vllmInstallArgs.trim() } : {}),
             ...(preScript.trim() ? { pre_script: preScript } : {}),
           }
@@ -1076,7 +1112,16 @@ export function InferenceForm() {
               )}
             </div>
 
-            {(isVm || cloudMulti) && (
+            {isAscend && (
+              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                <span className="font-medium">Huawei Ascend NPU provider</span> — this VM serves via{" "}
+                <span className="font-mono">vllm-ascend</span>. The install args below carry the matched
+                vLLM + vllm-ascend pair (CANN 8.5.x); the worker sources the CANN env, builds the venv
+                with Python 3.11 and pins models to NPUs automatically.
+              </div>
+            )}
+
+            {(isVm || cloudMulti) && !isAscend && (
               <Field
                 label="vLLM version (optional)"
                 hint={
@@ -1095,7 +1140,7 @@ export function InferenceForm() {
               </Field>
             )}
 
-            {(isVm || cloudMulti) && (
+            {(isVm || cloudMulti) && !isAscend && (
               <Field
                 label="Custom vLLM fork (git)"
                 hint="Install a forked vLLM from a git repo (e.g. the Gemma-4 FA4 CUTE fork). Precompiled reuses stock binaries over the fork's Python — fast, no CUDA toolchain; uncheck to build CUDA from source. Applying fills the install args below (which override the version)."
@@ -1150,15 +1195,15 @@ export function InferenceForm() {
             {(isVm || cloudMulti) && (
               <Field
                 label="vLLM install args (advanced)"
-                hint="Full `uv pip install` args for vLLM, used verbatim (overrides the version above) — for nightly / custom CUDA / git-fork builds. Leading NAME=VALUE tokens become install env (e.g. VLLM_USE_PRECOMPILED=1). The worker runs `uv pip install --python {venv}/bin/python <these args>`."
+                hint="Full `uv pip install` args for vLLM, used verbatim (overrides the version above) — for nightly / custom CUDA / git-fork / Ascend builds. Leading NAME=VALUE tokens become install env (e.g. VLLM_USE_PRECOMPILED=1). Multiple lines run as SEPARATE sequential installs (for stacks one resolve can't express, e.g. vllm + vllm-ascend). The worker runs `uv pip install --python {venv}/bin/python <line>` per line."
               >
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setVllmInstallArgs(VLLM_NIGHTLY_ARGS)}
+                    onClick={() => setVllmInstallArgs(isAscend ? ASCEND_INSTALL_ARGS : VLLM_NIGHTLY_ARGS)}
                     className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted"
                   >
-                    Insert nightly (cu130)
+                    {isAscend ? "Insert Ascend (CANN 8.5)" : "Insert nightly (cu130)"}
                   </button>
                   {vllmInstallArgs.trim() && (
                     <button

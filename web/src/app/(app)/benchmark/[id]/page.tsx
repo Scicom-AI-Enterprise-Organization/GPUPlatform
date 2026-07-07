@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { gateway } from "@/lib/gateway";
 import { currentUsername } from "@/lib/current-user";
+import { getMe } from "@/lib/me";
 import { BenchmarkDetail } from "./benchmark-detail";
 
 export default async function BenchmarkDetailPage({
@@ -10,7 +11,7 @@ export default async function BenchmarkDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const username = await currentUsername();
+  const [username, me] = await Promise.all([currentUsername(), getMe()]);
   let bench;
   try {
     bench = await gateway.getBenchmark(id);
@@ -38,7 +39,7 @@ export default async function BenchmarkDetailPage({
         crumbs={[{ label: "Benchmark", href: "/benchmark" }, { label: bench.name }]}
         username={username}
       />
-      <BenchmarkDetail bench={bench} />
+      <BenchmarkDetail bench={bench} isAdmin={!!me?.is_admin} />
     </div>
   );
 }

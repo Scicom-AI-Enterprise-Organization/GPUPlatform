@@ -53,6 +53,31 @@ _SSH = shutil.which("ssh") or "ssh"
 _FWD_LOCK = threading.Lock()
 
 
+@dataclass(frozen=True)
+class Jump:
+    """An SSH jump host (ProxyJump) in front of the VM — e.g. the TM NPU boxes
+    behind ssh.tma01.gpu.tm.com.my. Key auth ONLY: the tunnels run OpenSSH in
+    BatchMode, so neither hop can prompt for a password."""
+    host: str
+    port: int
+    user: str
+    pkey_pem: str
+
+
+def _proxy_command_opts(jump: Optional[Jump]) -> list[str]:
+    """`-o ProxyCommand=…` routing the connection through the jump host with its
+    own identity file (ProxyJump can't take a per-hop -i on the CLI)."""
+    if jump is None:
+        return []
+    jkey = _keyfile_for(f"jump:{jump.host}", jump.pkey_pem)
+    proxy = (
+        f"ssh -i {jkey} -W %h:%p -p {jump.port} "
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes "
+        f"{jump.user}@{jump.host}"
+    )
+    return ["-o", f"ProxyCommand={proxy}"]
+
+
 @dataclass
 class _FwdProc:
     proc: "subprocess.Popen"
@@ -100,7 +125,8 @@ def _port_accepting(port: int, timeout: float) -> bool:
 
 
 def _ssh_forward_cmd(local_port: int, vm_host: str, vm_port: int,
-                     host: str, port: int, user: str, keyfile: str) -> list[str]:
+                     host: str, port: int, user: str, keyfile: str,
+                     jump: Optional[Jump] = None) -> list[str]:
     opts = [
         "-N", "-T",
         "-o", "ServerAliveInterval=15",
@@ -110,6 +136,7 @@ def _ssh_forward_cmd(local_port: int, vm_host: str, vm_port: int,
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={CONNECT_TIMEOUT_S}",
+        *_proxy_command_opts(jump),
         "-i", keyfile,
         "-p", str(port),
         "-L", f"127.0.0.1:{local_port}:{vm_host}:{vm_port}",
@@ -121,7 +148,7 @@ def _ssh_forward_cmd(local_port: int, vm_host: str, vm_port: int,
 
 
 def _ssh_reverse_cmd(forwards: "tuple[Forward, ...]", host: str, port: int,
-                     user: str, keyfile: str) -> list[str]:
+                     user: str, keyfile: str, jump: Optional[Jump] = None) -> list[str]:
     """Native-OpenSSH reverse tunnel: bind each `127.0.0.1:vm_port` on the VM and
     pump it back to the gateway's `local_host:local_port`. Same resilient flags as
     the forward path — autossh + ServerAlive keepalives + ExitOnForwardFailure, so
@@ -136,6 +163,7 @@ def _ssh_reverse_cmd(forwards: "tuple[Forward, ...]", host: str, port: int,
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={CONNECT_TIMEOUT_S}",
+        *_proxy_command_opts(jump),
         "-i", keyfile,
         "-p", str(port),
     ]
@@ -412,7 +440,8 @@ def _monitor(t: _Tunnel) -> None:
         t.stop.wait(MONITOR_INTERVAL_S)
 
 
-def ensure(host: str, port: int, user: str, pkey_pem: str, forwards: list[Forward]) -> None:
+def ensure(host: str, port: int, user: str, pkey_pem: str, forwards: list[Forward],
+           jump: Optional[Jump] = None) -> None:
     """Idempotent: ensure a live reverse tunnel to `host` with `forwards`. Cheap
     no-op when the autossh subprocess is still alive. Safe to call every autoscaler
     tick. Native OpenSSH (autossh `ssh -R`), NOT paramiko: OpenSSH does the relay in
@@ -431,7 +460,7 @@ def ensure(host: str, port: int, user: str, pkey_pem: str, forwards: list[Forwar
         # VM ports → kill it so our fresh `-R` bind isn't denied.
         _kill_stale_reverse(host, int(port), fwds)
         keyfile = _keyfile_for(host, pkey_pem)
-        cmd = _ssh_reverse_cmd(fwds, host, port, user, keyfile)
+        cmd = _ssh_reverse_cmd(fwds, host, port, user, keyfile, jump=jump)
         env = {**os.environ, "AUTOSSH_GATETIME": "0"}  # keep retrying even if the 1st bind races a release
         proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -489,7 +518,8 @@ def _forward_listener(t: _Tunnel, fwd: LocalForward) -> None:
 
 
 def ensure_forward(host: str, port: int, user: str, pkey_pem: str,
-                   vm_port: int, vm_host: str = "127.0.0.1") -> int:
+                   vm_port: int, vm_host: str = "127.0.0.1",
+                   jump: Optional[Jump] = None) -> int:
     """Idempotent `ssh -L`: ensure a local listener on the gateway that forwards
     to `vm_host:vm_port` on the VM, via a native `autossh -L` subprocess. Returns
     the local port. Reuses a live subprocess; re-spawns a dead one (so the
@@ -508,7 +538,7 @@ def ensure_forward(host: str, port: int, user: str, pkey_pem: str,
             _kill_fwd(fp)  # dead/exited → clean up before re-spawning
         keyfile = _keyfile_for(host, pkey_pem)
         local_port = _free_local_port()
-        cmd = _ssh_forward_cmd(local_port, vm_host, vm_port, host, port, user, keyfile)
+        cmd = _ssh_forward_cmd(local_port, vm_host, vm_port, host, port, user, keyfile, jump=jump)
         env = {**os.environ, "AUTOSSH_GATETIME": "0"}  # keep retrying even if the 1st connect is slow
         proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

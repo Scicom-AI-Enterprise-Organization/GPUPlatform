@@ -32,6 +32,36 @@ To add Whisper to an existing fleet: **Overview → Models → Edit → add the 
 Audio, Save** — that re-provisions and re-ships the worker-agent + ensures the audio deps. (A
 member needs a GPU slot; small fleets time-share via sleep/wake. Sleep-mode works fine with Whisper.)
 
+### Huawei Ascend NPU (vllm-ascend) — auto-detected, verified on the TM 910B3 box
+
+The worker serves NPUs with **no endpoint-level device flag**: `launcher.is_ascend()`
+(= `/dev/davinci_manager` exists) switches venv creation to **python 3.11** (`uv venv --python`,
+Euler boxes ship 3.9), overlays the **CANN env** (captured once from `set_env.sh` of
+ascend-toolkit + nnal/atb via `bash -c 'source …; env -0'`) onto every uv install AND vLLM
+launch, and pins members with **`ASCEND_RT_VISIBLE_DEVICES`** instead of CUDA_VISIBLE_DEVICES.
+Verified e2e on the TM box (8× 910B3, CANN 8.5.2): endpoint `npu-qwen3` through the jump-host
+reverse tunnel. Gotchas that each cost a debug cycle:
+- **`--enable-sleep-mode` is SKIPPED on Ascend** — vllm-ascend's CaMeM allocator
+  (`aclrtMallocPhysical`) OOMs on hosts without hugepages (npu-smi shows `0/0`). So NPU fleet
+  members stay resident: size fleets to fit; the sleep/wake eviction path can't run.
+- **`vllm_install_args` is now MULTI-LINE** (each line = its own sequential `uv pip install`,
+  each with its own leading NAME=VALUE env tokens) because vllm and vllm-ascend pin
+  **conflicting torch versions** — one resolve is unsatisfiable, sequential installs work.
+- **The proven CANN 8.5.x recipe** (the form's "Insert Ascend" preset): line 1
+  `VLLM_TARGET_DEVICE=empty vllm==0.18.0`; line 2 `vllm-ascend==0.18.0` + the
+  `mirrors.huaweicloud.com/ascend/repos/pypi{,/variant}` extra indexes; line 3
+  `setuptools<81 z3-solver==4.12.2.0` (torchair needs `pkg_resources` — removed in
+  setuptools 81; newer z3 wheels need GLIBCXX_3.4.29 the Euler host lacks). ⚠ Do NOT bump to
+  0.22.1rc1 on a CANN 8.5 box: its wheels target CANN 9.0 — graph mode dies on a missing
+  `qkv_rmsnorm_rope` op and eager crashes in broken triton kernels.
+- **"Failed to import Triton kernels … No module named 'triton.…'" is BENIGN** on vllm-ascend
+  (an optional-kernel probe; serving works without it). It used to trip the `No module named`
+  fatal-marker scan and kill healthy boots — `has_fatal_error`/`read_failure_reason` now skip
+  lines matching `_BENIGN_ERROR_RE`.
+- Host prereqs (one-time, on the box): CANN toolkit AND **NNAL** (`libatb.so` — installed
+  8.5.2 from ascend-repo.obs.cn-east-2.myhuaweicloud.com on 2026-07-07); without NNAL,
+  torch_npu dies loading ATB ops.
+
 ### VM endpoints self-bootstrap their vLLM venv (`venv_path` no longer needs to pre-exist)
 
 A multi-model VM/RunPod worker now **builds its own vLLM venv on boot** — name a `venv_path` that
