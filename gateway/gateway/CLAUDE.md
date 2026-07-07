@@ -96,6 +96,21 @@ VM providers only): live CPU/mem/GPU + per-GPU process list. GPU procs come from
   heavy-VRAM GPUs (best-effort — there's no host↔container pid bridge inside the container). nvidia-smi's
   *human* process table is empty in a container, but the `--query-compute-apps` query interface isn't.
 
+**Huawei Ascend NPU + jump host + password auth** (added 2026-07-07): VM providers support an
+optional **ProxyJump** (paramiko direct-tcpip through a jump SSHClient) and **password auth** per
+hop — `VmConfig.{password,jump_host,jump_port,jump_user,jump_private_key,jump_password}`, secrets
+Fernet-encrypted (`*_enc`), resolved by `providers_api._vm_conn_from_cfg`. All of vm_probe
+(probe/availability/metrics/bandwidth/kill) falls back to **`npu-smi info`** when nvidia-smi is
+absent: `_parse_npu_info` parses the Ascend table (paired rows: id+name/health/power/temp, then
+chip/bus-id/AICore%/DDR/HBM — mem = last used/total pair with non-zero total) into `GpuMetric`
+`kind="npu"` (+`power_w`/`health`; util=AICore%, mem=HBM), and the NPU process table seeds per-NPU
+procs with commands from `/proc` (`@@NPUPROCCMD`). ⚠ In NPU mode the `@@FDPROC` merge is **skipped**:
+Ascend procs hold `/dev/davinci_manager`, never `/dev/davinciN`, so fd→device mapping is impossible
+and the heavy-fallback would attach every proc to every NPU; npu-smi's table is complete (bare
+metal). Verified e2e on the TM box (8× 910B3 via ssh.tma01.gpu.tm.com.my). Metrics UI renders
+"NPUs" cards with AICore%/HBM/power/health; jump/password providers only cover the metrics
+surface — training/serverless/tunnel paths still assume direct key SSH.
+
 Benchmark results show an **"individual TPS"** KPI = output tok/s ÷ concurrency (per-stream decode rate;
 `perStreamOutputTps` in `web/src/lib/bench-results.ts`, surfaced in `benchmark/[id]/tabs/results.tsx`).
 

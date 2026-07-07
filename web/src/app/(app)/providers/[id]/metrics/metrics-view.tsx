@@ -176,6 +176,10 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
 
   const memPct = m && m.mem_total_mib > 0 ? (m.mem_used_mib / m.mem_total_mib) * 100 : 0;
   const gpus = m?.gpus ?? [];
+  // Huawei Ascend boxes report through npu-smi: util is AICore%, memory is HBM,
+  // and the cards show power + health instead of PCIe/NVLink.
+  const isNpu = gpus.length > 0 && gpus[0].kind === "npu";
+  const accel = isNpu ? "NPU" : "GPU";
 
   return (
     <div className="space-y-4">
@@ -188,6 +192,9 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
         </h1>
         <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
           <span className="font-mono">{provider?.user ?? "root"}@{provider?.host ?? "—"}{provider?.port ? `:${provider.port}` : ""}</span>
+          {provider?.jump_host && (
+            <span className="font-mono text-xs" title="Reached via ProxyJump">via {provider.jump_host}</span>
+          )}
           <span>·</span>
           <span className="inline-flex items-center gap-1">
             <span className={cn("h-1.5 w-1.5 rounded-full", err ? "bg-destructive" : "animate-pulse bg-emerald-500")} />
@@ -364,7 +371,7 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm">
-              GPUs <span className="text-[11px] font-normal text-muted-foreground">· {gpus.length} × {gpus[0].name.replace(/^NVIDIA\s+/, "")}</span>
+              {accel}s <span className="text-[11px] font-normal text-muted-foreground">· {gpus.length} × {gpus[0].name.replace(/^NVIDIA\s+/, "")}</span>
             </CardTitle>
             {killNote && (
               <p className="mt-1 font-mono text-[11px] text-muted-foreground" title="kill result">{killNote}</p>
@@ -382,31 +389,47 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
                       </span>
                     </div>
                     <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px]">
-                      <span className="text-emerald-600 dark:text-emerald-400">{g.util_pct}% util</span>
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        {g.util_pct}% {isNpu ? "AICore" : "util"}
+                      </span>
                       <span className="text-sky-600 dark:text-sky-400">
-                        {mp.toFixed(0)}% mem · {gib(g.mem_used_mib)}/{gib(g.mem_total_mib)} GiB
+                        {mp.toFixed(0)}% {isNpu ? "HBM" : "mem"} · {gib(g.mem_used_mib)}/{gib(g.mem_total_mib)} GiB
                       </span>
                       <span className="text-amber-600 dark:text-amber-400">{g.temp_c}°C</span>
                     </div>
-                    <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted-foreground">
-                      {g.pcie_gen_cur ? (
-                        <span title="PCIe link — current (live; downclocks at idle) vs max">
-                          PCIe{" "}
-                          <span className="text-foreground">Gen{g.pcie_gen_cur} ×{g.pcie_width_cur}</span>
-                          {g.pcie_gen_max ? <> / max Gen{g.pcie_gen_max} ×{g.pcie_width_max}</> : null}
+                    {isNpu ? (
+                      <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted-foreground">
+                        <span title="Board power draw (npu-smi)">
+                          Power <span className="text-foreground">{g.power_w ? `${g.power_w.toFixed(0)} W` : "—"}</span>
                         </span>
-                      ) : (
-                        <span title="PCIe link unavailable">PCIe —</span>
-                      )}
-                      {g.nvlink_supported ? (
-                        <span title="NVLink — active links · aggregate per-direction bandwidth">
-                          NVLink{" "}
-                          <span className="text-foreground">{g.nvlink_active}× · {g.nvlink_gbps} GB/s</span>
+                        <span title="npu-smi health status">
+                          Health{" "}
+                          <span className={g.health && g.health !== "OK" ? "text-destructive" : "text-foreground"}>
+                            {g.health || "—"}
+                          </span>
                         </span>
-                      ) : (
-                        <span title="No NVLink on this GPU (PCIe-only)">NVLink —</span>
-                      )}
-                    </div>
+                      </div>
+                    ) : (
+                      <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted-foreground">
+                        {g.pcie_gen_cur ? (
+                          <span title="PCIe link — current (live; downclocks at idle) vs max">
+                            PCIe{" "}
+                            <span className="text-foreground">Gen{g.pcie_gen_cur} ×{g.pcie_width_cur}</span>
+                            {g.pcie_gen_max ? <> / max Gen{g.pcie_gen_max} ×{g.pcie_width_max}</> : null}
+                          </span>
+                        ) : (
+                          <span title="PCIe link unavailable">PCIe —</span>
+                        )}
+                        {g.nvlink_supported ? (
+                          <span title="NVLink — active links · aggregate per-direction bandwidth">
+                            NVLink{" "}
+                            <span className="text-foreground">{g.nvlink_active}× · {g.nvlink_gbps} GB/s</span>
+                          </span>
+                        ) : (
+                          <span title="No NVLink on this GPU (PCIe-only)">NVLink —</span>
+                        )}
+                      </div>
+                    )}
                     <MiniChart
                       data={gpuSeries[g.index] ?? []}
                       keys={[
@@ -459,8 +482,8 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
               })}
             </div>
             <p className="mt-2 text-[10px] text-muted-foreground">
-              <span className="text-emerald-600 dark:text-emerald-400">■</span> util % ·{" "}
-              <span className="text-sky-600 dark:text-sky-400">■</span> memory % — temperature shown live above (°C).
+              <span className="text-emerald-600 dark:text-emerald-400">■</span> {isNpu ? "AICore %" : "util %"} ·{" "}
+              <span className="text-sky-600 dark:text-sky-400">■</span> {isNpu ? "HBM %" : "memory %"} — temperature shown live above (°C).
             </p>
           </CardContent>
         </Card>

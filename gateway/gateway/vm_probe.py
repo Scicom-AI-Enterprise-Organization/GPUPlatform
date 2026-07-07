@@ -1,8 +1,14 @@
 """SSH probe for VM-type cloud providers.
 
-Opens SSH to a bare-metal box and runs `nvidia-smi` to return the GPU
-inventory. Paramiko is already a transitive dep via benchmaq, so we use it
-in a worker thread rather than pulling in asyncssh.
+Opens SSH to a bare-metal box and runs `nvidia-smi` (or `npu-smi` on Huawei
+Ascend boxes) to return the accelerator inventory. Paramiko is already a
+transitive dep via benchmaq, so we use it in a worker thread rather than
+pulling in asyncssh.
+
+Connections support key or password auth, and an optional jump host
+(ProxyJump equivalent): the jump client opens a direct-tcpip channel to the
+target and the target client connects through it. Needed for e.g. the TM
+Huawei NPU boxes, which are only reachable via ssh.tma01.gpu.tm.com.my.
 """
 from __future__ import annotations
 
@@ -66,100 +72,154 @@ def _load_pkey(private_key: str) -> paramiko.PKey:
     raise RuntimeError(f"unsupported private key format: {last_err}")
 
 
-def _probe_sync(host: str, port: int, user: str, private_key: str) -> VmProbeResult:
-    try:
-        pkey = _load_pkey(private_key)
-    except Exception as e:
-        return VmProbeResult(ok=False, message=f"key parse failed: {e}", gpus=[], gpu_count=0)
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=host,
-            port=port,
-            username=user,
-            pkey=pkey,
-            timeout=CONNECT_TIMEOUT_S,
-            banner_timeout=CONNECT_TIMEOUT_S,
-            auth_timeout=CONNECT_TIMEOUT_S,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-    except paramiko.AuthenticationException:
-        return VmProbeResult(ok=False, message="authentication failed — check user + private key", gpus=[], gpu_count=0)
-    except Exception as e:
-        return VmProbeResult(ok=False, message=f"SSH connect failed: {e}", gpus=[], gpu_count=0)
-
-    try:
-        cmd = "nvidia-smi --query-gpu=name --format=csv,noheader"
-        stdin, stdout, stderr = client.exec_command(cmd, timeout=COMMAND_TIMEOUT_S)
-        rc = stdout.channel.recv_exit_status()
-        out = stdout.read().decode(errors="replace").strip()
-        err = stderr.read().decode(errors="replace").strip()
-        if rc != 0:
-            return VmProbeResult(
-                ok=False,
-                message=f"nvidia-smi exited {rc}: {err or 'no GPU detected'}",
-                gpus=[],
-                gpu_count=0,
-            )
-        gpus = [line.strip() for line in out.splitlines() if line.strip()]
-        if not gpus:
-            return VmProbeResult(ok=False, message="nvidia-smi returned no GPUs", gpus=[], gpu_count=0)
-        return VmProbeResult(
-            ok=True,
-            message=f"connected · {len(gpus)} GPU{'s' if len(gpus) != 1 else ''} detected",
-            gpus=gpus,
-            gpu_count=len(gpus),
-        )
-    finally:
+def _auth_kwargs(private_key: str | None, password: str | None, hop: str) -> dict:
+    """Paramiko connect() auth kwargs for one hop: key when given, else password."""
+    if private_key and private_key.strip():
         try:
-            client.close()
+            return {"pkey": _load_pkey(private_key)}
+        except Exception as e:
+            raise RuntimeError(f"{hop} key parse failed: {e}") from e
+    if password:
+        return {"password": password}
+    raise RuntimeError(f"{hop} needs a private key or a password")
+
+
+def _close_quiet(*clients: paramiko.SSHClient | None) -> None:
+    for c in clients:
+        try:
+            if c is not None:
+                c.close()
         except Exception:
             pass
 
 
-async def probe_vm(host: str, port: int, user: str, private_key: str) -> VmProbeResult:
-    return await asyncio.to_thread(_probe_sync, host, port, user, private_key)
+def _connect(host: str, port: int, user: str,
+             private_key: str | None = None, password: str | None = None,
+             jump_host: str | None = None, jump_port: int = 22,
+             jump_user: str | None = None, jump_private_key: str | None = None,
+             jump_password: str | None = None,
+             ) -> tuple[paramiko.SSHClient, paramiko.SSHClient | None]:
+    """Open SSH to the target, optionally through a jump host. Returns
+    (client, jump_client) — the jump client must stay open for the target's
+    channel to live; close both with _close_quiet(). Raises RuntimeError with
+    a user-facing message on any failure."""
+    common = dict(timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
+                  auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False)
+    tkw = _auth_kwargs(private_key, password, "target")  # fail fast, pre-network
 
-
-def _availability_sync(host: str, port: int, user: str, private_key: str) -> VmAvailabilityResult:
-    """Like _probe_sync but returns per-GPU memory + utilisation so the UI can
-    show a runpod-style availability badge for VM providers."""
-    import time as _time
-    try:
-        pkey = _load_pkey(private_key)
-    except Exception as e:
-        return VmAvailabilityResult(ok=False, message=f"key parse failed: {e}", gpus=[], checked_at=_time.time())
+    sock = None
+    jump_client: paramiko.SSHClient | None = None
+    if jump_host and jump_host.strip():
+        jkw = _auth_kwargs(jump_private_key, jump_password, "jump host")
+        jump_client = paramiko.SSHClient()
+        jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            jump_client.connect(hostname=jump_host.strip(), port=int(jump_port or 22),
+                                username=(jump_user or "root").strip(), **common, **jkw)
+            transport = jump_client.get_transport()
+            if transport is None:
+                raise RuntimeError("no transport after connect")
+            sock = transport.open_channel(
+                "direct-tcpip", (host, port), ("127.0.0.1", 0), timeout=CONNECT_TIMEOUT_S,
+            )
+        except paramiko.AuthenticationException:
+            _close_quiet(jump_client)
+            raise RuntimeError("jump host authentication failed — check jump user + credentials") from None
+        except RuntimeError:
+            _close_quiet(jump_client)
+            raise
+        except Exception as e:
+            _close_quiet(jump_client)
+            raise RuntimeError(f"jump host SSH connect failed: {e}") from e
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client.connect(
-            hostname=host, port=port, username=user, pkey=pkey,
-            timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
-            auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False,
-        )
+        client.connect(hostname=host, port=port, username=user, sock=sock, **common, **tkw)
     except paramiko.AuthenticationException:
-        return VmAvailabilityResult(ok=False, message="authentication failed", gpus=[], checked_at=_time.time())
+        _close_quiet(client, jump_client)
+        raise RuntimeError("authentication failed — check user + credentials") from None
     except Exception as e:
-        return VmAvailabilityResult(ok=False, message=f"SSH connect failed: {e}", gpus=[], checked_at=_time.time())
+        _close_quiet(client, jump_client)
+        raise RuntimeError(f"SSH connect failed: {e}") from e
+    return client, jump_client
+
+
+def _probe_sync(host: str, port: int, user: str, private_key: str | None = None,
+                password: str | None = None,
+                jump_host: str | None = None, jump_port: int = 22,
+                jump_user: str | None = None, jump_private_key: str | None = None,
+                jump_password: str | None = None) -> VmProbeResult:
+    try:
+        client, jump = _connect(host, port, user, private_key, password,
+                                jump_host, jump_port, jump_user, jump_private_key, jump_password)
+    except RuntimeError as e:
+        return VmProbeResult(ok=False, message=str(e), gpus=[], gpu_count=0)
 
     try:
-        cmd = "nvidia-smi --query-gpu=index,name,memory.free,memory.total,utilization.gpu --format=csv,noheader,nounits"
-        _, stdout, stderr = client.exec_command(cmd, timeout=COMMAND_TIMEOUT_S)
-        rc = stdout.channel.recv_exit_status()
-        out = stdout.read().decode(errors="replace").strip()
-        err = stderr.read().decode(errors="replace").strip()
-        if rc != 0:
-            return VmAvailabilityResult(
-                ok=False,
-                message=f"nvidia-smi exited {rc}: {err or 'no GPU detected'}",
-                gpus=[], checked_at=_time.time(),
+        # nvidia-smi first; Huawei Ascend boxes have npu-smi instead — its table
+        # output after the @@NPU marker is parsed by _parse_npu_info.
+        cmd = ("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null; "
+               "echo @@NPU; command -v npu-smi >/dev/null 2>&1 && npu-smi info 2>/dev/null")
+        stdin, stdout, stderr = client.exec_command(cmd, timeout=COMMAND_TIMEOUT_S)
+        stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="replace")
+        head, _, npu_part = out.partition("@@NPU")
+        gpus = [line.strip() for line in head.splitlines() if line.strip()]
+        if gpus:
+            return VmProbeResult(
+                ok=True,
+                message=f"connected · {len(gpus)} GPU{'s' if len(gpus) != 1 else ''} detected",
+                gpus=gpus,
+                gpu_count=len(gpus),
             )
+        chips, _procs = _parse_npu_info(npu_part.splitlines())
+        if chips:
+            names = [c.name for c in chips]
+            return VmProbeResult(
+                ok=True,
+                message=f"connected · {len(names)} NPU{'s' if len(names) != 1 else ''} detected",
+                gpus=names,
+                gpu_count=len(names),
+            )
+        return VmProbeResult(ok=False, message="no accelerators detected (nvidia-smi / npu-smi)", gpus=[], gpu_count=0)
+    finally:
+        _close_quiet(client, jump)
+
+
+async def probe_vm(host: str, port: int, user: str, private_key: str | None = None,
+                   password: str | None = None,
+                   jump_host: str | None = None, jump_port: int = 22,
+                   jump_user: str | None = None, jump_private_key: str | None = None,
+                   jump_password: str | None = None) -> VmProbeResult:
+    return await asyncio.to_thread(_probe_sync, host, port, user, private_key, password,
+                                   jump_host, jump_port, jump_user, jump_private_key, jump_password)
+
+
+def _availability_sync(host: str, port: int, user: str, private_key: str | None = None,
+                       password: str | None = None,
+                       jump_host: str | None = None, jump_port: int = 22,
+                       jump_user: str | None = None, jump_private_key: str | None = None,
+                       jump_password: str | None = None) -> VmAvailabilityResult:
+    """Like _probe_sync but returns per-GPU memory + utilisation so the UI can
+    show a runpod-style availability badge for VM providers."""
+    import time as _time
+    try:
+        client, jump = _connect(host, port, user, private_key, password,
+                                jump_host, jump_port, jump_user, jump_private_key, jump_password)
+    except RuntimeError as e:
+        return VmAvailabilityResult(ok=False, message=str(e), gpus=[], checked_at=_time.time())
+
+    try:
+        cmd = ("nvidia-smi --query-gpu=index,name,memory.free,memory.total,utilization.gpu "
+               "--format=csv,noheader,nounits 2>/dev/null; "
+               "echo @@NPU; command -v npu-smi >/dev/null 2>&1 && npu-smi info 2>/dev/null")
+        _, stdout, stderr = client.exec_command(cmd, timeout=COMMAND_TIMEOUT_S)
+        stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="replace")
+        head, _, npu_part = out.partition("@@NPU")
         gpus: list[GpuInfo] = []
-        for line in out.splitlines():
+        for line in head.splitlines():
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 5:
                 continue
@@ -173,23 +233,34 @@ def _availability_sync(host: str, port: int, user: str, private_key: str) -> VmA
                 ))
             except ValueError:
                 continue
+        kind = "GPU"
         if not gpus:
-            return VmAvailabilityResult(ok=False, message="nvidia-smi returned no parseable GPUs", gpus=[], checked_at=_time.time())
+            chips, _procs = _parse_npu_info(npu_part.splitlines())
+            gpus = [GpuInfo(
+                index=c.index, name=c.name,
+                mem_free_mib=max(0, c.mem_total_mib - c.mem_used_mib),
+                mem_total_mib=c.mem_total_mib, util_pct=c.util_pct,
+            ) for c in chips]
+            kind = "NPU"
+        if not gpus:
+            return VmAvailabilityResult(ok=False, message="no parseable accelerators (nvidia-smi / npu-smi)", gpus=[], checked_at=_time.time())
         return VmAvailabilityResult(
             ok=True,
-            message=f"{len(gpus)} GPU{'s' if len(gpus) != 1 else ''} reachable",
+            message=f"{len(gpus)} {kind}{'s' if len(gpus) != 1 else ''} reachable",
             gpus=gpus,
             checked_at=_time.time(),
         )
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        _close_quiet(client, jump)
 
 
-async def availability_vm(host: str, port: int, user: str, private_key: str) -> VmAvailabilityResult:
-    return await asyncio.to_thread(_availability_sync, host, port, user, private_key)
+async def availability_vm(host: str, port: int, user: str, private_key: str | None = None,
+                          password: str | None = None,
+                          jump_host: str | None = None, jump_port: int = 22,
+                          jump_user: str | None = None, jump_private_key: str | None = None,
+                          jump_password: str | None = None) -> VmAvailabilityResult:
+    return await asyncio.to_thread(_availability_sync, host, port, user, private_key, password,
+                                   jump_host, jump_port, jump_user, jump_private_key, jump_password)
 
 
 # --------------------------------------------------------------------------
@@ -229,6 +300,11 @@ class GpuMetric:
     nvlink_supported: bool = False
     nvlink_active: int = 0
     nvlink_gbps: float = 0.0
+    # Huawei Ascend (npu-smi) fallback: kind="npu", util_pct=AICore%, mem=HBM.
+    # power_w/health come from the npu-smi table (nvidia path leaves them unset).
+    kind: str = "gpu"
+    power_w: float = 0.0
+    health: str = ""
     processes: list[GpuProc] = field(default_factory=list)
 
 
@@ -255,6 +331,79 @@ class VmMetricsResult:
     # read across the namespace. Not mapped to a specific GPU (no fd/NVML link), so
     # listed host-level alongside the per-GPU NVML VRAM.
     host_procs: list[GpuProc] = field(default_factory=list)
+
+
+def _parse_npu_info(lines: list[str]) -> tuple[list[GpuMetric], dict[int, list[tuple[int, int, str]]]]:
+    """Parse Huawei `npu-smi info` (Ascend) table output. Returns (chips, procs):
+    chips — GpuMetric list (kind="npu"; util_pct=AICore%, mem=HBM when the card has
+    it else DDR, power/temp/health from the table); procs — {npu_id: [(pid, mem_mib,
+    name)]} from the trailing process table. Chip rows come in pairs:
+      | 0     910B3 | OK           | 90.8   34   0 / 0        |  ← id+name | health | power temp hugepages
+      | 0           | 0000:C1:00.0 | 0    0 / 0  54388/ 65536 |  ← chip | bus-id | AICore% DDR HBM
+    """
+    chips: list[GpuMetric] = []
+    procs: dict[int, list[tuple[int, int, str]]] = {}
+    pending: GpuMetric | None = None
+    in_procs = False
+    for ln in lines:
+        s = ln.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        joined = " ".join(cells).lower()
+        if "process id" in joined:
+            in_procs = True
+            continue
+        if "health" in joined or "aicore" in joined or joined.startswith("npu-smi"):
+            continue  # header / banner rows
+        if in_procs:
+            # | NPU Chip | pid | pname | mem(MB) | — "No running processes …" rows
+            # don't have a numeric pid cell and fall through.
+            if len(cells) >= 4 and cells[1].isdigit():
+                m = re.match(r"(\d+)", cells[0])
+                if m:
+                    mem = int(cells[3]) if cells[3].isdigit() else 0
+                    procs.setdefault(int(m.group(1)), []).append((int(cells[1]), mem, cells[2]))
+            continue
+        if len(cells) < 3:
+            continue
+        if pending is None:
+            m = re.match(r"(\d+)\s+(\S.*)$", cells[0])
+            if not m:
+                continue
+            g = GpuMetric(index=int(m.group(1)), name=f"Ascend {m.group(2).strip()}",
+                          util_pct=0, mem_used_mib=0, mem_total_mib=0, temp_c=0,
+                          kind="npu", health=cells[1])
+            toks = cells[2].split()
+            try:
+                g.power_w = float(toks[0])
+            except (ValueError, IndexError):
+                pass
+            try:
+                g.temp_c = int(float(toks[1]))
+            except (ValueError, IndexError):
+                pass
+            pending = g
+        else:
+            g, pending = pending, None
+            toks = cells[2].split()
+            try:
+                g.util_pct = int(float(toks[0]))
+            except (ValueError, IndexError):
+                pass
+            # "used / total" pairs: DDR first, HBM second on HBM cards — prefer
+            # the last pair with a non-zero total (910x report DDR as 0/0).
+            pairs = re.findall(r"(\d+)\s*/\s*(\d+)", cells[2])
+            chosen = None
+            for used, total in pairs:
+                if int(total) > 0:
+                    chosen = (int(used), int(total))
+            if chosen is None and pairs:
+                chosen = (int(pairs[0][0]), int(pairs[0][1]))
+            if chosen:
+                g.mem_used_mib, g.mem_total_mib = chosen
+            chips.append(g)
+    return chips, procs
 
 
 # Two /proc/stat samples (CPU%), /proc/meminfo (RAM), nvidia-smi (GPUs) — one shot.
@@ -295,12 +444,22 @@ _METRICS_CMD = (
     "for d in /proc/[0-9]*; do p=${d#/proc/}; "
     "cmd=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-300); "
     "[ -z \"$cmd\" ] && continue; "
-    "g=$(ls -l /proc/$p/fd 2>/dev/null | grep -oE '/dev/nvidia[0-9]+' | grep -oE '[0-9]+$' | sort -un | tr '\\n' ',' | sed 's/,$//'); "
+    "g=$(ls -l /proc/$p/fd 2>/dev/null | grep -oE '/dev/(nvidia|davinci)[0-9]+' | grep -oE '[0-9]+$' | sort -un | tr '\\n' ',' | sed 's/,$//'); "
     "gpu=0; [ -n \"$g\" ] && gpu=1; "
     "case \"$cmd\" in *vllm*|*VLLM*|*sglang*|*SGLang*|*tensorrt*|*trtllm*|*deepspeed*) gpu=1;; esac; "
     "[ \"$gpu\" = 0 ] && continue; "
     "comm=$(cat /proc/$p/comm 2>/dev/null); "
     "echo \"$p|$g|$comm|$cmd\"; done 2>/dev/null; "
+    # Huawei Ascend fallback (no nvidia-smi on the box): the raw `npu-smi info`
+    # table — chips + the NPU process table — parsed gateway-side by
+    # _parse_npu_info. Captured once into $npu_out; @@NPUPROCCMD re-reads it to
+    # resolve each pid's real command from /proc (bare metal → world-readable).
+    "echo @@NPU; if command -v npu-smi >/dev/null 2>&1; then npu_out=$(npu-smi info 2>/dev/null); echo \"$npu_out\"; fi; "
+    "echo @@NPUPROCCMD; if [ -n \"$npu_out\" ]; then "
+    "echo \"$npu_out\" | awk -F'|' 'NF>=6 {p=$3; gsub(/ /,\"\",p); if (p ~ /^[0-9]+$/) print p}' | sort -u | "
+    "while read p; do comm=$(cat /proc/$p/comm 2>/dev/null); "
+    "cmd=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-300); "
+    "echo \"$p|$comm|$cmd\"; done; fi; "
     # Disk: real filesystems only (skip virtual mounts), bytes used + total.
     # Columns come out in --output order: <mount> <used> <size>.
     "echo @@DISK; df -B1 -x tmpfs -x devtmpfs -x overlay -x squashfs "
@@ -319,25 +478,17 @@ def _cpu_busy_total(line: str):
     return total - idle, total
 
 
-def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetricsResult:
+def _metrics_sync(host: str, port: int, user: str, private_key: str | None = None,
+                  password: str | None = None,
+                  jump_host: str | None = None, jump_port: int = 22,
+                  jump_user: str | None = None, jump_private_key: str | None = None,
+                  jump_password: str | None = None) -> VmMetricsResult:
     import time as _time
     try:
-        pkey = _load_pkey(private_key)
-    except Exception as e:
-        return VmMetricsResult(False, f"key parse failed: {e}", -1.0, 0, 0, [], _time.time())
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=host, port=port, username=user, pkey=pkey,
-            timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
-            auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False,
-        )
-    except paramiko.AuthenticationException:
-        return VmMetricsResult(False, "authentication failed", -1.0, 0, 0, [], _time.time())
-    except Exception as e:
-        return VmMetricsResult(False, f"SSH connect failed: {e}", -1.0, 0, 0, [], _time.time())
+        client, jump = _connect(host, port, user, private_key, password,
+                                jump_host, jump_port, jump_user, jump_private_key, jump_password)
+    except RuntimeError as e:
+        return VmMetricsResult(False, str(e), -1.0, 0, 0, [], _time.time())
 
     try:
         _, stdout, _ = client.exec_command(_METRICS_CMD, timeout=COMMAND_TIMEOUT_S)
@@ -347,7 +498,7 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
         cur = None
         for ln in out.splitlines():
             s = ln.strip()
-            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@NVLINK", "@@GPUUUID", "@@PROC", "@@FDPROC", "@@DISK"):
+            if s in ("@@CPU1", "@@CPU2", "@@MEM", "@@GPU", "@@NVLINK", "@@GPUUUID", "@@PROC", "@@FDPROC", "@@NPU", "@@NPUPROCCMD", "@@DISK"):
                 cur = s
                 sec[cur] = []
             elif cur:
@@ -470,6 +621,26 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
             procs_by_gpu.setdefault(idx, []).append(GpuProc(pid, comm, cmd, mem))
             seen.setdefault(idx, set()).add(pid)
 
+        # @@NPU: Huawei Ascend fallback — no nvidia-smi on the box. Chips map into
+        # GpuMetric (kind="npu": util=AICore%, mem=HBM, power/temp/health from the
+        # table); the npu-smi process table (pid + device memory) seeds procs_by_gpu,
+        # with each pid's real command resolved via @@NPUPROCCMD (pid|comm|cmd).
+        if not gpus:
+            npu_chips, npu_proc_rows = _parse_npu_info(sec.get("@@NPU", []))
+            if npu_chips:
+                gpus = npu_chips
+                cmd_by_pid: dict[int, tuple[str, str]] = {}
+                for ln in sec.get("@@NPUPROCCMD", []):
+                    bits = ln.split("|", 2)
+                    if len(bits) == 3 and bits[0].strip().isdigit():
+                        cmd_by_pid[int(bits[0])] = (bits[1].strip(), bits[2].strip())
+                for idx, rows in npu_proc_rows.items():
+                    for pid, mem, pname in rows:
+                        comm, cmdl = cmd_by_pid.get(pid, ("", ""))
+                        procs_by_gpu.setdefault(idx, []).append(
+                            GpuProc(pid, comm or pname, cmdl or pname, mem))
+                        seen.setdefault(idx, set()).add(pid)
+
         # @@FDPROC: pid|gpus|comm|cmd — GPU processes discovered from /proc (full
         # command + container pid → killable). Merge into each GPU so every card lists
         # pid + command, not just the NVML host pids:
@@ -479,9 +650,14 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
         #    (≥10 GiB), where a multi-GPU server is the obvious tenant. Best-effort:
         #    there's no fd/NVML pid bridge inside the container, so this correlates the
         #    NVML VRAM (host pid, no name) with the /proc command (container pid).
-        heavy = {idx for idx, ps in procs_by_gpu.items()
-                 if any(p.gpu_mem_mib >= 10240 for p in ps)}
-        for ln in sec.get("@@FDPROC", []):
+        # NPU mode: npu-smi's process table is complete (bare metal, no pid-namespace
+        # gap), and Ascend procs hold /dev/davinci_manager — never /dev/davinciN — so
+        # fds can't map them to a device; the heavy-fallback would just attach every
+        # proc to every busy NPU. Skip the /proc merge entirely.
+        npu_mode = bool(gpus) and gpus[0].kind == "npu"
+        heavy = set() if npu_mode else {idx for idx, ps in procs_by_gpu.items()
+                                        if any(p.gpu_mem_mib >= 10240 for p in ps)}
+        for ln in ([] if npu_mode else sec.get("@@FDPROC", [])):
             bits = ln.split("|", 3)
             if len(bits) < 4 or not bits[0].strip().isdigit():
                 continue
@@ -518,19 +694,21 @@ def _metrics_sync(host: str, port: int, user: str, private_key: str) -> VmMetric
 
         ok = mem_total_mib > 0 or bool(gpus) or cpu_pct >= 0
         return VmMetricsResult(
-            ok, "ok" if ok else "no metrics parsed (is this a Linux host with nvidia-smi?)",
+            ok, "ok" if ok else "no metrics parsed (is this a Linux host with nvidia-smi or npu-smi?)",
             cpu_pct, mem_used_mib, mem_total_mib, gpus, _time.time(),
             cpu_cores=cpu_cores, disks=disks, host_procs=host_procs,
         )
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        _close_quiet(client, jump)
 
 
-async def metrics_vm(host: str, port: int, user: str, private_key: str) -> VmMetricsResult:
-    return await asyncio.to_thread(_metrics_sync, host, port, user, private_key)
+async def metrics_vm(host: str, port: int, user: str, private_key: str | None = None,
+                     password: str | None = None,
+                     jump_host: str | None = None, jump_port: int = 22,
+                     jump_user: str | None = None, jump_private_key: str | None = None,
+                     jump_password: str | None = None) -> VmMetricsResult:
+    return await asyncio.to_thread(_metrics_sync, host, port, user, private_key, password,
+                                   jump_host, jump_port, jump_user, jump_private_key, jump_password)
 
 
 # --------------------------------------------------------------------------
@@ -584,25 +762,17 @@ def _parse_dd_rate(lines: list[str]) -> float:
     return 0.0
 
 
-def _bandwidth_sync(host: str, port: int, user: str, private_key: str) -> VmBandwidthResult:
+def _bandwidth_sync(host: str, port: int, user: str, private_key: str | None = None,
+                    password: str | None = None,
+                    jump_host: str | None = None, jump_port: int = 22,
+                    jump_user: str | None = None, jump_private_key: str | None = None,
+                    jump_password: str | None = None) -> VmBandwidthResult:
     import time as _time
     try:
-        pkey = _load_pkey(private_key)
-    except Exception as e:
-        return VmBandwidthResult(False, f"key parse failed: {e}", 0, 0, 0, "", 0, _time.time())
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=host, port=port, username=user, pkey=pkey,
-            timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
-            auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False,
-        )
-    except paramiko.AuthenticationException:
-        return VmBandwidthResult(False, "authentication failed", 0, 0, 0, "", 0, _time.time())
-    except Exception as e:
-        return VmBandwidthResult(False, f"SSH connect failed: {e}", 0, 0, 0, "", 0, _time.time())
+        client, jump = _connect(host, port, user, private_key, password,
+                                jump_host, jump_port, jump_user, jump_private_key, jump_password)
+    except RuntimeError as e:
+        return VmBandwidthResult(False, str(e), 0, 0, 0, "", 0, _time.time())
 
     try:
         _, stdout, _ = client.exec_command(_BANDWIDTH_CMD, timeout=BANDWIDTH_TIMEOUT_S)
@@ -647,14 +817,16 @@ def _bandwidth_sync(host: str, port: int, user: str, private_key: str) -> VmBand
             disk_w, disk_r, mem, cpu_model, round(cpu_mhz, 0), _time.time(),
         )
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        _close_quiet(client, jump)
 
 
-async def bandwidth_vm(host: str, port: int, user: str, private_key: str) -> VmBandwidthResult:
-    return await asyncio.to_thread(_bandwidth_sync, host, port, user, private_key)
+async def bandwidth_vm(host: str, port: int, user: str, private_key: str | None = None,
+                       password: str | None = None,
+                       jump_host: str | None = None, jump_port: int = 22,
+                       jump_user: str | None = None, jump_private_key: str | None = None,
+                       jump_password: str | None = None) -> VmBandwidthResult:
+    return await asyncio.to_thread(_bandwidth_sync, host, port, user, private_key, password,
+                                   jump_host, jump_port, jump_user, jump_private_key, jump_password)
 
 
 @dataclass
@@ -663,8 +835,12 @@ class VmKillResult:
     message: str
 
 
-def _kill_pid_sync(host: str, port: int, user: str, private_key: str,
-                   pid: int, sig: int = 9) -> VmKillResult:
+def _kill_pid_sync(host: str, port: int, user: str, private_key: str | None = None,
+                   pid: int = 0, sig: int = 9,
+                   password: str | None = None,
+                   jump_host: str | None = None, jump_port: int = 22,
+                   jump_user: str | None = None, jump_private_key: str | None = None,
+                   jump_password: str | None = None) -> VmKillResult:
     """SSH onto a VM and kill a process by pid (default SIGKILL — the metrics page
     "Terminate" button is for freeing a GPU held by a stuck/orphaned process). `pid`
     is an int (no shell interpolation of untrusted text). Reports the real outcome:
@@ -674,22 +850,10 @@ def _kill_pid_sync(host: str, port: int, user: str, private_key: str,
     if pid <= 1:
         return VmKillResult(ok=False, message=f"refusing to kill pid {pid}")
     try:
-        pkey = _load_pkey(private_key)
-    except Exception as e:
-        return VmKillResult(ok=False, message=f"key parse failed: {e}")
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=host, port=port, username=user, pkey=pkey,
-            timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
-            auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False,
-        )
-    except paramiko.AuthenticationException:
-        return VmKillResult(ok=False, message="authentication failed — check user + private key")
-    except Exception as e:
-        return VmKillResult(ok=False, message=f"SSH connect failed: {e}")
+        client, jump = _connect(host, port, user, private_key, password,
+                                jump_host, jump_port, jump_user, jump_private_key, jump_password)
+    except RuntimeError as e:
+        return VmKillResult(ok=False, message=str(e))
 
     try:
         cmd = f"kill -{int(sig)} {pid}"
@@ -701,12 +865,15 @@ def _kill_pid_sync(host: str, port: int, user: str, private_key: str,
         # kill's stderr is the useful bit ("No such process" / "Operation not permitted").
         return VmKillResult(ok=False, message=err or f"kill exited {rc}")
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        _close_quiet(client, jump)
 
 
-async def kill_pid_vm(host: str, port: int, user: str, private_key: str,
-                      pid: int, sig: int = 9) -> VmKillResult:
-    return await asyncio.to_thread(_kill_pid_sync, host, port, user, private_key, pid, sig)
+async def kill_pid_vm(host: str, port: int, user: str, private_key: str | None = None,
+                      pid: int = 0, sig: int = 9,
+                      password: str | None = None,
+                      jump_host: str | None = None, jump_port: int = 22,
+                      jump_user: str | None = None, jump_private_key: str | None = None,
+                      jump_password: str | None = None) -> VmKillResult:
+    return await asyncio.to_thread(_kill_pid_sync, host, port, user, private_key, pid, sig,
+                                   password, jump_host, jump_port, jump_user,
+                                   jump_private_key, jump_password)

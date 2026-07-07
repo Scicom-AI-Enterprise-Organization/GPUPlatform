@@ -852,6 +852,7 @@ export type ProviderRecord = {
   host?: string | null;
   port?: number | null;
   user?: string | null;
+  jump_host?: string | null; // set when the VM is reached via ProxyJump
   gpus?: string[] | null;
   gpu_count?: number | null;
   api_key_last4?: string | null;
@@ -1179,7 +1180,15 @@ export type VmConfigInput = {
   host: string;
   port: number;
   user: string;
+  // Key OR password (key preferred when both).
   private_key?: string;
+  password?: string;
+  // Optional jump host (ProxyJump) for boxes not directly reachable.
+  jump_host?: string;
+  jump_port?: number;
+  jump_user?: string;
+  jump_private_key?: string;
+  jump_password?: string;
 };
 
 export type ApiKeyConfigInput = {
@@ -1247,6 +1256,10 @@ export type ProviderGpuMetric = {
   nvlink_supported?: boolean;
   nvlink_active?: number;
   nvlink_gbps?: number;
+  // Huawei Ascend (npu-smi): kind="npu", util_pct=AICore%, mem=HBM.
+  kind?: "gpu" | "npu";
+  power_w?: number;
+  health?: string;
   processes?: ProviderGpuProc[];
 };
 

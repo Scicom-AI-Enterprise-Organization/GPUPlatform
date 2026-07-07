@@ -43,9 +43,18 @@ class VmConfig(BaseModel):
     host: str
     port: int = VM_DEFAULT_PORT
     user: str = "root"
-    # Full PEM body. Required on create; on update the client may omit it to
-    # keep the existing key — handled by `CreateProviderRequest` validation.
+    # Full PEM body. Key OR password required on create; on update the client
+    # may omit both to keep the existing credentials.
     private_key: Optional[str] = None
+    password: Optional[str] = None
+    # Optional jump host (ProxyJump) for boxes not directly reachable — e.g.
+    # the TM Huawei NPU machines behind ssh.tma01.gpu.tm.com.my. Jump auth is
+    # its own key or password.
+    jump_host: Optional[str] = None
+    jump_port: int = 22
+    jump_user: Optional[str] = None
+    jump_private_key: Optional[str] = None
+    jump_password: Optional[str] = None
 
 
 class ApiKeyConfig(BaseModel):
@@ -84,6 +93,7 @@ class ProviderRecord(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     user: Optional[str] = None
+    jump_host: Optional[str] = None  # set when the VM is reached via ProxyJump
     gpus: Optional[list[str]] = None
     gpu_count: Optional[int] = None
     # Cloud (runpod/pi): the catalog of GPU types this provider can provision, so
@@ -141,6 +151,10 @@ class GpuMetricInfo(BaseModel):
     nvlink_supported: bool = False
     nvlink_active: int = 0
     nvlink_gbps: float = 0.0
+    # Huawei Ascend (npu-smi): kind="npu", util_pct=AICore%, mem=HBM.
+    kind: str = "gpu"
+    power_w: float = 0.0
+    health: str = ""
     processes: list[GpuProcInfo] = []
 
 
@@ -206,6 +220,7 @@ def _to_record(p: Provider, owner_username: str) -> ProviderRecord:
         host=cfg.get("host"),
         port=cfg.get("port"),
         user=cfg.get("user"),
+        jump_host=cfg.get("jump_host"),
         gpus=cfg.get("gpus"),
         gpu_count=cfg.get("gpu_count"),
         available_gpus=available_gpus,
@@ -225,7 +240,77 @@ def _validate_vm(vm: Optional[VmConfig]) -> VmConfig:
         raise HTTPException(status_code=400, detail="vm.port must be 1..65535")
     if not vm.user.strip():
         raise HTTPException(status_code=400, detail="vm.user is required")
+    if vm.jump_host and vm.jump_host.strip():
+        if vm.jump_port < 1 or vm.jump_port > 65535:
+            raise HTTPException(status_code=400, detail="vm.jump_port must be 1..65535")
+        if not ((vm.jump_private_key and vm.jump_private_key.strip()) or vm.jump_password):
+            raise HTTPException(status_code=400, detail="jump host needs a private key or a password")
     return vm
+
+
+def _vm_has_credentials(vm: VmConfig) -> bool:
+    return bool((vm.private_key and vm.private_key.strip()) or vm.password)
+
+
+def _vm_config_dict(vm: VmConfig) -> dict:
+    """Provider.config for a validated VmConfig — secrets Fernet-encrypted."""
+    config: dict = {
+        "host": vm.host.strip(),
+        "port": int(vm.port),
+        "user": vm.user.strip(),
+    }
+    if vm.private_key and vm.private_key.strip():
+        config["private_key_enc"] = crypto.encrypt(vm.private_key)
+    if vm.password:
+        config["password_enc"] = crypto.encrypt(vm.password)
+    if vm.jump_host and vm.jump_host.strip():
+        config["jump_host"] = vm.jump_host.strip()
+        config["jump_port"] = int(vm.jump_port)
+        config["jump_user"] = (vm.jump_user or "root").strip()
+        if vm.jump_private_key and vm.jump_private_key.strip():
+            config["jump_private_key_enc"] = crypto.encrypt(vm.jump_private_key)
+        if vm.jump_password:
+            config["jump_password_enc"] = crypto.encrypt(vm.jump_password)
+    return config
+
+
+def _vm_conn_from_cfg(cfg: dict) -> dict:
+    """Decrypt a stored VM provider config into kwargs for the vm_probe
+    functions (probe/availability/metrics/bandwidth/kill)."""
+    if not cfg.get("private_key_enc") and not cfg.get("password_enc"):
+        raise HTTPException(status_code=500, detail="provider missing stored credentials")
+    conn: dict = {
+        "host": cfg.get("host", ""),
+        "port": int(cfg.get("port") or VM_DEFAULT_PORT),
+        "user": cfg.get("user", "root"),
+        "private_key": crypto.decrypt(cfg["private_key_enc"]) if cfg.get("private_key_enc") else None,
+        "password": crypto.decrypt(cfg["password_enc"]) if cfg.get("password_enc") else None,
+    }
+    if cfg.get("jump_host"):
+        conn.update(
+            jump_host=cfg["jump_host"],
+            jump_port=int(cfg.get("jump_port") or 22),
+            jump_user=cfg.get("jump_user") or "root",
+            jump_private_key=crypto.decrypt(cfg["jump_private_key_enc"]) if cfg.get("jump_private_key_enc") else None,
+            jump_password=crypto.decrypt(cfg["jump_password_enc"]) if cfg.get("jump_password_enc") else None,
+        )
+    return conn
+
+
+def _vm_conn_from_inline(vm: VmConfig) -> dict:
+    """Kwargs for the vm_probe functions from an unsaved form config."""
+    return {
+        "host": vm.host.strip(),
+        "port": int(vm.port),
+        "user": vm.user.strip(),
+        "private_key": vm.private_key,
+        "password": vm.password,
+        "jump_host": (vm.jump_host or "").strip() or None,
+        "jump_port": int(vm.jump_port or 22),
+        "jump_user": (vm.jump_user or "root").strip(),
+        "jump_private_key": vm.jump_private_key,
+        "jump_password": vm.jump_password,
+    }
 
 
 def _gen_ssh_keypair(label: str) -> tuple[str, str]:
@@ -393,14 +478,9 @@ async def create_provider(
     config: dict
     if req.kind == "vm":
         vm = _validate_vm(req.vm)
-        if not vm.private_key or not vm.private_key.strip():
-            raise HTTPException(status_code=400, detail="vm.private_key is required")
-        config = {
-            "host": vm.host.strip(),
-            "port": int(vm.port),
-            "user": vm.user.strip(),
-            "private_key_enc": crypto.encrypt(vm.private_key),
-        }
+        if not _vm_has_credentials(vm):
+            raise HTTPException(status_code=400, detail="vm.private_key or vm.password is required")
+        config = _vm_config_dict(vm)
     elif req.kind in API_KEY_KINDS:
         api = req.api or ApiKeyConfig()
         if not api.api_key or not api.api_key.strip():
@@ -516,24 +596,14 @@ async def test_provider(
             raise HTTPException(status_code=404, detail="provider not found")
         if row.kind != req.kind:
             raise HTTPException(status_code=400, detail="kind mismatch")
-        cfg = row.config or {}
-        host = cfg.get("host", "")
-        port = int(cfg.get("port") or VM_DEFAULT_PORT)
-        ssh_user = cfg.get("user", "root")
-        enc = cfg.get("private_key_enc")
-        if not enc:
-            raise HTTPException(status_code=500, detail="provider missing stored key")
-        private_key = crypto.decrypt(enc)
+        conn = _vm_conn_from_cfg(row.config or {})
     else:
         vm = _validate_vm(req.vm)
-        if not vm.private_key or not vm.private_key.strip():
-            raise HTTPException(status_code=400, detail="vm.private_key required for test")
-        host = vm.host.strip()
-        port = int(vm.port)
-        ssh_user = vm.user.strip()
-        private_key = vm.private_key
+        if not _vm_has_credentials(vm):
+            raise HTTPException(status_code=400, detail="vm.private_key or vm.password required for test")
+        conn = _vm_conn_from_inline(vm)
 
-    result = await probe_vm(host=host, port=port, user=ssh_user, private_key=private_key)
+    result = await probe_vm(**conn)
 
     # On a saved provider, persist the probe result so the list view can show
     # the GPU summary without re-running SSH on every page load.
@@ -579,17 +649,7 @@ async def provider_availability(
         )
     if row.kind != "vm":
         raise HTTPException(status_code=400, detail="availability check not supported for kind={}".format(row.kind))
-    cfg = row.config or {}
-    enc = cfg.get("private_key_enc")
-    if not enc:
-        raise HTTPException(status_code=500, detail="provider missing stored key")
-    private_key = crypto.decrypt(enc)
-    result = await availability_vm(
-        host=cfg.get("host", ""),
-        port=int(cfg.get("port") or VM_DEFAULT_PORT),
-        user=cfg.get("user", "root"),
-        private_key=private_key,
-    )
+    result = await availability_vm(**_vm_conn_from_cfg(row.config or {}))
     return AvailabilityResponse(
         ok=result.ok,
         message=result.message,
@@ -643,16 +703,7 @@ async def provider_metrics(
         raise HTTPException(status_code=404, detail="provider not found")
     if row.kind != "vm":
         raise HTTPException(status_code=400, detail="metrics are only available for VM providers")
-    cfg = row.config or {}
-    enc = cfg.get("private_key_enc")
-    if not enc:
-        raise HTTPException(status_code=500, detail="provider missing stored key")
-    result = await metrics_vm(
-        host=cfg.get("host", ""),
-        port=int(cfg.get("port") or VM_DEFAULT_PORT),
-        user=cfg.get("user", "root"),
-        private_key=crypto.decrypt(enc),
-    )
+    result = await metrics_vm(**_vm_conn_from_cfg(row.config or {}))
     return ProviderMetricsResponse(
         ok=result.ok,
         message=result.message,
@@ -667,6 +718,7 @@ async def provider_metrics(
             pcie_gen_max=g.pcie_gen_max, pcie_width_max=g.pcie_width_max,
             nvlink_supported=g.nvlink_supported, nvlink_active=g.nvlink_active,
             nvlink_gbps=g.nvlink_gbps,
+            kind=g.kind, power_w=g.power_w, health=g.health,
             processes=[GpuProcInfo(pid=p.pid, comm=p.comm, cmd=p.cmd, gpu_mem_mib=p.gpu_mem_mib) for p in g.processes],
         ) for g in result.gpus],
         disks=[DiskInfo(mount=d.mount, used_bytes=d.used_bytes, total_bytes=d.total_bytes)
@@ -705,17 +757,10 @@ async def provider_kill_pid(
         raise HTTPException(status_code=403, detail="not your provider")
     if row.kind != "vm":
         raise HTTPException(status_code=400, detail="kill-pid is only available for VM providers")
-    cfg = row.config or {}
-    enc = cfg.get("private_key_enc")
-    if not enc:
-        raise HTTPException(status_code=500, detail="provider missing stored key")
     if req.pid <= 1:
         raise HTTPException(status_code=400, detail=f"refusing to kill pid {req.pid}")
     result = await kill_pid_vm(
-        host=cfg.get("host", ""),
-        port=int(cfg.get("port") or VM_DEFAULT_PORT),
-        user=cfg.get("user", "root"),
-        private_key=crypto.decrypt(enc),
+        **_vm_conn_from_cfg(row.config or {}),
         pid=req.pid,
         sig=req.sig,
     )
@@ -740,16 +785,7 @@ async def provider_bandwidth(
         raise HTTPException(status_code=404, detail="provider not found")
     if row.kind != "vm":
         raise HTTPException(status_code=400, detail="bandwidth test is only available for VM providers")
-    cfg = row.config or {}
-    enc = cfg.get("private_key_enc")
-    if not enc:
-        raise HTTPException(status_code=500, detail="provider missing stored key")
-    result = await bandwidth_vm(
-        host=cfg.get("host", ""),
-        port=int(cfg.get("port") or VM_DEFAULT_PORT),
-        user=cfg.get("user", "root"),
-        private_key=crypto.decrypt(enc),
-    )
+    result = await bandwidth_vm(**_vm_conn_from_cfg(row.config or {}))
     return ProviderBandwidthResponse(
         ok=result.ok,
         message=result.message,
