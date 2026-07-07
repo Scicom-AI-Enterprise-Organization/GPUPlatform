@@ -124,6 +124,15 @@ still assume direct key SSH. Ascend serving specifics live in **worker-agent CLA
 Benchmark results show an **"individual TPS"** KPI = output tok/s ÷ concurrency (per-stream decode rate;
 `perStreamOutputTps` in `web/src/lib/bench-results.ts`, surfaced in `benchmark/[id]/tabs/results.tsx`).
 
+**Manual GPU identity (`benchmarks.gpu_type`/`gpu_count` columns, added 2026-07-07):** ingress/Slurm
+runs (no pod, no provider) have no derivable GPU, so external consumers (the GPU calculator) couldn't
+group them. Set it via `CreateBenchmarkRequest.gpu_type`, a top-level or per-benchmark-item `gpu_type:`
+key in the YAML, or post-hoc with `PATCH /benchmarks/{id}` (`UpdateBenchmarkRequest` — the old rename
+endpoint, `""`/`0` clears; UI = pencil on the Parameters tab's GPU row, plus a dedicated "Hardware"
+card for ingress runs). The row value wins over config in `_bench_gpu_meta`; `BenchmarkRecord` and
+`public-compare` now carry resolved top-level `gpu_type`/`gpu_count` so nobody has to parse
+`config_yaml`.
+
 ### Activity dashboard (`/activity`) + proxy-mode usage recording
 
 The **Activity** page (`web/.../activity-dashboard.tsx` → `GET /v1/history/activity` in

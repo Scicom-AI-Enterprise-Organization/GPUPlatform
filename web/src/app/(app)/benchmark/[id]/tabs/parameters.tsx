@@ -10,6 +10,7 @@ import {
   Cpu,
   FileCode2,
   Gauge,
+  Pencil,
   Server,
   Settings2,
 } from "lucide-react";
@@ -30,6 +31,9 @@ import { cn } from "@/lib/utils";
 /** A loose shape for the parsed benchmaq runpod-mode YAML — every field is
  * optional because users can drop into YAML mode and remove or rename keys. */
 type Parsed = {
+  // Ingress runs (bench an already-served endpoint — no pod spawned) put
+  // base_url either top-level or on a benchmark[] item.
+  base_url?: string;
   runpod?: {
     pod?: {
       name?: string;
@@ -54,6 +58,7 @@ type Parsed = {
   benchmark?: Array<{
     name?: string;
     engine?: string;
+    base_url?: string;
     model?: { repo_id?: string; local_dir?: string };
     serve?: Record<string, unknown>;
     bench?: Array<Record<string, unknown>>;
@@ -68,7 +73,35 @@ type Parsed = {
   }>;
 };
 
-export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
+// Datalist suggestions for the manual GPU-type editor — dropdown + free text in
+// one control. Full RunPod-style names so manually-tagged ingress runs group
+// with pod-run benches in stats/aggregate and external consumers.
+const GPU_TYPE_SUGGESTIONS = [
+  "NVIDIA H20",
+  "NVIDIA H100 80GB HBM3",
+  "NVIDIA H200",
+  "NVIDIA B200",
+  "NVIDIA B300",
+  "NVIDIA A100 80GB PCIe",
+  "NVIDIA A100-SXM4-80GB",
+  "NVIDIA L40S",
+  "NVIDIA L4",
+  "NVIDIA RTX A6000",
+  "NVIDIA GeForce RTX 4090",
+  "NVIDIA GeForce RTX 5090",
+  "AMD Instinct MI300X",
+  "Ascend 910B3",
+];
+
+export function ParametersTab({
+  bench,
+  canEdit = false,
+  onBenchChange,
+}: {
+  bench: BenchmarkRecord;
+  canEdit?: boolean;
+  onBenchChange?: (b: BenchmarkRecord) => void;
+}) {
   const [parseError, setParseError] = useState<string | null>(null);
   // For VM runs the submitted YAML doesn't contain host/port/user — those
   // are injected by the gateway at run time. Resolve them by looking up the
@@ -132,6 +165,12 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
   const concurrencies = uniqueNums(benchEntries, "max_concurrency");
   const isSweep = totalRuns > 1;
 
+  // Ingress/external runs (Slurm-submitted via API, benching an existing
+  // endpoint): no provider bound and no runpod block — nothing was spawned,
+  // so hardware identity is whatever the user sets manually.
+  const isIngress = !bench.provider_id && !parsed.runpod;
+  const baseUrl = parsed.base_url ?? first.base_url;
+
   return (
     <div className="space-y-6">
       <div>
@@ -186,6 +225,28 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
             />
           </KvGrid>
         </ParamsCard>
+      ) : isIngress ? (
+        <ParamsCard
+          icon={<Server className="h-4 w-4" />}
+          title="Hardware"
+          description="External endpoint run — nothing was spawned, so the platform can't detect the GPU behind it. Set it manually so this run groups by GPU in stats, comparisons, and the API."
+          action={
+            <Badge variant="secondary" className="font-mono text-[10px]">
+              ingress
+            </Badge>
+          }
+        >
+          <KvGrid>
+            <GpuIdentity
+              bench={bench}
+              fallbackType={pod.gpu_type}
+              fallbackCount={pod.gpu_count}
+              canEdit={canEdit}
+              onBenchChange={onBenchChange}
+            />
+            <Kv label="Endpoint" value={baseUrl} mono wide />
+          </KvGrid>
+        </ParamsCard>
       ) : (
         <ParamsCard
           icon={<Server className="h-4 w-4" />}
@@ -216,8 +277,13 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
                 wide
               />
             )}
-            <Kv label="GPU type" value={pod.gpu_type} mono />
-            <Kv label="GPU count" value={pod.gpu_count} />
+            <GpuIdentity
+              bench={bench}
+              fallbackType={pod.gpu_type}
+              fallbackCount={pod.gpu_count}
+              canEdit={canEdit}
+              onBenchChange={onBenchChange}
+            />
             <Kv
               label="Cloud"
               value={pod.secure_cloud ? "Secure" : "Community"}
@@ -457,6 +523,141 @@ export function ParametersTab({ bench }: { bench: BenchmarkRecord }) {
 
       <RawYamlBlock yaml={bench.config_yaml} />
     </div>
+  );
+}
+
+/** GPU type + count cells for a KvGrid, with an inline editor (owner/admin).
+ * The manual value lives on the benchmark row and wins over the config-derived
+ * one everywhere — it's the only way ingress/Slurm runs get a GPU identity.
+ * The input is a datalist: pick a known GPU or type any string. */
+function GpuIdentity({
+  bench,
+  fallbackType,
+  fallbackCount,
+  canEdit,
+  onBenchChange,
+}: {
+  bench: BenchmarkRecord;
+  fallbackType?: string;
+  fallbackCount?: number;
+  canEdit?: boolean;
+  onBenchChange?: (b: BenchmarkRecord) => void;
+}) {
+  // bench.gpu_type is already the server-resolved effective value (manual →
+  // config); the fallbacks only cover older gateway payloads without the field.
+  const effType = bench.gpu_type ?? fallbackType;
+  const effCount = bench.gpu_count ?? fallbackCount;
+  const [editing, setEditing] = useState(false);
+  const [typeDraft, setTypeDraft] = useState("");
+  const [countDraft, setCountDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  function start() {
+    setTypeDraft(effType ?? "");
+    setCountDraft(effCount != null ? String(effCount) : "");
+    setEditing(true);
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      const next = await gateway.updateBenchmark(bench.id, {
+        // "" / 0 clear the manual value (back to config-derived).
+        gpu_type: typeDraft.trim(),
+        gpu_count: countDraft.trim() === "" ? 0 : Math.max(0, parseInt(countDraft, 10) || 0),
+      });
+      onBenchChange?.(next);
+      setEditing(false);
+      toast.success("GPU type saved");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (editing) {
+    return (
+      <div className="sm:col-span-2">
+        <dt className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          GPU type × count
+        </dt>
+        <dd className="mt-1 flex flex-wrap items-center gap-2">
+          <input
+            list="gpu-type-suggestions"
+            value={typeDraft}
+            onChange={(e) => setTypeDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") save();
+              if (e.key === "Escape") setEditing(false);
+            }}
+            placeholder="NVIDIA H20"
+            autoFocus
+            className="h-7 w-48 rounded-md border border-border bg-background px-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"
+          />
+          <datalist id="gpu-type-suggestions">
+            {GPU_TYPE_SUGGESTIONS.map((g) => (
+              <option key={g} value={g} />
+            ))}
+          </datalist>
+          <input
+            type="number"
+            min={0}
+            value={countDraft}
+            onChange={(e) => setCountDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") save();
+              if (e.key === "Escape") setEditing(false);
+            }}
+            placeholder="×"
+            title="GPU count"
+            className="h-7 w-14 rounded-md border border-border bg-background px-2 text-xs outline-none focus:ring-1 focus:ring-ring"
+          />
+          <Button type="button" size="sm" className="h-7" onClick={save} disabled={saving}>
+            {saving ? "Saving…" : "Save"}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7"
+            onClick={() => setEditing(false)}
+            disabled={saving}
+          >
+            Cancel
+          </Button>
+        </dd>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div>
+        <dt className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          GPU type
+        </dt>
+        <dd className="mt-0.5 flex items-center gap-1 text-sm">
+          <span
+            className={cn("truncate font-mono text-xs", !effType && "text-muted-foreground")}
+            title={effType ?? "—"}
+          >
+            {effType ?? "—"}
+          </span>
+          {canEdit && (
+            <button
+              type="button"
+              onClick={start}
+              title="Set GPU type"
+              className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <Pencil className="h-3 w-3" />
+            </button>
+          )}
+        </dd>
+      </div>
+      <Kv label="GPU count" value={effCount ?? undefined} />
+    </>
   );
 }
 

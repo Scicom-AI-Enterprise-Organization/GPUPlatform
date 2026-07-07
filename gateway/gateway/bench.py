@@ -143,6 +143,13 @@ class Benchmark(Base):
     # at launch (the in-gateway ingress client sends it as Authorization: Bearer).
     # NULL = none (a pasted key lands in env_vars["OPENAI_API_KEY"] instead).
     api_key_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Manually-set GPU identity, for runs the platform didn't provision (ingress/
+    # Slurm-submitted): no runpod.pod block and usually no provider, so there's
+    # nothing to derive hardware from. Set at create or via PATCH; wins over the
+    # config-derived value everywhere GPU is read (record/stats/aggregate/export).
+    # NULL = derive from config_yaml / provider as before.
+    gpu_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    gpu_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
 # ---------- S3 ----------------------------------------------------------
@@ -1855,10 +1862,22 @@ class CreateBenchmarkRequest(BaseModel):
     # user). Default False = private. Same flag the post-creation
     # /{bench_id}/visibility toggle flips; set here to choose at create time.
     is_public: bool = False
+    # GPU identity for runs the platform doesn't provision (ingress/Slurm): the
+    # hardware behind base_url, e.g. "NVIDIA H20". Also settable as a top-level
+    # `gpu_type:`/`gpu_count:` key in the YAML itself. Cloud/VM runs don't need
+    # this — their GPU is derived from runpod.pod / the provider as usual.
+    gpu_type: Optional[str] = None
+    gpu_count: Optional[int] = None
 
 
-class RenameBenchmarkRequest(BaseModel):
-    name: str
+class UpdateBenchmarkRequest(BaseModel):
+    # All fields optional — absent means "leave unchanged". `name` renames (must
+    # be non-empty when present). `gpu_type`/`gpu_count` set the manual hardware
+    # identity ("" / 0 clears back to config-derived) so ingress/Slurm runs group
+    # correctly in stats/aggregate/export and external API consumers.
+    name: Optional[str] = None
+    gpu_type: Optional[str] = None
+    gpu_count: Optional[int] = None
 
 
 class BenchmarkRecord(BaseModel):
@@ -1888,6 +1907,12 @@ class BenchmarkRecord(BaseModel):
     # Exposed so the UI "Re-run" button can faithfully recreate the run — without
     # it, a re-run would default cleanup_model=true and wipe a pre-downloaded cache.
     cleanup_model: Optional[bool] = None
+    # Effective GPU identity, top-level so API consumers (e.g. the GPU calculator)
+    # never have to parse config_yaml: the manually-set row value when present
+    # (the only way ingress/Slurm runs get one), else the config's runpod.pod /
+    # top-level gpu_type. NULL when neither knows.
+    gpu_type: Optional[str] = None
+    gpu_count: Optional[int] = None
 
 
 class FileRecord(BaseModel):
@@ -1923,6 +1948,11 @@ class ImportBenchmarkData(BaseModel):
     cost_per_hr: Optional[float] = None
     env_vars: Optional[dict] = None
     visible_devices: Optional[str] = None
+    # Resolved hardware from the export (top-level in the export JSON since the
+    # source's provider doesn't travel). Stored on the imported row so GPU
+    # grouping survives the round-trip.
+    gpu_type: Optional[str] = None
+    gpu_count: Optional[int] = None
 
 
 class ImportBenchmarkFile(BaseModel):
@@ -1959,6 +1989,16 @@ router = APIRouter(prefix="/benchmarks", tags=["benchmarks"])
 def _to_record(
     b: Benchmark, owner_username: str, is_owner: Optional[bool] = None
 ) -> BenchmarkRecord:
+    # Effective GPU identity: manual row value first, else the config's
+    # runpod.pod / top-level gpu_type (same YAML parse _stats does per row).
+    # No provider fallback here — that needs a DB lookup (_bench_gpu_meta),
+    # and _to_record must stay sync/session-free.
+    gpu_type = getattr(b, "gpu_type", None)
+    gpu_count = getattr(b, "gpu_count", None)
+    if not gpu_type:
+        parsed = _parse_config(b.config_yaml or "")
+        gpu_type = parsed.get("gpu_type")
+        gpu_count = gpu_count or (parsed.get("gpu_count") if gpu_type else None)
     return BenchmarkRecord(
         id=b.id,
         name=b.name,
@@ -1982,6 +2022,8 @@ def _to_record(
         hf_token_secret=getattr(b, "hf_token_secret", None) or None,
         api_key_secret=getattr(b, "api_key_secret", None) or None,
         cleanup_model=getattr(b, "cleanup_model", None),
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
     )
 
 
@@ -2201,6 +2243,8 @@ async def create_benchmark(
         visible_devices=(body.visible_devices or "").strip() or None,
         hf_token_secret=(body.hf_token_secret or "").strip() or None,
         api_key_secret=(body.api_key_secret or "").strip() or None,
+        gpu_type=(body.gpu_type or "").strip()[:64] or None,
+        gpu_count=int(body.gpu_count) if body.gpu_count and body.gpu_count > 0 else None,
     )
     session.add(bench)
     await session.commit()
@@ -2439,6 +2483,13 @@ def _parse_dims_from_filename(name: str) -> dict:
     return out
 
 
+def _safe_int(v, default: int = 1) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
 def _parse_config(yaml_text: str) -> dict:
     try:
         cfg = yaml.safe_load(yaml_text) or {}
@@ -2448,15 +2499,23 @@ def _parse_config(yaml_text: str) -> dict:
         return {}
     pod = ((cfg.get("runpod") or {}).get("pod") or {})
     benches = cfg.get("benchmark") or []
-    first = benches[0] if benches else {}
+    first = benches[0] if isinstance(benches, list) and benches else {}
+    if not isinstance(first, dict):
+        first = {}
     serve = (first.get("serve") or {})
+    # GPU identity: runpod.pod for cloud runs; ingress/Slurm configs have no pod
+    # block, so also honor a top-level (or first-benchmark-item) gpu_type /
+    # gpu_count key — same YAML-author ergonomics as base_url/storage.
+    gpu_type = pod.get("gpu_type") or cfg.get("gpu_type") or first.get("gpu_type")
     return {
-        "gpu_type": pod.get("gpu_type"),
-        "gpu_count": int(pod.get("gpu_count") or 1),
+        "gpu_type": gpu_type,
+        "gpu_count": _safe_int(
+            pod.get("gpu_count") or cfg.get("gpu_count") or first.get("gpu_count") or 1
+        ),
         "engine": first.get("engine") or "vllm",
         "model": ((first.get("model") or {}).get("repo_id")),
-        "tp": int(serve.get("tensor_parallel_size") or 1),
-        "dp": int(serve.get("data_parallel_size") or 1),
+        "tp": _safe_int(serve.get("tensor_parallel_size") or 1),
+        "dp": _safe_int(serve.get("data_parallel_size") or 1),
     }
 
 
@@ -2468,6 +2527,12 @@ async def _bench_gpu_meta(b: "Benchmark") -> dict:
     e.g. ``"H20-3e (tm-2)"``. Opens its own session for the provider lookup so
     it's safe to call from concurrent gather() contexts."""
     meta = _parse_config(b.config_yaml or "")
+    # Manual row values (set at create / via PATCH — ingress and Slurm runs)
+    # override whatever the config says.
+    if getattr(b, "gpu_type", None):
+        meta["gpu_type"] = b.gpu_type
+    if getattr(b, "gpu_count", None):
+        meta["gpu_count"] = int(b.gpu_count)
     if b.provider_id and not meta.get("gpu_type"):
         try:
             async with session_factory()() as _s:
@@ -2639,30 +2704,51 @@ async def get_benchmark(
 
 
 @router.patch("/{bench_id}", response_model=BenchmarkRecord)
-async def rename_benchmark(
+async def update_benchmark(
     bench_id: str,
-    body: RenameBenchmarkRequest,
+    body: UpdateBenchmarkRequest,
     user: User = Depends(require_section("benchmark")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Rename a benchmark. Owner (or admin) only. Cosmetic — the run, S3 prefix,
-    and config are untouched."""
+    """Update mutable metadata: rename, and/or set the manual GPU identity (for
+    ingress/Slurm runs the platform didn't provision — nothing to derive hardware
+    from otherwise). Owner (or admin) only. Cosmetic — the run, S3 prefix, and
+    config are untouched."""
     b = await session.get(Benchmark, bench_id)
     if not b:
         raise HTTPException(status_code=404, detail={"error": "benchmark not found"})
     if not user.is_admin and b.owner_id != user.id:
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
-    name = (body.name or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail={"error": "name must not be empty"})
-    name = name[:200]
-    old = b.name
-    b.name = name
-    await session.commit()
-    await audit.record(
-        user, "benchmark.rename", "benchmark", bench_id, name,
-        details={"from": old, "to": name},
-    )
+    changes: dict = {}
+    if body.name is not None:
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail={"error": "name must not be empty"})
+        name = name[:200]
+        if name != b.name:
+            changes["name"] = {"from": b.name, "to": name}
+            b.name = name
+    if body.gpu_type is not None:
+        # "" clears the manual value (back to config-derived).
+        gpu_type = body.gpu_type.strip()[:64] or None
+        if gpu_type != b.gpu_type:
+            changes["gpu_type"] = {"from": b.gpu_type, "to": gpu_type}
+            b.gpu_type = gpu_type
+    if body.gpu_count is not None:
+        # 0 (or negative) clears the manual value.
+        gpu_count = int(body.gpu_count) if body.gpu_count > 0 else None
+        if gpu_count != b.gpu_count:
+            changes["gpu_count"] = {"from": b.gpu_count, "to": gpu_count}
+            b.gpu_count = gpu_count
+    if changes:
+        await session.commit()
+        # Keep the pre-existing rename event name so audit trails stay consistent;
+        # anything else lands under benchmark.update.
+        action = "benchmark.rename" if set(changes) == {"name"} else "benchmark.update"
+        await audit.record(
+            user, action, "benchmark", bench_id, b.name,
+            details=changes["name"] if action == "benchmark.rename" else {"changes": changes},
+        )
     owner = await session.get(User, b.owner_id)
     return _to_record(b, owner.username if owner else "", is_owner=b.owner_id == user.id)
 
@@ -2771,6 +2857,8 @@ async def duplicate_benchmark(
         cleanup_model=bool(getattr(src, "cleanup_model", True)),
         env_vars=getattr(src, "env_vars", None),
         visible_devices=getattr(src, "visible_devices", None),
+        gpu_type=getattr(src, "gpu_type", None),
+        gpu_count=getattr(src, "gpu_count", None),
     )
     session.add(new)
     await session.commit()
@@ -3257,6 +3345,8 @@ async def import_benchmark(
         visible_devices=data.visible_devices,
         hf_token_secret=None,
         api_key_secret=None,
+        gpu_type=(data.gpu_type or "").strip()[:64] or None,
+        gpu_count=data.gpu_count if (data.gpu_count or 0) > 0 else None,
     )
     session.add(b)
     await session.commit()
@@ -3332,6 +3422,7 @@ async def public_compare(
                 rows = json.loads(agg).get("results") or []
         except Exception:
             rows = []
+        meta = await _bench_gpu_meta(b)
         out.append({
             "id": b.id,
             "name": b.name,
@@ -3339,5 +3430,9 @@ async def public_compare(
             "config_yaml": b.config_yaml,
             "result_json": b.result_json,
             "result_rows": rows,
+            # Resolved hardware (manual value → config → provider) so the public
+            # page / external consumers don't have to parse config_yaml.
+            "gpu_type": meta.get("gpu_type"),
+            "gpu_count": meta.get("gpu_count") or 1,
         })
     return {"token": token, "notes": share.notes or "", "pairing": share.pairing or {}, "benchmarks": out}

@@ -333,6 +333,15 @@ export const gateway = {
       method: "PATCH",
       body: JSON.stringify({ name }),
     }),
+  /** Update mutable benchmark metadata. gpu_type/gpu_count set the manual GPU
+   * identity for runs the platform didn't provision (ingress/Slurm — no pod
+   * block to derive it from); gpu_type "" / gpu_count 0 clear back to
+   * config-derived. Absent fields are left unchanged. */
+  updateBenchmark: (id: string, body: { name?: string; gpu_type?: string; gpu_count?: number }) =>
+    request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
   setBenchmarkVisibility: (id: string, isPublic: boolean) =>
     request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}/visibility`, {
       method: "POST",
@@ -824,6 +833,12 @@ export const gateway = {
     request<{ ok: boolean; message: string }>(
       `/v1/providers/${encodeURIComponent(id)}/kill-pid`,
       { method: "POST", body: JSON.stringify({ pid }) },
+    ),
+  // Kill every pid on a GPU in one SSH session (metrics page "Kill all" button).
+  killProviderPids: (id: string, pids: number[]) =>
+    request<{ ok: boolean; message: string }>(
+      `/v1/providers/${encodeURIComponent(id)}/kill-pids`,
+      { method: "POST", body: JSON.stringify({ pids }) },
     ),
   // On-demand disk/memory/CPU bandwidth benchmark (button-triggered, not polled).
   getProviderBandwidth: (id: string) =>
