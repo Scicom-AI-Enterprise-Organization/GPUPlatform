@@ -161,6 +161,9 @@ def _normalize_minimax_turn(turn: dict) -> dict:
                             holder["arguments"] = json.loads(a)
                         except (json.JSONDecodeError, ValueError):
                             holder["arguments"] = {}
+                    elif a is None and "arguments" in holder:
+                        # explicit null → {} (the template does `arguments.items()`).
+                        holder["arguments"] = {}
             norm.append(tc)
         turn["tool_calls"] = norm
     return turn
@@ -245,6 +248,38 @@ def _normalize_mistral_turn(turn: dict, all_reasoning: bool) -> dict:
     return turn
 
 
+def _normalize_gemma_turn(turn: dict) -> dict:
+    """Gemma-4 template quirks: it reads `tool_call['function']['name']` and renders
+    `function['arguments']` in its NATIVE `key:<|"|>value<|"|>` form ONLY when arguments
+    is a *mapping* — a JSON-*string* cell is dumped verbatim as raw JSON (wrong format to
+    train on), and a bare `{name, arguments}` tool_call with no `function` wrapper
+    KeyErrors the template → the row is silently dropped. So parse `arguments` str→dict
+    and wrap bare calls into the OpenAI `{type:function, function:{…}}` shape. (Reasoning
+    needs no mapping — the template reads `reasoning`/`reasoning_content` directly.)"""
+    turn = dict(turn)
+    tcs = turn.get("tool_calls")
+    if isinstance(tcs, (list, tuple)):
+        norm = []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            tc = dict(tc)
+            fn = dict(tc["function"]) if isinstance(tc.get("function"), dict) else {
+                "name": tc.get("name"), "arguments": tc.get("arguments", {})}
+            a = fn.get("arguments")
+            if isinstance(a, str):
+                try:
+                    fn["arguments"] = json.loads(a)
+                except (json.JSONDecodeError, ValueError):
+                    fn["arguments"] = {}
+            elif a is None:
+                fn["arguments"] = {}
+            tc["function"] = fn
+            norm.append(tc)
+        turn["tool_calls"] = norm
+    return turn
+
+
 def extract_messages(value: Any, arch: str = "generic", all_reasoning: bool = True) -> Optional[list]:
     """Normalize a `messages` cell into a list[dict]. HF parquet often stores it as a
     JSON *string*; also tolerate a list / numpy array of dicts. Apply the arch-specific
@@ -271,6 +306,8 @@ def extract_messages(value: Any, arch: str = "generic", all_reasoning: bool = Tr
             out.append(_normalize_mistral_turn(turn, all_reasoning))
         elif arch == "qwen":
             out.append(_normalize_qwen_turn(turn))
+        elif arch == "gemma":
+            out.append(_normalize_gemma_turn(turn))
         else:
             out.append(dict(turn))
     return out or None
