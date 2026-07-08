@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/card";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkRecord, ProviderRecord } from "@/lib/types";
+import { GPU_TYPE_SUGGESTIONS } from "@/lib/bench-gpu-suggestions";
 import { cn } from "@/lib/utils";
 
 /** A loose shape for the parsed benchmaq runpod-mode YAML — every field is
@@ -73,25 +74,8 @@ type Parsed = {
   }>;
 };
 
-// Datalist suggestions for the manual GPU-type editor — dropdown + free text in
-// one control. Full RunPod-style names so manually-tagged ingress runs group
-// with pod-run benches in stats/aggregate and external consumers.
-const GPU_TYPE_SUGGESTIONS = [
-  "NVIDIA H20",
-  "NVIDIA H100 80GB HBM3",
-  "NVIDIA H200",
-  "NVIDIA B200",
-  "NVIDIA B300",
-  "NVIDIA A100 80GB PCIe",
-  "NVIDIA A100-SXM4-80GB",
-  "NVIDIA L40S",
-  "NVIDIA L4",
-  "NVIDIA RTX A6000",
-  "NVIDIA GeForce RTX 4090",
-  "NVIDIA GeForce RTX 5090",
-  "AMD Instinct MI300X",
-  "Ascend 910B3",
-];
+// GPU-type datalist suggestions now live in @/lib/bench-gpu-suggestions so the
+// create form (benchmark/new) offers the exact same list.
 
 export function ParametersTab({
   bench,
