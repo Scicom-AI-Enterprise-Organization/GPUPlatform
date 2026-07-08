@@ -94,30 +94,41 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
   const [bwErr, setBwErr] = useState<string | null>(null);
   const [killing, setKilling] = useState<Set<number>>(new Set());
   const [killNote, setKillNote] = useState<string | null>(null);
-  const [pendingKill, setPendingKill] = useState<number | null>(null);
+  // A pending kill is one-or-more pids plus a human label ("pid 123" / "all 11 processes on GPU #7").
+  const [pendingKill, setPendingKill] = useState<{ pids: number[]; label: string } | null>(null);
   const tick = useRef(0);
 
-  // Killing a GPU process is destructive (SIGKILL on the VM over SSH), so confirm via the themed
-  // dialog: the Kill button opens it (requestKill), the dialog's confirm runs the kill (confirmKill).
+  // Killing GPU processes is destructive (SIGKILL on the VM over SSH), so confirm via the themed
+  // dialog: a Kill button opens it (requestKill / requestKillGpu), the dialog's confirm runs it.
   function requestKill(pid: number) {
     setKillNote(null);
-    setPendingKill(pid);
+    setPendingKill({ pids: [pid], label: `pid ${pid}` });
   }
 
-  // Terminate the pending process. On success, refresh metrics so the freed GPU shows immediately.
+  // "Kill all" for one GPU — every pid bound to it, in a single SSH session.
+  function requestKillGpu(index: number, pids: number[]) {
+    if (pids.length === 0) return;
+    setKillNote(null);
+    setPendingKill({ pids, label: `all ${pids.length} process${pids.length === 1 ? "" : "es"} on GPU #${index}` });
+  }
+
+  // Terminate the pending pid(s). On success, refresh metrics so the freed GPU shows immediately.
   async function confirmKill() {
-    const pid = pendingKill;
-    if (pid == null) return;
+    const pend = pendingKill;
+    if (pend == null) return;
+    const { pids } = pend;
     setPendingKill(null);
-    setKilling((s) => new Set(s).add(pid));
+    setKilling((s) => { const n = new Set(s); pids.forEach((p) => n.add(p)); return n; });
     try {
-      const r = await gateway.killProviderPid(id, pid);
-      setKillNote(`pid ${pid}: ${r.message}`);
+      const r = pids.length === 1
+        ? await gateway.killProviderPid(id, pids[0])
+        : await gateway.killProviderPids(id, pids);
+      setKillNote(`${pend.label}: ${r.message}`);
       try { setM(await gateway.getProviderMetrics(id)); } catch { /* next poll refreshes */ }
     } catch (e) {
-      setKillNote(`pid ${pid}: ${e instanceof Error ? e.message : String(e)}`);
+      setKillNote(`${pend.label}: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setKilling((s) => { const n = new Set(s); n.delete(pid); return n; });
+      setKilling((s) => { const n = new Set(s); pids.forEach((p) => n.delete(p)); return n; });
     }
   }
 
@@ -381,12 +392,25 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
             <div className="grid gap-3 lg:grid-cols-2">
               {gpus.map((g) => {
                 const mp = g.mem_total_mib > 0 ? (g.mem_used_mib / g.mem_total_mib) * 100 : 0;
+                const procCount = g.processes?.length ?? 0;
+                const gpuBusy = (g.processes ?? []).some((p) => killing.has(p.pid));
                 return (
                   <div key={g.index} className="rounded-lg border border-border p-3">
                     <div className="flex items-center justify-between gap-2">
                       <span className="truncate font-mono text-xs font-medium">
                         #{g.index} {g.name.replace(/^NVIDIA\s+/, "")}
                       </span>
+                      {procCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => requestKillGpu(g.index, g.processes!.map((p) => p.pid))}
+                          disabled={gpuBusy}
+                          title={`SIGKILL all ${procCount} process${procCount === 1 ? "" : "es"} on GPU #${g.index}`}
+                          className="shrink-0 rounded border border-destructive/40 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                        >
+                          {gpuBusy ? "…" : `Kill all (${procCount})`}
+                        </button>
+                      )}
                     </div>
                     <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px]">
                       <span className="text-emerald-600 dark:text-emerald-400">
@@ -555,15 +579,15 @@ export function ProviderMetricsView({ id, provider }: { id: string; provider: Pr
       <Dialog open={pendingKill !== null} onOpenChange={(o) => { if (!o) setPendingKill(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Terminate process?</DialogTitle>
+            <DialogTitle>{(pendingKill?.pids.length ?? 0) > 1 ? "Terminate processes?" : "Terminate process?"}</DialogTitle>
             <DialogDescription>
-              SIGKILL <span className="font-mono text-foreground">pid {pendingKill}</span> on this VM to
-              free the GPU it holds. The process is killed immediately and cannot be resumed.
+              SIGKILL <span className="font-mono text-foreground">{pendingKill?.label}</span> on this VM to
+              free the GPU{(pendingKill?.pids.length ?? 0) > 1 ? "" : " it holds"}. They are killed immediately and cannot be resumed.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setPendingKill(null)}>Cancel</Button>
-            <Button variant="destructive" onClick={confirmKill}>Kill</Button>
+            <Button variant="destructive" onClick={confirmKill}>Kill{(pendingKill?.pids.length ?? 0) > 1 ? " all" : ""}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

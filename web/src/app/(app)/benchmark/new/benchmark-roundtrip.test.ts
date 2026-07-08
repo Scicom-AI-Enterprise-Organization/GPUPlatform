@@ -150,3 +150,99 @@ describe("benchmark VM Form<->YAML round-trip (DE-53)", () => {
     expect(renderYaml(parsed.state, "vm", "s3")).toBe(out);
   });
 });
+
+// Ingress GPU identity (DE-59): the author-stated GPU behind an external
+// endpoint must be emitted into the YAML template and round-trip, so the run's
+// Parameters -> Hardware shows it without a manual post-run edit.
+describe("benchmark ingress GPU Form<->YAML round-trip (DE-59)", () => {
+  const ingress = {
+    ...DEFAULTS,
+    ingress_base_url: "https://tm-h20-llm-1.aies.scicom.dev",
+    ingress_gpu_type: "NVIDIA H20",
+    ingress_gpu_count: 4,
+  };
+
+  it("emits gpu_type / gpu_count on the ingress benchmark item", () => {
+    const out = renderYaml(ingress, "ingress", "s3");
+    expect(out).toMatch(/^ {4}gpu_type: "NVIDIA H20"/m);
+    expect(out).toMatch(/^ {4}gpu_count: 4$/m);
+    expect(out).not.toMatch(/^runpod:/m); // ingress spawns nothing
+  });
+
+  it("parses gpu_type / gpu_count back out (YAML -> Form)", () => {
+    const parsed = parseYamlToForm(renderYaml(ingress, "ingress", "s3"), DEFAULTS);
+    expect(parsed.parseError).toBeNull();
+    expect(parsed.state.ingress_gpu_type).toBe("NVIDIA H20");
+    expect(parsed.state.ingress_gpu_count).toBe(4);
+  });
+
+  it("is byte-stable across render -> parse -> render (no drift)", () => {
+    const first = renderYaml(ingress, "ingress", "s3");
+    const parsed = parseYamlToForm(first, DEFAULTS);
+    expect(renderYaml(parsed.state, "ingress", "s3")).toBe(first);
+  });
+
+  it("keeps the empty-GPU template stable (blank stays blank)", () => {
+    const out = renderYaml(DEFAULTS, "ingress", "s3");
+    expect(out).toMatch(/^ {4}gpu_type: ""/m); // template always shows the key
+    const parsed = parseYamlToForm(out, DEFAULTS);
+    expect(parsed.state.ingress_gpu_type).toBe(""); // empty parses to no GPU
+    expect(renderYaml(parsed.state, "ingress", "s3")).toBe(out);
+  });
+});
+
+// TP/DP are now surfaced in the RunPod/VM serve template (default 1) and, for
+// ingress runs, recorded as a descriptive serve block (nothing is launched, so
+// they only annotate how the external endpoint is served).
+describe("benchmark TP/DP template + ingress round-trip", () => {
+  it("shows tensor_parallel_size / data_parallel_size in the cloud template (default 1)", () => {
+    const out = renderYaml(DEFAULTS, "cloud", "s3");
+    expect(out).toMatch(/^ {6}tensor_parallel_size: 1$/m);
+    expect(out).toMatch(/^ {6}data_parallel_size: 1$/m);
+  });
+
+  it("shows tensor_parallel_size / data_parallel_size in the VM template too", () => {
+    const out = renderYaml(DEFAULTS, "vm", "s3", { cleanupModel: true });
+    expect(out).toMatch(/^ {6}tensor_parallel_size: 1$/m);
+    expect(out).toMatch(/^ {6}data_parallel_size: 1$/m);
+  });
+
+  it("round-trips an edited TP/DP through cloud YAML -> Form -> YAML", () => {
+    const edited = renderYaml(
+      { ...DEFAULTS, tensor_parallel_size: "4", data_parallel_size: "2" },
+      "cloud",
+      "s3",
+    );
+    expect(edited).toMatch(/^ {6}tensor_parallel_size: 4$/m);
+    expect(edited).toMatch(/^ {6}data_parallel_size: 2$/m);
+    const parsed = parseYamlToForm(edited, DEFAULTS);
+    expect(parsed.parseError).toBeNull();
+    expect(parsed.state.tensor_parallel_size).toBe("4");
+    expect(parsed.state.data_parallel_size).toBe("2");
+  });
+
+  it("records TP/DP on the ingress item as a descriptive serve block (no pod)", () => {
+    const out = renderYaml(
+      { ...DEFAULTS, ingress_base_url: "https://x", tensor_parallel_size: "8", data_parallel_size: "1" },
+      "ingress",
+      "s3",
+    );
+    expect(out).toMatch(/^ {4}serve:$/m);
+    expect(out).toMatch(/^ {6}tensor_parallel_size: 8$/m);
+    expect(out).toMatch(/^ {6}data_parallel_size: 1$/m);
+    expect(out).not.toMatch(/^runpod:/m); // ingress still spawns nothing
+  });
+
+  it("parses ingress TP/DP back out and is byte-stable", () => {
+    const first = renderYaml(
+      { ...DEFAULTS, ingress_base_url: "https://x", tensor_parallel_size: "8", data_parallel_size: "2" },
+      "ingress",
+      "s3",
+    );
+    const parsed = parseYamlToForm(first, DEFAULTS);
+    expect(parsed.parseError).toBeNull();
+    expect(parsed.state.tensor_parallel_size).toBe("8");
+    expect(parsed.state.data_parallel_size).toBe("2");
+    expect(renderYaml(parsed.state, "ingress", "s3")).toBe(first);
+  });
+});

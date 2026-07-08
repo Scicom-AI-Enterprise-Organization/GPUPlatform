@@ -261,6 +261,11 @@ export type BenchmarkRecord = {
   visible_devices?: string | null;
   hf_token_secret?: string | null;
   cleanup_model?: boolean | null;
+  // Effective GPU identity, resolved server-side: the manually-set value when
+  // present (the only way ingress/Slurm runs get one — set at create or via
+  // updateBenchmark), else the config's runpod.pod / top-level gpu_type.
+  gpu_type?: string | null;
+  gpu_count?: number | null;
 };
 
 export type CreateBenchmarkRequest = {
@@ -288,6 +293,11 @@ export type CreateBenchmarkRequest = {
   // Create already public (read-only visible to every logged-in user). Omitted/
   // false = private. Same flag the /benchmarks/{id}/visibility toggle flips.
   is_public?: boolean;
+  // GPU identity for runs the platform doesn't provision (ingress/Slurm): the
+  // hardware behind base_url, e.g. "NVIDIA H20". Also settable as a top-level
+  // gpu_type/gpu_count key in the YAML, or later on the detail page.
+  gpu_type?: string | null;
+  gpu_count?: number | null;
 };
 
 export type BenchmarkFile = {

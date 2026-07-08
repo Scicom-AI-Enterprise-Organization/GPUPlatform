@@ -28,7 +28,7 @@ from .auth import current_user, require_admin
 from .compute import PI_GPU_TYPES, RUNPOD_GPU_TYPES, GpuTypeOption
 from .db import Provider, User, get_session
 from .provider import cloud_providers_disabled
-from .vm_probe import availability_vm, bandwidth_vm, kill_pid_vm, metrics_vm, probe_vm
+from .vm_probe import availability_vm, bandwidth_vm, kill_pid_vm, kill_pids_vm, metrics_vm, probe_vm
 
 logger = logging.getLogger("gateway.providers")
 
@@ -767,6 +767,43 @@ async def provider_kill_pid(
     await audit_module.record(
         user, "provider.kill-pid", "provider", provider_id, row.name,
         details={"pid": req.pid, "sig": req.sig, "ok": result.ok, "message": result.message},
+    )
+    return KillPidResponse(ok=result.ok, message=result.message)
+
+
+class KillPidsRequest(BaseModel):
+    pids: list[int]
+    sig: int = 9  # SIGKILL by default — the metrics "Kill all" button frees a whole GPU
+
+
+@router.post("/{provider_id}/kill-pids", response_model=KillPidResponse)
+async def provider_kill_pids(
+    provider_id: str,
+    req: KillPidsRequest,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Kill several pids in one SSH session — the metrics page "Kill all" button, to
+    free a GPU held by every process at once (far faster than N round-trips). Owner or
+    admin only. pid<=1 is dropped; reports the combined kill outcome."""
+    row = await session.get(Provider, provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+    if row.owner_id != user.id and not user.is_admin:
+        raise HTTPException(status_code=403, detail="not your provider")
+    if row.kind != "vm":
+        raise HTTPException(status_code=400, detail="kill-pids is only available for VM providers")
+    pids = [p for p in req.pids if p > 1]
+    if not pids:
+        raise HTTPException(status_code=400, detail="no killable pids")
+    result = await kill_pids_vm(
+        **_vm_conn_from_cfg(row.config or {}),
+        pids=pids,
+        sig=req.sig,
+    )
+    await audit_module.record(
+        user, "provider.kill-pids", "provider", provider_id, row.name,
+        details={"pids": pids, "sig": req.sig, "ok": result.ok, "message": result.message},
     )
     return KillPidResponse(ok=result.ok, message=result.message)
 

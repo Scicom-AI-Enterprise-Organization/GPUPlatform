@@ -1014,6 +1014,15 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS api_key_secret VARCHAR(128)"
         ))
+        # Manual GPU identity for runs the platform didn't provision (ingress/
+        # Slurm-submitted via API — no pod block, usually no provider). Set at
+        # create or via PATCH /benchmarks/{id}; wins over config-derived GPU.
+        await conn.execute(text(
+            "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS gpu_type VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE benchmarks ADD COLUMN IF NOT EXISTS gpu_count INTEGER"
+        ))
         # Worker/node identity per inference request (history API): mirrored
         # from the worker's Redis result alongside status/output.
         await conn.execute(text(

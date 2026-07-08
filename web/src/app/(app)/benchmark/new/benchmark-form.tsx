@@ -69,6 +69,7 @@ import {
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { FormFooter, FormShell } from "@/components/form-shell";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
+import { GPU_TYPE_SUGGESTIONS } from "@/lib/bench-gpu-suggestions";
 import { gateway } from "@/lib/gateway";
 import type { BenchmarkTemplate, GpuTypeOption, ProviderRecord, StorageRecord, VmAvailability } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -192,6 +193,13 @@ type FormState = {
   // the run skips all provisioning and hits this URL directly. model_repo_id
   // doubles as the served model name for the API request.
   ingress_base_url: string;
+  // Ingress target only: the GPU behind the external endpoint. Nothing is
+  // spawned so the platform can't detect it — the author states it here so the
+  // run groups by GPU in stats/comparisons/the API (visible in Parameters →
+  // Hardware without a manual post-run edit). A label like "NVIDIA H20" /
+  // "Ascend 910B3"; empty = unknown. Independent of cloud's runpod gpu_type.
+  ingress_gpu_type: string;
+  ingress_gpu_count: number;
   // All vLLM engine args are strings so empty = "use vLLM default" — same
   // ergonomics as the serverless endpoint create form.
   tensor_parallel_size: string;
@@ -256,8 +264,13 @@ export const DEFAULTS: FormState = {
   container_image: DEFAULT_CONTAINER_IMAGE,
   model_repo_id: "Qwen/Qwen2.5-0.5B-Instruct",
   ingress_base_url: "",
-  tensor_parallel_size: "",
-  data_parallel_size: "",
+  ingress_gpu_type: "",
+  ingress_gpu_count: 1,
+  // Default to 1 (vLLM's own default) so the knobs are visible in the template
+  // YAML for runpod/VM instead of hidden until first edited. Empty still means
+  // "omit / use vLLM default"; 1 renders as an explicit tensor_parallel_size: 1.
+  tensor_parallel_size: "1",
+  data_parallel_size: "1",
   max_model_len: "",
   gpu_memory_utilization: "",
   max_num_seqs: "",
@@ -566,12 +579,34 @@ ${renderBenchEntries(s)}
   // model.repo_id is the served model name for the API request. Storage still
   // applies — results + logs land in the selected S3 backend.
   if (target === "ingress") {
+    // gpu_type / gpu_count are stated by the author (nothing is spawned, so the
+    // platform can't detect the GPU). The gateway reads them off the item and
+    // stores them on the run, so Parameters → Hardware shows the GPU with no
+    // manual edit. Kept on the benchmark item, same as base_url / storage.
+    //
+    // TP/DP are descriptive for ingress — nothing is launched, so they only
+    // record how the external endpoint is served (tensor-parallel ×
+    // data-parallel). They show in Parameters → Model and let the run group by
+    // parallelism in stats/comparisons. Only these two serve keys (NOT the full
+    // engine-arg block, which would falsely imply the platform set them).
+    const ingressServe: string[] = [];
+    const itp = s.tensor_parallel_size.trim();
+    const idp = s.data_parallel_size.trim();
+    if (itp && Number.isFinite(Number(itp)))
+      ingressServe.push(`      tensor_parallel_size: ${Number(itp)}`);
+    if (idp && Number.isFinite(Number(idp)))
+      ingressServe.push(`      data_parallel_size: ${Number(idp)}`);
+    const ingressServeBlock = ingressServe.length
+      ? `    serve:\n${ingressServe.join("\n")}\n`
+      : "";
     return `benchmark:
   - name: ${s.benchName}
 ${benchStorageLine}    engine: vllm
     base_url: "${s.ingress_base_url}"
     model:
       repo_id: "${s.model_repo_id}"
+${ingressServeBlock}    gpu_type: "${s.ingress_gpu_type}"  # GPU behind the endpoint — shows in Parameters → Hardware
+    gpu_count: ${s.ingress_gpu_count}
 ${workloadBlock}`;
   }
 
@@ -741,6 +776,21 @@ export function parseYamlToForm(src: string, fallback: FormState): ParseYamlResu
   const topBaseUrl = typeof d.base_url === "string" ? (d.base_url as string).trim() : "";
   const baseUrl = itemBaseUrl || topBaseUrl || null;
   if (baseUrl) next.ingress_base_url = baseUrl;
+
+  // ---- ingress gpu_type / gpu_count — the author-stated GPU behind the
+  // endpoint (item-level, top-level fallback). Same keys the gateway parses;
+  // round-trips so flipping Form<->YAML doesn't drop the hardware label.
+  const itemGpuType = typeof first.gpu_type === "string" ? first.gpu_type.trim() : "";
+  const topGpuType = typeof d.gpu_type === "string" ? (d.gpu_type as string).trim() : "";
+  const gpuType = itemGpuType || topGpuType;
+  if (gpuType) next.ingress_gpu_type = gpuType;
+  const gpuCount =
+    typeof first.gpu_count === "number"
+      ? first.gpu_count
+      : typeof d.gpu_count === "number"
+        ? (d.gpu_count as number)
+        : null;
+  if (gpuCount != null && gpuCount > 0) next.ingress_gpu_count = gpuCount;
 
   // ---- benchmark[0].serve — split into form-mapped keys + Extra args.
   const serve = (first.serve ?? {}) as Record<string, unknown>;
@@ -1196,6 +1246,14 @@ export function BenchmarkForm({
       parsedYaml?.cleanupModel != null ? parsedYaml.cleanupModel : cleanupModel;
     const effectiveEnvText =
       parsedYaml?.envText != null ? parsedYaml.envText : envText;
+    // Ingress GPU identity: the YAML in YAML mode, else the form. config_yaml
+    // already carries gpu_type on the item (the gateway parses it regardless),
+    // but sending it also sets the run's row — matching the manual Hardware
+    // editor — so Parameters → Hardware shows the GPU with no post-run edit.
+    const effIngressGpuType =
+      (mode === "yaml" ? parsedYaml?.state.ingress_gpu_type : form.ingress_gpu_type) || "";
+    const effIngressGpuCount =
+      (mode === "yaml" ? parsedYaml?.state.ingress_gpu_count : form.ingress_gpu_count) || 1;
     setSubmitting(true);
     try {
       const envVars = parseEnvVars(effectiveEnvText);
@@ -1228,6 +1286,9 @@ export function BenchmarkForm({
           : {}),
         ...(hfSource === "secret" && hfTokenSecret ? { hf_token_secret: hfTokenSecret } : {}),
         ...(target === "ingress" && apiKeySource === "secret" && apiKeySecret ? { api_key_secret: apiKeySecret } : {}),
+        ...(target === "ingress" && effIngressGpuType.trim()
+          ? { gpu_type: effIngressGpuType.trim(), gpu_count: effIngressGpuCount }
+          : {}),
       });
       toast.success(`Created ${created.id}`, { duration: 4000 });
       router.push(`/benchmark/${encodeURIComponent(created.id)}`);
@@ -1531,6 +1592,73 @@ export function BenchmarkForm({
                     onChange={(e) => field("model_repo_id", e.target.value)}
                     placeholder="google/gemma-4-31b-it"
                   />
+                </FieldWrap>
+                <FieldWrap
+                  label="GPU type × count"
+                  hint="Nothing is provisioned, so state the GPU behind this endpoint. It's written into the YAML and shown in Parameters → Hardware — the run groups by GPU in stats, comparisons, and the API with no manual edit. Pick a known GPU or type any (e.g. Ascend 910B3). Leave blank if unknown."
+                  wide
+                >
+                  <div className="flex items-center gap-2">
+                    <Input
+                      className="font-mono"
+                      list="ingress-gpu-suggestions"
+                      value={form.ingress_gpu_type}
+                      onChange={(e) => field("ingress_gpu_type", e.target.value)}
+                      placeholder="NVIDIA H20"
+                    />
+                    <span className="shrink-0 text-muted-foreground">×</span>
+                    <Input
+                      type="number"
+                      min={1}
+                      className="w-20 font-mono"
+                      value={form.ingress_gpu_count}
+                      onChange={(e) =>
+                        field("ingress_gpu_count", Math.max(1, parseInt(e.target.value, 10) || 1))
+                      }
+                    />
+                    <datalist id="ingress-gpu-suggestions">
+                      {GPU_TYPE_SUGGESTIONS.map((g) => (
+                        <option key={g} value={g} />
+                      ))}
+                    </datalist>
+                  </div>
+                </FieldWrap>
+                <FieldWrap
+                  label="Parallelism — TP × DP (optional)"
+                  hint="Descriptive only — nothing is launched. Records how the endpoint is served: tensor-parallel (left) × data-parallel (right). Written to the YAML, shown in Parameters → Model, and groups runs by parallelism. Leave 1 × 1 if unknown."
+                  wide
+                >
+                  <div className="flex items-end gap-2">
+                    <div className="flex flex-col gap-1">
+                      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                        TP
+                      </span>
+                      <Input
+                        type="text"
+                        inputMode="numeric"
+                        className="w-24 font-mono"
+                        value={form.tensor_parallel_size}
+                        onChange={(e) => field("tensor_parallel_size", e.target.value)}
+                        placeholder="1"
+                        aria-label="tensor-parallel-size"
+                      />
+                    </div>
+                    <span className="shrink-0 pb-2 text-muted-foreground">×</span>
+                    <div className="flex flex-col gap-1">
+                      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                        DP
+                      </span>
+                      <Input
+                        type="text"
+                        inputMode="numeric"
+                        className="w-24 font-mono"
+                        value={form.data_parallel_size}
+                        onChange={(e) => field("data_parallel_size", e.target.value)}
+                        placeholder="1"
+                        aria-label="data-parallel-size"
+                      />
+                    </div>
+                  </div>
                 </FieldWrap>
                 <FieldWrap
                   label="API key (optional)"

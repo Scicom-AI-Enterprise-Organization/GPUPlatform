@@ -412,7 +412,7 @@ export function BenchmarkDetail({ bench: initial, isAdmin = false }: { bench: Be
         <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)}>
           <TabsContent value="logs"><LogsTab bench={bench} /></TabsContent>
           <TabsContent value="results"><ResultsTab bench={bench} /></TabsContent>
-          <TabsContent value="parameters"><ParametersTab bench={bench} /></TabsContent>
+          <TabsContent value="parameters"><ParametersTab bench={bench} canEdit={canRename} onBenchChange={setBench} /></TabsContent>
           <TabsContent value="files"><FilesTab bench={bench} /></TabsContent>
         </Tabs>
       </div>

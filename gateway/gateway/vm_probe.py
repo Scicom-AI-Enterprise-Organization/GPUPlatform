@@ -877,3 +877,48 @@ async def kill_pid_vm(host: str, port: int, user: str, private_key: str | None =
     return await asyncio.to_thread(_kill_pid_sync, host, port, user, private_key, pid, sig,
                                    password, jump_host, jump_port, jump_user,
                                    jump_private_key, jump_password)
+
+
+def _kill_pids_sync(host: str, port: int, user: str, private_key: str | None = None,
+                    pids: list[int] | None = None, sig: int = 9,
+                    password: str | None = None,
+                    jump_host: str | None = None, jump_port: int = 22,
+                    jump_user: str | None = None, jump_private_key: str | None = None,
+                    jump_password: str | None = None) -> VmKillResult:
+    """SSH onto a VM and kill several pids in ONE session (the metrics page "Kill all"
+    button, to free a GPU held by every process at once). Safer + far faster than N
+    round-trips. pids are ints (no shell interpolation); pid<=1 is dropped. A single
+    `kill -9 p1 p2 …` kills every live pid even if some are already gone — kill's
+    stderr (e.g. "No such process") is surfaced but the survivors are still killed."""
+    pids = [int(p) for p in (pids or []) if int(p) > 1]
+    if not pids:
+        return VmKillResult(ok=False, message="no killable pids")
+    try:
+        client, jump = _connect(host, port, user, private_key, password,
+                                jump_host, jump_port, jump_user, jump_private_key, jump_password)
+    except RuntimeError as e:
+        return VmKillResult(ok=False, message=str(e))
+
+    try:
+        signame = "KILL" if sig == 9 else str(sig)
+        cmd = "kill -{} {}".format(int(sig), " ".join(str(p) for p in pids))
+        _, stdout, stderr = client.exec_command(cmd, timeout=COMMAND_TIMEOUT_S)
+        rc = stdout.channel.recv_exit_status()
+        err = stderr.read().decode(errors="replace").strip()
+        if rc == 0:
+            return VmKillResult(ok=True, message=f"sent SIG{signame} to {len(pids)} pid(s)")
+        # Some pids may have been gone already; the rest were still killed.
+        return VmKillResult(ok=False, message=err or f"kill exited {rc}")
+    finally:
+        _close_quiet(client, jump)
+
+
+async def kill_pids_vm(host: str, port: int, user: str, private_key: str | None = None,
+                       pids: list[int] | None = None, sig: int = 9,
+                       password: str | None = None,
+                       jump_host: str | None = None, jump_port: int = 22,
+                       jump_user: str | None = None, jump_private_key: str | None = None,
+                       jump_password: str | None = None) -> VmKillResult:
+    return await asyncio.to_thread(_kill_pids_sync, host, port, user, private_key, pids, sig,
+                                   password, jump_host, jump_port, jump_user,
+                                   jump_private_key, jump_password)
