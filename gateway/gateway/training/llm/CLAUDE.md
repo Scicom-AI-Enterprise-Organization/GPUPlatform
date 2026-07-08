@@ -55,7 +55,12 @@ These are **copies** of the standalone `autotrain/{gemma4,minimax-m2,mistral-sma
 authority for the model-specific design — read their CLAUDE.md for the deep details). The gateway
 copy adds two edits to each `*.py` it runs: a `MODEL_ID`/`GEMMA_MODEL_ID` env override (so a run can
 pick a size) and, for gemma, the `--target_modules` flag. When the user improves a standalone
-trainer, RE-SYNC the vendored copy here (preserving those gateway edits).
+trainer, RE-SYNC the vendored copy here (preserving those gateway edits). ⚠ **The DPO additions
+(qwen3_5.py + gemma4.py: `dpo_collator`, `lora_disabled()`, the DPO forward branch, `--dpo/--dpo_beta`,
+and qwen's `make_custom_cls(dpo_beta=)` / gemma's `enable_dpo()`) currently live ONLY in these
+vendored gateway copies — NOT in the standalone `autotrain/{gemma4,qwen3.5}/`.** Treat them like the
+MODEL_ID/target_modules edits: preserve on re-sync (or port DPO to the standalone first). The
+`triton_func.py` + `triton_dpo.py` kernels ARE synced from `small-ablation/multipacking-dpo`.
 
 ## The end-to-end pipeline
 
@@ -268,12 +273,24 @@ only structural difference is qwen builds the custom class via `make_custom_cls(
 - **Constraints** (validated in create-run AND llm_finetune AND the trainer): qwen or gemma-4 arch;
   **incompatible with context parallelism** (per-sequence log-prob sums would need cross-rank
   reduction); qwen's `SGPU_MAX_SEQ_LEN` truncation is skipped under DPO (would cut pairs).
-- **Verified locally (CPU)**: pack invariants (real Qwen tokenizer, both source shapes, drop
-  paths), collator reorder/pairing over multi-bin batches, `dpo_loss_reference` on the packed
-  layout == a from-scratch per-pair computation (+ policy==ref → ln 2), and gemma's `dpo_collator`
-  byte-equal to qwen's. ⚠ NOT yet run on a GPU: the kernel gates (`python triton_func.py` /
-  `python triton_dpo.py` in the arch venv) and an end-to-end smoke train are owed on the box for
-  BOTH trainers (gemma runs the extra reference forward through the FA4 cute kernel).
+- **Verified locally (CPU)**: pack invariants (real Qwen tokenizer, both single- and multi-turn +
+  string/message-list source shapes, drop paths), collator reorder/pairing over multi-bin batches,
+  `dpo_loss_reference` on the packed layout == a from-scratch per-pair computation (+ policy==ref →
+  ln 2), and gemma's `dpo_collator` byte-equal to qwen's.
+- **✅ GPU-verified end-to-end (2026-07-08, tm-2 = prov-940055fc, 8× H20).** Two 10-step dry runs
+  (β=0.1, lr 5e-6, LoRA r=16, 4 GPUs each), both **exit 0** with textbook curves — **step-0 loss =
+  0.6931471824645996 = ln2 EXACTLY on both** (the policy==reference sanity), loss ↓, reward_acc →
+  ~1.0, margin → +:
+  - gemma (`google/gemma-4-31B-it`, FA4 cute kernel, GPUs 4-7): 0.693 → 0.475, reward_acc 0 → 1.0,
+    margin 0 → 0.556 — the DPO double-forward runs fine through FA4.
+  - qwen (`Qwen/Qwen3.6-27B`, GatedDeltaNet, GPUs 0-3): 0.693 → 0.638, reward_acc → ~1.0, margin
+    0 → 0.118 (early per-step wobble is just the 2-bin sampler alternating pair sets — not a bug).
+  Both wrote `lora.pt` + `lora_meta.json` (`objective=dpo, dpo_beta=0.1`) to S3.
+  ⚠ **DPO datasets MUST be packed with the base model's real tokenizer** (Qwen3.6 vocab 248077 ≠
+  Qwen3-0.6B's 151936; gemma-4 262144) — a small proxy tokenizer produces wrong ids. The local
+  gateway needs a gemma-authorized `HF_TOKEN` in its env to pack the gated gemma tokenizer. The
+  Triton kernel `__main__` gates (`python triton_func.py` / `triton_dpo.py`) are still worth a run
+  when re-syncing from small-ablation.
 
 ## Context parallelism — zigzag ring attention (gemma-4 only), 2026-07-04
 

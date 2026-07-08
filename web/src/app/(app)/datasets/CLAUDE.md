@@ -10,9 +10,17 @@ and client cards mutate through the proxy `PATCH/POST /api/proxy/v1/datasets/{id
 ## `kind` (the source discriminator)
 
 `upload` / `s3` (metadata file in S3) · `hf` (HuggingFace repo) · `llm` / `llm_packed` /
-`tts_packed` (LLM/TTS sources) · **`label`** (live import from a Label-platform project).
-`web/src/lib/types.ts` (`DatasetRecord`, `CreateDatasetRequest`, `UpdateDatasetRequest`) is the
-contract — keep it in sync with the gateway's pydantic models of the same name.
+`llm_dpo_packed` / `tts_packed` (LLM/TTS sources) · **`label`** (live import from a Label-platform
+project). `web/src/lib/types.ts` (`DatasetRecord`, `CreateDatasetRequest`, `UpdateDatasetRequest`)
+is the contract — keep it in sync with the gateway's pydantic models of the same name.
+
+**Chat vs DPO (preference) datasets.** A chat source (`kind=llm`, or `hf`/`upload` with a
+`messages_field`) packs to `llm_packed` for SFT. Setting `rejected_field` (the columns card's
+**Preference (DPO)** mode) makes it a preference dataset: `messages_field` = the **chosen** column,
+`rejected_field` = the **rejected** column. `Pack for LLM` with **objective=dpo** then produces
+`llm_dpo_packed` (chosen/rejected pairs, whole pairs per bin) for DPO training. The row browser
+renders a DPO source as chosen ✓ / rejected ✗ pairs (`DpoRowItem`) and a packed DPO dataset shows
+its **preference-pair** count + a per-pair decode.
 
 ## Pages & cards
 
@@ -20,7 +28,10 @@ contract — keep it in sync with the gateway's pydantic models of the same name
   the project URL, a token (pasted `lpat_…` or a global secret), the review-status filter, and the
   **timestamp cutoff** (see below).
 - `[datasetId]/dataset-detail.tsx` — tabbed detail. Editable cards PATCH then `router.refresh()`:
-  - `columns-card.tsx` — audio/transcription/speaker/messages column mapping.
+  - `columns-card.tsx` — audio/transcription/speaker/messages column mapping. For a chat-only
+    dataset it also has a **Chat (SFT) / Preference (DPO)** mode toggle: DPO mode maps a **chosen**
+    (= `messages_field`) + **rejected** (`rejected_field`) column; saving `rejected_field` flips the
+    dataset into DPO mode (row viewer → pairs; Pack for LLM defaults to objective=dpo).
   - `label-import-card.tsx` — **`kind=label` only**: edit the review status + timestamp cutoff
     post-registration (re-counts rows on save). Mirrors `columns-card`'s edit/save/inline-error
     pattern (no toasts; errors render as `text-destructive`).

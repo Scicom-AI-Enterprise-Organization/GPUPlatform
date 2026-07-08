@@ -37,14 +37,24 @@ export default async function DatasetDetailPage({
         ? !!dataset.label_project_id
         : !!dataset.metadata_filename || !!dataset.s3_metadata_uri);
 
-  let preview: DatasetPreview | null = null;
-  if (dataset && hasMetadata) {
-    try {
-      preview = await gateway.getDatasetPreview(dataset.id, limit, offset, split, speaker);
-    } catch (e) {
-      preview = { audio_field: dataset.audio_field, transcription_field: dataset.transcription_field, rows: [], error: e instanceof Error ? e.message : String(e) };
-    }
-  }
+  // Don't block the page render on the row preview. For a big S3/parquet upload the
+  // gateway has to download the whole metadata file (tens of MB → 10s+), which used
+  // to hang the entire route and blow the 30s SSR timeout. Instead we hand the
+  // RowBrowser a lightweight seed (the URL-driven page window) and it fetches page 1
+  // client-side behind its own loading spinner — off the render critical path, and
+  // the client fetch has no 30s abort so it just waits instead of erroring.
+  const preview: DatasetPreview | null =
+    dataset && hasMetadata
+      ? {
+          audio_field: dataset.audio_field,
+          transcription_field: dataset.transcription_field,
+          rows: [],
+          offset,
+          limit,
+          split: split ?? null,
+          speaker: speaker ?? null,
+        }
+      : null;
 
   // S3 storages to offer as a transform target (HF audio-zip / label platform →
   // audio column).
@@ -59,16 +69,13 @@ export default async function DatasetDetailPage({
   // (kind=llm_packed) for LLM finetuning. In-process (CPU tokenization, no GPU).
   // A kind=llm dataset, OR a kind=hf dataset with a messages column mapped (a chat
   // dataset registered as plain hf) — the latter is what surfaces a chat preview.
-  // Also any hf/upload dataset whose rows carry chosen/rejected preference columns
-  // (ultrafeedback style, no messages column) — those pack with the DPO objective.
-  const _previewCols = preview?.rows?.[0]
-    ? Object.keys(preview.rows[0] as Record<string, unknown>)
-    : [];
-  const _hasPrefCols = _previewCols.includes("chosen") && _previewCols.includes("rejected");
+  // A preference (DPO) dataset is identified by its mapped `rejected_field` (Columns
+  // card → Preference/DPO mode). We no longer sniff the first preview row for
+  // chosen/rejected columns, since the preview isn't fetched server-side anymore.
   const canPackLlm =
     dataset?.kind === "llm" ||
     ((dataset?.kind === "hf" || dataset?.kind === "upload") &&
-      (!!dataset?.messages_field || _hasPrefCols));
+      (!!dataset?.messages_field || !!dataset?.rejected_field));
   let s3Storages: StorageRecord[] = [];
   if (canTransform || canPack || canPackLlm) {
     try {

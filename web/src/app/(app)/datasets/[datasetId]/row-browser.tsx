@@ -820,13 +820,18 @@ export function RowBrowser({
   const [speakers, setSpeakers] = useState<string[]>(initial.speakers ?? []);
   const [rows, setRows] = useState<DatasetPreviewRow[]>(initial.rows ?? []);
   const [total, setTotal] = useState<number | null>(initial.total ?? null);
-  const [loading, setLoading] = useState(false);
+  // The page no longer server-renders the rows (the gateway preview can be slow for
+  // big S3/parquet sources) — it hands us an empty seed and we fetch page 1 on mount.
+  // When the seed DOES carry rows (fast source), skip that first fetch and show them.
+  const hasSeededRows = (initial.rows?.length ?? 0) > 0;
+  const [loading, setLoading] = useState(!hasSeededRows);
   const [error, setError] = useState<string | null>(initial.error ?? null);
   // Manual training-inclusion curation: count of rows un-ticked (excluded).
   const [excludedCount, setExcludedCount] = useState(initial.excluded_count ?? 0);
   const [toggleErr, setToggleErr] = useState<string | null>(null);
-  // Skip the very first fetch — we already have the server-rendered page.
-  const seeded = useRef(true);
+  // Skip the very first fetch only if the seed already carries rows; otherwise the
+  // mount effect fetches page 1 (spinner shows immediately via `loading` above).
+  const seeded = useRef(hasSeededRows);
 
   // Tick/un-tick a row → include/exclude it from training. Optimistic; reverts
   // on failure. The server is the source of truth for the excluded count.
@@ -890,7 +895,8 @@ export function RowBrowser({
   );
 
   useEffect(() => {
-    // First render already matches the server-rendered (URL-driven) page.
+    // If the seed already carried rows, the first render matches them — skip the
+    // initial fetch. Otherwise (empty seed) fall through and fetch page 1 on mount.
     if (seeded.current) {
       seeded.current = false;
       return;
@@ -1019,6 +1025,15 @@ export function RowBrowser({
       <CardContent className="space-y-3">
         {error ? (
           <p className="text-sm text-destructive">{error}</p>
+        ) : rows.length === 0 && loading ? (
+          // Initial load (no rows yet): a centred spinner rather than the zero-height
+          // overlay used for page-to-page transitions. Big S3/parquet sources can
+          // take several seconds to download server-side, so this is where the user
+          // waits instead of a blank/hung page.
+          <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
+            <Loader2 className="h-5 w-5 animate-spin" />
+            loading rows…
+          </div>
         ) : rows.length === 0 && !loading ? (
           <p className="text-sm text-muted-foreground">No rows.</p>
         ) : (

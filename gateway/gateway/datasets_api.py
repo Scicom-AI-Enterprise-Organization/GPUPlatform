@@ -24,6 +24,7 @@ import logging
 import os
 import secrets
 import tempfile
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Optional
 import posixpath
@@ -1860,6 +1861,180 @@ async def _packed_records_cached(
     return recs
 
 
+# ---- packed random access via the ChiniDataset index.json manifest -------------
+# A ChiniDataset writes an index.json ({"shards":[{"samples":N,"raw_data":{"basename":
+# "shard.NNNNN.parquet"}}]}) next to its parquet shards. That manifest lets us map a
+# global record offset to the shard(s) that hold it and read ONLY those — instead of
+# pulling every shard (tens of MB each) into memory like `_packed_records_cached`.
+#
+# StreamingDataset can stream from S3, but its unit is the whole shard, all columns,
+# staged to local disk (reader.py: pd.read_parquet(whole file)). The list view only
+# needs per-record token/utterance counts, which come from the tiny `attention_mask`
+# column alone (sum = #tokens, len = #docs), so a column-projected range read fetches
+# KB, not the 4 big columns of a 66 MB shard. Decode reads that one shard's ids too.
+_PACKED_INDEX_CACHE: dict[str, list[dict]] = {}    # "bucket/prefix" -> [{basename, samples}]
+_PACKED_MASK_CACHE: dict[str, list[list[int]]] = {}  # "bucket/prefix/basename" -> per-record masks
+_ARROW_FS_CACHE: dict[tuple, Any] = {}
+# Full-record (input_ids + attention_mask) reads for the decode path are heavy
+# (~one shard of 32k-token ids), so keep only a couple hot — a bounded LRU, unlike
+# the old _PACKED_CACHE which held EVERY shard of a dataset (and leaked per-dataset).
+_PACKED_REC_CACHE: "OrderedDict[str, list[dict]]" = OrderedDict()
+_PACKED_REC_CACHE_MAX = 2
+
+
+def _packed_target_prefix(target: "S3Target", s3_uri: str, split: Optional[str]) -> tuple["S3Target", str]:
+    """(bucket-scoped target, key prefix ending in '/') for a packed dataset's shard
+    dir, honouring the per-split subdir (`<prefix>/<split>/`)."""
+    u = urlparse(s3_uri)
+    t = dataclasses.replace(target, bucket=u.netloc) if u.scheme == "s3" else target
+    prefix = (u.path.lstrip("/") if u.scheme == "s3" else s3_uri).rstrip("/")
+    if split:
+        prefix = f"{prefix}/{split}"
+    return t, prefix + "/"
+
+
+def _packed_shard_index(target: "S3Target", prefix: str) -> Optional[list[dict]]:
+    """[{basename, samples}] for the shards under `prefix`, from the ChiniDataset
+    index.json (counts only — no row data). None if there's no usable manifest, so
+    the caller can fall back to the read-everything path for legacy packs."""
+    ck = f"{target.bucket}/{prefix}"
+    cached = _PACKED_INDEX_CACHE.get(ck)
+    if cached is not None:
+        return cached
+    body = bench.s3_get_bytes(prefix + "index.json", target)
+    if not body:
+        return None
+    try:
+        idx = json.loads(body)
+        shards = []
+        for i, s in enumerate(idx.get("shards", []) or []):
+            rd = s.get("raw_data", {}) or {}
+            shards.append({
+                "basename": rd.get("basename") or f"shard.{i:05}.parquet",
+                "samples": int(s.get("samples") or 0),
+            })
+    except Exception:  # noqa: BLE001 — unusable manifest → legacy fallback
+        return None
+    if not shards:
+        return None
+    _PACKED_INDEX_CACHE[ck] = shards
+    return shards
+
+
+def _arrow_s3fs(target: "S3Target"):
+    """A cached pyarrow S3FileSystem for `target`, so ParquetFile.read(columns=…)
+    issues HTTP range GETs for just the needed column chunks + footer."""
+    import pyarrow.fs as pafs
+    key = (target.endpoint, target.region, target.access_key)
+    fs = _ARROW_FS_CACHE.get(key)
+    if fs is None:
+        kw: dict[str, Any] = {"region": target.region or "us-east-1"}
+        if target.access_key:
+            kw["access_key"] = target.access_key
+        if target.secret_key:
+            kw["secret_key"] = target.secret_key
+        if target.endpoint:
+            kw["endpoint_override"] = target.endpoint
+        fs = pafs.S3FileSystem(**kw)
+        _ARROW_FS_CACHE[key] = fs
+    return fs
+
+
+def _read_shard_columns(target: "S3Target", prefix: str, basename: str, columns: list[str]) -> list[dict]:
+    """`columns` for one shard via a column-projected S3 range read (only those
+    column chunks + the footer are fetched). Falls back to a whole-object boto3
+    download + parse when the arrow filesystem can't be used (e.g. a custom endpoint
+    the range reader can't address) — still just this ONE shard, not all of them."""
+    import io as _io
+    import pyarrow.parquet as pq
+    key = prefix + basename
+    try:
+        fs = _arrow_s3fs(target)
+        with fs.open_input_file(f"{target.bucket}/{key}") as f:
+            tbl = pq.ParquetFile(f).read(columns=columns)
+    except Exception as e:  # noqa: BLE001 — range read unavailable → whole-shard fallback
+        logger.info("packed shard range-read fell back to full download (%s): %s", key, e)
+        body = bench.s3_get_bytes(key, target)
+        if body is None:
+            raise RuntimeError(f"packed shard not found: {key}")
+        tbl = pq.read_table(_io.BytesIO(body), columns=columns)
+    cols = {c: tbl.column(c).to_pylist() for c in columns}
+    return [{c: list(cols[c][i] or []) for c in columns} for i in range(tbl.num_rows)]
+
+
+def _read_shard_masks(target: "S3Target", prefix: str, basename: str) -> list[list[int]]:
+    """Per-record `attention_mask` lists for one shard (cached — they're tiny). This
+    is all the list view needs: tokens = sum(mask), #docs = len(mask)."""
+    ck = f"{target.bucket}/{prefix}{basename}"
+    hit = _PACKED_MASK_CACHE.get(ck)
+    if hit is not None:
+        return hit
+    masks = [r["attention_mask"] for r in _read_shard_columns(target, prefix, basename, ["attention_mask"])]
+    _PACKED_MASK_CACHE[ck] = masks
+    return masks
+
+
+def _read_shard_records(target: "S3Target", prefix: str, basename: str) -> list[dict]:
+    """Full {input_ids, attention_mask} records for one shard (bounded LRU — the
+    decode path re-hits the same shard as the user expands several rows in it)."""
+    ck = f"{target.bucket}/{prefix}{basename}"
+    hit = _PACKED_REC_CACHE.get(ck)
+    if hit is not None:
+        _PACKED_REC_CACHE.move_to_end(ck)
+        return hit
+    recs = _read_shard_columns(target, prefix, basename, ["input_ids", "attention_mask"])
+    _PACKED_REC_CACHE[ck] = recs
+    _PACKED_REC_CACHE.move_to_end(ck)
+    while len(_PACKED_REC_CACHE) > _PACKED_REC_CACHE_MAX:
+        _PACKED_REC_CACHE.popitem(last=False)
+    return recs
+
+
+def _packed_page_meta(target: "S3Target", s3_uri: str, split: Optional[str],
+                      offset: int, limit: int) -> Optional[tuple[list[dict], int]]:
+    """([{tokens, docs}] for rows offset..offset+limit], total) read from ONLY the
+    shard(s) the window spans, via the tiny attention_mask column. None → no manifest
+    (legacy pack); caller should use the read-everything path."""
+    t, prefix = _packed_target_prefix(target, s3_uri, split)
+    shards = _packed_shard_index(t, prefix)
+    if shards is None:
+        return None
+    total = sum(s["samples"] for s in shards)
+    out: list[dict] = []
+    seen = 0
+    for s in shards:
+        n = s["samples"]
+        start, seen = seen, seen + n
+        if n <= 0 or start + n <= offset or start >= offset + limit:
+            continue
+        masks = _read_shard_masks(t, prefix, s["basename"])
+        for j, mask in enumerate(masks):
+            gi = start + j
+            if offset <= gi < offset + limit:
+                out.append({"tokens": sum(mask), "docs": len(mask)})
+    return out, total
+
+
+def _packed_one_record(target: "S3Target", s3_uri: str, split: Optional[str],
+                       index: int) -> Optional[tuple[Optional[dict], int]]:
+    """(one {input_ids, attention_mask} record at global `index`, total) read from its
+    single shard. None → no manifest (legacy pack). (None, total) → index out of range."""
+    t, prefix = _packed_target_prefix(target, s3_uri, split)
+    shards = _packed_shard_index(t, prefix)
+    if shards is None:
+        return None
+    total = sum(s["samples"] for s in shards)
+    seen = 0
+    for s in shards:
+        n = s["samples"]
+        start, seen = seen, seen + n
+        if start <= index < start + n:
+            recs = _read_shard_records(t, prefix, s["basename"])
+            local = index - start
+            return (recs[local] if 0 <= local < len(recs) else None), total
+    return None, total
+
+
 def _stamp_detected_fields(
     d: Dataset, columns: list[str], num_rows: Optional[int], fmt: Optional[str]
 ) -> bool:
@@ -1931,21 +2106,29 @@ async def preview_dataset(
         try:
             storage = await _load_storage(session, d.storage_id)
             target, _base = _s3_target_and_prefix(storage)
-            recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
+            # Fast path: read only the shard(s) the page spans, and only the tiny
+            # attention_mask column (tokens = sum, #docs = len). Legacy packs with no
+            # index.json fall back to reading every shard (cached).
+            meta = await _run_sync(_packed_page_meta, target, d.s3_metadata_uri, used_split, offset, limit)
+            if meta is None:
+                recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
+                total = len(recs)
+                page_meta = [{"tokens": len(r["input_ids"]), "docs": len(r["attention_mask"])}
+                             for r in recs[offset:offset + limit]]
+            else:
+                page_meta, total = meta
         except Exception as e:  # noqa: BLE001
             logger.warning("packed preview failed for %s: %s", dataset_id, e)
             return _resp(rows=[], total=d.num_rows or 0, error=f"could not read packed shards: {e}")
-        total = len(recs)
-        page = recs[offset:offset + limit]
         # A DPO pack (kind=llm_dpo_packed) holds 2K docs per bin (K chosen + K
         # rejected) — surface the PAIR count so the UI reads "N preference pairs"
         # rather than the raw doc/"utterance" count (2N), which looks meaningless.
         objective = (_pack_meta(d).get("objective") or "sft")
         rows = []
-        for i, r in enumerate(page):
-            n_docs = len(r["attention_mask"])
+        for i, m in enumerate(page_meta):
+            n_docs = m["docs"]
             row = {"packed": True, "index": offset + i, "split": used_split,
-                   "tokens": len(r["input_ids"]), "utterances": n_docs}
+                   "tokens": m["tokens"], "utterances": n_docs}
             if objective == "dpo":
                 row["objective"] = "dpo"
                 row["pairs"] = n_docs // 2
@@ -2178,16 +2361,23 @@ async def packed_row(
     target, _base = _s3_target_and_prefix(storage)
     pack_splits = list((_pack_meta(d).get("splits") or {}).keys())
     used_split = (split if (split and split in pack_splits) else (pack_splits[0] if pack_splits else None))
-    recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
-    if index >= len(recs):
-        raise HTTPException(status_code=404, detail=f"index {index} out of range (have {len(recs)})")
+    # Read just the one shard holding `index` (via the index.json manifest); legacy
+    # packs with no manifest fall back to the read-everything path.
+    one = await _run_sync(_packed_one_record, target, d.s3_metadata_uri, used_split, index)
+    if one is None:
+        recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
+        rec, total = (recs[index] if index < len(recs) else None), len(recs)
+    else:
+        rec, total = one
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"index {index} out of range (have {total})")
 
     repo_id = _pack_tokenizer(d)
     from .global_env_api import load_global_env
     hf_token = (await load_global_env(session)).get("HF_TOKEN") or os.environ.get("HF_TOKEN")
     objective = _pack_meta(d).get("objective")  # "dpo" → decode returns chosen/rejected pairs
     try:
-        decoded = await _run_sync(_decode_packed_record, repo_id, hf_token, recs[index], objective)
+        decoded = await _run_sync(_decode_packed_record, repo_id, hf_token, rec, objective)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"decode failed (tokenizer {repo_id}): {e}")
     return {"index": index, "tokenizer": repo_id, **decoded}
@@ -2317,13 +2507,18 @@ async def decoder_decode(
     target, _base = _s3_target_and_prefix(storage)
     pack_splits = list((((d.split_fields or {}).get("_tts_pack") or {}).get("splits") or {}).keys())
     used_split = (req.split if (req.split and req.split in pack_splits) else (pack_splits[0] if pack_splits else None))
-    recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
-    if req.index >= len(recs):
-        raise HTTPException(status_code=404, detail=f"index {req.index} out of range (have {len(recs)})")
+    one = await _run_sync(_packed_one_record, target, d.s3_metadata_uri, used_split, req.index)
+    if one is None:
+        recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
+        rec, total = (recs[req.index] if req.index < len(recs) else None), len(recs)
+    else:
+        rec, total = one
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"index {req.index} out of range (have {total})")
     repo_id = ((d.split_fields or {}).get("_tts_pack") or {}).get("tokenizer") or _DEFAULT_TTS_TOKENIZER
     from .global_env_api import load_global_env
     hf_token = (await load_global_env(session)).get("HF_TOKEN") or os.environ.get("HF_TOKEN")
-    decoded = await _run_sync(_decode_packed_record, repo_id, hf_token, recs[req.index])
+    decoded = await _run_sync(_decode_packed_record, repo_id, hf_token, rec)
     utts = decoded.get("utterances") or []
     if req.utt >= len(utts):
         raise HTTPException(status_code=404, detail=f"utterance {req.utt} out of range (record has {len(utts)})")
