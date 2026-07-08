@@ -205,6 +205,7 @@ export function DatasetDetail({
                 kind={dataset.kind}
                 speakerField={dataset.speaker_field}
                 messagesField={dataset.messages_field}
+                rejectedField={dataset.rejected_field}
                 decoder={decoder}
               />
             </TabsContent>
@@ -226,6 +227,7 @@ export function DatasetDetail({
               speakerField={dataset.speaker_field}
               splitFields={dataset.split_fields}
               messagesField={dataset.messages_field}
+              rejectedField={dataset.rejected_field}
             />
           </TabsContent>
 
@@ -242,6 +244,7 @@ export function DatasetDetail({
                 kind={dataset.kind}
                 hfRepo={dataset.hf_repo ?? null}
                 messagesField={dataset.messages_field ?? null}
+                rejectedField={dataset.rejected_field ?? null}
                 s3Storages={s3Storages}
                 initialStatus={dataset.transform_status ?? null}
                 initialLog={dataset.transform_log ?? null}

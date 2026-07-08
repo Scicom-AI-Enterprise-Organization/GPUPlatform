@@ -355,6 +355,86 @@ function ToolCallArgs({ tc }: { tc: ToolCall }) {
   );
 }
 
+/** Chat-bubble rendering for a message list — shared by the SFT row view and the
+ * DPO chosen/rejected view. Per-role colours, reasoning traces, tool calls. */
+function ChatBubbles({ msgs }: { msgs: ChatMessage[] }) {
+  return (
+    <div className="space-y-2">
+      {msgs.map((m, i) => {
+        const isUser = m.role === "user";
+        const isSystem = m.role === "system";
+        const isTool = m.role === "tool";
+        const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
+
+        // ── avatar ──
+        const avatarCls = cn(
+          "flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
+          isUser        ? "bg-primary text-primary-foreground"
+          : isTool      ? "bg-emerald-600/20 text-emerald-500"
+          : hasToolCalls? "bg-amber-500/20 text-amber-500"
+          : isSystem    ? "bg-muted text-muted-foreground"
+          :               "bg-violet-500/20 text-violet-400",
+        );
+        const AvatarIcon = isUser ? User : isTool ? Terminal : hasToolCalls ? Wrench : Bot;
+
+        // ── bubble ──
+        const bubbleCls = cn(
+          "max-w-[85%] rounded-lg px-3 py-2 text-sm",
+          isUser        ? "bg-primary text-primary-foreground"
+          : isTool      ? "border border-emerald-500/30 bg-emerald-500/10 text-foreground"
+          : hasToolCalls? "border border-amber-500/30 bg-amber-500/10 text-foreground"
+          : isSystem    ? "bg-muted/50 text-muted-foreground italic"
+          :               "border border-violet-500/20 bg-violet-500/10 text-foreground",
+        );
+
+        const roleLabel =
+          isUser        ? null
+          : isTool      ? `tool · ${m.name ?? ""}`
+          : hasToolCalls? "assistant · tool call"
+          : isSystem    ? "system"
+          :               "assistant";
+
+        return (
+          <div key={i} className={cn("flex items-start gap-2", isUser ? "flex-row-reverse" : "flex-row")}>
+            {/* avatar */}
+            <div className={avatarCls} title={m.role}>
+              <AvatarIcon className="h-3 w-3" />
+            </div>
+
+            {/* bubble */}
+            <div className={bubbleCls}>
+              {roleLabel && (
+                <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide opacity-60">
+                  {roleLabel}
+                </span>
+              )}
+
+              {/* reasoning trace (collapsible) */}
+              {m.reasoning && <ReasoningBlock text={m.reasoning} invert={isUser} />}
+
+              {/* main content — tool responses get a collapsible JSON tree */}
+              {isTool ? (
+                <ToolContent content={m.content} />
+              ) : contentStr(m.content) ? (
+                <p className="whitespace-pre-wrap break-words">{contentStr(m.content)}</p>
+              ) : null}
+
+              {/* tool calls list */}
+              {hasToolCalls && (
+                <div className="mt-2 space-y-1.5">
+                  {m.tool_calls!.map((tc) => (
+                    <ToolCallArgs key={tc.id} tc={tc} />
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /** One LLM / multimodal row — chat bubbles with per-role colours, reasoning traces, tool calls. */
 function LlmRowItem({
   index,
@@ -407,81 +487,92 @@ function LlmRowItem({
       {open && (
         <div className="space-y-3 border-t border-border p-3">
           {audio && <WaveformPlayer src={audio} />}
-          {msgs && (
-            <div className="space-y-2">
-              {msgs.map((m, i) => {
-                const isUser = m.role === "user";
-                const isSystem = m.role === "system";
-                const isTool = m.role === "tool";
-                const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
+          {msgs && <ChatBubbles msgs={msgs} />}
+        </div>
+      )}
+    </div>
+  );
+}
 
-                // ── avatar ──
-                const avatarCls = cn(
-                  "flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
-                  isUser        ? "bg-primary text-primary-foreground"
-                  : isTool      ? "bg-emerald-600/20 text-emerald-500"
-                  : hasToolCalls? "bg-amber-500/20 text-amber-500"
-                  : isSystem    ? "bg-muted text-muted-foreground"
-                  :               "bg-violet-500/20 text-violet-400",
-                );
-                const AvatarIcon = isUser ? User : isTool ? Terminal : hasToolCalls ? Wrench : Bot;
+/**
+ * One DPO preference row — the shared prompt shown once, then the chosen (✓) and
+ * rejected (✕) responses side by side. `chosenField`/`rejectedField` name the two
+ * message-list columns (chosen defaults to the dataset's messages column).
+ */
+function DpoRowItem({
+  index,
+  row,
+  chosenField,
+  rejectedField,
+}: {
+  index: number;
+  row: DatasetPreviewRow;
+  chosenField: string;
+  rejectedField: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const chosen = isChatMessages(row[chosenField]) ? (row[chosenField] as ChatMessage[]) : null;
+  const rejected = isChatMessages(row[rejectedField]) ? (row[rejectedField] as ChatMessage[]) : null;
 
-                // ── bubble ──
-                const bubbleCls = cn(
-                  "max-w-[85%] rounded-lg px-3 py-2 text-sm",
-                  isUser        ? "bg-primary text-primary-foreground"
-                  : isTool      ? "border border-emerald-500/30 bg-emerald-500/10 text-foreground"
-                  : hasToolCalls? "border border-amber-500/30 bg-amber-500/10 text-foreground"
-                  : isSystem    ? "bg-muted/50 text-muted-foreground italic"
-                  :               "border border-violet-500/20 bg-violet-500/10 text-foreground",
-                );
+  // Chosen & rejected agree on the prompt turns; find how far, so the shared prompt
+  // is shown once and only the divergent tails go under chosen/rejected.
+  let shared = 0;
+  if (chosen && rejected) {
+    const n = Math.min(chosen.length, rejected.length);
+    while (shared < n && JSON.stringify(chosen[shared]) === JSON.stringify(rejected[shared])) shared++;
+  }
+  const prompt = chosen ? chosen.slice(0, shared) : [];
+  const chosenTail = chosen ? chosen.slice(shared) : [];
+  const rejectedTail = rejected ? rejected.slice(shared) : [];
+  const firstUser = prompt.find((m) => m.role === "user") ?? prompt[0] ?? chosen?.[0];
 
-                const roleLabel =
-                  isUser        ? null
-                  : isTool      ? `tool · ${m.name ?? ""}`
-                  : hasToolCalls? "assistant · tool call"
-                  : isSystem    ? "system"
-                  :               "assistant";
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-start gap-2 p-3 text-left transition-colors hover:bg-muted/40"
+      >
+        <ChevronRight className={cn("mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")} />
+        <span className="mt-0.5 w-9 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">#{index + 1}</span>
+        <span className="flex-1 space-y-0.5">
+          {chosen == null || rejected == null ? (
+            <span className="text-sm text-muted-foreground">
+              (row is missing a valid <span className="font-mono">{chosenField}</span> /{" "}
+              <span className="font-mono">{rejectedField}</span> message list)
+            </span>
+          ) : (
+            <span className="block truncate text-sm">
+              <span className="mr-1.5 font-medium text-muted-foreground">preference pair:</span>
+              {contentStr(firstUser?.content).slice(0, 120)}
+            </span>
+          )}
+        </span>
+        <span className="mt-0.5 shrink-0 text-xs text-muted-foreground">{open ? "hide" : "compare"}</span>
+      </button>
 
-                return (
-                  <div key={i} className={cn("flex items-start gap-2", isUser ? "flex-row-reverse" : "flex-row")}>
-                    {/* avatar */}
-                    <div className={avatarCls} title={m.role}>
-                      <AvatarIcon className="h-3 w-3" />
-                    </div>
-
-                    {/* bubble */}
-                    <div className={bubbleCls}>
-                      {roleLabel && (
-                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide opacity-60">
-                          {roleLabel}
-                        </span>
-                      )}
-
-                      {/* reasoning trace (collapsible) */}
-                      {m.reasoning && <ReasoningBlock text={m.reasoning} invert={isUser} />}
-
-                      {/* main content — tool responses get a collapsible JSON tree */}
-                      {isTool ? (
-                        <ToolContent content={m.content} />
-                      ) : contentStr(m.content) ? (
-                        <p className="whitespace-pre-wrap break-words">{contentStr(m.content)}</p>
-                      ) : null}
-
-                      {/* tool calls list */}
-                      {hasToolCalls && (
-                        <div className="mt-2 space-y-1.5">
-                          {m.tool_calls!.map((tc) => (
-                            <ToolCallArgs key={tc.id} tc={tc} />
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
+      {open && chosen && rejected && (
+        <div className="space-y-3 border-t border-border p-3">
+          {prompt.length > 0 && (
+            <div className="space-y-1">
+              <div className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">prompt</div>
+              <ChatBubbles msgs={prompt} />
             </div>
           )}
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <div className="rounded-md border border-emerald-600/40 bg-emerald-500/5 p-2">
+              <div className="mb-1 font-mono text-[10px] font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+                ✓ chosen
+              </div>
+              <ChatBubbles msgs={chosenTail.length ? chosenTail : chosen} />
+            </div>
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 p-2">
+              <div className="mb-1 font-mono text-[10px] font-semibold uppercase tracking-wide text-destructive">
+                ✕ rejected
+              </div>
+              <ChatBubbles msgs={rejectedTail.length ? rejectedTail : rejected} />
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -490,18 +581,25 @@ function LlmRowItem({
 
 // ── TTS packed row ───────────────────────────────────────────────────────────
 
+type PackedUtt = { tokens: number; text: string };
 type PackedDecode = {
   tokenizer: string;
   num_tokens: number;
   num_utterances: number;
-  utterances: { tokens: number; text: string }[];
+  utterances: PackedUtt[];
   full_text: string;
+  // DPO packs (kind=llm_dpo_packed) also return preference pairs so the block can
+  // render chosen ↔ rejected side by side instead of a flat 2K-utterance list.
+  objective?: string;
+  num_pairs?: number;
+  pairs?: { index: number; chosen: PackedUtt; rejected: PackedUtt }[];
 };
 
 /**
- * One multipacked block (tts_packed). The header shows token / utterance counts;
- * opening the collapse decodes the block to text via the run's Qwen3 tokenizer
- * (fetched lazily, server-side) so you can inspect what got packed together.
+ * One multipacked block. TTS/LLM packs show token + utterance counts; a DPO pack
+ * (kind=llm_dpo_packed) shows the PREFERENCE PAIR count and, on expand, each pair's
+ * chosen vs rejected response. Opening the collapse decodes the block to text via
+ * the pack tokenizer (fetched lazily, server-side).
  */
 function PackedRowItem({
   datasetId,
@@ -522,6 +620,9 @@ function PackedRowItem({
   const [err, setErr] = useState<string | null>(null);
   const tokens = typeof row.tokens === "number" ? row.tokens : undefined;
   const utts = typeof row.utterances === "number" ? row.utterances : undefined;
+  // DPO packs report a preference-pair count (chosen+rejected = one pair).
+  const isDpo = row.objective === "dpo";
+  const pairs = typeof row.pairs === "number" ? row.pairs : undefined;
   // Per-utterance audio decode (NeuCodec on the resident decoder). `decoding` is
   // the utterance index currently being decoded; `audioUrls` holds each decoded
   // clip as a data: URL so it gets a full WaveformPlayer (like an audio dataset).
@@ -580,8 +681,18 @@ function PackedRowItem({
         <ChevronRight className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")} />
         <span className="w-9 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">#{index + 1}</span>
         <span className="flex-1 text-sm">
-          Packed block · <span className="font-mono">{tokens ?? "?"}</span> tokens ·{" "}
-          <span className="font-mono">{utts ?? "?"}</span> utterance{utts === 1 ? "" : "s"}
+          {isDpo ? (
+            <>
+              Packed DPO block · <span className="font-mono">{tokens ?? "?"}</span> tokens ·{" "}
+              <span className="font-mono">{pairs ?? (utts != null ? utts / 2 : "?")}</span>{" "}
+              preference pair{pairs === 1 ? "" : "s"}
+            </>
+          ) : (
+            <>
+              Packed block · <span className="font-mono">{tokens ?? "?"}</span> tokens ·{" "}
+              <span className="font-mono">{utts ?? "?"}</span> utterance{utts === 1 ? "" : "s"}
+            </>
+          )}
         </span>
         <span className="shrink-0 text-xs text-muted-foreground">{open ? "hide" : "decode"}</span>
       </button>
@@ -593,7 +704,36 @@ function PackedRowItem({
             </span>
           )}
           {err && <span className="text-destructive">{err}</span>}
-          {data && (
+          {data && data.objective === "dpo" && data.pairs ? (
+            <>
+              <div className="text-[11px] text-muted-foreground">
+                {data.num_pairs ?? data.pairs.length} preference pair
+                {(data.num_pairs ?? data.pairs.length) === 1 ? "" : "s"} multipacked into{" "}
+                {data.num_tokens} tokens · decoded with <span className="font-mono">{data.tokenizer}</span>
+              </div>
+              <ol className="space-y-2">
+                {data.pairs.map((p, j) => (
+                  <li key={j} className="rounded border border-border/60 bg-muted/30 p-2">
+                    <div className="mb-1 font-mono text-[10px] text-muted-foreground">pair {j + 1}</div>
+                    <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                      <div className="rounded border border-emerald-600/40 bg-emerald-500/5 p-2">
+                        <div className="mb-0.5 font-mono text-[10px] text-emerald-600 dark:text-emerald-400">
+                          ✓ chosen · {p.chosen.tokens} tokens
+                        </div>
+                        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed scrollbar-thin">{p.chosen.text}</pre>
+                      </div>
+                      <div className="rounded border border-destructive/40 bg-destructive/5 p-2">
+                        <div className="mb-0.5 font-mono text-[10px] text-destructive">
+                          ✕ rejected · {p.rejected.tokens} tokens
+                        </div>
+                        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed scrollbar-thin">{p.rejected.text}</pre>
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            </>
+          ) : data ? (
             <>
               <div className="text-[11px] text-muted-foreground">
                 {data.num_utterances} utterance{data.num_utterances === 1 ? "" : "s"} multipacked into{" "}
@@ -627,7 +767,7 @@ function PackedRowItem({
               </ol>
               {playErr && <p className="text-destructive">{playErr}</p>}
             </>
-          )}
+          ) : null}
         </div>
       )}
     </div>
@@ -645,6 +785,7 @@ export function RowBrowser({
   kind,
   speakerField,
   messagesField,
+  rejectedField,
   decoder,
 }: {
   datasetId: string;
@@ -652,10 +793,16 @@ export function RowBrowser({
   kind?: string | null;
   speakerField?: string | null;
   messagesField?: string | null;
+  rejectedField?: string | null;
   decoder?: DecoderState | null;
 }) {
+  // A rejected column set → DPO (preference) dataset: render chosen ↔ rejected pairs.
+  // Else a messages column → chat-bubble view. chosen = the messages column.
+  const isDpo = !!(rejectedField ?? "").trim();
+  const chosenField = (messagesField ?? "").trim() || "chosen";
+  const rejField = (rejectedField ?? "").trim() || "rejected";
   // Use chat-bubble view whenever a messages column is configured, regardless of kind.
-  const isLlm = !!(messagesField ?? "").trim();
+  const isLlm = !isDpo && !!(messagesField ?? "").trim();
   const [limit, setLimit] = useState(initial.limit && initial.limit > 0 ? initial.limit : 20);
   const [offset, setOffset] = useState(initial.offset ?? 0);
   // Subsets (HF splits) are a MULTISELECT: pick several and the rows are merged
@@ -886,6 +1033,8 @@ export function RowBrowser({
               const rowSplit = typeof r.__split === "string" ? r.__split : null;
               const item = r.packed === true ? (
                 <PackedRowItem datasetId={datasetId} index={offset + i} row={r} split={rowSplit ?? selected[0] ?? null} decoder={decoder} />
+              ) : isDpo ? (
+                <DpoRowItem index={offset + i} row={r} chosenField={chosenField} rejectedField={rejField} />
               ) : isLlm ? (
                 <LlmRowItem index={offset + i} row={r} messagesField={messagesField ?? "messages"} />
               ) : (

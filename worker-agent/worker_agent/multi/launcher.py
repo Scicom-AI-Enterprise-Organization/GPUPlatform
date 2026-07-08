@@ -222,6 +222,22 @@ async def launch_member(
     else:
         env["CUDA_VISIBLE_DEVICES"] = devices
     env["VLLM_SERVER_DEV_MODE"] = "1"  # exposes /sleep, /wake_up, /collective_rpc
+    # Xet (hf_hub's chunked transfer backend) stalls/hangs on some hosts — the
+    # platform already disables it for mirror pushes and dataset transforms.
+    # Default OFF for model downloads too; an endpoint env var of 0 re-enables.
+    env.setdefault("HF_HUB_DISABLE_XET", "1")
+    # vLLM's engine-core-ready has its OWN 600s internal timeout (separate from
+    # the worker's health wait). A big model over many devices legitimately loads
+    # slower than that — verified: Qwen3-32B TP8 on Ascend blew past 600s in eager
+    # init and died with "Timed out waiting for engine core processes to start".
+    # Raise it (operator env still wins) so slow multi-device loads aren't clipped.
+    env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "2400")
+    if is_ascend():
+        # Multi-NPU (TP>1) HCCL: the default FFTS+ collective mode DEADLOCKS at
+        # model-load on Ascend — verified Qwen3-32B TP8 froze silently at "Starting
+        # to load model", 0% AICore, until killed. vLLM itself logs a warning
+        # recommending AIV. Setting it makes TP8 init complete + serve (verified).
+        env.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
     # Put the venv's bin dir on PATH (running {venv}/bin/python directly does NOT
     # activate the venv). flashinfer JIT-compiles sampling/attention kernels at
     # runtime via the `ninja` console script — without {venv}/bin on PATH it dies
@@ -231,6 +247,21 @@ async def launch_member(
         env["VIRTUAL_ENV"] = os.path.dirname(bindir)
         env["PATH"] = bindir + ":" + env.get("PATH", "")
 
+    # Ascend-safe defaults, each applied only when the member hasn't set it:
+    #  --enforce-eager: vllm-ascend's graph-mode compile ("OOT custom backend")
+    #    HANGS at larger scale (verified: silent 30-min stall at TP8/32B, 0%
+    #    AICore; tiny models compile fine). Eager trades peak throughput for a
+    #    launch that actually completes.
+    #  --gpu-memory-utilization 0.8: a 910B3 has ~8 GiB baseline overhead, so the
+    #    default 0.9 (~54.9 GiB) exceeds free HBM (~52.8) and trips vLLM's
+    #    memory-check — especially racing residual memory from a prior attempt.
+    ascend_defaults: list[str] = []
+    if is_ascend():
+        joined = " ".join(member.extra_args)
+        if "--enforce-eager" not in member.extra_args:
+            ascend_defaults.append("--enforce-eager")
+        if "--gpu-memory-utilization" not in joined and "--gpu_memory_utilization" not in joined:
+            ascend_defaults += ["--gpu-memory-utilization", "0.8"]
     args = [
         python_exe, "-m", "vllm.entrypoints.openai.api_server",
         "--model", member.model,
@@ -244,6 +275,7 @@ async def launch_member(
         # (aclrtMallocPhysical) OOMs on hosts without hugepages configured —
         # members stay resident instead of sleep/wake time-sharing.
         *([] if is_ascend() else ["--enable-sleep-mode"]),
+        *ascend_defaults,
         *member.extra_args,
     ]
     log_path = log_path or new_log_path(member, log_dir)

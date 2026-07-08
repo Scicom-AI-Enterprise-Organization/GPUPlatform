@@ -7,6 +7,15 @@ ChiniDataset packed bins produced by pack_dataset.py. Loss is LigerFusedLinearCr
 the FlashQLA `chunk_gated_delta_rule` kernel (v patched contiguous for the TileLang kernel).
 
 Attention backend: kernels-community/flash-attn3 (auto-fetched by the `kernels` package).
+
+`--dpo` switches the objective to Direct Preference Optimization over a DPO-packed
+dataset (kind=llm_dpo_packed: every bin holds whole preference pairs, first half of
+its docs chosen then rejected, labels PRE-ALIGNED next-token targets). The loss is
+triton_dpo.fused_dpo_loss (multipacked, logits never materialized — see
+small-ablation/multipacking-dpo); the frozen reference model is THIS model with the
+LoRA branches disabled (base weights are frozen and B=0-init ⇒ policy == reference at
+step 0 ⇒ first loss ≈ ln 2), so no second model copy is loaded. Incompatible with
+--cp_size > 1 (per-sequence log-probs would need cross-rank reduction).
 """
 from transformers import AutoConfig
 from transformers.cache_utils import Cache
@@ -29,6 +38,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 import os
 import json
 import time
+from contextlib import contextmanager
 from functools import partial
 from tqdm import tqdm
 import argparse
@@ -162,6 +172,46 @@ def collator(batch):
         'max_length_k': max_seqlen_q
     }
 
+def dpo_collator(batch):
+    """Packed DPO microbatch. Each DPO bin holds K whole preference pairs as 2K docs,
+    first K chosen then K rejected (llm_pack.collate_dpo_bin). When batch_size > 1
+    concatenates several bins, the docs are REORDERED so all chosen sequences come
+    first across the whole row — preserving triton_dpo's pair contract (pair k =
+    (seq k, seq K_total+k); chosen and rejected keep the same bin order, so pairing
+    stays aligned). `labels` are pre-aligned next-token targets (no shift at loss
+    time); `seq_boundaries` (int64 cu_seqlens) drives the fused DPO loss."""
+    batch = [b for b in batch if b is not None]
+    chosen, rejected = [], []  # per-bin (ids, labels, pos, lens) slices
+    for b in batch:
+        lens = np.asarray(b["attention_mask"])
+        assert len(lens) % 2 == 0, "DPO bin must hold K chosen + K rejected docs — is this a kind=llm_dpo_packed dataset?"
+        K = len(lens) // 2
+        cut = int(lens[:K].sum())
+        chosen.append((b["input_ids"][:cut], b["labels"][:cut], b["position_ids"][:cut], lens[:K]))
+        rejected.append((b["input_ids"][cut:], b["labels"][cut:], b["position_ids"][cut:], lens[K:]))
+    halves = chosen + rejected
+    input_ids = np.concatenate([h[0] for h in halves])
+    labels = np.concatenate([h[1] for h in halves])
+    position_ids = np.concatenate([h[2] for h in halves])
+    query_lens = np.concatenate([h[3] for h in halves])
+
+    cumsum = [0] + np.cumsum(query_lens).tolist()
+    cu_seq_lens_q = torch.tensor(cumsum, dtype=torch.int32)
+    input_ids_t = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+    return {
+        "input_ids": input_ids_t,
+        "position_ids": torch.tensor(position_ids, dtype=torch.long).unsqueeze(0),
+        "attention_mask": None,
+        "mm_token_type_ids": torch.zeros_like(input_ids_t),
+        "labels": torch.tensor(labels, dtype=torch.long).unsqueeze(0),
+        "seq_boundaries": torch.tensor(cumsum, dtype=torch.long),
+        "cu_seq_lens_q": cu_seq_lens_q,
+        "cu_seq_lens_k": cu_seq_lens_q,
+        "max_length_q": int(np.max(query_lens)),
+        "max_length_k": int(np.max(query_lens)),
+    }
+
+
 # Optional hard cap on packed-sequence length (env SGPU_MAX_SEQ_LEN). 0 = off (bins trained as-is).
 # Used to prove the CP path end-to-end at a SMALL context (the 32k-packed bins otherwise blow past
 # memory with AC disabled under CP). Truncates to a multiple of `mult` (the CP size) and rebuilds
@@ -204,16 +254,27 @@ def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha:int = 16):
                 lora = LinearLoRA(child_module, r, alpha)
                 setattr(module, child_name, lora)
 
-def make_custom_cls(base_cls):
+def make_custom_cls(base_cls, dpo_beta=None):
     """Build a CustomForConditionalGeneration subclass of the resolved base class
-    (dense or MoE) that overrides forward to compute the Liger fused-linear-CE loss
-    without ever materializing the lm_head logits. Same forward for both variants."""
+    (dense or MoE) that overrides forward to compute the loss without ever
+    materializing the lm_head logits. Same forward for both variants.
+
+    dpo_beta=None → the Liger fused-linear-CE SFT loss. dpo_beta set → the fused
+    multipacked DPO loss (triton_dpo): the batch carries `seq_boundaries` (cu_seqlens,
+    first half of the sequences chosen) + pre-aligned `labels` targets, the reference
+    log-probs come from a no-grad forward of THIS model with LoRA disabled, and the
+    lm_head weight serves both sides (it isn't LoRA-wrapped, so policy head == ref head)."""
 
     class CustomForConditionalGeneration(base_cls):
         def __init__(self, config):
             super().__init__(config)
-            from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-            self.loss_fn = LigerFusedLinearCrossEntropyLoss()
+            self.dpo_beta = dpo_beta
+            if dpo_beta is None:
+                from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+                self.loss_fn = LigerFusedLinearCrossEntropyLoss()
+            else:
+                from triton_dpo import fused_dpo_loss
+                self.loss_fn = fused_dpo_loss
 
         def forward(
             self,
@@ -229,6 +290,7 @@ def make_custom_cls(base_cls):
             video_grid_thw: torch.LongTensor | None = None,
             mm_token_type_ids: torch.IntTensor | None = None,
             logits_to_keep: int | torch.Tensor = 0,
+            seq_boundaries: torch.LongTensor | None = None,
             **kwargs
         ):
 
@@ -237,22 +299,41 @@ def make_custom_cls(base_cls):
             # inputs are all None here, and per_layer_inputs must NOT be passed — the model computes
             # it internally and re-passes it to the language model ("got multiple values for keyword
             # argument 'per_layer_inputs'" otherwise).
-            outputs = self.model(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                mm_token_type_ids=mm_token_type_ids,
-                **kwargs,
-            )
+            def _backbone():
+                return self.model(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    mm_token_type_ids=mm_token_type_ids,
+                    **kwargs,
+                )
 
+            outputs = _backbone()
             hidden_states = outputs.last_hidden_state
             # overwrite to disable the logits materializatioon
+
+            if self.dpo_beta is not None:
+                assert seq_boundaries is not None and labels is not None, \
+                    "DPO needs seq_boundaries + pre-aligned targets (the dpo_collator batch)"
+                # Frozen reference = same weights, LoRA bypassed (base is frozen; B=0
+                # init ⇒ ref == initial policy). Second backbone pass, no grad.
+                with torch.no_grad(), lora_disabled():
+                    ref_hidden = _backbone().last_hidden_state
+                loss, chosen_rewards, rejected_rewards = self.loss_fn(
+                    hidden_states[0], ref_hidden[0], labels[0], seq_boundaries,
+                    self.lm_head.weight, self.lm_head.weight, beta=self.dpo_beta,
+                )
+                return {
+                    "loss": loss,
+                    "chosen_rewards": chosen_rewards,
+                    "rejected_rewards": rejected_rewards,
+                }
 
             loss = None
             if labels is not None:
@@ -282,6 +363,23 @@ def make_custom_cls(base_cls):
     return CustomForConditionalGeneration
 
 
+# Process-wide LoRA bypass: the DPO reference forward runs THIS model with every
+# LoRA branch skipped. The base weights are frozen (requires_grad=False) and only
+# the adapters train, so base+no-LoRA IS the frozen initial policy — no second
+# model copy in memory. A plain python flag: no FSDP/AC interaction.
+_LORA_ENABLED = True
+
+
+@contextmanager
+def lora_disabled():
+    global _LORA_ENABLED
+    _LORA_ENABLED = False
+    try:
+        yield
+    finally:
+        _LORA_ENABLED = True
+
+
 class LinearLoRA(nn.Module):
     def __init__(self, linear: nn.Linear, r=4, alpha=1.0):
         super().__init__()
@@ -300,6 +398,8 @@ class LinearLoRA(nn.Module):
 
     def forward(self, x):
         out_non_lora = self.linear(x)
+        if not _LORA_ENABLED:  # DPO reference pass (see lora_disabled)
+            return out_non_lora
         lora_out = self.lora_b(self.lora_a(x))
         return out_non_lora + self.scaling * lora_out
 
@@ -321,7 +421,14 @@ def main(
         grad_accum:int = 1,
         cpu_offload:bool = False,
         cp_size:int = 1,
+        dpo:bool = False,
+        dpo_beta:float = 0.1,
     ):
+    if dpo and cp_size > 1:
+        # per-sequence log-prob sums (and the pairing) live on whole sequences; a CP
+        # shard only sees a chunk — would need a cross-rank logprob reduction + coeff
+        # broadcast that isn't wired. Reject up front instead of training garbage.
+        raise RuntimeError("--dpo is incompatible with --cp_size > 1 (context parallelism)")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     # Pin this process to its GPU BEFORE init'ing NCCL / the device mesh, otherwise every
@@ -345,7 +452,10 @@ def main(
 
     # Resolve dense vs MoE classes from the config + apply the matching Liger patches.
     config, is_moe, classes = resolve_arch(model_id)
-    CustomCls = make_custom_cls(classes["base"])
+    CustomCls = make_custom_cls(classes["base"], dpo_beta=(dpo_beta if dpo else None))
+    if dpo:
+        logger.info(f"[dpo] objective=DPO beta={dpo_beta} — fused multipacked loss, "
+                    f"reference = frozen base (LoRA disabled), expect first loss ≈ ln2 = 0.693")
     model = CustomCls.from_pretrained(
         model_id,
         config=config,
@@ -432,7 +542,7 @@ def main(
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        collate_fn=collator,
+        collate_fn=(dpo_collator if dpo else collator),
         sampler=sampler,
         prefetch_factor=4,
         num_workers=4,
@@ -494,8 +604,9 @@ def main(
             }
 
             # Optional context cap (SGPU_MAX_SEQ_LEN) — truncate to a multiple of cp_size so the CP
-            # shard is even. Off (0) by default.
-            if _MAX_SEQ_LEN:
+            # shard is even. Off (0) by default. Never under DPO: cutting docs would break the
+            # whole-pair layout (and seq_boundaries) the fused loss depends on.
+            if _MAX_SEQ_LEN and not dpo:
                 batch = _truncate_packed(batch, _MAX_SEQ_LEN, mult=max(cp_size, 1))
 
             # Context parallel: replace the full packed batch with THIS rank's contiguous chunk (+ set
@@ -504,14 +615,21 @@ def main(
                 batch = cp.shard_batch(batch, cp_size, cp_rank)
 
             output = model(**batch, use_cache=False) # forward pass and calculate losses
-            # Back-prop the token-SUM loss (mean × #label tokens). Accumulating sums, then
-            # normalizing by the GLOBAL token count at the step below, yields the exact
-            # token-weighted mean over the whole effective batch — not a naive mean-of-means
-            # that mis-weights variable-length bins / ranks (HF grad-accum loss fix).
+            # Back-prop the SUM loss (mean × #units). Accumulating sums, then normalizing
+            # by the GLOBAL unit count at the step below, yields the exact weighted mean
+            # over the whole effective batch — not a naive mean-of-means that mis-weights
+            # variable-length bins / ranks (HF grad-accum loss fix). The unit is the label
+            # TOKEN for SFT (the loss is a token-mean) and the preference PAIR for DPO
+            # (fused_dpo_loss is a pair-mean — weighting by tokens would re-introduce a
+            # length bias into the pairwise objective).
             # Under CP labels are already pre-shifted per-token targets (1:1), so count them directly;
             # otherwise count the shifted denominator (labels[:,1:]) the loss_fn uses.
-            n_tok = ((batch["labels"] != -100).sum() if cp_size > 1
-                     else (batch["labels"][:, 1:] != -100).sum())
+            if dpo:
+                n_tok = torch.tensor((batch["seq_boundaries"].numel() - 1) // 2,
+                                     device=f'cuda:{rank}', dtype=torch.long)
+            else:
+                n_tok = ((batch["labels"] != -100).sum() if cp_size > 1
+                         else (batch["labels"][:, 1:] != -100).sum())
             (output["loss"] * n_tok).backward() # calculate gradient
             win_tokens += n_tok
 
@@ -554,13 +672,23 @@ def main(
                 loss = output['loss'].item()
                 delta_time = time.time() - start_time
                 tps = token_count.item() / delta_time
-                logger.info(f"Epoch: {i}, mb: {idx}, step: {opt_step}, loss: {loss}, tokens/s: {tps:.2f}")
+                # DPO extras: reward accuracy (chosen > rejected) + margin. Appended AFTER
+                # loss so the orchestrator's "step: N … loss: L" parser keys on unchanged.
+                dpo_extra = ""
+                if dpo:
+                    cr, rr = output["chosen_rewards"], output["rejected_rewards"]
+                    reward_acc = (cr > rr).float().mean().item()
+                    reward_margin = (cr - rr).mean().item()
+                    dpo_extra = f", reward_acc: {reward_acc:.3f}, margin: {reward_margin:.4f}"
+                logger.info(f"Epoch: {i}, mb: {idx}, step: {opt_step}, loss: {loss}, tokens/s: {tps:.2f}{dpo_extra}")
                 # Post-microbatch CUDA residue — the leak/retention tell for long-context CP: after
                 # backward+step the allocator should be back near the steady floor; a climbing series
                 # here means graph/activation retention across steps.
                 logger.info(f"[mem] mb {idx}: allocated={torch.cuda.memory_allocated()/2**30:.2f}GB "
                             f"reserved={torch.cuda.memory_reserved()/2**30:.2f}GB")
                 metrics = {"loss": loss, "lr": optimizer.param_groups[0]['lr'], "tps": tps, "epoch": i}
+                if dpo:
+                    metrics.update({"reward_acc": reward_acc, "reward_margin": reward_margin})
                 if wandb_run is not None and do_step:
                     try:
                         wandb_run.log(metrics, step=opt_step)
@@ -604,6 +732,8 @@ def main(
                             "r": r, "alpha": alpha, "scaling": alpha / r,
                             "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
                             "wrapped_attr": "linear",
+                            "objective": "dpo" if dpo else "sft",
+                            **({"dpo_beta": dpo_beta} if dpo else {}),
                         }, f, indent=2)
                     logger.info(f"Saved LoRA ({len(lora_state_dict)} tensors) to {checkpoint_dir}/lora.pt")
 
@@ -666,6 +796,17 @@ if __name__ == "__main__":
              "relays GatedDeltaNet state + rings the full-attn KV; data-parallel across CP groups). "
              "1 = off. The gateway sets it to the GPU count when the run enables context parallelism.",
     )
+    parser.add_argument(
+        "--dpo", action="store_true",
+        help="Direct Preference Optimization over a DPO-packed dataset (kind=llm_dpo_packed: whole "
+             "preference pairs per bin, chosen-first layout, pre-aligned targets). Loss = the fused "
+             "multipacked DPO loss (triton_dpo); reference model = this model with LoRA disabled. "
+             "Incompatible with --cp_size > 1.",
+    )
+    parser.add_argument(
+        "--dpo_beta", type=float, default=0.1,
+        help="DPO temperature β on the policy/reference log-ratio (only with --dpo).",
+    )
     args = parser.parse_args()
     main(
         args.rank,
@@ -685,4 +826,6 @@ if __name__ == "__main__":
         args.grad_accum,
         args.cpu_offload,
         args.cp_size,
+        args.dpo,
+        args.dpo_beta,
     )

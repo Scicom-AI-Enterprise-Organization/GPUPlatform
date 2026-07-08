@@ -19,6 +19,7 @@ export function TransformationCard({
   kind,
   hfRepo,
   messagesField,
+  rejectedField,
   s3Storages,
   initialStatus,
   initialLog,
@@ -28,20 +29,24 @@ export function TransformationCard({
   kind: DatasetKind;
   hfRepo: string | null;
   messagesField?: string | null;
+  rejectedField?: string | null;
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
   initialSplit?: string | null;
 }) {
   // A chat dataset = kind=llm, OR a kind=hf / kind=upload dataset with a messages
-  // column mapped (a chat dataset registered as hf, or an uploaded chat file).
+  // column mapped (a chat dataset registered as hf, or an uploaded chat file). A
+  // rejected column additionally makes it a DPO (preference) dataset.
   // Prefer the LLM pack over audio extraction in the ambiguous hf case.
-  const isChat = kind === "llm" || ((kind === "hf" || kind === "upload") && !!messagesField);
+  const isChat =
+    kind === "llm" || ((kind === "hf" || kind === "upload") && (!!messagesField || !!rejectedField));
   if (isChat) {
     return (
       <LlmPackCard
         datasetId={datasetId}
         messagesField={messagesField ?? "messages"}
+        rejectedField={rejectedField ?? null}
         s3Storages={s3Storages}
         initialStatus={initialStatus}
         initialLog={initialLog}

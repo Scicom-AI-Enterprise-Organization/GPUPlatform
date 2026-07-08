@@ -44,7 +44,7 @@ logger = logging.getLogger("gateway.datasets")
 
 router = APIRouter(prefix="/v1/datasets", tags=["datasets"])
 
-KINDS = ("upload", "s3", "hf", "label", "tts_packed", "llm", "llm_packed")
+KINDS = ("upload", "s3", "hf", "label", "tts_packed", "llm", "llm_packed", "llm_dpo_packed")
 _UPLOAD_EXTS = (".csv", ".json", ".jsonl", ".ndjson", ".parquet")
 
 
@@ -68,7 +68,11 @@ class CreateDatasetRequest(BaseModel):
     # ("main", "dev"), or tag ("v1.0.0"). Blank → the repo's default branch.
     hf_revision: Optional[str] = None
     # kind=llm / kind=llm_packed — which column holds the OpenAI messages array ([{role,content}]).
+    # In DPO (preference) mode this is the CHOSEN column; rejected_field names the rejected one.
     messages_field: Optional[str] = None
+    # kind=llm preference (DPO) mode — the rejected-response column. Set it (chat→dpo mode)
+    # to pack chosen/rejected pairs and preview them side by side. Blank/None → chat mode.
+    rejected_field: Optional[str] = None
     # kind=label — live import from a labeling-platform project's export API.
     label_base_url: Optional[str] = None     # e.g. http://localhost:3002
     label_project_id: Optional[str] = None   # project UUID
@@ -89,8 +93,11 @@ class UpdateDatasetRequest(BaseModel):
     # Per-split transcription column overrides, e.g. {"train": "text", "test": "after"}.
     # Pass {} to clear. Splits not listed fall back to transcription_field.
     split_fields: Optional[dict[str, str]] = None
-    # kind=llm — which column holds the messages array. Pass "" to reset to default.
+    # kind=llm — which column holds the messages array (= chosen in DPO mode). Pass "" to reset.
     messages_field: Optional[str] = None
+    # kind=llm DPO mode — the rejected-response column. Pass "" to clear (→ chat mode),
+    # a name to enable preference (DPO) mode. None → leave unchanged.
+    rejected_field: Optional[str] = None
     # kind=label import filters. None → leave unchanged. label_status switches the
     # review-status filter; label_updated_until sets/clears (pass "") the ISO-8601
     # point-in-time cutoff. Changing either re-counts the dataset's rows.
@@ -202,6 +209,14 @@ class LlmPackRequest(BaseModel):
     # message (gemma-4, MiniMax-M2, …): render EVERY assistant turn's reasoning.
     # No-op on templates without that guard. See llm_pack.build_chat_template.
     all_reasoning: bool = True
+    # Packing objective: "sft" (default — the messages column → kind=llm_packed) or
+    # "dpo" (preference PAIRS → kind=llm_dpo_packed: chosen/rejected columns, each a
+    # full message list sharing the prompt turns — ultrafeedback-binarized style — or
+    # plain response strings + a prompt_field). See llm_pack.pack_dpo_rows.
+    objective: str = "sft"
+    chosen_field: str = "chosen"           # objective=dpo: preferred-response column
+    rejected_field: str = "rejected"       # objective=dpo: dispreferred-response column
+    prompt_field: Optional[str] = None     # objective=dpo: shared prompt column (string chosen/rejected only)
 
 
 class DatasetMergeRequest(BaseModel):
@@ -253,8 +268,10 @@ class DatasetRecord(BaseModel):
     label_token_secret: Optional[str] = None  # global-secret key (if used instead of a stored token)
     transform_status: Optional[str] = None  # "" | running | done | failed
     transform_log: Optional[str] = None     # short tail of progress lines
-    # kind=llm: which column holds the OpenAI messages array
+    # kind=llm: which column holds the OpenAI messages array (= chosen in DPO mode)
     messages_field: Optional[str] = None
+    # kind=llm DPO (preference) mode: the rejected-response column (None → chat mode)
+    rejected_field: Optional[str] = None
     # When published to the self-hosted HF mirror: the CatalogRepo id serving it
     # over /hf (None = not published). The dataset page links + shows pull snippets.
     catalog_repo_id: Optional[str] = None
@@ -367,6 +384,7 @@ def _to_record(
         label_updated_until=getattr(d, "label_updated_until", None),
         label_token_secret=getattr(d, "label_token_secret", None),
         messages_field=getattr(d, "messages_field", None) or None,
+        rejected_field=getattr(d, "rejected_field", None) or None,
         transform_status=getattr(d, "transform_status", None),
         transform_log=getattr(d, "transform_log", None),
         catalog_repo_id=getattr(d, "catalog_repo_id", None),
@@ -656,17 +674,17 @@ async def create_dataset(
     label_status_val: Optional[str] = None
     label_updated_until_val: Optional[str] = None
     label_num_rows: Optional[int] = None
-    if req.kind in ("upload", "s3", "tts_packed", "llm_packed"):
+    if req.kind in ("upload", "s3", "tts_packed", "llm_packed", "llm_dpo_packed"):
         if not req.storage_id:
             raise HTTPException(status_code=400, detail="storage_id (an S3 storage) is required")
         storage = await _load_storage(session, req.storage_id)
         if storage.kind != "s3":
-            raise HTTPException(status_code=400, detail="storage must be kind=s3 for upload / s3 / tts_packed / llm_packed datasets")
+            raise HTTPException(status_code=400, detail="storage must be kind=s3 for upload / s3 / packed datasets")
         storage_name = storage.name
-        if req.kind in ("s3", "tts_packed", "llm_packed") and not (req.s3_metadata_uri or "").strip():
+        if req.kind in ("s3", "tts_packed", "llm_packed", "llm_dpo_packed") and not (req.s3_metadata_uri or "").strip():
             raise HTTPException(
                 status_code=400,
-                detail="s3_metadata_uri is required (the metadata file for s3, the shards prefix for tts_packed / llm_packed)",
+                detail="s3_metadata_uri is required (the metadata file for s3, the shards prefix for packed kinds)",
             )
     elif req.kind in ("hf", "llm"):
         if not (req.hf_repo or "").strip():
@@ -766,12 +784,15 @@ async def create_dataset(
         # We don't introspect HF up front (same as kind=hf) — preview does it lazily.
         mf = (req.messages_field or "").strip() or "messages"
         row.messages_field = mf
+        # A rejected column flips it into DPO (preference) mode (messages = chosen).
+        row.rejected_field = (req.rejected_field or "").strip() or None
     elif req.kind in ("hf", "upload"):
         # A HF-repo or uploaded dataset is a CHAT dataset when a messages column is
         # mapped; empty → a plain audio dataset. (kind=hf and kind=llm are otherwise
         # identical downstream — preview/pack already treat hf+messages_field as chat.
         # Upload rows are introspected later by /upload; HF rows lazily by preview.)
         row.messages_field = (req.messages_field or "").strip() or None
+        row.rejected_field = (req.rejected_field or "").strip() or None
     elif req.kind == "tts_packed":
         # Register existing ChiniDataset shards: introspect the prefix for splits +
         # per-split counts + total size, and stamp the _tts_pack metadata so preview
@@ -799,11 +820,12 @@ async def create_dataset(
             "sequence_length": int(req.sequence_length or 4096),
             "splits": info["splits"],
         }}
-    elif req.kind == "llm_packed":
+    elif req.kind in ("llm_packed", "llm_dpo_packed"):
         # Register existing chat-multipack ChiniDataset shards already in S3 (the
-        # same layout the LLM pack job produces). Introspect the prefix for counts +
-        # size and stamp the _llm_pack metadata so preview / packed-row / training
-        # treat it like a packed dataset the job made. Fail loudly on an empty prefix.
+        # same layout the LLM pack job produces; llm_dpo_packed = the DPO pair
+        # layout). Introspect the prefix for counts + size and stamp the _llm_pack
+        # metadata so preview / packed-row / training treat it like a packed
+        # dataset the job made. Fail loudly on an empty prefix.
         try:
             target, _base = _s3_target_and_prefix(storage)
             u = urlparse(row.s3_metadata_uri or "")
@@ -826,6 +848,7 @@ async def create_dataset(
             "messages_field": mf,
             "subset": (req.subset or "").strip() or None,
             "splits": info["splits"],
+            "objective": "dpo" if req.kind == "llm_dpo_packed" else "sft",
         }}
     session.add(row)
     await session.commit()
@@ -998,6 +1021,9 @@ async def update_dataset(
         d.split_fields = cleaned or None
     if req.messages_field is not None:
         d.messages_field = req.messages_field.strip() or None
+    if req.rejected_field is not None:
+        # A non-blank value flips the dataset into DPO (preference) mode; "" clears it → chat.
+        d.rejected_field = req.rejected_field.strip() or None
     # kind=label import filters. Changing the status or the point-in-time cutoff
     # changes which tasks the dataset materialises, so re-count the rows (best-effort
     # — a transient platform/token issue must not block the metadata edit).
@@ -1044,7 +1070,7 @@ def _dataset_storage_prefix(d: Dataset, storage: Optional[Storage]) -> Optional[
         if d.kind == "s3":
             # metadata.csv lives at {base}/metadata.csv → purge the {base}/ folder.
             return (key.rsplit("/", 1)[0] + "/") if "/" in key else None
-        if d.kind in ("tts_packed", "llm_packed"):
+        if d.kind in ("tts_packed", "llm_packed", "llm_dpo_packed"):
             return key.rstrip("/") + "/"  # the URI already points at the shards prefix
     if d.kind == "upload" and storage is not None and storage.kind == "s3" and d.metadata_filename:
         _, base = _s3_target_and_prefix(storage)
@@ -1779,10 +1805,16 @@ def _read_packed_parquet(target: "S3Target", s3_uri: str, cap: int = 5000) -> li
     return out
 
 
-def _decode_packed_record(repo_id: str, hf_token: Optional[str], rec: dict) -> dict:
+def _decode_packed_record(repo_id: str, hf_token: Optional[str], rec: dict,
+                          objective: Optional[str] = None) -> dict:
     """Decode one packed record's token ids to text with the run's Qwen3 tokenizer
     (cached). Splits by attention_mask so each multipacked utterance shows on its
-    own; speech tokens render as `<|s_N|>`, control tokens kept (not stripped)."""
+    own; speech tokens render as `<|s_N|>`, control tokens kept (not stripped).
+
+    For a DPO pack (`objective="dpo"`) the bin holds 2K docs — first K chosen, last K
+    rejected (llm_pack.collate_dpo_bin) — so it ALSO returns `pairs`: a list of
+    {index, chosen, rejected} so the UI can show each preference pair side by side
+    instead of a flat 2K-utterance list."""
     from tokenizers import Tokenizer
 
     tok = _TTS_TOKENIZER_CACHE.get(repo_id)
@@ -1799,12 +1831,20 @@ def _decode_packed_record(repo_id: str, hf_token: Optional[str], rec: dict) -> d
         seg = ids[pos:pos + length]
         pos += length
         utts.append({"tokens": len(seg), "text": tok.decode(seg, skip_special_tokens=False)})
-    return {
+    out = {
         "num_tokens": len(ids),
         "num_utterances": len(utts),
         "utterances": utts,
         "full_text": tok.decode(ids, skip_special_tokens=False),
     }
+    if objective == "dpo" and utts and len(utts) % 2 == 0:
+        K = len(utts) // 2
+        out["objective"] = "dpo"
+        out["num_pairs"] = K
+        out["pairs"] = [
+            {"index": k, "chosen": utts[k], "rejected": utts[K + k]} for k in range(K)
+        ]
+    return out
 
 
 async def _packed_records_cached(
@@ -1876,10 +1916,11 @@ async def preview_dataset(
     def _resp(**kw):
         return PreviewResponse(audio_field=af, transcription_field=tf, offset=offset, limit=limit, **kw)
 
-    if d.kind in ("tts_packed", "llm_packed"):
+    if d.kind in ("tts_packed", "llm_packed", "llm_dpo_packed"):
         # Packed = multipacked token blocks (NeuCodec speech for tts_packed, chat
-        # text for llm_packed). Show one row per block with its token/segment
-        # counts; the UI decodes a block to text on expand (GET /{id}/packed-row).
+        # text for llm_packed, preference pairs for llm_dpo_packed). Show one row
+        # per block with its token/segment counts; the UI decodes a block to text
+        # on expand (GET /{id}/packed-row).
         if not (d.storage_id and d.s3_metadata_uri):
             return _resp(rows=[], total=d.num_rows or 0, error="packed dataset has no storage / shards")
         # Split-aware: `_*_pack.splits` = {split: count}; tts shards live under
@@ -1896,11 +1937,19 @@ async def preview_dataset(
             return _resp(rows=[], total=d.num_rows or 0, error=f"could not read packed shards: {e}")
         total = len(recs)
         page = recs[offset:offset + limit]
-        rows = [
-            {"packed": True, "index": offset + i, "split": used_split,
-             "tokens": len(r["input_ids"]), "utterances": len(r["attention_mask"])}
-            for i, r in enumerate(page)
-        ]
+        # A DPO pack (kind=llm_dpo_packed) holds 2K docs per bin (K chosen + K
+        # rejected) — surface the PAIR count so the UI reads "N preference pairs"
+        # rather than the raw doc/"utterance" count (2N), which looks meaningless.
+        objective = (_pack_meta(d).get("objective") or "sft")
+        rows = []
+        for i, r in enumerate(page):
+            n_docs = len(r["attention_mask"])
+            row = {"packed": True, "index": offset + i, "split": used_split,
+                   "tokens": len(r["input_ids"]), "utterances": n_docs}
+            if objective == "dpo":
+                row["objective"] = "dpo"
+                row["pairs"] = n_docs // 2
+            rows.append(row)
         return _resp(rows=rows, total=total, split=used_split, splits=(pack_splits or None))
 
     try:
@@ -2121,8 +2170,8 @@ async def packed_row(
     inspecting what got packed together. Returns per-utterance + full decoded text.
     The datasets UI calls this when a packed row's collapse is opened."""
     d = await _require_dataset(session, dataset_id, user)
-    if d.kind not in ("tts_packed", "llm_packed"):
-        raise HTTPException(status_code=400, detail="not a packed (tts_packed / llm_packed) dataset")
+    if d.kind not in ("tts_packed", "llm_packed", "llm_dpo_packed"):
+        raise HTTPException(status_code=400, detail="not a packed (tts_packed / llm_packed / llm_dpo_packed) dataset")
     if not (d.storage_id and d.s3_metadata_uri):
         raise HTTPException(status_code=400, detail="packed dataset has no storage / shards")
     storage = await _load_storage(session, d.storage_id)
@@ -2136,8 +2185,9 @@ async def packed_row(
     repo_id = _pack_tokenizer(d)
     from .global_env_api import load_global_env
     hf_token = (await load_global_env(session)).get("HF_TOKEN") or os.environ.get("HF_TOKEN")
+    objective = _pack_meta(d).get("objective")  # "dpo" → decode returns chosen/rejected pairs
     try:
-        decoded = await _run_sync(_decode_packed_record, repo_id, hf_token, recs[index])
+        decoded = await _run_sync(_decode_packed_record, repo_id, hf_token, recs[index], objective)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"decode failed (tokenizer {repo_id}): {e}")
     return {"index": index, "tokenizer": repo_id, **decoded}
@@ -2636,12 +2686,23 @@ async def pack_llm_dataset(
     session: AsyncSession = Depends(get_session),
 ):
     """Tokenize + multipack this chat (kind=llm) dataset's messages column into a
-    ChiniDataset on S3, then create a new kind=llm_packed dataset. Runs IN-PROCESS
-    (CPU tokenization — no GPU box). The source dataset's transform_status /
-    transform_log track progress (poll GET /{id})."""
+    ChiniDataset on S3, then create a new kind=llm_packed dataset — or, with
+    objective=dpo, pack its chosen/rejected preference pairs into a
+    kind=llm_dpo_packed dataset. Runs IN-PROCESS (CPU tokenization — no GPU box).
+    The source dataset's transform_status / transform_log track progress (poll GET /{id})."""
     d = await _require_dataset(session, dataset_id, user)
-    # A kind=llm dataset, OR any hf / uploaded dataset with a messages column mapped.
-    if not (d.kind == "llm" or (d.kind in ("hf", "upload") and getattr(d, "messages_field", None))):
+    if req.objective not in ("sft", "dpo"):
+        raise HTTPException(status_code=400, detail="objective must be 'sft' or 'dpo'")
+    dpo = req.objective == "dpo"
+    if dpo:
+        # DPO reads the chosen/rejected columns, not the messages column.
+        if d.kind not in ("llm", "hf", "upload"):
+            raise HTTPException(status_code=400, detail="DPO pack needs a kind=llm / hf / uploaded dataset "
+                                                        "with chosen/rejected preference columns")
+        if not (req.chosen_field or "").strip() or not (req.rejected_field or "").strip():
+            raise HTTPException(status_code=400, detail="chosen_field and rejected_field are required for objective=dpo")
+    # SFT: a kind=llm dataset, OR any hf / uploaded dataset with a messages column mapped.
+    elif not (d.kind == "llm" or (d.kind in ("hf", "upload") and getattr(d, "messages_field", None))):
         raise HTTPException(
             status_code=400,
             detail="LLM pack needs a kind=llm dataset (or an hf / uploaded dataset with a messages column set)",
@@ -2678,10 +2739,15 @@ async def pack_llm_dataset(
         storage_id=req.storage_id,
         tools_field=(req.tools_field or "").strip() or None,
         all_reasoning=bool(req.all_reasoning),
+        objective=req.objective,
+        chosen_field=(req.chosen_field or "chosen").strip(),
+        rejected_field=(req.rejected_field or "rejected").strip(),
+        prompt_field=(req.prompt_field or "").strip() or None,
     )
     await audit_module.record(user, "dataset.pack-llm", "dataset", dataset_id, d.name,
                               details={"tokenizer": req.tokenizer, "subsets": subsets,
-                                       "sequence_length": req.sequence_length})
+                                       "sequence_length": req.sequence_length,
+                                       "objective": req.objective})
     await session.refresh(d)
     return _to_record(d, user.username, None)
 

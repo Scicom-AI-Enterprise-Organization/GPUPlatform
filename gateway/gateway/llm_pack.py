@@ -345,6 +345,235 @@ def tokenize_row(tokenizer, messages, tools=None, chat_template=None, reasoning_
     return ids, list(ids), False
 
 
+def extract_pair_messages(row_get: Callable[[str], Any], *, chosen_field: str,
+                          rejected_field: str, prompt_field: Optional[str],
+                          arch: str, all_reasoning: bool) -> Optional[tuple[list, list, list]]:
+    """Normalize one preference row into (prompt_msgs, chosen_msgs, rejected_msgs),
+    each a full message list (chosen/rejected INCLUDE the prompt turns + the final
+    assistant turn). Two source shapes are accepted:
+      * chosen/rejected are message lists sharing the prompt turns (ultrafeedback-
+        binarized style) — the prompt is everything before the final assistant turn;
+      * chosen/rejected are plain strings + a `prompt_field` column (a string or a
+        messages list) holding the shared prompt.
+    Returns None when the row doesn't parse (caller counts it dropped)."""
+    def _as_prompt_msgs(value: Any) -> Optional[list]:
+        msgs = extract_messages(value, arch, all_reasoning)
+        if msgs:
+            return msgs
+        if isinstance(value, str) and value.strip():
+            return [{"role": "user", "content": value}]
+        return None
+
+    c_raw, r_raw = row_get(chosen_field), row_get(rejected_field)
+    if isinstance(c_raw, str) and isinstance(r_raw, str):
+        if not prompt_field:
+            return None
+        prompt = _as_prompt_msgs(row_get(prompt_field))
+        if not prompt or not c_raw.strip() or not r_raw.strip():
+            return None
+        chosen = prompt + [{"role": "assistant", "content": c_raw}]
+        rejected = prompt + [{"role": "assistant", "content": r_raw}]
+        return prompt, chosen, rejected
+
+    chosen = extract_messages(c_raw, arch, all_reasoning)
+    rejected = extract_messages(r_raw, arch, all_reasoning)
+    if not chosen or not rejected:
+        return None
+    if chosen[-1].get("role") not in ("assistant", "model") or \
+            rejected[-1].get("role") not in ("assistant", "model"):
+        return None
+    prompt = chosen[:-1]
+    # The pair must share its prompt turns — otherwise the DPO log-ratio compares
+    # apples to oranges. (Content compare, not identity: rows often duplicate them.)
+    if len(rejected) != len(chosen) or \
+            json.dumps(prompt, sort_keys=True, default=str) != \
+            json.dumps(rejected[:-1], sort_keys=True, default=str):
+        return None
+    if not prompt:
+        return None
+    return prompt, chosen, rejected
+
+
+def _common_prefix_len(a: list, b: list) -> int:
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+def tokenize_pair(tokenizer, prompt_msgs, chosen_msgs, rejected_msgs,
+                  chat_template=None, **kw) -> Optional[tuple[list, list, list, list]]:
+    """Tokenize one preference pair → (chosen_ids, chosen_targets, rejected_ids,
+    rejected_targets), with targets PRE-ALIGNED per the fused-DPO contract:
+    targets[j] = ids[j+1] on response positions, IGNORE_INDEX on prompt tokens and
+    the final position — no shifting happens at loss time.
+
+    The prompt/response boundary comes from rendering the prompt turns with
+    add_generation_prompt=True and checking it prefixes both full renders; templates
+    that aren't prefix-stable fall back to the longest common prefix of the two full
+    renders (equivalent for DPO: any shared-prefix tokens contribute identical
+    log-probs to both sides and cancel in the pairwise loss)."""
+    if chat_template is not None:
+        kw["chat_template"] = chat_template
+
+    def _render(msgs, **extra):
+        # return_dict=True like tokenize_row — transformers 5.x returns a dict
+        # (not a bare id list) from apply_chat_template.
+        out = tokenizer.apply_chat_template(msgs, tokenize=True, return_dict=True, **kw, **extra)
+        return list(out["input_ids"])
+
+    c_ids = _render(chosen_msgs)
+    r_ids = _render(rejected_msgs)
+    try:
+        p_ids = _render(prompt_msgs, add_generation_prompt=True)
+    except Exception:  # noqa: BLE001 — template without generation-prompt support
+        p_ids = []
+    if p_ids and c_ids[:len(p_ids)] == p_ids and r_ids[:len(p_ids)] == p_ids:
+        prompt_len = len(p_ids)
+    else:
+        prompt_len = _common_prefix_len(c_ids, r_ids)
+    # Need >=1 trained (response) token per side, and a non-empty prompt.
+    if prompt_len < 1 or len(c_ids) <= prompt_len or len(r_ids) <= prompt_len:
+        return None
+
+    def _targets(ids: list) -> list:
+        t = [IGNORE_INDEX] * len(ids)
+        for j in range(prompt_len - 1, len(ids) - 1):
+            t[j] = ids[j + 1]
+        return t
+
+    return c_ids, _targets(c_ids), r_ids, _targets(r_ids)
+
+
+def collate_dpo_bin(pairs: list) -> dict:
+    """One packed DPO bin: K pairs → 2K docs laid out FIRST K CHOSEN then K rejected
+    (the triton_dpo.fused_dpo_loss contract — pair k is (doc k, doc K+k)). Columns
+    are the standard ChiniDataset layout; `labels` holds the pre-aligned targets."""
+    docs_ids = [p[0] for p in pairs] + [p[2] for p in pairs]
+    docs_labels = [p[1] for p in pairs] + [p[3] for p in pairs]
+    return collate_bin(docs_ids, docs_labels)
+
+
+def pack_dpo_rows(
+    rows: Any,
+    *,
+    tokenizer_name: str,
+    out_dir: str,
+    chosen_field: str = "chosen",
+    rejected_field: str = "rejected",
+    prompt_field: Optional[str] = None,
+    max_seq_len: int = 131072,
+    hf_token: Optional[str] = None,
+    hf_endpoint: Optional[str] = None,
+    all_reasoning: bool = True,
+    arch: Optional[str] = None,
+    progress: Optional[Callable[[int, int], None]] = None,
+    progress_every: int = 100,
+) -> dict:
+    """Tokenize + greedily multipack preference pairs into a DPO ChiniDataset at
+    `out_dir` (kind=llm_dpo_packed). Same columns/invariants as pack_rows, plus:
+    every bin holds WHOLE pairs, doc count is even, and the first half of each
+    bin's docs are the chosen responses (see collate_dpo_bin). A pair whose
+    chosen+rejected renders don't both fit one bin is dropped (never split).
+
+    BLOCKING (CPU-bound): call from a threadpool, not the event loop.
+    """
+    from transformers import AutoTokenizer  # noqa: PLC0415 — lazy, like pack_rows
+
+    if hf_endpoint:
+        os.environ["HF_ENDPOINT"] = hf_endpoint
+    arch = arch or detect_arch(tokenizer_name)
+    logger.info("llm_pack: DPO pack — loading tokenizer %s (arch=%s)", tokenizer_name, arch)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=hf_token or None)
+    chat_template = build_chat_template(tokenizer, all_reasoning, arch)
+    tpl_kw: dict[str, Any] = {}
+    if arch == "mistral":
+        tpl_kw["reasoning_effort"] = "high" if all_reasoning else "none"
+    if all_reasoning and arch == "qwen":
+        tpl_kw["preserve_thinking"] = True
+
+    ParquetWriter = _import_parquet_writer()
+
+    total_rows = len(rows)
+    n_bins = n_pairs = n_dropped_long = n_dropped_bad = 0
+    total_tokens = 0
+    cur_pairs: list = []
+    cur_count = 0
+
+    def _get_factory(row: Any) -> Callable[[str], Any]:
+        def _get(key: str) -> Any:
+            if isinstance(row, dict):
+                return row.get(key)
+            try:
+                return row[key]
+            except (KeyError, IndexError, TypeError):
+                return None
+        return _get
+
+    writer = ParquetWriter(out=out_dir, columns=COLUMNS, exist_ok=True)
+    with writer as out:
+        for i in range(total_rows):
+            trip = extract_pair_messages(
+                _get_factory(rows[i]), chosen_field=chosen_field,
+                rejected_field=rejected_field, prompt_field=prompt_field,
+                arch=arch, all_reasoning=all_reasoning)
+            pair = None
+            if trip is not None:
+                try:
+                    pair = tokenize_pair(tokenizer, *trip, chat_template=chat_template, **tpl_kw)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("llm_pack: DPO row %d tokenize failed (%s); skipping", i, e)
+            if pair is None:
+                n_dropped_bad += 1
+            else:
+                length = len(pair[0]) + len(pair[2])
+                if length > max_seq_len:
+                    n_dropped_long += 1  # the pair must fit one bin whole
+                else:
+                    if cur_count + length > max_seq_len:
+                        if cur_pairs:
+                            sample = collate_dpo_bin(cur_pairs)
+                            assert_invariants(sample)
+                            out.write(sample)
+                            n_bins += 1
+                            total_tokens += len(sample["input_ids"])
+                        cur_pairs, cur_count = [pair], length
+                    else:
+                        cur_pairs.append(pair)
+                        cur_count += length
+                    n_pairs += 1
+
+            if progress and total_rows and (i + 1) % progress_every == 0:
+                progress(i + 1, total_rows)
+
+        if cur_pairs:
+            sample = collate_dpo_bin(cur_pairs)
+            assert_invariants(sample)
+            out.write(sample)
+            n_bins += 1
+            total_tokens += len(sample["input_ids"])
+
+    if progress and total_rows:
+        progress(total_rows, total_rows)
+
+    efficiency = (total_tokens / n_bins / max_seq_len) if n_bins else 0.0
+    return {
+        "total_rows": total_rows,
+        "pairs_packed": n_pairs,
+        "docs_packed": 2 * n_pairs,
+        "dropped_long": n_dropped_long,
+        "dropped_empty": n_dropped_bad,
+        "n_bins": n_bins,
+        "total_tokens": total_tokens,
+        "max_seq_len": max_seq_len,
+        "efficiency": efficiency,
+        "tokenizer": tokenizer_name,
+        "arch": arch,
+        "objective": "dpo",
+    }
+
+
 def collate_bin(docs_ids: list, docs_labels: list) -> dict:
     """Build one packed-bin sample: concatenate ids/labels, reset position_ids per
     doc, store per-doc lengths in attention_mask."""

@@ -50,6 +50,7 @@ function errText(body: unknown, fallback: string): string {
 export function LlmPackCard({
   datasetId,
   messagesField,
+  rejectedField,
   s3Storages,
   initialStatus,
   initialLog,
@@ -57,6 +58,7 @@ export function LlmPackCard({
 }: {
   datasetId: string;
   messagesField: string;
+  rejectedField?: string | null;
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
@@ -72,6 +74,15 @@ export function LlmPackCard({
   const [storageId, setStorageId] = useState(s3Storages[0]?.id ?? "");
   const [toolsField, setToolsField] = useState("functions");
   const [allReasoning, setAllReasoning] = useState(true);
+  // Objective: sft = the messages column → kind=llm_packed; dpo = chosen/rejected
+  // preference pairs → kind=llm_dpo_packed (whole pairs per bin, for DPO runs).
+  // Default to the dataset's configured mode: a mapped rejected column ⇒ DPO, with
+  // chosen = the messages column and rejected = the mapped rejected column.
+  const isPref = !!(rejectedField ?? "").trim();
+  const [objective, setObjective] = useState<"sft" | "dpo">(isPref ? "dpo" : "sft");
+  const [chosenField, setChosenField] = useState(isPref ? messagesField : "chosen");
+  const [rejectedFieldName, setRejectedFieldName] = useState((rejectedField ?? "").trim() || "rejected");
+  const [promptField, setPromptField] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [status, setStatus] = useState<string | null>(initialStatus);
   const [log, setLog] = useState<string | null>(initialLog);
@@ -165,6 +176,10 @@ export function LlmPackCard({
       setErr("Pick at least one subset / split to pack.");
       return;
     }
+    if (objective === "dpo" && (!chosenField.trim() || !rejectedFieldName.trim())) {
+      setErr("DPO packing needs the chosen and rejected column names.");
+      return;
+    }
     setStarting(true);
     try {
       const d = await gateway.packLlmDataset(datasetId, {
@@ -174,6 +189,14 @@ export function LlmPackCard({
         sequence_length: seqLen,
         tools_field: toolsField.trim() || null,
         all_reasoning: allReasoning,
+        objective,
+        ...(objective === "dpo"
+          ? {
+              chosen_field: chosenField.trim(),
+              rejected_field: rejectedFieldName.trim(),
+              prompt_field: promptField.trim() || null,
+            }
+          : {}),
       });
       setStatus(d.transform_status ?? "running");
       setLog(d.transform_log ?? null);
@@ -212,15 +235,92 @@ export function LlmPackCard({
       <CardHeader className="flex flex-col gap-0.5">
         <CardTitle className="text-base">Pack for LLM — tokenize + multipack</CardTitle>
         <span className="text-xs text-muted-foreground">
-          Tokenize the <span className="font-mono">{messagesField}</span> column (rendered via the
-          tokenizer&apos;s chat template, with any tool/function declarations) and greedily bin-pack
-          conversations into a ChiniDataset for LLM finetuning — the chat-text analogue of TTS packing.
-          Conversations longer than the sequence length are dropped (never split). Runs on the gateway
-          (CPU tokenization); watch progress below.
+          {objective === "dpo" ? (
+            <>
+              Tokenize the <span className="font-mono">{chosenField || "chosen"}</span> /{" "}
+              <span className="font-mono">{rejectedFieldName || "rejected"}</span> preference pairs
+              (rendered via the tokenizer&apos;s chat template) and bin-pack them — whole pairs per
+              bin — into a DPO ChiniDataset. Pairs longer than the sequence length are dropped
+              (never split). Runs on the gateway (CPU tokenization); watch progress below.
+            </>
+          ) : (
+            <>
+              Tokenize the <span className="font-mono">{messagesField}</span> column (rendered via the
+              tokenizer&apos;s chat template, with any tool/function declarations) and greedily bin-pack
+              conversations into a ChiniDataset for LLM finetuning — the chat-text analogue of TTS packing.
+              Conversations longer than the sequence length are dropped (never split). Runs on the gateway
+              (CPU tokenization); watch progress below.
+            </>
+          )}
         </span>
       </CardHeader>
       <CardContent>
         <div className="space-y-3">
+          <div className="space-y-1">
+            <Label className="text-xs">Objective</Label>
+            <Select
+              value={objective}
+              onValueChange={(v) => setObjective(v as "sft" | "dpo")}
+              disabled={running}
+            >
+              <SelectTrigger className="text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="sft">SFT — supervised finetune (messages column)</SelectItem>
+                <SelectItem value="dpo">DPO — preference pairs (chosen / rejected columns)</SelectItem>
+              </SelectContent>
+            </Select>
+            {objective === "dpo" && (
+              <p className="text-[11px] text-muted-foreground">
+                Produces a <span className="font-mono">kind=llm_dpo_packed</span> dataset for Autotrain&apos;s
+                DPO training type (Qwen3.5/3.6 and Gemma-4 base models). Chosen/rejected are full message
+                lists sharing the prompt turns (ultrafeedback style), or plain response strings + a prompt column.
+              </p>
+            )}
+          </div>
+
+          {objective === "dpo" && (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="space-y-1">
+                <Label htmlFor="lp-chosen" className="text-xs">Chosen column</Label>
+                <Input
+                  id="lp-chosen"
+                  value={chosenField}
+                  onChange={(e) => setChosenField(e.target.value)}
+                  placeholder="chosen"
+                  disabled={running}
+                  className="font-mono text-xs"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="lp-rejected" className="text-xs">Rejected column</Label>
+                <Input
+                  id="lp-rejected"
+                  value={rejectedFieldName}
+                  onChange={(e) => setRejectedFieldName(e.target.value)}
+                  placeholder="rejected"
+                  disabled={running}
+                  className="font-mono text-xs"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="lp-prompt" className="text-xs">Prompt column (optional)</Label>
+                <Input
+                  id="lp-prompt"
+                  value={promptField}
+                  onChange={(e) => setPromptField(e.target.value)}
+                  placeholder="prompt"
+                  disabled={running}
+                  className="font-mono text-xs"
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  Only when chosen/rejected are plain strings.
+                </p>
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="space-y-1">
               <Label className="text-xs">Subset / split</Label>
@@ -327,6 +427,7 @@ export function LlmPackCard({
           </button>
           {showAdvanced && (
             <div className="space-y-3 rounded-md border border-border p-3">
+              {objective === "sft" && (
               <div className="space-y-1">
                 <Label htmlFor="lp-tools" className="text-xs">Tools / functions column</Label>
                 <Input
@@ -342,6 +443,7 @@ export function LlmPackCard({
                   into the chat template. Leave blank to pack without tools.
                 </p>
               </div>
+              )}
               <label className="flex items-start gap-2 text-xs">
                 <Checkbox
                   checked={allReasoning}
@@ -363,7 +465,7 @@ export function LlmPackCard({
           <div className="flex items-center gap-3">
             <Button onClick={run} disabled={running || starting}>
               {running || starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Package className="h-4 w-4" />}
-              {running ? "Packing…" : "Pack for LLM"}
+              {running ? "Packing…" : objective === "dpo" ? "Pack for DPO" : "Pack for LLM"}
             </Button>
             {running && (
               <Button variant="outline" onClick={cancel} disabled={cancelling} className="text-destructive">

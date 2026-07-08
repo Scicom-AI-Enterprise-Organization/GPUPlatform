@@ -554,6 +554,10 @@ export type CreateTrainingRunRequest = {
   // CP group size (GPUs per group that shard one sequence). null/0 → all run GPUs (dp=1); when set
   // it must divide the run's GPU count (dp_size = world / cp_size). Only used when context_parallel.
   cp_size?: number | null;
+  // LLM training objective: "sft" (default, kind=llm_packed dataset) or "dpo"
+  // (kind=llm_dpo_packed preference pairs; qwen base models only; no context parallel).
+  training_type?: "sft" | "dpo";
+  dpo_beta?: number; // DPO temperature β (training_type=dpo)
   learning_rate?: number;
   warmup_steps?: number;
   lr_scheduler_type?: "linear" | "cosine" | "constant_with_warmup" | "constant";
@@ -906,6 +910,8 @@ export type StorageRecord = {
 // push_to_hub), surfaced in the Datasets list alongside Autotrain datasets.
 // "llm_packed" = a chat dataset (kind=llm) tokenized + bin-packed into a
 // ChiniDataset for LLM finetuning (the chat-text analogue of "tts_packed").
+// "llm_dpo_packed" = chosen/rejected preference PAIRS packed for DPO training
+// (whole pairs per bin, chosen-first layout — Pack for LLM with objective=dpo).
 export type DatasetKind =
   | "upload"
   | "s3"
@@ -915,7 +921,8 @@ export type DatasetKind =
   | "omnivoice_packed" // {audio,text} Higgs-codec → OmniVoice WebDataset shards (Pack for OmniVoice)
   | "hosted"
   | "llm"
-  | "llm_packed";
+  | "llm_packed"
+  | "llm_dpo_packed";
 
 export type DatasetRecord = {
   id: string;
@@ -943,7 +950,8 @@ export type DatasetRecord = {
   hf_repo?: string | null;
   hf_revision?: string | null;
   hf_synced_at?: string | null;
-  messages_field?: string | null; // kind=llm: column holding the messages array
+  messages_field?: string | null; // kind=llm: column holding the messages array (= chosen in DPO mode)
+  rejected_field?: string | null; // kind=llm DPO (preference) mode: rejected-response column (null → chat mode)
   label_base_url?: string | null; // kind=label source (token never returned)
   label_project_id?: string | null;
   label_status?: string | null; // approved | rejected | not_reviewed | all
@@ -970,7 +978,8 @@ export type CreateDatasetRequest = {
   subset?: string | null; // kind=llm_packed — source subset that was packed (metadata)
   hf_repo?: string | null;
   hf_revision?: string | null; // kind=hf/llm — commit/branch/tag to pin
-  messages_field?: string | null; // kind=llm / llm_packed — column holding the messages array
+  messages_field?: string | null; // kind=llm / llm_packed — column holding the messages array (= chosen in DPO mode)
+  rejected_field?: string | null; // kind=llm DPO mode — rejected-response column
   // kind=label — import from a labeling-platform project
   label_base_url?: string | null;
   label_project_id?: string | null;
@@ -986,6 +995,11 @@ export type UpdateDatasetRequest = {
   audio_prefix?: string | null;
   audio_field?: string;
   transcription_field?: string;
+  speaker_field?: string;
+  // kind=llm column mapping. messages_field = the messages/chosen column; rejected_field
+  // set → DPO (preference) mode, "" → chat mode. null → leave unchanged.
+  messages_field?: string | null;
+  rejected_field?: string | null;
   // kind=label import filters (null → unchanged; pass "" for label_updated_until to clear the cutoff)
   label_status?: string | null;
   label_updated_until?: string | null;
@@ -1091,6 +1105,10 @@ export type LlmPackRequest = {
   sequence_length?: number; // multipack bin length (tokens); longer convs dropped
   tools_field?: string | null; // source tool/function column (blank → no tools)
   all_reasoning?: boolean; // render every assistant turn's reasoning (gemma-4/MiniMax-M2 templates; no-op otherwise)
+  objective?: "sft" | "dpo"; // dpo = pack chosen/rejected preference pairs → kind=llm_dpo_packed
+  chosen_field?: string; // objective=dpo: preferred-response column (messages list or string)
+  rejected_field?: string; // objective=dpo: dispreferred-response column
+  prompt_field?: string | null; // objective=dpo: shared prompt column (only when chosen/rejected are strings)
 };
 
 // Concatenate >=2 kind=label datasets into one combined audio dataset (HF or

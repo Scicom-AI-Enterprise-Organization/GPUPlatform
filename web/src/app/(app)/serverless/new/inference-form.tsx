@@ -109,6 +109,35 @@ const ASCEND_INSTALL_ARGS = [
 ].join("\n");
 // Big-disk default on the TM NPU box; editable like any venv path.
 const ASCEND_VENV_PATH = "/data/nvme0/sgpu/vllm-ascend-venv";
+// Custom vllm-ascend fork (git) — installed from SOURCE on the box: uv's isolated
+// build env supplies cmake/torch-npu (pyproject build requires), SOC_VERSION
+// auto-detects from the chip, and the custom kernels compile against the box's
+// LOCAL CANN (the worker sources the CANN env for installs on Ascend) — which
+// sidesteps the prebuilt-wheel CANN mismatch entirely. Pair with the vllm version
+// the fork's branch tracks. The Gemma-4 Ascend fork sits on main just after the
+// upstream v0.19.0 bump.
+const ASCEND_FORK_GEMMA4_URL = "https://github.com/EheinWang/vllm-ascend-dev";
+const ASCEND_FORK_GEMMA4_REF = "bugfix/gemma4-support";
+const ASCEND_FORK_GEMMA4_VLLM = "0.19.0";
+// The fork gets its OWN venv so the stable vllm-ascend venv isn't rebuilt when
+// the spec marker changes.
+const ASCEND_FORK_VENV = "/data/nvme0/sgpu/vllm-ascend-fork-venv";
+
+// Multi-line install args for a vllm-ascend git fork (same 3-phase shape as
+// ASCEND_INSTALL_ARGS — see that constant for why the lines can't merge).
+function composeAscendForkArgs(url: string, ref: string, vllmVer: string): string {
+  const u = url.trim();
+  if (!u) return "";
+  const spec = `git+${u}${ref.trim() ? "@" + ref.trim() : ""}`;
+  return [
+    `VLLM_TARGET_DEVICE=empty vllm==${vllmVer.trim() || ASCEND_FORK_GEMMA4_VLLM}`,
+    `${spec} ` +
+      "--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/variant " +
+      "--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi " +
+      "--index-strategy unsafe-best-match",
+    "setuptools<81 z3-solver==4.12.2.0",
+  ].join("\n");
+}
 // Custom vLLM fork (git) — the Gemma-4 FA4 "CUTE" fork + what it needs to run.
 const GEMMA4_FA4_FORK_URL = "https://github.com/Scicom-AI-Enterprise-Organization/vllm-gemma4-fa4-cute";
 const GEMMA4_FA4_REF = "main";
@@ -234,6 +263,9 @@ export function InferenceForm() {
   const [forkUrl, setForkUrl] = useState("");
   const [forkRef, setForkRef] = useState("main");
   const [forkPrecompiled, setForkPrecompiled] = useState(true);
+  // Ascend fork: the vllm version the fork's branch tracks (line 1 of the
+  // composed multi-line install).
+  const [ascendForkVllm, setAscendForkVllm] = useState(ASCEND_FORK_GEMMA4_VLLM);
   // Append a serve flag (e.g. --attention-backend FLASH_ATTN_CUTE) to every member
   // that doesn't already carry it. VM (proxy/fleet) + cloud-multi serve via members.
   const addServeFlagToMembers = (flag: string) =>
@@ -251,6 +283,25 @@ export function InferenceForm() {
     if (!args) return;
     setVllmInstallArgs(args);
     setVllmVersion("");
+  };
+  // Ascend fork: compose the 3-line install (paired vllm + git fork + host pins)
+  // into the install args and give the fork a dedicated venv.
+  const applyAscendFork = () => {
+    const args = composeAscendForkArgs(forkUrl, forkRef, ascendForkVllm);
+    if (!args) return;
+    setVllmInstallArgs(args);
+    setVllmVersion("");
+    setVenvPath(ASCEND_FORK_VENV);
+  };
+  // One-click: the Gemma-4 vllm-ascend fork (source build against the box's CANN).
+  const useGemma4AscendPreset = () => {
+    setForkUrl(ASCEND_FORK_GEMMA4_URL);
+    setForkRef(ASCEND_FORK_GEMMA4_REF);
+    setAscendForkVllm(ASCEND_FORK_GEMMA4_VLLM);
+    setVllmInstallArgs(composeAscendForkArgs(
+      ASCEND_FORK_GEMMA4_URL, ASCEND_FORK_GEMMA4_REF, ASCEND_FORK_GEMMA4_VLLM));
+    setVllmVersion("");
+    setVenvPath(ASCEND_FORK_VENV);
   };
   // One-click: the Gemma-4 FA4 CUTE fork — git install (precompiled) of the vLLM
   // fork, the FA4 serve flag on every member, and a pre-launch script that installs
@@ -1184,6 +1235,57 @@ export function InferenceForm() {
                     type="button"
                     disabled={!forkUrl.trim()}
                     onClick={() => applyFork()}
+                    className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted disabled:opacity-40"
+                  >
+                    Apply to install args ↓
+                  </button>
+                </div>
+              </Field>
+            )}
+
+            {isAscend && (
+              <Field
+                label="Custom vllm-ascend fork (git)"
+                hint="Install a forked vllm-ascend from a git repo — built from SOURCE on the box, compiling its custom kernels against the local CANN (SOC auto-detected; cmake comes from the isolated build env; first install can take ~15 min). Pair with the vllm version the fork's branch tracks. Applying fills the install args below."
+              >
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={useGemma4AscendPreset}
+                    className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted"
+                  >
+                    Use Gemma-4 Ascend fork
+                  </button>
+                  <span className="text-[11px] text-muted-foreground">
+                    EheinWang/vllm-ascend-dev@{ASCEND_FORK_GEMMA4_REF} · vllm {ASCEND_FORK_GEMMA4_VLLM} · dedicated venv
+                  </span>
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Input
+                    value={forkUrl}
+                    onChange={(e) => setForkUrl(e.target.value)}
+                    placeholder={ASCEND_FORK_GEMMA4_URL}
+                    className="font-mono text-xs sm:flex-1"
+                  />
+                  <Input
+                    value={forkRef}
+                    onChange={(e) => setForkRef(e.target.value)}
+                    placeholder={ASCEND_FORK_GEMMA4_REF}
+                    className="font-mono text-xs sm:w-56"
+                  />
+                  <Input
+                    value={ascendForkVllm}
+                    onChange={(e) => setAscendForkVllm(e.target.value)}
+                    placeholder={ASCEND_FORK_GEMMA4_VLLM}
+                    title="vllm version the fork's branch tracks (install line 1)"
+                    className="font-mono text-xs sm:w-28"
+                  />
+                </div>
+                <div className="mt-2">
+                  <button
+                    type="button"
+                    disabled={!forkUrl.trim()}
+                    onClick={applyAscendFork}
                     className="rounded border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted disabled:opacity-40"
                   >
                     Apply to install args ↓

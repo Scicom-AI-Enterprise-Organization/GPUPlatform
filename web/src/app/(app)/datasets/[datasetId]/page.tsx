@@ -59,9 +59,16 @@ export default async function DatasetDetailPage({
   // (kind=llm_packed) for LLM finetuning. In-process (CPU tokenization, no GPU).
   // A kind=llm dataset, OR a kind=hf dataset with a messages column mapped (a chat
   // dataset registered as plain hf) — the latter is what surfaces a chat preview.
+  // Also any hf/upload dataset whose rows carry chosen/rejected preference columns
+  // (ultrafeedback style, no messages column) — those pack with the DPO objective.
+  const _previewCols = preview?.rows?.[0]
+    ? Object.keys(preview.rows[0] as Record<string, unknown>)
+    : [];
+  const _hasPrefCols = _previewCols.includes("chosen") && _previewCols.includes("rejected");
   const canPackLlm =
     dataset?.kind === "llm" ||
-    ((dataset?.kind === "hf" || dataset?.kind === "upload") && !!dataset?.messages_field);
+    ((dataset?.kind === "hf" || dataset?.kind === "upload") &&
+      (!!dataset?.messages_field || _hasPrefCols));
   let s3Storages: StorageRecord[] = [];
   if (canTransform || canPack || canPackLlm) {
     try {

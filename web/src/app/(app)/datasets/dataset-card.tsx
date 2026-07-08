@@ -35,13 +35,14 @@ export const KIND_LABEL: Record<DatasetKind, string> = {
   hosted: "hf repo",
   llm: "llm",
   llm_packed: "llm-packed",
+  llm_dpo_packed: "dpo-packed",
 };
 
 export function KindIcon({ kind, className }: { kind: DatasetKind; className?: string }) {
   if (kind === "hf" || kind === "hosted") return <Database className={className} />;
   if (kind === "s3") return <CloudUpload className={className} />;
   if (kind === "label") return <Tags className={className} />;
-  if (kind === "llm" || kind === "llm_packed") return <MessagesSquare className={className} />;
+  if (kind === "llm" || kind === "llm_packed" || kind === "llm_dpo_packed") return <MessagesSquare className={className} />;
   return <FileAudio className={className} />;
 }
 

@@ -627,6 +627,11 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     ]
     if _cpu_offload_on(cfg, True):  # dense default: offload ON (long-context VRAM)
         cmd.append("--cpu_offload")
+    # DPO (cfg.training_type="dpo"): the fused multipacked preference objective over a
+    # kind=llm_dpo_packed dataset. Mutually exclusive with context parallelism — the
+    # create-run validates that; the trainer also refuses --dpo + --cp_size > 1.
+    if (cfg.get("training_type") or "sft") == "dpo":
+        cmd += ["--dpo", "--dpo_beta", str(float(cfg.get("dpo_beta") or 0.1))]
     # Context parallelism (zigzag ring, gemma-only): shard each packed sequence across a CP group.
     # cfg["cp_size"] (GPUs per group) defaults to ALL run GPUs (one group, dp=1); when set it must
     # divide nproc (dp_size = nproc / cp_size). Needs >=2 GPUs. The form sets cfg["context_parallel"].
@@ -665,6 +670,11 @@ def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     ]
     if _cpu_offload_on(cfg, True):  # dense default: offload ON (long-context VRAM)
         cmd.append("--cpu_offload")
+    # DPO (cfg.training_type="dpo"): the fused multipacked preference objective over a
+    # kind=llm_dpo_packed dataset. Mutually exclusive with context parallelism — the
+    # create-run validates that; the trainer also refuses --dpo + --cp_size > 1.
+    if (cfg.get("training_type") or "sft") == "dpo":
+        cmd += ["--dpo", "--dpo_beta", str(float(cfg.get("dpo_beta") or 0.1))]
     # Context parallelism: shard ONE packed sequence across ALL run GPUs (one CP group, dp=1) — the
     # GatedDeltaNet hybrid relays its recurrent+conv state and rings the full-attn KV. Needs >=2 GPUs;
     # ignored otherwise. The form sets cfg["context_parallel"]. (Same knob as gemma's _gemma_cmd.)
@@ -724,9 +734,15 @@ def run(cfg: dict) -> None:
     _RUN_WORKDIR = work
     log(f"[trainer] arch={arch} · model={model_id} · work dir: {work}")
 
+    dpo = (cfg.get("training_type") or "sft") == "dpo"
+    if dpo and arch not in ("qwen", "gemma"):
+        raise RuntimeError(f"DPO training is wired for the qwen + gemma trainers only (base model arch is '{arch}')")
     ds = cfg.get("dataset") or {}
-    if (ds.get("kind") != "llm_packed") or not ds.get("packed_uri"):
-        raise RuntimeError("LLM training needs a packed dataset (kind=llm_packed) — pack it first via 'Pack for LLM'")
+    want_kind = "llm_dpo_packed" if dpo else "llm_packed"
+    if (ds.get("kind") != want_kind) or not ds.get("packed_uri"):
+        raise RuntimeError(
+            f"{'DPO' if dpo else 'LLM'} training needs a packed dataset (kind={want_kind}) — "
+            f"pack it first via 'Pack for LLM'" + (" with the DPO objective" if dpo else ""))
 
     report_to = list((cfg.get("tracking") or {}).get("report_to") or [])
     base_env = {**os.environ}

@@ -56,7 +56,7 @@ function searchableText(d: DatasetRecord): string {
 const MERGEABLE_KINDS = new Set<DatasetKind>(["label", "s3"]);
 // Kinds whose files live in OUR S3 storage, so delete can optionally purge them
 // (mirrors [datasetId]/delete-button.tsx). hf/label/llm have nothing here.
-const PURGEABLE_KINDS = new Set<DatasetKind>(["s3", "tts_packed", "llm_packed", "upload"]);
+const PURGEABLE_KINDS = new Set<DatasetKind>(["s3", "tts_packed", "llm_packed", "llm_dpo_packed", "upload"]);
 
 const SOURCE_OPTIONS: Array<{ value: "all" | DatasetKind; label: string }> = [
   { value: "all", label: "All sources" },

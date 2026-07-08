@@ -20,7 +20,7 @@ import type { DatasetKind } from "@/lib/types";
 // Kinds whose files live in OUR S3 storage (so "purge" can delete them). hf is
 // pushed to a HuggingFace repo and label lives on the labeling platform — for
 // those there's nothing in storage to purge.
-const PURGEABLE_KINDS: DatasetKind[] = ["s3", "tts_packed", "llm_packed", "upload"];
+const PURGEABLE_KINDS: DatasetKind[] = ["s3", "tts_packed", "llm_packed", "llm_dpo_packed", "upload"];
 
 export function DeleteButton({ id, name, kind }: { id: string; name: string; kind: DatasetKind }) {
   const router = useRouter();

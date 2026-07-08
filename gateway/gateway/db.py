@@ -434,8 +434,13 @@ class Dataset(Base):
     # being stored per-dataset; resolved via load_global_env() at use time.
     label_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # kind=llm: which column holds the OpenAI-compatible messages array
-    # ([{role,content}]). Default "messages".
+    # ([{role,content}]). Default "messages". In DPO (preference) mode this names
+    # the CHOSEN column and `rejected_field` names the rejected column.
     messages_field: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # kind=llm preference (DPO) mode: which column holds the REJECTED response
+    # (chosen = messages_field). NULL → chat/SFT mode (no preference pairing). Its
+    # presence is what flips the dataset into "dpo" mode (columns card + preview).
+    rejected_field: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # When this (s3-backed) dataset has been published to the self-hosted HF mirror
     # — the id of the CatalogRepo (repo_type=dataset) serving its files over /hf, so
     # the dataset page can show pull snippets + link to it. NULL = not published.
@@ -747,6 +752,11 @@ async def init_db() -> None:
         # existing rows → unchanged behaviour (import every task).
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_updated_until VARCHAR(64)"
+        ))
+        # kind=llm DPO (preference) mode: the rejected-response column (chosen =
+        # messages_field). NULL on existing rows → chat/SFT mode (unchanged).
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS rejected_field VARCHAR(128)"
         ))
         # Catalog revisions: existing repos stay flat (versioned=false) → no behaviour
         # change; only mirror-native pushes set versioned=true. catalog_revisions

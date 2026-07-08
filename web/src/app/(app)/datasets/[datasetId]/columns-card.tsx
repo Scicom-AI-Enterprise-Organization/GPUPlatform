@@ -43,6 +43,7 @@ export function ColumnsCard({
   speakerField,
   splitFields,
   messagesField,
+  rejectedField,
 }: {
   datasetId: string;
   kind: string;
@@ -51,6 +52,7 @@ export function ColumnsCard({
   speakerField?: string | null;
   splitFields?: Record<string, string> | null;
   messagesField?: string | null;
+  rejectedField?: string | null;
 }) {
   const router = useRouter();
   const isHfLike = kind === "hf" || kind === "llm"; // column list comes from HF splits API
@@ -76,8 +78,12 @@ export function ColumnsCard({
   const [editing, setEditing] = useState(false);
   const [audio, setAudio] = useState(audioField);
   const [transcription, setTranscription] = useState(transcriptionField);
-  // kind=llm primary column
+  // kind=llm primary column (= the chosen column in DPO mode)
   const [messages, setMessages] = useState(messagesField ?? "messages");
+  // kind=llm DPO (preference) mode: whether to map a rejected column, and its name.
+  // A rejected column on the dataset means it's already a preference dataset.
+  const [dpoMode, setDpoMode] = useState(!!(rejectedField ?? "").trim());
+  const [rejected, setRejected] = useState(rejectedField ?? "");
   // TTS-only speaker column (one global column, like audio). "" → one voice.
   const [speaker, setSpeaker] = useState(speakerField ?? "");
   // Per-split transcription column choices (only when the HF source exposes splits).
@@ -143,6 +149,8 @@ export function ColumnsCard({
     setAudio(audioField);
     setTranscription(transcriptionField);
     setMessages(messagesField ?? "messages");
+    setDpoMode(!!(rejectedField ?? "").trim());
+    setRejected(rejectedField ?? "");
     setSpeaker(speakerField ?? "");
     setErr(null);
     setEditing(true);
@@ -160,10 +168,19 @@ export function ColumnsCard({
     setErr(null);
     if (isChatOnly) {
       if (!messages.trim()) {
-        setErr("Messages column is required.");
+        setErr(dpoMode ? "Chosen column is required." : "Messages column is required.");
         return;
       }
-      const body = { messages_field: messages.trim() };
+      if (dpoMode && !rejected.trim()) {
+        setErr("Rejected column is required in DPO mode.");
+        return;
+      }
+      if (dpoMode && rejected.trim() === messages.trim()) {
+        setErr("Chosen and rejected must be different columns.");
+        return;
+      }
+      // rejected_field: a name → DPO (preference) mode; "" → chat mode.
+      const body = { messages_field: messages.trim(), rejected_field: dpoMode ? rejected.trim() : "" };
       setSaving(true);
       try {
         const r = await fetch(`/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}`, {
@@ -322,21 +339,65 @@ export function ColumnsCard({
                 )}
               </>
             )}
+            {showMessages && isChatOnly && (
+              <div className="flex items-baseline justify-between gap-4 py-1.5">
+                <span className="text-xs text-muted-foreground">Mode</span>
+                <span className="font-mono text-xs">
+                  {(rejectedField ?? "").trim() ? "DPO — preference pairs" : "Chat — SFT"}
+                </span>
+              </div>
+            )}
             {showMessages && (
               <div className="flex items-baseline justify-between gap-4 py-1.5">
                 <span className="text-xs text-muted-foreground">
-                  Messages column <span className="text-[10px]">(chat / LLM)</span>
+                  {(rejectedField ?? "").trim() ? "Chosen column" : "Messages column"}{" "}
+                  <span className="text-[10px]">(chat / LLM)</span>
                 </span>
                 <span className="font-mono text-xs">{messagesField || <span className="text-muted-foreground/50">not set</span>}</span>
               </div>
             )}
+            {showMessages && (rejectedField ?? "").trim() && (
+              <div className="flex items-baseline justify-between gap-4 py-1.5">
+                <span className="text-xs text-muted-foreground">
+                  Rejected column <span className="text-[10px]">(DPO)</span>
+                </span>
+                <span className="font-mono text-xs">{rejectedField}</span>
+              </div>
+            )}
           </div>
         ) : isChatOnly ? (
-          // Pure-chat dataset (kind=llm, or an uploaded chat file): only the
-          // messages column matters.
+          // Pure-chat dataset (kind=llm, or an uploaded chat file). Chat (SFT) maps a
+          // single messages column; DPO (preference) maps chosen + rejected columns.
           <div className="space-y-3">
+            <div className="space-y-1">
+              <Label className="text-xs">Mode</Label>
+              <div className="flex w-fit items-center gap-0.5 rounded-md border border-border p-0.5">
+                {([["sft", "Chat (SFT)"], ["dpo", "Preference (DPO)"]] as const).map(([m, lbl]) => (
+                  <button
+                    key={m}
+                    type="button"
+                    disabled={saving}
+                    onClick={() => setDpoMode(m === "dpo")}
+                    className={cn(
+                      "rounded px-2.5 py-1 text-xs font-medium transition-colors",
+                      (m === "dpo") === dpoMode
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                {dpoMode
+                  ? "Preference pairs: pick the chosen and rejected columns. Pack with objective=DPO to train a DPO run."
+                  : "Supervised: one messages column, packed for a standard SFT run."}
+              </p>
+            </div>
+
             <div className="space-y-1 sm:max-w-xs">
-              <Label htmlFor="ds-messages" className="text-xs">Messages column</Label>
+              <Label htmlFor="ds-messages" className="text-xs">{dpoMode ? "Chosen column" : "Messages column"}</Label>
               {loadingSplits ? (
                 <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <Loader2 className="h-3 w-3 animate-spin" /> reading columns…
@@ -355,12 +416,41 @@ export function ColumnsCard({
                   id="ds-messages"
                   value={messages}
                   onChange={(e) => setMessages(e.target.value)}
-                  placeholder="messages"
+                  placeholder={dpoMode ? "chosen" : "messages"}
                   disabled={saving}
                   className="font-mono text-xs"
                 />
               )}
             </div>
+
+            {dpoMode && (
+              <div className="space-y-1 sm:max-w-xs">
+                <Label htmlFor="ds-rejected" className="text-xs">Rejected column</Label>
+                {!loadingSplits && allColumns.length > 0 ? (
+                  <Select value={rejected || "__none__"} onValueChange={(v) => setRejected(v === "__none__" ? "" : v)} disabled={saving}>
+                    <SelectTrigger className="font-mono text-xs"><SelectValue placeholder="Choose a column" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__" className="text-xs text-muted-foreground">— choose —</SelectItem>
+                      {allColumns.map((c) => (
+                        <SelectItem key={c} value={c} className="font-mono text-xs">{c}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input
+                    id="ds-rejected"
+                    value={rejected}
+                    onChange={(e) => setRejected(e.target.value)}
+                    placeholder="rejected"
+                    disabled={saving}
+                    className="font-mono text-xs"
+                  />
+                )}
+                <p className="text-[11px] text-muted-foreground">
+                  The dispreferred response. Chosen &amp; rejected should share the prompt turns.
+                </p>
+              </div>
+            )}
             {err && <p className="text-sm text-destructive">{err}</p>}
             <div className="flex items-center gap-2">
               <Button size="sm" onClick={save} disabled={saving}>

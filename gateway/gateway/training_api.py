@@ -362,13 +362,15 @@ async def _resolve_dataset_spec(dataset_id: str, hf_token_fallback: Optional[str
             "region": creds["region"], "endpoint": creds["endpoint"],
             "access_key": creds["access_key"], "secret_key": creds["secret_key"],
         }
-    if ds.kind == "llm_packed":
+    if ds.kind in ("llm_packed", "llm_dpo_packed"):
         # Pre-packed (chat multipack) ChiniDataset: s3_metadata_uri is the s3://
         # prefix of the shards (input_ids/labels/position_ids/attention_mask). The
         # LLM trainer downloads it → ./packed_data and runs gemma4.py directly.
+        # llm_dpo_packed = same columns, whole preference pairs per bin (chosen-first
+        # layout + pre-aligned targets) for training_type=dpo.
         pack = (ds.split_fields or {}).get("_llm_pack") or {}
         return {
-            "kind": "llm_packed",
+            "kind": ds.kind,
             "packed_uri": ds.s3_metadata_uri,
             "tokenizer": pack.get("tokenizer"),
             "sequence_length": pack.get("sequence_length"),
@@ -2844,6 +2846,13 @@ class CreateTrainingRunRequest(BaseModel):
     # needs a CUDA-13 host); False = FA3 wheel + dynamic_attention (SDPA-tiled, runs on
     # the standard cu12.x RunPod host). Ignored by minimax/mistral (always FA3).
     gemma_fa4: bool = True
+    # LLM-only training objective: "sft" (default — supervised finetune over a
+    # kind=llm_packed dataset) or "dpo" (Direct Preference Optimization over a
+    # kind=llm_dpo_packed preference-pair dataset; fused multipacked DPO loss, the
+    # frozen reference = base with LoRA disabled). DPO is wired for the qwen trainer
+    # only and is incompatible with context_parallel.
+    training_type: str = "sft"
+    dpo_beta: float = 0.1          # DPO temperature β on the log-ratio (training_type=dpo)
     # LLM-only (gemma4): which linear projections to apply LoRA to. Default is the
     # attention projections (q/k/v/o); add MLP/dense layers (gate_proj, up_proj,
     # down_proj) to adapt those too. LLM finetune is always LoRA. Unknown names are
@@ -3163,16 +3172,36 @@ async def create_training_run(
         # the trainer tokenizes with the base model's tokenizer; record it.
         body.tokenizer = body.base_model
     if body.task_type == "llm":
-        # LLM finetune consumes a pre-packed chat ChiniDataset (kind=llm_packed) —
-        # the trainer (gemma4.py / minimax_m2.py, chosen by base-model arch) reads
-        # the packed ids directly (no re-tokenization).
-        if ds.kind != "llm_packed":
+        # LLM finetune consumes a pre-packed chat ChiniDataset — kind=llm_packed for
+        # SFT, kind=llm_dpo_packed (preference pairs, chosen-first bins) for DPO. The
+        # trainer (gemma4.py / minimax_m2.py / qwen3_5.py, chosen by base-model arch)
+        # reads the packed ids directly (no re-tokenization).
+        _dpo = (body.training_type or "sft") == "dpo"
+        if body.training_type not in ("sft", "dpo"):
+            raise HTTPException(status_code=400, detail="training_type must be 'sft' or 'dpo'")
+        _want_kind = "llm_dpo_packed" if _dpo else "llm_packed"
+        if ds.kind != _want_kind:
             raise HTTPException(
                 status_code=400,
-                detail="LLM training needs a packed dataset (kind=llm_packed) — pack it first via 'Pack for LLM'",
+                detail=(f"{'DPO' if _dpo else 'LLM'} training needs a packed dataset (kind={_want_kind}) — "
+                        f"pack it first via 'Pack for LLM'{' with the DPO objective' if _dpo else ''}"),
             )
-        if tds is not None and tds.kind != "llm_packed":
-            raise HTTPException(status_code=400, detail="LLM test dataset must also be packed (kind=llm_packed)")
+        if tds is not None and tds.kind != _want_kind:
+            raise HTTPException(status_code=400, detail=f"LLM test dataset must also be packed (kind={_want_kind})")
+        if _dpo:
+            if _llm_arch(body.base_model) not in ("qwen", "gemma"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="DPO training is currently wired for qwen (Qwen3.5/3.6) and gemma-4 base models only",
+                )
+            if body.context_parallel:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DPO is incompatible with context parallelism — per-sequence log-probs "
+                           "would need cross-rank reduction; turn one of them off",
+                )
+            if not math.isfinite(body.dpo_beta) or body.dpo_beta <= 0:
+                raise HTTPException(status_code=400, detail=f"dpo_beta must be a positive number (got {body.dpo_beta!r})")
         _pm = (ds.split_fields or {}).get("_llm_pack") or {}
         if _pm.get("sequence_length"):
             body.block_size = int(_pm["sequence_length"])
@@ -3283,6 +3312,9 @@ async def create_training_run(
         "lora_r": body.lora_r,
         "lora_alpha_ratio": body.lora_alpha_ratio,
         "gemma_fa4": body.gemma_fa4,
+        # LLM objective: "sft" | "dpo" (+ β). llm_finetune routes on training_type.
+        "training_type": (body.training_type or "sft") if body.task_type == "llm" else "sft",
+        "dpo_beta": body.dpo_beta,
         "lora_alpha": body.lora_alpha, "lora_dropout": body.lora_dropout,
         "lora_target_modules": ([m for m in (body.lora_target_modules or [])
                                  if m in _LORA_TARGET_MODULES] or list(_LORA_TARGET_DEFAULT)),

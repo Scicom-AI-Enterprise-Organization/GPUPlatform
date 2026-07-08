@@ -310,6 +310,10 @@ export function TrainingForm() {
   // CP group size (GPUs that jointly shard ONE sequence). 0 = all run GPUs (dp=1). When < world,
   // data parallelism runs across the CP groups (dp_size = world / cp_size).
   const [cpSize, setCpSize] = useState(0);
+  // LLM-only training objective: SFT (kind=llm_packed) or DPO (kind=llm_dpo_packed
+  // preference pairs — qwen base models only, incompatible with context parallelism).
+  const [trainingType, setTrainingType] = useState<"sft" | "dpo">("sft");
+  const [dpoBeta, setDpoBeta] = useState(0.1);
   // training
   const [evalMetric, setEvalMetric] = useState<"wer" | "cer">("wer");
   const [normalizeText, setNormalizeText] = useState(true);
@@ -509,6 +513,8 @@ export function TrainingForm() {
         if (c.cpu_offload != null) setCpuOffload(!!c.cpu_offload);
         if (c.context_parallel != null) setContextParallel(!!c.context_parallel);
         if (c.cp_size != null) setCpSize(num(c.cp_size, 0));
+        if (c.training_type === "sft" || c.training_type === "dpo") setTrainingType(c.training_type);
+        if (c.dpo_beta != null) setDpoBeta(num(c.dpo_beta, 0.1));
         if (c.eval_metric === "wer" || c.eval_metric === "cer") setEvalMetric(c.eval_metric);
         if (c.normalize_text != null) setNormalizeText(!!c.normalize_text);
         if (c.max_epochs != null) setMaxEpochs(num(c.max_epochs, 3));
@@ -657,9 +663,14 @@ export function TrainingForm() {
   const hfSecretKeys = secrets.filter((s) => s.is_secret).map((s) => s.key);
   const isTts = taskType === "tts";
   const isLlm = taskType === "llm";
+  // DPO: qwen + gemma-4 trainers (the fused multipacked DPO loss is wired there); the
+  // packed dataset kind + the CP toggle follow it.
+  const dpoEligible = isLlm && (llmArch(baseModel) === "qwen" || llmArch(baseModel) === "gemma");
+  const isDpo = dpoEligible && trainingType === "dpo";
   // Context parallelism: gemma4 (zigzag ring) + qwen3.5/3.6 (GatedDeltaNet state relay + full-attn ring).
+  // Not with DPO — per-sequence log-probs would need cross-rank reduction.
   const isGemma = isLlm && llmArch(baseModel) === "gemma";
-  const cpEligible = isLlm && (llmArch(baseModel) === "gemma" || llmArch(baseModel) === "qwen");
+  const cpEligible = isLlm && !isDpo && (llmArch(baseModel) === "gemma" || llmArch(baseModel) === "qwen");
   // Effective GPU count for CP (world) = pinned devices if set, else the run's GPU bound. The CP
   // group size (cp_size) must divide it; dp_size = cpWorld / cp_size.
   const cpWorld = visibleDevices.trim()
@@ -674,8 +685,8 @@ export function TrainingForm() {
   const pickDatasets = isTts
     ? datasets.filter((d) => d.kind === (isOmnivoice(baseModel) ? "omnivoice_packed" : "tts_packed"))
     : isLlm
-      ? datasets.filter((d) => d.kind === "llm_packed")
-      : datasets.filter((d) => !["tts_packed", "omnivoice_packed", "llm_packed"].includes(d.kind));
+      ? datasets.filter((d) => d.kind === (isDpo ? "llm_dpo_packed" : "llm_packed"))
+      : datasets.filter((d) => !["tts_packed", "omnivoice_packed", "llm_packed", "llm_dpo_packed"].includes(d.kind));
 
   // Optimizer steps per epoch ≈ ceil(train_rows / (batch × grad_accum × world_size)).
   // world_size = #GPUs whenever DDP runs: TTS ALWAYS torchruns (nproc = #GPUs), ASR
@@ -735,6 +746,7 @@ export function TrainingForm() {
     setLoraR((r) => ([16, 256].includes(r) ? d.r : r));
     setLoraAlphaRatio((a) => ([1, 2].includes(a) ? d.ratio : a));
     setCpuOffload(llmCpuOffloadDefault(v));  // dense → offload on, FP8-MoE → off
+    if (llmArch(v) !== "qwen" && llmArch(v) !== "gemma") setTrainingType("sft");  // DPO: qwen + gemma only
   }
 
   function pickTask(t: "asr" | "tts" | "llm") {
@@ -907,6 +919,8 @@ export function TrainingForm() {
       // CP group size: only when CP is on; 0/all-GPUs → null (backend defaults to one group, dp=1).
       cp_size: cpEligible && gpuBound >= 2 && contextParallel && cpSize >= 2 && cpSize < cpWorld
         ? cpSize : null,
+      // LLM training objective (qwen-only DPO over kind=llm_dpo_packed pairs).
+      ...(isLlm ? { training_type: (isDpo ? "dpo" : "sft") as "sft" | "dpo", dpo_beta: dpoBeta } : {}),
       learning_rate: Number(learningRate) || (isTts ? 2e-5 : isLlm ? 5e-5 : 1e-5),
       weight_decay: weightDecay,
       warmup_steps: warmupSteps,
@@ -1076,8 +1090,28 @@ export function TrainingForm() {
           <FieldWrap label="Run name">
             <Input className="font-mono" value={name} onChange={(e) => setName(e.target.value)} />
           </FieldWrap>
+          {isLlm && (
+            <FieldWrap label="Training objective"
+              hint={isDpo
+                ? "Direct Preference Optimization: trains on chosen/rejected preference pairs (kind=llm_dpo_packed) with the fused multipacked DPO loss; the frozen reference is the base model itself (LoRA disabled) — no second model copy."
+                : dpoEligible
+                  ? "Supervised finetune (causal LM over a packed chat dataset). Switch to DPO to train on preference pairs."
+                  : "Supervised finetune. DPO is available for Qwen3.5/3.6 and Gemma-4 base models only."}>
+              <Select value={isDpo ? "dpo" : "sft"}
+                onValueChange={(v) => setTrainingType(v as "sft" | "dpo")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="sft">SFT — supervised finetune</SelectItem>
+                  <SelectItem value="dpo" disabled={!dpoEligible}>
+                    DPO — preference pairs{dpoEligible ? "" : " (qwen/gemma only)"}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </FieldWrap>
+          )}
           <FieldWrap label="Training dataset"
             hint={isTts ? "A NeuCodec-packed dataset (kind=tts_packed) from the Datasets page."
+              : isDpo ? "A packed preference-pair dataset (kind=llm_dpo_packed) from the Datasets page."
               : isLlm ? "A packed chat dataset (kind=llm_packed) from the Datasets page." : "From the Datasets page."}>
             <SearchableSelect
               value={datasetId}
@@ -1095,8 +1129,9 @@ export function TrainingForm() {
             />
             {(isTts || isLlm) && pickDatasets.length === 0 && (
               <p className="mt-1.5 text-[11px] text-muted-foreground">
-                {isTts ? "TTS" : "LLM"} trains on a packed dataset. Create one with{" "}
-                <span className="font-mono">{isTts ? "Pack for TTS" : "Pack for LLM"}</span> on a dataset&apos;s Transformation tab.
+                {isTts ? "TTS" : isDpo ? "DPO" : "LLM"} trains on a packed dataset. Create one with{" "}
+                <span className="font-mono">{isTts ? "Pack for TTS" : "Pack for LLM"}</span>
+                {isDpo ? " (objective: DPO)" : ""} on a dataset&apos;s Transformation tab.
               </p>
             )}
           </FieldWrap>
@@ -1581,6 +1616,13 @@ export function TrainingForm() {
                   className="h-4 w-4 accent-primary" />
                 <span className="font-medium">{cpuOffload ? "On" : "Off"}</span>
               </label>
+            </FieldWrap>
+          )}
+          {isDpo && !sweepOn && (
+            <FieldWrap label="DPO β (beta)"
+              hint="Temperature on the policy/reference log-ratio. Higher = stay closer to the reference; 0.1 is the common default.">
+              <Input className="font-mono" type="number" min={0.001} step={0.01} value={dpoBeta}
+                onChange={(e) => setDpoBeta(Math.max(0.001, Number(e.target.value) || 0.1))} />
             </FieldWrap>
           )}
           {cpEligible && !sweepOn && (

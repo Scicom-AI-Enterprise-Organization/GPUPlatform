@@ -234,6 +234,47 @@ epoch is only ~3–4 steps — set `max_epochs` high enough that `max_steps` is 
 H20s are 143GB each so big-model FSDP shards fit alongside small jobs. `--container/share` venvs are
 cached between runs (the per-arch venv + the HF model cache make re-runs fast).
 
+## DPO — Direct Preference Optimization (qwen + gemma-4), 2026-07-08
+
+`training_type="dpo"` (create-run) trains the **qwen or gemma-4** trainer on preference pairs with
+the **fused multipacked DPO loss** from
+`Scicom-AI-Enterprise-Organization/small-ablation/multipacking-dpo` (vendored: `triton_func.py` =
+the fused linear+log-prob Triton kernel, `triton_dpo.py` = `fused_dpo_loss` — logits NEVER
+materialized; forward keeps only the [T] logsumexp, backward recomputes logits chunk-by-chunk.
+4.2× lower peak than Liger's padded DPO; **re-sync from small-ablation**, its `__main__` blocks
+are GPU correctness gates). The qwen and gemma trainers share the **identical** `dpo_collator` +
+DPO-forward + `lora_disabled()` logic (byte-equal collators, verified) — keep them in sync; the
+only structural difference is qwen builds the custom class via `make_custom_cls(dpo_beta=...)`
+(two base classes) while gemma sets it on the single subclass via `model.enable_dpo(beta)`.
+
+- **Dataset**: `kind=llm_dpo_packed` — packed by 'Pack for LLM' with **objective=dpo**
+  (`llm_pack.pack_dpo_rows`). Sources: `chosen`/`rejected` columns as full message lists sharing
+  the prompt turns (ultrafeedback style) OR plain strings + a `prompt_field`. Same ChiniDataset
+  columns as llm_packed but: every bin holds WHOLE pairs, doc count is even, **first half of the
+  docs are the chosen responses** (pair k = (doc k, doc K+k)), and `labels` are **pre-aligned
+  next-token targets** (targets[j]=ids[j+1] on response positions, −100 on prompt + final; NO
+  shift at loss time). The prompt/response boundary comes from rendering the prompt with
+  `add_generation_prompt=True`; non-prefix-stable templates fall back to the longest common
+  prefix of the two renders (equivalent for DPO — shared-prefix log-probs cancel in the loss).
+- **Trainer** (`qwen/qwen3_5.py` or `gemma4.py`, `--dpo --dpo_beta β`): `dpo_collator` reorders
+  multi-bin batches chosen-first across the row; the **reference model is THIS model with LoRA
+  disabled** (`lora_disabled()` flips a module flag in `LinearLoRA.forward` — base frozen + B=0
+  init ⇒ ref == initial policy, no second model copy), one extra no-grad backbone pass per
+  microbatch. lm_head isn't LoRA-wrapped so one weight serves both sides. First loss ≈ **ln 2 =
+  0.693** (the policy==ref sanity). Logs `reward_acc`/`margin` after the loss (the `@@STEP` parser
+  keys on "step: N … loss: L" unchanged). Grad-accum weighting mirrors the SFT token-weighted
+  scheme with the **pair** as the unit (the DPO loss is a pair-mean — token-weighting would re-add
+  a length bias). `lora_meta.json` gets `objective: "dpo"` + `dpo_beta`.
+- **Constraints** (validated in create-run AND llm_finetune AND the trainer): qwen or gemma-4 arch;
+  **incompatible with context parallelism** (per-sequence log-prob sums would need cross-rank
+  reduction); qwen's `SGPU_MAX_SEQ_LEN` truncation is skipped under DPO (would cut pairs).
+- **Verified locally (CPU)**: pack invariants (real Qwen tokenizer, both source shapes, drop
+  paths), collator reorder/pairing over multi-bin batches, `dpo_loss_reference` on the packed
+  layout == a from-scratch per-pair computation (+ policy==ref → ln 2), and gemma's `dpo_collator`
+  byte-equal to qwen's. ⚠ NOT yet run on a GPU: the kernel gates (`python triton_func.py` /
+  `python triton_dpo.py` in the arch venv) and an end-to-end smoke train are owed on the box for
+  BOTH trainers (gemma runs the extra reference forward through the FA4 cute kernel).
+
 ## Context parallelism — zigzag ring attention (gemma-4 only), 2026-07-04
 
 `--cp_size N` (>1) shards ONE packed sequence across N GPUs (a CP group) and computes exact attention

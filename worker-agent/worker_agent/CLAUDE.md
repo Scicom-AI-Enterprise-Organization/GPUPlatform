@@ -44,6 +44,26 @@ reverse tunnel. Gotchas that each cost a debug cycle:
 - **`--enable-sleep-mode` is SKIPPED on Ascend** — vllm-ascend's CaMeM allocator
   (`aclrtMallocPhysical`) OOMs on hosts without hugepages (npu-smi shows `0/0`). So NPU fleet
   members stay resident: size fleets to fit; the sleep/wake eviction path can't run.
+- **Two more Ascend-only launch defaults** (`launch_member`, each skipped if the member's
+  `extra_args` already set it): **`--enforce-eager`** — vllm-ascend's graph-mode compile ("Using
+  OOT custom backend for compilation") **silently HANGS** at scale (verified: 30-min stall at
+  TP8/Qwen3-32B, 0% AICore, log frozen — tiny models compile fine, so it's size-dependent and
+  unpredictable); eager trades peak throughput for a launch that completes. And
+  **`--gpu-memory-utilization 0.8`** — a 910B3 has ~8 GiB baseline overhead so the vLLM default
+  0.9 (~54.9 GiB) exceeds free HBM (~52.8) and trips the startup memory check ("Free memory on
+  device … less than desired"), doubly so when it races residual HBM from a prior attempt.
+- **`HCCL_OP_EXPANSION_MODE=AIV` + `VLLM_ENGINE_READY_TIMEOUT_S=2400` env** (also Ascend defaults
+  in `launch_member`, operator env wins). **AIV is REQUIRED for multi-NPU TP>1**: the default
+  FFTS+ HCCL collective mode **silently DEADLOCKS** at model-load (verified: Qwen3-32B TP8 froze
+  at "Starting to load model", 0% AICore, until killed; vLLM's own log warns and recommends AIV).
+  With AIV, TP8 inits + serves. The raised engine-ready timeout covers slow multi-device eager
+  loads (vLLM's internal 600s default is separate from the worker health wait). ✅ **Qwen3-32B
+  TP8 across all 8 NPUs verified serving through the gateway** (~6 tok/s eager end-to-end incl.
+  jump+tunnel). TP=1 never needed any of this (no cross-card collective) — these only bite multi-card.
+- **Orphan cleanup on Ascend**: killed vLLM workers rename their comm to `VLLM::Worker_TP*` /
+  `VLLM::EngineCore` and hold HBM after a parent kill — `pkill -f vllm`/venv-path MISSES them.
+  `cleanup.py` (engine-pid-tracked) reaps them correctly; by hand, match `VLLM::` or the
+  `/dev/davinci*` fd holders. Don't kill `telescope` (TM's monitor) — it holds a device handle too.
 - **`vllm_install_args` is now MULTI-LINE** (each line = its own sequential `uv pip install`,
   each with its own leading NAME=VALUE env tokens) because vllm and vllm-ascend pin
   **conflicting torch versions** — one resolve is unsatisfiable, sequential installs work.

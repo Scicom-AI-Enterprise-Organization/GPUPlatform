@@ -98,10 +98,15 @@ async def start_llm_pack(
     storage_id: str,
     tools_field: Optional[str] = None,
     all_reasoning: bool = True,
+    objective: str = "sft",
+    chosen_field: str = "chosen",
+    rejected_field: str = "rejected",
+    prompt_field: Optional[str] = None,
 ) -> None:
     """Mark the dataset running and kick off the in-process chat→multipack job
-    (kind=llm → kind=llm_packed ChiniDataset on S3). CPU-only tokenization, so it
-    runs here (no GPU box) — the threadpool steps stay off the event loop.
+    (kind=llm → kind=llm_packed ChiniDataset on S3; objective=dpo packs
+    chosen/rejected preference pairs → kind=llm_dpo_packed). CPU-only tokenization,
+    so it runs here (no GPU box) — the threadpool steps stay off the event loop.
     `subsets` may name several subset/split labels — their rows are concatenated
     into one packed dataset; None/empty packs the first split."""
     async with session_factory()() as s:
@@ -110,12 +115,15 @@ async def start_llm_pack(
             return
         d.transform_status = "running"
         d.transform_log = _append_log(
-            None, f"LLM pack queued · subsets={', '.join(subsets) if subsets else '(first)'} "
+            None, f"LLM pack queued · objective={objective} "
+                  f"· subsets={', '.join(subsets) if subsets else '(first)'} "
                   f"· tokenizer={tokenizer} · seq_len {sequence_length}")
         await s.commit()
     task = asyncio.create_task(_run_llm_pack(
         dataset_id, subsets=subsets, tokenizer=tokenizer, sequence_length=sequence_length,
         storage_id=storage_id, tools_field=tools_field, all_reasoning=all_reasoning,
+        objective=objective, chosen_field=chosen_field, rejected_field=rejected_field,
+        prompt_field=prompt_field,
     ))
     _active[dataset_id] = task
     task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
@@ -554,10 +562,12 @@ async def _create_llm_packed_output(
     source_id: str, *, new_id: str, name: str, description: str, storage_id: str,
     s3_uri: str, num_rows: int, messages_field: str, tokenizer: str,
     sequence_length: int, subset: Optional[str], arch: Optional[str] = None,
+    objective: str = "sft",
 ) -> str:
     """Create the packed (chat multipack) dataset as a NEW row, leaving the source
     intact + re-runnable. `_llm_pack` metadata (in split_fields) mirrors tts_packed's
-    `_tts_pack` so the packed-row preview/decode + the trainer can read it. Returns id."""
+    `_tts_pack` so the packed-row preview/decode + the trainer can read it. Returns id.
+    objective=dpo → kind=llm_dpo_packed (preference-pair bins for training_type=dpo)."""
     async with session_factory()() as s:
         src = await s.get(Dataset, source_id)
         owner_id = src.owner_id if src else None
@@ -566,7 +576,7 @@ async def _create_llm_packed_output(
             owner_id=owner_id,
             name=name[:255],
             description=description[:2048],
-            kind="llm_packed",
+            kind="llm_dpo_packed" if objective == "dpo" else "llm_packed",
             format="chinidataset",  # multipacked chat layout (ChiniDataset parquet shards)
             storage_id=storage_id,
             s3_metadata_uri=s3_uri,
@@ -586,6 +596,7 @@ async def _create_llm_packed_output(
                 # Packing arch (gemma|minimax|generic) — drives the trainer choice
                 # and lets a run reject a base-model/dataset arch mismatch.
                 "arch": arch,
+                "objective": objective,
             }},
         )
         s.add(new)
@@ -640,6 +651,10 @@ async def _run_llm_pack(
     storage_id: str,
     tools_field: Optional[str],
     all_reasoning: bool,
+    objective: str = "sft",
+    chosen_field: str = "chosen",
+    rejected_field: str = "rejected",
+    prompt_field: Optional[str] = None,
 ) -> None:
     from fastapi.concurrency import run_in_threadpool
 
@@ -721,8 +736,12 @@ async def _run_llm_pack(
             await _log(dataset_id, "downloading source parquet …")
             paths = await run_in_threadpool(_download_parquet_urls, urls, token, work, progress)
 
-            # 3. Read messages (+ tools) columns → rows.
-            cols = [messages_field] + ([tools_field] if tools_field else [])
+            # 3. Read the objective's columns → rows (messages+tools for SFT;
+            #    chosen/rejected (+prompt) preference columns for DPO).
+            if objective == "dpo":
+                cols = [chosen_field, rejected_field] + ([prompt_field] if prompt_field else [])
+            else:
+                cols = [messages_field] + ([tools_field] if tools_field else [])
             rows = await run_in_threadpool(_read_split_columns, paths, cols)
         else:
             # S3-backed upload: read the uploaded chat file (json / jsonl / parquet)
@@ -742,29 +761,40 @@ async def _run_llm_pack(
                 return
             rows = await run_in_threadpool(
                 dataset_metadata.parse_rows_any, src_metadata_filename, body, 10 ** 9)
-            if rows and messages_field not in rows[0]:
-                await _finish(dataset_id, "failed",
-                              f"no column '{messages_field}' in {src_metadata_filename} — "
-                              f"check the messages column mapping")
-                return
-            # Some exports store the messages array as a JSON string — parse it back
-            # to a real list so pack_rows sees a conversation (matches the preview).
-            for r in rows:
-                v = r.get(messages_field)
-                if isinstance(v, str):
-                    try:
-                        parsed = json.loads(v)
-                        if isinstance(parsed, list):
-                            r[messages_field] = parsed
-                    except (json.JSONDecodeError, ValueError):
-                        pass
+            if objective == "dpo":
+                missing = [c for c in (chosen_field, rejected_field) if rows and c not in rows[0]]
+                if missing:
+                    await _finish(dataset_id, "failed",
+                                  f"no column(s) {missing} in {src_metadata_filename} — "
+                                  f"check the chosen/rejected column mapping")
+                    return
+                # (llm_pack.extract_pair_messages parses JSON-string cells itself.)
+            else:
+                if rows and messages_field not in rows[0]:
+                    await _finish(dataset_id, "failed",
+                                  f"no column '{messages_field}' in {src_metadata_filename} — "
+                                  f"check the messages column mapping")
+                    return
+                # Some exports store the messages array as a JSON string — parse it back
+                # to a real list so pack_rows sees a conversation (matches the preview).
+                for r in rows:
+                    v = r.get(messages_field)
+                    if isinstance(v, str):
+                        try:
+                            parsed = json.loads(v)
+                            if isinstance(parsed, list):
+                                r[messages_field] = parsed
+                        except (json.JSONDecodeError, ValueError):
+                            pass
             label = src_name
 
         if not rows:
+            _cols = f"'{chosen_field}'/'{rejected_field}'" if objective == "dpo" else f"'{messages_field}'"
             await _finish(dataset_id, "failed",
-                          f"no rows read for column '{messages_field}' — check the messages column mapping")
+                          f"no rows read for column(s) {_cols} — check the column mapping")
             return
-        await _log(dataset_id, f"read {len(rows)} rows; tokenizing + multipacking with {tokenizer} …")
+        await _log(dataset_id, f"read {len(rows)} rows; tokenizing + multipacking with {tokenizer} "
+                               f"(objective={objective}) …")
 
         # 4. Tokenize + bin-pack into a ChiniDataset (CPU; threadpool).
         out_dir = os.path.join(work, "packed")
@@ -772,26 +802,44 @@ async def _run_llm_pack(
         def _pack_progress(p: int, t: int) -> None:
             progress("pack", p, t)
 
-        stats = await run_in_threadpool(
-            llm_pack.pack_rows, rows,
-            tokenizer_name=tokenizer, out_dir=out_dir,
-            messages_field=messages_field, tools_field=(tools_field or ""),
-            max_seq_len=int(sequence_length), hf_token=token, hf_endpoint=hf_endpoint,
-            all_reasoning=all_reasoning, progress=_pack_progress,
-        )
+        if objective == "dpo":
+            stats = await run_in_threadpool(
+                llm_pack.pack_dpo_rows, rows,
+                tokenizer_name=tokenizer, out_dir=out_dir,
+                chosen_field=chosen_field, rejected_field=rejected_field,
+                prompt_field=prompt_field,
+                max_seq_len=int(sequence_length), hf_token=token, hf_endpoint=hf_endpoint,
+                all_reasoning=all_reasoning, progress=_pack_progress,
+            )
+        else:
+            stats = await run_in_threadpool(
+                llm_pack.pack_rows, rows,
+                tokenizer_name=tokenizer, out_dir=out_dir,
+                messages_field=messages_field, tools_field=(tools_field or ""),
+                max_seq_len=int(sequence_length), hf_token=token, hf_endpoint=hf_endpoint,
+                all_reasoning=all_reasoning, progress=_pack_progress,
+            )
         n_bins = int(stats.get("n_bins") or 0)
         if n_bins == 0:
             await _finish(dataset_id, "failed",
                           f"packed 0 bins (rows={stats.get('total_rows')}, dropped_long="
                           f"{stats.get('dropped_long')}, dropped_empty={stats.get('dropped_empty')}) "
-                          f"— is seq_len {sequence_length} too small for every conversation?")
+                          f"— is seq_len {sequence_length} too small for every "
+                          f"{'pair' if objective == 'dpo' else 'conversation'}?")
             return
-        await _log(
-            dataset_id,
-            f"packed {n_bins} bins from {stats.get('docs_packed')} docs "
-            f"(dropped {stats.get('dropped_long')} too-long, {stats.get('dropped_empty')} empty; "
-            f"{stats.get('rows_with_tools')} rows had tools; efficiency "
-            f"{stats.get('efficiency', 0) * 100:.1f}%); uploading shards …")
+        if objective == "dpo":
+            await _log(
+                dataset_id,
+                f"packed {n_bins} bins from {stats.get('pairs_packed')} preference pairs "
+                f"(dropped {stats.get('dropped_long')} too-long, {stats.get('dropped_empty')} bad rows; "
+                f"efficiency {stats.get('efficiency', 0) * 100:.1f}%); uploading shards …")
+        else:
+            await _log(
+                dataset_id,
+                f"packed {n_bins} bins from {stats.get('docs_packed')} docs "
+                f"(dropped {stats.get('dropped_long')} too-long, {stats.get('dropped_empty')} empty; "
+                f"{stats.get('rows_with_tools')} rows had tools; efficiency "
+                f"{stats.get('efficiency', 0) * 100:.1f}%); uploading shards …")
 
         # 5. Upload the ChiniDataset dir to S3, then register the packed dataset.
         # Mint the new dataset id up front so its S3 prefix matches its row id.
@@ -802,13 +850,15 @@ async def _run_llm_pack(
 
         created_id = await _create_llm_packed_output(
             dataset_id, new_id=new_id,
-            name=f"{src_name}-llm-packed",
-            description=(f"Chat multipack (seq_len {sequence_length}, tokenizer {tokenizer}, "
+            name=f"{src_name}-llm-{'dpo-' if objective == 'dpo' else ''}packed",
+            description=(f"{'DPO preference-pair' if objective == 'dpo' else 'Chat'} multipack "
+                         f"(seq_len {sequence_length}, tokenizer {tokenizer}, "
                          f"subset {label}, arch {stats.get('arch')}) of "
                          f"{src_repo or src_metadata_filename} → {n_bins} bins"),
             storage_id=storage_id, s3_uri=s3_uri, num_rows=n_bins,
             messages_field=messages_field, tokenizer=tokenizer,
             sequence_length=int(sequence_length), subset=label, arch=stats.get("arch"),
+            objective=objective,
         )
         await _finish(
             dataset_id, "done",
