@@ -2460,7 +2460,12 @@ class AggregatePoint(BaseModel):
 
 
 _AGG_CACHE: dict[str, tuple[float, list[AggregatePoint]]] = {}
-_AGG_TTL_S = 60.0
+_AGG_TTL_S = 600.0          # in-process freshness window (was 60s — expired constantly, forcing cold S3 rebuilds)
+_AGG_REDIS_TTL_S = 3600     # shared Redis copy lives longer: survives a gateway restart and backs a cold in-process cache
+_AGG_WARM_MARGIN_S = 90.0   # background warmer re-warms each key this long before its in-process entry goes stale
+# cache_key -> (show_all, owner_id). Populated by aggregate() on every request so the
+# background warmer knows exactly which cache entries to keep hot.
+_AGG_WARM: dict[str, tuple[bool, int | None]] = {}
 
 
 def _safe_num(d: dict, k: str) -> float | None:
@@ -2589,19 +2594,13 @@ async def compact_result_json(
     }
 
 
-@router.get("/_aggregate", response_model=list[AggregatePoint])
-async def aggregate(
-    scope: str = "mine",
-    user: User = Depends(require_section("benchmark")),
-    session: AsyncSession = Depends(get_session),
-):
-    show_all = user.is_admin and scope == "all"
-    cache_key = "admin-all" if show_all else f"u{user.id}"
-    now = time.time()
-    cached = _AGG_CACHE.get(cache_key)
-    if cached and cached[0] > now:
-        return cached[1]
-
+async def _build_aggregate(
+    session: AsyncSession, *, show_all: bool, owner_id: int | None
+) -> list[AggregatePoint]:
+    """Build the benchmark aggregate points by fanning out over each benchmark's S3
+    results. No caching and no request/user context, so both the HTTP endpoint and the
+    background warmer can call it. `show_all` mirrors admin + scope=all (every
+    benchmark); otherwise it's scoped to `owner_id`."""
     if show_all:
         rows = await session.execute(
             select(Benchmark).where(Benchmark.status.in_(["done", "running", "failed"]))
@@ -2609,7 +2608,7 @@ async def aggregate(
     else:
         rows = await session.execute(
             select(Benchmark)
-            .where(Benchmark.owner_id == user.id)
+            .where(Benchmark.owner_id == owner_id)
             .where(Benchmark.status.in_(["done", "running", "failed"]))
         )
     benches = list(rows.scalars().all())
@@ -2683,9 +2682,102 @@ async def aggregate(
         return [p for p in results if p is not None]
 
     nested = await asyncio.gather(*[fetch_one(b) for b in benches])
-    flat: list[AggregatePoint] = [p for sub in nested for p in sub]
-    _AGG_CACHE[cache_key] = (now + _AGG_TTL_S, flat)
-    return flat
+    return [p for sub in nested for p in sub]
+
+
+async def _get_or_build_aggregate(
+    session: AsyncSession,
+    redis,
+    cache_key: str,
+    *,
+    show_all: bool,
+    owner_id: int | None,
+    force: bool = False,
+) -> list[AggregatePoint]:
+    """Return aggregate points for `cache_key` using the in-process cache, then the
+    shared Redis copy (survives a gateway restart), then a fresh S3 build as a last
+    resort. `force` skips the read caches (used by the warmer and the client Refresh)."""
+    now = time.time()
+    if not force:
+        cached = _AGG_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+        # In-process cold/expired (e.g. right after a restart) — try the shared Redis
+        # copy before paying for a full S3 rebuild.
+        if redis is not None:
+            try:
+                raw = await redis.get(f"agg:{cache_key}")
+            except Exception:
+                raw = None
+            if raw:
+                try:
+                    pts = [AggregatePoint(**d) for d in json.loads(raw)]
+                    _AGG_CACHE[cache_key] = (now + _AGG_TTL_S, pts)
+                    return pts
+                except Exception:
+                    logger.warning("aggregate: unreadable redis cache for %s; rebuilding", cache_key)
+
+    pts = await _build_aggregate(session, show_all=show_all, owner_id=owner_id)
+    _AGG_CACHE[cache_key] = (time.time() + _AGG_TTL_S, pts)
+    if redis is not None:
+        try:
+            await redis.set(
+                f"agg:{cache_key}",
+                json.dumps([p.model_dump() for p in pts]),
+                ex=_AGG_REDIS_TTL_S,
+            )
+        except Exception:
+            logger.warning("aggregate: redis write failed for %s (non-fatal)", cache_key, exc_info=True)
+    return pts
+
+
+@router.get("/_aggregate", response_model=list[AggregatePoint])
+async def aggregate(
+    request: Request,
+    scope: str = "mine",
+    refresh: bool = False,
+    user: User = Depends(require_section("benchmark")),
+    session: AsyncSession = Depends(get_session),
+):
+    show_all = user.is_admin and scope == "all"
+    cache_key = "admin-all" if show_all else f"u{user.id}"
+    owner_id = None if show_all else user.id
+    # Register this key so the background warmer keeps its cache entry hot.
+    _AGG_WARM[cache_key] = (show_all, owner_id)
+    redis = getattr(request.app.state, "redis", None)
+    # refresh=1 (the calculator's Refresh button) rebuilds from S3 now instead of
+    # serving the cache — so a just-finished benchmark shows up immediately.
+    return await _get_or_build_aggregate(
+        session, redis, cache_key, show_all=show_all, owner_id=owner_id, force=refresh,
+    )
+
+
+async def aggregate_warmer_loop(session_maker, redis) -> None:
+    """Keep the _aggregate cache hot so no user ever waits on a cold S3 rebuild. Every
+    ~(_AGG_TTL_S - margin) it rebuilds each key that has actually been requested
+    (tracked in _AGG_WARM) and refreshes both the in-process cache and Redis. Read-only
+    w.r.t. the platform: reads benchmarks + S3, writes only the agg:* cache keys."""
+    interval = max(30.0, _AGG_TTL_S - _AGG_WARM_MARGIN_S)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            targets = list(_AGG_WARM.items())
+            if not targets:
+                continue
+            async with session_maker() as session:
+                for cache_key, (show_all, owner_id) in targets:
+                    try:
+                        await _get_or_build_aggregate(
+                            session, redis, cache_key,
+                            show_all=show_all, owner_id=owner_id, force=True,
+                        )
+                    except Exception:
+                        logger.warning("aggregate warmer: rebuild %s failed", cache_key, exc_info=True)
+            logger.info("aggregate warmer: refreshed %d cache key(s)", len(targets))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("aggregate warmer: loop iteration failed")
 
 
 @router.get("/{bench_id}", response_model=BenchmarkRecord)
