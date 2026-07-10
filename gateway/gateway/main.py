@@ -554,6 +554,11 @@ async def lifespan(app: FastAPI):
         app.state.bench_janitor_task = asyncio.create_task(
             bench_module.janitor_loop(app.state.redis)
         )
+        # Keep the /_aggregate cache hot (the GPU-calculator benchmark picker) so no
+        # user waits on a cold S3 rebuild; also persists it to Redis across restarts.
+        app.state.agg_warmer_task = asyncio.create_task(
+            bench_module.aggregate_warmer_loop(session_factory(), app.state.redis)
+        )
         logger.info("bench enabled (bucket=%s)", os.environ.get("BENCHMARK_S3_BUCKET"))
     if os.environ.get("RUNPOD_API_KEY", "").strip():
         # Compute uses the same RunPod creds; cleanup any rows the previous
