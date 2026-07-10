@@ -1590,7 +1590,8 @@ export type TestProxyUpstreamBody = {
   base_url: string;
   api_key_secret?: string | null;
   api_key?: string | null;
-  model?: string | null; // real upstream model to chat-test; omitted = probe /models
+  model?: string | null; // real upstream model to end-to-end test; omitted = probe /models
+  mode?: "chat" | "embedding"; // which endpoint to test (default chat)
 };
 
 export type TestProxyUpstreamResult = {
