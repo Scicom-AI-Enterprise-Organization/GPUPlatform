@@ -254,7 +254,7 @@ def resolve_provider(gw: Gateway, want: Optional[str]) -> Optional[str]:
 
 
 def dataset_signature(ds: dict, cutoff: Optional[str], status: str,
-                      min_chars: Any, exclude_regex: Any) -> dict:
+                      min_chars: Any, exclude_regex: Any, ref_id: Any = None) -> dict:
     sig = {
         "project_id": ds.get("project_id"),
         "cutoff": cutoff,
@@ -268,6 +268,8 @@ def dataset_signature(ds: dict, cutoff: Optional[str], status: str,
         sig["test_min_chars"] = int(min_chars)
     if exclude_regex:
         sig["test_exclude_regex"] = str(exclude_regex)
+    if ref_id:
+        sig["test_split_ref_dataset_id"] = str(ref_id)
     return sig
 
 
@@ -285,6 +287,15 @@ def ensure_dataset(
     status = (ds.get("label_status") or cfg.get("label_status") or "approved").strip()
     pct = ds.get("test_split_pct")
     cnt = ds.get("test_split_count")
+    # Reuse ANOTHER dataset's exact test set instead of carving a random one: the
+    # rows whose audio matches that dataset's `test` split become this dataset's
+    # test set, everything else train. Guarantees no train/test overlap when this
+    # dataset is a superset of the reference (e.g. a v2 import with a later cutoff).
+    # Value = a dataset id (an S3/exported dataset, or a label dataset resolved to
+    # its exported S3 twin). Mutually exclusive with pct/count.
+    ref_id = (ds.get("test_split_ref_dataset_id") or "").strip() or None
+    if ref_id and (pct not in (None, 0) or cnt not in (None, 0)):
+        die(f"[{name}] set test_split_ref_dataset_id OR test_split_pct/test_split_count, not both")
     # Min transcription length (chars) for a row to be eligible for the test split;
     # per-dataset value, else the config-level default. Keeps junk transcripts
     # ("[silent]", "[unintelligible]") out of eval. Only applies when there's a test split.
@@ -302,10 +313,14 @@ def ensure_dataset(
             _re.compile(exclude_regex)
         except _re.error as e:
             die(f"[{name}] test_exclude_regex is not a valid regex: {e}")
-    has_test = pct not in (None, 0) or cnt not in (None, 0)
+    has_test = bool(ref_id) or pct not in (None, 0) or cnt not in (None, 0)
+    # min_chars / exclude_regex are eligibility filters for the RANDOM split only —
+    # a reused test set is taken verbatim, so they don't apply in ref mode.
+    eligibility = has_test and not ref_id
     sig = dataset_signature(
         ds, cutoff, status,
-        min_chars if has_test else None, exclude_regex if has_test else None,
+        min_chars if eligibility else None, exclude_regex if eligibility else None,
+        ref_id=ref_id,
     )
 
     entry = state.data["datasets"].get(name) or {}
@@ -314,12 +329,13 @@ def ensure_dataset(
         return entry["transformed_id"]
 
     _notes = []
-    if has_test and min_chars:
+    if eligibility and min_chars:
         _notes.append(f"min {int(min_chars)} chars")
-    if has_test and exclude_regex:
+    if eligibility and exclude_regex:
         _notes.append(f"excl /{exclude_regex}/")
     _n = (", " + ", ".join(_notes)) if _notes else ""
     test_desc = (
+        f"reuse test set of {ref_id}" if ref_id else
         f"{pct}% test{_n}" if pct not in (None, 0) else
         f"{cnt} test rows{_n}" if cnt not in (None, 0) else "no test set"
     )
@@ -346,13 +362,15 @@ def ensure_dataset(
 
     # 2. transform to S3 with the requested test split
     body: dict[str, Any] = {"target": "s3", "storage_id": storage_id}
-    if pct not in (None, 0):
+    if ref_id:
+        body["test_split_ref_dataset_id"] = ref_id
+    elif pct not in (None, 0):
         body["test_split_pct"] = float(pct)
     elif cnt not in (None, 0):
         body["test_split_count"] = int(cnt)
-    if has_test and min_chars not in (None, 0):
+    if eligibility and min_chars not in (None, 0):
         body["test_min_chars"] = int(min_chars)
-    if has_test and exclude_regex:
+    if eligibility and exclude_regex:
         body["test_exclude_regex"] = exclude_regex
     gw.post(f"/v1/datasets/{label_id}/transform", body)
     log(f"[{name}] transform started; waiting…")
@@ -547,10 +565,12 @@ def main() -> None:
     # extra=ignore), which would quietly put junk transcripts back in the test set —
     # fail loudly instead of misbehaving silently.
     def _needed_fields(d: dict) -> set:
+        out: set = set()
+        if (d.get("test_split_ref_dataset_id") or "").strip():
+            out.add("test_split_ref_dataset_id")
         has_test = d.get("test_split_pct") not in (None, 0) or d.get("test_split_count") not in (None, 0)
         if not has_test:
-            return set()
-        out: set = set()
+            return out
         mc = d.get("test_min_chars")
         if (mc if mc is not None else cfg.get("test_min_chars")):
             out.add("test_min_chars")

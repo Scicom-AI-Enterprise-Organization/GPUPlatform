@@ -93,7 +93,8 @@ _TTS_EVAL_METHODS = {"cer", "mos", "similarity"}
 # LLM LoRA target linear projections the user may select (gemma4 trainer). The
 # attention q/k/v/o are the default; gate/up/down are the MLP/dense layers. gemma4.py
 # warns for any target that wraps no nn.Linear on the loaded arch.
-_LORA_TARGET_MODULES = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+_LORA_TARGET_MODULES = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+                        "in_proj", "out_proj"}  # in/out_proj = Nemotron-H Mamba2 mixer projections
 _LORA_TARGET_DEFAULT = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # Strong refs to in-flight runner tasks (else asyncio may GC them) + per-run
@@ -236,7 +237,7 @@ async def _resolve_global_env() -> dict:
 
 
 def _llm_arch(model_id: Optional[str]) -> str:
-    """gemma | minimax | mistral | qwen from an LLM base model id (mirrors
+    """gemma | minimax | mistral | qwen | nemotron from an LLM base model id (mirrors
     llm_finetune.detect_arch + llm_pack.detect_arch). Drives the per-arch venv +
     trainer choice. Unknown → gemma (the default LLM base) so the venv path is still
     well-formed; the trainer raises a clear error on a truly unsupported model."""
@@ -247,6 +248,8 @@ def _llm_arch(model_id: Optional[str]) -> str:
         return "mistral"
     if "qwen" in n:
         return "qwen"  # Qwen3.5/3.6 dense + MoE (auto-detected by the trainer from config)
+    if "nemotron" in n:
+        return "nemotron"  # NVIDIA Nemotron-H hybrid Mamba2/attention MoE (one-doc-per-bin pack)
     return "gemma"
 
 
@@ -2858,6 +2861,12 @@ class CreateTrainingRunRequest(BaseModel):
     # down_proj) to adapt those too. LLM finetune is always LoRA. Unknown names are
     # dropped; an empty result falls back to the q/k/v/o default.
     lora_target_modules: list[str] = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    # LLM-only (gemma4): also FULL-train the token embeddings + LM head (gemma-4 ties them,
+    # so this is one ~1.4B weight), not just LoRA. Helps the finetune reliably learn to emit
+    # special tokens (e.g. <|tool_call>) that attention-only LoRA can only nudge via hidden
+    # states. Costs extra optimizer state (gemma cpu_offload default is ON). Pairs well with
+    # adding the MLP (gate_proj,up_proj,down_proj) to lora_target_modules.
+    train_embeddings: bool = False
     # Freeze the encoder; train the decoder only (faster, less overfit on small data).
     freeze_encoder: bool = False
     # Multi-GPU strategy for a single (non-sweep) run: DDP via torchrun (one
@@ -3202,6 +3211,13 @@ async def create_training_run(
                 )
             if not math.isfinite(body.dpo_beta) or body.dpo_beta <= 0:
                 raise HTTPException(status_code=400, detail=f"dpo_beta must be a positive number (got {body.dpo_beta!r})")
+            if body.train_embeddings:
+                raise HTTPException(
+                    status_code=400,
+                    detail="train_embeddings is incompatible with DPO — the LoRA-disabled "
+                           "reference assumes the base weights (incl. embeddings/lm_head) stay "
+                           "frozen; training them makes the reference drift. Turn one off.",
+                )
         _pm = (ds.split_fields or {}).get("_llm_pack") or {}
         if _pm.get("sequence_length"):
             body.block_size = int(_pm["sequence_length"])
@@ -3210,7 +3226,7 @@ async def create_training_run(
         # pack arch (a gemma-packed dataset trained as minimax = garbage ids).
         _pack_arch = _pm.get("arch")
         _model_arch = _llm_arch(body.base_model)
-        if _pack_arch and _pack_arch in ("gemma", "minimax", "mistral", "qwen") and _pack_arch != _model_arch:
+        if _pack_arch and _pack_arch in ("gemma", "minimax", "mistral", "qwen", "nemotron") and _pack_arch != _model_arch:
             raise HTTPException(
                 status_code=400,
                 detail=(f"base model arch '{_model_arch}' ≠ dataset pack arch '{_pack_arch}'. "
@@ -3318,6 +3334,7 @@ async def create_training_run(
         "lora_alpha": body.lora_alpha, "lora_dropout": body.lora_dropout,
         "lora_target_modules": ([m for m in (body.lora_target_modules or [])
                                  if m in _LORA_TARGET_MODULES] or list(_LORA_TARGET_DEFAULT)),
+        "train_embeddings": bool(body.train_embeddings),  # gemma4: full-train embed+lm_head
         "freeze_encoder": body.freeze_encoder, "use_ddp": body.use_ddp,
         "logging_steps": body.logging_steps,
         "augment_techniques": [t for t in (body.augment_techniques or []) if t in _AUG_TECHNIQUES],

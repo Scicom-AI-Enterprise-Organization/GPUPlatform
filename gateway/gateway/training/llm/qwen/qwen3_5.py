@@ -423,12 +423,19 @@ def main(
         cp_size:int = 1,
         dpo:bool = False,
         dpo_beta:float = 0.1,
+        train_embeddings:bool = False,
     ):
     if dpo and cp_size > 1:
         # per-sequence log-prob sums (and the pairing) live on whole sequences; a CP
         # shard only sees a chunk — would need a cross-rank logprob reduction + coeff
         # broadcast that isn't wired. Reject up front instead of training garbage.
         raise RuntimeError("--dpo is incompatible with --cp_size > 1 (context parallelism)")
+    if dpo and train_embeddings:
+        # The DPO reference = THIS model with LoRA disabled, only the frozen INITIAL policy
+        # if the base stays frozen. Training embed_tokens/lm_head (the reference shares the
+        # head) makes the reference drift with the policy → a wrong DPO objective.
+        raise RuntimeError("--train_embeddings is incompatible with --dpo (the LoRA-disabled "
+                           "reference assumes the base weights stay frozen)")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     # Pin this process to its GPU BEFORE init'ing NCCL / the device mesh, otherwise every
@@ -469,6 +476,12 @@ def main(
     for param in model.parameters():
         param.requires_grad = False
     apply_linear_lora(model, r=r, alpha=alpha)
+
+    # Optionally FULL-train the token embeddings + LM head on top of LoRA. Qwen3.6-27B is
+    # UNTIED (embed_tokens + lm_head are two weights, both unfrozen); smaller/tied qwens get
+    # one weight. Done BEFORE FSDP sharding / CP replication. See tc.unfreeze_embeddings.
+    if train_embeddings:
+        tc.unfreeze_embeddings(model, rank=rank, logger=logger)
 
     total_trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     logger.info(f"Total trainable parameters: {total_trainable_params/(1024*1024):.2f}M")
@@ -732,6 +745,7 @@ def main(
                             "r": r, "alpha": alpha, "scaling": alpha / r,
                             "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
                             "wrapped_attr": "linear",
+                            "train_embeddings": train_embeddings,
                             "objective": "dpo" if dpo else "sft",
                             **({"dpo_beta": dpo_beta} if dpo else {}),
                         }, f, indent=2)
@@ -807,6 +821,13 @@ if __name__ == "__main__":
         "--dpo_beta", type=float, default=0.1,
         help="DPO temperature β on the policy/reference log-ratio (only with --dpo).",
     )
+    parser.add_argument(
+        "--train_embeddings", action="store_true",
+        help="Also FULL-train the token embeddings + LM head (Qwen3.6-27B is untied → both "
+             "weights), not just LoRA. Helps the finetune reliably emit special tokens that "
+             "attention-only LoRA can only nudge. Costs extra optimizer state — combine with "
+             "--cpu_offload. Incompatible with --dpo.",
+    )
     args = parser.parse_args()
     main(
         args.rank,
@@ -828,4 +849,5 @@ if __name__ == "__main__":
         args.cp_size,
         args.dpo,
         args.dpo_beta,
+        args.train_embeddings,
     )

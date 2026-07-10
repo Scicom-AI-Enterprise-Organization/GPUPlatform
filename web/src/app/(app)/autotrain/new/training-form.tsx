@@ -98,27 +98,31 @@ const LLM_BASE_MODELS = [
   "Qwen/Qwen3.6-35B-A3B",
   "MiniMaxAI/MiniMax-M2.7",
   "mistralai/Mistral-Small-4-119B-2603",
+  "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
 ];
 const DEFAULT_LLM_BASE = "google/gemma-4-31B-it";
 // LLM base-model arch (mirrors the gateway's _llm_arch / detect_arch). Drives the
 // per-arch venv + LoRA defaults.
-function llmArch(model: string): "gemma" | "qwen" | "minimax" | "mistral" {
+function llmArch(model: string): "gemma" | "qwen" | "minimax" | "mistral" | "nemotron" {
   const n = model.toLowerCase();
   if (n.includes("minimax")) return "minimax";
   if (n.includes("mistral")) return "mistral";
   if (n.includes("qwen")) return "qwen";
+  if (n.includes("nemotron")) return "nemotron";
   return "gemma";
 }
 // Per-arch LoRA defaults. Dense archs (gemma, qwen): r=256 scaling 2.0. The FP8-MoE
 // archs (minimax, mistral): r=16 scaling 1.0 — 100s of experts × dozens of layers
-// make the MoE LoRA huge (see their CLAUDE.md).
+// make the MoE LoRA huge (see their CLAUDE.md). Nemotron-H (hybrid Mamba/attn MoE):
+// r=32 scaling 2.0 — LoRA wraps only the attn/mamba linears (the MoE experts stay frozen).
 function llmLoraDefaults(model: string): { r: number; ratio: number } {
   const a = llmArch(model);
+  if (a === "nemotron") return { r: 32, ratio: 2 };
   return a === "gemma" || a === "qwen" ? { r: 256, ratio: 2 } : { r: 16, ratio: 1 };
 }
 // FSDP CPU-offload default per arch (matches the gateway's _cpu_offload_on): the dense
 // gemma/qwen trainers hit the VRAM wall at long context → offload ON; the FP8-MoE
-// minimax/mistral fit without it and offload only slows them → OFF.
+// minimax/mistral + nemotron (MoE bulk frozen) fit sharded without it → OFF.
 function llmCpuOffloadDefault(model: string): boolean {
   const a = llmArch(model);
   return a === "gemma" || a === "qwen";
@@ -133,12 +137,12 @@ function llmVenvFor(model: string): string {
 const KNOWN_VENVS = [
   "/share/autotrain-whisper", "/share/autotrain-tts", "/share/autotrain-omnivoice", "/share/autotrain-llm",
   "/share/autotrain-llm-gemma", "/share/autotrain-llm-gemma4", "/share/autotrain-llm-qwen",
-  "/share/autotrain-llm-minimax", "/share/autotrain-llm-mistral",
+  "/share/autotrain-llm-minimax", "/share/autotrain-llm-mistral", "/share/autotrain-llm-nemotron",
 ];
 // LLM LoRA target linear projections. q/k/v/o (attention) are the default; the MLP
 // group (gate/up/down) is opt-in. gemma4 warns at train time for any target that
 // wraps no nn.Linear on the loaded arch.
-const LLM_LORA_TARGETS: { id: string; label: string; group: "attn" | "mlp" }[] = [
+const LLM_LORA_TARGETS: { id: string; label: string; group: "attn" | "mlp" | "mamba" }[] = [
   { id: "q_proj", label: "q_proj", group: "attn" },
   { id: "k_proj", label: "k_proj", group: "attn" },
   { id: "v_proj", label: "v_proj", group: "attn" },
@@ -146,6 +150,10 @@ const LLM_LORA_TARGETS: { id: string; label: string; group: "attn" | "mlp" }[] =
   { id: "gate_proj", label: "gate_proj", group: "mlp" },
   { id: "up_proj", label: "up_proj", group: "mlp" },
   { id: "down_proj", label: "down_proj", group: "mlp" },
+  // Nemotron-H Mamba2 mixer projections (attention layers are sparse in the hybrid pattern,
+  // so adapting these matters). No-op on non-Mamba archs (warned + skipped at train time).
+  { id: "in_proj", label: "in_proj", group: "mamba" },
+  { id: "out_proj", label: "out_proj", group: "mamba" },
 ];
 const CUSTOM = "__custom__";
 const AUTO_SPLIT = "__auto__";
@@ -347,6 +355,10 @@ export function TrainingForm() {
   // LLM-only (gemma4): which linear projections to LoRA. Default = attention q/k/v/o;
   // user can add MLP/dense layers. LLM finetune is always LoRA.
   const [loraTargets, setLoraTargets] = useState<string[]>(["q_proj", "k_proj", "v_proj", "o_proj"]);
+  // LLM gemma4-only: also FULL-train the token embeddings + LM head (gemma ties them → one
+  // ~1.4B weight) on top of LoRA. Helps the model reliably emit special tokens (e.g. tool
+  // calls) that attention-only LoRA can only nudge. Costs extra optimizer state.
+  const [trainEmbeddings, setTrainEmbeddings] = useState(false);
   const [freezeEncoder, setFreezeEncoder] = useState(false);
   // Multi-GPU single run: DDP (torchrun) vs DataParallel.
   const [useDdp, setUseDdp] = useState(true);
@@ -536,6 +548,7 @@ export function TrainingForm() {
         if (c.lora_dropout != null) setLoraDropout(num(c.lora_dropout, 0.05));
         if (Array.isArray(c.lora_target_modules) && c.lora_target_modules.length)
           setLoraTargets(c.lora_target_modules as string[]);
+        if (c.train_embeddings != null) setTrainEmbeddings(!!c.train_embeddings);
         if (c.freeze_encoder != null) setFreezeEncoder(!!c.freeze_encoder);
         if (c.use_ddp != null) setUseDdp(!!c.use_ddp);
         if (c.precision) setPrecision(str(c.precision));
@@ -681,12 +694,16 @@ export function TrainingForm() {
     .filter((d) => cpWorld % d === 0);
   const MODELS = isTts ? TTS_BASE_MODELS : isLlm ? LLM_BASE_MODELS : WHISPER_MODELS;
   // TTS/LLM train directly on a pre-packed ChiniDataset (tts_packed / llm_packed);
-  // ASR uses raw audio sources — never a packed dataset.
+  // ASR uses raw audio sources — never a packed dataset. ASR trains only on
+  // datasets exported to S3 (kind=s3: an S3 metadata file the trainer streams
+  // audio from) — NOT live label/hf pulls; and it needs {audio, transcription},
+  // so still exclude any S3 dataset flagged as chat (messages_field) or
+  // preference/DPO (rejected_field).
   const pickDatasets = isTts
     ? datasets.filter((d) => d.kind === (isOmnivoice(baseModel) ? "omnivoice_packed" : "tts_packed"))
     : isLlm
       ? datasets.filter((d) => d.kind === (isDpo ? "llm_dpo_packed" : "llm_packed"))
-      : datasets.filter((d) => !["tts_packed", "omnivoice_packed", "llm_packed", "llm_dpo_packed"].includes(d.kind));
+      : datasets.filter((d) => d.kind === "s3" && !d.messages_field && !d.rejected_field);
 
   // Optimizer steps per epoch ≈ ceil(train_rows / (batch × grad_accum × world_size)).
   // world_size = #GPUs whenever DDP runs: TTS ALWAYS torchruns (nproc = #GPUs), ASR
@@ -931,6 +948,9 @@ export function TrainingForm() {
       lora_alpha_ratio: loraAlphaRatio,
       lora_dropout: loraDropout,
       lora_target_modules: loraTargets,
+      // All LLM archs: full-train embed_tokens + lm_head on top of LoRA. Incompatible with DPO
+      // (its LoRA-disabled reference needs frozen base weights) → forced off there.
+      train_embeddings: isLlm && !isDpo ? trainEmbeddings : false,
       freeze_encoder: freezeEncoder,
       use_ddp: useDdp,
       logging_steps: loggingSteps,
@@ -1019,7 +1039,7 @@ export function TrainingForm() {
           {isTts
             ? "Finetune a Qwen3 + NeuCodec TTS model on a dataset. Audio is tokenized + packed, then trained as a causal LM. Eval loss runs on the held-out test split per epoch or every N steps; CER / MOS / speaker-similarity score generated audio at the end."
             : isLlm
-              ? "Finetune an LLM (Gemma-4, Qwen3.6, MiniMax-M2 or Mistral-Small-4 — auto-detected from the base model) on a packed chat dataset (kind=llm_packed) with FSDP2 LoRA. The pre-tokenized bins train directly as a causal LM; loss is logged per step."
+              ? "Finetune an LLM (Gemma-4, Qwen3.6, MiniMax-M2, Mistral-Small-4 or Nemotron-H — auto-detected from the base model) on a packed chat dataset (kind=llm_packed) with FSDP2 LoRA. The pre-tokenized bins train directly as a causal LM; loss is logged per step."
               : "Finetune a Whisper model on a dataset. WER + CER are evaluated on a held-out split — per epoch or every N steps — and training stops at the epoch / max-step cap or early on patience."}
         </p>
         {fromId && (
@@ -1071,7 +1091,7 @@ export function TrainingForm() {
         description={isTts
           ? "The base Qwen3 model + the {audio, transcription} dataset to finetune on."
           : isLlm
-            ? "The base LLM (Gemma-4, Qwen3.6, MiniMax-M2 or Mistral-Small-4) + the packed chat dataset (kind=llm_packed) to finetune on."
+            ? "The base LLM (Gemma-4, Qwen3.6, MiniMax-M2, Mistral-Small-4 or Nemotron-H) + the packed chat dataset (kind=llm_packed) to finetune on."
             : "The base Whisper checkpoint and the dataset to finetune on."}>
         <Grid>
           <FieldWrap label={isTts ? "Base TTS model" : isLlm ? "Base LLM model" : "Base Whisper model"}>
@@ -1083,7 +1103,7 @@ export function TrainingForm() {
               </SelectContent>
             </Select>
             {modelChoice === CUSTOM && (
-              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-…, MiniMaxAI/MiniMax-M2.7, mistralai/Mistral-Small-4-…" : "org/whisper-variant"}
+              <Input className="mt-2 font-mono" placeholder={isTts ? "Scicom-intl/Multilingual-…-TTS" : isLlm ? "google/gemma-4-…, MiniMaxAI/MiniMax-M2.7, mistralai/Mistral-Small-4-…, nvidia/NVIDIA-Nemotron-3-…" : "org/whisper-variant"}
                 value={customModel} onChange={(e) => setCustomModel(e.target.value)} />
             )}
           </FieldWrap>
@@ -1444,7 +1464,9 @@ export function TrainingForm() {
                   ? "Gemma-4 FSDP2 LoRA hyperparameters (loss-only; no eval). Effective batch = batch × grad-accum × GPUs (batch concatenates that many packed bins into one sequence). Recommended: lr 5e-5, 2–3 epochs, r 256."
                   : llmArch(baseModel) === "qwen"
                     ? "Qwen3.6 FSDP2 LoRA hyperparameters (dense 27B / MoE 35B-A3B; loss-only, no eval). Effective batch = batch × grad-accum × GPUs. Recommended: lr 5e-5, 2–3 epochs, r 256."
-                    : `${llmArch(baseModel) === "mistral" ? "Mistral-Small-4" : "MiniMax-M2"} FSDP2 LoRA hyperparameters (FP8 MoE, on-the-fly dequant LoRA; loss-only, no eval). Effective batch = batch × grad-accum × GPUs; keep batch small (each bin is a full sequence). Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large).`)
+                    : llmArch(baseModel) === "nemotron"
+                      ? "Nemotron-H FSDP2 LoRA hyperparameters (hybrid Mamba2/attention MoE; loss-only, no eval). One document per bin — batch pads that many docs per microbatch (not concatenated). LoRA targets attention q/k/v/o + Mamba in/out_proj (the MoE experts stay frozen). Recommended: lr 5e-5, 2–3 epochs, r 32."
+                      : `${llmArch(baseModel) === "mistral" ? "Mistral-Small-4" : "MiniMax-M2"} FSDP2 LoRA hyperparameters (FP8 MoE, on-the-fly dequant LoRA; loss-only, no eval). Effective batch = batch × grad-accum × GPUs; keep batch small (each bin is a full sequence). Recommended: lr 1e-5–5e-5, 1–3 epochs, r 16 (the MoE LoRA is large).`)
               : "Epochs, early stopping, and core hyperparameters.")}>
         <div className="mb-5 grid max-w-xl grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-2">
           {taskType === "asr" && (
@@ -1787,6 +1809,26 @@ export function TrainingForm() {
                   No modules selected — the server will fall back to the q/k/v/o default.
                 </p>
               )}
+            </div>
+          )}
+          {/* All LLM archs (SFT): full-train the token embeddings + LM head on top of LoRA.
+              Hidden for DPO — its LoRA-disabled reference needs the base weights frozen. */}
+          {isLlm && !isDpo && (
+            <div className="space-y-1.5 border-t border-border pt-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" className="h-4 w-4 accent-primary"
+                  checked={trainEmbeddings} onChange={(e) => setTrainEmbeddings(e.target.checked)} />
+                <span className="font-medium">Train embed tokens + LM head</span>
+                <span className="rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground">LLM</span>
+              </label>
+              <p className="text-xs text-muted-foreground">
+                Also full-train the token embeddings and LM head on top of LoRA — helps the finetune
+                reliably emit special tokens (e.g. <span className="font-mono">&lt;|tool_call&gt;</span>)
+                that attention-only LoRA can only nudge. gemma-4 ties them into one{" "}
+                <span className="font-mono">~1.4B</span> weight; qwen/minimax/mistral train embeddings and
+                head separately. Costs extra optimizer state (CPU offload is on by default). Pairs well with
+                adding the MLP <span className="font-mono">gate/up/down_proj</span> above.
+              </p>
             </div>
           )}
         </div>

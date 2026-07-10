@@ -28,7 +28,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Optional
 import posixpath
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -142,6 +142,13 @@ class TransformRequest(BaseModel):
     # test split (kept in train). E.g. r"^\s*\[.*\]\s*$" drops bracketed placeholder
     # tags like "[silent]" / "[unintelligible]". None/blank = no exclusion.
     test_exclude_regex: Optional[str] = None
+    # Reuse ANOTHER dataset's exact test set instead of carving a random one: the
+    # rows whose audio matches that dataset's `test` split become `test` here, and
+    # everything else becomes `train`. Guarantees no train/test overlap when this
+    # dataset is a superset of the reference. Mutually exclusive with pct/count. The
+    # reference may be an S3/exported dataset (its `split` column) or a label dataset
+    # (resolved to its exported S3 twin).
+    test_split_ref_dataset_id: Optional[str] = None
 
 
 class TtsPackRequest(BaseModel):
@@ -2184,6 +2191,18 @@ async def preview_dataset(
                     _hf_preview_rows, d.hf_repo, tok, limit, offset, (sel[0] if sel else None),
                     d.hf_revision,
                 )
+            # Self-heal the column mapping from the repo's ACTUAL columns, exactly as
+            # the s3/upload branch below does. A fresh kind=hf audio dataset defaults
+            # to audio/transcription, which rarely match the repo (e.g. this one is
+            # filename_audio/text/speaker) — so the row browser rendered every row as
+            # empty text + "no audio" until the user hand-mapped columns. detect_fields
+            # only fills nulls / repairs a mapping that points at no real column; it
+            # never clobbers a valid user choice. Chat sources (messages_field) skip it
+            # — they have no audio/transcription columns to detect.
+            if not mf and raw:
+                if _stamp_detected_fields(d, list(raw[0].keys()), None, None):
+                    await session.commit()
+                    af, tf = d.audio_field, d.transcription_field
             # Honour the per-split transcription mapping (e.g. test→after), per row in
             # the merged case (each row carries its own `__split`).
             sfmap = d.split_fields or {}
@@ -2703,6 +2722,84 @@ async def sync_to_hf(
     return _to_record(d, owner.username if owner else "", storage.name)
 
 
+def _audio_stem(v) -> Optional[str]:
+    """Basename (without extension) of an audio ref/URL — the stable identity a
+    materialised clip keeps across exports (label clips → `task-<uuid>`), used to
+    match a reused test set. Handles presigned URLs (strips scheme/query) and bare
+    paths."""
+    s = str(v or "").strip()
+    if not s:
+        return None
+    path = urlparse(s).path if "://" in s else s
+    base = os.path.basename(unquote(path))
+    return os.path.splitext(base)[0] or None
+
+
+def _read_test_stems(key: str, target, mdname: str, audio_col: str) -> set[str]:
+    """Read a materialised dataset's metadata file from S3 and return the audio
+    basename stems of its `test`-split rows. Runs in a threadpool (blocking I/O)."""
+    body = bench.s3_get_bytes(key, target)
+    if body is None:
+        return set()
+    out: set[str] = set()
+    for r in dataset_metadata.parse_rows_any(mdname, body, 10**9):
+        if str(r.get("split") or "").strip() != "test":
+            continue
+        st = _audio_stem(r.get(audio_col) if audio_col in r else r.get("audio"))
+        if st:
+            out.add(st)
+    return out
+
+
+async def _ref_test_stems(session: AsyncSession, ref_id: str, requester: User) -> set[str]:
+    """Resolve the set of audio-basename stems in `ref_id`'s test split, to reuse
+    as this transform's test set. A label dataset keeps its split only in its
+    materialised S3 twin, so follow `audio_dataset_id`. Raises HTTPException with a
+    clear message when the reference can't provide a test split."""
+    ref = await session.get(Dataset, ref_id)
+    if ref is None or (ref.owner_id != requester.id and not requester.is_admin):
+        raise HTTPException(status_code=404, detail=f"reference dataset {ref_id} not found")
+    if ref.kind == "label":
+        if not ref.audio_dataset_id:
+            raise HTTPException(
+                status_code=400,
+                detail="reference label dataset has no exported S3 dataset — run its transform with a test split first, then reuse it",
+            )
+        twin = await session.get(Dataset, ref.audio_dataset_id)
+        if twin is None:
+            raise HTTPException(status_code=400, detail="reference dataset's exported S3 twin is missing")
+        ref = twin
+    if ref.kind not in ("s3", "upload"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"reference dataset kind={ref.kind} has no readable test split — pick an S3/exported or label dataset",
+        )
+    if not ref.storage_id:
+        raise HTTPException(status_code=400, detail="reference dataset has no storage attached")
+    storage = await _load_storage(session, ref.storage_id)
+    target, _base = _s3_target_and_prefix(storage)
+    if ref.kind == "s3":
+        if not ref.s3_metadata_uri:
+            raise HTTPException(status_code=400, detail="reference dataset has no s3_metadata_uri")
+        u = urlparse(ref.s3_metadata_uri)
+        t = dataclasses.replace(target, bucket=u.netloc) if u.scheme == "s3" else target
+        key = u.path.lstrip("/") if u.scheme == "s3" else ref.s3_metadata_uri
+        mdname = os.path.basename(key)
+    else:  # upload
+        if not ref.metadata_filename:
+            raise HTTPException(status_code=400, detail="reference dataset has no uploaded metadata")
+        t = target
+        key = _metadata_key(storage, ref.id, ref.metadata_filename)
+        mdname = ref.metadata_filename
+    stems = await _run_sync(_read_test_stems, key, t, mdname, ref.audio_field or "audio")
+    if not stems:
+        raise HTTPException(
+            status_code=400,
+            detail=f"reference dataset '{ref.name}' has no `test` split rows to reuse",
+        )
+    return stems
+
+
 @router.post("/{dataset_id}/transform", response_model=DatasetRecord)
 async def transform_dataset(
     dataset_id: str,
@@ -2746,6 +2843,18 @@ async def transform_dataset(
         except _re.error as e:
             raise HTTPException(status_code=400, detail=f"test_exclude_regex is not a valid regex: {e}")
 
+    # Reuse another dataset's exact test set (resolved now so a bad reference errors
+    # synchronously, before the background job starts). Mutually exclusive with a
+    # random pct/count split.
+    ref_keys: Optional[list[str]] = None
+    ref_id = (req.test_split_ref_dataset_id or "").strip() or None
+    if ref_id:
+        if req.test_split_pct is not None or req.test_split_count is not None:
+            raise HTTPException(status_code=400, detail="reuse a test split from a dataset OR carve a random one, not both")
+        if ref_id == dataset_id:
+            raise HTTPException(status_code=400, detail="reference dataset must differ from this dataset")
+        ref_keys = sorted(await _ref_test_stems(session, ref_id, user))
+
     from . import dataset_transform
     await dataset_transform.start_transform(
         dataset_id, req.target, (req.hf_repo or "").strip() or None, req.storage_id,
@@ -2753,6 +2862,7 @@ async def transform_dataset(
         test_split_pct=req.test_split_pct, test_split_count=req.test_split_count,
         test_min_chars=req.test_min_chars,
         test_exclude_regex=(req.test_exclude_regex or "").strip() or None,
+        test_split_ref_keys=ref_keys,
     )
     await audit_module.record(user, "dataset.transform", "dataset", dataset_id, d.name, details={"target": req.target})
     await session.refresh(d)

@@ -71,6 +71,7 @@ async def start_transform(
     test_split_count: Optional[int] = None,
     test_min_chars: Optional[int] = None,
     test_exclude_regex: Optional[str] = None,
+    test_split_ref_keys: Optional[list[str]] = None,
 ) -> None:
     """Mark the dataset running and kick off the background job."""
     async with session_factory()() as s:
@@ -84,6 +85,7 @@ async def start_transform(
         dataset_id, target, hf_repo, storage_id, s3_folder,
         test_split_pct=test_split_pct, test_split_count=test_split_count,
         test_min_chars=test_min_chars, test_exclude_regex=test_exclude_regex,
+        test_split_ref_keys=test_split_ref_keys,
     ))
     _active[dataset_id] = task
     task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
@@ -229,6 +231,7 @@ async def _run(
     test_split_count: Optional[int] = None,
     test_min_chars: Optional[int] = None,
     test_exclude_regex: Optional[str] = None,
+    test_split_ref_keys: Optional[list[str]] = None,
 ) -> None:
     from fastapi.concurrency import run_in_threadpool
     from sqlalchemy import select
@@ -310,7 +313,18 @@ async def _run(
         await _log(dataset_id, f"matched {len(pairs)} rows to audio; building output …")
 
         # Optional held-out test split: reassign each row's split to train/test.
-        if test_split_pct is not None or test_split_count is not None:
+        if test_split_ref_keys is not None:
+            # Reuse another dataset's EXACT test set (matched by audio basename) so
+            # this dataset's train can't overlap the reference's test — the case
+            # where this dataset is a superset of the reference.
+            keyset = set(test_split_ref_keys)
+            pairs, n_test = _apply_test_split_from_keys(pairs, keyset)
+            await _log(
+                dataset_id,
+                f"test split (reuse reference) → {n_test} test / {len(pairs) - n_test} train rows "
+                f"· matched {n_test}/{len(keyset)} reference test clips",
+            )
+        elif test_split_pct is not None or test_split_count is not None:
             pairs, n_test = _apply_test_split(
                 pairs, test_split_pct, test_split_count,
                 min_chars=int(test_min_chars or 0), exclude_regex=(test_exclude_regex or None),
@@ -1500,6 +1514,39 @@ def _apply_test_split(
         ("test" if i in test_idx else "train", path, text, extra)
         for i, (_split, path, text, extra) in enumerate(pairs)
     ], k
+
+
+def _pair_stem(src) -> str:
+    """The audio-basename stem a clip carries across exports — the join key for
+    reusing another dataset's test set. `src` is either a local/absolute path or
+    an ("s3cp", bucket, key, dest_basename) copy-marker; both resolve to the same
+    dest basename `_materialise_s3` would write (label clips → `task-<uuid>`).
+    Extension-stripped so a re-export as a different container still matches."""
+    if isinstance(src, tuple) and src and src[0] == "s3cp":
+        base = src[3]
+    else:
+        base = os.path.basename(src)
+    return os.path.splitext(base)[0]
+
+
+def _apply_test_split_from_keys(
+    pairs: list[tuple[str, str, str, dict]],
+    test_keys: set[str],
+) -> tuple[list[tuple[str, str, str, dict]], int]:
+    """Reassign each pair's split to `test`/`train` by MATCHING its audio-basename
+    stem against `test_keys` (another dataset's exact test set), instead of drawing
+    a random subset. A clip keeps its basename across exports, so this reproduces
+    the reference test set exactly; and because every non-matching row goes to
+    `train`, it guarantees no train/test overlap when the current dataset is a
+    superset of the reference. Returns (pairs, n_test)."""
+    out: list[tuple[str, str, str, dict]] = []
+    n_test = 0
+    for _split, src, text, extra in pairs:
+        is_test = _pair_stem(src) in test_keys
+        if is_test:
+            n_test += 1
+        out.append(("test" if is_test else "train", src, text, extra))
+    return out, n_test
 
 
 def _push_hf(pairs: list[tuple[str, str, str, dict]], transcription_field: str, out_repo: str, token: Optional[str]) -> None:

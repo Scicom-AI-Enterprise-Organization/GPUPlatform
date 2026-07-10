@@ -582,6 +582,9 @@ export type CreateTrainingRunRequest = {
   // LLM-only (gemma4): which linear projections get LoRA. Default q/k/v/o; can add
   // MLP/dense layers (gate_proj, up_proj, down_proj). LLM finetune is always LoRA.
   lora_target_modules?: string[];
+  // LLM-only (gemma4): also full-train embed_tokens + lm_head (tied → one ~1.4B weight)
+  // on top of LoRA — helps the model reliably emit special tokens (e.g. tool calls).
+  train_embeddings?: boolean;
   // Freeze the encoder; train the decoder only.
   freeze_encoder?: boolean;
   // Multi-GPU single run: DDP via torchrun (default) vs DataParallel.
@@ -1062,6 +1065,7 @@ export type TransformDatasetRequest = {
   test_split_count?: number | null; // hold out this many rows as a `test` split (overrides pct)
   test_min_chars?: number | null; // min transcription length (chars) to be eligible for the test split; short/junk transcripts stay in train
   test_exclude_regex?: string | null; // regex; transcripts matching it (re.search) are excluded from the test split (kept in train)
+  test_split_ref_dataset_id?: string | null; // reuse this dataset's exact test set (matched by audio); mutually exclusive with pct/count
 };
 
 // NeuCodec-encode + multipack a {audio, transcription} dataset into a packed

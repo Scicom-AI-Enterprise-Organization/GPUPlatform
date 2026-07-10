@@ -9,6 +9,7 @@ import type { CatalogRecord, DatasetRecord, PageResponse } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { DatasetsList } from "./datasets-list";
+import { PurgeEmptyButton } from "./purge-empty-button";
 import { PushHint } from "@/components/catalog/push-hint";
 
 const PAGE_SIZE = 12;
@@ -123,6 +124,7 @@ export default async function DatasetsPage({
                     Merge label datasets
                   </Link>
                 </Button>
+                <PurgeEmptyButton scope={scope} />
                 <Button asChild size="sm">
                   <Link href="/datasets/new">
                     <Plus className="h-4 w-4" />

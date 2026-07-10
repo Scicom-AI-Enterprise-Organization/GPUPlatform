@@ -59,6 +59,42 @@ def add_common_args(parser, *, lr_default: float = 1e-4, wandb_project: str = "a
     parser.add_argument("--wandb_project", default=wandb_project, help="wandb project name.")
 
 
+def unfreeze_embeddings(model, *, rank: int = 0, logger=None) -> int:
+    """FULL-train the token embeddings + LM head on top of LoRA (the `--train_embeddings`
+    flag), shared by every LLM trainer. Attention-only LoRA can only nudge the output
+    distribution via hidden states, so teaching a model to reliably emit a specific special
+    token (e.g. gemma's `<|tool_call>`) is far easier when the head/embeddings themselves
+    adapt. The loss already projects hidden states through `self.lm_head.weight` (Liger FLCE
+    returns its gradient), so unfreezing that tensor trains it from BOTH the input-embed
+    lookup and the output projection.
+
+    Handles TIED heads (gemma-4, small qwen — `tie_word_embeddings=True` → ONE weight) and
+    UNTIED heads (minimax/mistral, larger qwen — two separate weights). Call AFTER LoRA is
+    applied + the base frozen, and BEFORE FSDP sharding (root `fully_shard` then shards the
+    now-trainable weight; requires_grad survives to_empty/broadcast on the meta-init path).
+    Returns the #params unfrozen. The checkpoint save (every `requires_grad` param via
+    `full_tensor()`) then captures the whole weight, and the arch's merge loads/folds it back.
+    """
+    in_emb = model.get_input_embeddings()
+    out_emb = model.get_output_embeddings()
+    in_w = getattr(in_emb, "weight", None)
+    out_w = getattr(out_emb, "weight", None)
+    n = 0
+    if in_w is not None:
+        in_w.requires_grad_(True)
+        n += in_w.numel()
+    tied = in_w is not None and out_w is not None and out_w is in_w
+    if out_w is not None and not tied:
+        out_w.requires_grad_(True)
+        n += out_w.numel()
+    if logger is not None and rank == 0:
+        which = ("embeddings + lm_head (tied, one weight)" if tied
+                 else "embeddings + lm_head" if out_w is not None else "embeddings")
+        logger.info(f"[train_embeddings] unfroze {which} — {n/1e6:.1f}M params "
+                    f"full-trained alongside LoRA")
+    return n
+
+
 def fsdp_kwargs(mesh, *, param_dtype, cpu_offload: bool) -> dict:
     """The FSDP2 `fully_shard` kwargs shared by every trainer: the mixed-precision
     policy (param_dtype=bf16 for dense; None for FP8 MoE so the fp8 weights are NOT

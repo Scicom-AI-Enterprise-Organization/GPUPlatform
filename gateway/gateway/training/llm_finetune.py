@@ -74,6 +74,11 @@ def _fa_mode(arch: str, cfg: dict) -> str:
     package at model load (no prebuilt FA3 wheel)."""
     if arch == "qwen":
         return "kernels"
+    if arch == "nemotron":
+        # Hybrid Mamba2/attention: attention runs sdpa (no prebuilt wheel) and the Mamba
+        # layers use transformers' torch SSD fallback (use_mamba_kernels=False) → no attn
+        # wheel, no mamba-ssm/causal-conv1d build. 'none' skips the FA install entirely.
+        return "none"
     if arch == "gemma":
         return "fa4" if cfg.get("gemma_fa4", True) else "fa3"
     return "fa3"
@@ -150,6 +155,36 @@ _ARCH = {
         "torchvision": "0.25.0",
         "deps": ["transformers==5.12.1", "kernels<=0.14.0"],
     },
+    "nemotron": {
+        # NVIDIA Nemotron-H (Nemotron-3-Nano-30B-A3B) — HYBRID Mamba2 + attention MoE, bf16.
+        # ONE decoder class (NemotronHBlock; mixer = mamba | attention | moe | mlp). LoRA wraps
+        # the attention q/k/v/o + Mamba in_proj/out_proj (nn.Linear); the MoE experts are 3D
+        # nn.Parameter → left frozen (like minimax/mistral's default before their expert LoRA).
+        "trainer": os.path.join("nemotron", "nemotron_h.py"),
+        # No cheap CPU pre-flight — the smoke run is the gate (like qwen). The trainer's own
+        # LinearLoRA(B=0) init + Liger loss are shared/tested; the Mamba torch SSD path is stock.
+        "preflight": None,
+        "preflight_cwd": os.path.join(LLM_DIR, "nemotron"),
+        "preflight_env": {},
+        "model_env": "MODEL_ID",
+        "default_model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        # torch 2.10 + cu13 (same verified base as qwen — no FA3-wheel ABI needed; attention
+        # uses sdpa). transformers 5.12.1 ships nemotron_h incl. the MoE NemotronHMoE/Experts
+        # (5.5.0 predates the MoE variant). kernels<=0.14.0 matches the 5.12.1 import contract.
+        "torch": "2.10.0",
+        "torchvision": "0.25.0",
+        # sentencepiece: the Nemotron tokenizer needs it (fast-tokenizer conversion) at
+        # merge/serve time — without it AutoTokenizer.from_pretrained raises.
+        # einops: the hub mamba-ssm kernel imports it (fetch succeeds, import fails without).
+        "deps": ["transformers==5.12.1", "kernels<=0.14.0", "sentencepiece", "einops"],
+        # Fast path (both hub-fetched by `kernels` at model load, no build): FA3 for the 6
+        # attention layers (head_dim 128 GQA; sdpa + a padding mask materializes an O(S^2)
+        # causal mask at long context) + the fused Mamba2 Triton kernels (mamba-ssm /
+        # causal-conv1d; the torch SSD fallback is THE long-context memory+speed hog across
+        # the 23 mamba layers). Opt out: NEMOTRON_ATTN=sdpa / NEMOTRON_MAMBA_KERNELS=0.
+        "run_env": {"NEMOTRON_ATTN": "kernels-community/flash-attn3",
+                    "NEMOTRON_MAMBA_KERNELS": "1"},
+    },
 }
 
 
@@ -172,11 +207,14 @@ def detect_arch(model_id: str) -> str:
         # Qwen3.5 / Qwen3.6 (dense + MoE) — the trainer auto-detects dense vs MoE from
         # the config, so one arch entry serves Qwen/Qwen3.6-27B and Qwen/Qwen3.6-35B-A3B.
         return "qwen"
+    if "nemotron" in n:
+        # NVIDIA Nemotron-H (hybrid Mamba2/attention MoE) — one trainer, one-doc-per-bin pack.
+        return "nemotron"
     if "gemma" in n:
         return "gemma"
     raise RuntimeError(
         f"unsupported LLM base model '{model_id}' — task_type=llm supports gemma-4, "
-        f"minimax-m2, mistral-small and qwen3.5/3.6 models (the trainer is chosen by name)")
+        f"minimax-m2, mistral-small, qwen3.5/3.6 and nemotron models (the trainer is chosen by name)")
 
 
 def _venv_path(cfg: dict, arch: str) -> str:
@@ -415,6 +453,10 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
         attn_import = "flash_attn.cute"
     elif fa == "kernels":
         attn_import = "flash_qla, causal_conv1d, boto3"
+    elif fa == "none":
+        # nemotron: no prebuilt attn wheel (sdpa + torch Mamba). Verify the base stack + boto3
+        # (a reused venv may carry training deps but not the orchestrator's S3 client).
+        attn_import = "boto3"
     else:
         attn_import = "flash_attn_interface"
 
@@ -497,6 +539,8 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
         _install_fa4(cfg, py, env, _pip)
     elif fa == "kernels":
         _install_qwen_kernels(py, env, _pip)  # FlashQLA + causal_conv1d (torch already in place)
+    elif fa == "none":
+        pass  # nemotron: sdpa attention + torch Mamba SSD fallback — no attention wheel to build
     else:
         _install_fa3_wheel(cu, venv, _pip)
     _pip(*pkgs)
@@ -632,6 +676,12 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     # create-run validates that; the trainer also refuses --dpo + --cp_size > 1.
     if (cfg.get("training_type") or "sft") == "dpo":
         cmd += ["--dpo", "--dpo_beta", str(float(cfg.get("dpo_beta") or 0.1))]
+    # Full-train token embeddings + LM head (gemma ties them → one ~1.4B weight), not just
+    # LoRA — helps the finetune reliably emit special tokens (e.g. <|tool_call>) that
+    # attention-only LoRA can only nudge. The form sets cfg["train_embeddings"]; it costs
+    # extra optimizer state (gemma's cpu_offload default is already ON).
+    if cfg.get("train_embeddings"):
+        cmd.append("--train_embeddings")
     # Context parallelism (zigzag ring, gemma-only): shard each packed sequence across a CP group.
     # cfg["cp_size"] (GPUs per group) defaults to ALL run GPUs (one group, dp=1); when set it must
     # divide nproc (dp_size = nproc / cp_size). Needs >=2 GPUs. The form sets cfg["context_parallel"].
@@ -675,12 +725,48 @@ def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     # create-run validates that; the trainer also refuses --dpo + --cp_size > 1.
     if (cfg.get("training_type") or "sft") == "dpo":
         cmd += ["--dpo", "--dpo_beta", str(float(cfg.get("dpo_beta") or 0.1))]
+    # Full-train token embeddings + LM head (Qwen3.6-27B is untied → both weights) on top of
+    # LoRA — helps the finetune reliably emit special tokens. The form sets cfg["train_embeddings"].
+    if cfg.get("train_embeddings"):
+        cmd.append("--train_embeddings")
     # Context parallelism: shard ONE packed sequence across ALL run GPUs (one CP group, dp=1) — the
     # GatedDeltaNet hybrid relays its recurrent+conv state and rings the full-attn KV. Needs >=2 GPUs;
     # ignored otherwise. The form sets cfg["context_parallel"]. (Same knob as gemma's _gemma_cmd.)
     # cfg["cp_size"] (GPUs per group) defaults to all run GPUs (dp=1); when set it must divide nproc.
     if cfg.get("context_parallel") and nproc >= 2:
         cmd += ["--cp_size", str(_cp_size(cfg, nproc))]
+    return cmd
+
+
+def _nemotron_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
+    """Nemotron-H trainer CLI (nemotron/nemotron_h.py). Like gemma/qwen it reads ./packed_data
+    (one-doc-per-bin — the padding collator, NOT the concatenating one) and writes
+    ./checkpointing; the model comes via MODEL_ID. LoRA wraps attention q/k/v/o + Mamba
+    in_proj/out_proj (nn.Linear); the MoE experts (3D nn.Parameter) stay frozen. No DPO, no CP."""
+    r, alpha = _lora_dims(cfg)
+    if not cfg.get("lora_r"):
+        r, alpha = 32, 64  # nemotron default — small: only the attn/mamba linears (+ optional embeds)
+    # Default targets: attention + Mamba projections (attention layers are SPARSE in the hybrid
+    # pattern, so q/k/v/o alone barely adapts the model — include the Mamba in_proj/out_proj).
+    targets = [str(t) for t in (cfg.get("lora_target_modules") or []) if str(t).strip()] \
+        or ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj", "out_proj"]
+    cmd = [
+        py, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
+        os.path.join(LLM_DIR, _ARCH["nemotron"]["trainer"]),
+        "--lora_r", str(r), "--alpha", str(alpha),
+        "--target_modules", ",".join(targets),
+        "--batch_size", str(int(cfg.get("batch_size") or 1)),  # docs padded per microbatch (not concatenated)
+        "--grad_accum", str(int(cfg.get("grad_accum") or 1)),
+        "--lr", str(float(cfg.get("learning_rate") or 5e-5)),
+        "--max_epochs", str(int(cfg.get("max_epochs") or 3)),
+        "--max_steps", str(int(cfg.get("max_steps") or 0)),
+        "--checkpointing_step", str(int(cfg.get("save_steps") or cfg.get("logging_steps") or 100)),
+    ]
+    if _cpu_offload_on(cfg, False):  # 30B bf16 base, MoE bulk frozen → fits sharded w/o offload
+        cmd.append("--cpu_offload")
+    # Full-train token embeddings + LM head (untied → both) on top of LoRA — see the shared flag.
+    if cfg.get("train_embeddings"):
+        cmd.append("--train_embeddings")
     return cmd
 
 
@@ -711,6 +797,10 @@ def _moe_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str, arch: str) 
     # (that has no MLP entry and would wrongly disable MoE on every run).
     if cfg.get("no_moe_lora"):
         cmd.append("--no_moe_lora")
+    # Full-train the (bf16) token embeddings + LM head on top of LoRA (minimax/mistral are
+    # untied → both weights) — helps the finetune reliably emit special tokens. Form-set.
+    if cfg.get("train_embeddings"):
+        cmd.append("--train_embeddings")
     if _cpu_offload_on(cfg, False):  # MoE default: offload OFF (fits without it; faster)
         cmd.append("--cpu_offload")
     return cmd
@@ -847,6 +937,8 @@ def run(cfg: dict) -> None:
         cmd = _gemma_cmd(py, cfg, nproc)
     elif arch == "qwen":
         cmd = _qwen_cmd(py, cfg, nproc)  # reads ./packed_data, writes ./checkpointing (like gemma)
+    elif arch == "nemotron":
+        cmd = _nemotron_cmd(py, cfg, nproc)  # one-doc-per-bin pack, padding collator
     else:  # minimax + mistral share the FP8-MoE CLI
         cmd = _moe_cmd(py, cfg, nproc, packed, ckpt_dir, arch)
     # Unique torchrun rendezvous port per run so two runs on one box don't collide on

@@ -81,7 +81,7 @@ _REASONING_GUARDS: dict[str, tuple[str, str]] = {
 
 def detect_arch(tokenizer_name: Optional[str]) -> str:
     """Map a tokenizer/model id to a packing arch: 'gemma' | 'minimax' | 'mistral' |
-    'qwen' | 'generic'. Drives the reasoning relaxation + per-turn message
+    'qwen' | 'nemotron' | 'generic'. Drives the reasoning relaxation + per-turn message
     normalization. Keep in sync with llm_finetune.detect_arch + training_api._llm_arch."""
     n = (tokenizer_name or "").lower()
     if "minimax" in n:
@@ -90,6 +90,8 @@ def detect_arch(tokenizer_name: Optional[str]) -> str:
         return "mistral"
     if "qwen" in n:
         return "qwen"
+    if "nemotron" in n:
+        return "nemotron"
     if "gemma" in n:
         return "gemma"
     return "generic"
@@ -116,24 +118,91 @@ def _import_parquet_writer():
     return ParquetWriter
 
 
+# --- assistant-only label masking (gemma-4) -----------------------------------
+# The gemma-4 chat template ships NO `{% generation %}` block, so
+# `apply_chat_template(return_assistant_tokens_mask=True)` returns an all-zero mask
+# and tokenize_row falls back to `labels = input_ids` — i.e. the finetune trains on
+# the WHOLE packed sequence: the system tool-DECLARATIONS, the user turns, AND the
+# (environment) tool-response blocks, not just the assistant's own output. Training
+# on the tool declarations is what taught earlier finetunes to regurgitate them.
+# We surgically wrap ONLY the model-generated spans (reasoning channel, tool_calls,
+# text content, and the model turn-end delimiter) in `{% generation %}` so the mask
+# marks assistant-only tokens. The tool-response forward-scan (env output) and the
+# `<|turn>model` opener stay OUTSIDE the blocks. Each replacement is a surgical
+# substring swap; the `{% generation %}` tags emit no text and are abutted against
+# whitespace-trimmed neighbours, so the RENDERED text is byte-identical to stock
+# (verified against google/gemma-4-31B-it: same token ids, mask covers exactly the
+# assistant spans). `\n` below matches the literal backslash-n in the jinja string
+# literals. If any anchor is missing (template changed upstream) we log + skip
+# rather than raise, so packing still works (falls back to full-sequence labels).
+_GEMMA_GENERATION_REPS: list[tuple[str, str]] = [
+    # (A) reasoning / thinking channel
+    ("{{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}",
+     "{% generation %}{{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}{% endgeneration %}"),
+    # (B) tool_calls block (open at the `if`, close before the prev_message_type set)
+    ("{%- if message['tool_calls'] -%}",
+     "{%- if message['tool_calls'] -%}{% generation %}"),
+    ("{%- set ns.prev_message_type = 'tool_call' -%}",
+     "{% endgeneration %}{%- set ns.prev_message_type = 'tool_call' -%}"),
+    # (C) captured text content — only for model turns (user/system content stays unmasked)
+    ("{{- captured_content -}}",
+     "{%- if role == 'model' -%}{% generation %}{{- captured_content -}}{% endgeneration %}"
+     "{%- else -%}{{- captured_content -}}{%- endif -%}"),
+    # (D) model turn-end delimiter (the elif branch fires for user/system too → gate on role)
+    ("{%- elif not (ns_tr_out.flag and not has_content) -%}\n            {{- '<turn|>\\n' -}}",
+     "{%- elif not (ns_tr_out.flag and not has_content) -%}\n            "
+     "{%- if role == 'model' -%}{% generation %}{{- '<turn|>\\n' -}}{% endgeneration %}"
+     "{%- else -%}{{- '<turn|>\\n' -}}{%- endif -%}"),
+]
+
+
+def _add_gemma_generation_mask(template: str) -> str:
+    """Wrap the gemma-4 model-generated spans in `{% generation %}` (see above).
+    Non-fatal: if an anchor is absent, log + return the template unchanged so the
+    packer degrades to the old full-sequence behaviour instead of crashing."""
+    out = template
+    for old, new in _GEMMA_GENERATION_REPS:
+        if old not in out:
+            logger.warning("llm_pack: gemma generation-mask anchor not found "
+                           "(template changed upstream?) — assistant-only masking "
+                           "DISABLED, training on the full sequence. Missing: %r", old)
+            return template
+        out = out.replace(old, new, 1)
+    return out
+
+
 def build_chat_template(tokenizer, all_reasoning: bool, arch: str = "generic") -> Optional[str]:
-    """Return the chat-template string to render with (stock, or arch-specific
-    reasoning relaxed). Non-fatal: an unrecognised template falls back to stock."""
-    stock = getattr(tokenizer, "chat_template", None)
-    if not all_reasoning or not stock:
-        return stock
-    # Prefer this arch's guard; otherwise try any known guard (the arch detection
-    # is a name heuristic — a custom finetune name might not match).
-    candidates = []
-    if arch in _REASONING_GUARDS:
-        candidates.append(_REASONING_GUARDS[arch])
-    candidates += [g for a, g in _REASONING_GUARDS.items() if a != arch]
-    for stock_guard, relaxed in candidates:
-        if stock_guard in stock:
-            return stock.replace(stock_guard, relaxed)
-    logger.info("llm_pack: all_reasoning requested but no known reasoning guard "
-                "matched the chat template (arch=%s) — using the stock template.", arch)
-    return stock
+    """Return the chat-template string to render with. Two orthogonal transforms:
+    (1) `all_reasoning` relaxes the arch's reasoning guard so EVERY assistant turn's
+    reasoning is trained (surgical substring swap); (2) gemma gets `{% generation %}`
+    blocks injected so `return_assistant_tokens_mask` yields real assistant-only
+    labels. Non-fatal: an unrecognised template falls back to stock (unchanged)."""
+    tpl = getattr(tokenizer, "chat_template", None)
+    if not tpl:
+        return tpl
+    if all_reasoning:
+        # Prefer this arch's guard; otherwise try any known guard (the arch detection
+        # is a name heuristic — a custom finetune name might not match).
+        candidates = []
+        if arch in _REASONING_GUARDS:
+            candidates.append(_REASONING_GUARDS[arch])
+        candidates += [g for a, g in _REASONING_GUARDS.items() if a != arch]
+        relaxed = None
+        for stock_guard, replacement in candidates:
+            if stock_guard in tpl:
+                relaxed = tpl.replace(stock_guard, replacement)
+                break
+        if relaxed is None:
+            logger.info("llm_pack: all_reasoning requested but no known reasoning guard "
+                        "matched the chat template (arch=%s) — using the stock template.", arch)
+        else:
+            tpl = relaxed
+    # Assistant-only label masking (gemma-4 only — the one shipped template lacking
+    # {% generation %}; other archs' templates already carry it). Applied whether or
+    # not reasoning was relaxed.
+    if arch == "gemma":
+        tpl = _add_gemma_generation_mask(tpl)
+    return tpl
 
 
 def _normalize_minimax_turn(turn: dict) -> dict:
@@ -248,6 +317,41 @@ def _normalize_mistral_turn(turn: dict, all_reasoning: bool) -> dict:
     return turn
 
 
+def _normalize_nemotron_turn(turn: dict) -> dict:
+    """NVIDIA Nemotron-H (Nemotron-3-Nano) template quirks — mirrors qwen's:
+    - The template renders `<think>` from `message.reasoning_content` (the dataset stores
+      per-turn `reasoning`) → map it on assistant turns.
+    - It iterates `tool_call.arguments | items`, so `arguments` MUST be a plain dict, never a
+      JSON string — parse it (LOUD crash otherwise → row dropped). Wrap a bare GLM
+      `{name, arguments}` call into the OpenAI `{type:function, function:{…}}` shape."""
+    turn = dict(turn)
+    if turn.get("content") is None:
+        turn["content"] = ""
+    if turn.get("role") in ("assistant", "model") and turn.get("reasoning") and not turn.get("reasoning_content"):
+        turn["reasoning_content"] = turn["reasoning"]
+    tcs = turn.get("tool_calls")
+    if isinstance(tcs, (list, tuple)):
+        norm = []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            tc = dict(tc)
+            fn = dict(tc["function"]) if isinstance(tc.get("function"), dict) else {
+                "name": tc.get("name"), "arguments": tc.get("arguments", {})}
+            a = fn.get("arguments")
+            if isinstance(a, str):
+                try:
+                    fn["arguments"] = json.loads(a)
+                except (json.JSONDecodeError, ValueError):
+                    fn["arguments"] = {}
+            elif a is None:
+                fn["arguments"] = {}
+            tc["function"] = fn
+            norm.append(tc)
+        turn["tool_calls"] = norm
+    return turn
+
+
 def _normalize_gemma_turn(turn: dict) -> dict:
     """Gemma-4 template quirks: it reads `tool_call['function']['name']` and renders
     `function['arguments']` in its NATIVE `key:<|"|>value<|"|>` form ONLY when arguments
@@ -306,6 +410,8 @@ def extract_messages(value: Any, arch: str = "generic", all_reasoning: bool = Tr
             out.append(_normalize_mistral_turn(turn, all_reasoning))
         elif arch == "qwen":
             out.append(_normalize_qwen_turn(turn))
+        elif arch == "nemotron":
+            out.append(_normalize_nemotron_turn(turn))
         elif arch == "gemma":
             out.append(_normalize_gemma_turn(turn))
         else:
@@ -344,15 +450,15 @@ def extract_tools(value: Any) -> list:
 
 
 def tokenize_row(tokenizer, messages, tools=None, chat_template=None, reasoning_effort=None,
-                 preserve_thinking=False):
+                 preserve_thinking=False, truncate_history_thinking=None):
     """Render + tokenize one conversation; return (input_ids, labels, used_mask).
 
     Prefers assistant-only labels via `return_assistant_tokens_mask=True`; falls
     back to `labels = input_ids` when the template lacks `{% generation %}` (mask
     all-zero) or the kwarg is unsupported. `reasoning_effort` (mistral) is passed
     to the template only when set. `preserve_thinking` (qwen3.6) makes the template
-    render EVERY assistant turn's `<think>` block (templates that don't reference the
-    variable ignore it)."""
+    render EVERY assistant turn's `<think>` block. `truncate_history_thinking` (nemotron)
+    False keeps every assistant turn's `<think>` (templates ignore unknown kwargs)."""
     kw: dict[str, Any] = {}
     if tools:
         kw["tools"] = tools
@@ -360,6 +466,8 @@ def tokenize_row(tokenizer, messages, tools=None, chat_template=None, reasoning_
         kw["reasoning_effort"] = reasoning_effort
     if preserve_thinking:
         kw["preserve_thinking"] = True
+    if truncate_history_thinking is not None:
+        kw["truncate_history_thinking"] = truncate_history_thinking
     if chat_template is not None:
         kw["chat_template"] = chat_template
 
@@ -679,6 +787,14 @@ def pack_rows(
     # (its guard is combined with a preserve_thinking clause, so the substring swap in
     # build_chat_template is a no-op there — this kwarg is the real control).
     preserve_thinking = bool(all_reasoning and arch == "qwen")
+    # nemotron's template gates history <think> on truncate_history_thinking (default True);
+    # all_reasoning → False keeps every assistant turn's reasoning (kwarg, not a guard swap).
+    truncate_history_thinking = (False if (all_reasoning and arch == "nemotron") else None)
+    # ⚠ Nemotron-H is a hybrid Mamba/attention model — its HF forward has NO cu_seqlens/seq_idx
+    # plumbing, so concatenating multiple docs into one sequence would LEAK the Mamba SSM state
+    # across document boundaries (there's no per-doc reset). So pack ONE document per bin (the
+    # nemotron trainer pads a batch instead of concatenating). Attention/MoE archs multipack.
+    one_doc_per_bin = (arch == "nemotron")
 
     ParquetWriter = _import_parquet_writer()
 
@@ -713,6 +829,7 @@ def pack_rows(
                     ids, labels, used_mask = tokenize_row(
                         tokenizer, messages, tools=tools, chat_template=chat_template,
                         reasoning_effort=reasoning_effort, preserve_thinking=preserve_thinking,
+                        truncate_history_thinking=truncate_history_thinking,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("llm_pack: row %d tokenize failed (%s); skipping", i, e)
@@ -725,6 +842,16 @@ def pack_rows(
                     n_dropped_empty += 1
                 elif length > max_seq_len:
                     n_dropped_long += 1  # too long for a single bin — drop, never split
+                elif one_doc_per_bin:
+                    # One doc per bin (Mamba-hybrid: no cross-doc state leakage). Write now.
+                    if used_mask:
+                        n_assistant_masked += 1
+                    sample = collate_bin([ids], [labels])
+                    assert_invariants(sample)
+                    out.write(sample)
+                    n_bins += 1
+                    n_docs += 1
+                    total_tokens += length
                 else:
                     if used_mask:
                         n_assistant_masked += 1

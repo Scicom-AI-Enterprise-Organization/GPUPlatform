@@ -361,12 +361,20 @@ def main(
         cp_size:int = 1,
         dpo:bool = False,
         dpo_beta:float = 0.1,
+        train_embeddings:bool = False,
     ):
     if dpo and cp_size > 1:
         # per-sequence log-prob sums (and the pairing) live on whole sequences; a CP
         # shard only sees a chunk — would need a cross-rank logprob reduction + coeff
         # broadcast that isn't wired. Reject up front instead of training garbage.
         raise RuntimeError("--dpo is incompatible with --cp_size > 1 (context parallelism)")
+    if dpo and train_embeddings:
+        # The DPO reference = THIS model with LoRA disabled, which is only the frozen
+        # INITIAL policy if the base weights stay frozen. Training embed_tokens/lm_head
+        # (shared with the reference's head) makes the reference drift with the policy →
+        # a wrong DPO objective. Would need a separate frozen reference copy (not wired).
+        raise RuntimeError("--train_embeddings is incompatible with --dpo (the LoRA-disabled "
+                           "reference assumes the base weights stay frozen)")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     # Pin this process to its GPU BEFORE init'ing NCCL / the device mesh, otherwise every
@@ -413,6 +421,13 @@ def main(
         param.requires_grad = False
     target_modules = list(target_modules or DEFAULT_LORA_TARGETS)
     apply_linear_lora(model, r=r, alpha=alpha, target_modules=target_modules)
+
+    # Optionally FULL-train the token embeddings + LM head (NOT LoRA — the real weights).
+    # gemma-4 ties them (tie_word_embeddings=True) so it's ONE ~1.4B weight (vocab 262144 ×
+    # hidden 5376). Done BEFORE FSDP sharding; pairs naturally with adding the MLP
+    # (gate_proj,up_proj,down_proj) to --target_modules. See tc.unfreeze_embeddings.
+    if train_embeddings:
+        tc.unfreeze_embeddings(model, rank=rank, logger=logger)
 
     total_trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     logger.info(f"Total trainable parameters: {total_trainable_params/(1024*1024):.2f}M")
@@ -568,8 +583,9 @@ def main(
             reached_max = max_steps > 0 and do_step and (opt_step + 1) >= max_steps
             if idx == len(dataloader)-1 or (do_step and (idx + 1) % checkpointing_step == 0) or reached_max:
                 logger.info("Checkpointing LoRA adapters..")
-                # Save only the trainable LoRA params. full_tensor() is a collective, so every rank
-                # must iterate the SAME params; requires_grad is identical across ranks.
+                # Save every trainable param — the LoRA adapters AND (with --train_embeddings)
+                # the full embed_tokens/lm_head weight. full_tensor() is a collective, so every
+                # rank must iterate the SAME params; requires_grad is identical across ranks.
                 lora_state_dict = {}
                 for name, param in model.named_parameters():
                     if not param.requires_grad:
@@ -586,6 +602,7 @@ def main(
                             "r": r, "alpha": alpha, "scaling": alpha / r,
                             "target_modules": target_modules,
                             "wrapped_attr": "linear",
+                            "train_embeddings": train_embeddings,
                             "objective": "dpo" if dpo else "sft",
                             **({"dpo_beta": dpo_beta} if dpo else {}),
                         }, f, indent=2)
@@ -652,6 +669,14 @@ if __name__ == "__main__":
         "--dpo_beta", type=float, default=0.1,
         help="DPO temperature β on the policy/reference log-ratio (only with --dpo).",
     )
+    parser.add_argument(
+        "--train_embeddings", action="store_true",
+        help="Also FULL-train the token embeddings + LM head (gemma-4 ties them → one "
+             "~1.4B weight), not just LoRA. Helps the finetune reliably emit special tokens "
+             "(e.g. <|tool_call>) that attention-only LoRA can only nudge. Costs extra VRAM/"
+             "optimizer state — combine with --cpu_offload. Pairs well with adding the MLP "
+             "(gate_proj,up_proj,down_proj) to --target_modules.",
+    )
     args = parser.parse_args()
     main(
         args.r,
@@ -670,4 +695,5 @@ if __name__ == "__main__":
         cp_size=args.cp_size,
         dpo=args.dpo,
         dpo_beta=args.dpo_beta,
+        train_embeddings=args.train_embeddings,
     )

@@ -36,15 +36,11 @@ def load_meta(lora_path):
 
 @torch.no_grad()
 def merge_lora_(model, lora_path, scaling):
-    """In-place: add scaling * (B @ A) to each base Linear that has an adapter."""
+    """In-place: add scaling * (B @ A) to each base Linear that has an adapter, then
+    REPLACE any full-weight tensors in the checkpoint (embed_tokens/lm_head from
+    --train_embeddings) — those are the trained weights themselves, not deltas."""
     lora = torch.load(lora_path, map_location="cpu")
     state = dict(model.named_parameters())
-
-    prefixes = sorted({
-        k[: -len(".lora_a.weight")] for k in lora if k.endswith(".lora_a.weight")
-    })
-    if not prefixes:
-        raise ValueError(f"No '*.lora_a.weight' keys in {lora_path}; keys look like: {list(lora)[:4]}")
 
     def base_name(prefix):
         # Strip FSDP / activation-checkpoint wrapper segments the trained model inserts
@@ -53,6 +49,16 @@ def merge_lora_(model, lora_path, scaling):
         for w in ("._checkpoint_wrapped_module", "._fsdp_wrapped_module", "._orig_mod"):
             prefix = prefix.replace(w, "")
         return prefix
+
+    prefixes = sorted({
+        k[: -len(".lora_a.weight")] for k in lora if k.endswith(".lora_a.weight")
+    })
+    # Full-weight (non-adapter) keys: embed_tokens/lm_head saved whole by --train_embeddings.
+    full_keys = [k for k in lora
+                 if not (k.endswith(".lora_a.weight") or k.endswith(".lora_b.weight"))]
+    if not prefixes and not full_keys:
+        raise ValueError(f"No '*.lora_a.weight' or full-weight keys in {lora_path}; "
+                         f"keys look like: {list(lora)[:4]}")
 
     merged, missing = 0, []
     diffs: dict[str, dict] = {}   # per-layer weight-change report (base W vs merged W+Δ)
@@ -84,6 +90,43 @@ def merge_lora_(model, lora_path, scaling):
     print(f">> merged {merged}/{len(prefixes)} adapters (scaling={scaling})")
     if missing:
         print(f">> WARNING: no base weight found for {len(missing)} prefixes, e.g. {missing[:3]}")
+
+    # ---- full-weight replacement (embed_tokens / lm_head from --train_embeddings) ----
+    def find_full_target(key):
+        base = base_name(key)
+        if base in state:
+            return base
+        stripped = base.replace(".linear.", ".")
+        if stripped in state:
+            return stripped
+        # gemma-4 ties embed_tokens <-> lm_head (one tensor), so the checkpoint may key it
+        # under either name; find whichever the clean base exposes (copy propagates the tie).
+        leaf = base.rsplit(".", 1)[0].rsplit(".", 1)[-1] if base.endswith(".weight") else None
+        aliases = {"embed_tokens": ("embed_tokens", "lm_head"),
+                   "lm_head": ("lm_head", "embed_tokens")}.get(leaf, (leaf,) if leaf else ())
+        for name in state:
+            if any(name.endswith(f"{al}.weight") for al in aliases):
+                return name
+        return None
+
+    n_full = 0
+    for k in full_keys:
+        target = find_full_target(k)
+        if target is None:
+            print(f">> WARNING: full-weight key {k} → no matching base param; skipped")
+            continue
+        w = state[target]
+        src = lora[k]
+        if tuple(src.shape) != tuple(w.shape):
+            print(f">> WARNING: full-weight {k} shape {tuple(src.shape)} != base {target} "
+                  f"{tuple(w.shape)}; skipped")
+            continue
+        w.copy_(src.to(device=w.device, dtype=w.dtype))
+        n_full += 1
+        print(f"[merge-full] {k} → {target}: replaced full weight {tuple(w.shape)}")
+    if full_keys:
+        print(f">> replaced {n_full}/{len(full_keys)} full weight(s) "
+              f"(embed_tokens/lm_head from --train_embeddings)")
     if diffs:
         import json as _json
         ranked = sorted(((v["rel"], k) for k, v in diffs.items()), reverse=True)

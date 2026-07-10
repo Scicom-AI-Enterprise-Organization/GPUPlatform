@@ -273,6 +273,13 @@ def main(args):
         f"= {stats['trainable_params']/1e6:.1f}M trainable"
     )
 
+    # Optionally FULL-train the token embeddings + LM head on top of LoRA (they're the bf16
+    # non-FP8 parts, so trainable as-is). MiniMax-M2 is UNTIED → both weights unfrozen. Done
+    # BEFORE FSDP sharding; requires_grad survives the meta-init to_empty/broadcast path. The
+    # save loop (every requires_grad param) captures them; merge attaches them by name.
+    if getattr(args, "train_embeddings", False):
+        tc.unfreeze_embeddings(model, rank=rank, logger=logger)
+
     # ---- FSDP2: shard each decoder layer + root -----------------------------
     # param_dtype is left at None: FSDP2 must NOT cast the frozen FP8 weights to bf16 (that
     # would defeat the block-scale dequant). Each param keeps its storage dtype (fp8 frozen,
@@ -419,6 +426,7 @@ def save_lora(model, args, rank, stats):
                 "moe_lora": not args.no_moe_lora,
                 "attn_targets": ["q_proj", "k_proj", "v_proj", "o_proj"],
                 "moe_targets": ["gate_up_proj", "down_proj"],
+                "train_embeddings": bool(getattr(args, "train_embeddings", False)),
             }, f, indent=2)
         logger.info(f"saved LoRA ({len(sd)} tensors) -> {args.out_dir}/lora.pt")
 
@@ -430,6 +438,10 @@ if __name__ == "__main__":
     p.add_argument("--moe_r", type=int, default=16, help="LoRA rank for MoE expert FFNs.")
     p.add_argument("--moe_alpha", type=float, default=16.0, help="LoRA alpha for MoE experts.")
     p.add_argument("--no_moe_lora", action="store_true", help="Adapt attention only (skip MoE experts).")
+    p.add_argument("--train_embeddings", action="store_true",
+                   help="Also FULL-train the (bf16) token embeddings + LM head on top of LoRA "
+                        "(MiniMax-M2 is untied → both weights). Helps the finetune reliably emit "
+                        "special tokens. Costs extra optimizer state — combine with --cpu_offload.")
     # batch_size / grad_accum / cpu_offload / max_epochs / max_steps / checkpointing_step
     # / limit_samples / lr / wandb[_project] — shared across all LLM trainers.
     tc.add_common_args(p, lr_default=1e-5, wandb_project="minimax-m2-autotrain")

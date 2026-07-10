@@ -811,7 +811,9 @@ export function RowBrowser({
   const [selected, setSelected] = useState<string[]>(
     (initial.split ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   );
-  const [splits] = useState<string[]>(initial.splits ?? []);
+  // The page seed no longer carries splits (server-side preview was dropped for
+  // speed in 46c4731), so this list is refreshed from each client fetch below.
+  const [splits, setSplits] = useState<string[]>(initial.splits ?? []);
   const splitKey = selected.join(",");
   const multiSubset = selected.length > 1;
   // Speaker filter (S3/upload datasets with a speaker column). The list is
@@ -882,6 +884,7 @@ export function RowBrowser({
         }
         setRows(data.rows ?? []);
         if (typeof data.total === "number") setTotal(data.total);
+        if (Array.isArray(data.splits)) setSplits(data.splits);
         if (Array.isArray(data.speakers)) setSpeakers(data.speakers);
         if (typeof data.excluded_count === "number") setExcludedCount(data.excluded_count);
         setError(data.error ?? null);

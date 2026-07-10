@@ -34,8 +34,11 @@ def fold_lora(model, lora_path: str, scaling: float) -> int:
     lora = torch.load(lora_path, map_location="cpu")
     state = dict(model.named_parameters())
     prefixes = sorted({k[: -len(".lora_a.weight")] for k in lora if k.endswith(".lora_a.weight")})
-    if not prefixes:
-        raise ValueError(f"no '*.lora_a.weight' keys in {lora_path}; keys look like {list(lora)[:4]}")
+    full_keys = [k for k in lora
+                 if not (k.endswith(".lora_a.weight") or k.endswith(".lora_b.weight"))]
+    if not prefixes and not full_keys:
+        raise ValueError(f"no '*.lora_a.weight' or full-weight keys in {lora_path}; "
+                         f"keys look like {list(lora)[:4]}")
 
     def base_name(prefix: str) -> str:
         for w in ("._checkpoint_wrapped_module", "._fsdp_wrapped_module", "._orig_mod"):
@@ -58,6 +61,26 @@ def fold_lora(model, lora_path: str, scaling: float) -> int:
     print(f">> merged {merged}/{len(prefixes)} adapters (scaling={scaling})", flush=True)
     if missing:
         print(f">> WARNING: no base weight for {len(missing)} prefixes, e.g. {missing[:3]}", flush=True)
+
+    # Full-weight tensors (embed_tokens/lm_head from --train_embeddings): COPY into the base
+    # (replace, not add-delta). Qwen3.6-27B is untied so both may be present; matched by name.
+    n_full = 0
+    for k in full_keys:
+        base = base_name(k)
+        target = base if base in state else (base.replace(".linear.", ".")
+                                             if base.replace(".linear.", ".") in state else None)
+        if target is None:
+            print(f">> WARNING: full-weight key {k} → no matching base param; skipped", flush=True)
+            continue
+        w = state[target]
+        src = lora[k]
+        if tuple(src.shape) != tuple(w.shape):
+            print(f">> WARNING: full-weight {k} shape {tuple(src.shape)} != base {tuple(w.shape)}; skipped", flush=True)
+            continue
+        w.copy_(src.to(dtype=w.dtype, device=w.device))
+        n_full += 1
+    if full_keys:
+        print(f">> replaced {n_full}/{len(full_keys)} full weight(s) (embed/lm_head)", flush=True)
     return merged
 
 

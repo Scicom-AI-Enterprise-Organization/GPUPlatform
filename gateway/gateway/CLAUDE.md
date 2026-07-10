@@ -236,3 +236,79 @@ and the worker contract live here. Section key `quantization` in `auth.SECTIONS`
   the own-mirror endpoint are rejected with a 400 (the box can't reach it without a tunnel).
 - **Restart semantics**: `cleanup_orphaned_running` marks queued/running jobs **failed** on gateway
   startup — quant jobs are short and are NOT log-reconciled like autotrain runs; re-run instead.
+
+### LLM chat packing (`llm_pack.py`) — per-arch tool-call `arguments` normalization
+
+The **Pack for LLM** transform (`dataset_transform._run_llm_pack` → `llm_pack.pack_rows`, produces
+`kind=llm_packed`; DPO → `pack_dpo_rows` → `kind=llm_dpo_packed`) tokenizes a chat dataset's `messages`
+(+ optional `functions`/tools column) through the tokenizer's chat template **once, here** — the trainer
+reads the packed ids as-is. CPU-only (threadpool; transformers imported lazily, no torch). The web UI is
+the `LlmPackCard` transform tab; `tools_field` (default `functions`) names the tool-declaration column,
+rendered as `tools=` (per-row `None`/empty/invalid → `extract_tools` returns `[]` → packed without tools;
+mixed with/without-tools datasets are fine).
+
+**⚠ Per-arch tool-call `arguments` MUST be normalized str→dict in `extract_messages`, and the requirement
+differs by arch.** SFT parquets store `tool_calls[].function.arguments` as a JSON **string** (OpenAI
+spec). The fix belongs in preprocessing (keep the parquet OpenAI-shaped), so `extract_messages(value, arch)`
+dispatches to a per-arch `_normalize_<arch>_turn` right before `apply_chat_template`; `detect_arch` maps the
+tokenizer name → `gemma|qwen|minimax|mistral|generic`. Whether the str→dict parse is needed depends on the
+template:
+- **gemma** (`_normalize_gemma_turn`, added 2026-07-09) — **REQUIRED; SILENT bug if missing.** The template
+  branches on type: `arguments is mapping` → native `key:<|"|>value<|"|>`; `arguments is string` → dumped
+  **verbatim as raw JSON** (`call:NAME{{"k":"v"}}`). A string cell renders wrong-but-valid → the finetune
+  trains on a format that fights gemma's native decode (this was the ROOT CAUSE of a real FP8 tool-call
+  regression — see the stress-test dir below). Also wraps bare `{name,arguments}` (no `function` key), else
+  `tool_call['function']` KeyErrors → row dropped.
+- **qwen** (`_normalize_qwen_turn`) / **minimax** (`_normalize_minimax_turn`) — **REQUIRED; LOUD.** Templates
+  do `arguments|items` / `.items()` → a string raises → the row is dropped (caught in `pack_rows`). Both
+  parse str→dict (+ `None`→`{}`; minimax parses the top-level AND nested `function` holder).
+- **mistral** (`_normalize_mistral_turn`) — **str→dict NOT needed** — its native format *is* JSON
+  (`[TOOL_CALLS]name[ARGS]{json}`; template `tojson`s a dict, uses a string verbatim). Only `None`→`{}`
+  matters (else `None|tojson`→`null`).
+
+So **adding a new arch to LLM packing = add a `_normalize_<arch>_turn` branch** (mirror qwen's) unless
+you've confirmed the template tolerates a JSON-string args cell. **Restart rule:** `llm_pack.py` /
+`dataset_transform.py` are imported (lazy, then `sys.modules`-cached) → a gateway restart is needed to pick
+up edits (unlike `quantize.py`, SFTP'd per job).
+
+**⚠ Assistant-only label masking (gemma-4), added 2026-07-10.** The gemma-4 chat template ships NO
+`{% generation %}` block, so `apply_chat_template(return_assistant_tokens_mask=True)` returned an all-zero
+mask and `tokenize_row` fell back to `labels = input_ids` — i.e. every gemma SFT run trained on the WHOLE
+packed sequence: the system tool-DECLARATIONS, user turns, AND (env) tool-response blocks, not just the
+assistant output. Training on the declarations is what taught earlier finetunes to regurgitate them.
+`build_chat_template` now injects `{% generation %}` around ONLY the model-generated spans (reasoning
+channel, tool_calls, text content, model turn-end) via surgical substring swaps in `_add_gemma_generation_mask`
+(`_GEMMA_GENERATION_REPS`); the `<|turn>model` opener and the tool-response forward-scan stay unmasked. The
+tags emit no text and abut whitespace-trimmed neighbours, so the **rendered text/token-ids are byte-identical
+to stock** — only the label mask changes (**verified against google/gemma-4-31B-it**: same ids, mask covers
+exactly the assistant spans; DPO's no-mask `tokenize_pair` render is unaffected). Anchor missing (template
+changed upstream) → logs a WARNING + degrades to full-sequence labels rather than crashing. This is gemma-only
+(other archs' templates already carry `{% generation %}`); the pack summary's `assistant_masked_rows` now
+reports how many rows got a real mask.
+
+**⚠ Nemotron-H (hybrid Mamba2/attention MoE) packs ONE-DOC-PER-BIN, added 2026-07-10.** `detect_arch`
+maps `nvidia/…nemotron…` → `nemotron`; `_normalize_nemotron_turn` parses tool-call `arguments` str→dict
+(REQUIRED — the template does `arguments|items`) + maps `reasoning`→`reasoning_content`;
+`truncate_history_thinking=False` keeps all reasoning. Unlike every other (attention) arch, `pack_rows`
+sets `one_doc_per_bin=True` for nemotron and writes each document as its OWN bin (never concatenates):
+the HF NemotronH forward has no cu_seqlens/seq_idx plumbing, so multipacking would LEAK the Mamba SSM
+state across doc boundaries. The nemotron trainer then PADS a batch of single-doc bins (not the varlen
+concatenating collator). No `{% generation %}` (full-sequence labels for now). ⚠ The Nemotron tokenizer
+needs **sentencepiece** in the gateway env to instantiate at pack time. See
+`training/llm/CLAUDE.md` → "Nemotron-H" for the trainer/merge/dry-run detail.
+
+**Verified e2e (2026-07-09)** on the real source `ds-f2116ddc` (635 tool rows / ~6.5k tool calls) by
+rendering each row through the REAL tokenizer template + round-tripping vLLM's own tool parser (gemma4 /
+qwen3xml / mistral / minimax_m2): fixed → ~100% native + parseable; unfixed → 0% (gemma raw-JSON,
+qwen/minimax render-crash); mistral 100% either way. The packed output `ds-998f5e75` (gemma) decodes to
+100% native tool calls. Tooling + the gemma root-cause writeup live in
+`~/Documents/ucc_ai_research/stress-test/prompt-correction/` (`verify_dataset.py` gemma,
+`verify_multi.py` qwen/minimax, `parse_mistral.py`, run on the tm-2 box's `/share/vllm-venv`).
+Verification gotchas: (1) qwen/minimax templates embed a tool-call **example** in the system prompt → isolate
+the assistant turn via a longest-common-prefix diff of `render(msgs[:k], gen=True)` vs `render(msgs[:k+1])`,
+NOT a whole-render parse; (2) the box's vLLM venv forces **MistralCommonBackend** (rejects this data's
+`chatcmpl-tool-*` tool_call ids — must be 9-char alnum — and validates msg structure) while the gateway's
+transformers picks **TokenizersBackend** (Jinja, no id check) → render mistral off-box, parse on-box;
+(3) mistral's parser reads args greedily to end-of-string → strip the trailing `</s>` before `json.loads`.
+⚠️ Separately, `ds-f2116ddc` has a corrupt source row whose tool `name` literally contains `</arg_value>`
+(fails cleanly across all archs) — a data-quality issue to scrub, not a packer bug.

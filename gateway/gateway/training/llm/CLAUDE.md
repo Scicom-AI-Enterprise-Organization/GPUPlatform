@@ -96,7 +96,40 @@ in `llm_finetune._ARCH` + `_fa_mode`:
 | extra deps | `peft` | `accelerate` | `accelerate` |
 | pre-flight | `test_attention.py` (FA3) / skipped (FA4) | `test_lora.py` (CPU) | `test_lora.py` (CPU) |
 | run env | `GEMMA_ATTN`, FA4 JIT cache | — | `MISTRAL_DEQUANT_TRITON=1` |
-| LoRA CLI | `--r --alpha --target_modules` | `--attn_r --moe_r --attn_alpha --moe_alpha [--no_moe_lora]` | + `--no_shared_lora` |
+| LoRA CLI | `--r --alpha --target_modules [--train_embeddings]` | `--attn_r --moe_r --attn_alpha --moe_alpha [--no_moe_lora --train_embeddings]` | + `--no_shared_lora [--train_embeddings]` |
+
+**`--train_embeddings` (added 2026-07-10, ALL LLM archs).** Also FULL-trains the token embeddings + LM
+head on top of LoRA — attention-only LoRA can only nudge the output distribution via hidden states, so
+teaching a model to reliably emit a specific special token (e.g. gemma's `<|tool_call>`) is far easier when
+the head/embeddings adapt. The shared helper **`_trainer_common.unfreeze_embeddings(model, rank, logger)`**
+unfreezes `get_input_embeddings()` + `get_output_embeddings()` right after LoRA is applied, BEFORE FSDP
+sharding (root `fully_shard` shards them; the loss already projects hidden states through
+`self.lm_head.weight` and Liger FLCE returns its gradient → trained from BOTH the input-embed lookup and the
+output projection). It handles **tied** heads (gemma-4, small qwen — `tie_word_embeddings=True` → ONE weight)
+and **untied** (Qwen3.6-27B, MiniMax-M2, Mistral-Small-4 — two separate weights). For the FP8-MoE pair the
+embeddings/lm_head are the bf16 non-FP8 parts, so they train as-is (requires_grad survives the meta-init
+`to_empty`/broadcast path). Checkpoint saves the whole weight(s) into `lora.pt` (non-`.lora_*` keys;
+`lora_meta.json` gets `train_embeddings:true`); the merges apply them back: gemma `merge_infer.py` +
+qwen `merge_to_disk.py` COPY the full weight (replace, not add-delta), and minimax/mistral `merge_to_bf16.py`
++ `merge_infer.py` already load-by-name so they auto-apply. Pairs naturally with adding the MLP
+(`gate/up/down_proj`) to `--target_modules` (gemma/qwen) — the FP8-MoE trainers adapt experts by default.
+⚠ **Incompatible with `--dpo`** (the LoRA-disabled reference assumes the base weights stay frozen; training
+the shared head makes the reference drift) — rejected in the gemma+qwen trainers, create-run (400), and hidden
+in the form for DPO. Wired: `_gemma_cmd`/`_qwen_cmd`/`_moe_cmd` (`cfg["train_embeddings"]`) → `training_api`
+(`train_embeddings` field + config) → form toggle (`/autotrain/new`, all LLM archs + SFT only). Costs extra
+optimizer state — the trainers' `cpu_offload` default helps (ON for gemma/qwen). Lives ONLY in these vendored
+gateway copies (like DPO/CP), not the standalone `autotrain/`.
+
+**✅ GPU-smoked (2026-07-10): gemma tied + nemotron untied.** Gemma `train-66c888ed` — gemma-4-31B on a
+**65k pack** (`ds-fcd94aac`, 548 bins @ cap 65536), 4× H20, r16 q/k/v/o + `train_embeddings`, 10 steps:
+unfroze "embeddings + lm_head (**tied, one weight**) — 1409.3M", losses 3.86→2.84 (finite, trending down,
+~1.1–1.4k tok/s at S≈54k), and the checkpoint saved **461 tensors = 460 LoRA + 1 full tied-embed weight**
+(the 1.4B CPU-offloaded DTensor gathered over the gloo backend — the exact collective `cpu:gloo` exists
+for) → S3. Nemotron (untied → 2 weights) smoked earlier on the tiny model + merge (2/2 full weights
+replaced). ⚠ **gemma at 65k on H20s REQUIRES `cpu_offload` even on 4 GPUs**: an explicit
+`cpu_offload=false` attempt (`train-ecdd6e11`) OOM'd at S=54k in the FA4 backward at ~133 GB/GPU — the
+O(seq×layers) activation-checkpoint memory + the 1.4B trainable embed's optimizer state don't fit beside
+the unsharded activations; the arch default (ON) is load-bearing, don't override it for ≥64k runs.
 
 Common to all: **torch 2.12** (the FA3-wheel ABI + `torch._grouped_mm` for fused MoE), transformers
 5.5.0, liger-kernel, the FA3 prebuilt wheel (cu126/130/132 from the host driver) — EXCEPT gemma's
@@ -316,3 +349,85 @@ non-contiguous-recv permutation bug, the per-doc loss pre-shift) lives in **`aut
 types). ⚠ A full gemma-4-31B CP **training run** (optimizer + checkpoint) is wired + ready
 (`HF_TOKEN` in `autotrain/.env`) but NOT yet run end-to-end — needs the 62GB model + an `llm_packed`
 dataset. Only gemma-4 is wired (qwen/minimax/mistral would each need the same hybrid dispatch).
+
+## Nemotron-H (NVIDIA Nemotron-3-Nano-30B-A3B) — hybrid Mamba2/attention MoE, 2026-07-10
+
+A 5th LLM arch. Nemotron-H is a **hybrid**: 52 `NemotronHBlock` layers = **23 Mamba2 SSM + 23 MoE +
+6 attention** (per `config.layers_block_type`, derived from `hybrid_override_pattern`). bf16, untied
+embeddings (`tie_word_embeddings=false`), vocab 131072. Native in **transformers 5.12.1** (incl. the
+MoE `NemotronHMoE`/`NemotronHExperts` — 5.5.0 predates it).
+
+- **`nemotron/nemotron_h.py`** — the trainer. `CustomNemotronHForCausalLM` runs the backbone → Liger
+  FLCE on hidden states (never materializes [B,S,V] logits). LoRA (custom `LinearLoRA`, B=0 init)
+  wraps attention **q/k/v/o_proj** + Mamba **in_proj/out_proj** (nn.Linear); the MoE experts are 3D
+  `nn.Parameter` (`NemotronHExperts.up_proj/down_proj`) so the Linear LoRA leaves them frozen.
+  `--train_embeddings` (shared `tc.unfreeze_embeddings`) full-trains the untied embed+lm_head.
+  FSDP2 shards the single `NemotronHBlock` class; `--cpu_offload` default OFF (MoE bulk frozen → fits
+  sharded on H20s). No DPO, no context parallelism.
+- **⚠ NO multipacking — ONE DOCUMENT PER BIN.** The HF NemotronH forward has no cu_seqlens/seq_idx
+  plumbing, so concatenating docs would LEAK the Mamba SSM state across document boundaries (no
+  per-doc reset). `llm_pack` packs `arch=nemotron` **one-doc-per-bin** (`one_doc_per_bin`), and the
+  trainer's collator **PADS** a batch of single-doc bins (right-pad; `attention_mask` marks real
+  tokens → `create_causal_mask` + the mamba mask zero the pad; correct for both attention and Mamba)
+  — NOT the concatenating varlen collator the attention archs use.
+- **Fast path (default since 2026-07-10; NVIDIA's own recipe = Megatron-Bridge → TE flash-attn +
+  fused mamba kernels — we get the HF equivalents):** attention = **hub FA3**
+  (`NEMOTRON_ATTN=kernels-community/flash-attn3`, head_dim 128 GQA 32/2; sdpa + a padding mask
+  materializes an O(S²) causal mask at long context — `NEMOTRON_ATTN=sdpa` is the fallback), and
+  Mamba = the **fused Triton kernels** (`NEMOTRON_MAMBA_KERNELS=1` → `config.use_mamba_kernels=True`;
+  `mamba-ssm` + `causal-conv1d` are `lazy_load_kernel`-fetched from the kernels hub at model load —
+  NO source build; needs `einops`). The torch SSD fallback (`NEMOTRON_MAMBA_KERNELS=0`) materializes
+  fp32 chunk intermediates in autograd across the 23 mamba layers — THE long-context memory/speed hog.
+  ⚠ **Three LoRA/kernel traps, all handled in the trainer (found via the NaN bisect + the
+  autotrain/nemotron gates — READ THAT CLAUDE.md before touching the backends):**
+  (1) the dispatch reads `self.in_proj.weight.device.type` → `LinearLoRA` exposes `weight`/`bias`
+  properties delegating to the wrapped Linear; (2) the mem-eff split kernel
+  (`mamba_split_conv1d_scan_combined`) fuses the RAW `out_proj.weight` into the kernel → a LoRA-wrapped
+  out_proj's adapter would be SILENTLY bypassed — the trainer sets `use_mem_eff_path=False` on every
+  mixer whose out_proj is wrapped (falls to the non-split fast path: causal_conv1d_fn +
+  mamba_chunk_scan_combined + module-call out_proj; the split kernel can't run here anyway — the hub
+  build asserts on `causal_conv1d_cuda`); (3) **the hub mamba-ssm kernel's bf16 BACKWARD is broken** —
+  NaN grads in exactly the ddt/dA path (dt_bias, A_log, dx→conv→in_proj; D/norm/out_proj grads stay
+  cos 1.0), NOT contiguity, forward fine (cos 0.999988), fp32 exact → `_patch_mamba_kernel_fp32`
+  wraps the kernel to upcast (x,dt,A,B,C)→fp32 + downcast the output (verified: xgrad cos 0.9999 vs
+  torch). Without the patch: step-0 loss finite, then **NaN from step 1** (the step-0 backward poisons
+  the LoRA weights at the first optimizer step — `train-6a672e67`/`train-9d5d1448`). FA3 attention is
+  grad-exact (q/k/v/o weight grads cos 1.0 vs sdpa — `autotrain/nemotron/test_attention_kernels.py`).
+  `_fa_mode` returns `"none"` → the deps install skips the FA3-wheel/FA4/qwen-kernel step (the hub
+  kernels fetch at model load instead).
+- **Deps/venv** (`_ARCH["nemotron"]`, `/share/autotrain-llm-nemotron`): torch 2.10+cu13 (same base as
+  qwen) + `transformers==5.12.1 kernels<=0.14.0 sentencepiece einops` (⚠ the Nemotron tokenizer needs
+  sentencepiece to instantiate — at pack time on the gateway AND at merge/serve time; the hub mamba-ssm
+  kernel imports einops).
+- **Chat template:** `_normalize_nemotron_turn` (llm_pack) parses tool-call `arguments` str→dict
+  (REQUIRED — the template does `arguments|items`, LOUD crash otherwise) + maps `reasoning`→
+  `reasoning_content`; `truncate_history_thinking=False` keeps all reasoning. NO `{% generation %}`
+  block → assistant-only masking falls back to full-sequence labels (a follow-up, like gemma pre-fix).
+- **Merge** (`nemotron/merge_infer.py`, used by `llm_playground.merge_lora_to_dir`): folds
+  `scaling·(B@A)` into the base Linears + COPIES the full embed/lm_head (from `--train_embeddings`);
+  tokenizer load + `device_map=auto` are best-effort (fall back so the weight merge always completes).
+
+**✅ Dry-run verified end-to-end on tm-2 (2026-07-10, 2× H20 FSDP, a tiny random 52-layer NemotronH
+so no 60GB download):** LoRA wrapped **q/k/v/o ×6 (the 6 attn layers) + in/out_proj ×23 (the 23 mamba
+layers)**; `--train_embeddings` unfroze embed+lm_head (untied); FSDP sharded `NemotronHBlock`
+(574.9M/rank); forward+backward+optimizer ran (**loss 8.19→8.00→7.41**, Mamba torch backward + Liger
+loss + padding collator all work); checkpoint saved; **merge folded 70/70 adapters + replaced 2/2 full
+weights** and saved a merged model.
+
+**✅ REAL 30B run VERIFIED end-to-end (2026-07-10, `train-d0efd849`, tm-2 4×H20 via the gateway API).**
+Packed `ds-f2116ddc` (12814 tool rows) → `ds-a077af13` (arch=nemotron, **12000 one-doc bins**,
+seq_len 16384). Gateway create-run accepted nemotron; tm-2 built `/share/autotrain-llm-nemotron`
+(transformers 5.12.1, `_fa_mode=none` → no FA wheel), downloaded the 59GB model, loaded **30115M
+params**, LoRA wrapped **q/k/v/o×6 + in/out_proj×23** (8.72M trainable), FSDP across 4 GPUs (~15GB/GPU),
+ran **10 steps** (finite loss, noisy — batch_size=1 single-doc bins so each step sees one document),
+**Saved LoRA (140 tensors)** → S3 `training-runs/train-d0efd849/checkpoint/`, `@@DONE`, workdir torn
+down. Torch Mamba SSD path ~500–690 tok/s.
+⚠ **`training_api._LORA_TARGET_MODULES` must include `in_proj`/`out_proj`** (added) — else the Mamba LoRA
+targets are silently filtered → only the 6 attention layers adapt.
+
+**✅ Fast path verified end-to-end (2026-07-10, `train-c7957876`, same config):** FA3 + mamba kernels +
+the fp32 kernel patch — all 10 steps finite (same per-bin loss shape as the baseline), checkpoint saved,
+**~720–1250 tok/s ≈ 1.45× the torch baseline at short (~750-tok) docs** (the O(S)-attention/fused-scan
+advantage grows with context; 16k-bin throughput not yet measured). Real-30B `compare_logits.py`:
+PASSED (cosine 0.999929, argmax match, top-5 5/5). Gates + the full NaN investigation:
+**`autotrain/nemotron/CLAUDE.md`**.

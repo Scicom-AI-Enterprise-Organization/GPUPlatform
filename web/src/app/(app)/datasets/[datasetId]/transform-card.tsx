@@ -16,8 +16,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ProgressEta } from "@/components/progress-eta";
+import { SearchableSelect, type SearchableOption } from "@/components/ui/searchable-select";
 import { gateway, GatewayError } from "@/lib/gateway";
-import type { DatasetKind, StorageRecord, TransformDatasetRequest } from "@/lib/types";
+import type { DatasetKind, DatasetRecord, StorageRecord, TransformDatasetRequest } from "@/lib/types";
 
 function errText(body: unknown, fallback: string): string {
   if (typeof body === "string") return body || fallback;
@@ -55,8 +56,25 @@ export function TransformCard({
   const [storageId, setStorageId] = useState(s3Storages[0]?.id ?? "");
   const [s3Folder, setS3Folder] = useState(`datasets/${datasetId}/transformed`);
   const [testSplitOn, setTestSplitOn] = useState(false);
-  const [testSplitMode, setTestSplitMode] = useState<"pct" | "count">("pct");
+  const [testSplitMode, setTestSplitMode] = useState<"pct" | "count" | "ref">("pct");
   const [testSplitValue, setTestSplitValue] = useState("10");
+  // "From dataset" mode: reuse another dataset's exact test set (no overlap when
+  // this dataset is a superset of it). The candidate list is fetched client-side.
+  const [refDatasetId, setRefDatasetId] = useState("");
+  const [datasets, setDatasets] = useState<DatasetRecord[]>([]);
+  useEffect(() => {
+    gateway.listDatasets().then(setDatasets).catch(() => {});
+  }, []);
+  // Only datasets that can yield a test split: S3/exported (own `split` column) or
+  // label (resolved server-side to its exported S3 twin). Never this dataset.
+  const refOptions = useMemo<SearchableOption[]>(
+    () =>
+      datasets
+        .filter((d) => d.id !== datasetId && (d.kind === "s3" || d.kind === "upload" || d.kind === "label"))
+        .map((d) => ({ value: d.id, label: d.name, hint: d.kind, group: d.kind })),
+    [datasets, datasetId],
+  );
+  const refName = datasets.find((d) => d.id === refDatasetId)?.name;
   // Min transcription length (chars) for a row to be eligible for the test split.
   // Blank/0 → no minimum. Keeps junk transcripts ("[silent]") out of eval.
   const [testMinChars, setTestMinChars] = useState("");
@@ -119,8 +137,17 @@ export function TransformCard({
       setErr("Pick an S3 storage.");
       return;
     }
-    let testSplit: Pick<TransformDatasetRequest, "test_split_pct" | "test_split_count" | "test_min_chars" | "test_exclude_regex"> = {};
-    if (testSplitOn) {
+    let testSplit: Pick<
+      TransformDatasetRequest,
+      "test_split_pct" | "test_split_count" | "test_min_chars" | "test_exclude_regex" | "test_split_ref_dataset_id"
+    > = {};
+    if (testSplitOn && testSplitMode === "ref") {
+      if (!refDatasetId) {
+        setErr("Pick a dataset to reuse the test split from.");
+        return;
+      }
+      testSplit = { test_split_ref_dataset_id: refDatasetId };
+    } else if (testSplitOn) {
       const v = Number(testSplitValue);
       if (!Number.isFinite(v) || v < 0) {
         setErr("Enter a valid test-split size.");
@@ -290,91 +317,123 @@ export function TransformCard({
           </label>
           {testSplitOn && (
             <div className="space-y-2 pl-6">
-              <div className="flex items-center gap-2">
-                <Input
-                  type="number"
-                  min={0}
-                  value={testSplitValue}
-                  onChange={(e) => setTestSplitValue(e.target.value)}
-                  disabled={running}
-                  className="h-8 w-24 text-xs"
-                />
-                <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
-                  {(["pct", "count"] as const).map((m) => (
-                    <button
-                      key={m}
-                      type="button"
-                      onClick={() => setTestSplitMode(m)}
-                      disabled={running}
-                      className={
-                        "rounded px-2.5 py-1 transition-colors " +
-                        (testSplitMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
-                      }
-                    >
-                      {m === "pct" ? "% of rows" : "# rows"}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Randomly holds out{" "}
-                {testSplitMode === "pct" ? `${testSplitValue || "0"}%` : `${testSplitValue || "0"} row(s)`} as a{" "}
-                <span className="font-mono">test</span> split; the rest become{" "}
-                <span className="font-mono">train</span>. Any source splits are collapsed.
-              </p>
-              <div className="flex items-center gap-2 pt-1">
-                <label className="text-xs text-muted-foreground">Min transcription length</label>
-                <Input
-                  type="number"
-                  min={0}
-                  placeholder="0"
-                  value={testMinChars}
-                  onChange={(e) => setTestMinChars(e.target.value)}
-                  disabled={running}
-                  className="h-8 w-20 text-xs"
-                />
-                <span className="text-xs text-muted-foreground">chars</span>
-              </div>
-              {testMinChars.trim() && Number(testMinChars) > 0 && (
-                <p className="text-xs text-muted-foreground">
-                  Only rows whose transcription is ≥ {Math.round(Number(testMinChars))} characters are
-                  eligible for <span className="font-mono">test</span> — shorter transcripts stay in{" "}
-                  <span className="font-mono">train</span>.
-                </p>
-              )}
-              <div className="space-y-1 pt-1">
-                <div className="flex items-center gap-2">
-                  <label className="text-xs text-muted-foreground">Exclude from test (regex)</label>
+              <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                {(["pct", "count", "ref"] as const).map((m) => (
                   <button
+                    key={m}
                     type="button"
+                    onClick={() => setTestSplitMode(m)}
                     disabled={running}
-                    onClick={() => setTestExcludeRegex("^\\s*\\[.*\\]\\s*$")}
-                    className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
-                    title="Match transcripts that are entirely a [bracketed] tag"
+                    className={
+                      "rounded px-2.5 py-1 transition-colors " +
+                      (testSplitMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")
+                    }
                   >
-                    [bracket] tags
+                    {m === "pct" ? "% of rows" : m === "count" ? "# rows" : "From dataset"}
                   </button>
-                </div>
-                <Input
-                  value={testExcludeRegex}
-                  onChange={(e) => setTestExcludeRegex(e.target.value)}
-                  disabled={running}
-                  placeholder="^\s*\[.*\]\s*$"
-                  className="h-8 font-mono text-xs"
-                />
-                {regexError ? (
-                  <p className="text-xs text-destructive">Invalid regex: {regexError}</p>
-                ) : (
-                  testExcludeRegex.trim() && (
-                    <p className="text-xs text-muted-foreground">
-                      Transcripts matching <span className="font-mono">/{testExcludeRegex}/</span> stay in{" "}
-                      <span className="font-mono">train</span> — e.g. <span className="font-mono">[silent]</span>,{" "}
-                      <span className="font-mono">[unintelligible]</span> are kept out of{" "}
-                      <span className="font-mono">test</span>.
-                    </p>
-                  )
-                )}
+                ))}
               </div>
+
+              {testSplitMode === "ref" ? (
+                <div className="space-y-2">
+                  <SearchableSelect
+                    value={refDatasetId}
+                    onChange={setRefDatasetId}
+                    options={refOptions}
+                    placeholder="Choose a dataset with a test split"
+                    searchPlaceholder="Search datasets…"
+                    className="text-xs"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Reuses{" "}
+                    {refName ? (
+                      <span className="font-medium text-foreground">{refName}</span>
+                    ) : (
+                      "the selected dataset"
+                    )}
+                    &apos;s exact <span className="font-mono">test</span> split as this dataset&apos;s test set
+                    (matched by audio filename); every other row becomes{" "}
+                    <span className="font-mono">train</span>. Guarantees no train/test overlap — ideal when this
+                    dataset just adds more rows on top of that one. A <span className="font-mono">label</span>{" "}
+                    dataset resolves to its exported S3 version.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      type="number"
+                      min={0}
+                      value={testSplitValue}
+                      onChange={(e) => setTestSplitValue(e.target.value)}
+                      disabled={running}
+                      className="h-8 w-24 text-xs"
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      {testSplitMode === "pct" ? "% of rows" : "rows"}
+                    </span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Randomly holds out{" "}
+                    {testSplitMode === "pct" ? `${testSplitValue || "0"}%` : `${testSplitValue || "0"} row(s)`} as a{" "}
+                    <span className="font-mono">test</span> split; the rest become{" "}
+                    <span className="font-mono">train</span>. Any source splits are collapsed.
+                  </p>
+                  <div className="flex items-center gap-2 pt-1">
+                    <label className="text-xs text-muted-foreground">Min transcription length</label>
+                    <Input
+                      type="number"
+                      min={0}
+                      placeholder="0"
+                      value={testMinChars}
+                      onChange={(e) => setTestMinChars(e.target.value)}
+                      disabled={running}
+                      className="h-8 w-20 text-xs"
+                    />
+                    <span className="text-xs text-muted-foreground">chars</span>
+                  </div>
+                  {testMinChars.trim() && Number(testMinChars) > 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      Only rows whose transcription is ≥ {Math.round(Number(testMinChars))} characters are
+                      eligible for <span className="font-mono">test</span> — shorter transcripts stay in{" "}
+                      <span className="font-mono">train</span>.
+                    </p>
+                  )}
+                  <div className="space-y-1 pt-1">
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-muted-foreground">Exclude from test (regex)</label>
+                      <button
+                        type="button"
+                        disabled={running}
+                        onClick={() => setTestExcludeRegex("^\\s*\\[.*\\]\\s*$")}
+                        className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                        title="Match transcripts that are entirely a [bracketed] tag"
+                      >
+                        [bracket] tags
+                      </button>
+                    </div>
+                    <Input
+                      value={testExcludeRegex}
+                      onChange={(e) => setTestExcludeRegex(e.target.value)}
+                      disabled={running}
+                      placeholder="^\s*\[.*\]\s*$"
+                      className="h-8 font-mono text-xs"
+                    />
+                    {regexError ? (
+                      <p className="text-xs text-destructive">Invalid regex: {regexError}</p>
+                    ) : (
+                      testExcludeRegex.trim() && (
+                        <p className="text-xs text-muted-foreground">
+                          Transcripts matching <span className="font-mono">/{testExcludeRegex}/</span> stay in{" "}
+                          <span className="font-mono">train</span> — e.g. <span className="font-mono">[silent]</span>,{" "}
+                          <span className="font-mono">[unintelligible]</span> are kept out of{" "}
+                          <span className="font-mono">test</span>.
+                        </p>
+                      )
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
         </div>

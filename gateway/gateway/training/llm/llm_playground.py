@@ -159,7 +159,7 @@ def ensure_vllm_venv(venv: str, version: str = "0.23.0") -> str:
 
 
 def _arch(model_id: str) -> str:
-    """gemma | qwen | minimax | mistral (mirror of training_api._llm_arch)."""
+    """gemma | qwen | minimax | mistral | nemotron (mirror of training_api._llm_arch)."""
     n = (model_id or "").lower()
     if "minimax" in n:
         return "minimax"
@@ -167,6 +167,8 @@ def _arch(model_id: str) -> str:
         return "mistral"
     if "qwen" in n:
         return "qwen"
+    if "nemotron" in n:
+        return "nemotron"
     return "gemma"
 
 
@@ -181,6 +183,11 @@ def merge_lora_to_dir(base_model, lora, merged, train_py, llm_dir, dtype="fp16",
     if arch == "gemma":
         cmd = [train_py, "merge_infer.py", "--lora", lora, "--merged-out", merged, "--no-generate"]
         cwd = llm_dir
+    elif arch == "nemotron":
+        # bf16 fold (+ full embed/lm_head copy) via nemotron/merge_infer.py, like gemma.
+        cmd = [train_py, "merge_infer.py", "--lora", lora, "--merged-out", merged,
+               "--model-id", base_model, "--no-generate"]
+        cwd = os.path.join(llm_dir, "nemotron")
     elif arch == "qwen":
         cmd = [train_py, "merge_to_disk.py", "--lora", lora, "--out", merged,
                "--dtype", dtype, "--model-id", base_model]
