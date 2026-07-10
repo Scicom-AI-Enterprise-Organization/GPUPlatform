@@ -24,6 +24,7 @@ type UpstreamDraft = {
   priority: number;
   enabled: boolean;
   hadKey: boolean;
+  testMode: "chat" | "embedding";
   test: { status: "idle" | "running" | "ok" | "fail"; message?: string };
 };
 
@@ -31,7 +32,7 @@ function blankUpstream(): UpstreamDraft {
   return {
     name: "", base_url: "", keyMode: "secret", api_key_secret: "", api_key: "",
     models: [{ alias: "", real: "" }], priority: 0, enabled: true, hadKey: false,
-    test: { status: "idle" },
+    testMode: "chat", test: { status: "idle" },
   };
 }
 
@@ -64,6 +65,7 @@ function fromEndpoint(ep: ProxyEndpoint): UpstreamDraft[] {
     priority: u.priority,
     enabled: u.enabled,
     hadKey: u.has_inline_key || !!u.api_key_secret,
+    testMode: "chat",
     test: { status: "idle" },
   }));
 }
@@ -93,8 +95,9 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
 
   const onTest = async (i: number) => {
     const u = ups[i];
-    // Chat-test with the first real model the upstream serves (falls back to a
-    // plain /models probe if none is set yet).
+    // End-to-end test the first real model the upstream serves, against the
+    // endpoint matching the chosen mode (chat vs embeddings). Falls back to a
+    // plain /models probe if no model is set yet.
     const model = u.models.map((m) => m.real.trim()).find((x) => x) || undefined;
     patch(i, { test: { status: "running" } });
     try {
@@ -103,6 +106,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         api_key_secret: u.keyMode === "secret" ? u.api_key_secret.trim() || null : null,
         api_key: u.keyMode === "paste" ? u.api_key.trim() || null : null,
         model,
+        mode: u.testMode,
       });
       patch(i, { test: { status: r.ok ? "ok" : "fail", message: r.ok ? `${r.message} · ${r.latency_ms ?? "?"}ms` : r.message } });
     } catch (e) {
@@ -282,12 +286,24 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
                 </div>
               </div>
 
-              {/* test — sends a real "hello" chat completion with the first model */}
+              {/* test — sends a real "hello" to the endpoint matching the chosen mode (chat or embeddings) */}
               <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
+                <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                  {(["chat", "embedding"] as const).map((m) => (
+                    <button key={m} type="button" onClick={() => patch(i, { testMode: m, test: { status: "idle" } })}
+                            className={"rounded px-2 py-1 " + (u.testMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                      {m === "chat" ? "Chat" : "Embedding"}
+                    </button>
+                  ))}
+                </div>
                 <Button type="button" variant="outline" size="xs" onClick={() => onTest(i)} disabled={u.test.status === "running" || !u.base_url.trim()}>
                   {u.test.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Test
                 </Button>
-                <span className="text-[11px] text-muted-foreground">sends a &ldquo;hello&rdquo; chat completion using the first model</span>
+                <span className="text-[11px] text-muted-foreground">
+                  {u.testMode === "embedding"
+                    ? "sends a “hello” embedding using the first model"
+                    : "sends a “hello” chat completion using the first model"}
+                </span>
                 {u.test.status !== "idle" && u.test.status !== "running" && (
                   <span className={"text-xs " + (u.test.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>{u.test.message}</span>
                 )}

@@ -191,7 +191,8 @@ class TestUpstreamRequest(BaseModel):
     base_url: str
     api_key_secret: Optional[str] = None
     api_key: Optional[str] = None
-    model: Optional[str] = None   # real upstream model to chat-test; None = just probe /models
+    model: Optional[str] = None   # real upstream model to end-to-end test; None = just probe /models
+    mode: str = "chat"            # "chat" | "embedding" — which endpoint to end-to-end test
 
 
 class TestUpstreamResponse(BaseModel):
@@ -1081,6 +1082,34 @@ async def test_upstream(req: TestUpstreamRequest, request: Request,
     cli = _http(request.app)
     t0 = time.perf_counter()
     model = (req.model or "").strip()
+    mode = (req.mode or "chat").strip().lower()
+
+    # Embedding upstreams don't speak /chat/completions — end-to-end test the
+    # matching endpoint instead: a tiny "hello" embedding, validating a vector back.
+    if model and mode == "embedding":
+        try:
+            r = await cli.post(
+                base + "/embeddings",
+                json={"model": model, "input": "hello"},
+                headers=headers, timeout=httpx.Timeout(30.0),
+            )
+        except httpx.HTTPError as e:
+            return TestUpstreamResponse(ok=False, message=f"network error: {e}")
+        lat = int((time.perf_counter() - t0) * 1000)
+        if r.status_code in (401, 403):
+            return TestUpstreamResponse(ok=False, message="unauthorized — check the API key", latency_ms=lat)
+        if r.status_code != 200:
+            return TestUpstreamResponse(ok=False, message=f"HTTP {r.status_code}: {r.text[:160]}", latency_ms=lat)
+        dim = 0
+        try:
+            data = (r.json().get("data") or [])
+            emb = (data[0].get("embedding") if data else None) or []
+            dim = len(emb) if isinstance(emb, list) else 0
+        except Exception:
+            pass
+        if dim <= 0:
+            return TestUpstreamResponse(ok=False, message=f"no embedding returned — is '{model}' an embedding model?", latency_ms=lat)
+        return TestUpstreamResponse(ok=True, message=f"embedding ok ({model}): dim {dim}", latency_ms=lat, models=[model])
 
     # With a model, do a real end-to-end check: a tiny "hello" chat completion.
     if model:
