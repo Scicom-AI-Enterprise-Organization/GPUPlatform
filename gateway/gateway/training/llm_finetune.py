@@ -305,6 +305,42 @@ def _install_qwen_kernels(py: str, env: dict, _pip) -> None:
     )
 
 
+def _install_nemotron_kernels(py: str, env: dict, _pip) -> None:
+    """Nemotron-H fused Mamba2 fast path needs the compiled `causal_conv1d_cuda` extension:
+    the hub-fetched mamba-ssm kernel does a plain `import causal_conv1d_cuda` and asserts on
+    it (both its split AND non-split forwards). It is NOT bundled with the mamba-ssm hub
+    kernel and is NOT a `kernels`-hub kernel, so it must be pip-built here. Without it the
+    fused kernels assert and the torch SSD fallback OOMs at long context (materialises fp32
+    chunk intermediates across the 23 mamba layers — ~47GB at 32k). mamba-ssm itself stays
+    hub-fetched at model load.
+
+    ⚠ Same cu13 gotcha as qwen (`_install_qwen_kernels`): a prebuilt cu12 wheel's
+    `causal_conv1d_cuda.so` links libcudart.so.12 → ImportError against the venv's cu13 torch.
+    Build FROM SOURCE (`--no-binary :all: --no-cache --no-build-isolation`); needs nvcc
+    (CUDA_HOME, set in _ensure_venv). nemotron shares qwen's torch 2.10+cu13 base, so the
+    identical build applies."""
+    # Fast path: the compiled ext already imports in this venv → skip the nvcc source build.
+    # NB: import torch FIRST — the raw causal_conv1d_cuda.so links torch's libc10.so, which is
+    # only on the loader path once torch is imported (a bare `import causal_conv1d_cuda` →
+    # "libc10.so: cannot open shared object file"). mamba-ssm imports it after torch, so it's fine.
+    try:
+        subprocess.check_call(
+            [py, "-c", "import torch, causal_conv1d_cuda"],
+            cwd="/tmp", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
+        log("[deps] nemotron: causal_conv1d already present — skipping rebuild")
+        return
+    except Exception:
+        pass
+    _pip("setuptools", "wheel", "packaging", "ninja")
+    _pip("--no-build-isolation", "--no-cache", "--no-binary", ":all:",
+         "--reinstall-package", "causal-conv1d", "--no-deps", "causal_conv1d")
+    subprocess.check_call(
+        [py, "-c", "import torch, causal_conv1d_cuda; print('nemotron causal_conv1d import OK')"],
+        cwd="/tmp", env=env,
+    )
+
+
 def _install_fa4(cfg: dict, py: str, env: dict, _pip) -> None:
     """FlashAttention-4 fork (gemma head_dim-512). torch 2.12 is already installed
     (common); add the cute subdir from the public git fork + the load-bearing
@@ -437,10 +473,10 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
         # We proactively clear stale locks (below) AND fail fast if one is contended.
         "UV_LOCK_TIMEOUT": os.environ.get("UV_LOCK_TIMEOUT", "60"),
     }
-    # qwen's causal_conv1d builds a CUDA extension from source → nvcc must be on PATH
-    # and CUDA_HOME set (matches autotrain/qwen3.5/run.sh). No-op when the kernels are
-    # already built (the skip-if-present fast path in _install_qwen_kernels).
-    if arch == "qwen" and os.path.isdir("/usr/local/cuda/bin"):
+    # qwen + nemotron build causal_conv1d (a CUDA extension) from source → nvcc must be on
+    # PATH and CUDA_HOME set (matches autotrain/qwen3.5/run.sh). No-op when the kernels are
+    # already built (the skip-if-present fast path in _install_{qwen,nemotron}_kernels).
+    if arch in ("qwen", "nemotron") and os.path.isdir("/usr/local/cuda/bin"):
         env.setdefault("CUDA_HOME", "/usr/local/cuda")
         env["PATH"] = "/usr/local/cuda/bin" + os.pathsep + env.get("PATH", "")
     pkgs = list(_ARCH[arch]["deps"]) + list(_COMMON_DEPS)
@@ -454,9 +490,10 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
     elif fa == "kernels":
         attn_import = "flash_qla, causal_conv1d, boto3"
     elif fa == "none":
-        # nemotron: no prebuilt attn wheel (sdpa + torch Mamba). Verify the base stack + boto3
-        # (a reused venv may carry training deps but not the orchestrator's S3 client).
-        attn_import = "boto3"
+        # nemotron: no prebuilt attn wheel (sdpa attention). The fused Mamba2 path needs the
+        # compiled causal_conv1d_cuda (built below); verify it so a reused venv lacking it
+        # rebuilds. + boto3 (a reused venv may carry training deps but not the S3 client).
+        attn_import = "causal_conv1d_cuda, boto3"
     else:
         attn_import = "flash_attn_interface"
 
@@ -540,7 +577,9 @@ def _ensure_venv(cfg: dict, arch: str) -> str:
     elif fa == "kernels":
         _install_qwen_kernels(py, env, _pip)  # FlashQLA + causal_conv1d (torch already in place)
     elif fa == "none":
-        pass  # nemotron: sdpa attention + torch Mamba SSD fallback — no attention wheel to build
+        # nemotron: sdpa attention (no wheel) + the fused Mamba2 kernels — build causal_conv1d
+        # (the fused path needs it; the torch SSD fallback OOMs at 32k). mamba-ssm is hub-fetched.
+        _install_nemotron_kernels(py, env, _pip)
     else:
         _install_fa3_wheel(cu, venv, _pip)
     _pip(*pkgs)

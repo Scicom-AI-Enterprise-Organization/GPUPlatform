@@ -53,6 +53,21 @@ ATTN_IMPL = os.environ.get("NEMOTRON_ATTN", "kernels-community/flash-attn3")
 MAMBA_KERNELS = os.environ.get("NEMOTRON_MAMBA_KERNELS", "1") == "1"
 
 
+def _causal_conv1d_available() -> bool:
+    """The hub mamba-ssm kernel's forward (both the mem-eff split path AND the non-split
+    `causal_conv1d_fn` path) hard-asserts `causal_conv1d_cuda is not None`. That compiled
+    extension ships with a pip/built `causal-conv1d` — it is NOT bundled with the mamba-ssm
+    hub kernel and is NOT in the nemotron venv deps, so a fresh venv lacks it. transformers'
+    `is_fast_path_available` only checks mamba-ssm (True even when causal_conv1d is missing),
+    so it can't guard this. Probe the extension directly so we can degrade to the torch SSD
+    path (use_mamba_kernels=False) instead of crashing at the first Mamba forward."""
+    try:
+        import causal_conv1d_cuda  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def ddp_setup():
     # cpu:gloo + cuda:nccl — gloo services the CPU collective in the checkpoint's full_tensor()
     # all-gather under CPUOffloadPolicy (NCCL can't); nccl stays the GPU fast path.
@@ -232,18 +247,27 @@ def main(
     mesh_device = init_device_mesh("cuda", (world_size,), mesh_dim_names=("shard",))
 
     config = AutoConfig.from_pretrained(MODEL_ID)
-    # Fused Mamba2 Triton kernels (hub-fetched) vs the torch SSD fallback. If the hub fetch
-    # fails, the modeling code falls back to torch_forward with a warning — degraded, not broken.
-    config.use_mamba_kernels = MAMBA_KERNELS
+    # Fused Mamba2 Triton kernels (hub-fetched) vs the torch SSD fallback. The fused path
+    # needs the compiled `causal_conv1d_cuda` extension (separate `causal-conv1d` package,
+    # NOT bundled with the mamba-ssm hub kernel); when it's absent the kernel forward would
+    # assert-crash. Probe it and degrade to the (autograd-friendly, always-available) torch
+    # SSD path instead of dying — the fallback the comment used to only claim.
+    use_mamba = MAMBA_KERNELS and _causal_conv1d_available()
+    if MAMBA_KERNELS and not use_mamba and rank == 0:
+        logger.warning("nemotron-h: causal_conv1d_cuda is unavailable — the fused Mamba2 "
+                       "kernels would assert; falling back to the torch SSD path "
+                       "(use_mamba_kernels=False). Install `causal-conv1d` in the venv "
+                       "to restore the ~1.5x fast path.")
+    config.use_mamba_kernels = use_mamba
     if rank == 0:
-        logger.info(f"nemotron-h: attn={ATTN_IMPL}, use_mamba_kernels={MAMBA_KERNELS}")
+        logger.info(f"nemotron-h: attn={ATTN_IMPL}, use_mamba_kernels={use_mamba}")
     model = CustomNemotronHForCausalLM.from_pretrained(
         MODEL_ID, config=config, dtype=torch.bfloat16, attn_implementation=ATTN_IMPL,
     )
     if rank == 0:
         logger.info(f"nemotron-h: mamba fast path available = "
                     f"{getattr(modeling_nemotron_h, 'is_fast_path_available', None)}")
-    if MAMBA_KERNELS and getattr(modeling_nemotron_h, "is_fast_path_available", False):
+    if use_mamba and getattr(modeling_nemotron_h, "is_fast_path_available", False):
         patched = _patch_mamba_kernel_fp32()
         if rank == 0:
             logger.info(f"nemotron-h: mamba_chunk_scan_combined fp32-upcast patch applied = {patched} "
@@ -256,22 +280,28 @@ def main(
     target_modules = list(target_modules or DEFAULT_LORA_TARGETS)
     apply_linear_lora(model, r=r, alpha=alpha, target_modules=target_modules)
 
-    # ⚠ LoRA × mamba-fast-path interaction: the mem-eff split kernel
-    # (mamba_split_conv1d_scan_combined) fuses the OUT-PROJECTION into the kernel via the RAW
-    # `out_proj.weight` — a LoRA-wrapped out_proj's adapter would be SILENTLY BYPASSED (trains
-    # but never fires in the forward). Force the non-split fast path (causal_conv1d_fn +
-    # mamba_chunk_scan_combined + a module-call out_proj that honors LoRA) on every mixer whose
-    # out_proj is wrapped. in_proj is a module call in both branches (LoRA-safe).
+    # ⚠ Force the NON-split fast path (use_mem_eff_path=False) on EVERY mamba mixer when the
+    # fused kernels are on — for TWO independent reasons:
+    #   (1) the mem-eff split kernel (mamba_split_conv1d_scan_combined) fuses the RAW
+    #       out_proj.weight into the kernel, so a LoRA-wrapped out_proj's adapter is SILENTLY
+    #       BYPASSED (trains but never fires in the forward); and
+    #   (2) the hub mamba-ssm build's split kernel hard-asserts `causal_conv1d_cuda is not None`
+    #       — its OWN reference is None even when the pip `causal-conv1d` IS installed — so it
+    #       CANNOT run here regardless of LoRA.
+    # The non-split path (causal_conv1d_fn + mamba_chunk_scan_combined + a module-call out_proj)
+    # uses the pip causal-conv1d and honors LoRA. Disable the split path UNCONDITIONALLY — the
+    # earlier `out_proj is LinearLoRA` guard missed a q/k/v/o-only target set (out_proj stays a
+    # plain Linear) → the split kernel ran → assert-crash. in_proj is a module call either way.
     n_meff_off = 0
-    for m in model.modules():
-        if isinstance(m, modeling_nemotron_h.NemotronHMamba2Mixer) and \
-                isinstance(getattr(m, "out_proj", None), LinearLoRA) and \
-                getattr(m, "use_mem_eff_path", False):
-            m.use_mem_eff_path = False
-            n_meff_off += 1
+    if use_mamba:
+        for m in model.modules():
+            if isinstance(m, modeling_nemotron_h.NemotronHMamba2Mixer) and \
+                    getattr(m, "use_mem_eff_path", False):
+                m.use_mem_eff_path = False
+                n_meff_off += 1
     if rank == 0 and n_meff_off:
-        logger.info(f"[lora] disabled use_mem_eff_path on {n_meff_off} mamba mixers "
-                    f"(fused out_proj would bypass the out_proj LoRA adapter)")
+        logger.info(f"[mamba] forced non-split fast path on {n_meff_off} mixers "
+                    f"(hub split kernel asserts on causal_conv1d_cuda + would bypass out_proj LoRA)")
 
     # Optionally FULL-train the (untied) token embeddings + LM head on top of LoRA. Done BEFORE
     # FSDP sharding. See tc.unfreeze_embeddings.

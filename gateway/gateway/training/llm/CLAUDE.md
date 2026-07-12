@@ -375,18 +375,31 @@ MoE `NemotronHMoE`/`NemotronHExperts` — 5.5.0 predates it).
   (`NEMOTRON_ATTN=kernels-community/flash-attn3`, head_dim 128 GQA 32/2; sdpa + a padding mask
   materializes an O(S²) causal mask at long context — `NEMOTRON_ATTN=sdpa` is the fallback), and
   Mamba = the **fused Triton kernels** (`NEMOTRON_MAMBA_KERNELS=1` → `config.use_mamba_kernels=True`;
-  `mamba-ssm` + `causal-conv1d` are `lazy_load_kernel`-fetched from the kernels hub at model load —
-  NO source build; needs `einops`). The torch SSD fallback (`NEMOTRON_MAMBA_KERNELS=0`) materializes
-  fp32 chunk intermediates in autograd across the 23 mamba layers — THE long-context memory/speed hog.
+  `mamba-ssm` is `lazy_load_kernel`-fetched from the kernels hub at model load, but its `ssd_combined`
+  does a plain `import causal_conv1d_cuda` and asserts on it — that compiled ext is NOT bundled with
+  the hub kernel and is NOT a `kernels`-hub kernel, so **`causal-conv1d` is BUILT FROM SOURCE in the
+  venv** by `_install_nemotron_kernels` (same cu13/`--no-build-isolation` recipe as qwen; needs
+  `einops` + nvcc). ⚠ **Regression fixed 2026-07-12:** causal-conv1d was NOT in `_ARCH["nemotron"]`
+  deps, so a venv rebuild dropped it → the fused path assert-crashed (worked earlier only because a
+  prior venv had it). Two-part fix: (a) `nemotron_h.py` probes `causal_conv1d_cuda` (import torch
+  first! the .so links libc10.so) and degrades to the torch SSD path with a warning if absent —
+  graceful, not a crash; (b) `_ensure_venv`/`_install_nemotron_kernels` builds it so the fast path
+  actually works at 32k. The torch SSD fallback (`NEMOTRON_MAMBA_KERNELS=0` OR causal-conv1d missing)
+  materializes fp32 chunk intermediates in autograd across the 23 mamba layers — THE long-context
+  memory/speed hog, and it **OOMs at 32k** (~47GB single alloc on H20) → the fused path is REQUIRED
+  for ≥32k. (All 8 dropdown models smoke-verified at 32k / 3 steps on tm-2, 2026-07-12.)
   ⚠ **Three LoRA/kernel traps, all handled in the trainer (found via the NaN bisect + the
   autotrain/nemotron gates — READ THAT CLAUDE.md before touching the backends):**
   (1) the dispatch reads `self.in_proj.weight.device.type` → `LinearLoRA` exposes `weight`/`bias`
   properties delegating to the wrapped Linear; (2) the mem-eff split kernel
   (`mamba_split_conv1d_scan_combined`) fuses the RAW `out_proj.weight` into the kernel → a LoRA-wrapped
-  out_proj's adapter would be SILENTLY bypassed — the trainer sets `use_mem_eff_path=False` on every
-  mixer whose out_proj is wrapped (falls to the non-split fast path: causal_conv1d_fn +
-  mamba_chunk_scan_combined + module-call out_proj; the split kernel can't run here anyway — the hub
-  build asserts on `causal_conv1d_cuda`); (3) **the hub mamba-ssm kernel's bf16 BACKWARD is broken** —
+  out_proj's adapter would be SILENTLY bypassed, AND the hub build's split kernel hard-asserts
+  `causal_conv1d_cuda is not None` (its OWN reference is None even when the pip causal-conv1d IS
+  installed) → it can't run here at all. So the trainer forces `use_mem_eff_path=False` on **every**
+  mamba mixer (unconditionally, when the fused path is on — falls to the non-split fast path:
+  causal_conv1d_fn + mamba_chunk_scan_combined + module-call out_proj). ⚠ **Fixed 2026-07-12:** the
+  old guard only disabled it for a LoRA-wrapped out_proj, so a q/k/v/o-only target set (out_proj stays
+  a plain Linear) left the split kernel active → assert-crash; (3) **the hub mamba-ssm kernel's bf16 BACKWARD is broken** —
   NaN grads in exactly the ddt/dA path (dt_bias, A_log, dx→conv→in_proj; D/norm/out_proj grads stay
   cos 1.0), NOT contiguity, forward fine (cos 0.999988), fp32 exact → `_patch_mamba_kernel_fp32`
   wraps the kernel to upcast (x,dt,A,B,C)→fp32 + downcast the output (verified: xgrad cos 0.9999 vs
@@ -396,9 +409,10 @@ MoE `NemotronHMoE`/`NemotronHExperts` — 5.5.0 predates it).
   `_fa_mode` returns `"none"` → the deps install skips the FA3-wheel/FA4/qwen-kernel step (the hub
   kernels fetch at model load instead).
 - **Deps/venv** (`_ARCH["nemotron"]`, `/share/autotrain-llm-nemotron`): torch 2.10+cu13 (same base as
-  qwen) + `transformers==5.12.1 kernels<=0.14.0 sentencepiece einops` (⚠ the Nemotron tokenizer needs
-  sentencepiece to instantiate — at pack time on the gateway AND at merge/serve time; the hub mamba-ssm
-  kernel imports einops).
+  qwen) + `transformers==5.12.1 kernels<=0.14.0 sentencepiece einops`, PLUS `causal-conv1d` built from
+  source by `_install_nemotron_kernels` (in the `_fa_mode=="none"` branch of `_ensure_venv`; nvcc/CUDA_HOME
+  wired for nemotron like qwen). ⚠ the Nemotron tokenizer needs sentencepiece to instantiate — at pack
+  time on the gateway AND at merge/serve time; the hub mamba-ssm kernel imports einops.
 - **Chat template:** `_normalize_nemotron_turn` (llm_pack) parses tool-call `arguments` str→dict
   (REQUIRED — the template does `arguments|items`, LOUD crash otherwise) + maps `reasoning`→
   `reasoning_content`; `truncate_history_thinking=False` keeps all reasoning. NO `{% generation %}`
