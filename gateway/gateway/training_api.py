@@ -29,7 +29,8 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from .pathsafe import validate_path_field
 from sqlalchemy import (
     JSON,
     DateTime,
@@ -746,6 +747,27 @@ async def _terminate_pod(api_key: str, runpod_id: str) -> None:
             await cli.delete(f"/pods/{runpod_id}")
     except Exception as e:  # noqa: BLE001
         logger.warning("training: pod %s teardown failed: %s", runpod_id, e)
+
+
+async def _teardown_run_pod_if_any(row, redis=None) -> None:
+    """Best-effort tear down a finalized run's RunPod pod so it stops billing.
+
+    The live path (`_safe_run`) terminates the pod inline after finalize, but the
+    restart finalize-from-log paths (`_resume_orphan_stream` / `_reconcile_orphan`)
+    reach the box over SSH and historically only swept temp files — leaving the
+    RunPod pod to bill indefinitely. `runpod_pod_id` is only ever set for RunPod
+    runs (VM runs leave it NULL), so its presence is the signal to tear down."""
+    pod = getattr(row, "runpod_pod_id", None)
+    prov_id = getattr(row, "provider_id", None)
+    if not (pod and prov_id):
+        return
+    try:
+        api_key = await compute._resolve_api_key(prov_id)
+        await _terminate_pod(api_key, pod)
+        if redis is not None:
+            await _push_log(redis, row.id, f"[gateway] pod {pod} torn down (billing stopped)")
+    except Exception as e:  # noqa: BLE001 — teardown is best-effort
+        logger.warning("training %s: pod %s teardown failed: %s", getattr(row, "id", "?"), pod, e)
 
 
 async def _reap_label_pod(run_id: str, provider_id: Optional[str]) -> bool:
@@ -2459,7 +2481,21 @@ async def _redispatch_run(redis, run_id: str, reason: str) -> str:
             row.error_text = (f"orphaned by gateway restart ({reason})"
                               + (f" — gave up after {attempts} relaunch(es)" if attempts else ""))[:4000]
             row.ended_at = datetime.now(timezone.utc)
+            orphan_pod = row.runpod_pod_id
+            orphan_prov = row.provider_id
+            prov_is_runpod = prov is not None and prov.kind == "runpod"
             await s.commit()
+            # The old RunPod pod survived the restart and we're NOT re-running it,
+            # so it would bill indefinitely with no DB record driving a teardown.
+            # Best-effort terminate it now (outside the session — the HTTP call
+            # mustn't hold a pooled connection).
+            if orphan_pod and prov_is_runpod:
+                try:
+                    api_key = await compute._resolve_api_key(orphan_prov)
+                    await _terminate_pod(api_key, orphan_pod)
+                    await _push_log(redis, run_id, f"[gateway] terminated orphaned pod {orphan_pod} (billing stopped)")
+                except Exception as e:  # noqa: BLE001 — teardown is best-effort
+                    logger.warning("training %s: orphan pod %s teardown failed: %s", run_id, orphan_pod, e)
             return "failed"
         rj["restart_relaunches"] = attempts + 1
         row.result_json = rj
@@ -2574,6 +2610,9 @@ async def _resume_orphan_stream(redis, run_id: str) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning("training %s: resume-finalize log upload failed: %s", run_id, e)
     await _cleanup_remote_run_files((host, port, suser, key), run_id)
+    # RunPod pod (if this was a cloud run) keeps billing until torn down — the
+    # live path does this inline; the restart-finalize path must too.
+    await _teardown_run_pod_if_any(row, redis)
 
 
 async def _reconcile_orphan(row, redis) -> str:
@@ -2645,6 +2684,9 @@ async def _reconcile_orphan(row, redis) -> str:
     except Exception as e:  # noqa: BLE001
         logger.warning("training %s: restart-finalize log upload failed: %s", row.id, e)
     await _cleanup_remote_run_files((host, port, user, key), row.id)
+    # Tear down the RunPod pod (cloud run) so it stops billing after this
+    # finalize-from-log — the live path does it inline; this path must too.
+    await _teardown_run_pod_if_any(row, redis)
     return status
 
 
@@ -2958,6 +3000,12 @@ class CreateTrainingRunRequest(BaseModel):
     # keeps the heavy stack off the box's system python. Default per task:
     # /share/autotrain-whisper (asr) or /share/autotrain-tts (tts).
     venv_path: Optional[str] = None
+
+    @field_validator("work_dir", "venv_path")
+    @classmethod
+    def _safe_paths(cls, v, info):  # noqa: N805
+        # These land in remote shell commands ({venv}/bin/python, rm -rf {work_dir}).
+        return validate_path_field(v, info.field_name)
     # rm the run's checkpoint/work dir on the remote once the run ends (the best
     # model is already on S3). Keeps the volume from filling across runs.
     cleanup_checkpoints: bool = True
@@ -3249,6 +3297,10 @@ async def create_training_run(
         prov = await session.get(Provider, body.provider_id)
         if prov is None:
             raise HTTPException(status_code=400, detail="unknown provider_id")
+        # Providers are per-user — a run bills the owner's cloud account or runs on
+        # their VM. Enforce ownership (admins exempt), matching the try-it path.
+        if prov.owner_id != user.id and not user.is_admin:
+            raise HTTPException(status_code=403, detail="that provider isn't yours")
         if prov.kind == "vm":
             is_vm_run = True
             vm_gpus = (prov.config or {}).get("gpus") or []
@@ -4227,6 +4279,11 @@ class HfExportRequest(BaseModel):
     venv_path: Optional[str] = None        # override the merge venv path
     image: Optional[str] = None            # cloud pod image; blank → DEFAULT_IMAGE
 
+    @field_validator("venv_path")
+    @classmethod
+    def _safe_venv_path(cls, v, info):  # noqa: N805
+        return validate_path_field(v, info.field_name)
+
 
 @router.post("/{run_id}/hf-export")
 async def export_to_huggingface(
@@ -4339,6 +4396,8 @@ async def export_to_huggingface(
             prov = await session.get(Provider, exp_provider_id) if exp_provider_id else None
             if exp_provider_id and (prov is None or prov.kind != "runpod"):
                 raise HTTPException(status_code=400, detail="the chosen cloud provider must be a RunPod account")
+            if prov is not None and prov.owner_id != user.id and not user.is_admin:
+                raise HTTPException(status_code=403, detail="that provider isn't yours")
             cloud_spec = {
                 "provider_id": exp_provider_id,
                 "gpu_type": (body.gpu_type or "").strip() or (row.gpu_type or "NVIDIA L40S"),
@@ -4354,6 +4413,10 @@ async def export_to_huggingface(
             prov = await session.get(Provider, vm_id) if vm_id else None
             if prov is None or prov.kind != "vm":
                 raise HTTPException(status_code=400, detail="the chosen VM provider was not found")
+            # A caller-chosen VM (exp_provider_id) must be the caller's own; the run's
+            # own box (row.provider_id) already passed _owned() above.
+            if exp_provider_id and prov.owner_id != user.id and not user.is_admin:
+                raise HTTPException(status_code=403, detail="that VM provider isn't yours")
             ssh = await _resolve_provider_ssh(prov, run_id)
             if ssh is None:
                 raise HTTPException(status_code=400, detail="can't reach the chosen VM (SSH coords unavailable)")

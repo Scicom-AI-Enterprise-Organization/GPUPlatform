@@ -18,7 +18,8 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from .pathsafe import validate_path_field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -211,6 +212,12 @@ class CreateAppRequest(BaseModel):
     # Optional setup script the worker runs once after the venv is ready and before
     # launching models (e.g. `bash <(curl -fsSL …/install_deepgemm.sh)`).
     pre_script: Optional[str] = None
+
+    @field_validator("venv_path")
+    @classmethod
+    def _safe_venv_path(cls, v, info):  # noqa: N805
+        # venv_path lands in remote shell commands on the VM worker.
+        return validate_path_field(v, info.field_name)
 
 
 class CreateAppResponse(BaseModel):
@@ -1578,6 +1585,11 @@ async def create_app(
                 status_code=400,
                 detail=f"provider {req.provider_id} is kind={prov.kind}, serverless requires runpod, pi or vm",
             )
+        # Providers are per-user (billed to the owner's cloud account / run on the
+        # owner's VM). Enforce ownership like the try-it path does — otherwise a
+        # caller can spend another tenant's RunPod credits or land on their box.
+        if prov.owner_id != user.id and not user.is_admin:
+            raise HTTPException(status_code=403, detail="that provider isn't yours")
     is_vm = prov is not None and prov.kind == "vm"
 
     # VM-only GPU pin (e.g. "0,1,2,3"). Validated against the VM's probed GPU

@@ -697,6 +697,48 @@ def _resolve_config(
     return yaml.safe_dump(cfg, sort_keys=False)
 
 
+_REDACTED = "***redacted***"
+
+
+def _redact_config_for_display(resolved_yaml: str) -> str:
+    """Strip secrets from a RESOLVED config before it's persisted to S3 and
+    served through the files API.
+
+    `_resolve_config` injects the platform `RUNPOD_API_KEY`, the resolved
+    `HF_TOKEN`, and every admin global env/secret into the config (under
+    `runpod.runpod_api_key`, `runpod.env` / `remote.env`, and
+    `benchmark[].model.hf_token`). The run owner — and, for a public benchmark,
+    every logged-in user — can download that file, so it must never carry live
+    credentials. Redact those fields (values only; key names are harmless) and
+    return YAML. On any parse failure we return a placeholder rather than risk
+    emitting the un-redacted text."""
+    try:
+        cfg = yaml.safe_load(resolved_yaml) or {}
+    except Exception:  # noqa: BLE001 — never leak the raw (secret-bearing) text
+        return "# config.yaml withheld — could not parse for secret redaction\n"
+    if not isinstance(cfg, dict):
+        return "# config.yaml withheld — unexpected structure\n"
+
+    def _redact_env(d: dict) -> None:
+        env = d.get("env")
+        if isinstance(env, dict):
+            d["env"] = {k: _REDACTED for k in env}
+
+    for section in ("runpod", "remote"):
+        blk = cfg.get(section)
+        if isinstance(blk, dict):
+            if blk.get("runpod_api_key"):
+                blk["runpod_api_key"] = _REDACTED
+            _redact_env(blk)
+    _redact_env(cfg)  # any top-level env
+    for item in cfg.get("benchmark") or []:
+        if isinstance(item, dict):
+            model = item.get("model")
+            if isinstance(model, dict) and model.get("hf_token"):
+                model["hf_token"] = _REDACTED
+    return yaml.safe_dump(cfg, sort_keys=False)
+
+
 def _pick_engine_subcommand(raw_yaml: str) -> list[str]:
     """Read engine from the first benchmark item; default to vllm.
 
@@ -836,8 +878,12 @@ def _ssh_cleanup_paths_sync(vm_target: dict, paths: list[str]) -> tuple[bool, st
         if not safe:
             return False, "no safe paths to clean"
         # `rm -rf` is fine for missing paths; we use bash -lc so ~ expands.
+        # Quote the whole inner command as ONE arg — inside `bash -lc "..."` the
+        # single quotes below lose their power and $()/backticks in a path would
+        # still execute; shlex.quote closes that.
+        import shlex as _shlex
         cmd = "; ".join(f"rm -rf '{p}'" for p in safe)
-        full = f"bash -lc \"{cmd}\""
+        full = "bash -lc " + _shlex.quote(cmd)
         stdin, stdout, stderr = client.exec_command(full, timeout=60)
         rc = stdout.channel.recv_exit_status()
         err = stderr.read().decode(errors="replace").strip()
@@ -1476,9 +1522,15 @@ async def run_benchmark(redis, bench_id: str, raw_yaml: str) -> None:
     # prefix baked into the row so reads + writes always agree.
     target = await _bench_s3_target(storage_id)
     prefix = s3_prefix
+    # Redact secrets from the resolved config before persisting — this file is
+    # downloadable via the files API (and by every logged-in user if the bench is
+    # public); the un-redacted resolve carries the platform RunPod/HF creds and
+    # all global secrets.
     s3_put_text(
         f"{prefix}config.yaml",
-        _resolve_config(raw_yaml, vm_target=vm_target, ingress=is_ingress, env_vars=run_env_vars, visible_devices=run_visible_devices, runpod_key_path=runpod_key_path, bench_id=bench_id, global_env=global_env),
+        _redact_config_for_display(
+            _resolve_config(raw_yaml, vm_target=vm_target, ingress=is_ingress, env_vars=run_env_vars, visible_devices=run_visible_devices, runpod_key_path=runpod_key_path, bench_id=bench_id, global_env=global_env)
+        ),
         target=target,
     )
     result_json: Optional[dict] = None
@@ -2169,6 +2221,14 @@ async def create_benchmark(
     # disabled gate doesn't apply — it only guards the spawn-a-pod path. Detect
     # the same way the runner does: a base_url in the config + no machine provider.
     is_ingress = (not body.provider_id) and (_ingress_base_url(body.config_yaml) is not None)
+    if is_ingress:
+        # SSRF guard: the ingress base_url is fetched server-side (and non-200
+        # bodies land in the run log) — block link-local/metadata + bad schemes.
+        from .netsafe import assert_safe_fetch_url
+        try:
+            assert_safe_fetch_url(_ingress_base_url(body.config_yaml))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"unsafe ingress base_url: {e}")
     from .provider import ensure_benchmark_provider_allowed, CloudProviderDisabled
     try:
         if not is_ingress:
@@ -2403,10 +2463,18 @@ async def benchmark_stats(
     user: User = Depends(require_section("benchmark")),
     session: AsyncSession = Depends(get_session),
 ):
-    rows = await session.execute(_bench_scope_stmt(user, scope))
+    bench_rows = (await session.execute(_bench_scope_stmt(user, scope))).scalars().all()
+    # Prefetch every bound provider in ONE query instead of a session-open +
+    # Provider.get per row (an N+1 that checked out a pooled connection each time).
+    prov_ids = {b.provider_id for b in bench_rows if b.provider_id}
+    prov_cache: dict = {}
+    if prov_ids:
+        from .db import Provider as _Provider
+        for _p in (await session.execute(select(_Provider).where(_Provider.id.in_(prov_ids)))).scalars().all():
+            prov_cache[_p.id] = _p
     out: list[BenchStat] = []
-    for b in rows.scalars().all():
-        meta = await _bench_gpu_meta(b)
+    for b in bench_rows:
+        meta = await _bench_gpu_meta(b, prov_cache)
         rj = b.result_json if isinstance(b.result_json, dict) else {}
         tput = rj.get("output_throughput")
         dur = (
@@ -2524,13 +2592,18 @@ def _parse_config(yaml_text: str) -> dict:
     }
 
 
-async def _bench_gpu_meta(b: "Benchmark") -> dict:
+async def _bench_gpu_meta(b: "Benchmark", prov_cache: Optional[dict] = None) -> dict:
     """Resolve a benchmark's hardware/serve metadata: ``{gpu_type, gpu_count,
     model, tp, dp, engine}``. RunPod runs carry ``gpu_type`` in the YAML's
     ``runpod.pod`` block; VM (bare-metal) runs don't, so fall back to the bound
     provider's stored GPU info (populated by its last Test/availability probe),
-    e.g. ``"H20-3e (tm-2)"``. Opens its own session for the provider lookup so
-    it's safe to call from concurrent gather() contexts."""
+    e.g. ``"H20-3e (tm-2)"``.
+
+    ``prov_cache`` (provider_id → Provider) lets a caller resolving MANY rows
+    prefetch every provider in one ``IN`` query and avoid the per-row
+    session-open + query (an N+1 — one pooled-connection checkout per benchmark).
+    Omit it and this opens its own session, so it's still safe to call standalone
+    from concurrent gather() contexts."""
     meta = _parse_config(b.config_yaml or "")
     # Manual row values (set at create / via PATCH — ingress and Slurm runs)
     # override whatever the config says.
@@ -2540,9 +2613,12 @@ async def _bench_gpu_meta(b: "Benchmark") -> dict:
         meta["gpu_count"] = int(b.gpu_count)
     if b.provider_id and not meta.get("gpu_type"):
         try:
-            async with session_factory()() as _s:
-                from .db import Provider as _Provider
-                prov = await _s.get(_Provider, b.provider_id)
+            if prov_cache is not None:
+                prov = prov_cache.get(b.provider_id)
+            else:
+                async with session_factory()() as _s:
+                    from .db import Provider as _Provider
+                    prov = await _s.get(_Provider, b.provider_id)
             if prov is not None:
                 pcfg = prov.config or {}
                 gpus_list = pcfg.get("gpus") or []
@@ -3102,12 +3178,38 @@ async def delete_benchmark(
         except Exception:
             pass
     bench_name = b.name
+    # Snapshot pod/provider before the row is gone: deleting a still-running
+    # cloud bench (Delete instead of Terminate) otherwise leaves its RunPod pod
+    # billing with no DB record left to drive a teardown.
+    runpod_pod_id = b.runpod_pod_id
+    del_provider_id = b.provider_id
+    del_provider_kind: Optional[str] = None
+    if del_provider_id:
+        from .db import Provider
+        _prov = await session.get(Provider, del_provider_id)
+        if _prov is not None:
+            del_provider_kind = _prov.kind
     # Snapshot billing inputs before the row is gone. If the user deletes a
     # bench that's still running, ended_at will be None and the audit helper
     # treats "now" as the end — giving us a "spent so far at deletion" total.
     cost = audit.cost_breakdown(b.started_at, b.ended_at, b.cost_per_hr)
     await session.delete(b)
     await session.commit()
+    # Tear the pod down AFTER the row is committed-gone (off the request session)
+    # in a tracked background task — same teardown Terminate runs. Best-effort.
+    if runpod_pod_id:
+        pid_for_teardown = del_provider_id if del_provider_kind == "runpod" else None
+
+        async def _delete_teardown():
+            try:
+                await _terminate_runpod_pod(runpod_pod_id, provider_id=pid_for_teardown)
+            except Exception as e:  # noqa: BLE001 — best-effort; row is already gone
+                logger.warning("benchmark %s: delete-time pod %s teardown failed: %s",
+                               bench_id, runpod_pod_id, e)
+
+        _t = asyncio.create_task(_delete_teardown())
+        _active_terminations[bench_id] = _t
+        _t.add_done_callback(lambda _tt, _bid=bench_id: _active_terminations.pop(_bid, None))
     await audit.record(
         user, "benchmark.delete", "benchmark", bench_id, bench_name,
         details=cost,
@@ -3509,7 +3611,9 @@ async def public_compare(
         rows: list = []
         try:
             target = await _bench_s3_target(b.storage_id)
-            agg = s3_get_text(f"{b.s3_prefix}result.json", target=target)
+            # s3_get_text is blocking boto3 — this is an UNAUTHENTICATED route, so a
+            # sync call here lets anyone stall the whole gateway event loop.
+            agg = await asyncio.to_thread(lambda: s3_get_text(f"{b.s3_prefix}result.json", target=target))
             if agg:
                 rows = json.loads(agg).get("results") or []
         except Exception:

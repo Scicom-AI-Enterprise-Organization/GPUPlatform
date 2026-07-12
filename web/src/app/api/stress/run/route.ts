@@ -7,6 +7,7 @@
 
 import { NextRequest } from "next/server";
 import { TOKEN_COOKIE } from "@/lib/auth-cookie";
+import { requireSession } from "@/lib/require-session";
 import { runStressBench, formatLine, type StressConfig } from "@/lib/stress-bench";
 
 export const runtime = "nodejs";
@@ -21,6 +22,16 @@ function clamp(v: unknown, lo: number, hi: number, dflt: number): number {
 }
 
 export async function POST(req: NextRequest) {
+  // A stress run drives a big load test against the gateway — require a valid
+  // session before starting (middleware skips /api/*, so guard here).
+  const session = await requireSession(req);
+  if (!session.ok) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   const token = req.cookies.get(TOKEN_COOKIE)?.value;
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const appId = typeof body?.app_id === "string" ? body.app_id : "";

@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import random
 import signal
 import time
 import uuid
@@ -108,11 +109,25 @@ async def _redis_ready(rdb, *, timeout_s: float = 120.0) -> None:
             delay = min(delay * 2, 10.0)
 
 
-async def register(gateway_url: str, machine_id: str, app_id: str, token: str) -> str:
+async def register(gateway_url: str, machine_id: str, app_id: str, token: str,
+                   *, timeout_s: float = 900.0) -> str:
+    """Register with the gateway, retrying transient failures with backoff.
+
+    The gateway may still be starting / rolling / briefly unreachable when a
+    freshly-provisioned pod boots — and giving up after ~30s (the old fixed
+    30×1s loop) exited the process while the pod kept billing indefinitely.
+    Retry patiently for up to `timeout_s` (~15 min) with a bounded exponential
+    backoff (cap 30s) plus jitter — modelled on `_redis_ready` — so a whole
+    fleet booting together doesn't hammer a recovering gateway in lockstep. An
+    explicit reject (`ok:false`) is deterministic, so it fails fast (no retry)."""
     url = f"{gateway_url.rstrip('/')}/workers/register"
     body = {"machine_id": machine_id, "app_id": app_id, "token": token}
+    deadline = time.monotonic() + timeout_s
+    delay = 1.0
+    attempt = 0
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for attempt in range(1, 31):
+        while True:
+            attempt += 1
             try:
                 r = await client.post(url, json=body)
                 if r.status_code == 200:
@@ -123,13 +138,49 @@ async def register(gateway_url: str, machine_id: str, app_id: str, token: str) -
                 logger.warning("register attempt %d → status=%s", attempt, r.status_code)
             except httpx.HTTPError as e:
                 logger.warning("register attempt %d → %s", attempt, e)
-            await asyncio.sleep(1.0)
-    raise RuntimeError("gateway never accepted registration after 30 attempts")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"gateway never accepted registration after {attempt} attempts "
+                    f"(~{int(timeout_s)}s)")
+            # Bounded exponential backoff + small jitter (decorrelates a fleet).
+            sleep_s = min(delay, 30.0) + random.uniform(0.0, 1.0)
+            logger.warning("register retrying in %.1fs", sleep_s)
+            await asyncio.sleep(sleep_s)
+            delay = min(delay * 2, 30.0)
 
 
 # OpenAI-compatible audio endpoints take a multipart file upload, so the worker
 # rebuilds multipart from the base64'd clip the gateway put in the JSON payload.
 AUDIO_PATHS = ("/v1/audio/transcriptions", "/v1/audio/translations")
+
+# Cap the upstream body we echo into a result so a pathological error page can't
+# bloat the Redis result key (vLLM's error JSON is normally tiny).
+_MAX_UPSTREAM_BODY = 4096
+
+
+class UpstreamError(Exception):
+    """A vLLM upstream call failed. Carries a structured `payload` (the error
+    message + the upstream status/body when it was an HTTP status error) so the
+    job runner can write it as a FAILED result instead of a bogus COMPLETED one."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("error", "upstream error"))
+        self.payload = payload
+
+
+def _upstream_error_payload(e: httpx.HTTPError) -> dict:
+    """Structured error info for a failed vLLM upstream call. For an HTTP status
+    error, preserve vLLM's OWN status code + response body — that's the actual
+    reason (bad request, model not found, OOM) — instead of collapsing it to a
+    bare `str(e)` that discards it."""
+    out: dict[str, Any] = {"error": str(e)}
+    if isinstance(e, httpx.HTTPStatusError):
+        out["status_code"] = e.response.status_code
+        try:
+            out["body"] = e.response.text[:_MAX_UPSTREAM_BODY]
+        except Exception:  # noqa: BLE001 — response body not available/decodable
+            pass
+    return out
 
 
 async def handle(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/completions", base_url: str | None = None) -> Any:
@@ -168,7 +219,10 @@ async def handle(mode: str, model_id: str, payload: dict, endpoint: str = "/v1/c
                 r.raise_for_status()
                 return r.json()
             except httpx.HTTPError as e:
-                return {"error": str(e)}
+                # An upstream/generation failure is NOT a completed job — raise so
+                # the runner records it as FAILED (preserving vLLM's status+body)
+                # rather than wrapping {"error": …} as a successful result.
+                raise UpstreamError(_upstream_error_payload(e)) from e
     return {"error": f"unknown WORKER_MODE: {mode}"}
 
 
@@ -203,7 +257,11 @@ async def handle_stream(mode: str, model_id: str, payload: dict, endpoint: str =
                 yield {"done": True}
                 return
             except httpx.HTTPError as e:
-                yield {"error": str(e), "done": True}
+                # Terminal upstream error mid-stream (bad request, engine dead,
+                # connection drop). Emit an error chunk carrying vLLM's own
+                # status+body; the runner keys off the "error" field to record the
+                # job as FAILED rather than completed.
+                yield {**_upstream_error_payload(e), "done": True}
                 return
 
     yield {"error": f"unknown WORKER_MODE: {mode}", "done": True}
@@ -425,31 +483,81 @@ async def heartbeat_loop(
                 pass
 
 
+# Max jobs a single-model worker runs at once. It used to serialize (one job
+# fully finished before the next BRPOP), starving vLLM's continuous-batching
+# engine — one in-flight request per worker no matter the GPU headroom. Now we
+# dispatch each popped job as a semaphore-bounded child task, matching multi
+# mode (dispatch.MAX_CONCURRENT_JOBS). Env-overridable for small/large boxes.
+SINGLE_MODE_MAX_CONCURRENT_JOBS = int(
+    os.environ.get("WORKER_MAX_CONCURRENT_JOBS", "64") or "64")
+
+
+async def _dispatch_job(rdb, blob: str, machine_id: str, mode: str, model_id: str,
+                        sem: asyncio.Semaphore, processing_key: str) -> None:
+    """Run one popped job (parse → unary/stream), then remove it from the
+    per-machine processing list. Result-writing + error handling live entirely
+    in _run_unary/_run_stream (unchanged); this just bounds concurrency and does
+    the processing-list bookkeeping. Never raises out (except cancellation)."""
+    try:
+        job = json.loads(blob)
+        request_id = job["request_id"]
+        payload = job.get("payload", {})
+        stream = bool(job.get("stream"))
+        timeout_s = float(job.get("timeout_s", 600))
+        endpoint = job.get("endpoint", "/v1/completions")
+        logger.info("picked up %s (stream=%s endpoint=%s timeout=%ss)", request_id, stream, endpoint, timeout_s)
+        if stream:
+            await _run_stream(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint)
+        else:
+            await _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("job handler crashed")
+    finally:
+        # Result written (or the job was poison/crashed) → drop it from the
+        # processing list. If the worker instead DIES before reaching here, the
+        # entry stays and can be recovered. See poll_loop for the follow-up note.
+        try:
+            await rdb.lrem(processing_key, 1, blob)
+        except Exception:  # noqa: BLE001 — best-effort cleanup, never fail the job
+            logger.warning("could not LREM job from %s", processing_key)
+        sem.release()
+
+
 async def poll_loop(rdb, queue_key: str, machine_id: str, mode: str, model_id: str, drain_event: asyncio.Event) -> None:
     logger.info("ready, polling %s", queue_key)
+    sem = asyncio.Semaphore(SINGLE_MODE_MAX_CONCURRENT_JOBS)
+    tasks: set[asyncio.Task] = set()
+    # Reliability: BRPOPLPUSH atomically moves the popped job into a per-machine
+    # processing list so a job in-flight when the worker dies (SIGKILL / OOM /
+    # crash between pop and result-write) isn't silently lost — it survives in
+    # `processing:{machine_id}`. We LREM it once the result is written (in
+    # _dispatch_job). FOLLOW-UP (gateway-side, intentionally NOT done here to
+    # avoid uncoordinated cross-service change): when a worker's heartbeat TTL
+    # lapses, the gateway should requeue any leftover entries in
+    # `processing:{machine_id}` back onto `queue:{app_id}` (and mark still-live
+    # request ids) to fully close the at-least-once loop.
+    processing_key = f"processing:{machine_id}"
     while not drain_event.is_set():
         try:
-            res = await rdb.brpop(queue_key, timeout=2)
-            if res is None:
+            blob = await rdb.brpoplpush(queue_key, processing_key, timeout=2)
+            if blob is None:
                 continue
-            _key, blob = res
-            job = json.loads(blob)
-            request_id = job["request_id"]
-            payload = job.get("payload", {})
-            stream = bool(job.get("stream"))
-            timeout_s = float(job.get("timeout_s", 600))
-            endpoint = job.get("endpoint", "/v1/completions")
-            logger.info("picked up %s (stream=%s endpoint=%s timeout=%ss)", request_id, stream, endpoint, timeout_s)
-
-            if stream:
-                await _run_stream(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint)
-            else:
-                await _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint)
+            await sem.acquire()
+            t = asyncio.create_task(
+                _dispatch_job(rdb, blob, machine_id, mode, model_id, sem, processing_key))
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("loop error, sleeping 1s")
             await asyncio.sleep(1.0)
+    # Graceful shutdown: let in-flight jobs finish (each writes its result +
+    # clears its processing-list entry) before returning.
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeout_s, endpoint="/v1/completions", base_url=None):
@@ -461,6 +569,16 @@ async def _run_unary(rdb, request_id, machine_id, mode, model_id, payload, timeo
         result = {
             "status": "timeout",
             "output": {"error": f"request exceeded timeout_s={timeout_s}"},
+            "machine_id": machine_id,
+            "node": node_meta(),
+        }
+    except UpstreamError as e:
+        # vLLM errored — a FAILED job, not a completed one. Preserve vLLM's own
+        # status/body (in e.payload) so the caller sees the real reason.
+        logger.warning("%s upstream error: %s", request_id, e)
+        result = {
+            "status": "failed",
+            "output": e.payload,
             "machine_id": machine_id,
             "node": node_meta(),
         }
@@ -541,6 +659,11 @@ async def _run_stream(rdb, request_id, machine_id, mode, model_id, payload, time
         status = "timeout"
     elif cancelled:
         status = "cancelled"
+    elif isinstance(last, dict) and "error" in last:
+        # handle_stream's terminal chunk carries an "error" field only when the
+        # upstream vLLM call failed (raise_for_status / mid-stream drop). Don't
+        # report a generation that errored as completed.
+        status = "failed"
     else:
         status = "completed"
     final = {"status": status, "output": last, "machine_id": machine_id, "streamed": True, "node": node_meta()}

@@ -22,6 +22,10 @@ export function LogsTab({ bench }: { bench: BenchmarkRecord }) {
   useEffect(() => {
     if (!streaming) return;
     const es = new EventSource(gateway.benchmarkLogsStreamUrl(bench.id));
+    // The server replays the whole Redis log list on every (re)connect. onopen
+    // fires on the initial connect AND every transparent reconnect, so clear
+    // here — otherwise a network blip doubles every line already shown.
+    es.onopen = () => setLines([]);
     es.onmessage = (ev) => {
       setLines((prev) => [...prev, ev.data]);
     };

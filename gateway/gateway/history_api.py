@@ -26,6 +26,7 @@ low-volume and have no default window.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -770,12 +771,18 @@ async def _activity_records(session, s_dt, u_dt):
     tout_col = func.json_extract_path_text(ReqRow.output, "usage", "completion_tokens").label("tout")
     sv = select(ReqRow.owner_id, ReqRow.app_id, ReqRow.created_at, ReqRow.completed_at, ReqRow.ttft_ms,
                 ReqRow.status, model_col, tin_col, tout_col).where(ReqRow.created_at >= s_dt)
-    px = select(ProxyRequest).where(ProxyRequest.created_at >= s_dt)
+    # Project only the columns the aggregator reads — NOT the whole ProxyRequest
+    # entity. At the cap that's the difference between materialising 200k slim
+    # Rows and 200k full ORM objects (every column + payload blobs + identity map).
+    px = select(ProxyRequest.owner_id, ProxyRequest.created_at, ProxyRequest.model,
+                ProxyRequest.prompt_tokens, ProxyRequest.completion_tokens,
+                ProxyRequest.ttft_ms, ProxyRequest.latency_ms,
+                ProxyRequest.upstream).where(ProxyRequest.created_at >= s_dt)
     if u_dt is not None:
         sv = sv.where(ReqRow.created_at < u_dt)
         px = px.where(ProxyRequest.created_at < u_dt)
     sv_rows = (await session.execute(sv.order_by(ReqRow.created_at.desc()).limit(_ACTIVITY_CAP))).all()
-    px_rows = (await session.execute(px.order_by(ProxyRequest.created_at.desc()).limit(_ACTIVITY_CAP))).scalars().all()
+    px_rows = (await session.execute(px.order_by(ProxyRequest.created_at.desc()).limit(_ACTIVITY_CAP))).all()
     # Requests whose body omitted `model` (valid on the path-scoped /{app_id}/v1/… routes —
     # the URL already fixes the endpoint) land with no payload.model and would chart as
     # "(unknown)". Backfill the label from the endpoint's served model instead. Only
@@ -806,27 +813,13 @@ async def _activity_records(session, s_dt, u_dt):
     return recs, (len(sv_rows) >= _ACTIVITY_CAP or len(px_rows) >= _ACTIVITY_CAP)
 
 
-@router.get("/activity", response_model=ActivityResponse)
-async def history_activity(
-    _: User = Depends(require_admin),
-    session: AsyncSession = Depends(get_session),
-    since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
-    tz: str = Query("UTC", description="IANA timezone for bucketing"),
-    granularity: str = Query("hour", pattern="^(15min|hour|day)$", description="time bucket size"),
-    top: int = Query(10, ge=1, le=50, description="how many top users / models to return"),
-    models: Optional[list[str]] = Query(None, description="filter to these model names (repeatable); omit for all"),
-):
+def _fold_activity(recs, tzinfo, granularity):
+    """Pure-CPU aggregation of the activity records into the per-bucket / model /
+    user / upstream accumulators. Extracted so the caller can run it via
+    asyncio.to_thread: at the row cap this loop (~400k iterations) would otherwise
+    block the single gateway event loop for seconds, stalling ALL inference, SSE
+    and heartbeats while an admin loads the dashboard."""
     from collections import defaultdict
-    tzinfo = _tzinfo(tz)
-    s_dt = _parse_dt(since, "since") or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_WINDOW_DAYS))
-    u_dt = _parse_dt(until, "until")
-    recs, capped = await _activity_records(session, s_dt, u_dt)
-    # The picker lists every model in the window; compute it before the filter narrows recs.
-    all_models = sorted({r[2] for r in recs}, key=str.lower)
-    if models:
-        wanted = set(models)
-        recs = [r for r in recs if r[2] in wanted]
-
     bkt = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
                                "_ts": 0, "_tn": 0, "_ls": 0, "_ln": 0})  # ttft/latency sum+count
     by_model = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
@@ -850,6 +843,35 @@ async def history_activity(
         if src == "proxy":  # upstream only exists for proxied requests
             bu = by_upstream[upstream]; bu["requests"] += 1; bu["tokens"] += pin + pout
             upb = upstream_bkt[(k, upstream)]; upb["requests"] += 1; upb["tokens"] += pin + pout
+    return (bkt, by_model, by_user, by_upstream, model_bkt, user_bkt, upstream_bkt,
+            ttfts, lats, sum_pin, sum_pout)
+
+
+@router.get("/activity", response_model=ActivityResponse)
+async def history_activity(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+    since: Optional[str] = _Q_SINCE, until: Optional[str] = _Q_UNTIL,
+    tz: str = Query("UTC", description="IANA timezone for bucketing"),
+    granularity: str = Query("hour", pattern="^(15min|hour|day)$", description="time bucket size"),
+    top: int = Query(10, ge=1, le=50, description="how many top users / models to return"),
+    models: Optional[list[str]] = Query(None, description="filter to these model names (repeatable); omit for all"),
+):
+    from collections import defaultdict
+    tzinfo = _tzinfo(tz)
+    s_dt = _parse_dt(since, "since") or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_WINDOW_DAYS))
+    u_dt = _parse_dt(until, "until")
+    recs, capped = await _activity_records(session, s_dt, u_dt)
+    # The picker lists every model in the window; compute it before the filter narrows recs.
+    all_models = sorted({r[2] for r in recs}, key=str.lower)
+    if models:
+        wanted = set(models)
+        recs = [r for r in recs if r[2] in wanted]
+
+    # Fold off the event loop — this is a ~400k-iteration pure-CPU pass at the cap.
+    (bkt, by_model, by_user, by_upstream, model_bkt, user_bkt, upstream_bkt,
+     ttfts, lats, sum_pin, sum_pout) = await asyncio.to_thread(
+        _fold_activity, recs, tzinfo, granularity)
 
     umap = await _user_map(session, list(by_user.keys()))
     top_models = sorted(by_model.items(), key=lambda kv: kv[1]["requests"], reverse=True)[:top]

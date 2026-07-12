@@ -214,7 +214,10 @@ class MultiModelScheduler:
             async with self._cond:
                 rt.state = ModelState.SLEEPING
                 self._cond.notify_all()
-            await vllm_ctl.sleep_model(self._client, rt.base_url, rt.member.sleep_level)
+            # A failed /sleep must not brick the model in SLEEPING forever — the
+            # helper recovers it (back to AWAKE if alive, else the crash path).
+            if not await self._sleep_victim(rt):
+                return
             async with self._cond:
                 rt.state = ModelState.ASLEEP
                 rt.last_used = time.time()
@@ -277,6 +280,39 @@ class MultiModelScheduler:
             logger.warning("%s died (%s); auto-retry %d/%d in ~%.0fs",
                            rt.member.model, cause, rt.restart_count + 1, MAX_RELAUNCH, delay)
         self._cond.notify_all()
+
+    async def _sleep_victim(self, v: ModelRuntime) -> bool:
+        """POST /sleep to a member already flipped to SLEEPING. On success return
+        True (the caller flips it ASLEEP). On failure (a 5xx or the ~120s /sleep
+        timeout) DON'T strand it in SLEEPING — monitor_loop only health-probes
+        AWAKE/ASLEEP members, so a stuck-SLEEPING one would never recover and
+        would wedge every request routed to it. Recover instead: if its engine
+        still answers /health, put it back AWAKE (alive + visible + serveable;
+        it just didn't free its GPUs); otherwise terminate the corpse and route
+        it into the crash-retry path so the monitor relaunches it. Returns False.
+
+        Runs with the Condition released (like the other /sleep calls) — the slow
+        HTTP happens off the lock; only the state flips take it."""
+        try:
+            await vllm_ctl.sleep_model(self._client, v.base_url, v.member.sleep_level)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("sleep failed for %s: %s", v.member.model, e)
+            if await vllm_ctl.is_healthy(self._client, v.base_url):
+                async with self._cond:
+                    # Only un-stick it if nothing else moved it meanwhile.
+                    if v.state == ModelState.SLEEPING:
+                        v.state = ModelState.AWAKE
+                        v.last_used = time.time()
+                    self._cond.notify_all()
+            else:
+                await launcher.terminate(v.proc)
+                v.proc = None
+                v.pgid = None
+                async with self._cond:
+                    self._schedule_retry_or_die(v, "engine died during sleep")
+                self._dump_pids()
+            return False
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -525,7 +561,10 @@ class MultiModelScheduler:
             async with self._cond:
                 v.state = ModelState.SLEEPING
                 self._cond.notify_all()
-            await vllm_ctl.sleep_model(self._client, v.base_url, v.member.sleep_level)
+            # A failed /sleep must not brick the victim in SLEEPING forever — the
+            # helper recovers it (back to AWAKE if alive, else the crash path).
+            if not await self._sleep_victim(v):
+                continue
             async with self._cond:
                 v.state = ModelState.ASLEEP
                 self._cond.notify_all()

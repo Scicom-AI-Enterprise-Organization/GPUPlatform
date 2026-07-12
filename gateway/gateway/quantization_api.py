@@ -29,7 +29,8 @@ from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from .pathsafe import validate_path_field
 from sqlalchemy import (
     JSON,
     DateTime,
@@ -501,6 +502,7 @@ async def cleanup_orphaned_running(redis) -> int:
     from their log (unlike autotrain) — simplest correct behavior is to mark them
     failed so the UI isn't stuck; the user can re-run. Returns the count."""
     n = 0
+    orphan_pods: list[tuple[str, str]] = []  # (provider_id, runpod_pod_id)
     async with session_factory()() as s:
         rows = (await s.execute(
             select(QuantizationJob).where(QuantizationJob.status.in_(("queued", "running")))
@@ -509,9 +511,21 @@ async def cleanup_orphaned_running(redis) -> int:
             row.status = "failed"
             row.error_text = "gateway restarted while this job was in flight — re-run it"
             row.ended_at = datetime.now(timezone.utc)
+            if row.runpod_pod_id and row.provider_id:
+                orphan_pods.append((row.provider_id, row.runpod_pod_id))
             n += 1
         if n:
             await s.commit()
+    # These jobs are failed but their cloud pods (if any) keep billing until torn
+    # down. Best-effort terminate, off the session (the HTTP call mustn't hold a
+    # pooled connection during startup reconcile).
+    for prov_id, pod_id in orphan_pods:
+        try:
+            api_key = await compute._resolve_api_key(prov_id)
+            await ta._terminate_pod(api_key, pod_id)
+            logger.info("quantization: torn down orphaned pod %s (billing stopped)", pod_id)
+        except Exception as e:  # noqa: BLE001 — teardown is best-effort
+            logger.warning("quantization: orphaned pod %s teardown failed: %s", pod_id, e)
     return n
 
 
@@ -554,6 +568,12 @@ class CreateQuantizationJobRequest(BaseModel):
     work_dir: Optional[str] = None
     venv_path: Optional[str] = None
     env_vars: Optional[dict] = None
+
+    @field_validator("work_dir", "venv_path")
+    @classmethod
+    def _safe_paths(cls, v, info):  # noqa: N805
+        # These reach remote shell commands on the quant box/pod.
+        return validate_path_field(v, info.field_name)
 
 
 class QuantizationJobRecord(BaseModel):
@@ -672,6 +692,10 @@ async def create_quantization_job(
         prov = await session.get(Provider, body.provider_id)
         if prov is None:
             raise HTTPException(status_code=400, detail="unknown provider_id")
+        # Providers are per-user — enforce ownership (admins exempt) so a job can't
+        # bill another tenant's cloud account or run on their VM.
+        if prov.owner_id != user.id and not user.is_admin:
+            raise HTTPException(status_code=403, detail="that provider isn't yours")
         if prov.kind == "vm":
             is_vm_run = True
             vm_gpus = (prov.config or {}).get("gpus") or []

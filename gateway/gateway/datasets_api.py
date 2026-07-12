@@ -32,7 +32,9 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from .pathsafe import validate_path_field, is_safe_path
+from .netsafe import assert_safe_fetch_url
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -166,6 +168,11 @@ class TtsPackRequest(BaseModel):
     # Isolated uv venv for the NeuCodec/TTS deps (mirrors Autotrain). Reused +
     # cached across packs/runs. None → /share/neucodec-tts (dedicated NeuCodec venv).
     venv_path: Optional[str] = None
+
+    @field_validator("venv_path")
+    @classmethod
+    def _safe_venv_path(cls, v, info):  # noqa: N805
+        return validate_path_field(v, info.field_name)
     # RunPod pod knobs (ignored for a VM provider).
     gpu_type: str = "NVIDIA L40S"
     secure_cloud: bool = True
@@ -188,6 +195,11 @@ class OmnivoicePackRequest(BaseModel):
     gpu_count: int = 1
     visible_devices: Optional[str] = None
     venv_path: Optional[str] = None         # None → /share/autotrain-omnivoice
+
+    @field_validator("venv_path")
+    @classmethod
+    def _safe_venv_path(cls, v, info):  # noqa: N805
+        return validate_path_field(v, info.field_name)
     # RunPod pod knobs (ignored for a VM provider). OmniVoice needs CUDA 12.8.
     gpu_type: str = "NVIDIA H100 80GB HBM3"
     image: Optional[str] = None             # None → a cu128 pytorch image (set by the endpoint)
@@ -707,6 +719,10 @@ async def create_dataset(
         sec = (req.label_token_secret or "").strip()
         if not (label_base_url and label_project_id):
             raise HTTPException(status_code=400, detail="label_base_url and label_project_id are required for kind=label")
+        try:
+            assert_safe_fetch_url(label_base_url)  # SSRF guard at ingress
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"unsafe label_base_url: {e}")
         if not tok and not sec:
             raise HTTPException(status_code=400, detail="provide an API token or pick a global secret for kind=label")
         # Resolve the actual token to verify with — either pasted, or pulled from
@@ -1735,13 +1751,15 @@ def _label_export_rows(
     the export's `updated_until` cutoff so the platform filters server-side (total +
     pagination stay accurate). Sync — call via `_run_sync`."""
     base = base_url.rstrip("/")
+    assert_safe_fetch_url(base)  # SSRF guard — blocks link-local/metadata targets
     url = f"{base}/api/projects/{project_id}/export.v1.jsonl"
     params: dict[str, str] = {"status": status or "approved"}
     if until:
         params["updated_until"] = until
     rows: list[dict[str, Any]] = []
     total: Optional[int] = None
-    with httpx.Client(timeout=120.0, follow_redirects=True) as cli:
+    # follow_redirects=False: a 3xx must not bounce a validated host onto a blocked one.
+    with httpx.Client(timeout=120.0, follow_redirects=False) as cli:
         with cli.stream(
             "GET", url, params=params,
             headers={"Authorization": f"Bearer {token}"},
@@ -2421,6 +2439,11 @@ class DecoderLoadRequest(BaseModel):
     idle_timeout_s: int = 600           # auto-unload after this many idle seconds (0 = never)
     venv_path: Optional[str] = None
 
+    @field_validator("venv_path")
+    @classmethod
+    def _safe_venv_path(cls, v, info):  # noqa: N805
+        return validate_path_field(v, info.field_name)
+
 
 class DecoderDecodeRequest(BaseModel):
     provider_id: str
@@ -2429,10 +2452,20 @@ class DecoderDecodeRequest(BaseModel):
     split: Optional[str] = None
     venv_path: Optional[str] = None
 
+    @field_validator("venv_path")
+    @classmethod
+    def _safe_venv_path(cls, v, info):  # noqa: N805
+        return validate_path_field(v, info.field_name)
+
 
 class DecoderActionRequest(BaseModel):
     provider_id: str
     venv_path: Optional[str] = None
+
+    @field_validator("venv_path")
+    @classmethod
+    def _safe_venv_path(cls, v, info):  # noqa: N805
+        return validate_path_field(v, info.field_name)
 
 
 async def _resolve_vm_ssh(session: AsyncSession, provider_id: str) -> tuple[str, int, str, str]:
@@ -2503,6 +2536,8 @@ async def decoder_status(
     _require_packed(d)
     host, port, suser, key = await _resolve_vm_ssh(session, provider_id)
     venv = (venv_path or "").strip() or _DECODER_DEFAULT_VENV
+    if not is_safe_path(venv):
+        raise HTTPException(status_code=400, detail="venv_path contains unsafe characters")
     from .training_api import dataset_decoder_status_ssh
     try:
         return await _run_sync(dataset_decoder_status_ssh, host, port, suser, key, dataset_id, venv)
@@ -2665,8 +2700,15 @@ async def label_audio(
         raise HTTPException(status_code=400, detail="no stored labeling-platform token")
 
     base = d.label_base_url.rstrip("/")
+    # SSRF guard — this proxy streams the upstream body back to the browser, so a
+    # crafted base_url could exfiltrate internal responses; block bad targets and
+    # don't follow redirects onto them.
+    try:
+        assert_safe_fetch_url(base)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"unsafe label_base_url: {e}")
     url = f"{base}/api/projects/{d.label_project_id}/tasks/{task_id}/audio"
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
         resp = await client.get(url, headers={"Authorization": f"Bearer {tok}"})
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"upstream audio fetch failed ({resp.status_code})")

@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { TOKEN_COOKIE } from "@/lib/auth-cookie";
+import { requireSession } from "@/lib/require-session";
 
 /**
  * Server-side proxy to SlurmUI's /api/reports for the Analytics page. The
@@ -16,8 +15,11 @@ import { TOKEN_COOKIE } from "@/lib/auth-cookie";
  */
 
 export async function GET(req: NextRequest) {
-  const jar = await cookies();
-  if (!jar.get(TOKEN_COOKIE)?.value) {
+  // SlurmUI is queried with a server-side ADMIN token, so a forgeable
+  // cookie-presence check isn't enough — validate the session against the
+  // gateway before forwarding.
+  const session = await requireSession(req);
+  if (!session.ok) {
     return NextResponse.json({ error: "not authenticated" }, { status: 401 });
   }
 

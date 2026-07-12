@@ -212,6 +212,14 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     setLines([]);
     setLiveSteps([]);
     const es = new EventSource(gateway.trainingLogsStreamUrl(run.id));
+    // The server replays the whole Redis log list on every (re)connect. onopen
+    // fires on the initial connect AND every transparent reconnect, so reset
+    // both buffers here — otherwise a blip doubles every log line and every
+    // replayed @@STEP re-appends a duplicate point onto the live loss curve.
+    es.onopen = () => {
+      setLines([]);
+      setLiveSteps([]);
+    };
     es.onmessage = (ev) => {
       setLines((p) => [...p, ev.data]);
       // @@STEP can be prefixed by a tqdm progress bar (\r, no newline) on the

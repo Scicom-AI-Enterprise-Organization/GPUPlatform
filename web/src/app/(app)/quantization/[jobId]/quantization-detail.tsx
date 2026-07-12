@@ -99,6 +99,10 @@ export function QuantizationDetail({ initial }: { initial: QuantizationJobRecord
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLines([]);
     const es = new EventSource(gateway.quantizationLogsStreamUrl(job.id));
+    // The server replays the whole Redis log list on every (re)connect. onopen
+    // fires on the initial connect AND every transparent reconnect, so clear
+    // here — otherwise a network blip doubles every line already shown.
+    es.onopen = () => setLines([]);
     es.onmessage = (ev) => setLines((p) => [...p, ev.data as string]);
     es.addEventListener("end", () => es.close());
     return () => es.close();

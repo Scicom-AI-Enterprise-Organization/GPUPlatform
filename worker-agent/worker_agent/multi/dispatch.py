@@ -41,16 +41,24 @@ async def multi_poll_loop(
 
     only_member = sched.cfg.members[0].served_name if len(sched.cfg.members) == 1 else None
 
+    # Reliability: BRPOPLPUSH atomically moves the popped job into a per-machine
+    # processing list so a job in-flight when the worker dies (SIGKILL / OOM /
+    # crash between pop and result-write) isn't silently lost — it survives in
+    # `processing:{machine_id}`. We LREM it once the result is written (in
+    # _handle_job). FOLLOW-UP (gateway-side, intentionally NOT done here to avoid
+    # an uncoordinated cross-service change): when a worker's heartbeat TTL
+    # lapses, the gateway should requeue any leftover entries in
+    # `processing:{machine_id}` back onto `queue:{app_id}` to close the loop.
+    processing_key = f"processing:{machine_id}"
+
     while not drain_event.is_set():
         try:
-            res = await rdb.brpop(queue_key, timeout=2)
-            if res is None:
+            blob = await rdb.brpoplpush(queue_key, processing_key, timeout=2)
+            if blob is None:
                 continue
-            _key, blob = res
-            job = json.loads(blob)
             await sem.acquire()
             t = asyncio.create_task(
-                _handle_job(rdb, job, machine_id, sched, only_member, _run_unary, _run_stream, sem)
+                _handle_job(rdb, blob, machine_id, sched, only_member, _run_unary, _run_stream, sem, processing_key)
             )
             tasks.add(t)
             t.add_done_callback(tasks.discard)
@@ -65,8 +73,9 @@ async def multi_poll_loop(
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _handle_job(rdb, job, machine_id, sched, only_member, run_unary, run_stream, sem):
+async def _handle_job(rdb, blob, machine_id, sched, only_member, run_unary, run_stream, sem, processing_key):
     try:
+        job = json.loads(blob)
         request_id = job["request_id"]
         # The client may have disconnected / timed out while this job waited in the
         # queue — the gateway then sets cancel:{request_id}. Bail BEFORE the model
@@ -118,6 +127,13 @@ async def _handle_job(rdb, job, machine_id, sched, only_member, run_unary, run_s
     except Exception:
         logger.exception("multi job handler crashed")
     finally:
+        # Result written (or the job was poison/crashed) → drop it from the
+        # processing list. If the worker DIES before reaching here the entry
+        # stays and can be recovered (see multi_poll_loop follow-up note).
+        try:
+            await rdb.lrem(processing_key, 1, blob)
+        except Exception:  # noqa: BLE001 — best-effort cleanup, never fail the job
+            logger.warning("could not LREM job from %s", processing_key)
         sem.release()
 
 

@@ -90,9 +90,11 @@ TAIL_PID=$!
 
 # Wait up to 10 minutes for vllm to be ready (large models take a while)
 echo "[entrypoint] waiting for vllm /health on :$VLLM_PORT ..."
+vllm_ready=0
 for i in $(seq 1 600); do
   if curl -sf "http://127.0.0.1:$VLLM_PORT/health" > /dev/null 2>&1; then
     echo "[entrypoint] vllm ready after ${i}s"
+    vllm_ready=1
     break
   fi
   if ! kill -0 "$VLLM_PID" 2>/dev/null; then
@@ -101,6 +103,16 @@ for i in $(seq 1 600); do
   fi
   sleep 1
 done
+
+# If the loop expired without /health ever passing (vllm alive but wedged —
+# stuck loading, deadlocked, unhealthy), do NOT fall through to the worker-agent:
+# a broken worker would register + poll while burning full GPU cost and serving
+# nothing. Exit non-zero so the provider/autoscaler tears it down + reprovisions.
+if [ "$vllm_ready" != "1" ]; then
+  echo "[entrypoint] vllm never became healthy after 600s — exiting so the provider reprovisions" >&2
+  kill -TERM "$VLLM_PID" "$TAIL_PID" 2>/dev/null || true
+  exit 1
+fi
 
 # Worker-agent runs in foreground; if it exits, kill vllm + tail too.
 trap 'kill -TERM "$VLLM_PID" "$TAIL_PID" 2>/dev/null || true' EXIT
