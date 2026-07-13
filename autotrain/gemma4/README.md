@@ -266,6 +266,34 @@ CUDA_VISIBLE_DEVICES=7 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 \
   python bench_attention.py --iters 50 --warmup 10 --out results.json
 ```
 
+## FA4 forward-kernel speedup — m64n80 → m64n64 (2026-07-12)
+
+The FA4 fork's head_dim-512 SM90 **forward** default was retiled from `tile_mn=(64,80)` + RS-replicated
+QK to **`(64,64)` cooperative QK N-split + intra-wg overlap** (`flash-attention-512-cute` commit
+`48ecadc`). The public `flash_attn_varlen_func` API is unchanged → a **drop-in speedup for
+`fa4_attention`**, no trainer edits. Verified on **H100 SXM** (gemma-4-31B, cu130, torch 2.12):
+
+| measurement | baseline `4c964fa` (m64n80) | latest `48ecadc` (m64n64) | speedup |
+|---|---|---|---|
+| forward kernel — hd512 32q/4kv @ 32k (`sweep_fwd.py`) | 375.4 TFLOP/s (93.7 ms) | 433.7 TFLOP/s (81.1 ms) | **+15.5%** |
+| forward kernel — hd512 @ 8k | 378.3 TFLOP/s | 444.7 TFLOP/s | +17.6% |
+| end-to-end 32k LoRA training (4× H100, FSDP2 + `--cpu_offload`) | 4178 tok/s | 5031 tok/s | **+20.4%** |
+
+Numerically identical: `compare_logits_fa4.py` cosine **0.999848**, argmax+top5 match; training losses
+track step-for-step. End-to-end exceeds the raw forward gain because activation checkpointing recomputes
+the forward in backward (kernel runs twice/step). **Memory caveat:** gemma-4-31B *fwd+bwd* at 32k does
+NOT fit unoffloaded on 2× or 4× H100 — the head_dim-512 **backward** (`_bwd_large_headdim_block`)
+materialises score-sized fp32 tensors and FSDP can't shard activations; run with `--cpu_offload` (LoRA
+offload stays compute-bound, ~100% util) or on 144 GB/GPU (H20). This is the FA4 *backward* wall,
+distinct from the SDPA-path forward `O(S²)` wall noted above.
+
+```bash
+# isolated kernel A/B (both configs benched in one process, correctness-checked before timing):
+CUDA_VISIBLE_DEVICES=0 python flash-attention-512-cute/dev512/sweep_fwd.py --s 32768 --b 1 --hq 32 --hkv 4 --causal 1
+# training A/B: checkout each commit, FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=0 so the source recompiles
+GEMMA_ATTN=fa4_attention torchrun --nproc_per_node=4 gemma4.py --batch_size 1 --cpu_offload --max_steps 16
+```
+
 ## Evaluation (function-calling accuracy)
 
 `eval_funccall.py` reuses **SyntheticGen's exact scoring** (`SyntheticGen/synthetic/

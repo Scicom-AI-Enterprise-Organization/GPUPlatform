@@ -591,3 +591,42 @@ shape); steady-state ~7–8 min/step here because the 25 **sliding** layers ring
 venv reuse (`/share/autotrain-llm-gemma4`, torch 2.12.0+cu130 / tf 5.5.0 / FA4 cute / cutlass 4.4.2 +
 `chinidataset`), plus the `train_a4b.sh` helper, live under `/share/autotrain-gemma4-a4b` on the tm box
 (port 1023). ⚠ Kernel JIT means the first step of any NEW context length / geometry recompiles.
+
+## FA4-cute head_dim-512 forward retile → +15–20% (m64n80 → m64n64), 2026-07-12
+
+The FA4 fork's SM90 head_dim-512 **forward** got a default-tiling rewrite (`flash-attention-512-cute`
+commit **`48ecadc`**): old default `tile_mn=(64,80)` + `mma_pv_is_rs=True` (RS-replicated QK) → new
+default **`(64,64)` cooperative QK N-split + intra-wg overlap** (`mma_pv_is_rs=False`), backed by a new
+named barrier + softmax epilogue. It's the ONLY change — the public `flash_attn_varlen_func` signature
+is unchanged, so it's a **drop-in speedup for `fa4_attention` with no trainer edits** (`git checkout`
+between the parent `4c964fa` and `48ecadc` is a clean A/B). `dev512/sweep_fwd.py` A/Bs both configs
+directly (each correctness-checked before timing, so a fast-but-wrong config can't win).
+
+**Verified on RunPod H100 SXM (gemma-4-31B, cu130, torch 2.12.0), 2026-07-12:**
+- **Correctness first** (`compare_logits_fa4.py` at the new default): cosine **0.999848**, argmax +
+  top-5 identical to default attention — same accuracy as the old kernel (sweep max-abs-err 4.7e-3 both).
+- **Isolated forward kernel** (`sweep_fwd.py`, gemma-4 global geom hd512 32q/4kv causal): **S=32768**
+  old `375.4 → 433.7 TFLOP/s = +15.5%` (93.7 → 81.1 ms); S=8192 **+17.6%** (378 → 445). The `packgqa`
+  variant is marginally faster (+16.4% @ 32k). The sweep is hd512-only (the retile targets the 512 path).
+- **End-to-end 32k LoRA training** (4× H100, FSDP2 + `--cpu_offload`, r256, batch 1, 16 steps over 2
+  deterministic epochs = identical bins per commit): baseline `4c964fa` **4178** → latest `48ecadc`
+  **5031 tok/s = +20.4%** (median per-step +23%); losses track step-for-step (bf16 noise, latest
+  consistently ~0.03 lower). End-to-end BEATS the raw forward gain because activation checkpointing
+  **recomputes the forward in backward → the faster kernel runs twice per step.**
+
+⚠ **Memory: gemma-4-31B fwd+bwd @ 32k does NOT fit unoffloaded on 2× OR 4× H100 80GB.** OOM is in the
+head_dim-512 **backward** (`_flash_attn_bwd_large_headdim` → `_bwd_large_headdim_block`,
+`interface.py:1103`, `ds = p*(dp−δ)*scale`), which materialises score-sized fp32 intermediates — and is
+UNCHANGED by the forward retile. FSDP shards only params (activations are per-GPU), so 4× only reclaims
+~16 GB of params — still OOMs (short ~3.5 GB at S≈30k). Fix used: **`--cpu_offload`** (params → CPU RAM);
+because LoRA has tiny grad/optimizer traffic the offloaded run stays **compute-bound (~100% GPU util,
+~4–5k tok/s)**, so the A/B is meaningful, not PCIe-washed. For unoffloaded long-context use the tm H20
+(144 GB/GPU). NOTE this is the FA4 *backward* wall — distinct from the older SDPA-path `O(S²)` *forward*
+score wall in `attention.py`.
+
+**Reproduce.** Kernel A/B (one H100, ~1 min): `CUDA_VISIBLE_DEVICES=0 python
+flash-attention-512-cute/dev512/sweep_fwd.py --s 32768 --b 1 --hq 32 --hkv 4 --causal 1`. Training A/B:
+per commit `git -C <fork> checkout <sha>` then `GEMMA_ATTN=fa4_attention PYTORCH_ALLOC_CONF=expandable_segments:True
+NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0 torchrun --nproc_per_node=4 gemma4.py --batch_size 1 --cpu_offload
+--max_steps 16 --checkpointing_step 9999`. Set **`FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=0`** across the
+A/B so the checked-out source actually recompiles instead of serving the old cached kernel.

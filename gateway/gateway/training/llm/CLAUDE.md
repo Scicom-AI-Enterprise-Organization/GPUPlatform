@@ -91,12 +91,23 @@ in `llm_finetune._ARCH` + `_fa_mode`:
 | trainer | `gemma4.py` | `minimax/minimax_m2.py` | `mistral/mistral_small.py` |
 | size / dtype | 31B dense bf16 | 230B FP8 MoE | 119B FP8 MoE (MLA) |
 | attention | **FA4 cute fork** (default; head_dim-512), or FA3+dynamic_attention | stock FA3 (head_dim 128) | stock FA3 (head_dim 128) |
-| venv | `/share/autotrain-llm-gemma` | `/share/autotrain-llm-minimax` | `/share/autotrain-llm-mistral` |
+| venv | `/share/autotrain-llm-gemma-v2` | `/share/autotrain-llm-minimax` | `/share/autotrain-llm-mistral` |
 | `kernels` pin | `==0.14.1` | `>=0.12,<0.13` | `>=0.12,<0.13` |
 | extra deps | `peft` | `accelerate` | `accelerate` |
 | pre-flight | `test_attention.py` (FA3) / skipped (FA4) | `test_lora.py` (CPU) | `test_lora.py` (CPU) |
 | run env | `GEMMA_ATTN`, FA4 JIT cache | — | `MISTRAL_DEQUANT_TRITON=1` |
 | LoRA CLI | `--r --alpha --target_modules [--train_embeddings]` | `--attn_r --moe_r --attn_alpha --moe_alpha [--no_moe_lora --train_embeddings]` | + `--no_shared_lora [--train_embeddings]` |
+
+**Per-arch venv version (`_LLM_VENV_VERSION`, 2026-07-12).** The box venv is
+`/share/autotrain-llm-{arch}` unless an arch is bumped in the `_LLM_VENV_VERSION` map — gemma is now
+pinned to **`gemma-v2`**. Bumping an arch's entry forces a FRESH venv on its next run (the old dir is
+left untouched for in-flight runs); this is how you roll deps/kernels forward, because the deps
+installer's "FA4 cute already imports → skip reinstall" fast path otherwise keeps a stale kernel in a
+reused venv. `gemma-v2` re-clones the FA4 fork → picks up the head_dim-512 forward retile
+(m64n80→m64n64, +15–20%; see `autotrain/gemma4/CLAUDE.md`). ⚠ The map lives in BOTH `training_api.py`
+(gateway — ships `venv_path` + re-derives it in every post-train op) and `training/llm_finetune.py`
+(box-side fallback); keep the two copies in sync or a run trains in one dir and its export/merge looks
+in another ("venv python not found").
 
 **`--train_embeddings` (added 2026-07-10, ALL LLM archs).** Also FULL-trains the token embeddings + LM
 head on top of LoRA — attention-only LoRA can only nudge the output distribution via hidden states, so

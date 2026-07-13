@@ -60,7 +60,7 @@ _FA3_BASE = "https://github.com/mjun0812/flash-attention-prebuild-wheels/release
 # kernels at runtime. The cutlass-dsl/quack pins are load-bearing — the `>=` bounds in cute's
 # pyproject pull too-new versions that break (quack 0.5 / cutlass-dsl 4.5; see gemma4 CLAUDE.md +
 # run.sh). Overridable via cfg (fa4_fork_install / fa4_pins) if the fork URL/branch changes.
-_FA4_FORK_INSTALL = "git+https://github.com/Scicom-AI-Enterprise-Organization/flash-attention-512.git#subdirectory=flash_attn/cute"
+_FA4_FORK_INSTALL = "git+https://github.com/Scicom-AI-Enterprise-Organization/flash-attention-512-cute.git#subdirectory=flash_attn/cute"
 _FA4_PINS = ["nvidia-cutlass-dsl[cu13]==4.4.2", "quack-kernels==0.3.10"]
 
 
@@ -217,8 +217,17 @@ def detect_arch(model_id: str) -> str:
         f"minimax-m2, mistral-small, qwen3.5/3.6 and nemotron models (the trainer is chosen by name)")
 
 
+# Per-arch venv version override (box side). gemma → gemma-v2 forces a fresh venv so the FA4
+# cute fork is re-cloned and picks up the head_dim-512 forward retile (m64n80→m64n64) instead of
+# the "already imports → skip reinstall" fast path keeping the old kernel in a reused venv.
+# ⚠ KEEP IN SYNC with training_api.py::_LLM_VENV_VERSION (gateway side, which ships venv_path).
+_LLM_VENV_VERSION = {"gemma": "gemma-v2"}
+
+
 def _venv_path(cfg: dict, arch: str) -> str:
-    return (cfg.get("venv_path") or f"/share/autotrain-llm-{arch}").rstrip("/")
+    # cfg.venv_path (shipped by the gateway) wins; the fallback applies the same version override
+    # so a box-side re-derivation (e.g. no venv_path in cfg) still lands on the SAME dir.
+    return (cfg.get("venv_path") or f"/share/autotrain-llm-{_LLM_VENV_VERSION.get(arch, arch)}").rstrip("/")
 
 
 # --------------------------------------------------------------------------

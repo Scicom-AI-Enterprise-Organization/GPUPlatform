@@ -254,6 +254,22 @@ def _llm_arch(model_id: Optional[str]) -> str:
     return "gemma"
 
 
+# Per-arch LLM venv dir on the shared box (/share). Bump an arch's entry here to roll its
+# venv forward WITHOUT touching the arch string (which drives trainer dispatch). gemma →
+# gemma-v2 (2026-07-12): forces a FRESH venv on the next gemma run so the deps installer
+# re-clones the FA4 cute fork and picks up the head_dim-512 forward retile (m64n80→m64n64,
+# +15-20%) — a reused venv keeps the old kernel (llm_finetune's "already imports → skip"
+# fast path). ⚠ KEEP IN SYNC with training/llm_finetune.py::_LLM_VENV_VERSION (box side).
+_LLM_VENV_VERSION = {"gemma": "gemma-v2"}
+
+
+def _llm_venv(arch: str) -> str:
+    """Canonical /share venv dir for an LLM arch (gateway side; single source of truth).
+    Applies the per-arch version override so training AND every post-train op (all of which
+    re-derive from arch — venv_path is NOT persisted to config_json) resolve to the SAME dir."""
+    return f"/share/autotrain-llm-{_LLM_VENV_VERSION.get(arch, arch)}"
+
+
 def _tts_arch(model_id: Optional[str]) -> str:
     """omnivoice | qwen3 from a TTS base model id. OmniVoice (k2-fsa/OmniVoice or
     a Scicom omnivoice repo) uses a different trainer + codec + packed format than
@@ -277,7 +293,7 @@ def _train_venv_default(task_type: Optional[str], base_model: Optional[str]) -> 
     if tt == "llm":
         # gemma vs minimax need different `kernels` pins (transformers 5.5.0 import
         # crashes outside each range) → SEPARATE venvs per arch.
-        return f"/share/autotrain-llm-{_llm_arch(base_model)}"
+        return _llm_venv(_llm_arch(base_model))
     if tt == "tts":
         # OmniVoice (torch 2.8/cu128 + its own repo) gets a SEPARATE venv from the
         # Qwen3+NeuCodec TTS stack (cu13/2.9). Selected by base model.
@@ -4437,7 +4453,7 @@ async def export_to_huggingface(
 
     # The merge venv: on a VM it's the arch venv training already built; on a fresh pod
     # _build_llm_venv_ssh builds it. None for non-merge (uses the run's train venv).
-    venv_path = (body.venv_path or "").strip() or (f"/share/autotrain-llm-{arch}" if merge else None)
+    venv_path = (body.venv_path or "").strip() or (_llm_venv(arch) if merge else None)
     visible_devices = (body.visible_devices or "").strip() or None
 
     # Re-click supersedes a stuck push (the orphaned upload just finishes + is discarded).
@@ -5179,7 +5195,7 @@ def _build_llm_venv_ssh(host: str, port: int, user: str, key_filename: str,
         _ssh_put_dir_tar(cli, str(base / "llm"), f"{stage}/llm")
         dconf = {
             "base_model": base_model,
-            "venv_path": (venv_path or f"/share/autotrain-llm-{arch}").rstrip("/"),
+            "venv_path": (venv_path or _llm_venv(arch)).rstrip("/"),
             "work_dir": (cfg.get("work_dir") or "/share").rstrip("/"),
             "gemma_fa4": False,   # merge needs no FA4 kernel → skip the slow cute-fork build
         }
@@ -5499,7 +5515,7 @@ def _playground_paths(cfg: dict, run_id: str, kind: str) -> dict:
         # deps) — the generic /share/autotrain-llm doesn't exist for arch runs.
         tdir = f"{work}/sgpu-llm-tryit/{run_id}"
         _arch = _llm_arch(cfg.get("base_model"))
-        venv = (cfg.get("venv_path") or f"/share/autotrain-llm-{_arch}").rstrip("/")
+        venv = (cfg.get("venv_path") or _llm_venv(_arch)).rstrip("/")
         return {
             **base,
             "tryit_dir": tdir,                   # the whole per-run tree (merged + ckpt) — swept on unload
@@ -6285,7 +6301,7 @@ def _run_llm_label_export_ssh(host: str, port: int, user: str, key_filename: str
         _ssh_put_bytes(cli, json.dumps(tconf).encode("utf-8"), "/tmp/sgpu_llm_label_cfg.json")
         user_env = _render_env_exports(cfg.get("env_vars") or {})
         # Use the same arch venv that training used — it already has torch + transformers.
-        venv_path = (cfg.get("venv_path") or f"/share/autotrain-llm-{arch}").rstrip("/")
+        venv_path = (cfg.get("venv_path") or _llm_venv(arch)).rstrip("/")
         py = f"{venv_path}/bin/python"
         out: dict = {"manifest": None, "error": None, "lines": []}
 
@@ -6512,7 +6528,7 @@ def _run_hf_merge_export_ssh(host: str, port: int, user: str, key_filename: str,
         _ssh_put_dir_tar(cli, str(base / "llm"), code_dir)
         work_dir = (cfg.get("work_dir") or "/share").rstrip("/")
         scratch = f"{work_dir}/sgpu-hf-export/{tag}"
-        venv = (venv_path or f"/share/autotrain-llm-{arch}").rstrip("/")
+        venv = (venv_path or _llm_venv(arch)).rstrip("/")
         py = f"{venv}/bin/python"
         tconf = {
             "model_s3": model_s3,
