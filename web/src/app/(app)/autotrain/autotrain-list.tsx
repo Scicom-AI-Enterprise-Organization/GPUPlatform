@@ -2,11 +2,13 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { useListUrlState, readParam } from "@/lib/list-url-state";
 import {
+  CheckSquare,
   Cpu,
+  GitCompare,
   Inbox,
   LayoutGrid,
   List,
@@ -88,13 +90,16 @@ export function AutotrainList({
   initialTotal: number;
   scope: "mine" | "all";
 }) {
+  const router = useRouter();
   const sp = useSearchParams();
-  // Seed search/status/sort/view from the URL (shareable); mirrored back below.
+  // Seed search/status/sort/view/select from the URL (shareable); mirrored back below.
   const [q, setQ] = useState(() => sp.get("q") ?? "");
   const [qDebounced, setQDebounced] = useState(q);
   const [status, setStatus] = useState<StatusFilter>(() => readParam(sp, "status", STATUS_OPTIONS, "all"));
   const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
   const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
+  const [selectMode, setSelectMode] = useState(() => sp.get("select") === "1");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
 
@@ -122,7 +127,28 @@ export function AutotrainList({
     setView(v);
     window.localStorage.setItem("sgpu_autotrain_view", v);
   };
-  useListUrlState({ q, status, sort, view });
+  useListUrlState({ q, status, sort, view, select: selectMode });
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const exitSelect = () => {
+    setSelectMode(false);
+    setSelected(new Set());
+  };
+
+  // Two or more runs → overlay their loss + accuracy curves on the compare page.
+  const onCompare = () => {
+    const ids = Array.from(selected);
+    if (ids.length < 2) return;
+    router.push(`/autotrain/compare?ids=${ids.map(encodeURIComponent).join(",")}`);
+  };
 
   // Debounce the search box so each keystroke doesn't hit the gateway.
   useEffect(() => {
@@ -294,7 +320,66 @@ export function AutotrainList({
             <LayoutGrid className="h-4 w-4" />
           </button>
         </div>
+        {selectMode ? (
+          <button
+            type="button"
+            onClick={exitSelect}
+            className="inline-flex h-10 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm shadow-xs hover:bg-muted"
+          >
+            <X className="h-4 w-4" /> Cancel
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setSelectMode(true)}
+            className="inline-flex h-10 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm shadow-xs hover:bg-muted"
+          >
+            <CheckSquare className="h-4 w-4" /> Select
+          </button>
+        )}
       </div>
+
+      {selectMode && (
+        <div className="mb-3 flex flex-col gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between">
+          <span className="text-muted-foreground">
+            {selected.size} selected
+            {items.length > 0 && (
+              <>
+                {" "}
+                <button
+                  type="button"
+                  onClick={() => setSelected(new Set(items.map((r) => r.id)))}
+                  className="ml-2 underline underline-offset-2 hover:text-foreground"
+                >
+                  Select all visible
+                </button>
+                {selected.size > 0 && (
+                  <>
+                    {" · "}
+                    <button
+                      type="button"
+                      onClick={() => setSelected(new Set())}
+                      className="underline underline-offset-2 hover:text-foreground"
+                    >
+                      Clear
+                    </button>
+                  </>
+                )}
+              </>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={onCompare}
+            disabled={selected.size < 2}
+            title={selected.size < 2 ? "Select 2 or more to compare" : "Compare selected"}
+            className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium shadow-xs hover:bg-muted disabled:opacity-50"
+          >
+            <GitCompare className="h-3.5 w-3.5" />
+            {`Compare ${selected.size >= 2 ? selected.size : ""}`.trim()}
+          </button>
+        </div>
+      )}
 
       {hasFilter && (
         <div className="mb-3 text-xs text-muted-foreground">
@@ -328,7 +413,15 @@ export function AutotrainList({
             )}
           >
             {items.map((r) => (
-              <RunItem key={r.id} run={r} onRename={openRename} onDelete={setSingle} />
+              <RunItem
+                key={r.id}
+                run={r}
+                onRename={openRename}
+                onDelete={setSingle}
+                selectMode={selectMode}
+                selected={selected.has(r.id)}
+                onToggle={toggle}
+              />
             ))}
           </div>
           <Pagination
@@ -424,10 +517,16 @@ function RunItem({
   run,
   onRename,
   onDelete,
+  selectMode = false,
+  selected = false,
+  onToggle,
 }: {
   run: TrainingRunRecord;
   onRename: (r: TrainingRunRecord) => void;
   onDelete: (r: TrainingRunRecord) => void;
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggle?: (id: string) => void;
 }) {
   const avatar = avatarFor(run.name);
   const metric = primaryMetric(run);
@@ -442,16 +541,20 @@ function RunItem({
 
   const chip = "inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 text-xs";
 
-  return (
-    <Link
-      href={`/autotrain/${encodeURIComponent(run.id)}`}
-      className={cn(
-        "group block rounded-xl border border-border bg-card p-4 transition-all",
-        "hover:border-primary/40 hover:bg-card/80 hover:shadow-md",
-      )}
-    >
+  const inner = (
+    <>
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
+          {selectMode && (
+            <input
+              type="checkbox"
+              checked={selected}
+              onChange={() => onToggle?.(run.id)}
+              onClick={(e) => e.stopPropagation()}
+              className="h-4 w-4 shrink-0 cursor-pointer accent-primary"
+              aria-label={`Select ${run.name}`}
+            />
+          )}
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-border bg-muted/60 text-base font-semibold text-muted-foreground">
             {avatar.letter}
           </div>
@@ -485,43 +588,45 @@ function RunItem({
               <div className="font-mono text-sm font-semibold tabular-nums">{metric.value}</div>
             </div>
           )}
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                className="-mr-1 text-muted-foreground hover:text-foreground"
-                aria-label="Actions"
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }}
-              >
-                <MoreHorizontal className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-              <DropdownMenuItem
-                onSelect={(e) => {
-                  e.preventDefault();
-                  onRename(run);
-                }}
-              >
-                <Pencil className="h-4 w-4" />
-                Rename
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                variant="destructive"
-                onSelect={(e) => {
-                  e.preventDefault();
-                  onDelete(run);
-                }}
-              >
-                <Trash2 className="h-4 w-4" />
-                Delete run
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {!selectMode && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="-mr-1 text-muted-foreground hover:text-foreground"
+                  aria-label="Actions"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    onRename(run);
+                  }}
+                >
+                  <Pencil className="h-4 w-4" />
+                  Rename
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  variant="destructive"
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    onDelete(run);
+                  }}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Delete run
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         </div>
       </div>
 
@@ -560,6 +665,40 @@ function RunItem({
           {new Date(run.created_at).toLocaleString()}
         </span>
       </div>
+    </>
+  );
+
+  const baseCard = "group block rounded-xl border border-border bg-card p-4 transition-all";
+
+  if (selectMode) {
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => onToggle?.(run.id)}
+        onKeyDown={(e) => {
+          if (e.key === " " || e.key === "Enter") {
+            e.preventDefault();
+            onToggle?.(run.id);
+          }
+        }}
+        className={cn(
+          baseCard,
+          "cursor-pointer",
+          selected ? "border-primary/60 bg-primary/5" : "hover:border-primary/40 hover:bg-card/80",
+        )}
+      >
+        {inner}
+      </div>
+    );
+  }
+
+  return (
+    <Link
+      href={`/autotrain/${encodeURIComponent(run.id)}`}
+      className={cn(baseCard, "hover:border-primary/40 hover:bg-card/80 hover:shadow-md")}
+    >
+      {inner}
     </Link>
   );
 }
