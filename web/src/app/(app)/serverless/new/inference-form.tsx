@@ -35,7 +35,7 @@ import { RegionSelect } from "@/components/region-select";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
 import { gateway } from "@/lib/gateway";
 import { GPU_CHOICES, GPU_COUNT_CHOICES, capacityHint } from "@/lib/gpu-catalog";
-import type { ProviderRecord, ProviderBalance, VmAvailability } from "@/lib/types";
+import type { CreateAppRequest, ProviderRecord, ProviderBalance, VmAvailability } from "@/lib/types";
 
 // vLLM is what the live RunPod template runs. SGLang is a placeholder for a
 // future template — keep it disabled so the option is visible but inert.
@@ -266,6 +266,17 @@ export function InferenceForm() {
   // Ascend fork: the vllm version the fork's branch tracks (line 1 of the
   // composed multi-line install).
   const [ascendForkVllm, setAscendForkVllm] = useState(ASCEND_FORK_GEMMA4_VLLM);
+  // Multi-model fleet auto-retry (crash recovery) knobs. Empty = the worker's
+  // built-in default (shown as the placeholder); only sent when the user sets one.
+  // Applies to the fleet scheduler (mode === "multi"), which relaunches a crashed
+  // member with exponential backoff, optionally waiting for free GPU memory first.
+  const [retryMax, setRetryMax] = useState("");
+  const [retryForever, setRetryForever] = useState(false);
+  const [retryBackoffBase, setRetryBackoffBase] = useState("");
+  const [retryBackoffCap, setRetryBackoffCap] = useState("");
+  const [retryRequireFreeGpu, setRetryRequireFreeGpu] = useState(false);
+  const [retryGpuFreePct, setRetryGpuFreePct] = useState("");
+  const [healthFailLimit, setHealthFailLimit] = useState("");
   // Append a serve flag (e.g. --attention-backend FLASH_ATTN_CUTE) to every member
   // that doesn't already carry it. VM (proxy/fleet) + cloud-multi serve via members.
   const addServeFlagToMembers = (flag: string) =>
@@ -482,6 +493,30 @@ export function InferenceForm() {
     intFieldInvalid(vllm.max_num_seqs) ||
     intFieldInvalid(vllm.tensor_parallel_size);
 
+  // A retry numeric field: empty = default (valid); else a number in [min,max].
+  const numFieldInvalid = (s: string, min: number, max: number) => {
+    if (!s.trim()) return false;
+    const n = Number(s.trim());
+    return !Number.isFinite(n) || n < min || n > max;
+  };
+  const retryInvalid =
+    numFieldInvalid(retryMax, 0, 100) ||
+    numFieldInvalid(retryBackoffBase, 0, 3600) ||
+    numFieldInvalid(retryBackoffCap, 0, 86400) ||
+    numFieldInvalid(retryGpuFreePct, 0, 100) ||
+    numFieldInvalid(healthFailLimit, 1, 100);
+  // Only the fields the user actually set — empty ones fall back to the worker
+  // default. Spread into the multi-model deploy body (mode === "multi").
+  const retryPayload: Partial<CreateAppRequest> = {
+    // retry_forever ignores retry_max, so only send the cap when NOT retrying forever.
+    ...(retryForever ? { retry_forever: true } : retryMax.trim() ? { retry_max: Number(retryMax) } : {}),
+    ...(retryBackoffBase.trim() ? { retry_backoff_base_s: Number(retryBackoffBase) } : {}),
+    ...(retryBackoffCap.trim() ? { retry_backoff_cap_s: Number(retryBackoffCap) } : {}),
+    ...(retryRequireFreeGpu ? { retry_require_free_gpu: true } : {}),
+    ...(retryRequireFreeGpu && retryGpuFreePct.trim() ? { retry_gpu_free_pct: Number(retryGpuFreePct) } : {}),
+    ...(healthFailLimit.trim() ? { health_fail_limit: Number(healthFailLimit) } : {}),
+  };
+
   const parsedDisk = Number.parseInt(containerDisk, 10);
   const diskInvalid =
     !Number.isFinite(parsedDisk) || parsedDisk < 1 || parsedDisk > 2000;
@@ -551,6 +586,10 @@ export function InferenceForm() {
       }
       if (mode === "proxy" && cleanedMembers.length !== 1) {
         setSubmitError("A proxy endpoint serves exactly one model.");
+        return;
+      }
+      if (mode === "multi" && retryInvalid) {
+        setSubmitError("Fix the invalid values in Auto-retry (crash recovery).");
         return;
       }
       const names = cleanedMembers.map((m) => m.model);
@@ -639,6 +678,8 @@ export function InferenceForm() {
             ...(vllmVersion.trim() && !isAscend ? { vllm_version: vllmVersion.trim() } : {}),
             ...(vllmInstallArgs.trim() ? { vllm_install_args: vllmInstallArgs.trim() } : {}),
             ...(preScript.trim() ? { pre_script: preScript } : {}),
+            // Auto-retry knobs apply to the fleet scheduler only (not the proxy mode).
+            ...(mode === "multi" ? retryPayload : {}),
           }
         : {
             name: slugify(name),
@@ -665,6 +706,7 @@ export function InferenceForm() {
               ? { vllm_install_args: vllmInstallArgs.trim() }
               : { vllm_version: vllmVersion.trim() || DEFAULT_VLLM_VERSION }),
             ...(preScript.trim() ? { pre_script: preScript } : {}),
+            ...retryPayload,
           };
       startTransition(async () => applyResult(await deployEndpoint(body)));
       return;
@@ -1389,6 +1431,137 @@ export function InferenceForm() {
               </Field>
             )}
 
+            {mode === "multi" && (
+              <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+                <div>
+                  <div className="text-sm font-medium">Auto-retry (crash recovery)</div>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    How the fleet relaunches a member whose vLLM engine crashes (e.g. a
+                    wake-OOM). Blank fields use the built-in default. A member that stays
+                    healthy resets its retry budget, so later incidents get a fresh set.
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <Field
+                    label="Max retries"
+                    hint={
+                      retryForever
+                        ? "Retrying forever — the member is never left dead; it keeps relaunching (with backoff) until it comes up."
+                        : "Relaunch attempts before the member is left dead (restart it from the Workers tab). Default 6."
+                    }
+                  >
+                    <Input
+                      type="number"
+                      min={0}
+                      max={100}
+                      inputMode="numeric"
+                      value={retryForever ? "" : retryMax}
+                      onChange={(e) => setRetryMax(e.target.value)}
+                      placeholder={retryForever ? "∞ (forever)" : "6"}
+                      disabled={retryForever}
+                      aria-invalid={!retryForever && numFieldInvalid(retryMax, 0, 100)}
+                      className="font-mono text-xs"
+                    />
+                    <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                      <input
+                        type="checkbox"
+                        checked={retryForever}
+                        onChange={(e) => setRetryForever(e.target.checked)}
+                        className="h-3.5 w-3.5 cursor-pointer accent-primary"
+                      />
+                      Retry forever (never give up)
+                    </label>
+                  </Field>
+                  <Field
+                    label="Health patience (failed probes)"
+                    hint="Consecutive failed /health checks (~5s apart) before an awake engine is treated as dead. Default 3 (~15s)."
+                  >
+                    <Input
+                      type="number"
+                      min={1}
+                      max={100}
+                      inputMode="numeric"
+                      value={healthFailLimit}
+                      onChange={(e) => setHealthFailLimit(e.target.value)}
+                      placeholder="3"
+                      aria-invalid={numFieldInvalid(healthFailLimit, 1, 100)}
+                      className="font-mono text-xs"
+                    />
+                  </Field>
+                  <Field
+                    label="Retry delay (seconds)"
+                    hint="Wait before the first retry, then doubled each attempt (exponential backoff). Default 15."
+                  >
+                    <Input
+                      type="number"
+                      min={0}
+                      max={3600}
+                      inputMode="numeric"
+                      value={retryBackoffBase}
+                      onChange={(e) => setRetryBackoffBase(e.target.value)}
+                      placeholder="15"
+                      aria-invalid={numFieldInvalid(retryBackoffBase, 0, 3600)}
+                      className="font-mono text-xs"
+                    />
+                  </Field>
+                  <Field
+                    label="Patience — max delay (seconds)"
+                    hint="Ceiling on the backoff — the longest wait between retries. Default 600."
+                  >
+                    <Input
+                      type="number"
+                      min={0}
+                      max={86400}
+                      inputMode="numeric"
+                      value={retryBackoffCap}
+                      onChange={(e) => setRetryBackoffCap(e.target.value)}
+                      placeholder="600"
+                      aria-invalid={numFieldInvalid(retryBackoffCap, 0, 86400)}
+                      className="font-mono text-xs"
+                    />
+                  </Field>
+                </div>
+                <div className="space-y-2 border-t border-border/60 pt-3">
+                  <label className="flex items-start gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={retryRequireFreeGpu}
+                      onChange={(e) => setRetryRequireFreeGpu(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 cursor-pointer accent-primary"
+                    />
+                    <span>
+                      Only retry when GPU memory is free
+                      <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
+                        Before each relaunch, check free VRAM on the member&apos;s GPUs; if a
+                        foreign job is holding the card, wait (without spending a retry) until it
+                        frees instead of OOM-looping. Needs nvidia-smi (ignored on non-NVIDIA boxes).
+                      </span>
+                    </span>
+                  </label>
+                  {retryRequireFreeGpu && (
+                    <div className="pl-6">
+                      <Field
+                        label="Min free GPU memory (%)"
+                        hint="Relaunch only once every GPU the member uses has at least this much of its VRAM free. Default 80."
+                      >
+                        <Input
+                          type="number"
+                          min={0}
+                          max={100}
+                          inputMode="numeric"
+                          value={retryGpuFreePct}
+                          onChange={(e) => setRetryGpuFreePct(e.target.value)}
+                          placeholder="80"
+                          aria-invalid={numFieldInvalid(retryGpuFreePct, 0, 100)}
+                          className="max-w-[160px] font-mono text-xs"
+                        />
+                      </Field>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {(isVm || cloudMulti) && (
               <Field
                 label="HF_HOME (model cache)"
@@ -1877,6 +2050,7 @@ export function InferenceForm() {
           : !isVm && explicitlyUnavailable ? "The selected GPU has no capacity — pick another type or region."
           : !isVm && (idleInvalid || diskInvalid || volumeInvalid) ? "Fix the pod sizing / idle timeout values."
           : mode === "single" && advancedInvalid ? "Fix the vLLM engine args to enable deploy."
+          : mode === "multi" && retryInvalid ? "Fix the Auto-retry (crash recovery) values to enable deploy."
           : `${isVm ? "Bare metal" : "Cloud"} · ${mode === "single" ? "single model" : mode}`
         }
       >
@@ -1891,7 +2065,9 @@ export function InferenceForm() {
             // Cloud (single OR multi-fleet): pod sizing + idle + availability.
             (!isVm && (idleInvalid || diskInvalid || volumeInvalid || explicitlyUnavailable)) ||
             // Single-model only has global vLLM engine args to validate.
-            (mode === "single" && advancedInvalid)
+            (mode === "single" && advancedInvalid) ||
+            // Multi-model fleet: the auto-retry (crash recovery) numeric fields.
+            (mode === "multi" && retryInvalid)
           }
         >
           {pending && <Loader2 className="h-4 w-4 animate-spin" />}

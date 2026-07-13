@@ -142,6 +142,28 @@ class UpdateModelsRequest(BaseModel):
     # Full `uv pip install` arg string for vLLM (overrides the version). None leaves
     # it unchanged; "" clears it.
     vllm_install_args: Optional[str] = None
+    # Auto-retry (crash recovery) tuning — None leaves each unchanged. See CreateAppRequest.
+    retry_max: Optional[int] = Field(default=None, ge=0, le=100)
+    retry_forever: Optional[bool] = None
+    retry_backoff_base_s: Optional[float] = Field(default=None, ge=0, le=3600)
+    retry_backoff_cap_s: Optional[float] = Field(default=None, ge=0, le=86400)
+    retry_require_free_gpu: Optional[bool] = None
+    retry_gpu_free_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    health_fail_limit: Optional[int] = Field(default=None, ge=1, le=100)
+
+
+class RetryConfigRequest(BaseModel):
+    """Edit ONLY the multi-model fleet's auto-retry (crash recovery) tuning, without
+    touching the model list (its own Overview card). Applied per `model_fields_set`:
+    a field present as a number sets it, present as `null` clears it back to the
+    worker default, absent leaves it unchanged (so a toggle can be turned off)."""
+    retry_max: Optional[int] = Field(default=None, ge=0, le=100)
+    retry_forever: Optional[bool] = None
+    retry_backoff_base_s: Optional[float] = Field(default=None, ge=0, le=3600)
+    retry_backoff_cap_s: Optional[float] = Field(default=None, ge=0, le=86400)
+    retry_require_free_gpu: Optional[bool] = None
+    retry_gpu_free_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    health_fail_limit: Optional[int] = Field(default=None, ge=1, le=100)
 
 
 class StressRunCreate(BaseModel):
@@ -212,6 +234,23 @@ class CreateAppRequest(BaseModel):
     # Optional setup script the worker runs once after the venv is ready and before
     # launching models (e.g. `bash <(curl -fsSL …/install_deepgemm.sh)`).
     pre_script: Optional[str] = None
+    # ---- Multi-model fleet auto-retry (crash recovery) tuning; None → worker default ----
+    # Max relaunch attempts before a crashed member is left DEAD.
+    retry_max: Optional[int] = Field(default=None, ge=0, le=100)
+    # Never give up — relaunch indefinitely, ignoring retry_max (waits for free GPU
+    # memory forever when retry_require_free_gpu is on).
+    retry_forever: Optional[bool] = None
+    # Backoff between relaunches (seconds): initial delay, doubled per attempt up to
+    # the cap (the "patience" ceiling — longest wait before a retry).
+    retry_backoff_base_s: Optional[float] = Field(default=None, ge=0, le=3600)
+    retry_backoff_cap_s: Optional[float] = Field(default=None, ge=0, le=86400)
+    # Hold a relaunch until the member's GPUs have free VRAM (poll, don't spend the
+    # retry budget) instead of OOM-looping against a foreign job.
+    retry_require_free_gpu: Optional[bool] = None
+    # Min free GPU memory (% of total) required to relaunch when the above is on.
+    retry_gpu_free_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    # Consecutive failed /health probes before a settled engine is declared dead.
+    health_fail_limit: Optional[int] = Field(default=None, ge=1, le=100)
 
     @field_validator("venv_path")
     @classmethod
@@ -253,6 +292,14 @@ class AppRecord(BaseModel):
     vllm_version: Optional[str] = None
     vllm_install_args: Optional[str] = None
     pre_script: Optional[str] = None
+    # Multi-model fleet auto-retry (crash recovery) tuning; None = worker default.
+    retry_max: Optional[int] = None
+    retry_forever: Optional[bool] = None
+    retry_backoff_base_s: Optional[float] = None
+    retry_backoff_cap_s: Optional[float] = None
+    retry_require_free_gpu: Optional[bool] = None
+    retry_gpu_free_pct: Optional[float] = None
+    health_fail_limit: Optional[int] = None
     is_public: bool = False
     created_at: str
     owner: str
@@ -472,6 +519,13 @@ def _to_app_record(app: App, *, redacted: bool = False) -> AppRecord:
         vllm_version=getattr(app, "vllm_version", None) or None,
         vllm_install_args=None if redacted else (getattr(app, "vllm_install_args", None) or None),
         pre_script=None if redacted else (getattr(app, "pre_script", None) or None),
+        retry_max=getattr(app, "retry_max", None),
+        retry_forever=getattr(app, "retry_forever", None),
+        retry_backoff_base_s=getattr(app, "retry_backoff_base_s", None),
+        retry_backoff_cap_s=getattr(app, "retry_backoff_cap_s", None),
+        retry_require_free_gpu=getattr(app, "retry_require_free_gpu", None),
+        retry_gpu_free_pct=getattr(app, "retry_gpu_free_pct", None),
+        health_fail_limit=getattr(app, "health_fail_limit", None),
         is_public=bool(getattr(app, "is_public", False)),
         created_at=app.created_at.isoformat() if app.created_at else "",
         owner=app.owner.username if app.owner else "",
@@ -1744,6 +1798,17 @@ async def create_app(
         # Pre-script runs on the worker (VM venv or RunPod multi-model pod), not a
         # single cloud pod.
         pre_script=((req.pre_script or "").strip() or None) if (is_vm or mode == "multi") else None,
+        # Auto-retry tuning is a multi-model fleet-scheduler concept only (a single
+        # pod / VM proxy has no relaunch loop) — persist it just for mode="multi".
+        retry_max=(req.retry_max if mode == "multi" else None),
+        retry_forever=(bool(req.retry_forever)
+                       if (mode == "multi" and req.retry_forever is not None) else None),
+        retry_backoff_base_s=(req.retry_backoff_base_s if mode == "multi" else None),
+        retry_backoff_cap_s=(req.retry_backoff_cap_s if mode == "multi" else None),
+        retry_require_free_gpu=(bool(req.retry_require_free_gpu)
+                                if (mode == "multi" and req.retry_require_free_gpu is not None) else None),
+        retry_gpu_free_pct=(req.retry_gpu_free_pct if mode == "multi" else None),
+        health_fail_limit=(req.health_fail_limit if mode == "multi" else None),
         created_at=datetime.now(timezone.utc),
     )
     session.add(record)
@@ -2222,6 +2287,47 @@ async def get_app_status(
     }
 
 
+async def _worker_boot_log_fallback(
+    rdb, session: AsyncSession, app: App, user: User, app_state, tail: int,
+) -> list[str]:
+    """Surface the worker-agent's on-box stdout when it hasn't shipped its own
+    __worker__ log yet — i.e. it's mid-bootstrap OR failed to register (broken
+    reverse tunnel / failed bootstrap). Without this the __worker__ panel is empty
+    and the failure is invisible (the shipper only runs once the agent phones home).
+    SSH is slow, so cache the result briefly to survive the panel's polling."""
+    cache_key = f"worker_bootlog:{app.app_id}"
+    cached = await rdb.get(cache_key)
+    if cached is not None:
+        try:
+            return json.loads(cached)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    lines: list[str] = []
+    try:
+        provider = await _provider_for_app(session, app.app_id, user, app_state)
+        if provider is not None:
+            for mid in await provider.list_machines_for_app(app.app_id):
+                boot = await asyncio.wait_for(provider.read_boot_log(mid, tail), timeout=10.0)
+                if boot:
+                    lines = [
+                        f"[gateway] worker {mid} hasn't shipped its own log yet — showing the "
+                        f"on-box worker-agent stdout (~/.sgpu/worker-{mid}.log). If this persists, "
+                        f"the agent is failing to register (check the reverse tunnel / VM_REVERSE_TUNNEL).",
+                        *boot,
+                    ]
+                    break
+    except Exception:  # noqa: BLE001 — best-effort; SSH may hang/fail, box may be down
+        lines = []
+    trimmed = lines[-tail:]
+    # Cache even an empty result briefly so a persistently-down box isn't SSHed on
+    # every poll; a live agent populates worker_logs and skips this path entirely.
+    try:
+        await rdb.set(cache_key, json.dumps(trimmed), ex=8)
+    except Exception:  # noqa: BLE001
+        pass
+    return trimmed
+
+
 @app.get("/apps/{app_id}/models/logs")
 async def get_app_model_logs(
     app_id: str,
@@ -2257,6 +2363,11 @@ async def get_app_model_logs(
             if raw:
                 lines = list(reversed(raw))  # stored newest-first → chronological
                 break
+    # Nothing shipped for the control-plane log → the agent hasn't registered yet
+    # (bootstrapping or failing to register). Read its on-box stdout directly so the
+    # __worker__ panel shows the bootstrap / registration error instead of nothing.
+    if not lines and model == "__worker__" and not log_session:
+        lines = await _worker_boot_log_fallback(rdb, session, app, user, request.app.state, tail)
     return {"app_id": app.app_id, "model": model, "session": log_session, "lines": lines, "count": len(lines)}
 
 
@@ -2977,6 +3088,21 @@ async def update_app_models(
         target.pre_script = req.pre_script.strip() or None
     if req.vllm_install_args is not None:
         target.vllm_install_args = req.vllm_install_args.strip() or None
+    # Auto-retry (crash recovery) tuning — each None leaves the stored value alone.
+    if req.retry_max is not None:
+        target.retry_max = req.retry_max
+    if req.retry_forever is not None:
+        target.retry_forever = bool(req.retry_forever)
+    if req.retry_backoff_base_s is not None:
+        target.retry_backoff_base_s = req.retry_backoff_base_s
+    if req.retry_backoff_cap_s is not None:
+        target.retry_backoff_cap_s = req.retry_backoff_cap_s
+    if req.retry_require_free_gpu is not None:
+        target.retry_require_free_gpu = bool(req.retry_require_free_gpu)
+    if req.retry_gpu_free_pct is not None:
+        target.retry_gpu_free_pct = req.retry_gpu_free_pct
+    if req.health_fail_limit is not None:
+        target.health_fail_limit = req.health_fail_limit
     await session.commit()
     await session.refresh(target)
 
@@ -2988,6 +3114,42 @@ async def update_app_models(
     await audit_module.record(
         user, "inference.update_models", "app", app_id, target.name,
         details={"models": [m.model for m in req.models], "reprovisioned_workers": n},
+    )
+    return _to_app_record(target)
+
+
+@app.patch("/apps/{app_id}/retry-config", response_model=AppRecord)
+async def update_app_retry_config(
+    app_id: str,
+    req: RetryConfigRequest,
+    request: Request,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Edit the multi-model fleet's auto-retry (crash recovery) tuning in place. Only
+    the fields the caller actually sent are touched (set / clear-to-null / unchanged);
+    then the worker is re-provisioned since the retry config is baked into
+    MULTI_MODEL_CONFIG at provision and read by the scheduler at boot."""
+    target = await _load_owned_app(session, app_id, user)
+    if (getattr(target, "mode", "single") or "single") != "multi":
+        raise HTTPException(status_code=400, detail="auto-retry config applies only to multi-model fleets")
+    fields = ("retry_max", "retry_forever", "retry_backoff_base_s", "retry_backoff_cap_s",
+              "retry_require_free_gpu", "retry_gpu_free_pct", "health_fail_limit")
+    sent = req.model_fields_set
+    for f in fields:
+        if f in sent:
+            setattr(target, f, getattr(req, f))
+    await session.commit()
+    await session.refresh(target)
+
+    rdb = request.app.state.redis
+    await rdb.delete(f"app:{app_id}:paused")  # editing implies you want it running
+    n = await _reprovision_workers(rdb, session, app_id, user, request.app.state)
+    logger.info("retry-config updated app=%s by user=%s: %s, reprovisioned %d worker(s)",
+                app_id, user.username, sorted(sent), n)
+    await audit_module.record(
+        user, "inference.update_retry_config", "app", app_id, target.name,
+        details={"fields": sorted(sent), "reprovisioned_workers": n},
     )
     return _to_app_record(target)
 

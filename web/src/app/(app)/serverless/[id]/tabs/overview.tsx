@@ -64,6 +64,8 @@ export function OverviewTab({ app, readOnly = false }: { app: AppRecord; readOnl
 
       {isMulti || isProxy ? <MultiModelArgsCard app={app} readOnly={readOnly} /> : <EngineArgsCard app={app} readOnly={readOnly} />}
 
+      {isMulti && <AutoRetryCard app={app} readOnly={readOnly} />}
+
       <EnvVarsCard app={app} />
     </div>
   );
@@ -668,6 +670,215 @@ function MultiModelArgsCard({ app, readOnly = false }: { app: AppRecord; readOnl
           </>
         )}
 
+        {err && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {err}
+          </div>
+        )}
+        {msg && !editing && (
+          <div className="flex items-center gap-2 rounded-md border border-status-active/40 bg-status-active/10 px-3 py-2 text-xs text-status-active">
+            <RotateCw className="h-3 w-3" /> {msg}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// Auto-retry (crash recovery) — its OWN card. Edits only the fleet's retry tuning
+// via PATCH /apps/{id}/retry-config (never touches the model list), then re-provisions
+// so the worker picks up the new config. Multi-model fleets only.
+function AutoRetryCard({ app, readOnly = false }: { app: AppRecord; readOnly?: boolean }) {
+  const router = useRouter();
+  const numStr = (v: number | null | undefined) => (v != null ? String(v) : "");
+  const [editing, setEditing] = useState(false);
+  const [forever, setForever] = useState<boolean>(app.retry_forever ?? false);
+  const [requireFreeGpu, setRequireFreeGpu] = useState<boolean>(app.retry_require_free_gpu ?? false);
+  const [maxRetries, setMaxRetries] = useState(numStr(app.retry_max));
+  const [backoffBase, setBackoffBase] = useState(numStr(app.retry_backoff_base_s));
+  const [backoffCap, setBackoffCap] = useState(numStr(app.retry_backoff_cap_s));
+  const [gpuFreePct, setGpuFreePct] = useState(numStr(app.retry_gpu_free_pct));
+  const [healthFail, setHealthFail] = useState(numStr(app.health_fail_limit));
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  function startEdit() {
+    setForever(app.retry_forever ?? false);
+    setRequireFreeGpu(app.retry_require_free_gpu ?? false);
+    setMaxRetries(numStr(app.retry_max));
+    setBackoffBase(numStr(app.retry_backoff_base_s));
+    setBackoffCap(numStr(app.retry_backoff_cap_s));
+    setGpuFreePct(numStr(app.retry_gpu_free_pct));
+    setHealthFail(numStr(app.health_fail_limit));
+    setErr(null);
+    setMsg(null);
+    setEditing(true);
+  }
+
+  const numOrNull = (s: string) => (s.trim() ? Number(s) : null);
+
+  async function save() {
+    setSaving(true);
+    setErr(null);
+    setMsg(null);
+    // Full desired state — every field sent, so a blank number clears back to the
+    // worker default (the backend applies exactly what's present in the request).
+    const body = {
+      retry_forever: forever,
+      retry_require_free_gpu: requireFreeGpu,
+      retry_max: forever ? null : numOrNull(maxRetries),
+      retry_backoff_base_s: numOrNull(backoffBase),
+      retry_backoff_cap_s: numOrNull(backoffCap),
+      retry_gpu_free_pct: requireFreeGpu ? numOrNull(gpuFreePct) : null,
+      health_fail_limit: numOrNull(healthFail),
+    };
+    try {
+      const r = await fetch(`/api/proxy/apps/${encodeURIComponent(app.app_id)}/retry-config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      let parsed: unknown = text;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        /* keep raw */
+      }
+      if (!r.ok) {
+        setErr(errText(parsed, r.statusText));
+        return;
+      }
+      setEditing(false);
+      setMsg("Saved — the fleet is re-provisioning to apply the new retry settings; watch the Workers tab.");
+      router.refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const field = (label: string, node: React.ReactNode) => (
+    <div className="flex flex-col gap-1">
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</span>
+      {node}
+    </div>
+  );
+  const stat = (label: string, value: string) => (
+    <div className="flex flex-col">
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</span>
+      <span className="font-medium">{value}</span>
+    </div>
+  );
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0">
+        <div className="flex flex-col gap-0.5">
+          <CardTitle className="text-sm font-medium">Auto-retry (crash recovery)</CardTitle>
+          <span className="text-xs text-muted-foreground">
+            How the fleet relaunches a member whose engine crashes (e.g. a wake-OOM).
+          </span>
+        </div>
+        {!editing && !readOnly && (
+          <Button variant="outline" size="xs" onClick={startEdit}>
+            <Pencil className="h-3 w-3" /> Edit
+          </Button>
+        )}
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        {!editing ? (
+          <div className="flex flex-wrap gap-x-6 gap-y-2">
+            {stat("Max retries", app.retry_forever ? "∞ (forever)" : String(app.retry_max ?? 6))}
+            {stat("Retry delay", `${app.retry_backoff_base_s ?? 15}s`)}
+            {stat("Max delay (patience)", `${app.retry_backoff_cap_s ?? 600}s`)}
+            {stat("Health patience", `${app.health_fail_limit ?? 3} probes`)}
+            {stat(
+              "Wait for free GPU",
+              app.retry_require_free_gpu ? `yes · ≥${app.retry_gpu_free_pct ?? 80}% free` : "no",
+            )}
+          </div>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
+              {field(
+                "Max retries",
+                <Input
+                  type="number" min={0} max={100} inputMode="numeric"
+                  value={forever ? "" : maxRetries}
+                  onChange={(e) => setMaxRetries(e.target.value)}
+                  placeholder={forever ? "∞" : "6"}
+                  disabled={saving || forever}
+                  className="h-8 w-20 font-mono text-xs"
+                />,
+              )}
+              {field(
+                "Health patience",
+                <Input
+                  type="number" min={1} max={100} inputMode="numeric"
+                  value={healthFail} onChange={(e) => setHealthFail(e.target.value)}
+                  placeholder="3" disabled={saving} className="h-8 w-20 font-mono text-xs"
+                />,
+              )}
+              {field(
+                "Retry delay (s)",
+                <Input
+                  type="number" min={0} max={3600} inputMode="numeric"
+                  value={backoffBase} onChange={(e) => setBackoffBase(e.target.value)}
+                  placeholder="15" disabled={saving} className="h-8 w-20 font-mono text-xs"
+                />,
+              )}
+              {field(
+                "Max delay (s)",
+                <Input
+                  type="number" min={0} max={86400} inputMode="numeric"
+                  value={backoffCap} onChange={(e) => setBackoffCap(e.target.value)}
+                  placeholder="600" disabled={saving} className="h-8 w-24 font-mono text-xs"
+                />,
+              )}
+            </div>
+            <label className="flex w-fit cursor-pointer select-none items-center gap-1.5 text-[11px] text-muted-foreground">
+              <input
+                type="checkbox" checked={forever}
+                onChange={(e) => setForever(e.target.checked)}
+                disabled={saving} className="h-3.5 w-3.5 accent-primary"
+              />
+              Retry forever (never give up — ignores max retries)
+            </label>
+            <label className="flex w-fit cursor-pointer select-none items-center gap-1.5 text-[11px] text-muted-foreground">
+              <input
+                type="checkbox" checked={requireFreeGpu}
+                onChange={(e) => setRequireFreeGpu(e.target.checked)}
+                disabled={saving} className="h-3.5 w-3.5 accent-primary"
+              />
+              Only retry when GPU memory is free
+            </label>
+            {requireFreeGpu &&
+              field(
+                "Min free GPU memory (%)",
+                <Input
+                  type="number" min={0} max={100} inputMode="numeric"
+                  value={gpuFreePct} onChange={(e) => setGpuFreePct(e.target.value)}
+                  placeholder="80" disabled={saving} className="h-8 w-24 font-mono text-xs"
+                />,
+              )}
+            <span className="block text-[10px] text-muted-foreground">
+              A blank number keeps the worker default. Saving drains + re-provisions the fleet to apply.
+            </span>
+            <div className="flex items-center gap-2 border-t border-border pt-3">
+              <div className="flex-1" />
+              <Button variant="ghost" size="sm" onClick={() => { setEditing(false); setErr(null); }} disabled={saving}>
+                <X className="h-4 w-4" /> Cancel
+              </Button>
+              <Button size="sm" onClick={save} disabled={saving}>
+                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                Save &amp; re-provision
+              </Button>
+            </div>
+          </>
+        )}
         {err && (
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {err}

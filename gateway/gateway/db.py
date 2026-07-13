@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
-from sqlalchemy import BigInteger, JSON, Boolean, ForeignKey, String, Text, DateTime, Integer, UniqueConstraint, select, text
+from sqlalchemy import BigInteger, JSON, Boolean, Float, ForeignKey, String, Text, DateTime, Integer, UniqueConstraint, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -196,6 +196,23 @@ class App(Base):
     # and before any model launches — for model-specific setup that isn't a plain
     # pip install (e.g. building DeepGEMM). NULL = none.
     pre_script: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # ---- Multi-model fleet auto-retry (crash recovery) tuning; NULL = worker default ----
+    # Max relaunch attempts before a crashed member is left DEAD.
+    retry_max: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Never give up — relaunch indefinitely, ignoring retry_max (waits for free GPU
+    # memory forever when retry_require_free_gpu is on). NULL/False = honour retry_max.
+    retry_forever: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Backoff between relaunches (seconds): initial delay, doubled per attempt up to
+    # retry_backoff_cap_s (the patience ceiling — longest wait before a retry).
+    retry_backoff_base_s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    retry_backoff_cap_s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Hold a relaunch until the member's GPUs have free VRAM (poll, don't spend the
+    # budget) instead of OOM-looping against a foreign job. NULL/False = retry now.
+    retry_require_free_gpu: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Min free GPU memory (% of total) required to relaunch when the above is on.
+    retry_gpu_free_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Consecutive failed /health probes before a settled engine is declared dead.
+    health_fail_limit: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -872,6 +889,17 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS vllm_install_args TEXT"
         ))
+        # Multi-model fleet auto-retry (crash recovery) tuning — NULL = worker default.
+        for _col, _type in (
+            ("retry_max", "INTEGER"),
+            ("retry_forever", "BOOLEAN"),
+            ("retry_backoff_base_s", "DOUBLE PRECISION"),
+            ("retry_backoff_cap_s", "DOUBLE PRECISION"),
+            ("retry_require_free_gpu", "BOOLEAN"),
+            ("retry_gpu_free_pct", "DOUBLE PRECISION"),
+            ("health_fail_limit", "INTEGER"),
+        ):
+            await conn.execute(text(f"ALTER TABLE apps ADD COLUMN IF NOT EXISTS {_col} {_type}"))
         # Per-endpoint log-archive storage (a kind=s3 Storage). NULL = Redis-only.
         await conn.execute(text(
             "ALTER TABLE apps ADD COLUMN IF NOT EXISTS storage_id VARCHAR(64)"

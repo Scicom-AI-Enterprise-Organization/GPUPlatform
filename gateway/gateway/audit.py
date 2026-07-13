@@ -55,6 +55,7 @@ ACTIONS = {
     "inference.model_action",
     "inference.update_autoscaler",
     "inference.update_models",
+    "inference.update_retry_config",
     "inference.visibility",
     "proxy.visibility",
     "benchmark.create",

@@ -55,6 +55,14 @@ export type AppRecord = {
   vllm_version?: string | null;
   vllm_install_args?: string | null;
   pre_script?: string | null;
+  // Multi-model fleet auto-retry (crash recovery) tuning; null = worker default.
+  retry_max?: number | null;
+  retry_forever?: boolean | null;
+  retry_backoff_base_s?: number | null;
+  retry_backoff_cap_s?: number | null;
+  retry_require_free_gpu?: boolean | null;
+  retry_gpu_free_pct?: number | null;
+  health_fail_limit?: number | null;
   is_public?: boolean;
   created_at: string;
   owner: string;
@@ -106,6 +114,23 @@ export type CreateAppRequest = {
   // Optional setup script run once per worker boot before launching models, e.g.
   // `bash <(curl -fsSL …/install_deepgemm.sh)`. VM venv / RunPod multi-model only.
   pre_script?: string | null;
+  // ---- Multi-model fleet auto-retry (crash recovery); omitted = worker default ----
+  // Max relaunch attempts before a crashed member is left DEAD.
+  retry_max?: number | null;
+  // Never give up — relaunch indefinitely, ignoring retry_max (waits for free GPU
+  // memory forever when retry_require_free_gpu is on).
+  retry_forever?: boolean | null;
+  // Backoff between relaunches (seconds): initial delay, doubled per attempt up to
+  // the cap (the "patience" ceiling — longest wait before a retry).
+  retry_backoff_base_s?: number | null;
+  retry_backoff_cap_s?: number | null;
+  // Hold a relaunch until the member's GPUs have free VRAM (don't OOM-loop against a
+  // foreign job); polls without spending the retry budget.
+  retry_require_free_gpu?: boolean | null;
+  // Min free GPU memory (% of total) required to relaunch when the above is on.
+  retry_gpu_free_pct?: number | null;
+  // Consecutive failed /health probes before a settled engine is declared dead.
+  health_fail_limit?: number | null;
 };
 
 export type CreateAppResponse = {

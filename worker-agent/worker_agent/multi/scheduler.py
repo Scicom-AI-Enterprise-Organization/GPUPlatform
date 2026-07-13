@@ -46,6 +46,31 @@ RELAUNCH_BACKOFF_CAP_S = float(os.environ.get("VLLM_RELAUNCH_BACKOFF_CAP_S", "60
 HEALTHY_RESET_TICKS = int(os.environ.get("VLLM_HEALTHY_RESET_TICKS", "6") or "6")
 
 
+async def _query_gpu_free_mib() -> "dict[int, tuple[float, float]]":
+    """{gpu_index: (free_mib, total_mib)} via nvidia-smi. Empty dict on ANY failure
+    (binary absent / parse error / non-NVIDIA box) so callers can fail-open. Async
+    so it never blocks the scheduler's event loop."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nvidia-smi", "--query-gpu=index,memory.free,memory.total",
+            "--format=csv,noheader,nounits",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    except Exception:  # noqa: BLE001 — nvidia-smi missing/hung: caller fails open
+        return {}
+    res: "dict[int, tuple[float, float]]" = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            continue
+        try:
+            idx, free, total = int(parts[0]), float(parts[1]), float(parts[2])
+        except ValueError:
+            continue
+        res[idx] = (free, total)
+    return res
+
+
 class ModelState(str, enum.Enum):
     QUEUED = "queued"        # waiting for an earlier wave to load + sleep (shares GPUs)
     LAUNCHING = "launching"
@@ -122,6 +147,49 @@ class MultiModelScheduler:
         # provider's terminate can kill ONLY our processes (never a box-wide
         # pkill). Set by the provider; None → no persistence (cleanup no-ops).
         self._pids_path: str | None = os.environ.get("WORKER_ENGINE_PIDS_PATH")
+        # Per-fleet auto-retry knobs. Fall back to the module env-var defaults when
+        # the config omits them, so fleets created before this feature are unchanged.
+        self._retry_max = cfg.retry_max if cfg.retry_max is not None else MAX_RELAUNCH
+        self._retry_forever = bool(getattr(cfg, "retry_forever", False))
+        self._backoff_base = (cfg.retry_backoff_base_s
+                              if cfg.retry_backoff_base_s is not None else RELAUNCH_BACKOFF_BASE_S)
+        self._backoff_cap = (cfg.retry_backoff_cap_s
+                             if cfg.retry_backoff_cap_s is not None else RELAUNCH_BACKOFF_CAP_S)
+        self._require_free_gpu = bool(getattr(cfg, "retry_require_free_gpu", False))
+        self._gpu_free_pct = (cfg.retry_gpu_free_pct
+                              if cfg.retry_gpu_free_pct is not None else 80.0)
+        self._health_fail_limit = (cfg.health_fail_limit
+                                   if cfg.health_fail_limit is not None else HEALTH_FAIL_LIMIT)
+        logger.info(
+            "auto-retry: max=%s backoff=%.0f→%.0fs health_fail_limit=%d require_free_gpu=%s%s",
+            "∞" if self._retry_forever else self._retry_max,
+            self._backoff_base, self._backoff_cap, self._health_fail_limit,
+            self._require_free_gpu,
+            f" (≥{self._gpu_free_pct:.0f}% free)" if self._require_free_gpu else "",
+        )
+
+    async def _gpus_free_enough(self, gpus: "set[int]") -> "tuple[bool, str]":
+        """True when every GPU in `gpus` has ≥ self._gpu_free_pct of its VRAM free.
+        Used to gate a crash relaunch (see monitor_loop) so we don't OOM-loop into a
+        card a foreign job is hogging. FAIL-OPEN: if nvidia-smi is absent/unreadable
+        (e.g. an Ascend box), returns True so the relaunch proceeds rather than
+        blocking forever. Returns (ok, why) — `why` names the busiest GPU when not."""
+        info = await _query_gpu_free_mib()
+        if not info:
+            return True, ""
+        worst_pct: float | None = None
+        worst_g: int | None = None
+        for g in sorted(gpus):
+            fm = info.get(g)
+            if not fm:
+                continue  # index not reported → don't block on it
+            free, total = fm
+            pct = (free / total * 100.0) if total > 0 else 100.0
+            if worst_pct is None or pct < worst_pct:
+                worst_pct, worst_g = pct, g
+        if worst_pct is not None and worst_pct < self._gpu_free_pct:
+            return False, f"GPU {worst_g} {worst_pct:.0f}% free < {self._gpu_free_pct:.0f}%"
+        return True, ""
 
     @asynccontextmanager
     async def _hold_gpus(self, gpus):
@@ -268,17 +336,20 @@ class MultiModelScheduler:
         rt.swapping = False
         rt.healthy_streak = 0
         rt.state = ModelState.DEAD
-        if rt.restart_count >= MAX_RELAUNCH:
+        budget = "∞" if self._retry_forever else str(self._retry_max)
+        if not self._retry_forever and rt.restart_count >= self._retry_max:
             rt.retry_pending = False
-            rt.reason = f"{prefix}(crashed: {cause}; gave up after {MAX_RELAUNCH} relaunches — restart it from the Workers tab)"
-            logger.error("%s: gave up after %d relaunches (%s)", rt.member.model, MAX_RELAUNCH, cause)
+            rt.reason = f"{prefix}(crashed: {cause}; gave up after {self._retry_max} relaunches — restart it from the Workers tab)"
+            logger.error("%s: gave up after %d relaunches (%s)", rt.member.model, self._retry_max, cause)
         else:
-            delay = min(RELAUNCH_BACKOFF_BASE_S * (2 ** rt.restart_count), RELAUNCH_BACKOFF_CAP_S)
+            # Cap the shift so a long "retry forever" run doesn't compute a giant int;
+            # min() clamps to the cap anyway (delays plateau at retry_backoff_cap_s).
+            delay = min(self._backoff_base * (2 ** min(rt.restart_count, 30)), self._backoff_cap)
             rt.retry_pending = True
             rt.next_retry_ts = time.monotonic() + delay
-            rt.reason = f"{prefix}(crashed: {cause}; auto-retry {rt.restart_count + 1}/{MAX_RELAUNCH} in ~{int(delay)}s)"
-            logger.warning("%s died (%s); auto-retry %d/%d in ~%.0fs",
-                           rt.member.model, cause, rt.restart_count + 1, MAX_RELAUNCH, delay)
+            rt.reason = f"{prefix}(crashed: {cause}; auto-retry {rt.restart_count + 1}/{budget} in ~{int(delay)}s)"
+            logger.warning("%s died (%s); auto-retry %d/%s in ~%.0fs",
+                           rt.member.model, cause, rt.restart_count + 1, budget, delay)
         self._cond.notify_all()
 
     async def _sleep_victim(self, v: ModelRuntime) -> bool:
@@ -643,6 +714,22 @@ class MultiModelScheduler:
                 if rt.retry_pending:
                     if time.monotonic() < rt.next_retry_ts:
                         continue
+                    # Optionally hold the relaunch until this member's GPUs have free
+                    # VRAM — relaunching into a card a foreign job is hogging would
+                    # just OOM and burn a retry. Re-poll on the next tick WITHOUT
+                    # spending the budget (restart_count unchanged) until it frees.
+                    if self._require_free_gpu:
+                        ok, why = await self._gpus_free_enough(rt.gpus)
+                        if not ok:
+                            async with self._cond:
+                                if rt.retry_pending:  # no operator action raced us
+                                    rt.next_retry_ts = time.monotonic() + self._backoff_base
+                                    budget = "∞" if self._retry_forever else str(self._retry_max)
+                                    rt.reason = (f"waiting for GPU memory ({why}); auto-retry "
+                                                 f"{rt.restart_count + 1}/{budget} once free")
+                                self._cond.notify_all()
+                            logger.info("%s: retry held — %s", rt.member.model, why)
+                            continue
                     async with self._cond:
                         rt.retry_pending = False
                         rt.state = ModelState.LAUNCHING
@@ -650,8 +737,9 @@ class MultiModelScheduler:
                         rt.health_fail = 0
                         self._cond.notify_all()
                     rt.restart_count += 1
-                    logger.warning("relaunching %s (backoff attempt %d/%d)",
-                                   rt.member.model, rt.restart_count, MAX_RELAUNCH)
+                    logger.warning("relaunching %s (backoff attempt %d/%s)",
+                                   rt.member.model, rt.restart_count,
+                                   "∞" if self._retry_forever else str(self._retry_max))
                     await self._launch_and_sleep(rt)  # success → AWAKE/ASLEEP; fail → schedules next backoff
                     continue
                 proc = rt.proc
@@ -672,7 +760,7 @@ class MultiModelScheduler:
                     else:
                         rt.health_fail += 1
                         rt.healthy_streak = 0
-                        if rt.health_fail >= HEALTH_FAIL_LIMIT:
+                        if rt.health_fail >= self._health_fail_limit:
                             died = True
                             cause = f"engine unresponsive ({rt.health_fail}× /health)"
                 if not died:

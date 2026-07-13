@@ -124,6 +124,16 @@ def build_multi_model_config(app) -> dict:
         # Optional setup script the worker runs once after the venv is ready and
         # before launching models (e.g. building DeepGEMM).
         "pre_script": (getattr(app, "pre_script", None) or None),
+        # Per-fleet auto-retry / crash-recovery tuning. None → the worker's env-var
+        # defaults (VLLM_MAX_RELAUNCH etc.), so fleets that don't set them are
+        # unchanged. Only the multi-model scheduler reads these.
+        "retry_max": getattr(app, "retry_max", None),
+        "retry_forever": bool(getattr(app, "retry_forever", False) or False),
+        "retry_backoff_base_s": getattr(app, "retry_backoff_base_s", None),
+        "retry_backoff_cap_s": getattr(app, "retry_backoff_cap_s", None),
+        "retry_require_free_gpu": bool(getattr(app, "retry_require_free_gpu", False) or False),
+        "retry_gpu_free_pct": getattr(app, "retry_gpu_free_pct", None),
+        "health_fail_limit": getattr(app, "health_fail_limit", None),
         "models": out,
     }
 

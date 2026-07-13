@@ -229,7 +229,19 @@ export const gateway = {
   // per-model vLLM args) and re-provision. Pass the FULL new member list.
   updateModels: (
     id: string,
-    body: { models: { model: string; tp?: number; extra_args?: string }[]; sleep_level?: number; visible_devices?: string },
+    body: {
+      models: { model: string; tp?: number; extra_args?: string }[];
+      sleep_level?: number;
+      visible_devices?: string;
+      // Auto-retry (crash recovery) tuning — omit to leave each unchanged.
+      retry_max?: number;
+      retry_forever?: boolean;
+      retry_backoff_base_s?: number;
+      retry_backoff_cap_s?: number;
+      retry_require_free_gpu?: boolean;
+      retry_gpu_free_pct?: number;
+      health_fail_limit?: number;
+    },
   ) =>
     request<AppRecord>(`/apps/${encodeURIComponent(id)}/models`, {
       method: "PATCH",

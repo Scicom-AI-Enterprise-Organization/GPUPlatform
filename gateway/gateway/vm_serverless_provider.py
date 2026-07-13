@@ -209,6 +209,36 @@ class VMProvider(Provider):
         await self._rdb.srem(f"vm_machines:{self._provider_id}", machine_id)
         await self._rdb.delete(f"vm_machine:{machine_id}:app")
 
+    async def read_boot_log(self, machine_id: str, tail: int = 400) -> list[str]:
+        """SSH in and tail the agent's own stdout log (`~/.sgpu/worker-{mid}.log`)
+        — the file the __worker__ shipper WOULD ship once the agent registers. For a
+        worker stuck bootstrapping / failing to register this is the only place its
+        error (venv install, `register attempt N → connection refused`, tracebacks)
+        is visible. Best-effort: returns [] on any SSH/read failure."""
+        import asyncio
+        return await asyncio.to_thread(self._read_boot_log_sync, machine_id, tail)
+
+    def _read_boot_log_sync(self, machine_id: str, tail: int) -> list[str]:
+        try:
+            client = self._connect_sync()
+        except Exception:  # noqa: BLE001 — box unreachable → nothing to show
+            return []
+        try:
+            home = self._run(client, "echo $HOME").strip() or f"/home/{self._user}"
+            remote_dir = REMOTE_DIR.replace("~", home)
+            log_path = f"{remote_dir}/worker-{machine_id}.log"
+            rc, out, _ = self._run_full(client, f"tail -n {int(tail)} {shlex.quote(log_path)}")
+            if rc != 0:
+                return []
+            return [ln for ln in out.splitlines() if ln.strip()]
+        except Exception:  # noqa: BLE001
+            return []
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     async def purge_app(self, app_id: str) -> int:
         """Hard cleanup: sweep EVERY on-disk worker remnant for this app (not just
         what redis tracks — crash-loop churn leaves orphan pidfiles/logs/configs),

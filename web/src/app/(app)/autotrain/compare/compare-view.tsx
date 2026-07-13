@@ -12,7 +12,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { Activity, ArrowLeft, Download, Gauge, Loader2, Target, TrendingDown } from "lucide-react";
+import { Activity, ArrowLeft, AudioLines, Download, Gauge, Loader2, Target, TrendingDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -53,6 +53,8 @@ type RunData = {
   steps: TrainingStep[];
   epochs: TrainingEpoch[];
   best: TrainingResult["best"];
+  // Post-train TTS audio eval (CER / MOS / speaker similarity) — TTS runs only.
+  ttsEval: TrainingResult["tts_eval"];
   error: string | null;
 };
 
@@ -151,7 +153,8 @@ export function CompareView({ ids }: { ids: string[] }) {
               steps,
               epochs,
               best: rj.best ?? null,
-              error: steps.length === 0 && epochs.length === 0 ? "no metrics yet" : null,
+              ttsEval: rj.tts_eval ?? null,
+              error: steps.length === 0 && epochs.length === 0 && !rj.tts_eval ? "no metrics yet" : null,
             };
           } catch (e) {
             return {
@@ -163,6 +166,7 @@ export function CompareView({ ids }: { ids: string[] }) {
               steps: [],
               epochs: [],
               best: null,
+              ttsEval: null,
               error: e instanceof Error ? e.message : String(e),
             };
           }
@@ -207,8 +211,17 @@ export function CompareView({ ids }: { ids: string[] }) {
     );
   }
 
-  const loadedCount = runs.filter((r) => r.steps.length > 0 || r.epochs.length > 0).length;
-  const noData = !trainLoss.hasData && !evalLoss.hasData && !werSeries.hasData && !cerSeries.hasData;
+  const loadedCount = runs.filter((r) => r.steps.length > 0 || r.epochs.length > 0 || r.ttsEval).length;
+  // Post-train TTS audio eval present on any run (CER / MOS / speaker similarity).
+  const anyTtsEval = runs.some(
+    (r) => r.ttsEval && (r.ttsEval.cer != null || r.ttsEval.mos != null || r.ttsEval.similarity != null),
+  );
+  const noData =
+    !trainLoss.hasData && !evalLoss.hasData && !werSeries.hasData && !cerSeries.hasData && !anyTtsEval;
+  // How many metric charts will render — drives the grid. With only one (e.g. two
+  // LLM runs → just Training loss) a 2-col grid would strand it at half width, so
+  // fall back to a single full-width column.
+  const chartCount = [trainLoss, evalLoss, werSeries, cerSeries].filter((s) => s.hasData).length;
 
   // Table columns only appear when at least one run carries that metric — a set
   // of all-LLM runs shouldn't show empty WER/CER columns, etc.
@@ -320,7 +333,9 @@ export function CompareView({ ids }: { ids: string[] }) {
             </CardContent>
           </Card>
 
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          {anyTtsEval && <TtsEvalCard runs={runs} />}
+
+          <div className={cn("grid grid-cols-1 gap-4", chartCount > 1 && "lg:grid-cols-2")}>
             {trainLoss.hasData && (
               <ChartCard
                 title="Training loss"
@@ -392,6 +407,91 @@ export function CompareView({ ids }: { ids: string[] }) {
         </>
       )}
     </div>
+  );
+}
+
+// Post-train TTS audio eval side by side (CER ↓ / MOS ↑ / speaker similarity ↑).
+// A table (not a curve) since each is one scalar per run; best value per metric is
+// highlighted (lower CER, higher MOS / similarity). Mirrors the single-run detail card.
+function TtsEvalCard({ runs }: { runs: RunData[] }) {
+  const anyCer = runs.some((r) => r.ttsEval?.cer != null);
+  const anyMos = runs.some((r) => r.ttsEval?.mos != null);
+  const anySim = runs.some((r) => r.ttsEval?.similarity != null);
+  const samples = runs.find((r) => r.ttsEval?.samples != null)?.ttsEval?.samples ?? null;
+  const nums = (pick: (r: RunData) => number | null | undefined) =>
+    runs.map(pick).filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  const cers = nums((r) => r.ttsEval?.cer);
+  const moss = nums((r) => r.ttsEval?.mos);
+  const sims = nums((r) => r.ttsEval?.similarity);
+  const bestCer = cers.length ? Math.min(...cers) : null; // lower is better
+  const bestMos = moss.length ? Math.max(...moss) : null; // higher is better
+  const bestSim = sims.length ? Math.max(...sims) : null; // higher is better
+  const cell = (v: number | null | undefined, digits: number, best: number | null) =>
+    v == null || !Number.isFinite(v) ? (
+      <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">—</td>
+    ) : (
+      <td
+        className={cn(
+          "px-3 py-1.5 text-right tabular-nums",
+          best != null && v === best && "font-semibold text-emerald-600 dark:text-emerald-400",
+        )}
+      >
+        {v.toFixed(digits)}
+      </td>
+    );
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <div className="flex items-center gap-2">
+          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-muted text-muted-foreground">
+            <AudioLines className="h-4 w-4" />
+          </div>
+          <div>
+            <CardTitle className="text-sm">
+              TTS evaluation{samples != null ? ` · ${samples} samples` : ""}
+            </CardTitle>
+            <CardDescription className="text-[11px]">
+              post-train audio eval · CER ↓ · MOS ↑ (UTMOSv2) · speaker similarity ↑ (TitaNet) — best highlighted
+            </CardDescription>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="px-0 pb-0">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/40">
+              <tr>
+                <th className="px-3 py-2 text-left text-xs uppercase tracking-wide text-muted-foreground">Run</th>
+                <th className="px-3 py-2 text-left text-xs uppercase tracking-wide text-muted-foreground">Model</th>
+                {anyCer && <th className="px-3 py-2 text-right text-xs uppercase tracking-wide text-muted-foreground">CER ↓</th>}
+                {anyMos && <th className="px-3 py-2 text-right text-xs uppercase tracking-wide text-muted-foreground">MOS ↑</th>}
+                {anySim && <th className="px-3 py-2 text-right text-xs uppercase tracking-wide text-muted-foreground">Speaker sim ↑</th>}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {runs.map((r, i) => {
+                const color = COMPARE_COLORS[i % COMPARE_COLORS.length];
+                const te = r.ttsEval;
+                return (
+                  <tr key={r.id}>
+                    <td className="px-3 py-1.5">
+                      <span className="inline-flex items-center gap-2">
+                        <span className="inline-block h-2 w-2 rounded-full" style={{ background: color }} />
+                        <span className="font-medium">{r.name}</span>
+                      </span>
+                    </td>
+                    <td className="px-3 py-1.5 font-mono text-xs text-muted-foreground">{shortModel(r.model)}</td>
+                    {anyCer && cell(te?.cer, 4, bestCer)}
+                    {anyMos && cell(te?.mos, 3, bestMos)}
+                    {anySim && cell(te?.similarity, 4, bestSim)}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

@@ -149,6 +149,14 @@ class Provider(ABC):
         no-op (RunPod pods are reaped by terminate); VM providers override."""
         return 0
 
+    async def read_boot_log(self, machine_id: str, tail: int = 400) -> list[str]:
+        """The worker-agent's own stdout read directly from the box (SSH/API),
+        NOT via the log shipper. Lets the UI show a worker that failed to REGISTER
+        (broken reverse tunnel / failed bootstrap) instead of an empty __worker__
+        panel — the shipper only runs once the agent is up and phoning home.
+        Default no-op; providers that can read the box override."""
+        return []
+
     async def check_availability(
         self,
         gpu: str,

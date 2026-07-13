@@ -55,6 +55,39 @@ class MultiModelConfig:
     # Optional shell snippet run once per worker boot, after the venv is ready and
     # before any model launches (e.g. building DeepGEMM). None → skip.
     pre_script: str | None = None
+    # ---- Auto-retry / crash-recovery knobs (per-fleet; None → worker env default) ----
+    # Max relaunch attempts for a crashed member before it's left DEAD.
+    retry_max: int | None = None
+    # Never give up: relaunch a crashed member indefinitely, ignoring retry_max.
+    # With retry_require_free_gpu this waits for free VRAM forever. Default off.
+    retry_forever: bool = False
+    # Backoff between relaunches (seconds): the initial delay, doubled each attempt
+    # up to retry_backoff_cap_s (the "patience" ceiling — the longest wait before a
+    # retry).
+    retry_backoff_base_s: float | None = None
+    retry_backoff_cap_s: float | None = None
+    # Hold a crashed member's relaunch until its GPUs have free VRAM — a foreign job
+    # hogging the card would just OOM the relaunch and burn a retry. Polls without
+    # spending the retry budget until the memory frees. Default off.
+    retry_require_free_gpu: bool = False
+    # Min free GPU memory (% of total) required to relaunch when the above is on.
+    retry_gpu_free_pct: float | None = None
+    # Consecutive failed /health probes before a settled engine is declared dead.
+    health_fail_limit: int | None = None
+
+
+def _int_or_none(v) -> int | None:
+    try:
+        return int(v) if v is not None and str(v).strip() != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(v) -> float | None:
+    try:
+        return float(v) if v is not None and str(v).strip() != "" else None
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiModelConfig:
@@ -126,4 +159,11 @@ def parse_multi_config(raw_json: str | None, path: str | None = None) -> MultiMo
         vllm_version=((cfg.get("vllm_version") or "").strip() or None),
         vllm_install_args=((cfg.get("vllm_install_args") or "").strip() or None),
         pre_script=((cfg.get("pre_script") or "").strip() or None),
+        retry_max=_int_or_none(cfg.get("retry_max")),
+        retry_forever=bool(cfg.get("retry_forever") or False),
+        retry_backoff_base_s=_float_or_none(cfg.get("retry_backoff_base_s")),
+        retry_backoff_cap_s=_float_or_none(cfg.get("retry_backoff_cap_s")),
+        retry_require_free_gpu=bool(cfg.get("retry_require_free_gpu") or False),
+        retry_gpu_free_pct=_float_or_none(cfg.get("retry_gpu_free_pct")),
+        health_fail_limit=_int_or_none(cfg.get("health_fail_limit")),
     )
