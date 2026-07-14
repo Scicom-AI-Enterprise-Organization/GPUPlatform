@@ -525,6 +525,11 @@ class MultiModelScheduler:
                 # 2,3 model while Mistral holds 0,1,2,3). At initial startup this
                 # is a no-op since nothing is awake yet.
                 await self._evict_overlapping(rt)
+                # Reap any orphan still bound to this member's port (a prior/racing
+                # launch under a different machine_id, or tp workers left by a rc=-9
+                # SIGKILL). Otherwise wait_health gets a false 200 from the orphan and
+                # this tp launch OOMs against the VRAM it still holds → crash-retry loop.
+                await launcher.free_port(rt.member.port)
                 rt.proc = await launcher.launch_member(rt.member, self.log_dir, self._python_exe, log_path=rt.log_path)
                 # Record the engine's process group right away (before health) so a
                 # worker SIGKILL mid-load still leaves a trackable orphan, not a
@@ -714,6 +719,12 @@ class MultiModelScheduler:
                 if rt.retry_pending:
                     if time.monotonic() < rt.next_retry_ts:
                         continue
+                    # Reap our OWN orphan still bound to this member's port before the
+                    # free-GPU gate. A dead-but-not-fully-reaped prior instance (tp
+                    # workers left by a rc=-9) keeps hoarding this member's VRAM, which
+                    # the gate below can't tell from a foreign job — so without this the
+                    # member waits forever for memory its own corpse is holding.
+                    await launcher.free_port(rt.member.port)
                     # Optionally hold the relaunch until this member's GPUs have free
                     # VRAM — relaunching into a card a foreign job is hogging would
                     # just OOM and burn a retry. Re-poll on the next tick WITHOUT

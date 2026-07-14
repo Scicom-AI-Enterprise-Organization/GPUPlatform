@@ -705,6 +705,48 @@ def has_fatal_error(log_path: str | None, tail_bytes: int = 32768) -> bool:
     return False
 
 
+def _pids_on_port(port: int) -> "list[int]":
+    """PIDs holding a LISTEN socket on `port`, via `ss`. Best-effort — [] on any error
+    (ss missing, parse failure). The port is this endpoint's own window (assigned by
+    the gateway's per-endpoint port packer), so a listener on it is ours to reap."""
+    try:
+        out = subprocess.run(
+            ["ss", "-H", "-ltnp", f"sport = :{int(port)}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:  # noqa: BLE001 — ss absent/slow → caller no-ops
+        return []
+    return sorted({int(m.group(1)) for m in re.finditer(r"pid=(\d+)", out)})
+
+
+async def free_port(port: int, grace_s: float = 10.0) -> None:
+    """Kill whatever is still LISTENing on `port` and wait for it to release it.
+
+    An orphaned vLLM from a prior/racing launch (a different machine_id, or a rc=-9
+    SIGKILL that left tp workers behind) keeps answering /health on this port AND
+    hoards its GPU memory. Launching a fresh engine over it makes wait_health return
+    a false-instant 200 (it hits the orphan) and the new tp launch OOMs against the
+    VRAM the orphan holds. Reaping the port-holder first avoids both."""
+    pids = await asyncio.to_thread(_pids_on_port, port)
+    if not pids:
+        return
+    logger.warning("port %d still held by pid(s) %s — reaping before launch", port, pids)
+    for pid in pids:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)  # whole group (tp workers)
+        except (ProcessLookupError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if not await asyncio.to_thread(_pids_on_port, port):
+            return
+        await asyncio.sleep(0.5)
+    logger.warning("port %d still held after %.0fs — launching anyway", port, grace_s)
+
+
 async def terminate(proc: asyncio.subprocess.Process | None, grace_s: float = 10.0) -> None:
     """Stop a vLLM engine and ALL its children (SIGTERM group, then SIGKILL).
 
