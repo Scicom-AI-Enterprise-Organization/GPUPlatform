@@ -3,13 +3,14 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, Cpu, Database, Library, Loader2, Server, Shrink } from "lucide-react";
+import { AlertTriangle, Cpu, Database, KeyRound, Library, Loader2, Server, Shrink } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type {
   CreateQuantizationJobRequest,
   DatasetRecord,
+  GlobalEnvRecord,
   GpuTypeOption,
   ProviderRecord,
   StorageRecord,
@@ -57,6 +58,7 @@ export function QuantizationForm() {
   const [datasets, setDatasets] = useState<DatasetRecord[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [storages, setStorages] = useState<StorageRecord[]>([]);
+  const [secrets, setSecrets] = useState<GlobalEnvRecord[]>([]);
   const [gpuOptions, setGpuOptions] = useState<GpuTypeOption[]>(RUNPOD_GPU_FALLBACK);
 
   // Core
@@ -88,11 +90,16 @@ export function QuantizationForm() {
   const [volumeGb, setVolumeGb] = useState(120);
   const [visibleDevices, setVisibleDevices] = useState("");
 
+  // HF token for the job (gated/private source model + push to Hub) — pasted, or a
+  // global-secret reference (default; rotates without editing this job).
+  const [hfTokenMode, setHfTokenMode] = useState<"paste" | "secret">("secret");
+  const [hfToken, setHfToken] = useState("");
+  const [hfTokenSecret, setHfTokenSecret] = useState("");
+
   // Output
   const [storageId, setStorageId] = useState("");
   const [hfPushRepo, setHfPushRepo] = useState("");
   const [hfPrivate, setHfPrivate] = useState(true);
-  const [hfToken, setHfToken] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,6 +108,7 @@ export function QuantizationForm() {
     gateway.listQuantizationSchemes().then((r) => setSchemes(r.schemes)).catch(() => {});
     gateway.listDatasets().then(setDatasets).catch(() => {});
     gateway.listStorage().then(setStorages).catch(() => {});
+    gateway.listGlobalEnv().then(setSecrets).catch(() => {});
     gateway
       .listProviders()
       .then((ps) => {
@@ -124,6 +132,8 @@ export function QuantizationForm() {
   const vmProviders = useMemo(() => providers.filter((p) => p.kind === "vm"), [providers]);
   const runpodProviders = useMemo(() => providers.filter((p) => p.kind === "runpod"), [providers]);
   const s3Storages = useMemo(() => storages.filter((s) => s.kind === "s3"), [storages]);
+  // Global-secret keys the HF token can reference (keys only; values stay server-side).
+  const hfSecretKeys = useMemo(() => secrets.filter((s) => s.is_secret).map((s) => s.key), [secrets]);
 
   const gpuBound =
     runOn === "vm"
@@ -173,7 +183,8 @@ export function QuantizationForm() {
         dampening_frac: dampening,
         hf_push_repo: hfPushRepo.trim() || null,
         hf_push_private: hfPrivate,
-        hf_token: hfToken.trim() || null,
+        hf_token: hfTokenMode === "paste" ? (hfToken.trim() || null) : null,
+        hf_token_secret: hfTokenMode === "secret" ? (hfTokenSecret || null) : null,
         provider_id: providerId || null,
         storage_id: storageId || null,
         gpu_type: gpuType,
@@ -209,7 +220,7 @@ export function QuantizationForm() {
       <Section icon={<Shrink className="h-4 w-4" />} title="Model"
         description="The Hugging Face model to pull and quantize.">
         <Grid>
-          <FieldWrap label="Source model" hint="Any causal LLM on the Hub, e.g. Qwen/Qwen3-8B.">
+          <FieldWrap label="Source model" hint="Any causal LLM on the Hub, e.g. Qwen/Qwen3-8B. Private / gated repos: set an HF token below.">
             <Input
               className="font-mono"
               placeholder="owner/model"
@@ -221,6 +232,74 @@ export function QuantizationForm() {
             <Input className="font-mono" placeholder="e.g. qwen3-8b-fp8" value={name} onChange={(e) => setName(e.target.value)} />
           </FieldWrap>
         </Grid>
+      </Section>
+
+      {/* HuggingFace token — pulls a gated/private SOURCE model and authenticates the
+          optional push to the Hub. A global secret (recommended — rotates without
+          editing this job) or a pasted token. Mirrors autotrain/new's HF-token card. */}
+      <Section icon={<KeyRound className="h-4 w-4" />} title="HuggingFace token"
+        description="For a gated / private source model and pushing the quantized model to the Hub. Use a global secret or paste a token. Empty falls back to the org HF_TOKEN secret.">
+        <div className="space-y-2">
+          <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+            {(["secret", "paste"] as const).map((src) => (
+              <button
+                key={src}
+                type="button"
+                onClick={() => setHfTokenMode(src)}
+                className={cn(
+                  "rounded px-2.5 py-1 transition-colors",
+                  hfTokenMode === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {src === "secret" ? "Global secret" : "Paste a token"}
+              </button>
+            ))}
+          </div>
+
+          {hfTokenMode === "secret" ? (
+            hfSecretKeys.length > 0 ? (
+              <div className="space-y-1.5">
+                <Label htmlFor="q-hf-secret" className="text-xs uppercase tracking-wide text-muted-foreground">Global secret</Label>
+                <Select value={hfTokenSecret} onValueChange={setHfTokenSecret}>
+                  <SelectTrigger id="q-hf-secret"><SelectValue placeholder="Select a secret (e.g. HF_TOKEN)" /></SelectTrigger>
+                  <SelectContent>
+                    {hfSecretKeys.map((k) => (
+                      <SelectItem key={k} value={k} className="font-mono text-xs">{k}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Resolved from{" "}
+                  <Link href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</Link>{" "}
+                  at run time and injected as <span className="font-mono">HF_TOKEN</span>.
+                </p>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                No global secrets yet. Add one under{" "}
+                <Link href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</Link>{" "}
+                (e.g. <span className="font-mono">HF_TOKEN</span>), then pick it here — or switch to{" "}
+                <span className="font-medium">Paste a token</span>.
+              </p>
+            )
+          ) : (
+            <div className="space-y-1.5">
+              <Label htmlFor="q-hf-token" className="text-xs uppercase tracking-wide text-muted-foreground">Token</Label>
+              <Input
+                id="q-hf-token"
+                type="password"
+                autoComplete="off"
+                className="font-mono text-xs"
+                placeholder="hf_…"
+                value={hfToken}
+                onChange={(e) => setHfToken(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Sent with this job, stored Fernet-encrypted (never returned). Prefer a global secret for shared / rotating tokens.
+              </p>
+            </div>
+          )}
+        </div>
       </Section>
 
       {/* Scheme */}
@@ -488,7 +567,7 @@ export function QuantizationForm() {
               </SelectContent>
             </Select>
           </FieldWrap>
-          <FieldWrap label="Push to HF (optional)" hint="HuggingFace repo, e.g. you/model-fp8. Pushed when the job finishes.">
+          <FieldWrap label="Push to HF (optional)" hint="HuggingFace repo, e.g. you/model-fp8. Pushed when the job finishes, using the HF token above.">
             <Input
               className="font-mono"
               placeholder="org/model-fp8"
@@ -497,23 +576,12 @@ export function QuantizationForm() {
             />
           </FieldWrap>
           {hfPushRepo.trim() && (
-            <>
-              <FieldWrap label="HF token (optional)" hint="Blank → the org HF_TOKEN from Secrets is used.">
-                <Input
-                  type="password"
-                  className="font-mono"
-                  placeholder="hf_…"
-                  value={hfToken}
-                  onChange={(e) => setHfToken(e.target.value)}
-                />
-              </FieldWrap>
-              <FieldWrap label="Private repo">
-                <div className="flex h-9 items-center">
-                  <Switch checked={hfPrivate} onCheckedChange={setHfPrivate} />
-                  <span className="ml-2 text-xs text-muted-foreground">{hfPrivate ? "Private" : "Public"}</span>
-                </div>
-              </FieldWrap>
-            </>
+            <FieldWrap label="Private repo">
+              <div className="flex h-9 items-center">
+                <Switch checked={hfPrivate} onCheckedChange={setHfPrivate} />
+                <span className="ml-2 text-xs text-muted-foreground">{hfPrivate ? "Private" : "Public"}</span>
+              </div>
+            </FieldWrap>
           )}
         </Grid>
       </Section>
