@@ -500,6 +500,22 @@ def _ssh_connect(host: str, port: int, user: str, key_filename: str):
                 hostname=host, port=port, username=user,
                 key_filename=key_filename, timeout=20, banner_timeout=30, auth_timeout=30,
             )
+            # SSH-level keepalive (every 30s). Without it, a long-idle exec channel —
+            # e.g. the multi-GB HF `upload_folder` streams VM→huggingface.co directly,
+            # so NOTHING flows over this control channel for many minutes — gets its TCP
+            # connection silently dropped by a NAT/firewall on the path. paramiko's
+            # blocking chan.recv() in _ssh_run_stream then never sees EOF and hangs
+            # FOREVER: the VM-side push finishes (model lands on HF) and prints @@HF, but
+            # that line vanishes into the dead socket → the export task never resolves and
+            # the run sticks on "uploading…" (real bug: train-96dc20e1). Keepalive both
+            # keeps the NAT mapping warm AND lets paramiko tear down a genuinely dead peer
+            # so recv() raises instead of blocking (→ the export is marked failed, not stuck).
+            try:
+                tr = cli.get_transport()
+                if tr is not None:
+                    tr.set_keepalive(30)
+            except Exception:  # noqa: BLE001 — keepalive is best-effort; never fail a connect over it
+                pass
             return cli
         except Exception as e:  # noqa: BLE001
             last = e
@@ -5940,6 +5956,15 @@ def _gpu_query_sync(run_id: str, host: str, port: int, user: str,
         cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         cli.connect(hostname=host, port=port, username=user, key_filename=key_filename,
                     timeout=8, banner_timeout=10, auth_timeout=10)
+        # This client is cached in _GPU_SSH and reused across polling gaps, so keep the
+        # connection warm (same keepalive rationale as _ssh_connect) — else an idle-dropped
+        # TCP wedges the next poll's recv() or forces a needless reconnect.
+        try:
+            tr2 = cli.get_transport()
+            if tr2 is not None:
+                tr2.set_keepalive(30)
+        except Exception:  # noqa: BLE001
+            pass
         _GPU_SSH[run_id] = cli
     q = ("nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,"
          "temperature.gpu,name --format=csv,noheader,nounits")

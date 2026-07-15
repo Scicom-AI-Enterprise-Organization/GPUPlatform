@@ -546,6 +546,9 @@ class CreateQuantizationJobRequest(BaseModel):
     calib_messages_field: Optional[str] = None
     # Recipe knobs.
     ignore_layers: list[str] = ["lm_head"]
+    # VLMs: keep the vision tower / multimodal projector in full precision by default
+    # (a quantized vision tower is not vLLM-servable). Set True to quantize it anyway.
+    quantize_vision: bool = False
     smoothing_strength: float = 0.8      # SmoothQuant (w8a8-int8)
     dampening_frac: float = 0.01         # GPTQ
     # Push target.
@@ -722,6 +725,7 @@ async def create_quantization_job(
         "calib_text_field": (body.calib_text_field or "").strip() or None,
         "calib_messages_field": (body.calib_messages_field or "").strip() or None,
         "ignore_layers": [str(x).strip() for x in (body.ignore_layers or []) if str(x).strip()] or ["lm_head"],
+        "quantize_vision": bool(body.quantize_vision),
         "smoothing_strength": float(body.smoothing_strength),
         "dampening_frac": float(body.dampening_frac),
         "hf_push_repo": (body.hf_push_repo or "").strip() or None,

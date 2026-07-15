@@ -243,12 +243,97 @@ def _build_calibration_dataset(cfg: dict, tokenizer):
     return ds
 
 
+# Multimodal (vision / audio) models: the modality towers + input embedders MUST stay
+# in full precision. Two failure modes seen on real gemma-4:
+#   1. an FP8 vision tower dies in the forward with "RuntimeError: Not yet supported
+#      ScalarType 46";
+#   2. vLLM's gemma-4 impl builds the vision/audio embedders as plain (unquantized)
+#      Linear, so a quantized `embed_audio`/`embed_vision` carries an unexpected
+#      `weight_scale` and load fails with "no module or parameter named
+#      '…embedding_projection.weight_scale'".
+# So for a detected VLM/omni model we union these into the recipe `ignore`. They're
+# regexes → they no-op on a model that lacks the matching modules. Covers the common
+# gemma / qwen / llava / *_unified naming for vision AND audio.
+_MULTIMODAL_IGNORE = [
+    "re:.*vision_tower.*",
+    "re:.*vision_model.*",
+    "re:.*vision_embedder.*",       # gemma-4 unified
+    "re:.*visual.*",                # qwen-VL
+    "re:.*audio_tower.*",
+    "re:.*audio_model.*",
+    "re:.*audio_embedder.*",
+    "re:.*multi_modal_projector.*",
+    "re:.*embed_vision.*",
+    "re:.*embed_audio.*",           # gemma-4 unified (omni)
+]
+
+
+def _is_multimodal(model) -> bool:
+    """True for vision-language models — detected via a `vision_config` sub-config or a
+    conditional-generation / image-text / *VL architecture name."""
+    conf = getattr(model, "config", None)
+    if conf is None:
+        return False
+    if getattr(conf, "vision_config", None) is not None:
+        return True
+    archs = getattr(conf, "architectures", None) or []
+    return any(
+        ("VL" in a) or ("Vision" in a) or ("ImageTextToText" in a) or a.endswith("ConditionalGeneration")
+        for a in archs
+    )
+
+
+def _save_processor_config(source: str, out_dir: str, hf_token) -> None:
+    """Copy a VLM's processor / preprocessor config into the output next to the weights.
+    Prefer AutoProcessor.save_pretrained; if its class isn't importable in this
+    transformers (brand-new arch, e.g. gemma-4 unified → no Gemma4UnifiedProcessor),
+    fall back to copying the processor/preprocessor JSONs straight from the source
+    snapshot (already in the HF cache). Best-effort — never fatal to the quant."""
+    try:
+        from transformers import AutoProcessor
+        AutoProcessor.from_pretrained(source, token=hf_token, trust_remote_code=True).save_pretrained(out_dir)
+        log("[quant] saved multimodal processor via AutoProcessor")
+        return
+    except Exception as e:  # noqa: BLE001
+        log(f"[quant] AutoProcessor unavailable ({type(e).__name__}); copying processor configs from snapshot")
+    try:
+        import shutil
+        from huggingface_hub import snapshot_download
+        snap = snapshot_download(source, token=hf_token, allow_patterns=[
+            "preprocessor_config.json", "processor_config.json", "image_processor*.json",
+            "video_preprocessor_config.json", "audio_processor*.json", "chat_template.json",
+        ])
+        copied = []
+        for fn in os.listdir(snap):
+            if fn.endswith(".json") and ("processor" in fn or "preprocess" in fn):
+                shutil.copy2(os.path.join(snap, fn), os.path.join(out_dir, fn))
+                copied.append(fn)
+        log(f"[quant] copied processor configs from snapshot: {copied or 'none found'}")
+    except Exception as e:  # noqa: BLE001
+        log(f"[quant] WARN: could not obtain processor config: {type(e).__name__}: {e} "
+            f"— multimodal serving may need it copied in manually")
+
+
+def _recipe_ignore(cfg: dict, model=None) -> list:
+    """Modules to exclude from quantization. Always `lm_head` (or the caller's
+    `ignore_layers`); for a detected VLM, also the vision stack (unless the caller opts
+    in with quantize_vision) — a quantized vision tower is not vLLM-servable."""
+    ignore = list(cfg.get("ignore_layers") or ["lm_head"])
+    if model is not None and _is_multimodal(model) and not cfg.get("quantize_vision"):
+        for pat in _MULTIMODAL_IGNORE:
+            if pat not in ignore:
+                ignore.append(pat)
+        log(f"[quant] multimodal model detected → keeping vision modules in full precision "
+            f"(ignore={ignore})")
+    return ignore
+
+
 # --------------------------------------------------------------------------
 # Recipe builder — scheme id → llm-compressor modifier(s).
 # --------------------------------------------------------------------------
-def _build_recipe(cfg: dict):
+def _build_recipe(cfg: dict, model=None):
     scheme = cfg["scheme"]
-    ignore = list(cfg.get("ignore_layers") or ["lm_head"])
+    ignore = _recipe_ignore(cfg, model)
     from llmcompressor.modifiers.quantization import QuantizationModifier
 
     if scheme == "fp8-dynamic":
@@ -312,7 +397,7 @@ def run(cfg: dict) -> None:
     )
     tokenizer = AutoTokenizer.from_pretrained(source, token=hf_token)
 
-    recipe = _build_recipe(cfg)
+    recipe = _build_recipe(cfg, model)
     oneshot_kwargs: dict = {"model": model, "recipe": recipe}
     if needs_calib:
         emit("PROGRESS", {"stage": "calibrating", "percent": 25})
@@ -333,6 +418,12 @@ def run(cfg: dict) -> None:
     log(f"[quant] saving compressed model → {out_dir}")
     model.save_pretrained(out_dir, save_compressed=True)
     tokenizer.save_pretrained(out_dir)
+    # Multimodal models need the image/audio processor config alongside the weights,
+    # else vLLM can't build the feature extractor ("Can't load feature extractor …") —
+    # model/tokenizer save_pretrained don't emit preprocessor_config.json /
+    # processor_config.json. Get them into the output.
+    if _is_multimodal(model):
+        _save_processor_config(source, out_dir, hf_token)
 
     try:
         emit("SIZES", {"quantized_gb": _dir_size_gb(out_dir)})

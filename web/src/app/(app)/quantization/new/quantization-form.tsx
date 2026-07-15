@@ -75,6 +75,7 @@ export function QuantizationForm() {
 
   // Recipe knobs
   const [ignoreLayers, setIgnoreLayers] = useState("lm_head");
+  const [quantizeVision, setQuantizeVision] = useState(false);
   const [smoothing, setSmoothing] = useState(0.8);
   const [dampening, setDampening] = useState(0.01);
 
@@ -179,6 +180,7 @@ export function QuantizationForm() {
         calib_text_field: textField.trim() || null,
         calib_messages_field: messagesField.trim() || null,
         ignore_layers: ignoreLayers.split(",").map((s) => s.trim()).filter(Boolean),
+        quantize_vision: quantizeVision,
         smoothing_strength: smoothing,
         dampening_frac: dampening,
         hf_push_repo: hfPushRepo.trim() || null,
@@ -330,6 +332,12 @@ export function QuantizationForm() {
               value={ignoreLayers}
               onChange={(e) => setIgnoreLayers(e.target.value)}
             />
+          </FieldWrap>
+          <FieldWrap label="Quantize vision tower" hint="Vision-language models only. Off (default) keeps the vision tower / multimodal projector in full precision — a quantized vision tower is not vLLM-servable. Turn on only if you know your runtime supports it.">
+            <div className="flex h-9 items-center">
+              <Switch checked={quantizeVision} onCheckedChange={setQuantizeVision} />
+              <span className="ml-2 text-xs text-muted-foreground">{quantizeVision ? "Quantize vision (advanced)" : "Keep vision full-precision"}</span>
+            </div>
           </FieldWrap>
           {scheme === "w8a8-int8" && (
             <FieldWrap label="SmoothQuant strength" hint="Migrates activation outliers into weights (0–1). 0.8 is a good default.">

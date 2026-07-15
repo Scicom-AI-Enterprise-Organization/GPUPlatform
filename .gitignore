@@ -36,3 +36,4 @@ scicom
 whisper-tiny
 *.pt
 *.log
+serverlessgpu-glm5-2-endpoint-errors.md

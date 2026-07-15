@@ -675,6 +675,11 @@ async def lifespan(app: FastAPI):
     app.state.proxy_health = {}
     app.state.proxy_live = {}
     app.state.proxy_sems = {}
+    # Per-app admission gates for single-model VM (mode=proxy) endpoints — bound
+    # concurrency to the replica so bursts queue/429 instead of overloading it into
+    # 500s (see _ProxyGate / _proxy_to_upstream). Distinct from proxy_sems (the
+    # separate LLM-proxy feature). Lazily populated per app by _get_proxy_gate.
+    app.state.proxy_gates = {}
     app.state.proxy_healthcheck_task = None
     try:
         app.state.proxy_healthcheck_task = asyncio.create_task(
@@ -3702,7 +3707,9 @@ async def stream(
         vllm_path = ep if isinstance(ep, str) and ep.startswith("/v1/") else "/v1/chat/completions"
         payload["stream"] = True
         await rdb.set(f"app:{app_id}:last_request_ts", str(time.time()))
-        return await _proxy_to_upstream(request, app_id, payload, vllm_path, int(app.request_timeout_s), owner_id=user.id)
+        limit, queue_max = _proxy_concurrency_config(app)
+        return await _proxy_to_upstream(request, app_id, payload, vllm_path, int(app.request_timeout_s),
+                                        owner_id=user.id, limit=limit, queue_max=queue_max)
     cfg = app.autoscaler
     cap = int(cfg["max_containers"]) * int(cfg["tasks_per_container"])
     queue_len = await rdb.llen(f"queue:{app_id}")
@@ -4262,6 +4269,147 @@ def _record_proxy_request(
     )
 
 
+# ---- Proxy-mode admission control (single-model VM endpoints) --------------
+#
+# A proxy endpoint forwards straight to ONE vLLM replica (e.g. glm5-2, a TP8
+# GLM-5.2-FP8). vLLM has a finite in-flight capacity (max_num_seqs / KV cache);
+# past it, long reasoning requests pile up, per-request latency balloons, and a
+# fraction come back as bare HTTP 500s (aborted / KV-cache or queue exhaustion).
+# The gateway used to forward every request unconditionally, so a bursty client
+# (~32 concurrent ~100s requests) drove exactly that collapse.
+#
+# _ProxyGate bounds concurrency PER APP: up to `limit` requests are forwarded to
+# the upstream at once; extra requests WAIT for a slot (a bounded "queue"); once
+# more than `queue_max` are already waiting we shed load with 429 + Retry-After
+# instead of deepening the backlog (the doc's ask #1: "queue or 429, not 500").
+# `limit`/`queue_max` = 0 disables that arm (0/0 = the old unbounded behaviour).
+class _ProxyGate:
+    def __init__(self, limit: int, queue_max: int):
+        self.limit = limit
+        self.queue_max = queue_max
+        self.sem = asyncio.Semaphore(limit) if limit > 0 else None
+        self.inflight = 0   # requests currently forwarded to the upstream
+        self.waiting = 0    # requests currently blocked waiting for a slot
+
+    def overloaded(self) -> bool:
+        """True when the wait backlog is full — shed load (429) rather than queue deeper."""
+        return self.sem is not None and self.queue_max > 0 and self.waiting >= self.queue_max
+
+    async def acquire(self) -> None:
+        """Reserve one in-flight slot, blocking for a free permit when a limit is set.
+        Call overloaded() first to reject instead of queueing without bound."""
+        if self.sem is None:
+            self.inflight += 1
+            return
+        self.waiting += 1
+        try:
+            await self.sem.acquire()
+        finally:
+            self.waiting -= 1
+        self.inflight += 1
+
+    def release(self) -> None:
+        self.inflight -= 1
+        if self.sem is not None:
+            self.sem.release()
+
+
+def _get_proxy_gate(app, app_id: str, limit: int, queue_max: int) -> _ProxyGate:
+    """Per-app admission gate, cached on app.state and rebuilt when the limits change
+    (so a live config edit takes effect on the next request). Mirrors proxy_api._get_sem."""
+    gates = getattr(app.state, "proxy_gates", None)
+    if gates is None:
+        gates = {}
+        app.state.proxy_gates = gates
+    cur = gates.get(app_id)
+    if cur is None or cur.limit != limit or cur.queue_max != queue_max:
+        gate = _ProxyGate(limit, queue_max)
+        gates[app_id] = gate
+        return gate
+    return cur
+
+
+def _proxy_concurrency_config(app_row) -> tuple[int, int]:
+    """Resolve (limit, queue_max) for a proxy endpoint. Per-app overrides live in the
+    app's autoscaler JSON (`proxy_max_concurrency` / `proxy_queue_max`); env
+    PROXY_MAX_CONCURRENCY / PROXY_QUEUE_MAX are the fallback defaults. 0 = unbounded
+    (the original forward-everything behaviour); queue_max only bites when limit > 0."""
+    def _nonneg(v, default: int) -> int:
+        try:
+            return max(0, int(v))
+        except (TypeError, ValueError):
+            return default
+    env_limit = _nonneg(os.environ.get("PROXY_MAX_CONCURRENCY"), 0)
+    env_queue = _nonneg(os.environ.get("PROXY_QUEUE_MAX"), 0)
+    cfg = getattr(app_row, "autoscaler", None) or {}
+    limit = _nonneg(cfg.get("proxy_max_concurrency"), env_limit)
+    queue_max = _nonneg(cfg.get("proxy_queue_max"), env_queue)
+    return limit, queue_max
+
+
+def _proxy_retry_after() -> int:
+    """Retry-After hint (seconds) attached to backpressure / retryable-error responses."""
+    try:
+        return max(1, int(os.environ.get("PROXY_RETRY_AFTER_S") or 5))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _proxy_headers(gate: Optional[_ProxyGate], extra: Optional[dict] = None) -> dict:
+    """Concurrency-depth signal on every proxy response (the doc's ask #4): clients can
+    self-throttle to X-SGPU-Concurrency-Limit instead of guessing. Limit 0 = unbounded
+    (still report in-flight so clients can watch live pressure)."""
+    h = dict(extra or {})
+    if gate is not None:
+        h["X-SGPU-Inflight"] = str(gate.inflight)
+        h["X-SGPU-Concurrency-Limit"] = str(gate.limit)
+    return h
+
+
+def _proxy_error_body(status_code: int, message: str, err_type: str) -> dict:
+    """OpenAI-shaped error envelope with `error` at the TOP level. The old path raised
+    HTTPException(detail=<body>), which FastAPI renders as `{"detail": {...}}` — so an
+    OpenAI SDK client reading `body["error"]["message"]` found nothing and logged only
+    the exception class (exactly the 'no useful error body' complaint in the doc, ask #3)."""
+    return {"error": {"message": message, "type": err_type, "code": status_code}}
+
+
+def _proxy_upstream_error_response(r, gate: Optional[_ProxyGate], *, retry_after: Optional[int] = None):
+    """Forward an upstream (vLLM) error with its body INTACT and at the top level, so
+    OpenAI SDKs can read error.message. vLLM emits `{"error": {...}}`, or
+    `{"object":"error","message":...}`, or (on an aborted/overloaded request) sometimes an
+    empty body — normalise all three to `{"error": {...}}`."""
+    try:
+        body = r.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        out = body
+    elif isinstance(body, dict) and (body.get("message") or body.get("object") == "error"):
+        out = _proxy_error_body(r.status_code, str(body.get("message") or "upstream error"),
+                                str(body.get("type") or "upstream_error"))
+    else:
+        # No usable JSON — fall back to the raw text, but treat empty / whitespace / a bare
+        # JSON `null` (aborted-request artifacts) as no-body so we synthesize a real message.
+        text = (r.text or "").strip()
+        if text.lower() == "null":
+            text = ""
+        out = _proxy_error_body(
+            r.status_code,
+            text[:1000] or f"upstream returned HTTP {r.status_code} with no body "
+                           f"(likely an aborted/overloaded request under concurrency)",
+            "upstream_error",
+        )
+    hdrs = _proxy_headers(gate)
+    # Honour an upstream Retry-After if present, else attach our own hint on retryable statuses.
+    ra = r.headers.get("retry-after")
+    if ra:
+        hdrs["Retry-After"] = ra
+    elif retry_after is not None:
+        hdrs["Retry-After"] = str(retry_after)
+    return JSONResponse(out, status_code=r.status_code, headers=hdrs)
+
+
 async def _proxy_to_upstream(
     request: Request,
     app_id: str,
@@ -4269,24 +4417,42 @@ async def _proxy_to_upstream(
     vllm_path: str,
     timeout_s: int,
     owner_id: Optional[int] = None,
+    *,
+    limit: int = 0,
+    queue_max: int = 0,
 ):
-    """Proxy-mode dispatch: forward the OpenAI request straight to the single
-    model's vLLM over the gateway→VM forward tunnel. No Redis queue, no admission,
-    no sleep/wake — a transparent reverse proxy. The upstream URL
-    (`http://127.0.0.1:{local_forward_port}`) is published by the VM provider when
-    it opens the tunnel (see vm_serverless_provider._wire_proxy_forward). `owner_id`
-    (when given) is recorded into the requests table so the Activity dashboard sees
-    proxy traffic too — see _record_proxy_request."""
+    """Proxy-mode dispatch: forward the OpenAI request straight to the single model's
+    vLLM over the gateway→VM forward tunnel. No Redis queue, no sleep/wake — a
+    transparent reverse proxy, now with per-app admission control (see _ProxyGate:
+    bound concurrency, queue, shed with 429 rather than overload the replica into 500s).
+    The upstream URL (`http://127.0.0.1:{local_forward_port}`) is published by the VM
+    provider when it opens the tunnel (see vm_serverless_provider._wire_proxy_forward).
+    `owner_id` (when given) is recorded into the requests table so the Activity dashboard
+    sees proxy traffic too — see _record_proxy_request."""
     rdb = request.app.state.redis
     upstream = await rdb.get(f"proxy:{app_id}:upstream")
     if isinstance(upstream, (bytes, bytearray)):
         upstream = upstream.decode()
+    gate = _get_proxy_gate(request.app, app_id, limit, queue_max)
     if not upstream:
-        raise HTTPException(
+        return JSONResponse(
+            _proxy_error_body(503, "proxy endpoint not ready — the worker is still starting "
+                                   "(no upstream tunnel yet). Check the Workers tab.", "endpoint_not_ready"),
             status_code=503,
-            detail={"error": "proxy endpoint not ready — the worker is still starting "
-                             "(no upstream tunnel yet). Check the Workers tab."},
+            headers=_proxy_headers(gate, {"Retry-After": str(_proxy_retry_after())}),
         )
+    if gate.overloaded():
+        # Backlog full: reject fast with a retryable signal instead of piling onto the
+        # replica (which is what turns into 500s). Clients back off / lower concurrency.
+        return JSONResponse(
+            _proxy_error_body(429, f"endpoint at capacity — {gate.inflight} in flight, {gate.waiting} "
+                                   f"queued (limit {gate.limit}). Retry after backoff or reduce concurrency.",
+                              "over_capacity"),
+            status_code=429,
+            headers=_proxy_headers(gate, {"Retry-After": str(_proxy_retry_after())}),
+        )
+    await gate.acquire()
+
     cli: httpx.AsyncClient = request.app.state.proxy_http
     url = upstream.rstrip("/") + vllm_path
     httpx_to = httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0)
@@ -4301,21 +4467,38 @@ async def _proxy_to_upstream(
 
     if not is_stream:
         try:
-            r = await cli.post(url, json=payload, timeout=httpx_to)
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail={"error": f"proxy upstream unreachable: {type(e).__name__}: {e}"})
-        if r.status_code >= 400:
             try:
-                detail = r.json()
-            except Exception:
-                detail = {"error": r.text[:500]}
-            raise HTTPException(status_code=r.status_code, detail=detail)
-        out = r.json()
-        _record_proxy_request(
-            app_id, owner_id, payload, vllm_path, created_at=created_at, is_stream=False,
-            usage=(out.get("usage") if isinstance(out, dict) else None),
-        )
-        return out
+                r = await cli.post(url, json=payload, timeout=httpx_to)
+            except httpx.TimeoutException as e:
+                # Ran past the endpoint's per-request budget, or couldn't get a pool slot
+                # in time — a transient 'busy', not a hard fault. 504/503 + Retry-After so
+                # the client backs off instead of treating it as a permanent error.
+                status = 504 if isinstance(e, httpx.ReadTimeout) else 503
+                return JSONResponse(
+                    _proxy_error_body(status, f"proxy upstream timed out: {type(e).__name__}", "upstream_timeout"),
+                    status_code=status,
+                    headers=_proxy_headers(gate, {"Retry-After": str(_proxy_retry_after())}),
+                )
+            except httpx.HTTPError as e:
+                return JSONResponse(
+                    _proxy_error_body(502, f"proxy upstream unreachable: {type(e).__name__}: {e}", "upstream_unreachable"),
+                    status_code=502,
+                    headers=_proxy_headers(gate),
+                )
+            if r.status_code >= 400:
+                # Surface the real upstream body (ask #3); tag 5xx/429 as retryable.
+                return _proxy_upstream_error_response(
+                    r, gate,
+                    retry_after=_proxy_retry_after() if (r.status_code >= 500 or r.status_code == 429) else None,
+                )
+            out = r.json()
+            _record_proxy_request(
+                app_id, owner_id, payload, vllm_path, created_at=created_at, is_stream=False,
+                usage=(out.get("usage") if isinstance(out, dict) else None),
+            )
+            return JSONResponse(out, headers=_proxy_headers(gate))
+        finally:
+            gate.release()
 
     _t0 = time.perf_counter()
 
@@ -4326,8 +4509,12 @@ async def _proxy_to_upstream(
         try:
             async with cli.stream("POST", url, json=payload, timeout=httpx_to) as r:
                 if r.status_code >= 400:
-                    body = (await r.aread()).decode("utf-8", "replace")[:500]
-                    yield f"data: {json.dumps({'error': {'message': body, 'code': r.status_code}})}\n\n".encode()
+                    # A stream commits HTTP 200 before the body, so a pre-body upstream error
+                    # can only be delivered in-band — emit an OpenAI-shaped error event.
+                    body = (await r.aread()).decode("utf-8", "replace")[:1000]
+                    err = _proxy_error_body(r.status_code,
+                                            body or f"upstream returned HTTP {r.status_code}", "upstream_error")
+                    yield f"data: {json.dumps(err)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
                     return
                 # vLLM already emits OpenAI SSE framing ("data: {…}\n\n") — pass bytes
@@ -4356,9 +4543,11 @@ async def _proxy_to_upstream(
                     except Exception:
                         pass
         except httpx.HTTPError as e:
-            yield f"data: {json.dumps({'error': {'message': f'upstream stream error: {type(e).__name__}'}})}\n\n".encode()
+            err = _proxy_error_body(502, f"upstream stream error: {type(e).__name__}", "upstream_unreachable")
+            yield f"data: {json.dumps(err)}\n\n".encode()
             yield b"data: [DONE]\n\n"
         finally:
+            gate.release()
             _record_proxy_request(
                 app_id, owner_id, payload, vllm_path, created_at=created_at,
                 is_stream=True, usage=usage, ttft_ms=ttft_ms,
@@ -4367,7 +4556,7 @@ async def _proxy_to_upstream(
     return StreamingResponse(
         gen(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=_proxy_headers(gate, {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}),
     )
 
 
@@ -4378,19 +4567,37 @@ async def _proxy_audio_to_upstream(
     vllm_path: str,
     timeout_s: int,
     owner_id: Optional[int] = None,
+    *,
+    limit: int = 0,
+    queue_max: int = 0,
 ):
     """Proxy-mode audio dispatch: rebuild the multipart request from the base64
     payload and forward it straight to the model's vLLM (which serves
     /v1/audio/{transcriptions,translations} as native multipart) over the forward
     tunnel. The queue path base64s + has the worker rebuild multipart; here we
-    rebuild + proxy directly (no queue). `owner_id` (when given) records the request
-    into the requests table for the Activity dashboard (ASR carries no token usage)."""
+    rebuild + proxy directly (no queue). Shares the JSON path's admission gate + error
+    shaping. `owner_id` (when given) records the request into the requests table for the
+    Activity dashboard (ASR carries no token usage)."""
     rdb = request.app.state.redis
     upstream = await rdb.get(f"proxy:{app_id}:upstream")
     if isinstance(upstream, (bytes, bytearray)):
         upstream = upstream.decode()
+    gate = _get_proxy_gate(request.app, app_id, limit, queue_max)
     if not upstream:
-        raise HTTPException(status_code=503, detail={"error": "proxy endpoint not ready — the worker is still starting."})
+        return JSONResponse(
+            _proxy_error_body(503, "proxy endpoint not ready — the worker is still starting.", "endpoint_not_ready"),
+            status_code=503,
+            headers=_proxy_headers(gate, {"Retry-After": str(_proxy_retry_after())}),
+        )
+    if gate.overloaded():
+        return JSONResponse(
+            _proxy_error_body(429, f"endpoint at capacity — {gate.inflight} in flight, {gate.waiting} "
+                                   f"queued (limit {gate.limit}). Retry after backoff or reduce concurrency.",
+                              "over_capacity"),
+            status_code=429,
+            headers=_proxy_headers(gate, {"Retry-After": str(_proxy_retry_after())}),
+        )
+    await gate.acquire()
     audio = base64.b64decode(payload["_audio_b64"])
     files = {"file": (payload.get("_filename") or "audio.wav", audio)}
     data = {"model": payload["model"], **{k: str(v) for k, v in (payload.get("_form") or {}).items()}}
@@ -4398,21 +4605,34 @@ async def _proxy_audio_to_upstream(
     url = upstream.rstrip("/") + vllm_path
     created_at = datetime.now(timezone.utc)
     try:
-        r = await cli.post(url, files=files, data=data,
-                           timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail={"error": f"proxy upstream unreachable: {type(e).__name__}: {e}"})
-    if r.status_code >= 400:
         try:
-            detail = r.json()
-        except Exception:
-            detail = {"error": r.text[:500]}
-        raise HTTPException(status_code=r.status_code, detail=detail)
-    _record_proxy_request(
-        app_id, owner_id, {"model": payload.get("model")}, vllm_path,
-        created_at=created_at, is_stream=False,
-    )
-    return r.json()
+            r = await cli.post(url, files=files, data=data,
+                               timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+        except httpx.TimeoutException as e:
+            status = 504 if isinstance(e, httpx.ReadTimeout) else 503
+            return JSONResponse(
+                _proxy_error_body(status, f"proxy upstream timed out: {type(e).__name__}", "upstream_timeout"),
+                status_code=status,
+                headers=_proxy_headers(gate, {"Retry-After": str(_proxy_retry_after())}),
+            )
+        except httpx.HTTPError as e:
+            return JSONResponse(
+                _proxy_error_body(502, f"proxy upstream unreachable: {type(e).__name__}: {e}", "upstream_unreachable"),
+                status_code=502,
+                headers=_proxy_headers(gate),
+            )
+        if r.status_code >= 400:
+            return _proxy_upstream_error_response(
+                r, gate,
+                retry_after=_proxy_retry_after() if (r.status_code >= 500 or r.status_code == 429) else None,
+            )
+        _record_proxy_request(
+            app_id, owner_id, {"model": payload.get("model")}, vllm_path,
+            created_at=created_at, is_stream=False,
+        )
+        return JSONResponse(r.json(), headers=_proxy_headers(gate))
+    finally:
+        gate.release()
 
 
 async def _openai_endpoint(
@@ -4443,10 +4663,12 @@ async def _openai_endpoint(
     app_row = await db_session.get(App, app_id)
     if app_row is not None and getattr(app_row, "mode", "single") == "proxy":
         proxy_timeout_s = int(getattr(app_row, "request_timeout_s", 600) or 600)
+        limit, queue_max = _proxy_concurrency_config(app_row)
         if target_model:
             payload = {**payload, "model": target_model}
         await db_session.close()
-        return await _proxy_to_upstream(request, app_id, payload, vllm_path, proxy_timeout_s, owner_id=user.id)
+        return await _proxy_to_upstream(request, app_id, payload, vllm_path, proxy_timeout_s,
+                                        owner_id=user.id, limit=limit, queue_max=queue_max)
 
     is_stream = bool(payload.get("stream"))
     if is_stream:
@@ -4734,8 +4956,10 @@ async def _openai_audio_endpoint(
         if target_model:
             payload["model"] = target_model
         ptimeout = int(getattr(app_row, "request_timeout_s", 600) or 600)
+        limit, queue_max = _proxy_concurrency_config(app_row)
         await db_session.close()
-        return await _proxy_audio_to_upstream(request, app_id, payload, vllm_path, ptimeout, owner_id=user.id)
+        return await _proxy_audio_to_upstream(request, app_id, payload, vllm_path, ptimeout,
+                                              owner_id=user.id, limit=limit, queue_max=queue_max)
 
     request_id, _timeout_s = await _admit_and_enqueue(
         rdb, db_session, app_id, user, payload, stream=False, endpoint=vllm_path,

@@ -162,6 +162,24 @@ NOT `proxy_requests`, which belongs to the LLM-proxy and is pruned by *its* heal
   rows/s** on defaults (`STATS_FLUSH_MAX_BATCH=500`, shared across all stat sources); above that the
   20k queue buffers then drops-and-logs (best-effort) — raise the batch env if real load nears it.
 
+**⚠ Proxy-mode admission control (added 2026-07-15) — bound concurrency, don't 500 the replica.**
+A proxy endpoint forwards to ONE vLLM replica; a bursty client (e.g. ~32 concurrent ~100s GLM-5.2
+reasoning requests on the TP8 `glm5-2`) overruns vLLM's `max_num_seqs`/KV cache → latency balloons +
+a fraction come back as **bare HTTP 500s** (aborted requests). `_proxy_to_upstream` /
+`_proxy_audio_to_upstream` now run a per-app **`_ProxyGate`** (`app.state.proxy_gates`, mirrors
+`proxy_api._get_sem`): up to `limit` requests forwarded at once, extras **wait** for a slot (bounded
+"queue"), and once `queue_max` are already waiting we **shed with 429 + `Retry-After`** instead of
+deepening the backlog. Config via `_proxy_concurrency_config`: per-app override in the App's
+**`autoscaler` JSON** (`proxy_max_concurrency` / `proxy_queue_max`), else env
+**`PROXY_MAX_CONCURRENCY` / `PROXY_QUEUE_MAX`**; **0 = unbounded (the old forward-everything default,
+non-breaking)** — set a ceiling on an endpoint that's getting overrun. Two more fixes ride along:
+(1) **upstream error bodies are surfaced top-level as `{"error":{…}}`** (was `HTTPException(detail=…)`
+→ rendered `{"detail":{…}}`, so OpenAI SDK clients read nothing and logged only the exception class);
+(2) every proxy response carries **`X-SGPU-Inflight` / `X-SGPU-Concurrency-Limit`** so clients can
+self-throttle. `PROXY_RETRY_AFTER_S` (default 5) tunes the Retry-After hint. Set the ceiling ≈ the
+model's vLLM `max_num_seqs` (or just below). NOTE this bounds a single replica — it is **not**
+multi-replica autoscaling of a proxy endpoint (that's still a separate follow-up).
+
 ### Label platform (data-labelling app)
 
 A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)
@@ -214,6 +232,30 @@ and the worker contract live here. Section key `quantization` in `auth.SECTIONS`
   `QUANT_SCHEMES` + `_build_recipe()` (worker — the actual llm-compressor modifiers). Add a scheme
   → touch both. Data-free: `fp8-dynamic`. Calibrated: `w4a16` (GPTQ), `w8a8-int8`
   (SmoothQuant→GPTQ), `fp8` (static), `nvfp4`, `awq`. All six verified e2e on tm-2 (Qwen3-0.6B).
+- **⚠️ Multimodal / VLM vision+audio protection (added 2026-07-15, VERIFIED e2e on tm-2).** Quantizing
+  a multimodal model's modality towers/embedders breaks vLLM two ways: (1) an FP8 vision tower dies in
+  the forward with `RuntimeError: Not yet supported ScalarType 46`; (2) vLLM's gemma-4 impl builds the
+  vision/audio input embedders as plain (unquantized) `ReplicatedLinear`, so a quantized
+  `embed_audio`/`embed_vision` carries an unexpected `weight_scale` → load fails with
+  `ValueError: no module or parameter named '…embedding_projection.weight_scale'`. The old default
+  `ignore=["lm_head"]` FP8'd them → broken model. Fixed in `quantize.py`: `_recipe_ignore(cfg, model)`
+  auto-detects a VLM/omni model (`_is_multimodal` — `config.vision_config` or a `*ConditionalGeneration`
+  / `*VL` / `*ImageTextToText` arch) and unions `_MULTIMODAL_IGNORE` into the recipe `ignore` so the
+  vision AND audio stacks stay full-precision: `re:.*vision_tower.*`, `.*vision_model.*`,
+  `.*vision_embedder.*`, `.*visual.*`, `.*audio_tower.*`, `.*audio_model.*`, `.*audio_embedder.*`,
+  `.*multi_modal_projector.*`, `.*embed_vision.*`, `.*embed_audio.*` (regexes → no-op on models lacking
+  them). Text-only models are unaffected (stays `["lm_head"]`). Opt out with `quantize_vision: true`
+  (job cfg / web toggle → `CreateQuantizationJobRequest.quantize_vision`). Also: multimodal `run()`
+  saves the processor config into the output via `_save_processor_config` — tries
+  `AutoProcessor.save_pretrained`, and when the processor class isn't importable (brand-new arch, e.g.
+  gemma-4 unified has no `Gemma4UnifiedProcessor`) **falls back to copying the processor/preprocessor
+  JSONs straight from the source snapshot** (model/tokenizer saves don't emit them → else vLLM "Can't
+  load feature extractor"). Both take effect on the next job (quantize.py is SFTP'd, no gateway restart).
+  **Verified:** `google/gemma-4-12B-it` (omni, `Gemma4UnifiedForConditionalGeneration`) → fp8-dynamic on
+  tm-2 (H20-3e, `/share/quant-llmcompressor`): only `model.language_model` FP8'd (328 tensors), all
+  vision/audio bf16; served on vLLM 0.23.0 (`/share/vllm-venv`, TP1, `--tool-call-parser gemma4
+  --reasoning-parser gemma4`) — loads clean, generation + tool-calling both work. Published to
+  `huggingface.co/huseinzolkepliscicom/gemma-4-12B-it-FP8-Dynamic`.
 - **Worker venv**: one shared uv venv `/share/quant-llmcompressor` (built by `--deps-only`;
   llmcompressor + compressed-tensors + transformers + boto3 + huggingface_hub). Jobs on the same
   box MUST run sequentially-ish on first use (parallel venv builds race).

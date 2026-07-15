@@ -527,6 +527,7 @@ export type CreateQuantizationJobRequest = {
   calib_text_field?: string | null;
   calib_messages_field?: string | null;
   ignore_layers?: string[];
+  quantize_vision?: boolean;
   smoothing_strength?: number;
   dampening_frac?: number;
   hf_push_repo?: string | null;

@@ -31,6 +31,11 @@ Tabs: **Overview / Logs / Files / Config / Export to HF** (HF tab only when done
   toggles the whole Calibration-dataset section. Don't hardcode scheme ids in the form beyond the
   per-scheme knob visibility (`w8a8-int8` → SmoothQuant strength; `w4a16`/`w8a8-int8` → GPTQ
   dampening).
+- **`quantize_vision`** (advanced toggle in the Recipe section, default **off**): for VLMs, off keeps
+  the vision tower / multimodal projector in full precision (a quantized vision tower is not
+  vLLM-servable — gemma-4 FP8 dies with `ScalarType 46`). The gateway auto-detects a VLM and protects
+  the vision stack unless this is on; flows through `CreateQuantizationJobRequest.quantize_vision` →
+  worker cfg. See the gateway CLAUDE.md Quantization section for `_MULTIMODAL_IGNORE`.
 - Calibration dataset picker filters `CALIB_KINDS` (`hf`/`llm`/`upload`/`s3`) — keep in sync with
   the gateway's `_CALIB_DATASET_KINDS`. `kind=llm` flips the text-column field to a
   messages-column field (chat template applied worker-side).
