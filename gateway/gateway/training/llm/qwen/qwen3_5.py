@@ -261,16 +261,17 @@ def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha:int = 16, use_dor
 
 
 def apply_moe_expert_lora(base_model: nn.Module, r: int = 16, alpha: int = 32,
-                          use_dora: bool = False, include_shared: bool = True):
+                          use_dora: bool = False, include_shared: bool = True, act_fn=None):
     """Adapt a Qwen3.5-MoE model's routed experts (fused 3D `Qwen3_5MoeExperts`) with the shared
     grouped LoRA/DoRA adapter, and (optionally) the shared-expert MLP with `LinearLoRA`. The routed
-    experts are the bulk of MoE capacity — attention-only LoRA leaves them frozen. Returns
-    (n_routed_blocks, n_shared_linears, routed_param_count)."""
+    experts are the bulk of MoE capacity — attention-only LoRA leaves them frozen. `act_fn` is the
+    SwiGLU activation, passed to add_expert_adapter (Liger swaps the experts for a `LigerExperts`
+    with no `.act_fn`). Returns (n_routed_blocks, n_shared_linears, routed_param_count)."""
     import moe_adapter as MA
     n_routed, n_shared, routed_params = 0, 0, 0
     for name, module in list(base_model.named_modules()):
         if name.endswith(".experts") and hasattr(module, "gate_up_proj"):
-            routed_params += MA.add_expert_adapter(module, r=r, alpha=alpha, use_dora=use_dora)
+            routed_params += MA.add_expert_adapter(module, r=r, alpha=alpha, use_dora=use_dora, act_fn=act_fn)
             n_routed += 1
         elif include_shared and name.endswith(".shared_expert"):
             for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -537,14 +538,18 @@ def main(
     # + shared-expert MLP by default. Without this a MoE run would train ONLY attention.
     if is_moe and not no_moe_lora:
         import moe_adapter as _MA
+        from transformers.activations import ACT2FN
         if not moe_r or moe_r <= 0:  # auto: expert rank = attn rank ÷ active-experts (top-k)
             k = _MA.num_active_experts(config) or 8
             moe_r, moe_alpha = _MA.derive_moe_rank(r, alpha, k)
             logger.info(f"MoE expert rank auto-derived: r={moe_r} alpha={moe_alpha:.1f} "
                         f"(attn r={r} ÷ top_k={k}; scaling held at {alpha / r:.2f}) "
                         f"— https://thinkingmachines.ai/blog/lora/")
+        # Resolve the SwiGLU activation from config — Liger's MoE patch drops experts' `.act_fn`.
+        _hidden_act = getattr(config, "hidden_act", None) or getattr(getattr(config, "text_config", None), "hidden_act", None) or "silu"
         n_routed, n_shared, routed_params = apply_moe_expert_lora(
-            model, r=moe_r, alpha=moe_alpha, use_dora=use_dora, include_shared=not no_shared_lora)
+            model, r=moe_r, alpha=moe_alpha, use_dora=use_dora, include_shared=not no_shared_lora,
+            act_fn=ACT2FN[_hidden_act])
         logger.info(f"MoE expert {'DoRA' if use_dora else 'LoRA'}: adapted {n_routed} routed-expert "
                     f"blocks ({routed_params/1e6:.1f}M params) + {n_shared} shared-expert linears "
                     f"(moe_r={moe_r}, moe_alpha={moe_alpha})")

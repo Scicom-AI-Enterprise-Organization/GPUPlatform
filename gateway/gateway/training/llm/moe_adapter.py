@@ -161,7 +161,7 @@ def fused_adapter_experts_forward(
     # ---- gate_up projection -> SwiGLU -> down projection ----
     gate_up = _adapter_project(self, x_g, self.gate_up_proj, "gate_up", offsets)  # (S, 2I)
     gate, up = gate_up.chunk(2, dim=-1)
-    inter = self.act_fn(gate) * up                                                # (S, I)
+    inter = self._moe_act_fn(gate) * up                                           # (S, I)
     down = _adapter_project(self, inter, self.down_proj, "down", offsets)         # (S, H)
 
     # Apply routing weights, restore original token order, sum the top-k per token.
@@ -180,6 +180,7 @@ def add_expert_adapter(
     alpha: float = 16.0,
     use_dora: bool = False,
     lora_dtype: torch.dtype = torch.bfloat16,
+    act_fn=None,
 ) -> int:
     """Attach per-expert LoRA/DoRA params to a fused-experts module and bind the fused forward.
 
@@ -189,7 +190,19 @@ def add_expert_adapter(
     `*_lora_b` are zero so the adapter is a no-op at init. For DoRA add per-expert per-output-row
     magnitudes (E, 2I) / (E, H) initialised from the base weight row-norms — so W_eff == base at
     init too. Returns the number of trainable params added.
+
+    `act_fn` is the SwiGLU activation. Pass it explicitly when the experts module may not carry
+    `.act_fn` — e.g. a Liger-patched `LigerExperts` (qwen's `apply_liger_kernel_to_qwen3_5_moe`
+    replaces the module and drops `act_fn`). Falls back to `experts.act_fn` when present (gemma).
     """
+    # Resolve the activation BEFORE we override forward. Fallback to the module's own act_fn
+    # (present on stock Gemma4TextExperts / Qwen3_5MoeExperts, absent on LigerExperts).
+    experts._moe_act_fn = act_fn if act_fn is not None else getattr(experts, "act_fn", None)
+    if experts._moe_act_fn is None:
+        raise ValueError(
+            "add_expert_adapter: no SwiGLU activation available — the experts module has no "
+            "`.act_fn` (e.g. a Liger-patched LigerExperts); pass act_fn=ACT2FN[config.hidden_act]."
+        )
     E = experts.num_experts
     two_I, H = experts.gate_up_proj.shape[-2], experts.gate_up_proj.shape[-1]
     Hd, I = experts.down_proj.shape[-2], experts.down_proj.shape[-1]
@@ -383,6 +396,22 @@ def _test():
     assert num_active_experts(_t.SimpleNamespace(text_config=_t.SimpleNamespace(top_k_experts=4))) == 4
     assert num_active_experts(_t.SimpleNamespace(hidden_size=1)) is None
     print("[moe_adapter] rank derivation: OK (256/8→32 α64, 16/8→2, top_k lookup incl. text_config)")
+
+    # ---- (5) act_fn: explicit override works; missing .act_fn + no override raises (LigerExperts) ----
+    import torch.nn as _nn
+    ex = _make_fake_experts(4, 32, 16)
+    del ex.act_fn  # simulate a Liger-patched LigerExperts (no .act_fn attribute)
+    try:
+        add_expert_adapter(ex, r=4, alpha=8.0, lora_dtype=torch.float32)
+        raise SystemExit("[moe_adapter] FAIL: expected ValueError when act_fn missing")
+    except ValueError:
+        pass
+    ex2 = _make_fake_experts(4, 32, 16)
+    del ex2.act_fn
+    add_expert_adapter(ex2, r=4, alpha=8.0, lora_dtype=torch.float32, act_fn=_nn.SiLU())  # explicit
+    _h = torch.randn(6, 32); _w, _i = torch.topk(torch.softmax(torch.randn(6, 4), -1), 2, -1)
+    ex2(_h, _i, _w / _w.sum(-1, keepdim=True))  # forward must run using the passed act_fn
+    print("[moe_adapter] act_fn: OK (explicit override runs; missing+no-override raises)")
 
     print("[moe_adapter] all CPU tests passed")
 
