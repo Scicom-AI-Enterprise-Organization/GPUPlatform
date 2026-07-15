@@ -267,20 +267,84 @@ _MULTIMODAL_IGNORE = [
     "re:.*embed_audio.*",           # gemma-4 unified (omni)
 ]
 
+# MoE routers/gates MUST stay full precision too: vLLM builds the router as a plain
+# Linear, so a quantized router carries an unexpected `weight_scale` → load dies with
+# `KeyError: '…router.proj.weight_scale'` (gemma-4) or the analogous mismatch on
+# Qwen/Mixtral. These are the router modules ONLY — NOT the experts' gate_proj (which
+# should be quantized), hence the `$` anchors / `.router.` scoping.
+# vLLM keeps ALL MoE gating/routing Linears unquantized — not just the top-1 router
+# (`mlp.gate`) but also per-layer shared-expert gates (`mlp.shared_expert_gate`). A
+# quantized gate carries a `weight_scale` vLLM doesn't expect → it skips the scale and
+# uses the raw fp8 weight undequantized → GARBAGE output (verified on Qwen3.6-35B-A3B).
+# `re:.*gate$` catches every module whose name ENDS in `gate` (mlp.gate,
+# shared_expert_gate, …) — never the experts' `gate_proj` (ends in `proj`).
+_MOE_IGNORE = [
+    "re:.*gate$",                     # MoE routers + shared-expert gates (NOT gate_proj)
+    "re:.*\\.router\\..*",            # gemma-4 (router.proj)
+    "re:.*\\.router$",
+    "re:.*\\.gate\\.wg$",             # deepseek-style
+]
 
-def _is_multimodal(model) -> bool:
-    """True for vision-language models — detected via a `vision_config` sub-config or a
-    conditional-generation / image-text / *VL architecture name."""
-    conf = getattr(model, "config", None)
+# Hybrid state-space models (mamba / gated-DeltaNet linear attention): the SSM /
+# linear-attention mixer layers are highly quantization-sensitive — fp8 on them yields
+# GARBAGE output (verified on Qwen3.6-35B-A3B GDN: fp8'd `linear_attn.in_proj_*` →
+# incoherent text). Keep them bf16 (quantize the full-attention + MoE/MLP layers
+# instead), matching NVIDIA's mamba/Nemotron fp8 recipes. Regexes → no-op elsewhere.
+_SSM_IGNORE = [
+    "re:.*linear_attn.*",   # Qwen3.6 gated DeltaNet (in_proj_qkv/a/b/z, out_proj)
+    "re:.*\\.mamba.*",      # Mamba/Mamba2/Nemotron-H mixer
+    "re:.*mamba_mixer.*",
+]
+
+
+def _config_is_multimodal(conf) -> bool:
+    """True for a vision/audio (VLM / omni) config — a `vision_config`/`audio_config`
+    sub-config, or a conditional-generation / image-text / *VL / *Omni architecture."""
     if conf is None:
         return False
-    if getattr(conf, "vision_config", None) is not None:
+    if getattr(conf, "vision_config", None) is not None or getattr(conf, "audio_config", None) is not None:
         return True
     archs = getattr(conf, "architectures", None) or []
     return any(
-        ("VL" in a) or ("Vision" in a) or ("ImageTextToText" in a) or a.endswith("ConditionalGeneration")
+        ("VL" in a) or ("Vision" in a) or ("ImageTextToText" in a) or ("Omni" in a) or a.endswith("ConditionalGeneration")
         for a in archs
     )
+
+
+def _is_multimodal(model) -> bool:
+    """True for vision/audio models — checks the loaded model's config."""
+    return _config_is_multimodal(getattr(model, "config", None))
+
+
+def _is_moe(model) -> bool:
+    """True for mixture-of-experts models (also checks a nested text_config, since a
+    multimodal wrapper config puts the expert fields there)."""
+    conf = getattr(model, "config", None)
+    keys = ("num_experts", "num_local_experts", "n_routed_experts", "num_experts_per_tok")
+    for c in (conf, getattr(conf, "text_config", None)):
+        if c is None:
+            continue
+        if any(getattr(c, k, None) for k in keys):
+            return True
+    archs = getattr(conf, "architectures", None) or []
+    return any("moe" in a.lower() for a in archs)
+
+
+def _is_hybrid_ssm(model) -> bool:
+    """True for hybrid state-space models (mamba / linear-attention mixers alongside
+    attention) — their SSM layers must stay bf16 (fp8 breaks them)."""
+    conf = getattr(model, "config", None)
+    keys = ("linear_key_head_dim", "linear_num_key_heads", "linear_conv_kernel_dim",
+            "mamba_d_state", "mamba_num_heads", "mamba_expand", "ssm_state_size")
+    for c in (conf, getattr(conf, "text_config", None)):
+        if c is None:
+            continue
+        if any(getattr(c, k, None) for k in keys):
+            return True
+        lt = getattr(c, "layer_types", None) or []
+        if any(("linear" in str(t).lower() or "mamba" in str(t).lower()) for t in lt):
+            return True
+    return False
 
 
 def _save_processor_config(source: str, out_dir: str, hf_token) -> None:
@@ -316,16 +380,50 @@ def _save_processor_config(source: str, out_dir: str, hf_token) -> None:
 
 def _recipe_ignore(cfg: dict, model=None) -> list:
     """Modules to exclude from quantization. Always `lm_head` (or the caller's
-    `ignore_layers`); for a detected VLM, also the vision stack (unless the caller opts
-    in with quantize_vision) — a quantized vision tower is not vLLM-servable."""
+    `ignore_layers`); for a detected VLM, also the vision/audio stack (unless the caller
+    opts in with quantize_vision); for a MoE model, also the router/gate. Both are
+    modules vLLM keeps in full precision — quantizing them makes the model unloadable."""
     ignore = list(cfg.get("ignore_layers") or ["lm_head"])
+
+    def _add(pats, why):
+        added = [p for p in pats if p not in ignore]
+        ignore.extend(added)
+        if added:
+            log(f"[quant] {why} → keeping in full precision: {added}")
+
     if model is not None and _is_multimodal(model) and not cfg.get("quantize_vision"):
-        for pat in _MULTIMODAL_IGNORE:
-            if pat not in ignore:
-                ignore.append(pat)
-        log(f"[quant] multimodal model detected → keeping vision modules in full precision "
-            f"(ignore={ignore})")
+        _add(_MULTIMODAL_IGNORE, "multimodal model detected")
+    if model is not None and _is_moe(model):
+        _add(_MOE_IGNORE, "MoE model detected (router/gate)")
+    if model is not None and _is_hybrid_ssm(model):
+        _add(_SSM_IGNORE, "hybrid SSM/linear-attention model detected")
     return ignore
+
+
+def _load_model(source: str, hf_token):
+    """Load the source model for quantization. Multimodal (VLM / omni) models are loaded
+    FULL via AutoModelForImageTextToText so the vision/audio tower + the multimodal
+    wrapper config survive — AutoModelForCausalLM silently drops them on archs like
+    Qwen3.5-MoE-VL (→ a text-only `*ForCausalLM` model whose config lost `vision_config`,
+    which vLLM's multimodal impl then refuses to load). Text models use
+    AutoModelForCausalLM."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+    kw = dict(torch_dtype="auto", device_map="auto", token=hf_token)
+    try:
+        conf = AutoConfig.from_pretrained(source, token=hf_token)
+    except Exception as e:  # noqa: BLE001
+        log(f"[quant] AutoConfig probe failed ({type(e).__name__}); loading as CausalLM")
+        conf = None
+    if _config_is_multimodal(conf):
+        try:
+            from transformers import AutoModelForImageTextToText
+            log("[quant] multimodal config → loading full model via AutoModelForImageTextToText "
+                "(preserves vision/audio tower + wrapper config)")
+            return AutoModelForImageTextToText.from_pretrained(source, **kw)
+        except Exception as e:  # noqa: BLE001
+            log(f"[quant] AutoModelForImageTextToText failed ({type(e).__name__}: {e}); "
+                f"falling back to AutoModelForCausalLM")
+    return AutoModelForCausalLM.from_pretrained(source, **kw)
 
 
 # --------------------------------------------------------------------------
@@ -380,7 +478,7 @@ def _dir_size_gb(path: str) -> float:
 def run(cfg: dict) -> None:
     import tempfile
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
     from llmcompressor import oneshot
 
     scheme = cfg["scheme"]
@@ -392,9 +490,7 @@ def run(cfg: dict) -> None:
 
     emit("PROGRESS", {"stage": "loading-model", "percent": 5})
     log(f"[quant] loading {source} (scheme={scheme}) …")
-    model = AutoModelForCausalLM.from_pretrained(
-        source, torch_dtype="auto", device_map="auto", token=hf_token,
-    )
+    model = _load_model(source, hf_token)
     tokenizer = AutoTokenizer.from_pretrained(source, token=hf_token)
 
     recipe = _build_recipe(cfg, model)

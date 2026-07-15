@@ -190,24 +190,37 @@ def grouped_linear(x: torch.Tensor, weight_eoi: torch.Tensor, offsets: torch.Ten
 # Linear LoRA — wraps a frozen (FP8)Linear (MLA q/kv/o + shared-expert MLP)
 # ---------------------------------------------------------------------------
 class LinearLoRA(nn.Module):
-    """y = base(x) + scaling * B(A(x)).
+    """LoRA:  y = base(x) + scaling * B(A(x)).
+    DoRA:  y = F.linear(x, magnitude * normalize(W + scaling*B@A))   (weight-decomposed LoRA).
 
     `base` is the original frozen Linear. If it is an FP8Linear (fp8 weight +
     `weight_scale_inv`), the base path dequantizes to bf16 and runs a differentiable
     `F.linear` instead of FP8Linear's inference-only kernel, plus `scaling * B(A(x))`.
     `lora_b` is zero-initialised so the adapter is a no-op at step 0 (a non-zero B
     corrupts the frozen model from the first step).
+
+    DoRA (`use_dora=True`) adds a per-output-row `magnitude` initialised to the base weight's
+    row-norms; since B=0 and magnitude=‖W_row‖ at init, `magnitude*normalize(W) == W`, so DoRA
+    is also the identity at step 0.
     """
 
     def __init__(self, base: nn.Linear, r: int = 16, alpha: float = 16.0,
-                 lora_dtype: torch.dtype = torch.bfloat16):
+                 lora_dtype: torch.dtype = torch.bfloat16, use_dora: bool = False):
         super().__init__()
         self.base = base
         self.scaling = alpha / r
         self.r = r
+        self.use_dora = use_dora
 
         in_features = base.in_features
         out_features = base.out_features
+
+        # Cache FP8 metadata once (the base weight stays fp8 + frozen). Set BEFORE the magnitude
+        # init below, which dequantizes the base via _base_weight().
+        self._fp8 = _is_fp8(base) and getattr(base, "weight_scale_inv", None) is not None
+        self._block_size = getattr(base, "block_size", None)  # None for Mistral-Small-4 (per-tensor)
+        self._bias = getattr(base, "bias", None)
+
         # Create the adapters on the SAME device as the frozen base weight. nn.Linear defaults
         # to CPU, which is wrong whenever the base is already on a GPU before LoRA is applied
         # (e.g. device_map="auto" in compare_logits.py / merge_infer.py) -> "mat2 is on cpu".
@@ -218,16 +231,27 @@ class LinearLoRA(nn.Module):
         self.lora_b = nn.Linear(r, out_features, bias=False, dtype=lora_dtype, device=dev)
         # kaiming_uniform_ needs an RNG fill, which fails on a meta tensor (low-CPU meta-init
         # path in mistral_small.py). Skip here when meta — `_reinit_lora_` re-inits the adapters
-        # after `to_empty` materialises them on GPU. Non-meta path is unchanged.
+        # (and magnitude) after `to_empty` materialises them on GPU. Non-meta path is unchanged.
         if not self.lora_a.weight.is_meta:
             with torch.no_grad():
                 nn.init.kaiming_uniform_(self.lora_a.weight)
                 nn.init.zeros_(self.lora_b.weight)  # CRITICAL: adapter = identity at init
 
-        # Cache FP8 metadata once (the base weight stays fp8 + frozen).
-        self._fp8 = _is_fp8(base) and getattr(base, "weight_scale_inv", None) is not None
-        self._block_size = getattr(base, "block_size", None)  # None for Mistral-Small-4 (per-tensor)
-        self._bias = getattr(base, "bias", None)
+        if use_dora:
+            if base.weight.is_meta:
+                mag = torch.ones(out_features, dtype=lora_dtype, device=dev)
+            else:
+                with torch.no_grad():
+                    mag = self._base_weight(torch.float32).norm(dim=1).to(lora_dtype)
+            self.magnitude = nn.Parameter(mag, requires_grad=True)
+
+    def _base_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        """The frozen base weight (out, in) in `dtype`, dequantizing if fp8."""
+        if self._fp8:
+            return dequantize_fp8(
+                self.base.weight, self.base.weight_scale_inv, self._block_size, out_dtype=dtype
+            )
+        return self.base.weight.to(dtype)
 
     def _base_forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._fp8:
@@ -238,6 +262,13 @@ class LinearLoRA(nn.Module):
         return self.base(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_dora:
+            w = self._base_weight(self.lora_a.weight.dtype)                     # (out, in)
+            delta = self.lora_b.weight @ self.lora_a.weight                     # (out, in)
+            adapted = w + self.scaling * delta
+            direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            w_eff = self.magnitude.unsqueeze(1) * direction
+            return F.linear(x.to(w_eff.dtype), w_eff, self._bias).to(x.dtype)
         base = self._base_forward(x)
         lora = self.lora_b(self.lora_a(x.to(self.lora_a.weight.dtype)))
         return base + self.scaling * lora.to(base.dtype)
@@ -257,6 +288,28 @@ def _expert_base_weight(experts: nn.Module, which: str, out_dtype: torch.dtype) 
     if w.element_size() == 1 and s is not None:
         return dequantize_fp8(w, s, getattr(experts, "block_size", None), out_dtype=out_dtype)
     return w.to(out_dtype)
+
+
+def _expert_project(experts, x_g, which, compute_dtype, offsets):
+    """One routed-expert projection with the adapter folded in (LoRA or DoRA).
+
+    LoRA:  out = grouped(dequant base) + scaling * grouped(grouped(x, A), B)
+    DoRA:  W_eff = magnitude * normalize(dequant base + scaling*(B@A));  out = grouped(x, W_eff)
+    """
+    base = _expert_base_weight(experts, which, compute_dtype)   # (E, out, in)
+    a = getattr(experts, f"{which}_lora_a")                     # (E, r, in)
+    b = getattr(experts, f"{which}_lora_b")                     # (E, out, r)
+    if getattr(experts, "use_dora", False):
+        mag = getattr(experts, f"{which}_mag")                  # (E, out)
+        delta = torch.bmm(b.to(a.dtype), a)                     # (E, out, in)
+        adapted = base.to(a.dtype) + experts.lora_scaling * delta
+        direction = adapted / adapted.norm(dim=2, keepdim=True).clamp_min(1e-8)
+        w_eff = mag.unsqueeze(-1) * direction                   # (E, out, in)
+        return grouped_linear(x_g, w_eff, offsets)
+    out = grouped_linear(x_g, base, offsets)                    # (S, out)
+    lo = grouped_linear(x_g, a, offsets)                        # (S, r)
+    lo = grouped_linear(lo, b, offsets)                         # (S, out)
+    return out + experts.lora_scaling * lo
 
 
 def fused_lora_experts_forward(
@@ -300,21 +353,10 @@ def fused_lora_experts_forward(
     tokens_per_expert = torch.histc(histc_input, bins=self.num_experts, min=0, max=self.num_experts - 1)
     offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
-    # ---- gate_up projection: frozen base (dequant) + bf16 LoRA, both grouped ----
-    gu_w = _expert_base_weight(self, "gate_up", compute_dtype)            # (E, 2I, H)
-    gate_up = grouped_linear(x_g, gu_w, offsets)                         # (S, 2I)
-    gu_lora = grouped_linear(x_g, self.gate_up_lora_a, offsets)          # (S, r)
-    gu_lora = grouped_linear(gu_lora, self.gate_up_lora_b, offsets)      # (S, 2I)
-    gate_up = gate_up + self.lora_scaling * gu_lora
-
-    inter = self._apply_gate(gate_up)                                   # (S, I)  SwiGLU
-
-    # ---- down projection: frozen base (dequant) + bf16 LoRA, both grouped ----
-    dn_w = _expert_base_weight(self, "down", compute_dtype)              # (E, H, I)
-    down = grouped_linear(inter, dn_w, offsets)                         # (S, H)
-    dn_lora = grouped_linear(inter, self.down_lora_a, offsets)          # (S, r)
-    dn_lora = grouped_linear(dn_lora, self.down_lora_b, offsets)        # (S, H)
-    down = down + self.lora_scaling * dn_lora
+    # ---- gate_up projection (LoRA or DoRA) -> SwiGLU -> down projection ----
+    gate_up = _expert_project(self, x_g, "gate_up", compute_dtype, offsets)   # (S, 2I)
+    inter = self._apply_gate(gate_up)                                         # (S, I)  SwiGLU
+    down = _expert_project(self, inter, "down", compute_dtype, offsets)       # (S, H)
 
     # Apply routing weights, restore original token order, sum the top-k per token.
     weighted = down * sample_weights_g.to(down.dtype).unsqueeze(-1)
@@ -324,13 +366,14 @@ def fused_lora_experts_forward(
 
 
 def add_expert_lora(experts: nn.Module, r: int = 16, alpha: float = 16.0,
-                    lora_dtype: torch.dtype = torch.bfloat16) -> int:
-    """Attach per-expert LoRA params to a routed-experts module and bind the fused forward.
+                    lora_dtype: torch.dtype = torch.bfloat16, use_dora: bool = False) -> int:
+    """Attach per-expert LoRA/DoRA params to a routed-experts module and bind the fused forward.
 
     Stores adapters in F.linear/grouped layout (E, out, in):
         gate_up_lora_a (E, r, H)   gate_up_lora_b (E, 2I, r)
         down_lora_a    (E, r, I)   down_lora_b    (E, H, r)
-    `*_lora_b` are zero so the adapter is a no-op at init. Returns the #trainable params.
+    `*_lora_b` are zero so the adapter is a no-op at init. For DoRA add per-expert per-output-row
+    magnitudes `gate_up_mag (E, 2I)` / `down_mag (E, H)` from the base row-norms. Returns #params.
     """
     E = experts.num_experts
     # Derive dims from the stored expert weights (works for FP8Experts and bf16 stand-ins).
@@ -350,14 +393,26 @@ def add_expert_lora(experts: nn.Module, r: int = 16, alpha: float = 16.0,
     experts.down_lora_b = _param((E, H, r), zero=True)
     experts.lora_scaling = alpha / r
     experts.lora_r = r
+    experts.use_dora = bool(use_dora)
+
+    params = [experts.gate_up_lora_a, experts.gate_up_lora_b, experts.down_lora_a, experts.down_lora_b]
+
+    if use_dora:
+        def _mag(which, out_dim):
+            if experts.gate_up_proj.is_meta:
+                return nn.Parameter(torch.ones(E, out_dim, dtype=lora_dtype, device=dev), requires_grad=True)
+            with torch.no_grad():
+                w = _expert_base_weight(experts, which, torch.float32)  # (E, out, in)
+                return nn.Parameter(w.norm(dim=2).to(lora_dtype), requires_grad=True)
+        experts.gate_up_mag = _mag("gate_up", two_I)
+        experts.down_mag = _mag("down", H)
+        params += [experts.gate_up_mag, experts.down_mag]
 
     # Bind the fused LoRA forward to THIS instance (overrides the dispatched class forward).
     import types
     experts.forward = types.MethodType(fused_lora_experts_forward, experts)
 
-    return sum(p.numel() for p in (
-        experts.gate_up_lora_a, experts.gate_up_lora_b, experts.down_lora_a, experts.down_lora_b
-    ))
+    return sum(p.numel() for p in params)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +433,7 @@ def apply_mistral_lora(
     include_moe: bool = True,
     include_shared: bool = True,
     lora_dtype: torch.dtype = torch.bfloat16,
+    use_dora: bool = False,
 ) -> dict:
     """Freeze every base param, wrap MLA attention projections with LinearLoRA, and
     (optionally) add per-expert LoRA to every routed-experts block + LinearLoRA to the
@@ -398,20 +454,21 @@ def apply_mistral_lora(
             child = getattr(module, proj, None)
             if child is None or not isinstance(child, nn.Linear):
                 continue
-            lora = LinearLoRA(child, r=attn_r, alpha=attn_alpha, lora_dtype=lora_dtype)
+            lora = LinearLoRA(child, r=attn_r, alpha=attn_alpha, lora_dtype=lora_dtype, use_dora=use_dora)
             setattr(module, proj, lora)
             n_attn += 1
-            attn_params += lora.lora_a.weight.numel() + lora.lora_b.weight.numel()
+            attn_params += sum(p.numel() for p in lora.parameters() if p.requires_grad)
 
     n_moe, moe_params = 0, 0
     n_shared, shared_params = 0, 0
     if include_moe:
-        # Routed experts: the (FP8)Experts module holding the 3D params (fused LoRA).
+        # Routed experts: the (FP8)Experts module holding the 3D params (fused LoRA/DoRA).
         for name, module in list(model.named_modules()):
             if name.endswith(".experts") and hasattr(module, "gate_up_proj"):
-                moe_params += add_expert_lora(module, r=moe_r, alpha=moe_alpha, lora_dtype=lora_dtype)
+                moe_params += add_expert_lora(module, r=moe_r, alpha=moe_alpha,
+                                              lora_dtype=lora_dtype, use_dora=use_dora)
                 n_moe += 1
-        # Shared expert: a dense SwiGLU MLP (gate/up/down FP8Linear) -> LinearLoRA each.
+        # Shared expert: a dense SwiGLU MLP (gate/up/down FP8Linear) -> LinearLoRA/DoRA each.
         if include_shared:
             for name, module in list(model.named_modules()):
                 if not name.endswith(".shared_experts"):
@@ -420,10 +477,10 @@ def apply_mistral_lora(
                     child = getattr(module, proj, None)
                     if child is None or not isinstance(child, nn.Linear):
                         continue
-                    lora = LinearLoRA(child, r=moe_r, alpha=moe_alpha, lora_dtype=lora_dtype)
+                    lora = LinearLoRA(child, r=moe_r, alpha=moe_alpha, lora_dtype=lora_dtype, use_dora=use_dora)
                     setattr(module, proj, lora)
                     n_shared += 1
-                    shared_params += lora.lora_a.weight.numel() + lora.lora_b.weight.numel()
+                    shared_params += sum(p.numel() for p in lora.parameters() if p.requires_grad)
 
     total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return {
@@ -434,6 +491,7 @@ def apply_mistral_lora(
         "moe_lora_params": moe_params,
         "shared_lora_params": shared_params,
         "trainable_params": total,
+        "use_dora": bool(use_dora),
     }
 
 

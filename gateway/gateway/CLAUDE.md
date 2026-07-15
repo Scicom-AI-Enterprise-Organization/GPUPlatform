@@ -256,6 +256,32 @@ and the worker contract live here. Section key `quantization` in `auth.SECTIONS`
   vision/audio bf16; served on vLLM 0.23.0 (`/share/vllm-venv`, TP1, `--tool-call-parser gemma4
   --reasoning-parser gemma4`) — loads clean, generation + tool-calling both work. Published to
   `huggingface.co/huseinzolkepliscicom/gemma-4-12B-it-FP8-Dynamic`.
+- **⚠️ MoE + hybrid-SSM + full-multimodal-load (added 2026-07-15, VERIFIED serving gemma-4-26B-A4B +
+  Qwen3.6-35B-A3B).** Serving fp8 MoE / hybrid / VL models on vLLM surfaced 3 more "must stay bf16 /
+  must load full" rules — `_recipe_ignore` + `_load_model` handle them automatically now:
+  1. **MoE routers + gates** (`_is_moe` → `_MOE_IGNORE`). vLLM builds every MoE gating Linear
+     unquantized — the top-1 router (gemma `router.proj`, Qwen `mlp.gate`) AND per-layer
+     **shared-expert gates** (`mlp.shared_expert_gate`). A quantized one → `KeyError:
+     '…router.proj.weight_scale'` at load, or a SILENT `weight_scale not found … skipping` warning →
+     the fp8 weight is used undequantized → **garbage output**. Pattern is `re:.*gate$` (catches
+     `mlp.gate` + `shared_expert_gate`, never the experts' `gate_proj`) + `re:.*router.*`.
+  2. **Hybrid state-space / linear-attention** (`_is_hybrid_ssm` → `_SSM_IGNORE`: `re:.*linear_attn.*`,
+     `.*mamba.*`). Mamba/GDN mixer layers are quantization-sensitive → fp8 = garbage. Detected via
+     `linear_key_head_dim` / `mamba_*` config keys or a `layer_types` with linear/mamba entries.
+     (Same sensitivity as Nemotron-H — see [[nemotron-h-training]].)
+  3. **Full multimodal load** (`_load_model`): for a multimodal *config* (checked via `AutoConfig`
+     BEFORE loading), load with **`AutoModelForImageTextToText`**, NOT `AutoModelForCausalLM` — on
+     archs like Qwen3.5-MoE-VL the latter silently returns only the **text sub-model** (arch becomes
+     `*ForCausalLM`, config loses `vision_config`) → vLLM's multimodal impl rejects it
+     (`TypeError: Invalid type of HuggingFace config. Expected Qwen3_5MoeConfig`). gemma-4's
+     AutoModelForCausalLM already returns the full model, so this is a no-op there.
+  Diagnose fp8 serve failures by grepping the vLLM log for `weight_scale not found`, `KeyError:
+  *weight_scale`, or `ScalarType`; garbage-but-loads → suspect an unignored gate/router or SSM layer.
+  **Verified e2e:** `google/gemma-4-26B-A4B-it` (25.3GB, tool-calling works) + `Qwen/Qwen3.6-35B-A3B`
+  (35.1GB, coherent — `17×23=391`) on tm-2, served on vLLM 0.23.0, published to
+  `huggingface.co/huseinzolkepliscicom/{gemma-4-26B-A4B-it,Qwen3.6-35B-A3B}-FP8-Dynamic`.
+  ⚠️ Qwen3.6 GDN uses a FlashInfer kernel that **JIT-compiles on first serve (~8 min, GPU 100%, health
+  000)** — not a hang.
 - **Worker venv**: one shared uv venv `/share/quant-llmcompressor` (built by `--deps-only`;
   llmcompressor + compressed-tensors + transformers + boto3 + huggingface_hub). Jobs on the same
   box MUST run sequentially-ish on first use (parallel venv builds race).

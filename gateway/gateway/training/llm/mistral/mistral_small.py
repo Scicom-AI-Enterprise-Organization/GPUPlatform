@@ -191,6 +191,7 @@ def build_meta_lora_model(config, args):
         attn_r=args.attn_r, attn_alpha=args.attn_alpha,
         moe_r=args.moe_r, moe_alpha=args.moe_alpha,
         include_moe=not args.no_moe_lora, include_shared=not args.no_shared_lora,
+        use_dora=args.use_dora,
     )
     return model, stats
 
@@ -254,23 +255,53 @@ def _promote_scalar_params(model):
 
 
 def _reinit_lora_(model):
-    """Re-initialise LoRA adapters on the materialised (sharded) tensors: A=kaiming, B=0."""
-    from lora import LinearLoRA
-    from torch.distributed.tensor import DTensor
+    """Re-initialise LoRA/DoRA adapters on the materialised (sharded) tensors: A=kaiming, B=0, and
+    (DoRA only) magnitude = base-weight row-norm. See minimax_m2._reinit_lora_ for the sharding
+    rationale (attention gathers the full weight; experts use whole-expert local shards)."""
+    from lora import LinearLoRA, dequantize_fp8
+    from torch.distributed.tensor import DTensor, distribute_tensor
 
     def loc(t):
         return t.to_local() if isinstance(t, DTensor) else t
+
+    def _dequant_local(experts, which):
+        if which == "gate_up":
+            w, s = experts.gate_up_proj, getattr(experts, "gate_up_proj_scale_inv", None)
+        else:
+            w, s = experts.down_proj, getattr(experts, "down_proj_scale_inv", None)
+        wl = loc(w)
+        if wl.element_size() == 1 and s is not None:
+            return dequantize_fp8(wl, loc(s), getattr(experts, "block_size", None), out_dtype=torch.float32)
+        return wl.to(torch.float32)
 
     with torch.no_grad():
         for m in model.modules():
             if isinstance(m, LinearLoRA):
                 nn.init.kaiming_uniform_(loc(m.lora_a.weight))
                 nn.init.zeros_(loc(m.lora_b.weight))
-            if hasattr(m, "gate_up_lora_a"):  # FP8Experts carrying routed-expert LoRA
+                if getattr(m, "use_dora", False):
+                    w = m.base.weight
+                    w_full = w.full_tensor() if isinstance(w, DTensor) else w
+                    if m._fp8:
+                        s = m.base.weight_scale_inv
+                        s_full = s.full_tensor() if isinstance(s, DTensor) else s
+                        deq = dequantize_fp8(w_full, s_full, m._block_size, out_dtype=torch.float32)
+                    else:
+                        deq = w_full.to(torch.float32)
+                    mag_full = deq.norm(dim=1).to(m.magnitude.dtype)
+                    mag = m.magnitude
+                    if isinstance(mag, DTensor):
+                        mag.copy_(distribute_tensor(mag_full, mag.device_mesh, mag.placements))
+                    else:
+                        mag.copy_(mag_full)
+            if hasattr(m, "gate_up_lora_a"):  # FP8Experts carrying routed-expert LoRA/DoRA
                 nn.init.kaiming_uniform_(loc(m.gate_up_lora_a))
                 nn.init.kaiming_uniform_(loc(m.down_lora_a))
                 nn.init.zeros_(loc(m.gate_up_lora_b))
                 nn.init.zeros_(loc(m.down_lora_b))
+                if getattr(m, "use_dora", False):
+                    loc(m.gate_up_mag).copy_(_dequant_local(m, "gate_up").norm(dim=2).to(loc(m.gate_up_mag).dtype))
+                    loc(m.down_mag).copy_(_dequant_local(m, "down").norm(dim=2).to(loc(m.down_mag).dtype))
 
 
 def main(args):
@@ -285,6 +316,15 @@ def main(args):
     # the model config, so from_pretrained loads the MLA q/kv/o + shared expert as FP8Linear
     # and the routed experts as FP8Experts automatically (after the num_experts workaround).
     config = load_patched_config(MODEL_ID)
+    # MoE expert rank: AUTO-derive attn_r ÷ active-experts (top-k), scaling held constant, unless
+    # --moe_r was explicitly set (>0). Set on args so BOTH build paths use the same rank.
+    # https://thinkingmachines.ai/blog/lora/
+    if not args.no_moe_lora and (not args.moe_r or args.moe_r <= 0):
+        import moe_adapter as _MA
+        _k = _MA.num_active_experts(config) or 8
+        args.moe_r, args.moe_alpha = _MA.derive_moe_rank(args.attn_r, args.attn_alpha, _k)
+        logger.info(f"[Rank{rank}] MoE expert rank auto-derived: r={args.moe_r} alpha={args.moe_alpha:.1f} "
+                    f"(attn_r={args.attn_r} ÷ top_k={_k}; scaling {args.attn_alpha/args.attn_r:.2f})")
     if args.low_cpu_shard_load:
         logger.info(f"[Rank{rank}] meta-init {MODEL_ID} (FP8 structure, low-CPU sharded load)")
         model, stats = build_meta_lora_model(config, args)
@@ -471,6 +511,7 @@ def save_lora(model, args, rank, stats):
                 "moe_targets": ["gate_up_proj", "down_proj"],
                 "shared_targets": ["gate_proj", "up_proj", "down_proj"],
                 "train_embeddings": bool(getattr(args, "train_embeddings", False)),
+                "use_dora": bool(args.use_dora),
             }, f, indent=2)
         logger.info(f"saved LoRA ({len(sd)} tensors) -> {args.out_dir}/lora.pt")
 
@@ -479,10 +520,15 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--attn_r", type=int, default=16, help="LoRA rank for MLA q_a/q_b/kv_a/kv_b/o.")
     p.add_argument("--attn_alpha", type=float, default=16.0, help="LoRA alpha for attention (scaling=alpha/r).")
-    p.add_argument("--moe_r", type=int, default=16, help="LoRA rank for routed + shared expert FFNs.")
-    p.add_argument("--moe_alpha", type=float, default=16.0, help="LoRA alpha for the expert FFNs.")
+    p.add_argument("--moe_r", type=int, default=0,
+                   help="LoRA/DoRA rank for routed + shared expert FFNs. 0 = AUTO: attn_r ÷ active-experts "
+                        "(top-k), scaling held constant (https://thinkingmachines.ai/blog/lora/). >0 overrides.")
+    p.add_argument("--moe_alpha", type=float, default=0.0, help="alpha for the expert FFNs (0 = auto, keeps attn scaling).")
     p.add_argument("--no_moe_lora", action="store_true", help="Adapt attention only (skip all experts).")
     p.add_argument("--no_shared_lora", action="store_true", help="Skip the shared-expert MLP (keep routed).")
+    p.add_argument("--use_dora", action="store_true",
+                   help="Use DoRA (weight-decomposed LoRA) instead of plain LoRA for attention + "
+                        "routed/shared experts: adds a trainable per-output-row magnitude.")
     p.add_argument("--train_embeddings", action="store_true",
                    help="Also FULL-train the (bf16) token embeddings + LM head on top of LoRA "
                         "(Mistral-Small-4 is untied → both weights). Helps the finetune reliably "

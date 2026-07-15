@@ -227,12 +227,89 @@ def test_fused_experts():
     return ok
 
 
+# ---------------------------------------------------------------------------
+# DoRA (weight-decomposed LoRA): W_eff = magnitude * normalize(W + scaling*B@A)
+# ---------------------------------------------------------------------------
+def test_linear_dora():
+    """DoRA is identity at init (B=0, mag=‖W‖); with a non-zero B it equals the composed weight."""
+    torch.manual_seed(1)
+    base = nn.Linear(16, 24, bias=False)
+    x = torch.randn(5, 16)
+
+    m = L.LinearLoRA(base, r=4, alpha=8.0, lora_dtype=torch.float32, use_dora=True)
+    ok = report("LinearDoRA init (B=0, mag=||W||) == base", m(x), base(x), atol=1e-5, rtol=1e-4)
+
+    with torch.no_grad():
+        m.lora_b.weight.normal_()
+    W = base.weight.float()
+    adapted = W + m.scaling * (m.lora_b.weight.float() @ m.lora_a.weight.float())
+    w_eff = m.magnitude.float().unsqueeze(1) * (adapted / adapted.norm(dim=1, keepdim=True))
+    ok &= report("LinearDoRA == magnitude*normalize(W+sBA)", m(x), F.linear(x, w_eff), atol=1e-5, rtol=1e-4)
+    return ok
+
+
+def reference_experts_dora(experts, x, top_k_index, top_k_weights):
+    """Per-token/per-expert reference for the DoRA-MoE forward (compose W_eff, then apply)."""
+    sc = experts.lora_scaling
+    out = torch.zeros_like(x)
+    for t in range(x.size(0)):
+        acc = torch.zeros(x.size(1))
+        for j in range(top_k_index.size(1)):
+            e = int(top_k_index[t, j]); w = top_k_weights[t, j].float(); xt = x[t].float()
+            gu_w = experts.gate_up_proj[e].float() + sc * (experts.gate_up_lora_b[e].float() @ experts.gate_up_lora_a[e].float())
+            gu_eff = experts.gate_up_mag[e].float().unsqueeze(1) * (gu_w / gu_w.norm(dim=1, keepdim=True))
+            gu = xt @ gu_eff.T
+            half = gu.size(-1) // 2
+            inter = F.silu(gu[:half]) * gu[half:]
+            dn_w = experts.down_proj[e].float() + sc * (experts.down_lora_b[e].float() @ experts.down_lora_a[e].float())
+            dn_eff = experts.down_mag[e].float().unsqueeze(1) * (dn_w / dn_w.norm(dim=1, keepdim=True))
+            acc = acc + w * (inter @ dn_eff.T)
+        out[t] = acc
+    return out
+
+
+def test_fused_experts_dora():
+    torch.manual_seed(2)
+    E, H, I, top_k, T = 6, 8, 5, 2, 13
+    experts = DummyExperts(E, H, I)
+    L.add_expert_lora(experts, r=4, alpha=8.0, lora_dtype=torch.float32, use_dora=True)
+
+    x = torch.randn(T, H)
+    top_k_index = torch.stack([torch.randperm(E)[:top_k] for _ in range(T)])
+    raw = torch.rand(T, top_k)
+    top_k_weights = raw / raw.sum(-1, keepdim=True)
+
+    base_ref = reference_experts(experts, x, top_k_index, top_k_weights)  # B=0 => base
+    ok = report("fused MoE DoRA (init) == base reference", experts(x, top_k_index, top_k_weights), base_ref, atol=1e-4, rtol=1e-3)
+
+    with torch.no_grad():
+        experts.gate_up_lora_b.normal_(std=0.5)
+        experts.down_lora_b.normal_(std=0.5)
+    ref = reference_experts_dora(experts, x, top_k_index, top_k_weights)
+    ok &= report("fused MoE DoRA == reference (fwd)", experts(x, top_k_index, top_k_weights), ref, atol=1e-4, rtol=1e-3)
+
+    g = torch.randn(T, H)
+    trainables = ("gate_up_lora_a", "gate_up_lora_b", "down_lora_a", "down_lora_b", "gate_up_mag", "down_mag")
+    for k in trainables:
+        getattr(experts, k).grad = None
+    (experts(x, top_k_index, top_k_weights) * g).sum().backward()
+    assert experts.gate_up_proj.grad is None and experts.down_proj.grad is None, "frozen base got a grad!"
+    for k in trainables:
+        gr = getattr(experts, k).grad
+        good = gr is not None and torch.isfinite(gr).all() and gr.abs().sum() > 0
+        print(f"[{'PASS' if good else 'FAIL'}]   d/d {k}: finite+nonzero grad")
+        ok &= bool(good)
+    return ok
+
+
 if __name__ == "__main__":
     print(f"torch {torch.__version__}, MISTRAL_GROUPED_FALLBACK={os.environ.get('MISTRAL_GROUPED_FALLBACK')}")
     results = [
         test_dequant(),
         test_linear_lora(),
         test_fused_experts(),
+        test_linear_dora(),
+        test_fused_experts_dora(),
     ]
     if all(results):
         print(f"\nALL {len(results)} TEST GROUPS PASSED")

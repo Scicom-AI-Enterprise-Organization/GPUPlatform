@@ -9,7 +9,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 import torch.nn as nn
-import logging 
+import torch.nn.functional as F
+import logging
 from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -172,7 +173,8 @@ def dpo_collator(batch):
 
 DEFAULT_LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha: int = 16, target_modules=None):
+def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha: int = 16, target_modules=None,
+                      use_dora: bool = False):
     # gemma-4's q/k/v/o are Gemma4ClippableLinear (an nn.Linear subclass), so isinstance
     # matches them. The MLP projections (gate_proj/up_proj/down_proj) may NOT be plain
     # nn.Linear on every arch — so any requested target that wraps nothing is reported
@@ -185,16 +187,33 @@ def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha: int = 16, target
                 if 'vision' in name:
                     continue
 
-                lora = LinearLoRA(child_module, r, alpha)
+                lora = LinearLoRA(child_module, r, alpha, use_dora=use_dora)
                 setattr(module, child_name, lora)
                 wrapped[child_name] = wrapped.get(child_name, 0) + 1
     if int(os.environ.get("LOCAL_RANK", "0")) == 0:
-        logger.info(f"LoRA target_modules={target_modules}; wrapped per module: {wrapped}")
+        logger.info(f"{'DoRA' if use_dora else 'LoRA'} target_modules={target_modules}; wrapped per module: {wrapped}")
         zero = [t for t, n in wrapped.items() if n == 0]
         if zero:
             logger.warning(f"LoRA targets matched NO nn.Linear modules and will NOT be trained: "
                            f"{zero} — this architecture may fuse/rename them.")
     return wrapped
+
+
+def apply_moe_expert_lora(base_model: nn.Module, r: int = 16, alpha: int = 32, use_dora: bool = False):
+    """Adapt a gemma-4-MoE model's routed experts (fused 3D `Gemma4TextExperts`, present when
+    `config.enable_moe_block`) with the shared grouped LoRA/DoRA adapter. gemma MoE has no shared
+    routed expert — the per-layer dense `mlp` stays reachable via `--target_modules`. Returns
+    (n_expert_blocks, routed_param_count); (0, 0) on a dense model (no-op)."""
+    import moe_adapter as MA
+    n_exp, params = 0, 0
+    for name, module in list(base_model.named_modules()):
+        if name.endswith(".experts") and hasattr(module, "gate_up_proj"):
+            params += MA.add_expert_adapter(module, r=r, alpha=alpha, use_dora=use_dora)
+            n_exp += 1
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0 and n_exp:
+        logger.info(f"MoE expert {'DoRA' if use_dora else 'LoRA'}: adapted {n_exp} routed-expert "
+                    f"blocks ({params/1e6:.1f}M params, moe_r={r}, moe_alpha={alpha})")
+    return n_exp, params
 
 class CustomGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
     def __init__(self, config):
@@ -318,10 +337,18 @@ def lora_disabled():
 
 
 class LinearLoRA(nn.Module):
-    def __init__(self, linear: nn.Linear, r=4, alpha=1.0):
+    """LoRA:  y = linear(x) + scaling * B(A(x)).
+    DoRA:  y = F.linear(x, magnitude * normalize(W + scaling*B@A))  (weight-decomposed LoRA).
+
+    DoRA adds a per-output-row `magnitude` init'd to the base row-norms (identity at init since
+    B=0). The DPO reference pass (`_LORA_ENABLED=False`) returns the pure frozen base for BOTH modes.
+    """
+
+    def __init__(self, linear: nn.Linear, r=4, alpha=1.0, use_dora: bool = False):
         super().__init__()
         self.linear = linear
         self.scaling = alpha / r
+        self.use_dora = use_dora
 
         in_features = linear.in_features
         out_features = linear.out_features
@@ -337,10 +364,22 @@ class LinearLoRA(nn.Module):
             # merged result is degenerate (the bug that produced 0 accuracy / <|"|> garbage).
             nn.init.zeros_(self.lora_b.weight)
 
+        if use_dora:
+            # gemma loads real weights (no meta path), so the row-norm init is exact at apply time.
+            with torch.no_grad():
+                mag = linear.weight.to(torch.float32).norm(dim=1).to(torch.bfloat16)
+            self.magnitude = nn.Parameter(mag, requires_grad=True)
+
     def forward(self, x):
+        if not _LORA_ENABLED:  # DPO reference pass (see lora_disabled): pure frozen base
+            return self.linear(x)
+        if self.use_dora:
+            w = self.linear.weight.to(self.lora_a.weight.dtype)
+            adapted = w + self.scaling * (self.lora_b.weight @ self.lora_a.weight)
+            direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            w_eff = self.magnitude.unsqueeze(1) * direction
+            return F.linear(x.to(w_eff.dtype), w_eff, self.linear.bias).to(x.dtype)
         out_non_lora = self.linear(x)
-        if not _LORA_ENABLED:  # DPO reference pass (see lora_disabled)
-            return out_non_lora
         lora_out = self.lora_b(self.lora_a(x))
         return out_non_lora + self.scaling * lora_out
 
@@ -362,7 +401,16 @@ def main(
         dpo:bool = False,
         dpo_beta:float = 0.1,
         train_embeddings:bool = False,
+        moe_r:int = 0,       # 0 = auto: attn rank ÷ active-experts (top-k). >0 overrides.
+        moe_alpha:float = 0,
+        no_moe_lora:bool = False,
+        use_dora:bool = False,
     ):
+    if dpo and use_dora:
+        # DoRA retrains a per-row magnitude on top of the frozen base; the DPO reference
+        # (LoRA disabled -> pure base) assumes the base is untouched. Reject up front (matches
+        # the create-run guard) rather than train against a drifting reference.
+        raise RuntimeError("--use_dora is incompatible with --dpo (v1)")
     if dpo and cp_size > 1:
         # per-sequence log-prob sums (and the pairing) live on whole sequences; a CP
         # shard only sees a chunk — would need a cross-rank logprob reduction + coeff
@@ -420,7 +468,20 @@ def main(
     for param in model.parameters():
         param.requires_grad = False
     target_modules = list(target_modules or DEFAULT_LORA_TARGETS)
-    apply_linear_lora(model, r=r, alpha=alpha, target_modules=target_modules)
+    apply_linear_lora(model, r=r, alpha=alpha, target_modules=target_modules, use_dora=use_dora)
+    # gemma-4-MoE (e.g. gemma-4-26B-A4B): adapt the routed experts (Gemma4TextExperts, the MoE
+    # capacity) by default — without this a MoE run would train ONLY attention. No-op on the dense
+    # 31B. The per-layer dense mlp stays reachable via --target_modules (gate_proj/up_proj/down_proj).
+    n_moe_experts = 0
+    if not no_moe_lora:
+        import moe_adapter as _MA
+        k = _MA.num_active_experts(config)  # None on dense gemma-4-31B (no MoE) → apply is a no-op
+        if k and (not moe_r or moe_r <= 0):  # auto: expert rank = attn rank ÷ active-experts (top-k)
+            moe_r, moe_alpha = _MA.derive_moe_rank(r, alpha, k)
+            logger.info(f"MoE expert rank auto-derived: r={moe_r} alpha={moe_alpha:.1f} "
+                        f"(attn r={r} ÷ top_k={k}; scaling held at {alpha / r:.2f}) "
+                        f"— https://thinkingmachines.ai/blog/lora/")
+        n_moe_experts, _ = apply_moe_expert_lora(model, r=(moe_r or 16), alpha=(moe_alpha or 32), use_dora=use_dora)
 
     # Optionally FULL-train the token embeddings + LM head (NOT LoRA — the real weights).
     # gemma-4 ties them (tie_word_embeddings=True) so it's ONE ~1.4B weight (vocab 262144 ×
@@ -604,6 +665,10 @@ def main(
                             "wrapped_attr": "linear",
                             "train_embeddings": train_embeddings,
                             "objective": "dpo" if dpo else "sft",
+                            "use_dora": use_dora,
+                            "moe_lora": bool(n_moe_experts > 0),
+                            "moe_r": moe_r, "moe_alpha": moe_alpha,
+                            "moe_targets": ["gate_up_proj", "down_proj"],
                             **({"dpo_beta": dpo_beta} if dpo else {}),
                         }, f, indent=2)
                     logger.info(f"Saved LoRA ({len(lora_state_dict)} tensors) to checkpointing/lora.pt")
@@ -677,6 +742,17 @@ if __name__ == "__main__":
              "optimizer state — combine with --cpu_offload. Pairs well with adding the MLP "
              "(gate_proj,up_proj,down_proj) to --target_modules.",
     )
+    parser.add_argument("--moe_r", type=int, default=0,
+                        help="LoRA/DoRA rank for the MoE routed experts (gemma-4-MoE only, e.g. "
+                             "26B-A4B). 0 = AUTO: attention --r ÷ the model's active experts (top-k), "
+                             "scaling held constant (https://thinkingmachines.ai/blog/lora/). >0 overrides.")
+    parser.add_argument("--moe_alpha", type=float, default=0, help="alpha for the MoE expert adapters (0 = auto, keeps attn scaling).")
+    parser.add_argument("--no_moe_lora", action="store_true",
+                        help="For a gemma-4-MoE model, adapt attention only (leave the routed experts frozen).")
+    parser.add_argument("--use_dora", action="store_true",
+                        help="Use DoRA (weight-decomposed LoRA) instead of plain LoRA for the "
+                             "target_modules + (for MoE) the routed experts: adds a trainable "
+                             "per-output-row magnitude.")
     args = parser.parse_args()
     main(
         args.r,
@@ -696,4 +772,8 @@ if __name__ == "__main__":
         dpo=args.dpo,
         dpo_beta=args.dpo_beta,
         train_embeddings=args.train_embeddings,
+        moe_r=args.moe_r,
+        moe_alpha=args.moe_alpha,
+        no_moe_lora=args.no_moe_lora,
+        use_dora=args.use_dora,
     )

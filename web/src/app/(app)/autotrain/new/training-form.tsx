@@ -111,6 +111,16 @@ function llmArch(model: string): "gemma" | "qwen" | "minimax" | "mistral" | "nem
   if (n.includes("nemotron")) return "nemotron";
   return "gemma";
 }
+// Whether the selected base has ADAPTABLE MoE experts (fused 3D tensors we LoRA/DoRA by default).
+// minimax/mistral are always FP8-MoE; gemma/qwen have both dense and MoE variants (the active-param
+// "-A<n>B" suffix marks MoE: gemma-4-26B-A4B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B). Nemotron is MoE
+// but its experts stay frozen (Mamba-hybrid), so it's NOT adaptable here.
+function llmMoeAdaptable(model: string): boolean {
+  const a = llmArch(model);
+  if (a === "minimax" || a === "mistral") return true;
+  if (a === "gemma" || a === "qwen") return /-a\d+b/.test(model.toLowerCase());
+  return false;
+}
 // Per-arch LoRA defaults. Dense archs (gemma, qwen): r=256 scaling 2.0. The FP8-MoE
 // archs (minimax, mistral): r=16 scaling 1.0 — 100s of experts × dozens of layers
 // make the MoE LoRA huge (see their CLAUDE.md). Nemotron-H (hybrid Mamba/attn MoE):
@@ -359,6 +369,10 @@ export function TrainingForm() {
   // ~1.4B weight) on top of LoRA. Helps the model reliably emit special tokens (e.g. tool
   // calls) that attention-only LoRA can only nudge. Costs extra optimizer state.
   const [trainEmbeddings, setTrainEmbeddings] = useState(false);
+  // LLM: DoRA (weight-decomposed LoRA) instead of plain LoRA — attention + the MoE experts.
+  const [useDora, setUseDora] = useState(false);
+  // LLM MoE: adapt the fused routed-expert weights (default on; maps to no_moe_lora = !this).
+  const [adaptMoeExperts, setAdaptMoeExperts] = useState(true);
   const [freezeEncoder, setFreezeEncoder] = useState(false);
   // Multi-GPU single run: DDP (torchrun) vs DataParallel.
   const [useDdp, setUseDdp] = useState(true);
@@ -549,6 +563,8 @@ export function TrainingForm() {
         if (Array.isArray(c.lora_target_modules) && c.lora_target_modules.length)
           setLoraTargets(c.lora_target_modules as string[]);
         if (c.train_embeddings != null) setTrainEmbeddings(!!c.train_embeddings);
+        if (c.use_dora != null) setUseDora(!!c.use_dora);
+        if (c.no_moe_lora != null) setAdaptMoeExperts(!c.no_moe_lora);
         if (c.freeze_encoder != null) setFreezeEncoder(!!c.freeze_encoder);
         if (c.use_ddp != null) setUseDdp(!!c.use_ddp);
         if (c.precision) setPrecision(str(c.precision));
@@ -683,6 +699,8 @@ export function TrainingForm() {
   // Context parallelism: gemma4 (zigzag ring) + qwen3.5/3.6 (GatedDeltaNet state relay + full-attn ring).
   // Not with DPO — per-sequence log-probs would need cross-rank reduction.
   const isGemma = isLlm && llmArch(baseModel) === "gemma";
+  // MoE base with adaptable experts (minimax/mistral always; gemma/qwen only the -A<n>B variants).
+  const moeAdaptable = isLlm && llmMoeAdaptable(baseModel);
   const cpEligible = isLlm && !isDpo && (llmArch(baseModel) === "gemma" || llmArch(baseModel) === "qwen");
   // Effective GPU count for CP (world) = pinned devices if set, else the run's GPU bound. The CP
   // group size (cp_size) must divide it; dp_size = cpWorld / cp_size.
@@ -951,6 +969,9 @@ export function TrainingForm() {
       // All LLM archs: full-train embed_tokens + lm_head on top of LoRA. Incompatible with DPO
       // (its LoRA-disabled reference needs frozen base weights) → forced off there.
       train_embeddings: isLlm && !isDpo ? trainEmbeddings : false,
+      use_dora: isLlm && !isDpo ? useDora : false,
+      // MoE-only opt-out of the routed-expert adapter (default: adapt them). Positive UI toggle.
+      no_moe_lora: moeAdaptable ? !adaptMoeExperts : false,
       freeze_encoder: freezeEncoder,
       use_ddp: useDdp,
       logging_steps: loggingSteps,
@@ -1809,6 +1830,36 @@ export function TrainingForm() {
                   No modules selected — the server will fall back to the q/k/v/o default.
                 </p>
               )}
+              {moeAdaptable && (
+                <p className="text-xs text-muted-foreground">
+                  This is a <span className="font-medium">MoE</span> model — its <span className="font-medium">expert
+                  weights</span> are fused 3D tensors, not linear layers, so they aren&apos;t listed above. They&apos;re
+                  adapted by a separate grouped adapter (toggle below), on by default.
+                </p>
+              )}
+            </div>
+          )}
+          {/* MoE base (minimax/mistral always; gemma/qwen -A<n>B): the routed experts are fused 3D
+              tensors adapted by the grouped LoRA/DoRA adapter (default on) — not selectable above. */}
+          {moeAdaptable && (
+            <div className="space-y-1.5 border-t border-border pt-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" className="h-4 w-4 accent-primary"
+                  checked={adaptMoeExperts} onChange={(e) => setAdaptMoeExperts(e.target.checked)} />
+                <span className="font-medium">Adapt MoE expert weights</span>
+                <span className="rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground">MoE</span>
+              </label>
+              <p className="text-xs text-muted-foreground">
+                Apply {useDora ? "DoRA" : "LoRA"} to the fused routed-expert projections
+                (<span className="font-mono">gate_up_proj</span>/<span className="font-mono">down_proj</span>) —
+                the bulk of a MoE model&apos;s capacity. On by default; uncheck to adapt attention only. The
+                expert rank is derived automatically as your LoRA rank ÷ the model&apos;s active experts
+                (top-k), holding scaling constant — a token routes to only top-k experts, so this matches
+                the dense per-token update magnitude (<a className="underline"
+                href="https://thinkingmachines.ai/blog/lora/" target="_blank" rel="noreferrer">thinking-machines
+                LoRA recipe</a>).
+                {llmArch(baseModel) === "mistral" ? " Mistral's shared-expert MLP is adapted too." : ""}
+              </p>
             </div>
           )}
           {/* All LLM archs (SFT): full-train the token embeddings + LM head on top of LoRA.
@@ -1828,6 +1879,25 @@ export function TrainingForm() {
                 <span className="font-mono">~1.4B</span> weight; qwen/minimax/mistral train embeddings and
                 head separately. Costs extra optimizer state (CPU offload is on by default). Pairs well with
                 adding the MLP <span className="font-mono">gate/up/down_proj</span> above.
+              </p>
+            </div>
+          )}
+          {/* All LLM archs (SFT): DoRA (weight-decomposed LoRA). Hidden for DPO — its
+              LoRA-disabled reference assumes the base stays frozen (DoRA retrains a magnitude). */}
+          {isLlm && !isDpo && (
+            <div className="space-y-1.5 border-t border-border pt-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" className="h-4 w-4 accent-primary"
+                  checked={useDora} onChange={(e) => setUseDora(e.target.checked)} />
+                <span className="font-medium">Use DoRA</span>
+                <span className="rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground">LLM</span>
+              </label>
+              <p className="text-xs text-muted-foreground">
+                Weight-decomposed LoRA (DoRA): trains a per-output-row <span className="font-mono">magnitude</span>{" "}
+                alongside the low-rank direction (<span className="font-mono">W_eff = m·normalize(W + ΔW)</span>) —
+                often closer to full finetuning than LoRA at the same rank. Applies to every adapted module,
+                including the fused MoE experts on MiniMax / Mistral / Qwen-MoE / gemma-4-MoE. Slightly heavier
+                per step (it composes the full weight each forward). Incompatible with DPO.
               </p>
             </div>
           )}

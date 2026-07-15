@@ -107,6 +107,7 @@ const GROUPS: Group[] = [
   { id: "benchmarks", title: "Benchmarks", blurb: <>Run llm-benchmaq throughput/latency sweeps on a RunPod pod or a registered VM. Logs + results land in a storage backend.</> },
   { id: "datasets", title: "Datasets", blurb: <>Audio + transcription (+ optional speaker) datasets — from an uploaded metadata file, an S3 metadata file, a HuggingFace repo, or a live labeling project. Browse + curate rows (exclude some from training), map the audio/transcription/speaker columns (per-split for HF), <strong>extract a real <code>audio</code> column</strong> from a zip-of-audio repo (→ HF / S3), or <strong>Pack for TTS</strong> (NeuCodec-encode + multipack into a <code>tts_packed</code> dataset).</> },
   { id: "autotrain", title: "Autotrain", blurb: <>Fine-tune <strong>Whisper (ASR)</strong> or <strong>Qwen3 + NeuCodec (TTS)</strong> on your datasets, with optional <strong>hyperparameter sweeps</strong> — SSH-orchestrated on a RunPod pod or a registered VM. Logs stream live; checkpoints + metrics land in a storage backend.</> },
+  { id: "quantization", title: "Quantization", blurb: <>Compress an LLM with <strong>llm-compressor</strong> (compressed-tensors, loadable by vLLM) — <strong>FP8</strong> (dynamic / static), <strong>INT8</strong> (W8A8), <strong>INT4</strong> (W4A16 / AWQ), or <strong>NVFP4</strong>. Pull from HuggingFace, quantize on a RunPod pod or a registered VM, write the compressed model to S3, and optionally push it to HF. Multimodal (VLM / omni) models keep their <strong>vision + audio</strong> stacks in full precision automatically.</> },
   { id: "compute", title: "Compute pods", blurb: <>Raw RunPod / Prime Intellect pods with SSH + JupyterLab. Creation may require admin approval.</> },
   { id: "storage", title: "Storage", blurb: <>S3 / HuggingFace backends the platform writes to (dataset files, benchmark logs, inference logs, trained models). Writes are admin-only.</> },
   { id: "providers", title: "GPU providers", blurb: <>Registered VMs / RunPod / Prime Intellect accounts that endpoints, benchmarks, autotrain, and compute can target. Writes are admin-only.</> },
@@ -1121,6 +1122,234 @@ data: end` }],
     parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Run id." }],
     request: { sample: `curl -s -X POST "$SGPU/v1/training-runs/train-1a2b3c4d/playground/stop" -H "Authorization: Bearer $SGPU_API_KEY"` },
     responses: [{ code: 200, codeLabel: "OK", sample: `{ "running": false, "ready": false, "device": null, "kind": null, "logs": [] }` }],
+  },
+
+  // ───── Quantization ─────
+  {
+    id: "list-quant-schemes",
+    group: "quantization",
+    method: "GET",
+    path: "/v1/quantization-jobs/schemes",
+    title: "List quantization schemes",
+    description: <>The compression schemes the platform supports, each with a <code>label</code> and whether it <code>needs_calibration</code> (a calibration dataset). Also returns the calibration dataset <code>kinds</code> the create endpoint accepts. The console form reads this so scheme choices never drift from the backend.</>,
+    request: { sample: `curl -s "$SGPU/v1/quantization-jobs/schemes" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{
+  "schemes": {
+    "fp8-dynamic": { "label": "FP8 dynamic (W8A8, data-free)", "needs_calibration": false },
+    "fp8":         { "label": "FP8 static (W8A8, calibrated)", "needs_calibration": true },
+    "w8a8-int8":   { "label": "W8A8 INT8 (SmoothQuant + GPTQ)", "needs_calibration": true },
+    "w4a16":       { "label": "W4A16 (GPTQ, 4-bit weights)",    "needs_calibration": true },
+    "nvfp4":       { "label": "NVFP4 (4-bit microscale)",       "needs_calibration": true },
+    "awq":         { "label": "AWQ (W4A16)",                    "needs_calibration": true }
+  },
+  "calib_dataset_kinds": ["hf", "llm", "upload", "s3"]
+}` }],
+  },
+  {
+    id: "create-quant-job",
+    group: "quantization",
+    method: "POST",
+    path: "/v1/quantization-jobs",
+    title: "Create a quantization job",
+    description: (
+      <>
+        <p>Queues a compression job. The gateway pulls <code>source_model</code> from HuggingFace, quantizes it with llm-compressor on the target (a RunPod pod it spawns, or a registered VM via <code>provider_id</code>), writes the compressed-tensors model to the job&apos;s storage prefix, and — if <code>hf_push_repo</code> is set — pushes it to the Hub.</p>
+        <p className="mt-2"><strong>Data-free vs calibrated:</strong> <code>fp8-dynamic</code> needs no data. The calibrated schemes (<code>fp8</code>, <code>w8a8-int8</code>, <code>w4a16</code>, <code>nvfp4</code>, <code>awq</code>) require a <code>calibration_dataset_id</code>. See <em>list quantization schemes</em>.</p>
+        <p className="mt-2"><strong>Multimodal models are handled automatically:</strong> for a detected VLM / omni model (e.g. gemma-4) the vision <em>and</em> audio towers + input embedders are kept in full precision — a quantized modality tower is not vLLM-servable. Set <code>quantize_vision: true</code> to override.</p>
+      </>
+    ),
+    parameters: [
+      { name: "name", in: "body", type: "string", required: true, doc: "Job label." },
+      { name: "source_model", in: "body", type: "string", required: true, doc: "HuggingFace repo id to compress, e.g. google/gemma-4-12B-it." },
+      { name: "scheme", in: "body", type: "string", doc: 'One of the ids from /schemes. Default "fp8-dynamic".' },
+      { name: "calibration_dataset_id", in: "body", type: "string", doc: "Required for calibrated schemes. A dataset id (kind hf / llm / upload / s3)." },
+      { name: "num_calibration_samples / max_seq_length", in: "body", type: "number", doc: "Calibration sample count + token length. Defaults 512 / 2048." },
+      { name: "calib_text_field / calib_messages_field", in: "body", type: "string", doc: "Text column (hf/upload/s3) or chat-messages column (llm) in the calibration dataset. Blank = auto-detect." },
+      { name: "ignore_layers", in: "body", type: "string[]", doc: 'Modules kept in full precision. Default ["lm_head"]. Vision/audio modules are added automatically for multimodal models.' },
+      { name: "quantize_vision", in: "body", type: "boolean", doc: "Quantize a VLM's vision/audio stack too (advanced; usually not vLLM-servable). Default false." },
+      { name: "smoothing_strength", in: "body", type: "number", doc: "SmoothQuant strength (w8a8-int8). Default 0.8." },
+      { name: "dampening_frac", in: "body", type: "number", doc: "GPTQ Hessian dampening (w4a16 / w8a8-int8). Default 0.01." },
+      { name: "hf_push_repo", in: "body", type: "string", doc: "Push the compressed model to this HF repo (uses hf_token / storage / env HF_TOKEN)." },
+      { name: "hf_push_private", in: "body", type: "boolean", doc: "Create the pushed repo private. Default true." },
+      { name: "hf_token / hf_token_secret", in: "body", type: "string", doc: "Inline HF token, or the name of a global secret holding one. Needed for gated source models + pushes." },
+      { name: "provider_id", in: "body", type: "string", doc: "vm provider → bare metal; omit (or a runpod provider) → cloud pod." },
+      { name: "storage_id", in: "body", type: "string", doc: "Enabled S3 backend for the compressed model. Omit → no S3 upload (HF push still works)." },
+      { name: "gpu_type / gpu_count / secure_cloud / disk_gb / volume_gb / data_center_id", in: "body", type: "mixed", doc: "Cloud-pod hardware. Defaults: H100 / 1 / true / 60 / 120." },
+      { name: "visible_devices", in: "body", type: "string", doc: 'VM-only GPU pin, e.g. "3". Omit → all of the VM\'s GPUs.' },
+      { name: "venv_path / env_vars / image / work_dir", in: "body", type: "mixed", doc: "Advanced worker overrides (venv, extra env, RunPod image, scratch dir)." },
+    ],
+    request: {
+      sample: `# FP8-dynamic (data-free) on a registered VM, pushed to HF
+curl -s -X POST "$SGPU/v1/quantization-jobs" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "gemma-4-12B-fp8",
+    "source_model": "google/gemma-4-12B-it",
+    "scheme": "fp8-dynamic",
+    "provider_id": "prov-1a2b3c4d", "visible_devices": "3",
+    "storage_id": "store-1a2b3c4d",
+    "hf_token_secret": "HF_TOKEN",
+    "hf_push_repo": "my-org/gemma-4-12B-it-FP8-Dynamic", "hf_push_private": false
+  }'
+
+# W4A16 (GPTQ, 4-bit) — a calibrated scheme needs a calibration dataset
+curl -s -X POST "$SGPU/v1/quantization-jobs" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "name": "qwen3-0.6b-w4a16",
+    "source_model": "Qwen/Qwen3-0.6B",
+    "scheme": "w4a16",
+    "calibration_dataset_id": "ds-1a2b3c4d", "calib_text_field": "text",
+    "num_calibration_samples": 512, "dampening_frac": 0.01,
+    "provider_id": "prov-1a2b3c4d", "storage_id": "store-1a2b3c4d"
+  }'`,
+    },
+    responses: [
+      {
+        code: 200,
+        codeLabel: "OK",
+        sample: `{
+  "id": "quant-1a2b3c4d",
+  "name": "gemma-4-12B-fp8",
+  "status": "queued",
+  "source_model": "google/gemma-4-12B-it",
+  "scheme": "fp8-dynamic",
+  "calibration_dataset_id": null,
+  "s3_prefix": "quantization-jobs/quant-1a2b3c4d/",
+  "config_json": { "scheme": "fp8-dynamic", "ignore_layers": ["lm_head"], "quantize_vision": false, "...": "…" },
+  "exit_code": null, "error_text": null, "result_json": null,
+  "created_by": "admin", "created_at": "2026-07-15T03:21:08+00:00",
+  "started_at": null, "ended_at": null,
+  "provider_id": "prov-1a2b3c4d", "provider_kind": "vm",
+  "storage_id": "store-1a2b3c4d",
+  "gpu_type": "NVIDIA H100 80GB HBM3", "gpu_count": 1, "visible_devices": "3"
+}`,
+      },
+      { code: 400, codeLabel: "Bad Request", doc: "Unknown scheme / provider_id / storage_id, or a calibrated scheme without calibration_dataset_id.", sample: `{ "detail": "scheme 'w4a16' needs a calibration_dataset_id" }` },
+    ],
+  },
+  {
+    id: "list-quant-jobs",
+    group: "quantization",
+    method: "GET",
+    path: "/v1/quantization-jobs",
+    title: "List quantization jobs",
+    description: <>Your jobs, newest first. <code>scope=all</code> (admin) returns everyone&apos;s.</>,
+    parameters: [{ name: "scope", in: "query", type: '"mine" | "all"', doc: "Default mine." }],
+    request: { sample: `curl -s "$SGPU/v1/quantization-jobs?scope=mine" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `[ { "id": "quant-1a2b3c4d", "name": "gemma-4-12B-fp8", "status": "done", "scheme": "fp8-dynamic", "result_json": { "quantized_gb": 12.16, "hf_repo": "my-org/gemma-4-12B-it-FP8-Dynamic" }, "...": "QuantizationJobRecord" } ]` }],
+  },
+  {
+    id: "get-quant-job",
+    group: "quantization",
+    method: "GET",
+    path: "/v1/quantization-jobs/:id",
+    title: "Get a quantization job",
+    description: <>Full record — status, the resolved recipe (<code>config_json</code>), and results (<code>result_json</code>: quantized size, S3 uri, HF repo) once it finishes.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Job id (quant-…)." }],
+    request: { sample: `curl -s "$SGPU/v1/quantization-jobs/quant-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "id": "quant-1a2b3c4d", "status": "running", "...": "QuantizationJobRecord" }` },
+      { code: 403, codeLabel: "Forbidden", doc: "The job isn't yours (and you're not admin).", sample: `{ "detail": "not yours" }` },
+    ],
+  },
+  {
+    id: "quant-logs",
+    group: "quantization",
+    method: "GET",
+    path: "/v1/quantization-jobs/:id/logs",
+    title: "Fetch logs (tail)",
+    description: <>Last <code>tail</code> log lines plus the live <code>status</code> and any <code>error_text</code>. <code>result_json.progress</code> (<code>{`{stage, percent}`}</code>) tracks the loading → quantizing → uploading phases.</>,
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Job id." },
+      { name: "tail", in: "query", type: "number", doc: "Lines from the end. Default 400." },
+    ],
+    request: { sample: `curl -s "$SGPU/v1/quantization-jobs/quant-1a2b3c4d/logs?tail=200" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{
+  "status": "running",
+  "error_text": null,
+  "lines": [
+    "[quant] loading google/gemma-4-12B-it (scheme=fp8-dynamic) …",
+    "[quant] multimodal model detected → keeping vision modules in full precision",
+    "[quant] running llm-compressor oneshot …"
+  ]
+}` }],
+  },
+  {
+    id: "quant-logs-stream",
+    group: "quantization",
+    method: "GET",
+    path: "/v1/quantization-jobs/:id/logs/stream",
+    title: "Stream logs (SSE)",
+    description: <>Server-sent-events tail of the job&apos;s log. Emits each new line as <code>data:</code> and closes with an <code>end</code> event when the job reaches a terminal state.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Job id." }],
+    request: { sample: `curl -N "$SGPU/v1/quantization-jobs/quant-1a2b3c4d/logs/stream" \\
+  -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK · text/event-stream", sample: `data: [quant] running llm-compressor oneshot …
+data: @@SIZES {"quantized_gb": 12.16}
+event: end
+data: end` }],
+  },
+  {
+    id: "quant-files",
+    group: "quantization",
+    method: "GET",
+    path: "/v1/quantization-jobs/:id/files",
+    title: "List artifacts",
+    description: <>Every file of the compressed model under the job&apos;s storage prefix (safetensors, config, tokenizer, recipe) with a presigned download URL. Requires a <code>storage_id</code> on the job.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Job id." }],
+    request: { sample: `curl -s "$SGPU/v1/quantization-jobs/quant-1a2b3c4d/files" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `[ { "key": "quantization-jobs/quant-1a2b3c4d/model/model.safetensors", "size": 13021677512, "url": "https://…presigned…" } ]` }],
+  },
+  {
+    id: "terminate-quant-job",
+    group: "quantization",
+    method: "POST",
+    path: "/v1/quantization-jobs/:id/terminate",
+    title: "Terminate a running job",
+    description: <>Cancels the job, kills the worker, and tears down the RunPod pod (cloud jobs). Safe only while active.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Job id." }],
+    request: { sample: `curl -s -X POST "$SGPU/v1/quantization-jobs/quant-1a2b3c4d/terminate" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "id": "quant-1a2b3c4d", "status": "cancelled", "...": "QuantizationJobRecord" }` },
+      { code: 409, codeLabel: "Conflict", doc: "The job already finished (done / failed / cancelled).", sample: `{ "detail": "already done" }` },
+    ],
+  },
+  {
+    id: "quant-hf-export",
+    group: "quantization",
+    method: "POST",
+    path: "/v1/quantization-jobs/:id/hf-export",
+    title: "Push the model to HuggingFace",
+    description: <>Push a finished job&apos;s compressed model to the Hub — use this to publish after the fact, or to push when the create call didn&apos;t set <code>hf_push_repo</code>. <code>run_on: &quot;gateway&quot;</code> (default) pushes in-process from S3; <code>&quot;vm&quot;</code> pushes from the job&apos;s VM (not allowed for the self-hosted mirror). The token comes from an HF <code>storage_id</code>, an inline <code>token</code>, or the global <code>HF_TOKEN</code>.</>,
+    parameters: [
+      { name: "id", in: "path", type: "string", required: true, doc: "Job id (a finished job with an artifact)." },
+      { name: "repo", in: "body", type: "string", required: true, doc: "Target HF repo id." },
+      { name: "private", in: "body", type: "boolean", doc: "Create the repo private. Default true." },
+      { name: "storage_id", in: "body", type: "string", doc: "A kind=huggingface storage supplying the push token + (optional) endpoint." },
+      { name: "token", in: "body", type: "string", doc: "Inline HF token (alternative to storage_id)." },
+      { name: "run_on", in: "body", type: '"gateway" | "vm"', doc: "Where to push from. Default gateway." },
+    ],
+    request: {
+      sample: `curl -s -X POST "$SGPU/v1/quantization-jobs/quant-1a2b3c4d/hf-export" \\
+  -H "Authorization: Bearer $SGPU_API_KEY" -H "Content-Type: application/json" \\
+  -d '{ "repo": "my-org/gemma-4-12B-it-FP8-Dynamic", "private": false, "storage_id": "store-hf01" }'`,
+    },
+    responses: [
+      { code: 200, codeLabel: "OK", sample: `{ "id": "quant-1a2b3c4d", "result_json": { "hf_export": { "status": "running", "repo": "my-org/gemma-4-12B-it-FP8-Dynamic" } }, "...": "QuantizationJobRecord" }` },
+      { code: 400, codeLabel: "Bad Request", doc: "Job not finished / no artifact, or a VM push to the self-hosted mirror.", sample: `{ "detail": "job has no artifact to export" }` },
+    ],
+  },
+  {
+    id: "delete-quant-job",
+    group: "quantization",
+    method: "DELETE",
+    path: "/v1/quantization-jobs/:id",
+    title: "Delete a quantization job",
+    description: <>Cancels it if still running (tearing down the pod), then removes the record. Artifacts already written to storage are not deleted.</>,
+    parameters: [{ name: "id", in: "path", type: "string", required: true, doc: "Job id." }],
+    request: { sample: `curl -s -X DELETE "$SGPU/v1/quantization-jobs/quant-1a2b3c4d" -H "Authorization: Bearer $SGPU_API_KEY"` },
+    responses: [{ code: 200, codeLabel: "OK", sample: `{ "ok": true, "id": "quant-1a2b3c4d" }` }],
   },
 
   // ───── Compute pods ─────

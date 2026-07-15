@@ -34,11 +34,23 @@ def load_meta(lora_path):
     return {}
 
 
+# Adapter tensor suffixes (LinearLoRA + fused-expert LoRA/DoRA) — everything else is a full weight.
+_ADAPTER_SUFFIXES = (".lora_a.weight", ".lora_b.weight", ".magnitude",
+                     ".gate_up_lora_a", ".gate_up_lora_b", ".down_lora_a", ".down_lora_b",
+                     ".gate_up_mag", ".down_mag")
+
+
 @torch.no_grad()
-def merge_lora_(model, lora_path, scaling):
-    """In-place: add scaling * (B @ A) to each base Linear that has an adapter, then
-    REPLACE any full-weight tensors in the checkpoint (embed_tokens/lm_head from
-    --train_embeddings) — those are the trained weights themselves, not deltas."""
+def merge_lora_(model, lora_path, scaling, moe_scaling=None, use_dora=False):
+    """In-place fold of the trained adapters into the bf16 base, then REPLACE any full-weight
+    tensors (embed_tokens/lm_head from --train_embeddings).
+
+    LinearLoRA (attention/MLP):  LoRA W += scaling·(B@A);  DoRA W = magnitude·normalize(W+scaling·B@A).
+    Fused routed experts (gemma-4-MoE `...experts.{gate_up,down}_proj`, 3D): per-expert same fold at
+    moe_scaling via moe_adapter.fold_expert_adapter."""
+    import moe_adapter as MA
+    if moe_scaling is None:
+        moe_scaling = scaling
     lora = torch.load(lora_path, map_location="cpu")
     state = dict(model.named_parameters())
 
@@ -53,19 +65,17 @@ def merge_lora_(model, lora_path, scaling):
     prefixes = sorted({
         k[: -len(".lora_a.weight")] for k in lora if k.endswith(".lora_a.weight")
     })
+    expert_prefixes = sorted({k[: -len(".gate_up_lora_a")] for k in lora if k.endswith(".gate_up_lora_a")})
     # Full-weight (non-adapter) keys: embed_tokens/lm_head saved whole by --train_embeddings.
-    full_keys = [k for k in lora
-                 if not (k.endswith(".lora_a.weight") or k.endswith(".lora_b.weight"))]
-    if not prefixes and not full_keys:
-        raise ValueError(f"No '*.lora_a.weight' or full-weight keys in {lora_path}; "
-                         f"keys look like: {list(lora)[:4]}")
+    full_keys = [k for k in lora if not any(k.endswith(s) for s in _ADAPTER_SUFFIXES)]
+    if not prefixes and not expert_prefixes and not full_keys:
+        raise ValueError(f"No adapter or full-weight keys in {lora_path}; keys look like: {list(lora)[:4]}")
 
     merged, missing = 0, []
     diffs: dict[str, dict] = {}   # per-layer weight-change report (base W vs merged W+Δ)
     for p in prefixes:
         A = lora[f"{p}.lora_a.weight"].float()   # (r, in)
         B = lora[f"{p}.lora_b.weight"].float()   # (out, r)
-        delta = scaling * (B @ A)                # (out, in)
 
         # The base weight lives at <prefix>.weight. LinearLoRA wraps the original Linear as
         # <prefix>.linear, so a checkpoint kept unwrapped may instead carry <prefix>.linear.weight.
@@ -75,21 +85,47 @@ def merge_lora_(model, lora_path, scaling):
             missing.append(base)
             continue
         w = state[target]
-        d = delta.to(device=w.device, dtype=torch.float32)   # the exact fold Δ, for reporting
-        # How much the LoRA moved this layer: relative Frobenius change |Δ|/|W| (+ raw
-        # norms + max element). Cheap (Δ is already computed); logged per layer + summarized.
+        adapted = w.float() + scaling * (B @ A)
+        if use_dora:
+            mag = lora[f"{p}.magnitude"].float()  # (out,)
+            direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            new_w = mag.unsqueeze(1) * direction
+        else:
+            new_w = adapted
+        d = (new_w - w.float())   # net change, for reporting
         wn = w.float().norm().item()
         dn = d.norm().item()
         diffs[base] = {"rel": (dn / wn) if wn else float("inf"), "abs": dn, "w": wn,
                        "max": d.abs().max().item()}
         print(f"[merge-diff] {base}: |Δ|/|W|={diffs[base]['rel']:.4f} "
               f"|Δ|={dn:.3e} |W|={wn:.3e} max|Δ|={diffs[base]['max']:.3e}")
-        w.add_(d.to(dtype=w.dtype))
+        w.copy_(new_w.to(dtype=w.dtype))
         merged += 1
 
-    print(f">> merged {merged}/{len(prefixes)} adapters (scaling={scaling})")
+    print(f">> merged {merged}/{len(prefixes)} Linear adapters (scaling={scaling}, dora={use_dora})")
     if missing:
         print(f">> WARNING: no base weight found for {len(missing)} prefixes, e.g. {missing[:3]}")
+
+    # ---- fused routed experts (gemma-4-MoE 3D gate_up_proj/down_proj) ----
+    n_exp = 0
+    for p in expert_prefixes:
+        base = base_name(p)
+        if f"{base}.gate_up_proj" not in state or f"{base}.down_proj" not in state:
+            missing.append(base)
+            continue
+        adapters = {
+            "gate_up_lora_a": lora[f"{p}.gate_up_lora_a"], "gate_up_lora_b": lora[f"{p}.gate_up_lora_b"],
+            "down_lora_a": lora[f"{p}.down_lora_a"], "down_lora_b": lora[f"{p}.down_lora_b"],
+        }
+        if use_dora:
+            adapters["gate_up_mag"] = lora[f"{p}.gate_up_mag"]
+            adapters["down_mag"] = lora[f"{p}.down_mag"]
+        gu = state[f"{base}.gate_up_proj"]; dn = state[f"{base}.down_proj"]
+        gu_f, dn_f = MA.fold_expert_adapter(gu.float(), dn.float(), adapters, moe_scaling, use_dora)
+        gu.copy_(gu_f.to(dtype=gu.dtype)); dn.copy_(dn_f.to(dtype=dn.dtype))
+        n_exp += 1
+    if expert_prefixes:
+        print(f">> merged {n_exp}/{len(expert_prefixes)} routed-expert blocks (moe_scaling={moe_scaling})")
 
     # ---- full-weight replacement (embed_tokens / lm_head from --train_embeddings) ----
     def find_full_target(key):
@@ -161,6 +197,9 @@ def main():
     scaling = args.scaling if args.scaling is not None else meta.get("scaling")
     if scaling is None:
         raise SystemExit("scaling unknown: pass --scaling alpha/r (no lora_meta.json found)")
+    # gemma-4-MoE routed experts were adapted with a separate (smaller) moe_r/moe_alpha.
+    moe_scaling = float(meta.get("moe_alpha", 32)) / float(meta.get("moe_r", 16))
+    use_dora = bool(meta.get("use_dora", False))
 
     print(f">> loading base {model_id} (bf16, sdpa, device_map=auto)")
     tok = AutoTokenizer.from_pretrained(model_id)
@@ -169,7 +208,7 @@ def main():
     )
     model.eval()
 
-    merge_lora_(model, args.lora, scaling)
+    merge_lora_(model, args.lora, scaling, moe_scaling=moe_scaling, use_dora=use_dora)
 
     if args.merged_out:
         print(f">> saving merged model to {args.merged_out}")

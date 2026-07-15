@@ -730,6 +730,12 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     # extra optimizer state (gemma's cpu_offload default is already ON).
     if cfg.get("train_embeddings"):
         cmd.append("--train_embeddings")
+    # DoRA (weight-decomposed LoRA): per-output-row magnitude + direction from W+ΔW. Form-set.
+    if cfg.get("use_dora"):
+        cmd.append("--use_dora")
+    # gemma-4-MoE (e.g. 26B-A4B) adapts the routed experts by default; opt out to attention-only.
+    if cfg.get("no_moe_lora"):
+        cmd.append("--no_moe_lora")
     # Context parallelism (zigzag ring, gemma-only): shard each packed sequence across a CP group.
     # cfg["cp_size"] (GPUs per group) defaults to ALL run GPUs (one group, dp=1); when set it must
     # divide nproc (dp_size = nproc / cp_size). Needs >=2 GPUs. The form sets cfg["context_parallel"].
@@ -777,6 +783,14 @@ def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     # LoRA — helps the finetune reliably emit special tokens. The form sets cfg["train_embeddings"].
     if cfg.get("train_embeddings"):
         cmd.append("--train_embeddings")
+    # DoRA (weight-decomposed LoRA). Form-set.
+    if cfg.get("use_dora"):
+        cmd.append("--use_dora")
+    # MoE (Qwen3.6-35B-A3B / Qwen3.5-122B-A10B) adapts routed + shared experts by default.
+    if cfg.get("no_moe_lora"):
+        cmd.append("--no_moe_lora")
+    if cfg.get("no_shared_lora"):
+        cmd.append("--no_shared_lora")
     # Context parallelism: shard ONE packed sequence across ALL run GPUs (one CP group, dp=1) — the
     # GatedDeltaNet hybrid relays its recurrent+conv state and rings the full-attn KV. Needs >=2 GPUs;
     # ignored otherwise. The form sets cfg["context_parallel"]. (Same knob as gemma's _gemma_cmd.)
@@ -815,19 +829,25 @@ def _nemotron_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     # Full-train token embeddings + LM head (untied → both) on top of LoRA — see the shared flag.
     if cfg.get("train_embeddings"):
         cmd.append("--train_embeddings")
+    # DoRA (weight-decomposed LoRA) for the attn/mamba linears — experts stay frozen either way.
+    if cfg.get("use_dora"):
+        cmd.append("--use_dora")
     return cmd
 
 
 def _moe_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str, arch: str) -> list[str]:
     """The FP8-MoE trainers (minimax_m2.py / mistral_small.py) share a CLI: separate
-    attention + MoE LoRA ranks, --data_dir/--out_dir, --low_cpu_shard_load. The form
-    sends one r/alpha → used for both attn + MoE."""
+    attention + MoE LoRA ranks, --data_dir/--out_dir, --low_cpu_shard_load. The form's r/alpha
+    set the ATTENTION rank; the MoE expert rank is auto-derived by the trainer as attn_r ÷
+    active-experts (top-k), scaling held constant (--moe_r 0 = auto)."""
     r, alpha = _lora_dims(cfg)
     cmd = [
         py, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
         os.path.join(LLM_DIR, _ARCH[arch]["trainer"]),
         "--attn_r", str(r), "--attn_alpha", str(float(alpha)),
-        "--moe_r", str(r), "--moe_alpha", str(float(alpha)),
+        # --moe_r 0 = AUTO: the trainer derives attn_r ÷ active-experts (top-k), scaling held
+        # constant (https://thinkingmachines.ai/blog/lora/) — not a fixed rank.
+        "--moe_r", "0", "--moe_alpha", "0",
         "--batch_size", str(int(cfg.get("batch_size") or 1)),  # packed bins concatenated per microbatch
         "--grad_accum", str(int(cfg.get("grad_accum") or 1)),  # microbatches accumulated per optimizer step
         "--lr", str(float(cfg.get("learning_rate") or 1e-5)),
@@ -845,6 +865,13 @@ def _moe_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str, arch: str) 
     # (that has no MLP entry and would wrongly disable MoE on every run).
     if cfg.get("no_moe_lora"):
         cmd.append("--no_moe_lora")
+    # mistral shared-expert MLP is adapted by default; opt out (minimax has no shared expert,
+    # so its trainer has no --no_shared_lora flag → only pass it for mistral).
+    if cfg.get("no_shared_lora") and arch == "mistral":
+        cmd.append("--no_shared_lora")
+    # DoRA (weight-decomposed LoRA) for attention + the fused MoE experts. Form-set.
+    if cfg.get("use_dora"):
+        cmd.append("--use_dora")
     # Full-train the (bf16) token embeddings + LM head on top of LoRA (minimax/mistral are
     # untied → both weights) — helps the finetune reliably emit special tokens. Form-set.
     if cfg.get("train_embeddings"):

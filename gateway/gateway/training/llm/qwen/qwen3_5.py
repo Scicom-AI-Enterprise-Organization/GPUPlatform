@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 import torch.nn as nn
+import torch.nn.functional as F
 import logging
 from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
@@ -237,22 +238,47 @@ def _truncate_packed(batch, n, mult=1):
     return out
 
 
-def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha:int = 16):
-    # no nn.Linear instance for up_proj, down_proj, gate_proj after attention block
+def apply_linear_lora(base_model: nn.Module, r: int = 8, alpha:int = 16, use_dora: bool = False):
+    # Text attention q/k/v/o only (the MoE experts are 3D nn.Parameters, not nn.Linear — see
+    # apply_moe_expert_lora; the shared-expert MLP's gate/up/down are handled there too).
     linear_layers = [
         "q_proj",
         "k_proj",
         "v_proj",
         "o_proj"
     ]
+    n = 0
     for name, module in list(base_model.named_modules()):
         for child_name, child_module in module.named_children():
             if isinstance(child_module, nn.Linear) and child_name in linear_layers:
                 if 'vision' in name:
                     continue
 
-                lora = LinearLoRA(child_module, r, alpha)
+                lora = LinearLoRA(child_module, r, alpha, use_dora=use_dora)
                 setattr(module, child_name, lora)
+                n += 1
+    return n
+
+
+def apply_moe_expert_lora(base_model: nn.Module, r: int = 16, alpha: int = 32,
+                          use_dora: bool = False, include_shared: bool = True):
+    """Adapt a Qwen3.5-MoE model's routed experts (fused 3D `Qwen3_5MoeExperts`) with the shared
+    grouped LoRA/DoRA adapter, and (optionally) the shared-expert MLP with `LinearLoRA`. The routed
+    experts are the bulk of MoE capacity — attention-only LoRA leaves them frozen. Returns
+    (n_routed_blocks, n_shared_linears, routed_param_count)."""
+    import moe_adapter as MA
+    n_routed, n_shared, routed_params = 0, 0, 0
+    for name, module in list(base_model.named_modules()):
+        if name.endswith(".experts") and hasattr(module, "gate_up_proj"):
+            routed_params += MA.add_expert_adapter(module, r=r, alpha=alpha, use_dora=use_dora)
+            n_routed += 1
+        elif include_shared and name.endswith(".shared_expert"):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                child = getattr(module, proj, None)
+                if isinstance(child, nn.Linear):
+                    setattr(module, proj, LinearLoRA(child, r, alpha, use_dora=use_dora))
+                    n_shared += 1
+    return n_routed, n_shared, routed_params
 
 def make_custom_cls(base_cls, dpo_beta=None):
     """Build a CustomForConditionalGeneration subclass of the resolved base class
@@ -381,10 +407,19 @@ def lora_disabled():
 
 
 class LinearLoRA(nn.Module):
-    def __init__(self, linear: nn.Linear, r=4, alpha=1.0):
+    """LoRA:  y = linear(x) + scaling * B(A(x)).
+    DoRA:  y = F.linear(x, magnitude * normalize(W + scaling*B@A))  (weight-decomposed LoRA).
+
+    DoRA adds a per-output-row `magnitude` init'd to the base weight row-norms, so with B=0 and
+    magnitude=‖W_row‖ it equals the base at step 0. The DPO reference pass (`_LORA_ENABLED=False`)
+    returns the pure frozen base for BOTH modes (the reference must be the un-adapted weight).
+    """
+
+    def __init__(self, linear: nn.Linear, r=4, alpha=1.0, use_dora: bool = False):
         super().__init__()
         self.linear = linear
         self.scaling = alpha / r
+        self.use_dora = use_dora
 
         in_features = linear.in_features
         out_features = linear.out_features
@@ -396,10 +431,22 @@ class LinearLoRA(nn.Module):
             nn.init.kaiming_uniform_(self.lora_a.weight)
             nn.init.zeros_(self.lora_b.weight)
 
+        if use_dora:
+            # qwen loads real weights (no meta path), so the row-norm init is exact at apply time.
+            with torch.no_grad():
+                mag = linear.weight.to(torch.float32).norm(dim=1).to(torch.bfloat16)
+            self.magnitude = nn.Parameter(mag, requires_grad=True)
+
     def forward(self, x):
+        if not _LORA_ENABLED:  # DPO reference pass (see lora_disabled): pure frozen base
+            return self.linear(x)
+        if self.use_dora:
+            w = self.linear.weight.to(self.lora_a.weight.dtype)
+            adapted = w + self.scaling * (self.lora_b.weight @ self.lora_a.weight)
+            direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            w_eff = self.magnitude.unsqueeze(1) * direction
+            return F.linear(x.to(w_eff.dtype), w_eff, self.linear.bias).to(x.dtype)
         out_non_lora = self.linear(x)
-        if not _LORA_ENABLED:  # DPO reference pass (see lora_disabled)
-            return out_non_lora
         lora_out = self.lora_b(self.lora_a(x))
         return out_non_lora + self.scaling * lora_out
 
@@ -424,7 +471,16 @@ def main(
         dpo:bool = False,
         dpo_beta:float = 0.1,
         train_embeddings:bool = False,
+        moe_r:int = 0,       # 0 = auto: attn rank ÷ active-experts (top-k). >0 overrides.
+        moe_alpha:float = 0,
+        no_moe_lora:bool = False,
+        no_shared_lora:bool = False,
+        use_dora:bool = False,
     ):
+    if dpo and use_dora:
+        # DoRA retrains a per-row magnitude on the frozen base; the DPO reference (LoRA disabled
+        # -> pure base) assumes the base is untouched. Reject up front (matches the create-run guard).
+        raise RuntimeError("--use_dora is incompatible with --dpo (v1)")
     if dpo and cp_size > 1:
         # per-sequence log-prob sums (and the pairing) live on whole sequences; a CP
         # shard only sees a chunk — would need a cross-rank logprob reduction + coeff
@@ -475,7 +531,23 @@ def main(
 
     for param in model.parameters():
         param.requires_grad = False
-    apply_linear_lora(model, r=r, alpha=alpha)
+    n_attn = apply_linear_lora(model, r=r, alpha=alpha, use_dora=use_dora)
+    logger.info(f"{'DoRA' if use_dora else 'LoRA'}: wrapped {n_attn} attention projections (r={r}, alpha={alpha})")
+    # MoE models (Qwen3.6-35B-A3B / Qwen3.5-122B-A10B): adapt the routed experts (the MoE capacity)
+    # + shared-expert MLP by default. Without this a MoE run would train ONLY attention.
+    if is_moe and not no_moe_lora:
+        import moe_adapter as _MA
+        if not moe_r or moe_r <= 0:  # auto: expert rank = attn rank ÷ active-experts (top-k)
+            k = _MA.num_active_experts(config) or 8
+            moe_r, moe_alpha = _MA.derive_moe_rank(r, alpha, k)
+            logger.info(f"MoE expert rank auto-derived: r={moe_r} alpha={moe_alpha:.1f} "
+                        f"(attn r={r} ÷ top_k={k}; scaling held at {alpha / r:.2f}) "
+                        f"— https://thinkingmachines.ai/blog/lora/")
+        n_routed, n_shared, routed_params = apply_moe_expert_lora(
+            model, r=moe_r, alpha=moe_alpha, use_dora=use_dora, include_shared=not no_shared_lora)
+        logger.info(f"MoE expert {'DoRA' if use_dora else 'LoRA'}: adapted {n_routed} routed-expert "
+                    f"blocks ({routed_params/1e6:.1f}M params) + {n_shared} shared-expert linears "
+                    f"(moe_r={moe_r}, moe_alpha={moe_alpha})")
 
     # Optionally FULL-train the token embeddings + LM head on top of LoRA. Qwen3.6-27B is
     # UNTIED (embed_tokens + lm_head are two weights, both unfrozen); smaller/tied qwens get
@@ -747,6 +819,11 @@ def main(
                             "wrapped_attr": "linear",
                             "train_embeddings": train_embeddings,
                             "objective": "dpo" if dpo else "sft",
+                            "use_dora": use_dora,
+                            "moe_lora": bool(is_moe and not no_moe_lora),
+                            "moe_r": moe_r, "moe_alpha": moe_alpha,
+                            "shared_lora": bool(is_moe and not no_moe_lora and not no_shared_lora),
+                            "moe_targets": ["gate_up_proj", "down_proj"],
                             **({"dpo_beta": dpo_beta} if dpo else {}),
                         }, f, indent=2)
                     logger.info(f"Saved LoRA ({len(lora_state_dict)} tensors) to {checkpoint_dir}/lora.pt")
@@ -828,6 +905,18 @@ if __name__ == "__main__":
              "attention-only LoRA can only nudge. Costs extra optimizer state — combine with "
              "--cpu_offload. Incompatible with --dpo.",
     )
+    parser.add_argument("--moe_r", type=int, default=0,
+                        help="LoRA/DoRA rank for the MoE routed + shared experts (MoE models only). "
+                             "0 = AUTO: attention --lora_r ÷ the model's active experts (top-k), "
+                             "scaling held constant (https://thinkingmachines.ai/blog/lora/). >0 overrides.")
+    parser.add_argument("--moe_alpha", type=float, default=0, help="alpha for the MoE expert adapters (0 = auto, keeps attn scaling).")
+    parser.add_argument("--no_moe_lora", action="store_true",
+                        help="For a MoE model, adapt attention only (leave routed + shared experts frozen).")
+    parser.add_argument("--no_shared_lora", action="store_true",
+                        help="For a MoE model, skip the shared-expert MLP (keep the routed experts).")
+    parser.add_argument("--use_dora", action="store_true",
+                        help="Use DoRA (weight-decomposed LoRA) instead of plain LoRA for attention + "
+                             "(for MoE) the experts: adds a trainable per-output-row magnitude.")
     args = parser.parse_args()
     main(
         args.rank,
@@ -850,4 +939,9 @@ if __name__ == "__main__":
         args.dpo,
         args.dpo_beta,
         args.train_embeddings,
+        args.moe_r,
+        args.moe_alpha,
+        args.no_moe_lora,
+        args.no_shared_lora,
+        args.use_dora,
     )

@@ -23,6 +23,7 @@ from transformers.models.nemotron_h import modeling_nemotron_h
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import logging
 import os
 import json
@@ -105,18 +106,30 @@ DEFAULT_LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj", "out_
 
 
 class LinearLoRA(nn.Module):
-    """y = W x + (alpha/r)·B(A x). Wraps the real Linear (calls its forward) so any
-    module-specific behaviour is preserved. B=0 init ⇒ a no-op adapter at start."""
+    """LoRA:  y = W x + (alpha/r)·B(A x).
+    DoRA:  y = F.linear(x, magnitude·normalize(W + (alpha/r)·B@A))  (weight-decomposed LoRA).
 
-    def __init__(self, linear: nn.Linear, r=8, alpha=16):
+    Wraps the real Linear (calls its forward) so any module-specific behaviour is preserved. B=0
+    init ⇒ a no-op adapter at start; for DoRA magnitude=‖W_row‖ so it's identity at init too.
+    The DoRA branch lives only in `forward()` — the SAME active code path LoRA uses (the Mamba
+    fast path calls in_proj/out_proj as modules; the raw-weight mem-eff kernel is disabled by the
+    trainer), so DoRA is applied wherever LoRA was."""
+
+    def __init__(self, linear: nn.Linear, r=8, alpha=16, use_dora: bool = False):
         super().__init__()
         self.linear = linear
         self.scaling = alpha / r
+        self.use_dora = use_dora
         self.lora_a = nn.Linear(linear.in_features, r, bias=False, dtype=torch.bfloat16)
         self.lora_b = nn.Linear(r, linear.out_features, bias=False, dtype=torch.bfloat16)
         with torch.no_grad():
             nn.init.kaiming_uniform_(self.lora_a.weight)
             nn.init.zeros_(self.lora_b.weight)  # CRITICAL: adapter delta = 0 at init
+        if use_dora:
+            # nemotron loads real weights (no meta path) — row-norm init is exact at apply time.
+            with torch.no_grad():
+                mag = linear.weight.to(torch.float32).norm(dim=1).to(torch.bfloat16)
+            self.magnitude = nn.Parameter(mag, requires_grad=True)
 
     # The Mamba2 fast-path dispatch reads `self.in_proj.weight.device.type` (and the mem-eff
     # kernel reads `.weight`/`.bias` directly) — expose the wrapped Linear's tensors so a
@@ -130,16 +143,22 @@ class LinearLoRA(nn.Module):
         return self.linear.bias
 
     def forward(self, x):
+        if self.use_dora:
+            w = self.linear.weight.to(self.lora_a.weight.dtype)
+            adapted = w + self.scaling * (self.lora_b.weight @ self.lora_a.weight)
+            direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            w_eff = self.magnitude.unsqueeze(1) * direction
+            return F.linear(x.to(w_eff.dtype), w_eff, self.linear.bias).to(x.dtype)
         return self.linear(x) + self.scaling * self.lora_b(self.lora_a(x))
 
 
-def apply_linear_lora(base_model: nn.Module, r: int, alpha: int, target_modules=None):
+def apply_linear_lora(base_model: nn.Module, r: int, alpha: int, target_modules=None, use_dora: bool = False):
     target_modules = list(target_modules or DEFAULT_LORA_TARGETS)
     wrapped = {t: 0 for t in target_modules}
     for name, module in list(base_model.named_modules()):
         for child_name, child_module in module.named_children():
             if isinstance(child_module, nn.Linear) and child_name in target_modules:
-                setattr(module, child_name, LinearLoRA(child_module, r, alpha))
+                setattr(module, child_name, LinearLoRA(child_module, r, alpha, use_dora=use_dora))
                 wrapped[child_name] = wrapped.get(child_name, 0) + 1
     if int(os.environ.get("LOCAL_RANK", "0")) == 0:
         logger.info(f"LoRA target_modules={target_modules}; wrapped per module: {wrapped}")
@@ -239,6 +258,7 @@ def main(
         cpu_offload: bool = False,
         target_modules=None,
         train_embeddings: bool = False,
+        use_dora: bool = False,
     ):
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -278,7 +298,7 @@ def main(
     for param in model.parameters():
         param.requires_grad = False
     target_modules = list(target_modules or DEFAULT_LORA_TARGETS)
-    apply_linear_lora(model, r=r, alpha=alpha, target_modules=target_modules)
+    apply_linear_lora(model, r=r, alpha=alpha, target_modules=target_modules, use_dora=use_dora)
 
     # ⚠ Force the NON-split fast path (use_mem_eff_path=False) on EVERY mamba mixer when the
     # fused kernels are on — for TWO independent reasons:
@@ -421,6 +441,7 @@ def main(
                             "wrapped_attr": "linear",
                             "train_embeddings": train_embeddings,
                             "objective": "sft",
+                            "use_dora": use_dora,
                         }, f, indent=2)
                     logger.info(f"Saved LoRA ({len(lora_state_dict)} tensors) to checkpointing/lora.pt")
 
@@ -451,6 +472,10 @@ if __name__ == "__main__":
         "--train_embeddings", action="store_true",
         help="Also FULL-train the (untied) token embeddings + LM head, not just LoRA. Helps the "
              "finetune reliably emit special tokens. Costs extra optimizer state — combine with --cpu_offload.")
+    parser.add_argument("--use_dora", action="store_true",
+                        help="Use DoRA (weight-decomposed LoRA) instead of plain LoRA for the target "
+                             "modules (attention q/k/v/o + Mamba in/out_proj). The MoE experts stay "
+                             "frozen either way.")
     args = parser.parse_args()
     main(
         args.r, args.alpha, args.batch_size, args.max_steps, args.checkpointing_step,
@@ -458,4 +483,5 @@ if __name__ == "__main__":
         grad_accum=args.grad_accum, cpu_offload=args.cpu_offload,
         target_modules=[t.strip() for t in (args.target_modules or "").split(",") if t.strip()],
         train_embeddings=args.train_embeddings,
+        use_dora=args.use_dora,
     )

@@ -59,6 +59,7 @@ def attach_lora(model, lora_path, meta):
         attn_r=meta.get("attn_r", 16), attn_alpha=meta.get("attn_alpha", 16.0),
         moe_r=meta.get("moe_r", 16), moe_alpha=meta.get("moe_alpha", 16.0),
         include_moe=meta.get("moe_lora", True), include_shared=meta.get("shared_lora", True),
+        use_dora=meta.get("use_dora", False),
     )
     print(f">> LoRA structure: {stats['attn_modules_wrapped']} attn + "
           f"{stats['moe_blocks_adapted']} routed-MoE + {stats['shared_modules_wrapped']} shared "

@@ -38,14 +38,18 @@ def _base_name(prefix):
 
 
 @torch.no_grad()
-def merge_lora_(model, lora_path, scaling):
-    """In-place: fold scaling·(B@A) into each adapted Linear, then REPLACE any full-weight
-    tensors (embed_tokens/lm_head from --train_embeddings)."""
+def merge_lora_(model, lora_path, scaling, use_dora=False):
+    """In-place: fold the adapter into each adapted Linear, then REPLACE any full-weight
+    tensors (embed_tokens/lm_head from --train_embeddings). Nemotron adapts only Linears
+    (attention q/k/v/o + Mamba in/out_proj); the MoE experts stay frozen (no 3D fold).
+
+    LoRA:  W += scaling·(B@A)     DoRA:  W = magnitude·normalize(W + scaling·B@A)."""
     lora = torch.load(lora_path, map_location="cpu")
     state = dict(model.named_parameters())
 
     prefixes = sorted({k[: -len(".lora_a.weight")] for k in lora if k.endswith(".lora_a.weight")})
-    full_keys = [k for k in lora if not (k.endswith(".lora_a.weight") or k.endswith(".lora_b.weight"))]
+    full_keys = [k for k in lora if not (k.endswith(".lora_a.weight") or k.endswith(".lora_b.weight")
+                                         or k.endswith(".magnitude"))]
     if not prefixes and not full_keys:
         raise ValueError(f"No '*.lora_a.weight' or full-weight keys in {lora_path}; keys: {list(lora)[:4]}")
 
@@ -53,16 +57,20 @@ def merge_lora_(model, lora_path, scaling):
     for p in prefixes:
         A = lora[f"{p}.lora_a.weight"].float()
         B = lora[f"{p}.lora_b.weight"].float()
-        delta = scaling * (B @ A)
         base = _base_name(p)
         target = next((c for c in (f"{base}.weight", f"{base}.linear.weight") if c in state), None)
         if target is None:
             missing.append(base)
             continue
         w = state[target]
-        w.add_(delta.to(dtype=w.dtype, device=w.device))
+        adapted = w.float() + scaling * (B @ A)
+        if use_dora:
+            mag = lora[f"{p}.magnitude"].float()
+            direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            adapted = mag.unsqueeze(1) * direction
+        w.copy_(adapted.to(dtype=w.dtype, device=w.device))
         merged += 1
-    print(f">> merged {merged}/{len(prefixes)} adapters (scaling={scaling})")
+    print(f">> merged {merged}/{len(prefixes)} adapters (scaling={scaling}, dora={use_dora})")
     if missing:
         print(f">> WARNING: no base weight for {len(missing)} prefixes, e.g. {missing[:3]}")
 
@@ -105,6 +113,7 @@ def main():
         r = float(meta.get("r") or meta.get("lora_r") or 32)
         alpha = float(meta.get("alpha") or meta.get("lora_alpha") or 64)
         scaling = alpha / r
+    use_dora = bool(meta.get("use_dora", False))
 
     print(f">> loading base {model_id} (bf16, sdpa, torch Mamba path, device_map=auto)")
     config = AutoConfig.from_pretrained(model_id)
@@ -127,7 +136,7 @@ def main():
         )
     model.eval()
 
-    merge_lora_(model, args.lora, float(scaling))
+    merge_lora_(model, args.lora, float(scaling), use_dora=use_dora)
 
     if args.merged_out:
         print(f">> saving merged model to {args.merged_out}")

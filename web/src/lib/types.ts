@@ -611,6 +611,13 @@ export type CreateTrainingRunRequest = {
   // LLM-only (gemma4): also full-train embed_tokens + lm_head (tied → one ~1.4B weight)
   // on top of LoRA — helps the model reliably emit special tokens (e.g. tool calls).
   train_embeddings?: boolean;
+  // LLM-only: use DoRA (weight-decomposed LoRA) instead of plain LoRA for every adapted module
+  // (attention + the fused MoE experts on minimax/mistral/qwen-MoE/gemma-MoE). Incompatible with DPO.
+  use_dora?: boolean;
+  // LLM MoE-only: skip the fused routed-expert adapter (adapt attention only). Experts are 3D
+  // tensors, not nn.Linear, so they're not in lora_target_modules — they're adapted by default;
+  // set this to opt out. No effect on dense models / nemotron (experts always frozen there).
+  no_moe_lora?: boolean;
   // Freeze the encoder; train the decoder only.
   freeze_encoder?: boolean;
   // Multi-GPU single run: DDP via torchrun (default) vs DataParallel.

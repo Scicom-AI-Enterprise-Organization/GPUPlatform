@@ -78,7 +78,12 @@ def build_merged_state_dict(model, out_dtype=torch.float16):
             else:
                 w = base.weight.to(torch.float32)
             delta = module.lora_b.weight.to(torch.float32) @ module.lora_a.weight.to(torch.float32)
-            merged[f"{name}.weight"] = (w + module.scaling * delta).to(out_dtype)
+            adapted = w + module.scaling * delta
+            if getattr(module, "use_dora", False):
+                # DoRA: W_eff = magnitude * normalize(W + scaling·BA)  (per output row).
+                direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
+                adapted = module.magnitude.to(torch.float32).unsqueeze(1) * direction
+            merged[f"{name}.weight"] = adapted.to(out_dtype)
             if getattr(base, "bias", None) is not None:
                 merged[f"{name}.bias"] = base.bias.to(out_dtype)
             handled.append(name + ".")
@@ -89,9 +94,14 @@ def build_merged_state_dict(model, out_dtype=torch.float16):
             dn = (dequantize_fp8_blockwise(module.down_proj, module.down_proj_scale_inv, bs, out_dtype=torch.float32)
                   if module.down_proj.element_size() == 1 else module.down_proj.to(torch.float32))
             sc = module.lora_scaling
+            dora = getattr(module, "use_dora", False)
             for e in range(module.num_experts):
                 gu[e] += sc * (module.gate_up_lora_b[e].float() @ module.gate_up_lora_a[e].float())
                 dn[e] += sc * (module.down_lora_b[e].float() @ module.down_lora_a[e].float())
+                if dora:
+                    # DoRA: per-expert W_eff = magnitude · normalize(W + scaling·BA) over the input dim.
+                    gu[e] = module.gate_up_mag[e].float().unsqueeze(1) * (gu[e] / gu[e].norm(dim=1, keepdim=True).clamp_min(1e-8))
+                    dn[e] = module.down_mag[e].float().unsqueeze(1) * (dn[e] / dn[e].norm(dim=1, keepdim=True).clamp_min(1e-8))
             merged[f"{name}.gate_up_proj"] = gu.to(out_dtype)
             merged[f"{name}.down_proj"] = dn.to(out_dtype)
             handled.append(name + ".")

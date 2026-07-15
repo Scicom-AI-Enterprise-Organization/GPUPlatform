@@ -2941,6 +2941,16 @@ class CreateTrainingRunRequest(BaseModel):
     # states. Costs extra optimizer state (gemma cpu_offload default is ON). Pairs well with
     # adding the MLP (gate_proj,up_proj,down_proj) to lora_target_modules.
     train_embeddings: bool = False
+    # LLM-only: use DoRA (weight-decomposed LoRA) instead of plain LoRA for every adapted module
+    # (attention + the MoE experts on minimax/mistral/qwen-MoE/gemma-MoE). DoRA adds a trainable
+    # per-output-row magnitude and takes the direction from W+ΔW. Incompatible with DPO (the
+    # LoRA-disabled reference assumes the base is untouched). All LLM archs.
+    use_dora: bool = False
+    # LLM MoE-only: skip the fused routed-expert adapter (adapt attention only). The experts are
+    # 3D tensors (not nn.Linear), so they're NOT in lora_target_modules — they're adapted by
+    # default on minimax/mistral/qwen-MoE/gemma-MoE; set True to opt out. No effect on dense
+    # models or nemotron (whose MoE experts are always frozen).
+    no_moe_lora: bool = False
     # Freeze the encoder; train the decoder only (faster, less overfit on small data).
     freeze_encoder: bool = False
     # Multi-GPU strategy for a single (non-sweep) run: DDP via torchrun (one
@@ -3298,6 +3308,13 @@ async def create_training_run(
                            "reference assumes the base weights (incl. embeddings/lm_head) stay "
                            "frozen; training them makes the reference drift. Turn one off.",
                 )
+            if body.use_dora:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DoRA is incompatible with DPO (v1) — the LoRA-disabled reference "
+                           "assumes the base weights stay frozen, but DoRA retrains a per-row "
+                           "magnitude on top of the base. Turn one off.",
+                )
         _pm = (ds.split_fields or {}).get("_llm_pack") or {}
         if _pm.get("sequence_length"):
             body.block_size = int(_pm["sequence_length"])
@@ -3419,6 +3436,8 @@ async def create_training_run(
         "lora_target_modules": ([m for m in (body.lora_target_modules or [])
                                  if m in _LORA_TARGET_MODULES] or list(_LORA_TARGET_DEFAULT)),
         "train_embeddings": bool(body.train_embeddings),  # gemma4: full-train embed+lm_head
+        "use_dora": bool(body.use_dora),  # LLM: DoRA instead of LoRA (attention + MoE experts)
+        "no_moe_lora": bool(body.no_moe_lora),  # LLM MoE: opt out of the routed-expert adapter
         "freeze_encoder": body.freeze_encoder, "use_ddp": body.use_ddp,
         "logging_steps": body.logging_steps,
         "augment_techniques": [t for t in (body.augment_techniques or []) if t in _AUG_TECHNIQUES],
