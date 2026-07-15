@@ -66,24 +66,23 @@ def fold_lora(model, lora_path: str, scaling: float, moe_scaling: float = None, 
 
     merged, missing = 0, []
     for p in prefixes:
-        A = lora[f"{p}.lora_a.weight"].float()   # (r, in)
-        B = lora[f"{p}.lora_b.weight"].float()   # (out, r)
         base = base_name(p)
         target = next((c for c in (f"{base}.weight", f"{base}.linear.weight") if c in state), None)
         if target is None:
             missing.append(base)
             continue
         w = state[target]
+        # Align adapters to the base's device (robust to a device_map load; qwen loads on CPU today).
+        A = lora[f"{p}.lora_a.weight"].float().to(w.device)   # (r, in)
+        B = lora[f"{p}.lora_b.weight"].float().to(w.device)   # (out, r)
         # shared-expert MLP was adapted with moe_r/moe_alpha; attention with r/alpha.
         sc = moe_scaling if ".shared_expert." in base else scaling
         adapted = w.float() + sc * (B @ A)
         if use_dora:
-            mag = lora[f"{p}.magnitude"].float()  # (out,)
+            mag = lora[f"{p}.magnitude"].float().to(w.device)  # (out,)
             direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
             adapted = mag.unsqueeze(1) * direction
-            w.copy_(adapted.to(dtype=w.dtype, device=w.device))
-        else:
-            w.add_((sc * (B @ A)).to(dtype=w.dtype, device=w.device))
+        w.copy_(adapted.to(dtype=w.dtype, device=w.device))
         merged += 1
     print(f">> merged {merged}/{len(prefixes)} Linear adapters (scaling={scaling}, dora={use_dora})", flush=True)
     if missing:

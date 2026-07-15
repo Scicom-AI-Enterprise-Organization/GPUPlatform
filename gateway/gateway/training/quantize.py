@@ -512,7 +512,17 @@ def run(cfg: dict) -> None:
     os.makedirs(out_dir, exist_ok=True)
     emit("PROGRESS", {"stage": "saving", "percent": 75})
     log(f"[quant] saving compressed model → {out_dir}")
-    model.save_pretrained(out_dir, save_compressed=True)
+    # Shard the safetensors (default 5GB) instead of one giant file. A single ~30GB
+    # shard uploads as one opaque multipart blob → the job sits at "uploading 88%" with
+    # no feedback for minutes (looks stuck). Small shards upload per-file (visible
+    # progress below), are resumable, and lower peak host memory while writing.
+    try:
+        model.save_pretrained(out_dir, save_compressed=True,
+                              max_shard_size=str(cfg.get("max_shard_size") or "5GB"))
+    except TypeError:
+        # older compressed-tensors save_pretrained without max_shard_size support
+        log("[quant] max_shard_size unsupported here — saving unsharded")
+        model.save_pretrained(out_dir, save_compressed=True)
     tokenizer.save_pretrained(out_dir)
     # Multimodal models need the image/audio processor config alongside the weights,
     # else vLLM can't build the feature extractor ("Can't load feature extractor …") —
@@ -533,11 +543,23 @@ def run(cfg: dict) -> None:
         emit("PROGRESS", {"stage": "uploading", "percent": 88})
         cli = _s3_client(art)
         base_key = art["prefix"].rstrip("/") + "/model"
-        for root, _dirs, files in os.walk(out_dir):
-            for fn in files:
-                fp = os.path.join(root, fn)
-                rel = os.path.relpath(fp, out_dir)
-                cli.upload_file(fp, art["bucket"], f"{base_key}/{rel}")
+        files = [os.path.join(r, fn) for r, _d, fns in os.walk(out_dir) for fn in fns]
+        files.sort(key=os.path.getsize)  # small (configs) first, big shards last
+        total = sum(os.path.getsize(f) for f in files) or 1
+        n = len(files)
+        # Byte-level progress via a boto3 Callback (invoked as multipart parts complete),
+        # so the bar advances 88 → 94 continuously even for one large shard — not frozen.
+        prog = {"sent": 0, "last": 88.0}
+        def _cb(nbytes):
+            prog["sent"] += nbytes
+            pct = round(88 + 6 * prog["sent"] / total, 1)
+            if pct - prog["last"] >= 0.3:  # throttle marker spam
+                prog["last"] = pct
+                emit("PROGRESS", {"stage": "uploading", "percent": pct})
+        for i, fp in enumerate(files, 1):
+            rel = os.path.relpath(fp, out_dir)
+            log(f"[upload] s3 {i}/{n} {rel} ({os.path.getsize(fp) / 1024**3:.2f}GB) …")
+            cli.upload_file(fp, art["bucket"], f"{base_key}/{rel}", Callback=_cb)
         s3_uri = f"s3://{art['bucket']}/{base_key}/"
         log(f"[upload] quantized model → {s3_uri}")
 
@@ -549,6 +571,9 @@ def run(cfg: dict) -> None:
             from huggingface_hub import HfApi
 
             repo = cfg["hf_push_repo"]
+            n_files = sum(len(fns) for _r, _d, fns in os.walk(out_dir))
+            log(f"[upload] pushing {n_files} files → https://huggingface.co/{repo} "
+                f"(large shards upload in the background; per-file progress in the hub client log)")
             api = HfApi(token=hf_token)
             api.create_repo(repo, private=bool(cfg.get("hf_push_private", True)),
                             exist_ok=True, repo_type="model")

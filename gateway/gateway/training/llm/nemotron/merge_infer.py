@@ -55,17 +55,18 @@ def merge_lora_(model, lora_path, scaling, use_dora=False):
 
     merged, missing = 0, []
     for p in prefixes:
-        A = lora[f"{p}.lora_a.weight"].float()
-        B = lora[f"{p}.lora_b.weight"].float()
         base = _base_name(p)
         target = next((c for c in (f"{base}.weight", f"{base}.linear.weight") if c in state), None)
         if target is None:
             missing.append(base)
             continue
         w = state[target]
+        # Align adapters to the base's device (nemotron loads with device_map="auto" → cuda; lora is cpu).
+        A = lora[f"{p}.lora_a.weight"].float().to(w.device)
+        B = lora[f"{p}.lora_b.weight"].float().to(w.device)
         adapted = w.float() + scaling * (B @ A)
         if use_dora:
-            mag = lora[f"{p}.magnitude"].float()
+            mag = lora[f"{p}.magnitude"].float().to(w.device)
             direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
             adapted = mag.unsqueeze(1) * direction
         w.copy_(adapted.to(dtype=w.dtype, device=w.device))

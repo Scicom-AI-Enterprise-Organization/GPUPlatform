@@ -74,9 +74,6 @@ def merge_lora_(model, lora_path, scaling, moe_scaling=None, use_dora=False):
     merged, missing = 0, []
     diffs: dict[str, dict] = {}   # per-layer weight-change report (base W vs merged W+Δ)
     for p in prefixes:
-        A = lora[f"{p}.lora_a.weight"].float()   # (r, in)
-        B = lora[f"{p}.lora_b.weight"].float()   # (out, r)
-
         # The base weight lives at <prefix>.weight. LinearLoRA wraps the original Linear as
         # <prefix>.linear, so a checkpoint kept unwrapped may instead carry <prefix>.linear.weight.
         base = base_name(p)
@@ -85,9 +82,12 @@ def merge_lora_(model, lora_path, scaling, moe_scaling=None, use_dora=False):
             missing.append(base)
             continue
         w = state[target]
+        # Align adapters to the base's device (gemma loads with device_map="auto" → cuda; lora.pt is cpu).
+        A = lora[f"{p}.lora_a.weight"].float().to(w.device)   # (r, in)
+        B = lora[f"{p}.lora_b.weight"].float().to(w.device)   # (out, r)
         adapted = w.float() + scaling * (B @ A)
         if use_dora:
-            mag = lora[f"{p}.magnitude"].float()  # (out,)
+            mag = lora[f"{p}.magnitude"].float().to(w.device)  # (out,)
             direction = adapted / adapted.norm(dim=1, keepdim=True).clamp_min(1e-8)
             new_w = mag.unsqueeze(1) * direction
         else:

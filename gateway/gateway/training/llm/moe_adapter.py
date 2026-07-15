@@ -278,13 +278,16 @@ def fold_expert_adapter(
     DoRA:  W  = magnitude · normalize(W + scaling·(B[e] @ A[e])) per expert per output row.
     """
     def _fold(base, which):
-        a = adapters[f"{which}_lora_a"].to(torch.float32)   # (E, r, in)
-        b = adapters[f"{which}_lora_b"].to(torch.float32)   # (E, out, r)
+        # Align adapters to the base weight's device — the base may be on cuda (a device_map="auto"
+        # merge, e.g. gemma) while the adapters come from torch.load(map_location="cpu").
+        dev = base.device
+        a = adapters[f"{which}_lora_a"].to(device=dev, dtype=torch.float32)   # (E, r, in)
+        b = adapters[f"{which}_lora_b"].to(device=dev, dtype=torch.float32)   # (E, out, r)
         delta = scaling * torch.bmm(b, a)                   # (E, out, in)
         if use_dora:
             adapted = base + delta
             direction = adapted / adapted.norm(dim=2, keepdim=True).clamp_min(1e-8)
-            mag = adapters[f"{which}_mag"].to(torch.float32)  # (E, out)
+            mag = adapters[f"{which}_mag"].to(device=dev, dtype=torch.float32)  # (E, out)
             return mag.unsqueeze(-1) * direction
         return base + delta
 
