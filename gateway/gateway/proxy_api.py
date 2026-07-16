@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from . import crypto
+from . import proxy_cluster
 from .auth import current_user, require_admin
 from .db import Base, User, get_session, get_user_by_username, session_factory
 from .global_env_api import load_global_env
@@ -247,6 +248,59 @@ def _get_sem(app, endpoint_id: str, max_conc: int) -> Optional[asyncio.Semaphore
     return cur[0]
 
 
+class _Gate:
+    """One endpoint's concurrency gate. Two backends behind a single async
+    acquire→token / release(token) interface so the forwarding engine doesn't
+    branch on mode:
+      • LOCAL (default) — a per-replica ``asyncio.Semaphore`` (``sem`` set). The cap
+        applies per replica; behavior identical to the old raw-semaphore path.
+      • GLOBAL (``PROXY_CLUSTER=1``, ``sem is None``) — a Redis ZSET-lease slot shared
+        by every replica, so ``max_concurrency`` is a cluster-wide cap. Over cap →
+        the caller waits (polls) for a slot, honoring ``cancel_ev`` — same visible-queue
+        semantics as the local semaphore, just global."""
+
+    def __init__(self, app, endpoint_id: str, max_conc: int, sem: Optional[asyncio.Semaphore]):
+        self.app = app
+        self.endpoint_id = endpoint_id
+        self.max_conc = max_conc
+        self.sem = sem  # None => Redis global mode
+
+    async def acquire(self, cancel_ev: Optional[asyncio.Event] = None, live_entry: Optional[dict] = None):
+        if self.sem is not None:
+            await self.sem.acquire()
+            return "__local__"
+        token = f"{proxy_cluster.replica_id()}-{_secrets.token_hex(6)}"
+        while True:
+            if cancel_ev is not None and cancel_ev.is_set():
+                raise asyncio.CancelledError()
+            if await proxy_cluster.limiter_acquire(self.app.state.redis, self.endpoint_id, self.max_conc, token):
+                # Stash the slot token on the live entry so the sync loop renews its
+                # lease (long streams) and releases it if this replica dies.
+                if live_entry is not None:
+                    live_entry["slot_token"] = token
+                return token
+            await asyncio.sleep(0.1)  # at global cap — wait in the (visible) queue
+
+    async def release(self, token) -> None:
+        if token is None:
+            return
+        if token == "__local__":
+            if self.sem is not None:
+                self.sem.release()
+            return
+        await proxy_cluster.limiter_release(self.app.state.redis, self.endpoint_id, token)
+
+
+def _get_gate(app, endpoint_id: str, max_conc: int) -> Optional["_Gate"]:
+    """Concurrency gate for an endpoint, or None when uncapped (max_conc<=0).
+    Redis-global when PROXY_CLUSTER=1, else the per-replica semaphore."""
+    if max_conc <= 0:
+        return None
+    if proxy_cluster.enabled():
+        return _Gate(app, endpoint_id, max_conc, sem=None)
+    return _Gate(app, endpoint_id, max_conc, sem=_get_sem(app, endpoint_id, max_conc))
+
+
 def _mark_health(app, endpoint_id: str, upstream_id: str, alive: bool,
                  latency_ms: Optional[int] = None, error: Optional[str] = None) -> None:
     _health(app)[(endpoint_id, upstream_id)] = {
@@ -266,20 +320,34 @@ def _upstream_record(u: dict) -> UpstreamRecord:
     )
 
 
-def _endpoint_record(app, e: ProxyEndpoint, owner_username: str) -> ProxyEndpointRecord:
+def _endpoint_record(app, e: ProxyEndpoint, owner_username: str,
+                     counts: Optional[tuple[int, int]] = None) -> ProxyEndpointRecord:
     cfg = e.config or {}
-    live = _live(app)
-    mine = [v for v in live.values() if v.get("endpoint_id") == e.id]
+    if counts is None:  # per-replica counts (local _live); pass global counts when clustered
+        live = _live(app)
+        mine = [v for v in live.values() if v.get("endpoint_id") == e.id]
+        inflight = sum(1 for v in mine if v.get("state") == "running")
+        queued = sum(1 for v in mine if v.get("state") == "queued")
+    else:
+        inflight, queued = counts
     return ProxyEndpointRecord(
         id=e.id, name=e.name, enabled=bool(e.enabled), public=bool(getattr(e, "public", False)),
         max_concurrency=int(cfg.get("max_concurrency") or 0),
         timeout_s=int(cfg.get("timeout_s") or int(DEFAULT_TIMEOUT_S)),
         upstreams=[_upstream_record(u) for u in cfg.get("upstreams", [])],
-        inflight=sum(1 for v in mine if v.get("state") == "running"),
-        queued=sum(1 for v in mine if v.get("state") == "queued"),
+        inflight=inflight,
+        queued=queued,
         created_at=e.created_at.isoformat() if e.created_at else "",
         created_by=owner_username,
     )
+
+
+async def _endpoint_counts(app, endpoint_id: str) -> Optional[tuple[int, int]]:
+    """Global (inflight, queued) for an endpoint when PROXY_CLUSTER=1, else None so
+    the caller falls back to this replica's local counts."""
+    if not proxy_cluster.enabled():
+        return None
+    return await proxy_cluster.live_counts_endpoint(app.state.redis, endpoint_id)
 
 
 def _public_endpoint_record(app, e: ProxyEndpoint) -> ProxyEndpointRecord:
@@ -491,7 +559,7 @@ async def _watch_cancel(request: Request, cancel_ev: asyncio.Event) -> None:
 
 
 async def _unary(app, request: Request, request_id: str, forward,
-                 sem: Optional[asyncio.Semaphore], cancel_ev: asyncio.Event) -> Response:
+                 gate: Optional["_Gate"], cancel_ev: asyncio.Event) -> Response:
     """Run one non-streaming forward (`forward` is a zero-arg coroutine returning the
     {upstream,status_code,data,latency_ms,pt,ct} dict) with disconnect-cancel + the
     concurrency slot + request tracking. Works for JSON (chat/completions/embeddings)
@@ -499,11 +567,10 @@ async def _unary(app, request: Request, request_id: str, forward,
     live = _live(app)
 
     async def work() -> Response:
-        acquired = False
+        token = None
         try:
-            if sem is not None:
-                await sem.acquire()
-                acquired = True
+            if gate is not None:
+                token = await gate.acquire(cancel_ev, live.get(request_id))
             if cancel_ev.is_set():
                 raise asyncio.CancelledError()
             if request_id in live:
@@ -523,8 +590,8 @@ async def _unary(app, request: Request, request_id: str, forward,
                 hdrs["X-Upstream-Name"] = res["upstream"]
             return JSONResponse(res["data"], status_code=res["status_code"], headers=hdrs)
         finally:
-            if acquired and sem is not None:
-                sem.release()
+            if gate is not None:
+                await gate.release(token)
 
     wtask = asyncio.create_task(work())
     ctask = asyncio.create_task(_watch_cancel(request, cancel_ev))
@@ -555,18 +622,19 @@ async def _unary(app, request: Request, request_id: str, forward,
 
 async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict], alias: str,
                   payload: dict, upstream_path: str, timeout_s: float,
-                  sem: Optional[asyncio.Semaphore], cancel_ev: asyncio.Event):
+                  gate: Optional["_Gate"], cancel_ev: asyncio.Event):
     """SSE passthrough. Failover only before the first byte. The finally releases
     the slot, drops the live entry, and (on disconnect/cancel) marks the row
     cancelled via a detached task (no await during generator close)."""
     live = _live(app)
     cli = _http(app)
-    acquired = False
+    token = None
+    gate_held = False
     finished = False
     try:
-        if sem is not None:
-            await sem.acquire()
-            acquired = True
+        if gate is not None:
+            token = await gate.acquire(cancel_ev, live.get(request_id))
+            gate_held = True
         if cancel_ev.is_set():
             return
         if request_id in live:
@@ -669,8 +737,8 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
         yield f"data: {err}\n\n".encode()
         await _finish(request_id, "failed", status_code=502, error=last_err)
     finally:
-        if acquired and sem is not None:
-            sem.release()
+        if gate_held and gate is not None:
+            await gate.release(token)
         live.pop(request_id, None)
         if not finished:
             # disconnect/manual cancel — record without awaiting (may be mid-aclose)
@@ -745,7 +813,7 @@ async def _dispatch_buffered(app, request, user, endpoint_id, candidates, alias,
                              timeout_s, max_conc, request_id, payload, upstream_path) -> Response:
     """Forward a fully-buffered payload dict — the classic engine (_stream / _do_unary),
     which supports failover across multiple candidate upstreams."""
-    sem = _get_sem(app, endpoint_id, max_conc)
+    gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream)
     if is_stream:
@@ -759,13 +827,13 @@ async def _dispatch_buffered(app, request, user, endpoint_id, candidates, alias,
             sse_headers["X-Upstream-Url"] = candidates[0]["base_url"]
             sse_headers["X-Upstream-Name"] = candidates[0]["name"]
         return StreamingResponse(
-            _stream(app, request_id, endpoint_id, candidates, alias, payload, upstream_path, timeout_s, sem, cancel_ev),
+            _stream(app, request_id, endpoint_id, candidates, alias, payload, upstream_path, timeout_s, gate, cancel_ev),
             media_type="text/event-stream",
             headers=sse_headers,
         )
     return await _unary(app, request, request_id,
                         lambda: _do_unary(app, endpoint_id, candidates, alias, payload, upstream_path, timeout_s),
-                        sem, cancel_ev)
+                        gate, cancel_ev)
 
 
 # ---------- streaming request-body passthrough (big-payload latency fix) -----
@@ -918,7 +986,7 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
     its REAL status instead of masking it inside a 200 SSE envelope."""
     request_id = f"pxr-{_secrets.token_hex(8)}"
     await _insert_request_row(request_id, endpoint_id, user, alias, is_stream_hint)
-    sem = _get_sem(app, endpoint_id, max_conc)
+    gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream_hint)
     live = _live(app)
@@ -933,11 +1001,12 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
         async for chunk in body_it:
             yield chunk
 
-    acquired = False
+    token = None
+    gate_held = False
     handed_off = False
     try:
-        if sem is not None:
-            await sem.acquire(); acquired = True
+        if gate is not None:
+            token = await gate.acquire(cancel_ev, live.get(request_id)); gate_held = True
         if cancel_ev.is_set():
             raise asyncio.CancelledError()
         if request_id in live:
@@ -954,8 +1023,8 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
         if "text/event-stream" not in r.headers.get("content-type", ""):
             data = await r.aread()
             await r.aclose()
-            if acquired and sem is not None:
-                sem.release(); acquired = False
+            if gate_held and gate is not None:
+                await gate.release(token); gate_held = False
             try:
                 obj = json.loads(data)
             except Exception:
@@ -973,7 +1042,7 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
         sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **base_hdrs}
 
         async def _relay():
-            nonlocal acquired
+            nonlocal token, gate_held
             ttft = None; pt = ct2 = None; usage_buf = ""; finished = False
             try:
                 async for chunk in r.aiter_bytes():
@@ -1013,22 +1082,29 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
                     await r.aclose()
                 except Exception:
                     pass
-                if acquired and sem is not None:
-                    sem.release(); acquired = False
+                if gate_held and gate is not None:
+                    await gate.release(token); gate_held = False
                 live.pop(request_id, None)
                 if not finished:
                     asyncio.create_task(_finish(request_id, "cancelled", status_code=499, error="client disconnected"))
 
         return StreamingResponse(_relay(), media_type="text/event-stream", headers=sse_headers)
+    except asyncio.CancelledError:
+        # Cancelled while queued (manual cancel / cross-replica flush set cancel_ev,
+        # caught in the gate's acquire loop) OR the client disconnected before we sent
+        # anything upstream — a cancellation, not an upstream failure. Record 499.
+        await _finish(request_id, "cancelled", status_code=499, error="cancelled")
+        live.pop(request_id, None)
+        return Response(status_code=499)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.ReadTimeout,
-            httpx.RemoteProtocolError, httpx.WriteError, asyncio.CancelledError) as e:
+            httpx.RemoteProtocolError, httpx.WriteError) as e:
         _mark_health(app, endpoint_id, cand["id"], False, error=str(e))
         await _finish(request_id, "failed", status_code=502, error=f"{type(e).__name__}: {e}")
         live.pop(request_id, None)
         raise HTTPException(status_code=502, detail={"error": f"upstream failed: {type(e).__name__}"})
     finally:
-        if acquired and sem is not None and not handed_off:
-            sem.release()
+        if gate_held and gate is not None and not handed_off:
+            await gate.release(token)
 
 
 async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstream_path: str) -> Response:
@@ -1107,13 +1183,13 @@ async def _handle_audio(request: Request, user: User, endpoint_name: str, upstre
     # temperature, timestamp_granularities[], …) verbatim to the upstream.
     extra = {k: v for k, v in form.multi_items() if k not in ("file", "model") and isinstance(v, str)}
     endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, False)
-    sem = _get_sem(app, endpoint_id, max_conc)
+    gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, False)
     return await _unary(app, request, request_id,
                         lambda: _do_unary_multipart(app, endpoint_id, candidates, alias, upstream_path,
                                                     file_name, file_bytes, content_type, extra, timeout_s),
-                        sem, cancel_ev)
+                        gate, cancel_ev)
 
 
 # ---------- data-plane routes ------------------------------------------------
@@ -1188,7 +1264,11 @@ async def list_proxies(request: Request, user: User = Depends(require_admin),  #
     if owners:
         for u in (await session.execute(select(User).where(User.id.in_(owners)))).scalars().all():
             names[u.id] = u.username
-    return [_endpoint_record(request.app, e, names.get(e.owner_id, "?")) for e in rows]
+    out = []
+    for e in rows:
+        out.append(_endpoint_record(request.app, e, names.get(e.owner_id, "?"),
+                                    counts=await _endpoint_counts(request.app, e.id)))
+    return out
 
 
 @router.post("", response_model=ProxyEndpointRecord)
@@ -1234,7 +1314,8 @@ async def get_proxy(proxy_id: str, request: Request, user: User = Depends(requir
     row = await session.get(ProxyEndpoint, proxy_id)
     if row is None:
         raise HTTPException(status_code=404, detail="proxy endpoint not found")
-    return _endpoint_record(request.app, row, await _owner_username(session, row.owner_id))
+    return _endpoint_record(request.app, row, await _owner_username(session, row.owner_id),
+                            counts=await _endpoint_counts(request.app, row.id))
 
 
 @router.get("/{proxy_id}/public", response_model=ProxyEndpointRecord)
@@ -1344,6 +1425,13 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offse
         raise HTTPException(status_code=404, detail="proxy endpoint not found")
     live = _live(request.app)
     live_ids = {rid for rid, v in live.items() if v.get("endpoint_id") == proxy_id}
+    if proxy_cluster.enabled():
+        # The request ROWS are already global (shared Postgres); only the in-memory
+        # "is it live right now" flag was per-replica — union the global registry so a
+        # request in flight on another replica still shows live here.
+        for r in await proxy_cluster.live_list_endpoint(request.app.state.redis, proxy_id):
+            if r.get("id"):
+                live_ids.add(r["id"])
     q = select(ProxyRequest).where(ProxyRequest.endpoint_id == proxy_id)
     if request_id:
         # Direct primary-key lookup — finds the row anywhere in the FULL history (not
@@ -1387,25 +1475,42 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offse
 @router.post("/{proxy_id}/requests/{req_id}/cancel")
 async def cancel_proxy_request(proxy_id: str, req_id: str, request: Request,
                                user: User = Depends(require_admin)):  # noqa: ARG001
-    live = _live(request.app)
-    entry = live.get(req_id)
-    if entry is None or entry.get("endpoint_id") != proxy_id:
-        raise HTTPException(status_code=404, detail="request not found / already finished")
-    entry["cancel"].set()
-    return {"ok": True, "id": req_id}
+    app = request.app
+    entry = _live(app).get(req_id)
+    if entry is not None and entry.get("endpoint_id") == proxy_id:
+        entry["cancel"].set()  # served by THIS replica — cancel directly
+        if proxy_cluster.enabled():
+            await proxy_cluster.publish_cancel(app.state.redis, req_id)  # + any dup holder
+        return {"ok": True, "id": req_id}
+    if proxy_cluster.enabled():
+        # Not local — it may be in flight on another replica. Confirm it exists in the
+        # global registry, then fan the cancel out via pub/sub to whoever holds it.
+        rows = await proxy_cluster.live_list_endpoint(app.state.redis, proxy_id)
+        if any(r.get("id") == req_id for r in rows):
+            await proxy_cluster.publish_cancel(app.state.redis, req_id)
+            return {"ok": True, "id": req_id}
+    raise HTTPException(status_code=404, detail="request not found / already finished")
 
 
 @router.post("/{proxy_id}/flush")
 async def flush_proxy_queue(proxy_id: str, request: Request,
                             user: User = Depends(require_admin)):  # noqa: ARG001
     """Cancel every request still WAITING for a slot (state=queued). Already-running
-    requests are left alone — same semantics as the serverless queue flush."""
-    live = _live(request.app)
+    requests are left alone — same semantics as the serverless queue flush. With
+    PROXY_CLUSTER=1 this spans replicas (fan out via pub/sub over the global registry)."""
+    app = request.app
+    live = _live(app)
     n = 0
     for entry in list(live.values()):
         if entry.get("endpoint_id") == proxy_id and entry.get("state") == "queued":
             entry["cancel"].set()
             n += 1
+    if proxy_cluster.enabled():
+        rows = await proxy_cluster.live_list_endpoint(app.state.redis, proxy_id)
+        queued = [r.get("id") for r in rows if r.get("state") == "queued" and r.get("id")]
+        for rid in queued:
+            await proxy_cluster.publish_cancel(app.state.redis, rid)
+        n = len(queued)  # global queued count (local ones are mirrored into it)
     return {"ok": True, "flushed": n}
 
 
@@ -1499,6 +1604,86 @@ async def test_upstream(req: TestUpstreamRequest, request: Request,
     except Exception:
         pass
     return TestUpstreamResponse(ok=True, message=f"reachable ({len(models)} models) — add a model to chat-test", latency_ms=lat, models=models)
+
+
+# ---------- cross-replica cluster loops (PROXY_CLUSTER=1) ---------------------
+
+async def proxy_cluster_sync_loop(app) -> None:
+    """Reconcile this replica's in-memory live requests to the Redis registry (so the
+    admin queue view + inflight/queued counts span every replica) and renew each
+    in-flight request's global concurrency-slot lease (so long streams keep their slot
+    and a crashed replica's slots free themselves within the lease TTL). Off unless
+    PROXY_CLUSTER=1 — then it's the ONLY thing that writes the registry, keeping the
+    request hot path free of extra Redis writes."""
+    if not proxy_cluster.enabled():
+        logger.info("proxy cluster sync loop disabled (PROXY_CLUSTER!=1)")
+        return
+    redis = app.state.redis
+    registered: dict[str, str] = {}  # rid -> endpoint_id we've mirrored to Redis
+    app.state.proxy_cluster_registered = registered
+    interval = proxy_cluster.SYNC_INTERVAL_S
+    await asyncio.sleep(1)
+    logger.info("proxy cluster sync loop started (interval=%ss)", interval)
+    while True:
+        try:
+            live = _live(app)
+            seen = set()
+            for rid, e in list(live.items()):
+                seen.add(rid)
+                ep = e.get("endpoint_id") or ""
+                await proxy_cluster.live_upsert(redis, rid, {
+                    "id": rid, "endpoint_id": ep, "model": e.get("model"),
+                    "upstream": e.get("upstream"), "state": e.get("state"),
+                    "owner": e.get("owner"), "is_stream": e.get("is_stream"),
+                    "created_at": e.get("created_at"), "replica": proxy_cluster.replica_id(),
+                })
+                registered[rid] = ep
+                tok = e.get("slot_token")
+                if tok:
+                    await proxy_cluster.limiter_renew(redis, ep, tok)
+            # Requests that ended locally since the last tick: drop their mirror now
+            # (don't wait for TTL) so the global queue view stays tight.
+            for rid in [r for r in registered if r not in seen]:
+                await proxy_cluster.live_remove(redis, rid, registered.pop(rid))
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("proxy cluster sync tick failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+async def proxy_cancel_subscriber_loop(app) -> None:
+    """Subscribe to the cross-replica cancel channel; when a cancel for a request THIS
+    replica is holding arrives, set its local cancel event. Lets an admin cancel/flush
+    issued on ANY replica reach the replica actually serving the request. Reconnects on
+    error. Off unless PROXY_CLUSTER=1."""
+    if not proxy_cluster.enabled():
+        return
+    redis = app.state.redis
+    await asyncio.sleep(1)
+    while True:
+        try:
+            pubsub = redis.pubsub()
+            await pubsub.subscribe(proxy_cluster.CANCEL_CHANNEL)
+            logger.info("proxy cancel subscriber started (channel=%s)", proxy_cluster.CANCEL_CHANNEL)
+            async for msg in pubsub.listen():
+                if msg.get("type") != "message":
+                    continue
+                rid = msg.get("data")
+                entry = _live(app).get(rid)
+                if entry is not None and entry.get("cancel") is not None:
+                    entry["cancel"].set()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("proxy cancel subscriber failed; reconnecting")
+            try:
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                break
 
 
 # ---------- background health loop -------------------------------------------

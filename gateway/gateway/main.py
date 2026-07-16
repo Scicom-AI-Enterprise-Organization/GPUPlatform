@@ -53,6 +53,7 @@ from . import quantization_api as quantization_module
 from . import tracking_creds_api as tracking_creds_module
 from . import gitops_api as gitops_module
 from . import proxy_api as proxy_module
+from . import leader
 from . import log_archive
 from . import history_api as history_module
 from . import catalog_api as catalog_module
@@ -532,6 +533,102 @@ def _to_app_record(app: App, *, redacted: bool = False) -> AppRecord:
     )
 
 
+async def leader_workload(app: FastAPI) -> list[asyncio.Task]:
+    """The MUTATING control-plane workload — runs on exactly ONE replica (the
+    leader). Started by LeaderCoordinator on lock acquire, cancelled on loss.
+
+    Each subsystem is its own task that runs its one-time orphan-reconcile THEN its
+    loop, so becoming leader (at boot or on failover) never blocks the coordinator's
+    lock renewal on a slow SSH reconcile. Env gates (BENCHMARK_S3_BUCKET /
+    RUNPOD_API_KEY / AUTOSCALER) mirror the old inline startup. The provider object
+    itself is built always-on in lifespan (request handlers use it); only these
+    loops are leader-scoped."""
+    tasks: list[asyncio.Task] = []
+
+    # Log-archive flusher — ships buffered worker logs from Redis to S3. Two
+    # flushers would split one app's logs across replicas, so leader-only.
+    tasks.append(asyncio.create_task(
+        log_archive.flusher_loop(session_factory(), app.state.redis), name="log_archive_flusher"))
+
+    async def _bench_subsystem():
+        # Materialize SSH key from env (prod) before anything else uses it.
+        bench_module.bootstrap_ssh_key_from_env()
+        try:
+            orphaned = await bench_module.cleanup_orphaned_running(app.state.redis)
+            if orphaned:
+                logger.warning(
+                    "bench: marked %d previously-running benchmark(s) as failed (gateway restart). "
+                    "Check RunPod for any pods left billing.", orphaned,
+                )
+        except Exception:
+            logger.exception("bench: orphan reconcile failed")
+        await bench_module.janitor_loop(app.state.redis)
+
+    if os.environ.get("BENCHMARK_S3_BUCKET", "").strip():
+        tasks.append(asyncio.create_task(_bench_subsystem(), name="bench_janitor"))
+        # Keep the /_aggregate cache hot (the GPU-calculator benchmark picker) so no
+        # user waits on a cold S3 rebuild; also persists it to Redis across restarts.
+        tasks.append(asyncio.create_task(
+            bench_module.aggregate_warmer_loop(session_factory(), app.state.redis), name="agg_warmer"))
+        logger.info("bench enabled (bucket=%s)", os.environ.get("BENCHMARK_S3_BUCKET"))
+
+    async def _compute_subsystem():
+        try:
+            orphaned = await compute_module.cleanup_orphaned_running()
+            if orphaned:
+                logger.warning(
+                    "compute: marked %d previously-creating pod(s) as failed (gateway restart). "
+                    "Check RunPod dashboard for any pod still billing.", orphaned,
+                )
+        except Exception:
+            logger.exception("compute: orphan reconcile failed")
+        await compute_module.compute_idle_loop()
+
+    if os.environ.get("RUNPOD_API_KEY", "").strip():
+        tasks.append(asyncio.create_task(_compute_subsystem(), name="compute_idle"))
+        logger.info("compute enabled")
+
+    async def _training_subsystem():
+        try:
+            t_orphaned = await training_module.cleanup_orphaned_running(app.state.redis)
+            if t_orphaned:
+                logger.warning("autotrain: finalized %d orphaned training run(s) after gateway restart", t_orphaned)
+        except Exception:
+            logger.exception("autotrain: orphan reconcile failed")
+        await training_module.training_janitor_loop(app.state.redis)
+
+    tasks.append(asyncio.create_task(_training_subsystem(), name="training_janitor"))
+
+    async def _quant_reconcile():
+        try:
+            q_orphaned = await quantization_module.cleanup_orphaned_running(app.state.redis)
+            if q_orphaned:
+                logger.warning("quantization: finalized %d orphaned job(s) after gateway restart", q_orphaned)
+        except Exception:
+            logger.exception("quantization: orphan reconcile failed")
+
+    tasks.append(asyncio.create_task(_quant_reconcile(), name="quant_reconcile"))
+
+    # GitOps loop (self-disables with GITOPS_POLL=0; manual sync + webhook always work).
+    tasks.append(asyncio.create_task(gitops_module.gitops_reconcile_loop(app), name="gitops"))
+
+    if os.environ.get("AUTOSCALER", "0") == "1":
+        from .autoscaler import autoscaler_loop, vm_watchdog_loop
+        from .reconciler import reconciler_loop
+        tasks.append(asyncio.create_task(
+            autoscaler_loop(app.state.redis, app.state.provider, session_factory(), app.state.provider_cache),
+            name="autoscaler"))
+        tasks.append(asyncio.create_task(
+            reconciler_loop(app.state.redis, app.state.provider, session_factory(), app.state.provider_cache),
+            name="reconciler"))
+        tasks.append(asyncio.create_task(
+            vm_watchdog_loop(app.state.redis, session_factory(), app.state.provider_cache),
+            name="vm_watchdog"))
+        logger.info("autoscaler + reconciler + vm_watchdog loops started (leader)")
+
+    return tasks
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     accesslog.init_access_logging()  # idempotent; also covers the uvicorn reload subprocess
@@ -577,12 +674,8 @@ async def lifespan(app: FastAPI):
 
     app.state.provider = None
     app.state.provider_cache = {}
-    app.state.autoscaler_task = None
-    app.state.reconciler_task = None
-    app.state.bench_janitor_task = None
-    app.state.compute_idle_task = None
-    app.state.gitops_task = None
-    app.state.log_archive_task = None
+    # The mutating control-plane loops (autoscaler/reconciler/janitors/gitops/
+    # log-archive) are owned by leader_workload()/LeaderCoordinator now — see below.
 
     # Backfill the log-archive Redis mirror (app:{id}:log_storage_id) from the DB
     # so the /workers/logs hot path can decide to archive without a DB hit. The
@@ -600,73 +693,15 @@ async def lifespan(app: FastAPI):
             logger.info("log-archive: mirrored %d app→storage binding(s) to redis", len(rows))
     except Exception:  # noqa: BLE001 — non-fatal; setter still maintains the mirror
         logger.warning("log-archive: redis mirror backfill failed (non-fatal)", exc_info=True)
-    app.state.log_archive_task = asyncio.create_task(
-        log_archive.flusher_loop(session_factory(), app.state.redis)
-    )
-    if os.environ.get("BENCHMARK_S3_BUCKET", "").strip():
-        # Materialize SSH key from env (prod) before anything else uses it.
-        bench_module.bootstrap_ssh_key_from_env()
-        orphaned = await bench_module.cleanup_orphaned_running(app.state.redis)
-        if orphaned:
-            logger.warning(
-                "bench: marked %d previously-running benchmark(s) as failed (gateway restart). "
-                "Check RunPod for any pods left billing.", orphaned,
-            )
-        app.state.bench_janitor_task = asyncio.create_task(
-            bench_module.janitor_loop(app.state.redis)
-        )
-        # Keep the /_aggregate cache hot (the GPU-calculator benchmark picker) so no
-        # user waits on a cold S3 rebuild; also persists it to Redis across restarts.
-        app.state.agg_warmer_task = asyncio.create_task(
-            bench_module.aggregate_warmer_loop(session_factory(), app.state.redis)
-        )
-        logger.info("bench enabled (bucket=%s)", os.environ.get("BENCHMARK_S3_BUCKET"))
-    if os.environ.get("RUNPOD_API_KEY", "").strip():
-        # Compute uses the same RunPod creds; cleanup any rows the previous
-        # gateway process was mid-creating. Running pods stay running on
-        # RunPod and the row keeps its `running` status.
-        orphaned = await compute_module.cleanup_orphaned_running()
-        if orphaned:
-            logger.warning(
-                "compute: marked %d previously-creating pod(s) as failed (gateway restart). "
-                "Check RunPod dashboard for any pod still billing.", orphaned,
-            )
-        # Idle auto-terminate sweep — tears down pods left idle (no GPU/memory
-        # use) past their per-pod window. No-op for pods with the window unset.
-        app.state.compute_idle_task = asyncio.create_task(
-            compute_module.compute_idle_loop()
-        )
-        logger.info("compute enabled")
-    # Autotrain: reconcile training runs left 'running'/'queued' by a previous
-    # gateway process. Trainers run detached on the VM/pod, so a restart no longer
-    # kills them — cleanup SSH-checks each (alive → kept running; exited → finalized
-    # from its log; unreachable → failed), and the janitor finalizes survivors when
-    # they later exit. Runs without the env bucket (runs can target per-storage S3).
-    try:
-        t_orphaned = await training_module.cleanup_orphaned_running(app.state.redis)
-        if t_orphaned:
-            logger.warning("autotrain: finalized %d orphaned training run(s) after gateway restart", t_orphaned)
-        app.state.training_janitor_task = asyncio.create_task(
-            training_module.training_janitor_loop(app.state.redis)
-        )
-    except Exception:
-        logger.exception("autotrain: orphan reconcile failed")
-    # Quantization: same detached-run reconcile as autotrain — a restart leaves
-    # llm-compressor jobs running on the box; finalize/keep them from their log.
-    try:
-        q_orphaned = await quantization_module.cleanup_orphaned_running(app.state.redis)
-        if q_orphaned:
-            logger.warning("quantization: finalized %d orphaned job(s) after gateway restart", q_orphaned)
-    except Exception:
-        logger.exception("quantization: orphan reconcile failed")
-    # GitOps: reconcile platform resources declared in registered git repos.
-    # The loop self-disables with GITOPS_POLL=0; manual sync + webhook always work.
-    try:
-        app.state.gitops_task = asyncio.create_task(
-            gitops_module.gitops_reconcile_loop(app)
-        )
-    except Exception:
-        logger.exception("gitops: failed to start poll loop")
+    # ── Leader-only control-plane workload moved to leader_workload() ──────────
+    # The log-archive flusher, bench/compute/training/quant orphan-reconciles +
+    # janitors, and the gitops loop MUTATE shared state (S3 log objects, DB run
+    # rows, cluster resources) and MUST run on exactly one replica. They're started
+    # by the LeaderCoordinator further down (see leader.py + leader_workload). In
+    # single-replica mode (GATEWAY_HA unset) that's this process — identical to the
+    # old inline startup, just relocated. Only the per-replica-safe work (redis, PG,
+    # stats_writer, the log→storage redis backfill above, proxy health) stays inline.
+
     # LLM API proxy: shared httpx client + live state + health-check loop.
     app.state.proxy_http = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=10.0),
@@ -687,10 +722,28 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         logger.exception("proxy: failed to start health loop")
+    # Cross-replica proxy coordination (PROXY_CLUSTER=1): a per-replica sync loop that
+    # mirrors live requests → Redis + renews global slot leases, and a cancel-channel
+    # subscriber. Both are per-replica (NOT leader-only) and self-disable when off.
+    app.state.proxy_cluster_sync_task = None
+    app.state.proxy_cancel_sub_task = None
+    try:
+        app.state.proxy_cluster_sync_task = asyncio.create_task(
+            proxy_module.proxy_cluster_sync_loop(app)
+        )
+        app.state.proxy_cancel_sub_task = asyncio.create_task(
+            proxy_module.proxy_cancel_subscriber_loop(app)
+        )
+    except Exception:
+        logger.exception("proxy: failed to start cluster loops")
+    # Provider build stays ALWAYS-ON (every replica): it's just an API-client
+    # object, harmless until called, and request handlers use app.state.provider
+    # as the synchronous-provision fallback during app creation (resolve_app_provider).
+    # Only the autoscaler/reconciler/vm_watchdog *loops* mutate cluster state, so
+    # those are leader-only (started in leader_workload). Validation raising here
+    # still fails startup fast on EVERY replica — a misconfig can't hide on a follower.
     if os.environ.get("AUTOSCALER", "0") == "1":
         from .provider import build_provider, cloud_providers_disabled, CLOUD_PROVIDER_NAMES
-        from .autoscaler import autoscaler_loop, vm_watchdog_loop
-        from .reconciler import reconciler_loop
 
         provider_name = os.environ.get("PROVIDER", "fake")
 
@@ -737,31 +790,53 @@ async def lifespan(app: FastAPI):
         # cached in app.state.provider_cache (initialised above) and shared by
         # the autoscaler + reconciler so we don't re-decrypt creds every tick.
         # (provider may be None for PROVIDER=vm — apps then resolve their own row.)
-        app.state.autoscaler_task = asyncio.create_task(
-            autoscaler_loop(
-                app.state.redis, app.state.provider, session_factory(), app.state.provider_cache
-            )
-        )
-        app.state.reconciler_task = asyncio.create_task(
-            reconciler_loop(
-                app.state.redis, app.state.provider, session_factory(), app.state.provider_cache
-            )
-        )
-        app.state.vm_watchdog_task = asyncio.create_task(
-            vm_watchdog_loop(
-                app.state.redis, session_factory(), app.state.provider_cache
-            )
-        )
         logger.info(
-            "autoscaler + reconciler + vm_watchdog enabled (provider=%s)",
+            "provider built (provider=%s) — autoscaler/reconciler loops run on the leader",
             app.state.provider.name if app.state.provider else f"{provider_name} (per-app rows)",
         )
+
+    # ── Leadership: start the mutating control-plane workload on the leader ────
+    # GATEWAY_HA=1  → elect via a Redis lock; only the leader runs the workload,
+    #                 and on leader death a follower promotes within ~LEADER_TTL_S.
+    # GATEWAY_HA=0  → this replica is the sole leader; run the workload INLINE so a
+    #                 misconfig still fails startup fast (unchanged single-replica).
+    app.state.leader_coordinator = None
+    app.state.leader_task = None
+    app.state.leader_tasks = []
+    if leader.ha_enabled():
+        coord = leader.LeaderCoordinator(app, leader_workload)
+        app.state.leader_coordinator = coord
+        app.state.leader_task = asyncio.create_task(coord.run())
+    else:
+        app.state.is_leader = True
+        app.state.leader_id = leader.instance_id()
+        app.state.leader_tasks = await leader_workload(app)
 
     try:
         yield
     finally:
-        for task_attr in ("autoscaler_task", "reconciler_task", "vm_watchdog_task", "bench_janitor_task", "compute_idle_task", "gitops_task", "proxy_healthcheck_task", "log_archive_task"):
-            t = getattr(app.state, task_attr, None)
+        # Stop the leader-only workload: in HA mode the coordinator cancels its own
+        # tasks + hands off the lock; otherwise cancel the inline workload tasks.
+        coord = getattr(app.state, "leader_coordinator", None)
+        if coord is not None:
+            coord.stop()
+            lt = getattr(app.state, "leader_task", None)
+            if lt:
+                try:
+                    await lt
+                except (asyncio.CancelledError, BaseException):
+                    pass
+        else:
+            for t in getattr(app.state, "leader_tasks", []) or []:
+                t.cancel()
+            for t in getattr(app.state, "leader_tasks", []) or []:
+                try:
+                    await t
+                except (asyncio.CancelledError, BaseException):
+                    pass
+        # Per-replica always-on tasks (not part of the leader workload).
+        for _attr in ("proxy_healthcheck_task", "proxy_cluster_sync_task", "proxy_cancel_sub_task"):
+            t = getattr(app.state, _attr, None)
             if t:
                 t.cancel()
                 try:
@@ -955,6 +1030,19 @@ async def ready(request: Request):
     except Exception as e:
         raise HTTPException(status_code=503, detail={"redis": "unreachable", "error": str(e)[:200]})
     return {"ok": True, "redis": "ok"}
+
+
+@app.get("/leader")
+async def leader_status(request: Request):
+    """Which replica currently runs the mutating control-plane loops. In HA mode
+    (GATEWAY_HA=1) exactly one replica reports is_leader=true; the rest serve the
+    data plane (proxy + API) as followers. Single-replica mode always reports true."""
+    st = request.app.state
+    return {
+        "ha_enabled": leader.ha_enabled(),
+        "is_leader": bool(getattr(st, "is_leader", False)),
+        "instance_id": getattr(st, "leader_id", None),
+    }
 
 
 @app.get("/metrics")

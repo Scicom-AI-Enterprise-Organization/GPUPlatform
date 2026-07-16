@@ -21,6 +21,14 @@ workerImage:
 
 gateway:
   replicaCount: 1
+  # Multi-replica HA. When true (and replicaCount >= 2) every replica serves the
+  # data plane (LLM proxy + API) but only ONE — elected via a Redis lock — runs
+  # the mutating controllers (autoscaler/reconciler/janitors/gitops/log-archive),
+  # so they don't fight. On leader-pod death a follower promotes within
+  # ~LEADER_TTL_S. Sets GATEWAY_HA=1. Safe to leave false at replicaCount: 1.
+  # REQUIRED before setting replicaCount > 1 with autoscaler: true — otherwise
+  # every replica runs its own autoscaler and double-provisions.
+  ha: false
   resources:
     requests:
       cpu: 100m

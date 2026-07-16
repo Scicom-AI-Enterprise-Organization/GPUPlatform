@@ -34,6 +34,9 @@ workerImage:
 # -----------------------------------------------------------------------------
 gateway:
   replicaCount: 2                          # >=2 for HA; chart adds anti-affinity
+  ha: true                                 # leader election: only 1 replica runs
+                                           # the controllers (auto-on at replicas>1,
+                                           # set explicitly here for clarity)
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 1000m, memory: 1Gi }

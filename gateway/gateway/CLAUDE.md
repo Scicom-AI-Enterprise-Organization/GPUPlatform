@@ -177,8 +177,50 @@ non-breaking)** — set a ceiling on an endpoint that's getting overrun. Two mor
 → rendered `{"detail":{…}}`, so OpenAI SDK clients read nothing and logged only the exception class);
 (2) every proxy response carries **`X-SGPU-Inflight` / `X-SGPU-Concurrency-Limit`** so clients can
 self-throttle. `PROXY_RETRY_AFTER_S` (default 5) tunes the Retry-After hint. Set the ceiling ≈ the
-model's vLLM `max_num_seqs` (or just below). NOTE this bounds a single replica — it is **not**
-multi-replica autoscaling of a proxy endpoint (that's still a separate follow-up).
+model's vLLM `max_num_seqs` (or just below). NOTE this bounds a single replica (see the multi-replica
+section below for the cluster-wide cap on the *separate* LLM-proxy feature).
+
+### Multi-replica HA — leader election (`leader.py`) + proxy cluster (`proxy_cluster.py`)
+
+The gateway is a monolith: it serves a **stateless data plane** (the LLM proxy in `proxy_api.py`, API
+reads) but also runs **singleton controllers** (autoscaler/reconciler/vm_watchdog/janitors/gitops/
+log-archive) that are NOT safe to run on >1 replica (two autoscalers double-provision). So HA splits by
+leadership rather than by deployment:
+
+- **`GATEWAY_HA=1`** (auto-on in the Helm chart when `replicaCount > 1`, or `gateway.ha: true`) → every
+  replica serves HTTP, but only the **leader** runs the mutating controllers. Leader = a Redis lock
+  `gateway:leader` (`SET NX PX`); the holder renews it every `LEADER_RENEW_S` (5s) and on leader death
+  the lock lapses after `LEADER_TTL_S` (15s) so a follower's `SET NX` promotes it. `main.leader_workload()`
+  is the leader-only task set; `LeaderCoordinator` starts it on acquire / cancels on loss. **`GATEWAY_HA`
+  unset (default) → this replica is the sole leader, no Redis lock, byte-identical to the old inline
+  startup** (so local dev + single-replica prod are unchanged). Observe via **`GET /leader`**.
+  ⚠ The **provider object stays always-on on every replica** (built in lifespan, not the workload) —
+  request handlers use `app.state.provider` as the app-create provision fallback; only the *loops* are
+  leader-scoped. Validation still fails startup fast on every replica.
+- **`PROXY_CLUSTER=1`** makes the LLM proxy correct across replicas (opt-in; off → per-replica in-memory,
+  unchanged; **fails OPEN if Redis is down** so a blip never blocks traffic):
+  - **Global concurrency cap.** A proxy endpoint's `max_concurrency` becomes a cluster-wide cap (was
+    N×per-replica) via a Redis ZSET of leased slots (`proxy:sem:{endpoint_id}`). Acquire/release are on
+    the hot path (one Lua call each, client-time-stamped so the script stays a pure write); the
+    per-replica **sync loop renews each in-flight slot's lease**, so a crashed replica's slots self-free
+    within `PROXY_CLUSTER_SLOT_LEASE_S` (30s) instead of wedging the cap. Over cap → the caller waits in
+    the gate's cancel-aware acquire loop (0.1s poll) — same visible-queue semantics, just global. The
+    concurrency gate is `_Gate`/`_get_gate` (local `asyncio.Semaphore` vs Redis), which replaced the raw
+    `sem` passed through `_unary`/`_stream`/`_forward_passthrough`/`_handle_audio`.
+  - **Global queue + cancel.** The **sync loop** (`proxy_cluster_sync_loop`, per-replica, every
+    `PROXY_CLUSTER_SYNC_S`=2s) mirrors the local `_live` dict → Redis (`proxy:live:{rid}` hash +
+    `proxy:live:ep:{eid}` index, TTL-bounded) — so the admin queue view + inflight/queued counts span all
+    replicas, entirely OFF the request hot path. Cancel/flush publish the request id on `proxy:cancel`
+    pub/sub; every replica's **`proxy_cancel_subscriber_loop`** sets the local `cancel_ev` if it's the
+    holder. Both loops are per-replica (NOT leader-only) and self-disable when off.
+- **Verified e2e locally** (2 clustered gateways + a mock upstream): global cap held at 2 across both
+  replicas (8 concurrent split 4/4 → mock saw max 2); a queued request on replica A was visible on B and
+  a **flush issued on B cancelled it (499)** cross-replica; streaming requests respect the cap + release
+  slots; the ZSET lease self-heals a crashed holder. Leader election: A led, B followed, `kill -9` A →
+  B promoted in ~TTL. Single-replica (`PROXY_CLUSTER`/`GATEWAY_HA` off) regression-clean (local semaphore,
+  no cluster loops). ⚠ The single-upstream **passthrough non-SSE path still can't abort mid-upstream-read**
+  (no `_watch_cancel` there — pre-existing); cancel only lands while the request is *queued* (gate loop)
+  or *streaming* (relay loop).
 
 ### Label platform (data-labelling app)
 

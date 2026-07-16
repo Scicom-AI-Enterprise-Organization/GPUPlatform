@@ -109,6 +109,12 @@ spec:
               value: "0.0.0.0:8080"
             - name: AUTOSCALER
               value: "{{ if .Values.gateway.autoscaler }}1{{ else }}0{{ end }}"
+            {{- /* HA leader election: only the elected leader runs the mutating
+                  controllers. Auto-on when replicaCount > 1 even if not set
+                  explicitly, so a scaled deployment can't accidentally run N
+                  autoscalers. */}}
+            - name: GATEWAY_HA
+              value: "{{ if or .Values.gateway.ha (gt (int .Values.gateway.replicaCount) 1) }}1{{ else }}0{{ end }}"
             - name: PROVIDER
               value: {{ .Values.gateway.provider | quote }}
             - name: DISABLE_CLOUD_PROVIDERS
