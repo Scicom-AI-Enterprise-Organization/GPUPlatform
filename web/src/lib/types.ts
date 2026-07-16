@@ -1002,6 +1002,7 @@ export type DatasetRecord = {
   label_project_id?: string | null;
   label_status?: string | null; // approved | rejected | not_reviewed | all
   label_updated_until?: string | null; // ISO-8601 point-in-time import cutoff (null → no upper bound)
+  label_download_retries?: number | null; // per-clip transform retry cap (null/≤0 → retry until success)
   label_token_secret?: string | null; // global-secret key (if used instead of a stored token)
   transform_status?: string | null; // "" | running | done | failed
   transform_log?: string | null;
@@ -1033,6 +1034,7 @@ export type CreateDatasetRequest = {
   label_token_secret?: string | null; // OR: a global-secret key holding the token
   label_status?: string | null; // approved | rejected | not_reviewed | all
   label_updated_until?: string | null; // ISO-8601 cutoff — import only tasks last updated at/before it
+  label_download_retries?: number | null; // per-clip transform retry cap (null/≤0 → retry until success)
 };
 
 export type UpdateDatasetRequest = {
@@ -1049,6 +1051,7 @@ export type UpdateDatasetRequest = {
   // kind=label import filters (null → unchanged; pass "" for label_updated_until to clear the cutoff)
   label_status?: string | null;
   label_updated_until?: string | null;
+  label_download_retries?: number | null; // null → unchanged; ≤0 → retry until success
 };
 
 export type DatasetUploadResult = {

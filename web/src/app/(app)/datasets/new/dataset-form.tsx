@@ -91,6 +91,10 @@ export function DatasetForm({
   // this instant. Held as a `datetime-local` value (browser-local wall clock); sent
   // as a UTC ISO-8601 string. Empty → no upper bound (import every task).
   const [labelUpdatedUntil, setLabelUpdatedUntil] = useState("");
+  // label: per-clip audio-download retry cap for the transform. Empty → retry
+  // until success (the default — the platform ingress flakes under load and a
+  // single attempt silently drops rows). A positive number caps the attempts.
+  const [labelDownloadRetries, setLabelDownloadRetries] = useState("");
   const [tokenMode, setTokenMode] = useState<"paste" | "secret">("paste");
   const [labelTokenSecret, setLabelTokenSecret] = useState("");
   const [secrets, setSecrets] = useState<GlobalEnvRecord[]>([]);
@@ -176,6 +180,11 @@ export function DatasetForm({
         label_status: kind === "label" ? labelStatus : null,
         label_updated_until:
           kind === "label" && labelUpdatedUntil ? new Date(labelUpdatedUntil).toISOString() : null,
+        // Empty → null → gateway retries until success (the default).
+        label_download_retries:
+          kind === "label" && labelDownloadRetries.trim()
+            ? Number.parseInt(labelDownloadRetries, 10)
+            : null,
       });
       // In-form file upload: push the chat file straight to the new dataset's
       // /upload endpoint (same multipart call the detail-page UploadCard makes —
@@ -598,6 +607,27 @@ export function DatasetForm({
                     <> (= <span className="font-mono">{new Date(labelUpdatedUntil).toISOString()}</span> UTC)</>
                   ) : null}
                   . Leave blank to import every task.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="ds-labelretries" className="text-xs uppercase tracking-wide text-muted-foreground">
+                  Download retries <span className="text-muted-foreground/60 normal-case">— optional</span>
+                </Label>
+                <Input
+                  id="ds-labelretries"
+                  type="number"
+                  min={0}
+                  value={labelDownloadRetries}
+                  onChange={(e) => setLabelDownloadRetries(e.target.value)}
+                  placeholder="retry until success"
+                  className="sm:max-w-xs"
+                />
+                <p className="text-xs text-muted-foreground">
+                  How many times the transform retries a clip whose audio fails to download before giving up. The
+                  platform ingress flakes under the load of a big project, so{" "}
+                  <span className="font-medium">leave blank to retry until success</span> (recommended) — no rows are
+                  silently dropped. Set a number to cap the attempts instead.
                 </p>
               </div>
 

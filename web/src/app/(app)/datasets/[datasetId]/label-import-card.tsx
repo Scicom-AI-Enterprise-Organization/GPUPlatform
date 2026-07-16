@@ -52,22 +52,28 @@ export function LabelImportCard({
   datasetId,
   labelStatus,
   labelUpdatedUntil,
+  labelDownloadRetries,
 }: {
   datasetId: string;
   labelStatus?: string | null;
   labelUpdatedUntil?: string | null;
+  labelDownloadRetries?: number | null;
 }) {
   const router = useRouter();
   const curStatus = labelStatus || "approved";
+  // Empty string ⇒ "retry until success" (null / ≤0 stored value).
+  const retriesToInput = (v: number | null | undefined) => (v && v > 0 ? String(v) : "");
   const [editing, setEditing] = useState(false);
   const [status, setStatus] = useState(curStatus);
   const [until, setUntil] = useState(isoToLocalInput(labelUpdatedUntil));
+  const [retries, setRetries] = useState(retriesToInput(labelDownloadRetries));
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   function startEdit() {
     setStatus(curStatus);
     setUntil(isoToLocalInput(labelUpdatedUntil));
+    setRetries(retriesToInput(labelDownloadRetries));
     setErr(null);
     setEditing(true);
   }
@@ -79,6 +85,8 @@ export function LabelImportCard({
     const body = {
       label_status: status,
       label_updated_until: until ? new Date(until).toISOString() : "",
+      // Empty ⇒ 0 ⇒ retry until success; else the explicit cap.
+      label_download_retries: retries.trim() ? Number.parseInt(retries, 10) : 0,
     };
     setSaving(true);
     try {
@@ -140,6 +148,16 @@ export function LabelImportCard({
                 )}
               </span>
             </div>
+            <div className="flex items-baseline justify-between gap-4 py-1.5">
+              <span className="text-xs text-muted-foreground">Download retries</span>
+              <span className="text-xs">
+                {labelDownloadRetries && labelDownloadRetries > 0 ? (
+                  labelDownloadRetries
+                ) : (
+                  <span className="text-muted-foreground/50">retry until success</span>
+                )}
+              </span>
+            </div>
           </div>
         ) : (
           <div className="space-y-3">
@@ -175,6 +193,26 @@ export function LabelImportCard({
                   <> (= <span className="font-mono">{new Date(until).toISOString()}</span> UTC)</>
                 ) : null}
                 . Clear to import every task.
+              </p>
+            </div>
+            <div className="space-y-1 sm:max-w-xs">
+              <Label htmlFor="ds-label-retries" className="text-xs">
+                Download retries <span className="text-muted-foreground">(optional)</span>
+              </Label>
+              <Input
+                id="ds-label-retries"
+                type="number"
+                min={0}
+                value={retries}
+                onChange={(e) => setRetries(e.target.value)}
+                disabled={saving}
+                placeholder="retry until success"
+                className="text-xs"
+              />
+              <p className="text-xs text-muted-foreground">
+                Retries per clip whose audio fails to download during a transform.{" "}
+                <span className="font-medium">Blank = retry until success</span> (recommended) — nothing is dropped.
+                Set a number to cap the attempts.
               </p>
             </div>
             {err && <p className="text-sm text-destructive">{err}</p>}

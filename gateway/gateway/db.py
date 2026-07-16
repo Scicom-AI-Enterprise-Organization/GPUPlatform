@@ -450,6 +450,12 @@ class Dataset(Base):
     # Alternatively the lpat token can come from a named global secret instead of
     # being stored per-dataset; resolved via load_global_env() at use time.
     label_token_secret: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # How many times to retry a per-clip audio download during the transform before
+    # giving up on that clip. None / ≤ 0 → RETRY UNTIL SUCCESS (the default): the
+    # labelling-platform ingress flakes under the rapid-fire load of a big project,
+    # and a single-attempt fetch used to SILENTLY drop 20–50% of rows. Set a positive
+    # cap to bound the attempts (a give-up is then counted + surfaced, not hidden).
+    label_download_retries: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # kind=llm: which column holds the OpenAI-compatible messages array
     # ([{role,content}]). Default "messages". In DPO (preference) mode this names
     # the CHOSEN column and `rejected_field` names the rejected column.
@@ -774,6 +780,11 @@ async def init_db() -> None:
         # messages_field). NULL on existing rows → chat/SFT mode (unchanged).
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS rejected_field VARCHAR(128)"
+        ))
+        # Per-clip audio-download retry cap for kind=label transforms. NULL on existing
+        # rows → retry until success (the new default; fixes the silent-drop bug).
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS label_download_retries INTEGER"
         ))
         # Catalog revisions: existing repos stay flat (versioned=false) → no behaviour
         # change; only mirror-native pushes set versioned=true. catalog_revisions

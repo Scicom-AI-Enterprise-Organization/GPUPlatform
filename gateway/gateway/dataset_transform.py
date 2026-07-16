@@ -17,8 +17,10 @@ import logging
 import os
 import shutil
 import tarfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -42,6 +44,22 @@ _AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac")
 _META_NAMES = ("metadata", "train", "data")
 _META_EXTS = (".csv", ".tsv", ".parquet", ".jsonl", ".json")
 
+# ---- label-project audio download (used by _label_pairs) --------------------
+# The per-clip audio fetch is the slow, failure-prone part of a label transform:
+# a big project is thousands of small HTTP GETs against the labelling platform.
+# Historically it ran one clip at a time, single-attempt, and SILENTLY dropped
+# any clip whose fetch raised — so a platform-ingress hiccup under the rapid-fire
+# load quietly lost 20–50% of rows on large projects (and, downstream, part of a
+# reused test set). Now: bounded concurrency + per-clip retry with backoff, and
+# the caller ABORTS the transform when the drop rate exceeds _LABEL_DL_MAX_FAIL_PCT
+# (rather than materialising a partial dataset). All three are env-tunable.
+_LABEL_DL_CONCURRENCY = max(1, int(os.environ.get("LABEL_DOWNLOAD_CONCURRENCY") or 12))
+_LABEL_DL_RETRIES = max(1, int(os.environ.get("LABEL_DOWNLOAD_RETRIES") or 4))
+# Max % of clips allowed to fail before the transform is failed instead of
+# shipping a partial dataset. 0 → fail on any drop; ≥100 → never fail (old
+# behaviour, but the drops are now logged loudly either way).
+_LABEL_DL_MAX_FAIL_PCT = float(os.environ.get("LABEL_DOWNLOAD_MAX_FAIL_PCT") or 2.0)
+
 
 def _ts() -> str:
     return f"[{datetime.now(timezone.utc):%H:%M:%S}]"
@@ -59,6 +77,13 @@ def _append_log(existing: Optional[str], line: str, max_chars: int = 8000) -> st
 # In-flight transform tasks, keyed by dataset_id, so the datasets "Cancel"
 # button can abort an audio-extraction job (hf/label → audio) mid-run.
 _active: dict[str, asyncio.Task] = {}
+
+# Thread-side cancel flags, keyed by the id being processed (dataset_id, or the
+# merge output_id). The label download runs in a thread pool and (by default)
+# retries a failing clip UNTIL SUCCESS — cancelling the asyncio task can't
+# interrupt those threads, so `cancel_transform` also sets this Event and the
+# download loop checks it (and wakes from its backoff sleep) to bail promptly.
+_cancel_events: dict[str, threading.Event] = {}
 
 
 async def start_transform(
@@ -138,6 +163,9 @@ async def cancel_transform(dataset_id: str) -> bool:
     t = _active.get(dataset_id)
     if t is None or t.done():
         return False
+    ev = _cancel_events.get(dataset_id)
+    if ev is not None:
+        ev.set()  # stop the download threads' retry-until-success loop promptly
     t.cancel()
     await _finish(dataset_id, "cancelled", "transform cancelled by user")
     return True
@@ -243,6 +271,8 @@ async def _run(
     work = _work_dir(dataset_id)
     success = False
     progress = _make_progress(dataset_id, asyncio.get_running_loop())
+    cancel_event = threading.Event()
+    _cancel_events[dataset_id] = cancel_event
     try:
         os.makedirs(work, exist_ok=True)
         # Resolve source repo + columns + tokens + output storage.
@@ -267,6 +297,7 @@ async def _run(
             label_project_id = d.label_project_id
             label_status = d.label_status or "approved"
             label_updated_until = d.label_updated_until
+            label_download_retries = d.label_download_retries  # None/≤0 → retry until success
             label_token = await _label_token(d, s) if kind == "label" else None
 
         if kind == "label":
@@ -284,14 +315,21 @@ async def _run(
             return
 
         if kind == "label":
-            # Stream the project export + download each task's audio. No archive
-            # extraction — the export already pairs audio with its transcription.
+            # Stream the project export + download each task's audio (concurrently,
+            # with per-clip retry). No archive extraction — the export already pairs
+            # audio with its transcription.
             _cut = f", until={label_updated_until}" if label_updated_until else ""
             await _log(dataset_id, f"exporting label project {label_project_id} (status={label_status}{_cut}) …")
-            pairs = await run_in_threadpool(
+            pairs, dl_stats = await run_in_threadpool(
                 _label_pairs, label_base_url, label_project_id, label_token, label_status, work, "",
-                label_updated_until,
+                label_updated_until, progress, label_download_retries, cancel_event,
             )
+            if cancel_event.is_set():
+                return  # cancelled mid-download; status already set by cancel_transform
+            await _log(dataset_id, _dl_summary_line(dl_stats))
+            if _over_fail_threshold(dl_stats):
+                await _finish(dataset_id, "failed", _dl_abort_msg(dl_stats))
+                return
             if not pairs:
                 await _finish(dataset_id, "failed", "no tasks with downloadable audio in the label export (check the status filter / token)")
                 return
@@ -372,6 +410,7 @@ async def _run(
         await _finish(dataset_id, "failed", f"transform failed: {e}")
         logger.exception("transform %s failed", dataset_id)
     finally:
+        _cancel_events.pop(dataset_id, None)
         # Keep the scratch dir on failure/cancel so a re-run resumes from the
         # already-downloaded + extracted files; only clean up after success.
         if work and success:
@@ -431,6 +470,8 @@ async def _run_merge(
     work = _work_dir(output_id) + "-merge"
     success = False
     progress = _make_progress(output_id, asyncio.get_running_loop())
+    cancel_event = threading.Event()
+    _cancel_events[output_id] = cancel_event
     try:
         if os.path.isdir(work):
             shutil.rmtree(work, ignore_errors=True)
@@ -465,6 +506,7 @@ async def _run_merge(
                         "base_url": sd.label_base_url, "project_id": sd.label_project_id,
                         "status": sd.label_status or "approved",
                         "until": sd.label_updated_until,
+                        "retries": sd.label_download_retries,  # None/≤0 → retry until success
                         "token": await _label_token(sd, s),
                     })
                 else:  # s3 — read its materialised metadata.csv + audio/ folder.
@@ -490,6 +532,7 @@ async def _run_merge(
         all_pairs: list[tuple[str, str, str, dict]] = []
         for idx, src in enumerate(sources):
             sub = os.path.join(work, f"src-{idx}")
+            dl_stats: Optional[dict] = None  # set for label sources (download accounting)
             if src["kind"] == "label":
                 if not (src["base_url"] and src["project_id"] and src["token"]):
                     await _finish(output_id, "failed",
@@ -500,10 +543,13 @@ async def _run_merge(
                 await _log(output_id,
                            f"[{idx + 1}/{len(sources)}] exporting '{src['name']}' "
                            f"(project {src['project_id']}, status={src['status']}{_cut}) …")
-                pairs = await run_in_threadpool(
+                pairs, dl_stats = await run_in_threadpool(
                     _label_pairs, src["base_url"], src["project_id"], src["token"],
-                    src["status"], sub, f"s{idx}-", src["until"],
+                    src["status"], sub, f"s{idx}-", src["until"], progress,
+                    src.get("retries"), cancel_event,
                 )
+                if cancel_event.is_set():
+                    return  # cancelled mid-download; status set by cancel_transform
             else:  # s3
                 if not (src["s3_target"] and src["s3_metadata_uri"]):
                     await _finish(output_id, "failed",
@@ -531,6 +577,14 @@ async def _run_merge(
                         src["audio_field"], src["transcription_field"], sub, f"s{idx}-", progress,
                     )
             await _log(output_id, f"  ↳ {len(pairs)} clip(s) from '{src['name']}'")
+            if dl_stats is not None:
+                if dl_stats.get("failed"):
+                    await _log(output_id,
+                               f"  ↳ ⚠ {dl_stats['failed']}/{dl_stats['total']} clip(s) "
+                               f"failed to download from '{src['name']}'")
+                if _over_fail_threshold(dl_stats):
+                    await _finish(output_id, "failed", f"[{src['name']}] {_dl_abort_msg(dl_stats)}")
+                    return
             all_pairs.extend(pairs)
 
         if not all_pairs:
@@ -565,6 +619,7 @@ async def _run_merge(
         await _finish(output_id, "failed", f"merge failed: {e}")
         logger.exception("merge %s failed", output_id)
     finally:
+        _cancel_events.pop(output_id, None)
         if work and success:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -1016,6 +1071,127 @@ _CT_EXT = {
 }
 
 
+def _dl_summary_line(stats: dict) -> str:
+    """One-line transform_log summary of a label-project download pass."""
+    t, d, f = stats.get("total", 0), stats.get("downloaded", 0), stats.get("failed", 0)
+    line = f"downloaded {d}/{t} audio clip(s)"
+    if f:
+        line += f" — ⚠ {f} still failed after {_LABEL_DL_RETRIES} attempts"
+    return line
+
+
+def _over_fail_threshold(stats: dict) -> bool:
+    """Whether a download pass lost too large a fraction of clips to trust the
+    output. No failures → never; _LABEL_DL_MAX_FAIL_PCT ≥ 100 → effectively off."""
+    t, f = stats.get("total", 0), stats.get("failed", 0)
+    if t <= 0 or f <= 0:
+        return False
+    return (f / t * 100.0) > _LABEL_DL_MAX_FAIL_PCT
+
+
+def _dl_abort_msg(stats: dict) -> str:
+    t, f = stats.get("total", 0), stats.get("failed", 0)
+    pct = (f / t * 100.0) if t else 0.0
+    return (
+        f"aborting: {f}/{t} audio download(s) failed ({pct:.1f}% > "
+        f"{_LABEL_DL_MAX_FAIL_PCT:.1f}% allowed). The clips are usually fine — the "
+        f"labelling-platform ingress tends to flake under load; re-run the transform "
+        f"to pick them up. To materialise the partial set anyway, raise "
+        f"LABEL_DOWNLOAD_MAX_FAIL_PCT (e.g. =100)."
+    )
+
+
+def _interruptible_sleep(seconds: float, cancel_event: Optional[threading.Event]) -> None:
+    """Sleep, but wake immediately if a cancel is requested — `Event.wait` returns
+    as soon as it's set, so an (unbounded) retry backoff can't delay cancellation."""
+    if cancel_event is None:
+        time.sleep(seconds)
+    else:
+        cancel_event.wait(timeout=seconds)
+
+
+def _download_label_clip(
+    cli: "httpx.Client",
+    r: dict,
+    i: int,
+    base: str,
+    project_id: str,
+    token: str,
+    name_prefix: str,
+    audio_dir: Path,
+    retries: Optional[int],
+    cancel_event: Optional[threading.Event] = None,
+) -> Optional[tuple[str, str, str, dict]]:
+    """Fetch ONE task's audio → (split, abs_path, transcription, {}), or None when
+    it can't be fetched. Each ROUND tries every candidate URL once; a round that
+    fails everything backs off (capped exponential) and retries.
+
+    `retries` bounds the rounds: **None / ≤ 0 means RETRY UNTIL SUCCESS** (the
+    default) — a transient platform-ingress flap under load never drops the row,
+    it keeps trying until the clip returns (or the transform is cancelled, checked
+    each round + during backoff). A positive value caps the rounds and counts a
+    give-up as a failure. Runs concurrently from a thread pool, so it touches only
+    its own row + a uniquely-named dest file.
+
+    Audio resolution mirrors the gateway's label-audio proxy: a presigned
+    off-platform `audio_url` is tried first (no platform load); else (or on
+    failure) the platform's authenticated task-audio endpoint whenever there's a
+    task id. `name_prefix` keeps basenames unique across merged projects."""
+    import os as _os
+    from urllib.parse import unquote, urlparse
+
+    u = str(r.get("audio_url") or "").strip()
+    tid = r.get("id")
+    candidates: list[tuple[str, dict]] = []
+    if u and not u.startswith(base):
+        candidates.append((u, {}))                       # direct presigned
+    if tid is not None:
+        candidates.append((f"{base}/api/projects/{project_id}/tasks/{tid}/audio",
+                           {"Authorization": f"Bearer {token}"}))
+    elif u and u.startswith(base):
+        candidates.append((u, {"Authorization": f"Bearer {token}"}))  # on-platform; needs token
+    if not candidates:
+        return None
+
+    infinite = retries is None or retries <= 0
+    resp = None
+    rnd = 0
+    while resp is None:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        for dl_url, dl_headers in candidates:
+            try:
+                rr = cli.get(dl_url, headers=dl_headers)
+                rr.raise_for_status()
+                resp = rr
+                break
+            except Exception:  # noqa: BLE001 — try the next candidate this round
+                continue
+        if resp is not None:
+            break
+        rnd += 1
+        if not infinite and rnd >= retries:
+            break
+        # Back off before the next round (capped), waking early on cancel.
+        _interruptible_sleep(min(0.5 * (2 ** min(rnd, 6)), 15.0), cancel_event)
+    if resp is None:
+        logger.warning("label audio download gave up (task=%s, rounds=%d, retries=%s)",
+                       tid, rnd, "∞" if infinite else retries)
+        return None
+
+    # Pick an extension: URL basename, else the response content-type.
+    ext = _os.path.splitext(unquote(_os.path.basename(urlparse(u).path)))[1].lower()
+    if ext not in _AUDIO_EXTS:
+        ext = _CT_EXT.get((resp.headers.get("content-type") or "").split(";")[0].strip().lower(), ".wav")
+    name = f"{name_prefix}task-{tid}{ext}" if tid is not None else f"{name_prefix}row-{i}{ext}"
+    dest = audio_dir / name
+    dest.write_bytes(resp.content)
+    text = r.get("transcription")
+    text = "" if text is None else str(text)
+    split = str(r.get("split") or "train")
+    return (split, str(dest), text, {})
+
+
 def _label_pairs(
     base_url: str,
     project_id: str,
@@ -1024,26 +1200,20 @@ def _label_pairs(
     work: str,
     name_prefix: str = "",
     until: Optional[str] = None,
-) -> list[tuple[str, str, str, dict]]:
+    progress: Optional[Callable[..., None]] = None,
+    retries: Optional[int] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[list[tuple[str, str, str, dict]], dict]:
     """Stream a labeling-platform project export (export.v1.jsonl) and download
-    each task's audio into `work/audio`. Returns [(split, abs_audio_path,
-    transcription, extra)] — the same shape `_build_pairs` produces for HF
-    sources (extra is empty here), so the HF/S3 target writers are reused.
-
-    `name_prefix` is prepended to each downloaded filename — used by the merge
-    job to keep basenames unique ACROSS projects (S3 keys collide on basename;
-    two projects can each have a `task-5.wav`). Empty for the single-project path.
-    `until` (ISO-8601) is the point-in-time cutoff forwarded to the export so only
-    tasks last updated at or before it are pulled.
-
-    Audio resolution mirrors the gateway's label-audio proxy: tasks whose
-    `audio_url` lives under the platform (or that only expose a task id) are
-    fetched from `/api/projects/{pid}/tasks/{tid}/audio` with the bearer token;
-    presigned-S3 `audio_url`s are downloaded directly (no auth header — the
-    signature lives in the query string)."""
-    import os as _os
-    from urllib.parse import unquote, urlparse
-
+    each task's audio into `work/audio`, CONCURRENTLY, retrying each clip per
+    `retries` (None/≤0 = until success — the default). Returns (pairs, stats):
+    pairs = [(split, abs_audio_path, transcription, extra)] (the same shape
+    `_build_pairs` produces for HF sources, so the HF/S3 target writers are
+    reused); stats = {"total", "downloaded", "failed"}. With the default
+    retry-until-success, `failed` is 0 unless cancelled or a row has no fetchable
+    URL at all; with a finite `retries`, a give-up is COUNTED (and logged) rather
+    than silently dropped — the caller decides whether the rate is acceptable (see
+    `_over_fail_threshold`). `name_prefix` keeps basenames unique across projects."""
     import httpx
 
     from .datasets_api import _label_export_rows
@@ -1055,50 +1225,41 @@ def _label_pairs(
 
     audio_dir = Path(work) / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
+
+    n_total = len(rows)
     pairs: list[tuple[str, str, str, dict]] = []
-    with httpx.Client(timeout=120.0, follow_redirects=True) as cli:
-        for i, r in enumerate(rows):
-            u = str(r.get("audio_url") or "").strip()
-            tid = r.get("id")
-            # Candidate download URLs, in priority order. A presigned off-platform
-            # `audio_url` is fastest (no platform load); but some storage configs
-            # presign an S3 endpoint we can't resolve (e.g. a non-routable region
-            # host), so fall back to the platform's authenticated task-audio
-            # endpoint whenever there's a task id.
-            candidates: list[tuple[str, dict]] = []
-            if u and not u.startswith(base):
-                candidates.append((u, {}))                       # direct presigned
-            if tid is not None:
-                candidates.append((f"{base}/api/projects/{project_id}/tasks/{tid}/audio",
-                                   {"Authorization": f"Bearer {token}"}))
-            elif u and u.startswith(base):
-                candidates.append((u, {"Authorization": f"Bearer {token}"}))  # on-platform; needs token
-            if not candidates:
-                continue
-            resp = None
-            for dl_url, dl_headers in candidates:
+    n_fail = 0
+    n_done = 0
+    lock = threading.Lock()
+    # One shared client (httpx.Client is safe across threads); size the pool to the
+    # worker count so keep-alive connections are reused rather than thrashed.
+    limits = httpx.Limits(max_connections=_LABEL_DL_CONCURRENCY,
+                          max_keepalive_connections=_LABEL_DL_CONCURRENCY)
+    with httpx.Client(timeout=httpx.Timeout(60.0), follow_redirects=True, limits=limits) as cli:
+        with ThreadPoolExecutor(max_workers=_LABEL_DL_CONCURRENCY) as ex:
+            futs = [
+                ex.submit(_download_label_clip, cli, r, i, base, project_id, token,
+                          name_prefix, audio_dir, retries, cancel_event)
+                for i, r in enumerate(rows)
+            ]
+            for fut in as_completed(futs):
                 try:
-                    rr = cli.get(dl_url, headers=dl_headers)
-                    rr.raise_for_status()
-                    resp = rr
-                    break
-                except Exception:  # noqa: BLE001 — try the next candidate
-                    continue
-            if resp is None:
-                logger.warning("label audio download failed (task=%s)", tid)
-                continue
-            # Pick an extension: URL basename, else the response content-type.
-            ext = _os.path.splitext(unquote(_os.path.basename(urlparse(u).path)))[1].lower()
-            if ext not in _AUDIO_EXTS:
-                ext = _CT_EXT.get((resp.headers.get("content-type") or "").split(";")[0].strip().lower(), ".wav")
-            name = f"{name_prefix}task-{tid}{ext}" if tid is not None else f"{name_prefix}row-{i}{ext}"
-            dest = audio_dir / name
-            dest.write_bytes(resp.content)
-            text = r.get("transcription")
-            text = "" if text is None else str(text)
-            split = str(r.get("split") or "train")
-            pairs.append((split, str(dest), text, {}))
-    return pairs
+                    res = fut.result()
+                except Exception:  # noqa: BLE001 — defensive; count as a failed clip
+                    res = None
+                with lock:
+                    n_done += 1
+                    if res is None:
+                        n_fail += 1
+                    else:
+                        pairs.append(res)
+                    done = n_done
+                if progress is not None and (done % 50 == 0 or done == n_total):
+                    try:
+                        progress("download", done, n_total)
+                    except Exception:  # noqa: BLE001 — progress is best-effort
+                        pass
+    return pairs, {"total": n_total, "downloaded": len(pairs), "failed": n_fail}
 
 
 def _same_account(a, b) -> bool:

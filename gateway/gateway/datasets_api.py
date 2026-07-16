@@ -83,6 +83,10 @@ class CreateDatasetRequest(BaseModel):
     label_token_secret: Optional[str] = None # OR: a global-secret key holding the lpat token
     label_status: Optional[str] = None       # approved | rejected | not_reviewed | all (default approved)
     label_updated_until: Optional[str] = None # ISO-8601 cutoff — import only tasks last updated at/before it
+    # Per-clip audio-download retry cap for the transform. None/≤0 → retry until
+    # success (default; the platform ingress flakes under load). A positive value
+    # caps attempts (a give-up is then counted + surfaced instead of silently dropped).
+    label_download_retries: Optional[int] = None
 
 
 class UpdateDatasetRequest(BaseModel):
@@ -106,6 +110,8 @@ class UpdateDatasetRequest(BaseModel):
     # point-in-time cutoff. Changing either re-counts the dataset's rows.
     label_status: Optional[str] = None
     label_updated_until: Optional[str] = None
+    # Per-clip transform retry cap. None → leave unchanged; ≤0 → retry until success.
+    label_download_retries: Optional[int] = None
 
 
 class RowInclusionRequest(BaseModel):
@@ -285,6 +291,7 @@ class DatasetRecord(BaseModel):
     label_project_id: Optional[str] = None
     label_status: Optional[str] = None
     label_updated_until: Optional[str] = None  # ISO-8601 point-in-time import cutoff (None → no upper bound)
+    label_download_retries: Optional[int] = None  # per-clip transform retry cap (None/≤0 → retry until success)
     label_token_secret: Optional[str] = None  # global-secret key (if used instead of a stored token)
     transform_status: Optional[str] = None  # "" | running | done | failed
     transform_log: Optional[str] = None     # short tail of progress lines
@@ -402,6 +409,7 @@ def _to_record(
         label_project_id=getattr(d, "label_project_id", None),
         label_status=getattr(d, "label_status", None),
         label_updated_until=getattr(d, "label_updated_until", None),
+        label_download_retries=getattr(d, "label_download_retries", None),
         label_token_secret=getattr(d, "label_token_secret", None),
         messages_field=getattr(d, "messages_field", None) or None,
         rejected_field=getattr(d, "rejected_field", None) or None,
@@ -775,6 +783,7 @@ async def create_dataset(
         label_token_secret=label_token_secret_val,
         label_status=label_status_val,
         label_updated_until=label_updated_until_val,
+        label_download_retries=(req.label_download_retries if req.kind == "label" else None),
     )
     if req.kind == "label":
         # The Label export uses audio_url + transcription columns.
@@ -1065,6 +1074,9 @@ async def update_dataset(
             if cutoff != d.label_updated_until:
                 d.label_updated_until = cutoff
                 label_filter_changed = True
+        if req.label_download_retries is not None:
+            # Retry policy only affects the NEXT transform, not the row count.
+            d.label_download_retries = req.label_download_retries
     if label_filter_changed:
         tok = await _label_token(d, session)
         if d.label_base_url and d.label_project_id and tok:

@@ -217,6 +217,7 @@ export function DatasetDetail({
                 datasetId={dataset.id}
                 labelStatus={dataset.label_status}
                 labelUpdatedUntil={dataset.label_updated_until}
+                labelDownloadRetries={dataset.label_download_retries}
               />
             )}
             <ColumnsCard
