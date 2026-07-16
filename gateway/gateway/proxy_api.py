@@ -112,6 +112,10 @@ class UpstreamSpec(BaseModel):
     models: dict[str, str] = {}           # alias -> real upstream model name
     priority: int = 0
     enabled: bool = True
+    # Extra top-level JSON merged into every forwarded body for this upstream, e.g.
+    # OpenRouter provider pinning: {"provider": {"order": ["ModelRun"], "allow_fallbacks": false}}.
+    # Optional; the upstream's own keys win over the caller's, `model` always wins over both.
+    extra_body: Optional[dict] = None
 
 
 class CreateProxyRequest(BaseModel):
@@ -143,6 +147,7 @@ class UpstreamRecord(BaseModel):
     models: dict[str, str] = {}
     priority: int = 0
     enabled: bool = True
+    extra_body: dict = {}
 
 
 class ProxyEndpointRecord(BaseModel):
@@ -194,6 +199,7 @@ class TestUpstreamRequest(BaseModel):
     api_key: Optional[str] = None
     model: Optional[str] = None   # real upstream model to end-to-end test; None = just probe /models
     mode: str = "chat"            # "chat" | "embedding" — which endpoint to end-to-end test
+    extra_body: Optional[dict] = None  # merged into the chat test body (e.g. provider pinning)
 
 
 class TestUpstreamResponse(BaseModel):
@@ -316,7 +322,7 @@ def _upstream_record(u: dict) -> UpstreamRecord:
         id=u.get("id", ""), name=u.get("name", ""), base_url=u.get("base_url", ""),
         api_key_secret=u.get("api_key_secret"), has_inline_key=bool(u.get("api_key_enc")),
         models=u.get("models") or {}, priority=int(u.get("priority", 0)),
-        enabled=bool(u.get("enabled", True)),
+        enabled=bool(u.get("enabled", True)), extra_body=u.get("extra_body") or {},
     )
 
 
@@ -397,6 +403,11 @@ def _build_upstreams(specs: list[UpstreamSpec], existing: Optional[list[dict]] =
             "priority": int(sp.priority),
             "enabled": bool(sp.enabled),
         }
+        # extra_body is admin intent, not a secret — always round-tripped by the form,
+        # so store it verbatim when it's a non-empty object, drop it otherwise (no
+        # preserve-on-omit like keys: sending {} / null clears it).
+        if isinstance(sp.extra_body, dict) and sp.extra_body:
+            u["extra_body"] = sp.extra_body
         ref = (sp.api_key_secret or "").strip()
         if ref:
             u["api_key_secret"] = ref  # secret reference wins; no inline key kept
@@ -477,7 +488,7 @@ async def _do_unary(app, endpoint_id: str, candidates: list[dict], alias: str,
     cli = _http(app)
     last_err = "no upstream"
     for u in candidates:
-        body = {**payload, "model": u["models"][alias]}
+        body = {**payload, **(u.get("extra_body") or {}), "model": u["models"][alias]}
         headers = {"Content-Type": "application/json"}
         if u.get("_key"):
             headers["Authorization"] = f"Bearer {u['_key']}"
@@ -642,7 +653,7 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
         await _set_started(request_id)
         last_err = "no upstream"
         for u in candidates:
-            body = {**payload, "model": u["models"][alias], "stream": True}
+            body = {**payload, **(u.get("extra_body") or {}), "model": u["models"][alias], "stream": True}
             # Ask for a final usage chunk so streamed requests record token counts too
             # (vLLM/OpenAI emit it last when include_usage=true). Don't clobber a caller's.
             body.setdefault("stream_options", {"include_usage": True})
@@ -1139,7 +1150,11 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
         return await _handle(request, user, endpoint_name, payload, upstream_path)
 
     endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias)
-    if len(candidates) == 1:
+    # The passthrough fast path only rewrites the `model` value in-place in the byte
+    # stream; it can't inject new top-level keys. An upstream with extra_body (e.g.
+    # OpenRouter provider pinning) must go through the buffered path so extra_body is
+    # merged into the parsed payload.
+    if len(candidates) == 1 and not candidates[0].get("extra_body"):
         cand = candidates[0]
         real = cand["models"][alias]
         head = ing["head"]
@@ -1564,10 +1579,11 @@ async def test_upstream(req: TestUpstreamRequest, request: Request,
 
     # With a model, do a real end-to-end check: a tiny "hello" chat completion.
     if model:
+        extra = req.extra_body if isinstance(req.extra_body, dict) else {}
         try:
             r = await cli.post(
                 base + "/chat/completions",
-                json={"model": model, "messages": [{"role": "user", "content": "hello"}], "max_tokens": 16, "stream": False},
+                json={**extra, "model": model, "messages": [{"role": "user", "content": "hello"}], "max_tokens": 16, "stream": False},
                 headers=headers, timeout=httpx.Timeout(30.0),
             )
         except httpx.HTTPError as e:

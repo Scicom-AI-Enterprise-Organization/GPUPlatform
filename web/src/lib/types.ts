@@ -1554,6 +1554,7 @@ export type ProxyUpstream = {
   models: Record<string, string>; // alias -> real upstream model
   priority: number;
   enabled: boolean;
+  extra_body?: Record<string, unknown>; // merged into every forwarded body (e.g. OpenRouter provider pinning)
 };
 
 export type ProxyEndpoint = {
@@ -1581,6 +1582,7 @@ export type ProxyUpstreamSpec = {
   models: Record<string, string>;
   priority: number;
   enabled: boolean;
+  extra_body?: Record<string, unknown> | null;
 };
 
 export type CreateProxyBody = {
@@ -1629,6 +1631,7 @@ export type TestProxyUpstreamBody = {
   api_key?: string | null;
   model?: string | null; // real upstream model to end-to-end test; omitted = probe /models
   mode?: "chat" | "embedding"; // which endpoint to test (default chat)
+  extra_body?: Record<string, unknown> | null; // merged into the chat test body
 };
 
 export type TestProxyUpstreamResult = {
