@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { gateway } from "@/lib/gateway";
 import type { ProxyEndpoint, ProxyUpstreamSpec } from "@/lib/types";
 import { FormFooter, FormShell } from "@/components/form-shell";
@@ -24,6 +25,7 @@ type UpstreamDraft = {
   priority: number;
   enabled: boolean;
   hadKey: boolean;
+  extraBody: string; // raw JSON text; parsed + validated on submit
   testMode: "chat" | "embedding";
   test: { status: "idle" | "running" | "ok" | "fail"; message?: string };
 };
@@ -32,8 +34,22 @@ function blankUpstream(): UpstreamDraft {
   return {
     name: "", base_url: "", keyMode: "secret", api_key_secret: "", api_key: "",
     models: [{ alias: "", real: "" }], priority: 0, enabled: true, hadKey: false,
-    testMode: "chat", test: { status: "idle" },
+    extraBody: "", testMode: "chat", test: { status: "idle" },
   };
+}
+
+// Parse an upstream's raw extra_body text. "" → undefined (field omitted). Non-empty
+// must be a JSON object; anything else is a form error surfaced on submit/test.
+function parseExtraBody(text: string): { ok: true; value?: Record<string, unknown> } | { ok: false } {
+  const t = text.trim();
+  if (!t) return { ok: true, value: undefined };
+  try {
+    const v = JSON.parse(t);
+    if (v && typeof v === "object" && !Array.isArray(v)) return { ok: true, value: v as Record<string, unknown> };
+    return { ok: false };
+  } catch {
+    return { ok: false };
+  }
 }
 
 // Seed the first upstream from a deep-link prefill (e.g. the serverless "Proxy"
@@ -65,6 +81,7 @@ function fromEndpoint(ep: ProxyEndpoint): UpstreamDraft[] {
     priority: u.priority,
     enabled: u.enabled,
     hadKey: u.has_inline_key || !!u.api_key_secret,
+    extraBody: u.extra_body && Object.keys(u.extra_body).length ? JSON.stringify(u.extra_body, null, 2) : "",
     testMode: "chat",
     test: { status: "idle" },
   }));
@@ -99,6 +116,8 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
     // endpoint matching the chosen mode (chat vs embeddings). Falls back to a
     // plain /models probe if no model is set yet.
     const model = u.models.map((m) => m.real.trim()).find((x) => x) || undefined;
+    const eb = parseExtraBody(u.extraBody);
+    if (!eb.ok) { patch(i, { test: { status: "fail", message: "Extra body must be valid JSON object" } }); return; }
     patch(i, { test: { status: "running" } });
     try {
       const r = await gateway.testProxyUpstream({
@@ -107,6 +126,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         api_key: u.keyMode === "paste" ? u.api_key.trim() || null : null,
         model,
         mode: u.testMode,
+        extra_body: eb.value ?? null,
       });
       patch(i, { test: { status: r.ok ? "ok" : "fail", message: r.ok ? `${r.message} · ${r.latency_ms ?? "?"}ms` : r.message } });
     } catch (e) {
@@ -126,6 +146,8 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         if (m.alias.trim() && m.real.trim()) models[m.alias.trim()] = m.real.trim();
       }
       if (Object.keys(models).length === 0) return { ok: false, err: `Upstream "${u.name}" needs at least one model mapping (alias → upstream model).` };
+      const eb = parseExtraBody(u.extraBody);
+      if (!eb.ok) return { ok: false, err: `Upstream "${u.name}": Extra body must be a valid JSON object.` };
       specs.push({
         id: u.id,
         name: u.name.trim(),
@@ -135,6 +157,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         models,
         priority: Number(u.priority) || 0,
         enabled: u.enabled,
+        extra_body: eb.value ?? null,
       });
     }
     return { ok: true, upstreams: specs };
@@ -284,6 +307,17 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
                     <Plus className="h-3 w-3" /> Add model
                   </Button>
                 </div>
+              </div>
+
+              {/* extra body — optional JSON merged into every forwarded request for this upstream */}
+              <div className="mt-3">
+                <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Extra body (JSON)</Label>
+                <Textarea value={u.extraBody} onChange={(e) => patch(i, { extraBody: e.target.value })} rows={4} spellCheck={false}
+                          placeholder={'{\n  "provider": { "order": ["ModelRun"], "allow_fallbacks": false }\n}'}
+                          className="font-mono text-xs" />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Optional. Merged into every forwarded body — e.g. OpenRouter <span className="font-mono">provider</span> pinning. The upstream&apos;s keys win over the caller&apos;s; <span className="font-mono">model</span> always wins.
+                </p>
               </div>
 
               {/* test — sends a real "hello" to the endpoint matching the chosen mode (chat or embeddings) */}
