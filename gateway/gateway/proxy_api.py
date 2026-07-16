@@ -677,11 +677,11 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
             asyncio.create_task(_finish(request_id, "cancelled", status_code=499, error="client disconnected"))
 
 
-async def _prepare(app, endpoint_name: str, alias: str, user: User, is_stream: bool):
-    """Resolve the endpoint + candidate upstreams for `alias`, resolve their keys, and
-    record a queued ProxyRequest. Returns (endpoint_id, candidates, timeout_s, max_conc,
-    request_id). Raises 404 if the endpoint or model alias is unknown/disabled."""
-    request_id = f"pxr-{_secrets.token_hex(8)}"
+async def _route(app, endpoint_name: str, alias: str):
+    """Resolve the endpoint + candidate upstreams for `alias` and their keys (NO DB row).
+    Returns (endpoint_id, candidates, timeout_s, max_conc). Raises 404 if the endpoint or
+    model alias is unknown/disabled. Split out of _prepare so the streaming-passthrough path
+    can decide single-vs-multi upstream BEFORE committing a request row."""
     async with session_factory()() as s:
         ep = (await s.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint_name))).scalar_one_or_none()
         if ep is None or not ep.enabled:
@@ -696,12 +696,25 @@ async def _prepare(app, endpoint_name: str, alias: str, user: User, is_stream: b
             u["_key"] = _resolve_key(u, genv)
         max_conc = int(cfg.get("max_concurrency") or 0)
         timeout_s = float(cfg.get("timeout_s") or DEFAULT_TIMEOUT_S)
+    return endpoint_id, candidates, timeout_s, max_conc
+
+
+async def _insert_request_row(request_id, endpoint_id, user, alias, is_stream) -> None:
+    async with session_factory()() as s:
         s.add(ProxyRequest(
             id=request_id, endpoint_id=endpoint_id, owner_id=getattr(user, "id", None),
             model=alias, status="queued", is_stream=is_stream,
             created_at=datetime.now(timezone.utc),
         ))
         await s.commit()
+
+
+async def _prepare(app, endpoint_name: str, alias: str, user: User, is_stream: bool):
+    """Resolve routing (via _route) + record a queued ProxyRequest. Returns
+    (endpoint_id, candidates, timeout_s, max_conc, request_id)."""
+    request_id = f"pxr-{_secrets.token_hex(8)}"
+    endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias)
+    await _insert_request_row(request_id, endpoint_id, user, alias, is_stream)
     return endpoint_id, candidates, timeout_s, max_conc, request_id
 
 
@@ -714,6 +727,9 @@ def _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stre
 
 
 async def _handle(request: Request, user: User, endpoint_name: str, payload: dict, upstream_path: str) -> Response:
+    """Classic path: a fully-buffered payload dict. Routes + records the row, then dispatches
+    (supports failover across candidates). Used by embeddings and by the buffered fallbacks
+    of _handle_ingest."""
     app = request.app
     alias = payload.get("model")
     if not isinstance(alias, str) or not alias.strip():
@@ -721,6 +737,14 @@ async def _handle(request: Request, user: User, endpoint_name: str, payload: dic
     alias = alias.strip()
     is_stream = bool(payload.get("stream"))
     endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, is_stream)
+    return await _dispatch_buffered(app, request, user, endpoint_id, candidates, alias, is_stream,
+                                    timeout_s, max_conc, request_id, payload, upstream_path)
+
+
+async def _dispatch_buffered(app, request, user, endpoint_id, candidates, alias, is_stream,
+                             timeout_s, max_conc, request_id, payload, upstream_path) -> Response:
+    """Forward a fully-buffered payload dict — the classic engine (_stream / _do_unary),
+    which supports failover across multiple candidate upstreams."""
     sem = _get_sem(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream)
@@ -742,6 +766,326 @@ async def _handle(request: Request, user: User, endpoint_name: str, payload: dic
     return await _unary(app, request, request_id,
                         lambda: _do_unary(app, endpoint_id, candidates, alias, payload, upstream_path, timeout_s),
                         sem, cancel_ev)
+
+
+# ---------- streaming request-body passthrough (big-payload latency fix) -----
+#
+# A chat/completions body carrying a base64 image can be ~1 MB. Declaring the route
+# `payload: dict` makes FastAPI BUFFER + parse the whole body before we forward, so the
+# client→gateway upload and the gateway→upstream relay run SERIALLY (measured: +~500 ms
+# TTFT on a ~960 KB image through a WAN gateway hop). Instead we read the body as a stream,
+# pull just enough to find + rewrite the top-level `model` alias, then relay the remainder
+# to the upstream AS IT ARRIVES — overlapping the two uploads. Kill-switch:
+# PROXY_STREAM_PASSTHROUGH=0 reverts to the classic buffered path.
+
+_STREAM_PASSTHROUGH_CAP = int(os.environ.get("PROXY_STREAM_HEAD_CAP", "65536") or "65536")
+
+
+def _scan_top_level_model(buf: bytes):
+    """Find the top-level "model" string value in a (possibly PARTIAL) JSON object body.
+    Returns ("found", vstart, vend, alias) with byte offsets of the value (excluding the
+    surrounding quotes), ("absent",) if the root object closed / body isn't a JSON object
+    without a top-level model, or ("need_more",) if the buffer ends before we can decide.
+    base64 image data can't contain a double-quote, so a depth-1 '"model"' key is
+    unambiguous; we still depth-gate + skip string contents to be safe."""
+    n = len(buf)
+    i = 0
+    while i < n and buf[i] in b" \t\r\n":
+        i += 1
+    if i >= n:
+        return ("need_more",)
+    if buf[i] != 0x7b:  # '{'
+        return ("absent",)
+    i += 1
+    depth = 1
+    expect_key = True
+    while i < n:
+        c = buf[i]
+        if c in b" \t\r\n":
+            i += 1; continue
+        if c == 0x7d:  # '}'
+            depth -= 1; i += 1; expect_key = False
+            if depth == 0:
+                return ("absent",)
+            continue
+        if c == 0x5d:  # ']'
+            depth -= 1; i += 1; expect_key = False; continue
+        if c == 0x2c:  # ','
+            i += 1
+            if depth == 1:
+                expect_key = True
+            continue
+        if c == 0x3a:  # ':'
+            i += 1; continue
+        if c in b"[{":
+            depth += 1; i += 1; expect_key = False; continue
+        if c == 0x22:  # '"' — a string token
+            j = i + 1
+            while j < n:
+                if buf[j] == 0x5c:  # backslash escape
+                    j += 2; continue
+                if buf[j] == 0x22:
+                    break
+                j += 1
+            if j >= n:
+                return ("need_more",)
+            s = buf[i+1:j]
+            end = j + 1
+            if depth == 1 and expect_key:
+                k = end
+                while k < n and buf[k] in b" \t\r\n":
+                    k += 1
+                if k >= n:
+                    return ("need_more",)
+                if buf[k] != 0x3a:  # not a ':' — malformed, let caller buffer + parse
+                    return ("absent",)
+                k += 1
+                while k < n and buf[k] in b" \t\r\n":
+                    k += 1
+                if k >= n:
+                    return ("need_more",)
+                if s == b"model":
+                    if buf[k] != 0x22:  # model value isn't a string
+                        return ("absent",)
+                    v = k + 1
+                    while v < n:
+                        if buf[v] == 0x5c:
+                            v += 2; continue
+                        if buf[v] == 0x22:
+                            break
+                        v += 1
+                    if v >= n:
+                        return ("need_more",)
+                    return ("found", k+1, v, buf[k+1:v].decode("utf-8", "ignore"))
+                i = k; expect_key = False; continue  # non-model key: skip to its value
+            else:
+                i = end; expect_key = False; continue
+        i += 1; expect_key = False  # scalar char (number / true / false / null)
+    return ("need_more",)
+
+
+async def _ingest_body(request: Request) -> dict:
+    """Read the request body, locating the top-level `model` within the first
+    _STREAM_PASSTHROUGH_CAP bytes. Returns either:
+      {"mode":"stream", "alias", "head", "vstart", "vend", "it"} — model found early; `it`
+          is the (partially-consumed) body iterator whose remainder can be relayed live, or
+      {"mode":"buffer", "payload": dict|None} — whole body buffered + parsed (classic path).
+    Degrades to buffer mode on any scan/read hiccup (never streams uncertain input)."""
+    it = request.stream().__aiter__()
+    buf = bytearray()
+    ended = False
+    try:
+        while True:
+            st = _scan_top_level_model(bytes(buf))
+            if st[0] == "found":
+                return {"mode": "stream", "alias": st[3], "head": bytes(buf),
+                        "vstart": st[1], "vend": st[2], "it": it}
+            if st[0] == "absent" or len(buf) >= _STREAM_PASSTHROUGH_CAP:
+                break
+            try:
+                chunk = await it.__anext__()
+            except StopAsyncIteration:
+                ended = True; break
+            if not chunk:
+                ended = True; break
+            buf.extend(chunk)
+    except Exception:
+        pass  # fall through to buffered mode
+    if not ended:
+        while True:
+            try:
+                chunk = await it.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception:
+                break
+            if chunk:
+                buf.extend(chunk)
+    try:
+        payload = json.loads(bytes(buf)) if buf else None
+    except Exception:
+        payload = None
+    return {"mode": "buffer", "payload": payload}
+
+
+async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, upstream_path,
+                               head: bytes, body_it, timeout_s, max_conc, is_stream_hint) -> Response:
+    """Single-upstream forward that STREAMS the request body (with `model` rewritten) to the
+    upstream as it keeps arriving from the client — overlapping the client→gateway upload
+    with the gateway→upstream relay. Branches the RESPONSE on the upstream's content-type
+    (SSE vs JSON), so we needn't pre-know the client's `stream` flag. No failover (single
+    candidate by construction); this also surfaces a non-2xx upstream (e.g. nginx 413) with
+    its REAL status instead of masking it inside a 200 SSE envelope."""
+    request_id = f"pxr-{_secrets.token_hex(8)}"
+    await _insert_request_row(request_id, endpoint_id, user, alias, is_stream_hint)
+    sem = _get_sem(app, endpoint_id, max_conc)
+    cancel_ev = asyncio.Event()
+    _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream_hint)
+    live = _live(app)
+    cli = _http(app)
+    url = cand["base_url"].rstrip("/") + upstream_path
+    headers = {"Content-Type": "application/json"}
+    if cand.get("_key"):
+        headers["Authorization"] = f"Bearer {cand['_key']}"
+
+    async def _agen():
+        yield head
+        async for chunk in body_it:
+            yield chunk
+
+    acquired = False
+    handed_off = False
+    try:
+        if sem is not None:
+            await sem.acquire(); acquired = True
+        if cancel_ev.is_set():
+            raise asyncio.CancelledError()
+        if request_id in live:
+            live[request_id]["state"] = "running"; live[request_id]["upstream"] = cand["name"]
+        await _set_started(request_id, upstream=cand["name"])
+        t0 = time.perf_counter()
+        req = cli.build_request("POST", url, content=_agen(), headers=headers,
+                                timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+        r = await cli.send(req, stream=True)
+        lat = int((time.perf_counter() - t0) * 1000)
+        _mark_health(app, endpoint_id, cand["id"], r.status_code < 500,
+                     latency_ms=lat, error=None if r.status_code < 500 else f"HTTP {r.status_code}")
+        base_hdrs = {"X-Request-Id": request_id, "X-Upstream-Url": cand["base_url"], "X-Upstream-Name": cand["name"]}
+        if "text/event-stream" not in r.headers.get("content-type", ""):
+            data = await r.aread()
+            await r.aclose()
+            if acquired and sem is not None:
+                sem.release(); acquired = False
+            try:
+                obj = json.loads(data)
+            except Exception:
+                obj = {"raw": data.decode("utf-8", "ignore")}
+            usage = (obj.get("usage") or {}) if isinstance(obj, dict) else {}
+            ok = r.status_code < 400
+            await _finish(request_id, "completed" if ok else "failed", status_code=r.status_code,
+                          latency_ms=lat, pt=usage.get("prompt_tokens"), ct=usage.get("completion_tokens"),
+                          upstream=cand["name"],
+                          error=None if ok else (json.dumps(obj)[:500] if isinstance(obj, dict) else str(obj)[:500]))
+            live.pop(request_id, None)
+            return JSONResponse(obj, status_code=r.status_code, headers=base_hdrs)
+        # SSE relay — hand the concurrency slot + cleanup off to the generator's finally.
+        handed_off = True
+        sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **base_hdrs}
+
+        async def _relay():
+            nonlocal acquired
+            ttft = None; pt = ct2 = None; usage_buf = ""; finished = False
+            try:
+                async for chunk in r.aiter_bytes():
+                    if cancel_ev.is_set():
+                        break
+                    if ttft is None:
+                        ttft = int((time.perf_counter() - t0) * 1000)
+                    yield chunk
+                    try:  # light usage sniff — same as _stream
+                        usage_buf += chunk.decode("utf-8", "ignore")
+                        while "\n\n" in usage_buf:
+                            frame, usage_buf = usage_buf.split("\n\n", 1)
+                            if '"usage"' not in frame:
+                                continue
+                            for ln in frame.split("\n"):
+                                if not ln.startswith("data:"):
+                                    continue
+                                d = ln[5:].strip()
+                                if not d or d == "[DONE]":
+                                    continue
+                                try:
+                                    us = json.loads(d).get("usage") or {}
+                                    if us.get("prompt_tokens") is not None:
+                                        pt = us["prompt_tokens"]
+                                    if us.get("completion_tokens") is not None:
+                                        ct2 = us["completion_tokens"]
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                finished = True
+                await _finish(request_id, "completed", status_code=r.status_code,
+                              latency_ms=int((time.perf_counter() - t0) * 1000),
+                              ttft_ms=ttft, pt=pt, ct=ct2, upstream=cand["name"])
+            finally:
+                try:
+                    await r.aclose()
+                except Exception:
+                    pass
+                if acquired and sem is not None:
+                    sem.release(); acquired = False
+                live.pop(request_id, None)
+                if not finished:
+                    asyncio.create_task(_finish(request_id, "cancelled", status_code=499, error="client disconnected"))
+
+        return StreamingResponse(_relay(), media_type="text/event-stream", headers=sse_headers)
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.ReadTimeout,
+            httpx.RemoteProtocolError, httpx.WriteError, asyncio.CancelledError) as e:
+        _mark_health(app, endpoint_id, cand["id"], False, error=str(e))
+        await _finish(request_id, "failed", status_code=502, error=f"{type(e).__name__}: {e}")
+        live.pop(request_id, None)
+        raise HTTPException(status_code=502, detail={"error": f"upstream failed: {type(e).__name__}"})
+    finally:
+        if acquired and sem is not None and not handed_off:
+            sem.release()
+
+
+async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstream_path: str) -> Response:
+    """Entry for chat/completions + completions. Streams the body straight through to a
+    single upstream when possible (overlap); otherwise buffers + uses the classic failover
+    path. PROXY_STREAM_PASSTHROUGH=0 forces the classic path for all requests."""
+    app = request.app
+    if os.environ.get("PROXY_STREAM_PASSTHROUGH", "1") == "0":
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail={"error": "invalid JSON body"})
+        return await _handle(request, user, endpoint_name, payload, upstream_path)
+
+    ing = await _ingest_body(request)
+    if ing["mode"] == "buffer":
+        payload = ing["payload"]
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail={"error": "invalid JSON body"})
+        return await _handle(request, user, endpoint_name, payload, upstream_path)
+
+    alias = (ing["alias"] or "").strip()
+    it = ing["it"]
+    if not alias:  # defensive: unusable alias — buffer the rest, classic path
+        rest = bytearray(ing["head"])
+        async for c in it:
+            rest.extend(c)
+        try:
+            payload = json.loads(bytes(rest))
+        except Exception:
+            raise HTTPException(status_code=400, detail={"error": "invalid JSON body"})
+        return await _handle(request, user, endpoint_name, payload, upstream_path)
+
+    endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias)
+    if len(candidates) == 1:
+        cand = candidates[0]
+        real = cand["models"][alias]
+        head = ing["head"]
+        new_head = head[:ing["vstart"]] + real.encode("utf-8") + head[ing["vend"]:]
+        flat = head.replace(b" ", b"").replace(b"\n", b"").replace(b"\t", b"").replace(b"\r", b"")
+        is_stream_hint = b'"stream":true' in flat[:4096]
+        return await _forward_passthrough(app, request, user, endpoint_id, cand, alias, upstream_path,
+                                          new_head, it, timeout_s, max_conc, is_stream_hint)
+
+    # multiple candidates → preserve failover: buffer the rest, parse, classic dispatch
+    rest = bytearray(ing["head"])
+    async for c in it:
+        rest.extend(c)
+    try:
+        payload = json.loads(bytes(rest))
+    except Exception:
+        raise HTTPException(status_code=400, detail={"error": "invalid JSON body"})
+    is_stream = bool(payload.get("stream"))
+    request_id = f"pxr-{_secrets.token_hex(8)}"
+    await _insert_request_row(request_id, endpoint_id, user, alias, is_stream)
+    return await _dispatch_buffered(app, request, user, endpoint_id, candidates, alias, is_stream,
+                                    timeout_s, max_conc, request_id, payload, upstream_path)
 
 
 async def _handle_audio(request: Request, user: User, endpoint_name: str, upstream_path: str) -> Response:
@@ -775,13 +1119,15 @@ async def _handle_audio(request: Request, user: User, endpoint_name: str, upstre
 # ---------- data-plane routes ------------------------------------------------
 
 @data_router.post("/proxy/{endpoint}/v1/chat/completions")
-async def proxy_chat(endpoint: str, payload: dict, request: Request, user: User = Depends(current_user)):
-    return await _handle(request, user, endpoint, payload, "/chat/completions")
+async def proxy_chat(endpoint: str, request: Request, user: User = Depends(current_user)):
+    # No `payload: dict` param on purpose — that would make FastAPI buffer the whole (possibly
+    # ~1 MB image) body before we forward. _handle_ingest streams it through instead.
+    return await _handle_ingest(request, user, endpoint, "/chat/completions")
 
 
 @data_router.post("/proxy/{endpoint}/v1/completions")
-async def proxy_completions(endpoint: str, payload: dict, request: Request, user: User = Depends(current_user)):
-    return await _handle(request, user, endpoint, payload, "/completions")
+async def proxy_completions(endpoint: str, request: Request, user: User = Depends(current_user)):
+    return await _handle_ingest(request, user, endpoint, "/completions")
 
 
 @data_router.post("/proxy/{endpoint}/v1/embeddings")
