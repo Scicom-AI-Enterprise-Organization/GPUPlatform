@@ -749,6 +749,20 @@ def _bucket_key(dt: Optional[datetime], tzinfo, gran: str) -> str:
     return d.strftime("%Y-%m-%dT%H:00")  # hour (default)
 
 
+def _pctl(vals_sorted: list[int], q: float) -> Optional[int]:
+    """q-th percentile (0-100) of a PRE-SORTED list via linear interpolation; None if empty.
+    numpy-free so it runs in the aggregation thread without pulling a heavy import."""
+    n = len(vals_sorted)
+    if n == 0:
+        return None
+    if n == 1:
+        return int(vals_sorted[0])
+    rank = (q / 100.0) * (n - 1)
+    lo = int(rank)
+    hi = min(lo + 1, n - 1)
+    return int(round(vals_sorted[lo] + (vals_sorted[hi] - vals_sorted[lo]) * (rank - lo)))
+
+
 class ActivityResponse(BaseModel):
     window: dict
     totals: dict
@@ -758,6 +772,10 @@ class ActivityResponse(BaseModel):
     by_model_bucket: list[dict]
     by_user_bucket: list[dict]
     by_upstream_bucket: list[dict]  # proxy-only: requests per bucket, by upstream
+    by_model_latency_bucket: list[dict]     # avg latency/ttft per bucket, by model (top-N + "other")
+    by_upstream_latency_bucket: list[dict]  # proxy-only: avg latency/ttft per bucket, by upstream
+    by_status_bucket: list[dict]    # requests per bucket, by outcome (ok|error|pending)
+    by_source_bucket: list[dict]    # requests + tokens per bucket, by source (serverless|proxy)
     all_models: list[str]           # every model seen in the window, pre-filter (for the picker)
     note: str
 
@@ -777,7 +795,8 @@ async def _activity_records(session, s_dt, u_dt):
     px = select(ProxyRequest.owner_id, ProxyRequest.created_at, ProxyRequest.model,
                 ProxyRequest.prompt_tokens, ProxyRequest.completion_tokens,
                 ProxyRequest.ttft_ms, ProxyRequest.latency_ms,
-                ProxyRequest.upstream).where(ProxyRequest.created_at >= s_dt)
+                ProxyRequest.upstream, ProxyRequest.status,
+                ProxyRequest.status_code).where(ProxyRequest.created_at >= s_dt)
     if u_dt is not None:
         sv = sv.where(ReqRow.created_at < u_dt)
         px = px.where(ProxyRequest.created_at < u_dt)
@@ -803,13 +822,19 @@ async def _activity_records(session, s_dt, u_dt):
         lat = (int((r.completed_at - r.created_at).total_seconds() * 1000)
                if (r.status == "completed" and r.completed_at and r.created_at) else None)
         model = r.model or app_model.get(r.app_id) or "(unknown)"
+        # Normalized outcome for success/error-rate charts (in-flight rows → "pending").
+        outcome = ("ok" if r.status == "completed"
+                   else "error" if r.status in ("failed", "cancelled") else "pending")
         # serverless requests aren't proxied → no upstream.
         recs.append((r.owner_id, r.created_at, model, "serverless",
-                     _int(r.tin) or 0, _int(r.tout) or 0, r.ttft_ms, lat, None))
+                     _int(r.tin) or 0, _int(r.tout) or 0, r.ttft_ms, lat, None, outcome))
     for r in px_rows:
+        sc = r.status_code
+        outcome = ("error" if (sc is not None and sc >= 400) or r.status in ("failed", "cancelled")
+                   else "ok" if r.status == "completed" else "pending")
         recs.append((r.owner_id, r.created_at, (r.model or "(unknown)"), "proxy",
                      r.prompt_tokens or 0, r.completion_tokens or 0, r.ttft_ms, r.latency_ms,
-                     r.upstream or "(unknown)"))
+                     r.upstream or "(unknown)", outcome))
     return recs, (len(sv_rows) >= _ACTIVITY_CAP or len(px_rows) >= _ACTIVITY_CAP)
 
 
@@ -818,33 +843,71 @@ def _fold_activity(recs, tzinfo, granularity):
     user / upstream accumulators. Extracted so the caller can run it via
     asyncio.to_thread: at the row cap this loop (~400k iterations) would otherwise
     block the single gateway event loop for seconds, stalling ALL inference, SSE
-    and heartbeats while an admin loads the dashboard."""
+    and heartbeats while an admin loads the dashboard. Per-bucket percentiles are
+    finalized here too (the sorts are the heavy part) so the event loop only ever
+    sees small summary dicts."""
     from collections import defaultdict
+    # `_tt`/`_ll` collect the raw ttft/latency samples per bucket for percentiles;
+    # they're sorted → percentiles → dropped before returning (never leave the thread).
     bkt = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                               "_ts": 0, "_tn": 0, "_ls": 0, "_ln": 0})  # ttft/latency sum+count
+                               "_ts": 0, "_tn": 0, "_ls": 0, "_ln": 0,
+                               "_tt": [], "_ll": []})  # ttft/latency sum+count (+samples)
     by_model = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
     by_user = defaultdict(lambda: {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
     by_upstream = defaultdict(lambda: {"requests": 0, "tokens": 0})  # proxy-only
     model_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})
     user_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})
     upstream_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})  # proxy-only
+    # avg latency/ttft over time, split by series (sum+count only — cheap, no percentiles).
+    _lat = lambda: {"lat_s": 0, "lat_n": 0, "ttft_s": 0, "ttft_n": 0, "requests": 0}
+    model_lat_bkt = defaultdict(_lat)              # (bucket, model)    — all requests
+    upstream_lat_bkt = defaultdict(_lat)           # (bucket, upstream) — proxy-only
+    status_bkt = defaultdict(lambda: {"requests": 0})              # (bucket, outcome)
+    source_bkt = defaultdict(lambda: {"requests": 0, "tokens": 0})  # (bucket, serverless|proxy)
     ttfts, lats = [], []
     sum_pin = sum_pout = 0
-    for (oid, ts, model, src, pin, pout, ttft, lat, upstream) in recs:
+    n_ok = n_err = n_pending = 0
+    for (oid, ts, model, src, pin, pout, ttft, lat, upstream, outcome) in recs:
         sum_pin += pin; sum_pout += pout
+        if outcome == "ok": n_ok += 1
+        elif outcome == "error": n_err += 1
+        else: n_pending += 1
         k = _bucket_key(ts, tzinfo, granularity)
+        toks = pin + pout
         b = bkt[k]; b["requests"] += 1; b["prompt_tokens"] += pin; b["completion_tokens"] += pout
-        if ttft is not None: ttfts.append(ttft); b["_ts"] += ttft; b["_tn"] += 1
-        if lat is not None: lats.append(lat); b["_ls"] += lat; b["_ln"] += 1
+        if ttft is not None: ttfts.append(ttft); b["_ts"] += ttft; b["_tn"] += 1; b["_tt"].append(ttft)
+        if lat is not None: lats.append(lat); b["_ls"] += lat; b["_ln"] += 1; b["_ll"].append(lat)
         m = by_model[model]; m["requests"] += 1; m["prompt_tokens"] += pin; m["completion_tokens"] += pout
         u = by_user[oid]; u["requests"] += 1; u["prompt_tokens"] += pin; u["completion_tokens"] += pout
-        mb = model_bkt[(k, model)]; mb["requests"] += 1; mb["tokens"] += pin + pout
-        ub = user_bkt[(k, oid)]; ub["requests"] += 1; ub["tokens"] += pin + pout
+        mb = model_bkt[(k, model)]; mb["requests"] += 1; mb["tokens"] += toks
+        ub = user_bkt[(k, oid)]; ub["requests"] += 1; ub["tokens"] += toks
+        ml = model_lat_bkt[(k, model)]; ml["requests"] += 1
+        if lat is not None: ml["lat_s"] += lat; ml["lat_n"] += 1
+        if ttft is not None: ml["ttft_s"] += ttft; ml["ttft_n"] += 1
+        status_bkt[(k, outcome)]["requests"] += 1
+        sb = source_bkt[(k, src)]; sb["requests"] += 1; sb["tokens"] += toks
         if src == "proxy":  # upstream only exists for proxied requests
-            bu = by_upstream[upstream]; bu["requests"] += 1; bu["tokens"] += pin + pout
-            upb = upstream_bkt[(k, upstream)]; upb["requests"] += 1; upb["tokens"] += pin + pout
+            bu = by_upstream[upstream]; bu["requests"] += 1; bu["tokens"] += toks
+            upb = upstream_bkt[(k, upstream)]; upb["requests"] += 1; upb["tokens"] += toks
+            ul = upstream_lat_bkt[(k, upstream)]; ul["requests"] += 1
+            if lat is not None: ul["lat_s"] += lat; ul["lat_n"] += 1
+            if ttft is not None: ul["ttft_s"] += ttft; ul["ttft_n"] += 1
+    # Finalize per-bucket percentiles in-thread (sorting is the heavy part) + free the samples.
+    for b in bkt.values():
+        tt = sorted(b.pop("_tt")); ll = sorted(b.pop("_ll"))
+        b["p50_ttft_ms"], b["p95_ttft_ms"], b["p99_ttft_ms"] = _pctl(tt, 50), _pctl(tt, 95), _pctl(tt, 99)
+        b["p50_latency_ms"], b["p95_latency_ms"], b["p99_latency_ms"] = _pctl(ll, 50), _pctl(ll, 95), _pctl(ll, 99)
+    ttfts.sort(); lats.sort()
+    agg = {
+        "sum_pin": sum_pin, "sum_pout": sum_pout,
+        "n_ok": n_ok, "n_err": n_err, "n_pending": n_pending,
+        "ttft_avg": int(sum(ttfts) / len(ttfts)) if ttfts else None,
+        "lat_avg": int(sum(lats) / len(lats)) if lats else None,
+        "ttft_p50": _pctl(ttfts, 50), "ttft_p95": _pctl(ttfts, 95), "ttft_p99": _pctl(ttfts, 99),
+        "lat_p50": _pctl(lats, 50), "lat_p95": _pctl(lats, 95), "lat_p99": _pctl(lats, 99),
+    }
     return (bkt, by_model, by_user, by_upstream, model_bkt, user_bkt, upstream_bkt,
-            ttfts, lats, sum_pin, sum_pout)
+            model_lat_bkt, upstream_lat_bkt, status_bkt, source_bkt, agg)
 
 
 @router.get("/activity", response_model=ActivityResponse)
@@ -870,7 +933,7 @@ async def history_activity(
 
     # Fold off the event loop — this is a ~400k-iteration pure-CPU pass at the cap.
     (bkt, by_model, by_user, by_upstream, model_bkt, user_bkt, upstream_bkt,
-     ttfts, lats, sum_pin, sum_pout) = await asyncio.to_thread(
+     model_lat_bkt, upstream_lat_bkt, status_bkt, source_bkt, agg) = await asyncio.to_thread(
         _fold_activity, recs, tzinfo, granularity)
 
     umap = await _user_map(session, list(by_user.keys()))
@@ -897,19 +960,46 @@ async def history_activity(
         name = ups if ups in top_up_names else "other"
         upb2[(k, name)]["requests"] += v["requests"]; upb2[(k, name)]["tokens"] += v["tokens"]
 
+    # Latency-over-time split by series → collapse the tail into "other", then emit a
+    # weighted avg (sum/count survives the merge; averaging pre-averaged buckets wouldn't).
+    def _fold_lat(src, keep):
+        acc = defaultdict(lambda: {"lat_s": 0, "lat_n": 0, "ttft_s": 0, "ttft_n": 0, "requests": 0})
+        for (k, key), v in src.items():
+            a = acc[(k, key if key in keep else "other")]
+            for f in ("lat_s", "lat_n", "ttft_s", "ttft_n", "requests"):
+                a[f] += v[f]
+        return acc
+
+    def _lat_out(acc):
+        return [{"bucket": k, "series": nm,
+                 "avg_latency_ms": int(v["lat_s"] / v["lat_n"]) if v["lat_n"] else None,
+                 "avg_ttft_ms": int(v["ttft_s"] / v["ttft_n"]) if v["ttft_n"] else None,
+                 "requests": v["requests"]}
+                for (k, nm), v in sorted(acc.items())]
+
+    mlat = _lat_out(_fold_lat(model_lat_bkt, top_names))
+    ulat = _lat_out(_fold_lat(upstream_lat_bkt, top_up_names))
+
     def _bo(k, v):
         return {"bucket": k, "requests": v["requests"], "prompt_tokens": v["prompt_tokens"],
                 "completion_tokens": v["completion_tokens"],
                 "avg_ttft_ms": int(v["_ts"] / v["_tn"]) if v["_tn"] else None,
-                "avg_latency_ms": int(v["_ls"] / v["_ln"]) if v["_ln"] else None}
+                "avg_latency_ms": int(v["_ls"] / v["_ln"]) if v["_ln"] else None,
+                "p50_ttft_ms": v["p50_ttft_ms"], "p95_ttft_ms": v["p95_ttft_ms"], "p99_ttft_ms": v["p99_ttft_ms"],
+                "p50_latency_ms": v["p50_latency_ms"], "p95_latency_ms": v["p95_latency_ms"],
+                "p99_latency_ms": v["p99_latency_ms"]}
 
+    total = len(recs)
     return ActivityResponse(
         window={"since": _iso(s_dt), "until": _iso(u_dt), "tz": tz, "granularity": granularity},
         totals={
-            "requests": len(recs), "prompt_tokens": sum_pin, "completion_tokens": sum_pout,
-            "total_tokens": sum_pin + sum_pout,
-            "avg_ttft_ms": int(sum(ttfts) / len(ttfts)) if ttfts else None,
-            "avg_latency_ms": int(sum(lats) / len(lats)) if lats else None,
+            "requests": total, "prompt_tokens": agg["sum_pin"], "completion_tokens": agg["sum_pout"],
+            "total_tokens": agg["sum_pin"] + agg["sum_pout"],
+            "avg_ttft_ms": agg["ttft_avg"], "avg_latency_ms": agg["lat_avg"],
+            "p50_ttft_ms": agg["ttft_p50"], "p95_ttft_ms": agg["ttft_p95"], "p99_ttft_ms": agg["ttft_p99"],
+            "p50_latency_ms": agg["lat_p50"], "p95_latency_ms": agg["lat_p95"], "p99_latency_ms": agg["lat_p99"],
+            "requests_ok": agg["n_ok"], "requests_error": agg["n_err"], "requests_pending": agg["n_pending"],
+            "success_rate": (agg["n_ok"] / total) if total else None,
         },
         by_bucket=[_bo(k, v) for k, v in sorted(bkt.items())],
         by_model=[{"model": k, **v} for k, v in top_models],
@@ -917,9 +1007,15 @@ async def history_activity(
         by_model_bucket=[{"bucket": d, "model": m, **vv} for (d, m), vv in sorted(mb2.items())],
         by_user_bucket=[{"bucket": d, "user": u, **vv} for (d, u), vv in sorted(ub2.items())],
         by_upstream_bucket=[{"bucket": d, "upstream": u, **vv} for (d, u), vv in sorted(upb2.items())],
+        by_model_latency_bucket=mlat,
+        by_upstream_latency_bucket=ulat,
+        by_status_bucket=[{"bucket": d, "status": s, "requests": vv["requests"]}
+                          for (d, s), vv in sorted(status_bkt.items())],
+        by_source_bucket=[{"bucket": d, "source": s, **vv} for (d, s), vv in sorted(source_bkt.items())],
         all_models=all_models,
         note=("Unified serverless + LLM-proxy usage. Tokens from vLLM `usage` (include_usage set "
-              "on streams). TTFT recorded for streamed requests."
+              "on streams). TTFT recorded for streamed requests; latency/percentiles over "
+              "cleanly-completed requests only."
               + (" ⚠ window truncated at the scan cap." if capped else "")))
 
 

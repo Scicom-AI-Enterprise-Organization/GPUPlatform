@@ -95,13 +95,13 @@ export function FormShell({ children, className }: { children: React.ReactNode; 
   }, [sections]);
 
   return (
-    <div className={cn("mx-auto flex w-full max-w-6xl items-start gap-8", className)}>
+    <div className={cn("mx-auto flex w-full items-start gap-4", className)}>
       <div ref={bodyRef} className="min-w-0 flex-1">
         {children}
       </div>
       {sections.length > 1 && (
         <nav className="sticky top-2 hidden w-44 shrink-0 xl:block" aria-label="Form sections">
-          <p className="mb-2 px-3 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+          <p className="mb-2 px-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
             On this page
           </p>
           <ul className="space-y-0.5 border-l border-border">
@@ -111,7 +111,7 @@ export function FormShell({ children, className }: { children: React.ReactNode; 
                   type="button"
                   onClick={() => s.el.scrollIntoView({ behavior: "smooth", block: "start" })}
                   className={cn(
-                    "-ml-px block w-full truncate border-l-2 px-3 py-1 text-left text-xs transition-colors",
+                    "-ml-px block w-full truncate border-l-2 px-2 py-1 text-left text-xs transition-colors",
                     active === s.id
                       ? "border-primary font-medium text-foreground"
                       : "border-transparent text-muted-foreground hover:border-border hover:text-foreground",

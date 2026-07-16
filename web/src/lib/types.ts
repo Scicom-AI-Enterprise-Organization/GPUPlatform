@@ -1651,6 +1651,16 @@ export type ActivitySummary = {
     total_tokens: number;
     avg_ttft_ms: number | null;
     avg_latency_ms: number | null;
+    p50_ttft_ms: number | null;
+    p95_ttft_ms: number | null;
+    p99_ttft_ms: number | null;
+    p50_latency_ms: number | null;
+    p95_latency_ms: number | null;
+    p99_latency_ms: number | null;
+    requests_ok: number;
+    requests_error: number;
+    requests_pending: number;
+    success_rate: number | null;
   };
   by_bucket: {
     bucket: string;
@@ -1659,12 +1669,24 @@ export type ActivitySummary = {
     completion_tokens: number;
     avg_ttft_ms: number | null;
     avg_latency_ms: number | null;
+    p50_ttft_ms: number | null;
+    p95_ttft_ms: number | null;
+    p99_ttft_ms: number | null;
+    p50_latency_ms: number | null;
+    p95_latency_ms: number | null;
+    p99_latency_ms: number | null;
   }[];
   by_model: { model: string; requests: number; prompt_tokens: number; completion_tokens: number }[];
   top_users: { user: string; owner_id: number | null; requests: number; prompt_tokens: number; completion_tokens: number }[];
   by_model_bucket: { bucket: string; model: string; requests: number; tokens: number }[];
   by_user_bucket: { bucket: string; user: string; requests: number; tokens: number }[];
   by_upstream_bucket: { bucket: string; upstream: string; requests: number; tokens: number }[];
+  // Avg latency/TTFT per bucket, split by series (top-N + "other"). `series` = the
+  // model / upstream name. avg_* are null in buckets where that series had no timing.
+  by_model_latency_bucket: { bucket: string; series: string; avg_latency_ms: number | null; avg_ttft_ms: number | null; requests: number }[];
+  by_upstream_latency_bucket: { bucket: string; series: string; avg_latency_ms: number | null; avg_ttft_ms: number | null; requests: number }[];
+  by_status_bucket: { bucket: string; status: "ok" | "error" | "pending"; requests: number }[];
+  by_source_bucket: { bucket: string; source: "serverless" | "proxy"; requests: number; tokens: number }[];
   all_models: string[];
   note: string;
 };

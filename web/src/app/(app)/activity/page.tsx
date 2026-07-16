@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import { redirect } from "next/navigation";
 import { getMe } from "@/lib/me";
 import { ConsoleTopbar } from "@/components/console/topbar";
@@ -16,7 +17,10 @@ export default async function ActivityPage() {
       <ConsoleTopbar crumbs={[{ label: "Activity" }]} username={me.username} />
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         <FormShell>
-          <ActivityDashboard />
+          {/* Suspense: ActivityDashboard reads useSearchParams (shareable URL state). */}
+          <Suspense>
+            <ActivityDashboard />
+          </Suspense>
         </FormShell>
       </div>
     </div>
