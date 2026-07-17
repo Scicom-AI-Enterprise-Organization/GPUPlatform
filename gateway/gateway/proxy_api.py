@@ -2227,6 +2227,62 @@ async def proxy_metrics(endpoint: str, session: AsyncSession = Depends(get_sessi
     return Response(content=_metrics.render_proxy(ep.id), media_type="text/plain; version=0.0.4")
 
 
+def _proxy_health_report(app, ep: ProxyEndpoint) -> tuple[dict, int]:
+    """Aggregate this replica's upstream-liveness view for a proxy endpoint into a
+    load-balancer / k8s-probe verdict. Reads the health kept fresh by proxy_health_loop
+    (no active probe on the call). HTTP status: 200 = serveable, 503 = don't route.
+      healthy      — no enabled upstream is known-dead (unknown/not-yet-probed counts OK)
+      degraded     — ≥1 alive but ≥1 known-dead (still serves via failover)   → 200
+      unhealthy    — every enabled upstream is known-dead                     → 503
+      disabled     — endpoint disabled                                        → 503
+      misconfigured— enabled but no enabled upstreams                         → 503"""
+    cfg = ep.config or {}
+    health = _health(app)
+    now = time.time()
+    ups = [u for u in cfg.get("upstreams", []) if u.get("enabled", True)]
+    items: list[dict] = []
+    n_alive = n_dead = 0
+    for u in ups:
+        h = health.get((ep.id, u.get("id")))
+        fresh = bool(h) and (now - h.get("checked_at", 0)) < HEALTH_TTL_S
+        if fresh and h.get("alive"):
+            state = "alive"; n_alive += 1
+        elif fresh and h.get("alive") is False:
+            state = "dead"; n_dead += 1
+        else:
+            state = "unknown"
+        items.append({
+            "name": u.get("name", ""), "state": state,
+            "latency_ms": (h or {}).get("latency_ms"),
+            "checked_at": (h or {}).get("checked_at"),
+            "error": (h or {}).get("error") if state == "dead" else None,
+        })
+    if not ep.enabled:
+        status, code = "disabled", 503
+    elif not ups:
+        status, code = "misconfigured", 503
+    elif n_dead == len(ups):
+        status, code = "unhealthy", 503
+    elif n_dead > 0:
+        status, code = "degraded", 200
+    else:
+        status, code = "healthy", 200
+    return {"status": status, "endpoint": ep.name, "enabled": bool(ep.enabled),
+            "upstreams_alive": n_alive, "upstreams_total": len(ups), "upstreams": items}, code
+
+
+@data_router.get("/proxy/{endpoint}/health")
+@data_router.get("/proxy/{endpoint}/healthz")
+async def proxy_endpoint_health(endpoint: str, request: Request, session: AsyncSession = Depends(get_session)):
+    """Liveness/readiness for a proxy endpoint — auth-exempt (probes/LBs carry no key),
+    the sibling of `/proxy/{name}/metrics`. 200 = routeable, 503 = degraded-to-dead."""
+    ep = (await session.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint))).scalar_one_or_none()
+    if ep is None:
+        raise HTTPException(status_code=404, detail={"error": f"proxy endpoint '{endpoint}' not found"})
+    report, code = _proxy_health_report(request.app, ep)
+    return JSONResponse(report, status_code=code)
+
+
 # ---------- management routes (admin) ----------------------------------------
 
 async def _owner_username(session: AsyncSession, owner_id: int) -> str:

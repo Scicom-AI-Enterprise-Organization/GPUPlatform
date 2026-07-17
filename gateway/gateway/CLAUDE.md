@@ -276,6 +276,13 @@ an alias → `TTS-model` by hand).
   (`_sum`/`_count`) are additive across pods; that's why drift is a histogram, not a gauge. Don't scrape
   `/proxy/{name}/metrics` (render_proxy) through the LB — it's this-replica-only.
 
+**Per-endpoint health probe** (general, not audio-specific): `GET /proxy/{name}/health` (+ `/healthz`
+alias), **auth-exempt**, sibling of `/proxy/{name}/metrics`. Reads the liveness `proxy_health_loop`
+already tracks (probes each upstream's `/models` every ~20s; `<500` & not 401/403 = alive) — no probe on
+the call. LB/k8s semantics: **200** `healthy`/`degraded` (≥1 upstream not-known-dead; unknown counts OK),
+**503** `unhealthy` (all known-dead) / `disabled` / `misconfigured`, **404** unknown endpoint. Per-replica
+view (right for a per-pod probe). Excluded from the HTTP metrics (`METRICS_IGNORE_PATHS`).
+
 ### Label platform (data-labelling app)
 
 A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)

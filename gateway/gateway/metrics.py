@@ -202,7 +202,8 @@ IGNORE_PATHS = {
     p.strip()
     for p in os.environ.get(
         "METRICS_IGNORE_PATHS",
-        "/metrics,/metrics/resources,/{app_id}/metrics,/proxy/{endpoint}/metrics,/health,/ready,/version,/",
+        "/metrics,/metrics/resources,/{app_id}/metrics,/proxy/{endpoint}/metrics,"
+        "/proxy/{endpoint}/health,/proxy/{endpoint}/healthz,/health,/ready,/version,/",
     ).split(",")
     if p.strip()
 }
