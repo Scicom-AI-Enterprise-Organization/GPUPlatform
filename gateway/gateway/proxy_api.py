@@ -554,42 +554,121 @@ def _extract_audio_logprob(data: object) -> Optional[float]:
     return None
 
 
+def _fmt_ts(sec: object, sep: str) -> str:
+    """Seconds → an SRT/VTT timestamp `HH:MM:SS<sep>mmm` (sep=',' for SRT, '.' for VTT)."""
+    try:
+        v = max(0.0, float(sec or 0))
+    except (TypeError, ValueError):
+        v = 0.0
+    whole = int(v)
+    ms = int(round((v - whole) * 1000))
+    if ms == 1000:  # rounding carry
+        whole += 1
+        ms = 0
+    h, rem = divmod(whole, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+
+def _segments_to_srt(vj: dict) -> str:
+    out: list[str] = []
+    for i, s in enumerate(vj.get("segments") or [], 1):
+        if not isinstance(s, dict):
+            continue
+        out += [str(i), f"{_fmt_ts(s.get('start'), ',')} --> {_fmt_ts(s.get('end'), ',')}",
+                (s.get("text") or "").strip(), ""]
+    return "\n".join(out)
+
+
+def _segments_to_vtt(vj: dict) -> str:
+    out: list[str] = ["WEBVTT", ""]
+    for s in vj.get("segments") or []:
+        if not isinstance(s, dict):
+            continue
+        out += [f"{_fmt_ts(s.get('start'), '.')} --> {_fmt_ts(s.get('end'), '.')}",
+                (s.get("text") or "").strip(), ""]
+    return "\n".join(out)
+
+
+# response_format values we can reconstruct FROM a verbose_json body — so we can always
+# ask the upstream for verbose_json (→ segment avg_logprob → drift metric) and downgrade.
+_CONVERTIBLE_AUDIO_FORMATS = ("", "json", "verbose_json", "text", "srt", "vtt")
+
+
+def _convert_verbose_audio(vj: dict, client_fmt: str) -> dict:
+    """Downgrade a verbose_json transcription body to the caller's response_format.
+    Returns fields to merge into the result: either `data` (a JSON body) or
+    `raw_body` + `media_type` (text/srt/vtt). verbose_json passes through unchanged."""
+    if client_fmt in ("", "json"):
+        return {"data": {"text": vj.get("text", "")}}
+    if client_fmt == "verbose_json":
+        return {"data": vj}
+    if client_fmt == "text":
+        return {"raw_body": (vj.get("text") or ""), "media_type": "text/plain; charset=utf-8"}
+    if client_fmt == "srt":
+        return {"raw_body": _segments_to_srt(vj), "media_type": "text/plain; charset=utf-8"}
+    if client_fmt == "vtt":
+        return {"raw_body": _segments_to_vtt(vj), "media_type": "text/vtt; charset=utf-8"}
+    return {"data": vj}  # unreachable given the convertible gate
+
+
 async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], alias: str,
                               upstream_path: str, file_name: str, file_bytes: bytes,
                               content_type: str, form_fields: dict, timeout_s: float) -> dict:
-    """Multipart forward (audio transcriptions/translations). Like _do_unary but
-    rebuilds the multipart body — the uploaded file + passthrough form fields, with
-    the upstream's mapped model name. Failover on connect error / 5xx."""
+    """Multipart forward (audio transcriptions/translations). Rebuilds the multipart body
+    (uploaded file + passthrough form fields, model rewritten). For the standard whisper
+    response formats it ALWAYS asks the upstream for `verbose_json` — its per-segment
+    `avg_logprob` is the drift signal (metrics.PROXY_AUDIO_NLL) and it's a superset of
+    json/text/srt/vtt — then converts the body back to exactly the format the caller asked
+    for. If an upstream rejects verbose_json (4xx) we retry once in the caller's own format
+    so a working request never breaks (forgoing the logprob). Failover on connect error/5xx."""
     cli = _http(app)
     last_err = "no upstream"
+    client_fmt = str(form_fields.get("response_format") or "json").strip().lower()
+    upgradable = client_fmt in _CONVERTIBLE_AUDIO_FORMATS
     for u in candidates:
-        data = {**form_fields, "model": u["models"][alias]}
         files = {"file": (file_name, file_bytes, content_type)}
-        headers = {}
-        if u.get("_key"):
-            headers["Authorization"] = f"Bearer {u['_key']}"
+        headers = {"Authorization": f"Bearer {u['_key']}"} if u.get("_key") else {}
         url = u["base_url"].rstrip("/") + upstream_path
-        t0 = time.perf_counter()
-        try:
-            r = await cli.post(url, data=data, files=files, headers=headers,
-                               timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError) as e:
-            _mark_health(app, endpoint_id, u["id"], False, error=str(e))
-            last_err = f"{u['name']}: {type(e).__name__}"
-            continue
-        lat = int((time.perf_counter() - t0) * 1000)
-        if r.status_code >= 500:
-            _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
-            last_err = f"{u['name']}: HTTP {r.status_code}"
-            continue
-        _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
-        try:
-            data_out = r.json()
-        except Exception:
-            data_out = {"text": r.text}  # response_format=text → plain string
-        return {"upstream": u["name"], "upstream_url": u["base_url"], "status_code": r.status_code,
-                "data": data_out, "latency_ms": lat, "pt": None, "ct": None,
-                "avg_logprob": _extract_audio_logprob(data_out)}
+        force_verbose = upgradable
+        while True:
+            data = {**form_fields, "model": u["models"][alias]}
+            if force_verbose:
+                data["response_format"] = "verbose_json"
+            t0 = time.perf_counter()
+            try:
+                r = await cli.post(url, data=data, files=files, headers=headers,
+                                   timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                _mark_health(app, endpoint_id, u["id"], False, error=str(e))
+                last_err = f"{u['name']}: {type(e).__name__}"
+                break  # → next candidate
+            lat = int((time.perf_counter() - t0) * 1000)
+            if r.status_code >= 500:
+                _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+                last_err = f"{u['name']}: HTTP {r.status_code}"
+                break  # → next candidate (failover)
+            if force_verbose and 400 <= r.status_code < 500:
+                # Upstream won't do verbose_json — retry once in the caller's own format
+                # (no logprob) rather than fail a request that would otherwise have worked.
+                force_verbose = False
+                continue
+            _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
+            res = {"upstream": u["name"], "upstream_url": u["base_url"], "status_code": r.status_code,
+                   "latency_ms": lat, "pt": None, "ct": None, "avg_logprob": None}
+            try:
+                body = r.json()
+            except Exception:
+                body = None
+            if force_verbose and isinstance(body, dict):
+                res["avg_logprob"] = _extract_audio_logprob(body)
+                res.update(_convert_verbose_audio(body, client_fmt))
+            elif body is None:
+                res["raw_body"] = r.text          # response_format=text → plain string
+                res["media_type"] = r.headers.get("content-type") or "text/plain; charset=utf-8"
+            else:
+                res["data"] = body                # already in the caller's format (fallback path)
+            return res
     raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
 
 
@@ -638,7 +717,12 @@ async def _unary(app, request: Request, request_id: str, forward,
                 hdrs["X-Upstream-Url"] = res["upstream_url"]
             if res.get("upstream"):
                 hdrs["X-Upstream-Name"] = res["upstream"]
-            return JSONResponse(res["data"], status_code=res["status_code"], headers=hdrs)
+            # Audio forwards may return a non-JSON body (response_format=text/srt/vtt,
+            # reconstructed from the upstream's verbose_json); everything else is JSON.
+            if res.get("raw_body") is not None:
+                return Response(res["raw_body"], status_code=res["status_code"],
+                                media_type=res.get("media_type") or "text/plain; charset=utf-8", headers=hdrs)
+            return JSONResponse(res.get("data"), status_code=res["status_code"], headers=hdrs)
         finally:
             if gate is not None:
                 await gate.release(token)
