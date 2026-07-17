@@ -28,6 +28,9 @@ dependencies = [
     "huggingface_hub>=0.24",
     "datasets>=2.20",
     "soundfile>=0.12",
+    # CER/WER for the TTS proxy's async STT round-trip drift metric (proxy_api._tts_eval_async);
+    # imported lazily so a missing wheel never breaks gateway startup.
+    "jiwer>=3.0",
     # Packed-row preview (datasets_api.packed-row) decodes tts_packed token blocks
     # back to per-utterance text via the standalone tokenizers lib (Tokenizer.from_file
     # on a downloaded tokenizer.json) — deliberately NOT importing transformers. Not a

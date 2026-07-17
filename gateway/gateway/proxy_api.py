@@ -22,7 +22,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets as _secrets
+import struct
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -118,6 +120,29 @@ class UpstreamSpec(BaseModel):
     extra_body: Optional[dict] = None
 
 
+class SttCallbackSpec(BaseModel):
+    """A whisper-compatible STT endpoint the TTS proxy calls back to transcribe its
+    own generated audio, for async CER/WER drift metrics. Not a data-plane upstream —
+    it never serves client requests. Key handling mirrors UpstreamSpec."""
+    enabled: bool = True
+    base_url: str = ""                    # e.g. https://…/proxy/stt/v1 (an /audio/transcriptions base)
+    model: str = ""                       # STT model to send (real upstream name)
+    api_key_secret: Optional[str] = None  # GlobalEnv key ref
+    api_key: Optional[str] = None         # OR a pasted key (stored encrypted); write-only
+
+
+class CaptureSpec(BaseModel):
+    """Persist audio (+ a JSON sidecar) to a storage backend when a request crosses a
+    quality threshold — STT low confidence (avg_logprob < threshold) / TTS high error
+    (CER or WER > threshold). For collecting drift/failure samples to inspect or retrain."""
+    enabled: bool = False
+    storage_id: str = ""                    # a /v1/storage backend id
+    prefix: str = "drift/"                  # key prefix within that backend
+    logprob_threshold: Optional[float] = None  # STT: capture if avg_logprob < this
+    cer_threshold: Optional[float] = None      # TTS: capture if cer > this
+    wer_threshold: Optional[float] = None      # TTS: capture if wer > this
+
+
 class CreateProxyRequest(BaseModel):
     name: str
     max_concurrency: int = 0              # 0 = unlimited (no queue)
@@ -127,6 +152,8 @@ class CreateProxyRequest(BaseModel):
     enabled: bool = True
     public: bool = False
     upstreams: list[UpstreamSpec] = []
+    stt_callback: Optional[SttCallbackSpec] = None
+    capture: Optional[CaptureSpec] = None
 
 
 class UpdateProxyRequest(BaseModel):
@@ -136,6 +163,8 @@ class UpdateProxyRequest(BaseModel):
     enabled: Optional[bool] = None
     public: Optional[bool] = None
     upstreams: Optional[list[UpstreamSpec]] = None
+    stt_callback: Optional[SttCallbackSpec] = None
+    capture: Optional[CaptureSpec] = None
 
 
 class UpstreamRecord(BaseModel):
@@ -150,6 +179,23 @@ class UpstreamRecord(BaseModel):
     extra_body: dict = {}
 
 
+class SttCallbackRecord(BaseModel):
+    enabled: bool = True
+    base_url: str = ""
+    model: str = ""
+    api_key_secret: Optional[str] = None
+    has_inline_key: bool = False
+
+
+class CaptureRecord(BaseModel):
+    enabled: bool = False
+    storage_id: str = ""
+    prefix: str = "drift/"
+    logprob_threshold: Optional[float] = None
+    cer_threshold: Optional[float] = None
+    wer_threshold: Optional[float] = None
+
+
 class ProxyEndpointRecord(BaseModel):
     id: str
     name: str
@@ -158,6 +204,8 @@ class ProxyEndpointRecord(BaseModel):
     max_concurrency: int
     timeout_s: int
     upstreams: list[UpstreamRecord]
+    stt_callback: Optional[SttCallbackRecord] = None
+    capture: Optional[CaptureRecord] = None
     inflight: int = 0
     queued: int = 0
     created_at: str
@@ -341,6 +389,8 @@ def _endpoint_record(app, e: ProxyEndpoint, owner_username: str,
         max_concurrency=int(cfg.get("max_concurrency") or 0),
         timeout_s=int(cfg.get("timeout_s") or int(DEFAULT_TIMEOUT_S)),
         upstreams=[_upstream_record(u) for u in cfg.get("upstreams", [])],
+        stt_callback=_stt_callback_record(cfg),
+        capture=_capture_record(cfg),
         inflight=inflight,
         queued=queued,
         created_at=e.created_at.isoformat() if e.created_at else "",
@@ -432,6 +482,71 @@ def _resolve_key(u: dict, genv: dict[str, str]) -> str:
         except Exception:
             return ""
     return ""
+
+
+def _build_stt_callback(spec: Optional[SttCallbackSpec], existing: Optional[dict] = None) -> Optional[dict]:
+    """Turn the API spec into the stored stt_callback dict (or None to clear it).
+    None spec on UPDATE = field omitted → keep existing. A spec with a blank
+    base_url/model clears it. Inline key encrypted; blank key preserved on edit."""
+    if spec is None:
+        return existing  # PATCH: omitted → unchanged
+    base = (spec.base_url or "").strip().rstrip("/")
+    model = (spec.model or "").strip()
+    if not base or not model:
+        return None  # incomplete/cleared → disable the callback
+    prev = existing or {}
+    out: dict[str, Any] = {"enabled": bool(spec.enabled), "base_url": base, "model": model}
+    ref = (spec.api_key_secret or "").strip()
+    if ref:
+        out["api_key_secret"] = ref
+    elif (spec.api_key or "").strip():
+        out["api_key_enc"] = crypto.encrypt(spec.api_key.strip())
+    elif prev.get("api_key_enc"):
+        out["api_key_enc"] = prev["api_key_enc"]
+    elif prev.get("api_key_secret"):
+        out["api_key_secret"] = prev["api_key_secret"]
+    return out
+
+
+def _stt_callback_record(cfg: dict) -> Optional[SttCallbackRecord]:
+    c = cfg.get("stt_callback")
+    if not isinstance(c, dict) or not c.get("base_url"):
+        return None
+    return SttCallbackRecord(
+        enabled=bool(c.get("enabled", True)),
+        base_url=c.get("base_url", ""),
+        model=c.get("model", ""),
+        api_key_secret=c.get("api_key_secret"),
+        has_inline_key=bool(c.get("api_key_enc")),
+    )
+
+
+def _build_capture(spec: Optional[CaptureSpec], existing: Optional[dict] = None) -> Optional[dict]:
+    """Stored capture dict (or None to clear). None spec on UPDATE = keep existing; a spec
+    with no storage_id clears it. Thresholds omitted (None) mean that dimension won't trigger."""
+    if spec is None:
+        return existing
+    sid = (spec.storage_id or "").strip()
+    if not sid:
+        return None
+    out: dict[str, Any] = {"enabled": bool(spec.enabled), "storage_id": sid,
+                           "prefix": (spec.prefix or "").strip()}
+    for key, val in (("logprob_threshold", spec.logprob_threshold),
+                     ("cer_threshold", spec.cer_threshold), ("wer_threshold", spec.wer_threshold)):
+        if val is not None:
+            out[key] = float(val)
+    return out
+
+
+def _capture_record(cfg: dict) -> Optional[CaptureRecord]:
+    c = cfg.get("capture")
+    if not isinstance(c, dict) or not c.get("storage_id"):
+        return None
+    return CaptureRecord(
+        enabled=bool(c.get("enabled", False)), storage_id=c.get("storage_id", ""),
+        prefix=c.get("prefix", "drift/"), logprob_threshold=c.get("logprob_threshold"),
+        cer_threshold=c.get("cer_threshold"), wer_threshold=c.get("wer_threshold"),
+    )
 
 
 def _select_candidates(app, endpoint_id: str, cfg: dict, alias: str) -> list[dict]:
@@ -614,7 +729,9 @@ def _convert_verbose_audio(vj: dict, client_fmt: str) -> dict:
 
 async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], alias: str,
                               upstream_path: str, file_name: str, file_bytes: bytes,
-                              content_type: str, form_fields: dict, timeout_s: float) -> dict:
+                              content_type: str, form_fields: dict, timeout_s: float,
+                              capture: Optional[dict] = None, request_id: Optional[str] = None,
+                              sample_id: Optional[str] = None) -> dict:
     """Multipart forward (audio transcriptions/translations). Rebuilds the multipart body
     (uploaded file + passthrough form fields, model rewritten). For the standard whisper
     response formats it ALWAYS asks the upstream for `verbose_json` — its per-segment
@@ -663,6 +780,17 @@ async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], ali
             if force_verbose and isinstance(body, dict):
                 res["avg_logprob"] = _extract_audio_logprob(body)
                 res.update(_convert_verbose_audio(body, client_fmt))
+                lp = res["avg_logprob"]
+                if (capture and lp is not None and capture.get("logprob_threshold") is not None
+                        and lp < capture["logprob_threshold"]):
+                    ext = os.path.splitext(file_name or "")[1].lstrip(".").lower() or "wav"
+                    sid = sample_id or request_id
+                    _fire_capture(app, endpoint_id, "stt", file_bytes, ext,
+                                  {"kind": "stt", "model": alias, "avg_logprob": round(lp, 4),
+                                   "transcription": body.get("text", ""), "threshold": capture["logprob_threshold"],
+                                   "request_id": sid, "proxy_request_id": request_id,
+                                   "ts": datetime.now(timezone.utc).isoformat()},
+                                  capture, sid)
             elif body is None:
                 res["raw_body"] = r.text          # response_format=text → plain string
                 res["media_type"] = r.headers.get("content-type") or "text/plain; charset=utf-8"
@@ -899,6 +1027,32 @@ async def _route(app, endpoint_name: str, alias: str):
         max_conc = int(cfg.get("max_concurrency") or 0)
         timeout_s = float(cfg.get("timeout_s") or DEFAULT_TIMEOUT_S)
     return endpoint_id, candidates, timeout_s, max_conc
+
+
+async def _resolve_speech_route(app, endpoint_name: str, alias: str):
+    """Like _route, but also resolves the endpoint's stt_callback (base_url/model +
+    decrypted key) for the TTS CER/WER round-trip. Returns
+    (endpoint_id, candidates, timeout_s, max_conc, stt) where stt is None if unset/disabled."""
+    async with session_factory()() as s:
+        ep = (await s.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint_name))).scalar_one_or_none()
+        if ep is None or not ep.enabled:
+            raise HTTPException(status_code=404, detail={"error": f"proxy endpoint '{endpoint_name}' not found or disabled"})
+        cfg = ep.config or {}
+        endpoint_id = ep.id
+        candidates = _select_candidates(app, endpoint_id, cfg, alias)
+        if not candidates:
+            raise HTTPException(status_code=404, detail={"error": f"model '{alias}' is not served by endpoint '{endpoint_name}'"})
+        genv = await load_global_env(s)
+        for u in candidates:
+            u["_key"] = _resolve_key(u, genv)
+        max_conc = int(cfg.get("max_concurrency") or 0)
+        timeout_s = float(cfg.get("timeout_s") or DEFAULT_TIMEOUT_S)
+        stt = None
+        sc = cfg.get("stt_callback")
+        if isinstance(sc, dict) and sc.get("enabled", True) and sc.get("base_url") and sc.get("model"):
+            stt = {"base_url": sc["base_url"], "model": sc["model"], "_key": _resolve_key(sc, genv)}
+        capture = _resolve_capture(cfg)
+    return endpoint_id, candidates, timeout_s, max_conc, stt, capture
 
 
 async def _insert_request_row(request_id, endpoint_id, user, alias, is_stream) -> None:
@@ -1302,6 +1456,516 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
                                     timeout_s, max_conc, request_id, payload, upstream_path)
 
 
+# ---------- background job queue (off-path eval + capture) -------------------
+# TTS CER/WER evals + drift-sample uploads run OFF the request path. Rather than a
+# per-call cap that DROPS work under load, they go through one bounded queue drained by
+# a worker pool: bursts buffer and run in parallel, and only a genuinely full queue sheds
+# (backpressure). Scale parallelism with PROXY_BG_WORKERS, backlog with PROXY_BG_QUEUE_MAX.
+_BG_WORKERS = int(os.environ.get("PROXY_BG_WORKERS", "8") or "8")
+_BG_QUEUE_MAX = int(os.environ.get("PROXY_BG_QUEUE_MAX", "1000") or "1000")
+_bg_queue: "Optional[asyncio.Queue]" = None
+_bg_started = False
+
+
+async def _bg_worker() -> None:
+    assert _bg_queue is not None
+    while True:
+        factory = await _bg_queue.get()
+        try:
+            await factory()
+        except Exception as e:  # noqa: BLE001 — a bad job must never kill the worker
+            logger.warning("background job failed: %s", e)
+        finally:
+            _bg_queue.task_done()
+            from . import metrics as _metrics
+            _metrics.set_bg_queue_depth(_bg_queue.qsize())
+
+
+def _ensure_bg_workers() -> None:
+    """Lazily start the worker pool on first use (runs on the request's event loop).
+    Synchronous → atomic on the single-threaded loop, so no double-start race."""
+    global _bg_queue, _bg_started
+    if _bg_started:
+        return
+    _bg_queue = asyncio.Queue(maxsize=max(1, _BG_QUEUE_MAX))
+    for _ in range(max(1, _BG_WORKERS)):
+        asyncio.create_task(_bg_worker())
+    _bg_started = True
+
+
+def _submit_bg(factory) -> bool:
+    """Enqueue a zero-arg coroutine factory for a background worker. Returns False (shed)
+    when the queue is full — never blocks the caller."""
+    _ensure_bg_workers()
+    assert _bg_queue is not None
+    try:
+        _bg_queue.put_nowait(factory)
+    except asyncio.QueueFull:
+        return False
+    from . import metrics as _metrics
+    _metrics.set_bg_queue_depth(_bg_queue.qsize())
+    return True
+
+
+# ---------- TTS speech proxy + async CER/WER round-trip ----------------------
+# The TTS API returns raw audio (audio/pcm headerless, or audio/wav with response_format=wav;
+# this engine is 16-bit mono 24 kHz). We relay it verbatim, and — off the response path — tee
+# the bytes, transcribe them through the configured whisper STT, and score CER/WER vs the input
+# text into Prometheus. Never blocks or alters the client response.
+_TTS_PCM_SR = int(os.environ.get("TTS_PCM_SAMPLE_RATE", "24000") or "24000")
+_TTS_EVAL_CAP_BYTES = int(os.environ.get("TTS_EVAL_MAX_BYTES", str(50 * 1024 * 1024)))
+
+
+def _pcm_to_wav(pcm: bytes, sr: int, ch: int, bits: int) -> bytes:
+    """Wrap raw PCM in a correct 44-byte WAV header (so a strict STT decoder accepts it)."""
+    byte_rate = sr * ch * bits // 8
+    block = ch * bits // 8
+    dl = len(pcm)
+    return (b"RIFF" + struct.pack("<I", 36 + dl) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, ch, sr, byte_rate, block, bits)
+            + b"data" + struct.pack("<I", dl) + pcm)
+
+
+def _parse_wav(data: bytes):
+    """(sr, ch, bits, pcm) from a RIFF/WAVE buffer, or None. Takes the data chunk to EOF —
+    the engine streams WAV with a bogus 0x7FFFFFFF size, so the declared length is ignored."""
+    try:
+        i, n = 12, len(data)
+        sr, ch, bits, pcm = _TTS_PCM_SR, 1, 16, None
+        while i + 8 <= n:
+            cid = data[i:i + 4]
+            size = struct.unpack("<I", data[i + 4:i + 8])[0]
+            i += 8
+            if cid == b"fmt " and i + 16 <= n:
+                _fmt, ch, sr, _br, _ba, bits = struct.unpack("<HHIIHH", data[i:i + 16])
+                i += size
+            elif cid == b"data":
+                pcm = data[i:]
+                break
+            else:
+                i += size
+            if size % 2:
+                i += 1  # chunks are word-aligned
+        return (sr, ch, bits, pcm) if pcm is not None else None
+    except Exception:
+        return None
+
+
+def _audio_to_wav(data: bytes, content_type: str = "") -> bytes:
+    """Normalize TTS output to a clean WAV for the STT round-trip. RIFF/WAVE → re-wrap with a
+    correct header; anything else → treat as raw PCM at the engine's 16-bit/mono/24 kHz."""
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        p = _parse_wav(data)
+        if p:
+            sr, ch, bits, pcm = p
+            return _pcm_to_wav(pcm, sr, ch, bits)
+    return _pcm_to_wav(data, _TTS_PCM_SR, 1, 16)
+
+
+def _cer_wer(ref: str, hyp: str):
+    """(cer, wer) via jiwer, on case/punctuation-normalized text; (None, None) if unscoreable.
+    For CJK (no word spaces) WER is coarse (~1.0 on any mismatch) — CER is the real signal."""
+    ref = (ref or "").strip()
+    hyp = (hyp or "").strip()
+    if not ref:
+        return None, None
+    try:
+        import re
+        import jiwer
+    except Exception:
+        return None, None
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", s.lower())).strip()
+    rn, hn = _norm(ref), _norm(hyp)
+    if not rn:
+        return None, None
+    try:
+        return float(jiwer.cer(rn, hn)), float(jiwer.wer(rn, hn))
+    except Exception:
+        return None, None
+
+
+async def _tts_eval_async(app, endpoint_id: str, model_alias: str, voice: str,
+                          input_text: str, audio_bytes: bytes, content_type: str, stt: dict,
+                          capture: Optional[dict] = None, request_id: Optional[str] = None,
+                          sample_id: Optional[str] = None) -> None:
+    """Fire-and-forget: transcribe generated audio via the STT callback, score CER/WER,
+    record to Prometheus, and (if a capture threshold is crossed) persist the clip. Runs on
+    a background worker (bounded by the pool); never raises."""
+    from . import metrics as _metrics
+    try:
+        wav = _audio_to_wav(audio_bytes, content_type)
+        cli = _http(app)
+        url = stt["base_url"].rstrip("/") + "/audio/transcriptions"
+        # Mark this as the TTS round-trip's own transcription so, if the STT callback
+        # points at a capture-enabled STT proxy on THIS gateway, it doesn't also file the
+        # internal call as an STT drift sample (would double-capture the same audio).
+        headers = {"X-SGPU-TTS-Eval": "1"}
+        if stt.get("_key"):
+            headers["Authorization"] = f"Bearer {stt['_key']}"
+        r = await cli.post(url, data={"model": stt["model"], "response_format": "json"},
+                           files={"file": ("tts.wav", wav, "audio/wav")}, headers=headers,
+                           timeout=httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0))
+        if r.status_code != 200:
+            _metrics.observe_tts_eval_outcome(endpoint_id, "stt_error")
+            return
+        try:
+            hyp = (r.json() or {}).get("text") or ""
+        except Exception:
+            hyp = r.text or ""
+        cer, wer = _cer_wer(input_text, hyp)
+        if cer is None:
+            _metrics.observe_tts_eval_outcome(endpoint_id, "stt_error")
+            return
+        _metrics.observe_tts_eval(endpoint_id, model_alias, voice, cer, wer)
+        # Capture bad syntheses (CER or WER over threshold) — save the WAV we already built.
+        if capture:
+            ct_thr, wt_thr = capture.get("cer_threshold"), capture.get("wer_threshold")
+            if (ct_thr is not None and cer > ct_thr) or (wt_thr is not None and wer > wt_thr):
+                sid = sample_id or request_id
+                _fire_capture(app, endpoint_id, "tts", wav, "wav",
+                              {"kind": "tts", "model": model_alias, "voice": voice, "input": input_text,
+                               "hypothesis": hyp, "cer": round(cer, 4), "wer": round(wer, 4),
+                               "request_id": sid, "proxy_request_id": request_id,
+                               "ts": datetime.now(timezone.utc).isoformat()},
+                              capture, sid)
+    except Exception as e:  # noqa: BLE001 — eval is best-effort, never touches the response
+        logger.warning("tts CER/WER eval failed (endpoint=%s): %s", endpoint_id, e)
+        _metrics.observe_tts_eval_outcome(endpoint_id, "stt_error")
+
+
+def _fire_tts_eval(app, endpoint_id: str, alias: str, ev: dict, audio: bytes, content_type: str) -> None:
+    """Queue the CER/WER round-trip if a callback + input text + audio are present."""
+    stt = ev.get("stt")
+    text = ev.get("input")
+    if not stt or not text or not audio:
+        return
+    from . import metrics as _metrics
+    if len(audio) > _TTS_EVAL_CAP_BYTES:
+        _metrics.observe_tts_eval_outcome(endpoint_id, "skipped")
+        return
+    ok = _submit_bg(lambda: _tts_eval_async(app, endpoint_id, alias, ev.get("voice", ""),
+                                            text, bytes(audio), content_type, stt,
+                                            ev.get("capture"), ev.get("request_id"), ev.get("sample_id")))
+    if not ok:
+        _metrics.observe_tts_eval_outcome(endpoint_id, "skipped")
+
+
+# ---------- drift-sample capture (threshold-triggered audio → storage) -------
+_SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _trace_sample_id(request: Request, fallback: str) -> str:
+    """Storage key stem for a captured sample = the request's X-Request-ID so it lines up
+    with tracing/logs. Honours an inbound X-Request-ID (an external tracer's id); else the
+    proxy's own `pxr-…` id (which is what the response + access log carry). Sanitized —
+    the inbound value is client-controlled, so strip it to a safe, bounded key segment."""
+    raw = (request.headers.get("x-request-id") or "").strip()
+    if not raw:
+        return fallback
+    safe = _SAFE_ID_RE.sub("-", raw)[:80].strip("-.")
+    return safe or fallback
+
+
+def _resolve_capture(cfg: dict) -> Optional[dict]:
+    """The endpoint's capture config if enabled + a storage target is set, else None."""
+    c = cfg.get("capture")
+    if isinstance(c, dict) and c.get("enabled") and c.get("storage_id"):
+        return c
+    return None
+
+
+async def _resolve_capture_cfg(endpoint_name: str) -> Optional[dict]:
+    """Load just the capture config for an endpoint (used by the STT path, which doesn't
+    otherwise need the full endpoint row)."""
+    async with session_factory()() as s:
+        ep = (await s.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint_name))).scalar_one_or_none()
+        return _resolve_capture(ep.config or {}) if ep is not None else None
+
+
+async def _capture_sample_async(app, endpoint_id: str, kind: str, ext: str,
+                                audio_bytes: bytes, meta: dict, capture: dict, sample_id: str) -> None:
+    """Persist audio + a JSON sidecar to the configured storage backend. Runs on a background
+    worker; boto3/SFTP puts go through a thread so they never block the event loop, best-effort."""
+    from . import metrics as _metrics
+    try:
+        from .storage_api import Storage
+        from .storage_backends import resolve_backend
+        async with session_factory()() as s:
+            row = await s.get(Storage, capture["storage_id"])
+        if row is None:
+            logger.warning("capture: storage %s not found (endpoint=%s)", capture.get("storage_id"), endpoint_id)
+            _metrics.observe_capture(endpoint_id, kind, "error")
+            return
+        backend = resolve_backend(row)
+        prefix = (capture.get("prefix") or "").strip()
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        base = f"{prefix}{endpoint_id}/{day}/{sample_id}"
+        await asyncio.to_thread(backend.put_bytes, f"{base}.{ext}", audio_bytes)
+        await asyncio.to_thread(backend.put_bytes, f"{base}.json",
+                                json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
+        _metrics.observe_capture(endpoint_id, kind, "saved")
+    except Exception as e:  # noqa: BLE001 — capture is best-effort, never touches the response
+        logger.warning("drift-sample capture failed (endpoint=%s kind=%s): %s", endpoint_id, kind, e)
+        _metrics.observe_capture(endpoint_id, kind, "error")
+
+
+def _fire_capture(app, endpoint_id: str, kind: str, audio: bytes, ext: str,
+                  meta: dict, capture: Optional[dict], sample_id: Optional[str]) -> None:
+    """Queue a threshold-crossing sample save (if a storage target is configured)."""
+    if not capture or not audio or not capture.get("storage_id"):
+        return
+    from . import metrics as _metrics
+    if len(audio) > _TTS_EVAL_CAP_BYTES:
+        _metrics.observe_capture(endpoint_id, kind, "skipped")
+        return
+    ok = _submit_bg(lambda: _capture_sample_async(app, endpoint_id, kind, ext, bytes(audio),
+                                                  meta, capture, sample_id or _secrets.token_hex(8)))
+    if not ok:
+        _metrics.observe_capture(endpoint_id, kind, "skipped")
+
+
+async def _do_speech(app, endpoint_id: str, candidates: list[dict], alias: str,
+                     payload: dict, timeout_s: float, ev: dict) -> dict:
+    """Non-streaming TTS forward. Returns the binary audio as raw_body (relayed verbatim) and
+    fires the async CER/WER eval. Failover on connect error / 5xx."""
+    cli = _http(app)
+    last_err = "no upstream"
+    for u in candidates:
+        body = {**payload, **(u.get("extra_body") or {}), "model": u["models"][alias]}
+        body.pop("stream", None)
+        headers = {"Content-Type": "application/json"}
+        if u.get("_key"):
+            headers["Authorization"] = f"Bearer {u['_key']}"
+        url = u["base_url"].rstrip("/") + "/audio/speech"
+        t0 = time.perf_counter()
+        try:
+            r = await cli.post(url, json=body, headers=headers,
+                               timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError) as e:
+            _mark_health(app, endpoint_id, u["id"], False, error=str(e))
+            last_err = f"{u['name']}: {type(e).__name__}"
+            continue
+        lat = int((time.perf_counter() - t0) * 1000)
+        if r.status_code >= 500:
+            _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+            last_err = f"{u['name']}: HTTP {r.status_code}"
+            continue
+        _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
+        audio = r.content
+        ct = r.headers.get("content-type") or "application/octet-stream"
+        res = {"upstream": u["name"], "upstream_url": u["base_url"], "status_code": r.status_code,
+               "latency_ms": lat, "pt": None, "ct": None, "avg_logprob": None}
+        if r.status_code >= 400:
+            try:
+                res["data"] = r.json()
+            except Exception:
+                res["data"] = {"error": r.text[:500]}
+            return res
+        _fire_tts_eval(app, endpoint_id, alias, ev, audio, ct)
+        res["raw_body"] = audio
+        res["media_type"] = ct
+        return res
+    raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
+
+
+async def _stream_speech(app, request_id: str, endpoint_id: str, candidates: list[dict], alias: str,
+                         payload: dict, timeout_s: float, gate, cancel_ev: asyncio.Event, ev: dict) -> Response:
+    """Streaming TTS forward: relays the upstream binary audio as it arrives and tees it into a
+    bounded buffer for the async CER/WER eval fired on completion. Failover before the first byte."""
+    live = _live(app)
+    cli = _http(app)
+    token = None
+    gate_held = False
+    handed_off = False
+    try:
+        if gate is not None:
+            token = await gate.acquire(cancel_ev, live.get(request_id)); gate_held = True
+        if cancel_ev.is_set():
+            raise asyncio.CancelledError()
+        if request_id in live:
+            live[request_id]["state"] = "running"
+        await _set_started(request_id)
+        last_err = "no upstream"
+        chosen = None
+        for u in candidates:
+            body = {**payload, **(u.get("extra_body") or {}), "model": u["models"][alias], "stream": True}
+            headers = {"Content-Type": "application/json"}
+            if u.get("_key"):
+                headers["Authorization"] = f"Bearer {u['_key']}"
+            url = u["base_url"].rstrip("/") + "/audio/speech"
+            t0 = time.perf_counter()
+            try:
+                req = cli.build_request("POST", url, json=body, headers=headers,
+                                        timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+                r = await cli.send(req, stream=True)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                _mark_health(app, endpoint_id, u["id"], False, error=str(e))
+                last_err = f"{u['name']}: {type(e).__name__}"
+                continue
+            lat = int((time.perf_counter() - t0) * 1000)
+            if r.status_code >= 500:
+                _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+                last_err = f"{u['name']}: HTTP {r.status_code}"
+                await r.aclose()
+                continue
+            _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
+            chosen = (r, u, t0, lat)
+            break
+        if chosen is None:
+            await _finish(request_id, "failed", status_code=502, error=last_err)
+            live.pop(request_id, None)
+            raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
+
+        r, u, t0, lat = chosen
+        if request_id in live:
+            live[request_id]["upstream"] = u["name"]
+        await _set_started(request_id, upstream=u["name"])
+        ct = r.headers.get("content-type") or "application/octet-stream"
+        base_hdrs = {"X-Request-Id": request_id, "X-Upstream-Url": u["base_url"], "X-Upstream-Name": u["name"]}
+        if r.status_code >= 400:  # upstream client error → surface it as JSON, don't stream
+            body = await r.aread()
+            await r.aclose()
+            if gate_held and gate is not None:
+                await gate.release(token); gate_held = False
+            await _finish(request_id, "failed", status_code=r.status_code, latency_ms=lat,
+                          upstream=u["name"], error=body[:500].decode("utf-8", "ignore"))
+            live.pop(request_id, None)
+            try:
+                obj = json.loads(body)
+            except Exception:
+                obj = {"error": body.decode("utf-8", "ignore")[:500]}
+            return JSONResponse(obj, status_code=r.status_code, headers=base_hdrs)
+
+        handed_off = True
+        hdrs = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **base_hdrs}
+
+        async def _relay():
+            nonlocal token, gate_held
+            ttft = None
+            finished = False
+            truncated = False
+            buf = bytearray()
+            try:
+                async for chunk in r.aiter_bytes():
+                    if cancel_ev.is_set():
+                        break
+                    if ttft is None:
+                        ttft = int((time.perf_counter() - t0) * 1000)
+                    yield chunk
+                    if not truncated:
+                        if len(buf) + len(chunk) <= _TTS_EVAL_CAP_BYTES:
+                            buf.extend(chunk)
+                        else:
+                            truncated = True
+                finished = True
+                await _finish(request_id, "completed", status_code=r.status_code,
+                              latency_ms=int((time.perf_counter() - t0) * 1000), ttft_ms=ttft, upstream=u["name"])
+                if truncated:
+                    from . import metrics as _metrics
+                    _metrics.observe_tts_eval_outcome(endpoint_id, "skipped")
+                elif buf:
+                    _fire_tts_eval(app, endpoint_id, alias, ev, bytes(buf), ct)
+            finally:
+                try:
+                    await r.aclose()
+                except Exception:
+                    pass
+                if gate_held and gate is not None:
+                    await gate.release(token); gate_held = False
+                live.pop(request_id, None)
+                if not finished:
+                    asyncio.create_task(_finish(request_id, "cancelled", status_code=499, error="client disconnected"))
+
+        return StreamingResponse(_relay(), media_type=ct, headers=hdrs)
+    except asyncio.CancelledError:
+        await _finish(request_id, "cancelled", status_code=499, error="cancelled")
+        live.pop(request_id, None)
+        return Response(status_code=499)
+    except HTTPException:
+        raise
+    except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.WriteError) as e:
+        await _finish(request_id, "failed", status_code=502, error=f"{type(e).__name__}: {e}")
+        live.pop(request_id, None)
+        raise HTTPException(status_code=502, detail={"error": f"upstream failed: {type(e).__name__}"})
+    finally:
+        if gate_held and gate is not None and not handed_off:
+            await gate.release(token)
+
+
+async def _handle_speech(request: Request, user: User, endpoint_name: str) -> Response:
+    """TTS text→speech forward (POST /v1/audio/speech). JSON body in, binary audio out
+    (stream or unary). Routes by the `model` alias; fires an async CER/WER round-trip."""
+    app = request.app
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail={"error": "invalid JSON body"})
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={"error": "body must be a JSON object"})
+    alias = payload.get("model")
+    if not isinstance(alias, str) or not alias.strip():
+        raise HTTPException(status_code=400, detail={"error": "missing 'model' in request body"})
+    alias = alias.strip()
+    input_text = payload["input"] if isinstance(payload.get("input"), str) else ""
+    voice = payload["voice"] if isinstance(payload.get("voice"), str) else ""
+    is_stream = bool(payload.get("stream"))
+    endpoint_id, candidates, timeout_s, max_conc, stt, capture = await _resolve_speech_route(app, endpoint_name, alias)
+    request_id = f"pxr-{_secrets.token_hex(8)}"
+    ev = {"stt": stt, "input": input_text, "voice": voice, "capture": capture,
+          "request_id": request_id, "sample_id": _trace_sample_id(request, request_id)}
+    await _insert_request_row(request_id, endpoint_id, user, alias, is_stream)
+    gate = _get_gate(app, endpoint_id, max_conc)
+    cancel_ev = asyncio.Event()
+    _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream)
+    if is_stream:
+        return await _stream_speech(app, request_id, endpoint_id, candidates, alias, payload,
+                                    timeout_s, gate, cancel_ev, ev)
+    return await _unary(app, request, request_id,
+                        lambda: _do_speech(app, endpoint_id, candidates, alias, payload, timeout_s, ev),
+                        gate, cancel_ev)
+
+
+async def _handle_speaker(request: Request, user: User, endpoint_name: str) -> Response:
+    """GET /v1/audio/speaker — forward the upstream's speaker/voice list (endpoint-wide, not
+    per-model). Cheap read: no gate / request-row tracking. Failover across enabled upstreams."""
+    app = request.app
+    async with session_factory()() as s:
+        ep = (await s.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint_name))).scalar_one_or_none()
+        if ep is None or not ep.enabled:
+            raise HTTPException(status_code=404, detail={"error": f"proxy endpoint '{endpoint_name}' not found or disabled"})
+        cfg = ep.config or {}
+        genv = await load_global_env(s)
+        ups = [dict(u) for u in cfg.get("upstreams", []) if u.get("enabled", True)]
+        for u in ups:
+            u["_key"] = _resolve_key(u, genv)
+        timeout_s = float(cfg.get("timeout_s") or DEFAULT_TIMEOUT_S)
+    if not ups:
+        raise HTTPException(status_code=404, detail={"error": "endpoint has no enabled upstreams"})
+    cli = _http(app)
+    last_err = "no upstream"
+    for u in ups:
+        headers = {"Authorization": f"Bearer {u['_key']}"} if u.get("_key") else {}
+        url = u["base_url"].rstrip("/") + "/audio/speaker"
+        try:
+            r = await cli.get(url, headers=headers,
+                              timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError) as e:
+            last_err = f"{u['name']}: {type(e).__name__}"
+            continue
+        if r.status_code >= 500:
+            last_err = f"{u['name']}: HTTP {r.status_code}"
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
+        return JSONResponse(data, status_code=r.status_code, headers={"X-Upstream-Name": u["name"]})
+    raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
+
+
 def _truthy(v: object) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
@@ -1483,12 +2147,17 @@ async def _handle_audio(request: Request, user: User, endpoint_name: str, upstre
         return await _stream_audio(app, request, user, endpoint_id, candidates, alias, upstream_path,
                                    file_name, file_bytes, content_type, extra, timeout_s, max_conc)
     endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, False)
+    # Low-logprob sample capture (best-effort) — skipped for a TTS proxy's own round-trip
+    # transcription so it doesn't double-capture the same audio as an STT sample.
+    capture = None if request.headers.get("x-sgpu-tts-eval") else await _resolve_capture_cfg(endpoint_name)
     gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, False)
+    sample_id = _trace_sample_id(request, request_id)  # key captures by X-Request-ID (tracing)
     return await _unary(app, request, request_id,
                         lambda: _do_unary_multipart(app, endpoint_id, candidates, alias, upstream_path,
-                                                    file_name, file_bytes, content_type, extra, timeout_s),
+                                                    file_name, file_bytes, content_type, extra, timeout_s,
+                                                    capture=capture, request_id=request_id, sample_id=sample_id),
                         gate, cancel_ev)
 
 
@@ -1520,6 +2189,16 @@ async def proxy_audio_transcriptions(endpoint: str, request: Request, user: User
 @data_router.post("/proxy/{endpoint}/v1/audio/translations")
 async def proxy_audio_translations(endpoint: str, request: Request, user: User = Depends(current_user)):
     return await _handle_audio(request, user, endpoint, "/audio/translations")
+
+
+@data_router.post("/proxy/{endpoint}/v1/audio/speech")
+async def proxy_audio_speech(endpoint: str, request: Request, user: User = Depends(current_user)):
+    return await _handle_speech(request, user, endpoint)
+
+
+@data_router.get("/proxy/{endpoint}/v1/audio/speaker")
+async def proxy_audio_speaker(endpoint: str, request: Request, user: User = Depends(current_user)):
+    return await _handle_speaker(request, user, endpoint)
 
 
 @data_router.get("/proxy/{endpoint}/v1/models")
@@ -1584,6 +2263,12 @@ async def create_proxy(req: CreateProxyRequest, request: Request, user: User = D
         "timeout_s": max(1, int(req.timeout_s)),
         "upstreams": _build_upstreams(req.upstreams),
     }
+    stt = _build_stt_callback(req.stt_callback)
+    if stt:
+        cfg["stt_callback"] = stt
+    cap = _build_capture(req.capture)
+    if cap:
+        cfg["capture"] = cap
     row = ProxyEndpoint(id=f"proxy-{_secrets.token_hex(4)}", owner_id=user.id, name=name,
                         enabled=bool(req.enabled), public=bool(req.public), config=cfg,
                         created_at=datetime.now(timezone.utc))
@@ -1654,6 +2339,18 @@ async def update_proxy(proxy_id: str, req: UpdateProxyRequest, request: Request,
         cfg["timeout_s"] = max(1, int(req.timeout_s))
     if req.upstreams is not None:
         cfg["upstreams"] = _build_upstreams(req.upstreams, existing=cfg.get("upstreams"))
+    if req.stt_callback is not None:
+        stt = _build_stt_callback(req.stt_callback, existing=cfg.get("stt_callback"))
+        if stt:
+            cfg["stt_callback"] = stt
+        else:
+            cfg.pop("stt_callback", None)  # cleared (blank base_url/model)
+    if req.capture is not None:
+        cap = _build_capture(req.capture, existing=cfg.get("capture"))
+        if cap:
+            cfg["capture"] = cap
+        else:
+            cfg.pop("capture", None)  # cleared (no storage_id)
     row.config = cfg
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(row, "config")

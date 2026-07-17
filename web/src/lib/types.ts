@@ -1560,6 +1560,28 @@ export type ProxyUpstream = {
   extra_body?: Record<string, unknown>; // merged into every forwarded body (e.g. OpenRouter provider pinning)
 };
 
+// A whisper-compatible STT endpoint the TTS proxy calls back to transcribe its own
+// generated audio, for async CER/WER drift metrics. Not a data-plane upstream.
+export type ProxySttCallback = {
+  enabled: boolean;
+  base_url: string;
+  model: string;
+  api_key_secret?: string | null;
+  has_inline_key: boolean;
+};
+
+// Threshold-triggered drift-sample capture: save audio (+ JSON sidecar) to a storage
+// backend when STT confidence drops (avg_logprob < threshold) or TTS error rises
+// (CER/WER > threshold). A null threshold means that dimension never triggers.
+export type ProxyCapture = {
+  enabled: boolean;
+  storage_id: string;
+  prefix: string;
+  logprob_threshold?: number | null;
+  cer_threshold?: number | null;
+  wer_threshold?: number | null;
+};
+
 export type ProxyEndpoint = {
   id: string;
   name: string;
@@ -1568,10 +1590,21 @@ export type ProxyEndpoint = {
   max_concurrency: number;
   timeout_s: number;
   upstreams: ProxyUpstream[];
+  stt_callback?: ProxySttCallback | null;
+  capture?: ProxyCapture | null;
   inflight: number;
   queued: number;
   created_at: string;
   created_by: string;
+};
+
+// STT-callback spec sent on create/update (mirrors ProxyUpstreamSpec key handling).
+export type ProxySttCallbackSpec = {
+  enabled: boolean;
+  base_url: string;
+  model: string;
+  api_key_secret?: string | null;
+  api_key?: string | null;
 };
 
 // Upstream spec sent on create/update. `api_key` is write-only (paste); blank on
@@ -1595,6 +1628,8 @@ export type CreateProxyBody = {
   enabled?: boolean;
   public?: boolean;
   upstreams: ProxyUpstreamSpec[];
+  stt_callback?: ProxySttCallbackSpec | null;
+  capture?: ProxyCapture | null;
 };
 
 export type UpdateProxyBody = Partial<CreateProxyBody>;

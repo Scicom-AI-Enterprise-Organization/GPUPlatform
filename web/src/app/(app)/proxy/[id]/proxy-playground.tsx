@@ -12,12 +12,13 @@ import {
 import { ChatPlayground, openAiTransport } from "@/components/playground/chat-playground";
 import { EmbeddingPlayground } from "@/app/(app)/serverless/[id]/tabs/embedding";
 import { TranscribePlayground } from "@/app/(app)/serverless/[id]/tabs/transcribe";
+import { SpeechPlayground } from "@/app/(app)/serverless/[id]/tabs/speech";
 
 export function ProxyPlayground({ name, aliases, baseUrl }: { name: string; aliases: string[]; baseUrl: string }) {
   // The data-plane base behind the Next proxy: /api/proxy → gateway, then
   // /proxy/{name}/v1 → the proxy router. Each mode appends its OpenAI sub-path.
   const apiBase = `/api/proxy/proxy/${encodeURIComponent(name)}/v1`;
-  const [mode, setMode] = useState<"chat" | "embedding" | "audio">("chat");
+  const [mode, setMode] = useState<"chat" | "embedding" | "audio" | "tts">("chat");
 
   const chat = (
     <ChatPlayground
@@ -35,12 +36,13 @@ export function ProxyPlayground({ name, aliases, baseUrl }: { name: string; alia
     <div className="space-y-3">
       <div className="flex items-center gap-2">
         <span className="text-xs text-muted-foreground">mode</span>
-        <Select value={mode} onValueChange={(v) => setMode(v as "chat" | "embedding" | "audio")}>
+        <Select value={mode} onValueChange={(v) => setMode(v as "chat" | "embedding" | "audio" | "tts")}>
           <SelectTrigger className="h-8 w-[280px] text-xs"><SelectValue /></SelectTrigger>
           <SelectContent>
             <SelectItem value="chat" className="text-xs">Chat / text generation</SelectItem>
             <SelectItem value="embedding" className="text-xs">Embeddings (/v1/embeddings)</SelectItem>
             <SelectItem value="audio" className="text-xs">Audio transcription (Whisper)</SelectItem>
+            <SelectItem value="tts" className="text-xs">Text to speech (/v1/audio/speech)</SelectItem>
           </SelectContent>
         </Select>
         <span className="hidden text-[11px] text-muted-foreground sm:inline">
@@ -50,7 +52,9 @@ export function ProxyPlayground({ name, aliases, baseUrl }: { name: string; alia
       {mode === "chat" ? chat
         : mode === "embedding"
           ? <EmbeddingPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:embed:proxy:${name}`} />
-          : <TranscribePlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:transcribe:proxy:${name}`} />}
+          : mode === "audio"
+            ? <TranscribePlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:transcribe:proxy:${name}`} />
+            : <SpeechPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:speech:proxy:${name}`} />}
     </div>
   );
 }

@@ -296,6 +296,75 @@ PROXY_AUDIO_NLL = Histogram(
 )
 
 
+# TTS round-trip quality: the proxy transcribes its own generated audio through a
+# whisper STT (async, off the response path) and scores it vs the input text. CER is
+# the meaningful signal for CJK (word-based WER ≈ 1.0 there); WER for spaced scripts.
+# Watch the windowed mean for TTS DRIFT:
+#   rate(proxy_tts_cer_sum[30m]) / rate(proxy_tts_cer_count[30m])   (rises = worse)
+# Labelled by voice/speaker too, so per-speaker regressions surface.
+_ERR_RATE_BUCKETS = (
+    0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, float("inf"),
+)
+_TTS_LABELS = ["proxy", "model", "voice"]
+PROXY_TTS_CER = Histogram(
+    "proxy_tts_cer",
+    "TTS proxy character error rate (generated audio → STT → vs input text; drift signal)",
+    _TTS_LABELS, buckets=_ERR_RATE_BUCKETS, registry=_registry,
+)
+PROXY_TTS_WER = Histogram(
+    "proxy_tts_wer",
+    "TTS proxy word error rate (generated audio → STT → vs input text; drift signal)",
+    _TTS_LABELS, buckets=_ERR_RATE_BUCKETS, registry=_registry,
+)
+PROXY_TTS_EVAL_TOTAL = Counter(
+    "proxy_tts_eval_total",
+    "TTS CER/WER round-trip evaluations by outcome (scored / stt_error / skipped)",
+    ["proxy", "result"], registry=_registry,
+)
+
+
+def observe_tts_eval(proxy: str, model: str, voice: str, cer: float, wer: float) -> None:
+    """Record one completed TTS→STT round-trip: CER + WER (both ≥ 0). Best-effort;
+    caller guarantees numeric inputs from a successful STT transcription."""
+    lbl = {"proxy": proxy, "model": model or "", "voice": voice or ""}
+    PROXY_TTS_CER.labels(**lbl).observe(max(0.0, float(cer)))
+    PROXY_TTS_WER.labels(**lbl).observe(max(0.0, float(wer)))
+    PROXY_TTS_EVAL_TOTAL.labels(proxy=proxy, result="scored").inc()
+
+
+def observe_tts_eval_outcome(proxy: str, result: str) -> None:
+    """Bump the eval outcome counter for a non-scored case (stt_error / skipped)."""
+    PROXY_TTS_EVAL_TOTAL.labels(proxy=proxy, result=result).inc()
+
+
+# Drift-sample capture: audio (+ JSON sidecar) persisted to storage when a request
+# crosses a threshold (STT low avg_logprob / TTS high CER-WER). Watch the rate of
+# "saved" as a leading indicator of how much bad output is flowing.
+PROXY_CAPTURE_TOTAL = Counter(
+    "proxy_capture_total",
+    "Drift audio samples captured to storage, by kind (stt/tts) and outcome (saved/error/skipped)",
+    ["proxy", "kind", "result"], registry=_registry,
+)
+
+
+def observe_capture(proxy: str, kind: str, result: str) -> None:
+    PROXY_CAPTURE_TOTAL.labels(proxy=proxy, kind=kind or "", result=result).inc()
+
+
+# Depth of the shared off-path background-job queue (TTS CER/WER evals + drift-sample
+# uploads). A persistently-high value means the worker pool is saturated — raise
+# PROXY_BG_WORKERS. Process-wide (not per-proxy), so it lives on the infra /metrics.
+PROXY_BG_QUEUE = Gauge(
+    "proxy_bg_queue_depth",
+    "Pending off-path background jobs (TTS eval + drift capture) awaiting a worker",
+    registry=_registry,
+)
+
+
+def set_bg_queue_depth(n: int) -> None:
+    PROXY_BG_QUEUE.set(n)
+
+
 def observe_proxy(
     proxy: str, model: str, upstream: str, status: str, duration_s: float | None = None,
     ttft_s: float | None = None, tps: float | None = None, avg_logprob: float | None = None,
@@ -328,7 +397,8 @@ def render_proxy(proxy: str) -> bytes:
     class _ProxyFilter:
         def collect(self):
             for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION, PROXY_TTFT, PROXY_TPS,
-                           PROXY_AUDIO_NLL):
+                           PROXY_AUDIO_NLL, PROXY_TTS_CER, PROXY_TTS_WER, PROXY_TTS_EVAL_TOTAL,
+                           PROXY_CAPTURE_TOTAL):
                 for mf in metric.collect():
                     samples = [s for s in mf.samples if s.labels.get("proxy") == proxy]
                     if not samples:

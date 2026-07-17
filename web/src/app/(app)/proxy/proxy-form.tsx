@@ -8,8 +8,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
 import { gateway } from "@/lib/gateway";
-import type { ProxyEndpoint, ProxyUpstreamSpec } from "@/lib/types";
+import type { ProxyEndpoint, ProxyUpstreamSpec, StorageRecord } from "@/lib/types";
 import { FormFooter, FormShell } from "@/components/form-shell";
 
 type KeyMode = "secret" | "paste" | "keep";
@@ -96,7 +99,28 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [maxConc, setMaxConc] = useState(String(initial?.max_concurrency ?? 0));
   const [timeoutS, setTimeoutS] = useState(String(initial?.timeout_s ?? 3600));
   const [ups, setUps] = useState<UpstreamDraft[]>(initial ? fromEndpoint(initial) : [seededUpstream(prefill)]);
+  // STT callback (CER/WER) — a whisper-compatible endpoint the TTS proxy transcribes
+  // its generated audio through, async, to record CER/WER. Not a data-plane upstream.
+  const stt0 = initial?.stt_callback ?? undefined;
+  const [sttEnabled, setSttEnabled] = useState(stt0?.enabled ?? true);
+  const [sttBase, setSttBase] = useState(stt0?.base_url ?? "");
+  const [sttModel, setSttModel] = useState(stt0?.model ?? "");
+  const sttHadKey = !!(stt0?.has_inline_key || stt0?.api_key_secret);
+  const [sttKeyMode, setSttKeyMode] = useState<KeyMode>(
+    stt0?.has_inline_key ? "keep" : stt0?.api_key_secret ? "secret" : "paste");
+  const [sttKeySecret, setSttKeySecret] = useState(stt0?.api_key_secret ?? "");
+  const [sttKey, setSttKey] = useState("");
   const [secretKeys, setSecretKeys] = useState<string[]>([]);
+  // Capture drift samples — save audio (+ sidecar) to storage when a threshold is crossed.
+  const cap0 = initial?.capture ?? undefined;
+  const [capEnabled, setCapEnabled] = useState(cap0?.enabled ?? false);
+  const [capStorage, setCapStorage] = useState(cap0?.storage_id ?? "");
+  const [capPrefix, setCapPrefix] = useState(cap0?.prefix ?? "drift/");
+  const numStr = (n?: number | null) => (n === null || n === undefined ? "" : String(n));
+  const [capLogprob, setCapLogprob] = useState(numStr(cap0?.logprob_threshold));
+  const [capCer, setCapCer] = useState(numStr(cap0?.cer_threshold));
+  const [capWer, setCapWer] = useState(numStr(cap0?.wer_threshold));
+  const [storages, setStorages] = useState<StorageRecord[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -104,6 +128,10 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
     fetch("/api/proxy/v1/global-env", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : []))
       .then((rows) => { if (Array.isArray(rows)) setSecretKeys(rows.map((r: { key: string }) => r.key)); })
+      .catch(() => {});
+    fetch("/api/proxy/v1/storage", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => { if (Array.isArray(rows)) setStorages(rows as StorageRecord[]); })
       .catch(() => {});
   }, []);
 
@@ -177,6 +205,25 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         enabled,
         public: isPublic,
         upstreams: b.upstreams,
+        // Always sent: blank base_url/model clears the callback server-side (edit) or
+        // is ignored (create). keyMode "keep" leaves the stored key untouched.
+        stt_callback: {
+          enabled: sttEnabled,
+          base_url: sttBase.trim(),
+          model: sttModel.trim(),
+          api_key_secret: sttKeyMode === "secret" ? (sttKeySecret.trim() || null) : null,
+          api_key: sttKeyMode === "paste" ? (sttKey.trim() || null) : null,
+        },
+        // Always sent: blank storage clears it (edit) / is ignored (create). Empty
+        // threshold → null (that dimension never triggers).
+        capture: {
+          enabled: capEnabled,
+          storage_id: capStorage.trim(),
+          prefix: capPrefix.trim(),
+          logprob_threshold: capLogprob.trim() === "" ? null : Number(capLogprob),
+          cer_threshold: capCer.trim() === "" ? null : Number(capCer),
+          wer_threshold: capWer.trim() === "" ? null : Number(capWer),
+        },
       };
       const ep = editing
         ? await gateway.updateProxy(initial!.id, body)
@@ -346,6 +393,110 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           ))}
         </div>
         <datalist id="px-secret-keys">{secretKeys.map((k) => <option key={k} value={k} />)}</datalist>
+      </section>
+
+      <section data-form-section="STT callback (CER/WER)" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
+        <div className="mb-1 flex items-center justify-between">
+          <h2 className="text-base font-medium">STT callback — CER/WER</h2>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-muted-foreground">enabled</span>
+            <Switch checked={sttEnabled} onCheckedChange={setSttEnabled} />
+          </div>
+        </div>
+        <p className="mb-4 text-xs text-muted-foreground">
+          Optional — for a <span className="font-mono">TTS</span> proxy that serves <span className="font-mono">/v1/audio/speech</span>. The gateway transcribes each generated
+          clip through this whisper-compatible STT and records <span className="font-mono">CER</span>/<span className="font-mono">WER</span> vs the input text to Prometheus
+          <span className="font-medium"> asynchronously</span> (never in the API response). Point it at any whisper API — e.g. this platform&apos;s own <span className="font-mono">stt</span> proxy.
+          Leave the URL/model blank to disable.
+        </p>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
+          <div className="md:col-span-7">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">STT base URL</Label>
+            <Input value={sttBase} onChange={(e) => setSttBase(e.target.value)}
+                   placeholder="https://serverlessgpu.aies.scicom.dev/proxy/stt/v1" className="font-mono text-xs" />
+          </div>
+          <div className="md:col-span-5">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">STT model</Label>
+            <Input value={sttModel} onChange={(e) => setSttModel(e.target.value)}
+                   placeholder="scicom-ai-enterprise/whisper-large-v3-turbo-…" className="font-mono text-xs" />
+          </div>
+        </div>
+        <div className="mt-3">
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">API key</Label>
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+              {(["secret", "paste", ...(sttHadKey ? ["keep" as const] : [])] as KeyMode[]).map((m) => (
+                <button key={m} type="button" onClick={() => setSttKeyMode(m)}
+                        className={"rounded px-2 py-1 " + (sttKeyMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                  {m === "secret" ? "Secret ref" : m === "paste" ? "Paste" : "Keep existing"}
+                </button>
+              ))}
+            </div>
+            {sttKeyMode === "secret" && (
+              <Input list="px-secret-keys" value={sttKeySecret} onChange={(e) => setSttKeySecret(e.target.value)}
+                     placeholder="SECRETS_KEY" className="h-8 max-w-xs font-mono text-xs" />
+            )}
+            {sttKeyMode === "paste" && (
+              <Input type="password" autoComplete="off" value={sttKey} onChange={(e) => setSttKey(e.target.value)}
+                     placeholder="sgpu-… (stored encrypted)" className="h-8 max-w-xs font-mono text-xs" />
+            )}
+            {sttKeyMode === "keep" && <span className="text-xs text-muted-foreground">existing key kept</span>}
+            <span className="text-[11px] text-muted-foreground">optional — omit for a keyless / auth-disabled STT</span>
+          </div>
+        </div>
+      </section>
+
+      <section data-form-section="Capture drift samples" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
+        <div className="mb-1 flex items-center justify-between">
+          <h2 className="text-base font-medium">Capture drift samples</h2>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-muted-foreground">enabled</span>
+            <Switch checked={capEnabled} onCheckedChange={setCapEnabled} />
+          </div>
+        </div>
+        <p className="mb-4 text-xs text-muted-foreground">
+          Optional — when a request crosses a quality threshold, save the audio (+ a JSON sidecar with the text/scores)
+          to a storage backend for inspection. <span className="font-mono">STT</span>: captures when the transcription&apos;s
+          <span className="font-mono"> avg_logprob</span> falls below the floor. <span className="font-mono">TTS</span>: captures when the
+          round-trip <span className="font-mono">CER</span> or <span className="font-mono">WER</span> exceeds the ceiling (needs the STT callback above).
+          Leave a threshold blank to never trigger on it.
+        </p>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
+          <div className="md:col-span-7">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Storage backend</Label>
+            <Select value={capStorage} onValueChange={setCapStorage}>
+              <SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Select a storage backend…" /></SelectTrigger>
+              <SelectContent>
+                {storages.map((s) => (
+                  <SelectItem key={s.id} value={s.id} className="text-xs">
+                    {s.name} <span className="text-muted-foreground">({s.kind}{s.bucket ? `: ${s.bucket}` : ""})</span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="md:col-span-5">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Key prefix</Label>
+            <Input value={capPrefix} onChange={(e) => setCapPrefix(e.target.value)} placeholder="drift/" className="font-mono text-xs" />
+          </div>
+        </div>
+        <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">STT logprob floor</Label>
+            <Input type="number" step="0.05" value={capLogprob} onChange={(e) => setCapLogprob(e.target.value)} placeholder="e.g. -0.5" className="font-mono text-xs" />
+            <p className="mt-1 text-[11px] text-muted-foreground">save if avg_logprob &lt; this</p>
+          </div>
+          <div>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">TTS CER ceiling</Label>
+            <Input type="number" step="0.05" min={0} value={capCer} onChange={(e) => setCapCer(e.target.value)} placeholder="e.g. 0.2" className="font-mono text-xs" />
+            <p className="mt-1 text-[11px] text-muted-foreground">save if CER &gt; this</p>
+          </div>
+          <div>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">TTS WER ceiling</Label>
+            <Input type="number" step="0.05" min={0} value={capWer} onChange={(e) => setCapWer(e.target.value)} placeholder="e.g. 0.3" className="font-mono text-xs" />
+            <p className="mt-1 text-[11px] text-muted-foreground">save if WER &gt; this</p>
+          </div>
+        </div>
       </section>
 
       <FormFooter error={error}>

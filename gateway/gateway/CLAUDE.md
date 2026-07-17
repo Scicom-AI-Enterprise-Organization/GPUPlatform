@@ -222,6 +222,60 @@ leadership rather than by deployment:
   (no `_watch_cancel` there — pre-existing); cancel only lands while the request is *queued* (gate loop)
   or *streaming* (relay loop).
 
+### Audio proxy (STT/TTS) — drift metrics, format conversion, CER/WER, sample capture
+
+The LLM-proxy (`proxy_api.py`) fronts audio backends too: `/v1/audio/{transcriptions,translations}`
+(whisper STT), `/v1/audio/speech` + `/v1/audio/speaker` (TTS). All route by the `model` alias like
+chat, with failover / gate / `X-Upstream-*` headers. Verified e2e against `stt-engine-tm-l40` (vLLM
+whisper-large-v3-turbo) + `tts-api-tm-l40` (real model name **`TTS-model`**; `/v1/models` 404s so map
+an alias → `TTS-model` by hand).
+
+- **STT drift metric = `proxy_audio_nll` (NLL, not raw logprob).** whisper `verbose_json` returns
+  per-segment `avg_logprob` (≤ 0). We record its duration-weighted mean **NEGATED** (`-avg_logprob`,
+  a histogram, labels `proxy`/`model`). ⚠️ **Why negated:** `prometheus_client` DROPS a histogram's
+  `_sum` sample once it observes a negative value (spec bans `rate()` over a decreasing sum) → the
+  windowed-mean drift query would break. NLL ≥ 0 keeps `_sum`. Drift: `rate(proxy_audio_nll_sum[30m]) /
+  rate(proxy_audio_nll_count[30m])` — RISE = worse (whisper turbo baselines ~0.19).
+- **STT proxy ALWAYS requests `verbose_json` upstream, then converts back** to the caller's
+  `response_format` (`_do_unary_multipart` → `_convert_verbose_audio`: json→`{text}`, verbose_json
+  passthrough, text/srt/vtt reconstructed from segments via `_segments_to_{srt,vtt}` + `Response(raw_body,
+  media_type)` in `_unary`). So the drift signal populates on **all** non-stream traffic, not only when a
+  client opts into verbose_json (the playground sends `json`). On a 4xx from the verbose_json attempt it
+  retries once in the caller's own format (never breaks a working request).
+- **Streaming.** whisper streams (`stream=true` → SSE `transcription.chunk` deltas) via `_stream_audio`;
+  TTS streams raw `audio/pcm` chunks via `_stream_speech` (both relay incrementally + tee bytes). ⚠️
+  **`verbose_json` + `stream=true` is mutually exclusive** — vLLM returns `400 "verbose_json format
+  doesn't support streaming case"` (surfaced, not masked), so **streaming carries NO logprob** (the
+  stream frames are content-only). Stream for latency, `verbose_json` for drift — can't have both.
+- **TTS output** is 16-bit mono **24 kHz** — `audio/pcm` (headerless) by default, `audio/wav` with
+  `response_format=wav` (bogus `0x7FFFFFFF` size header — the playground patches it client-side for
+  playback). `_audio_to_wav` wraps PCM→WAV (parses a real RIFF, else assumes 24k/mono/16) for the STT
+  round-trip.
+- **TTS CER/WER round-trip (`proxy_tts_cer` / `proxy_tts_wer`, labels proxy/model/voice).** A per-proxy
+  **`stt_callback`** config (base_url + model + optional key, set on the proxy form) transcribes each
+  generated clip back through a whisper STT; `_cer_wer` scores it (jiwer, case/punct-normalized) vs the
+  input text. ⚠️ **CJK voices → use CER** (word-based WER ≈ 1.0 with no spaces). ⚠️ The round-trip's own
+  STT call sends **`X-SGPU-TTS-Eval: 1`** so a capture-enabled STT proxy doesn't re-capture it. `jiwer`
+  is a lazy import (in `pyproject`; missing wheel ⇒ metric silently skipped, gateway still boots).
+- **Drift-sample capture** (per-proxy **`capture`** config: `storage_id` + `prefix` + `logprob_threshold`
+  (STT) / `cer_threshold` + `wer_threshold` (TTS)). When a request crosses a threshold, save the audio +
+  a `.json` sidecar to the storage backend (`storage_backends.resolve_backend(row).put_bytes`, run via
+  `asyncio.to_thread`). Key = **`{prefix}{proxy_id}/{YYYY-MM-DD}/{X-Request-ID}.{ext}`** — honours an
+  inbound `X-Request-ID` (tracing) else the `pxr-…` id, **sanitized** (`_SAFE_ID_RE`) against path
+  traversal. Metric `proxy_capture_total{proxy,kind,result}`.
+- **All off-path work goes through ONE bounded background queue + worker pool** (`_submit_bg` →
+  `_bg_queue` drained by `_BG_WORKERS` `_bg_worker`s). Replaced the old per-call inflight caps that
+  *dropped* work under load — now bursts buffer and run in parallel; only a full queue sheds (→
+  `result="skipped"`). Scale with **`PROXY_BG_WORKERS`** (default 8) / **`PROXY_BG_QUEUE_MAX`** (1000);
+  watch **`proxy_bg_queue_depth`** to decide when to raise workers. Verified: 12 concurrent TTS → all 12
+  scored + captured, 0 dropped (old cap-of-4 would've dropped ~8). Response latency unaffected (measured
+  −80 ms proxy-vs-direct — i.e. noise — with evals+capture firing).
+- ⚠️ **Multi-replica**: these are per-replica in-process metrics (no cross-replica sync — `proxy_cluster`
+  only shares slots/queue, not Prometheus). The ServiceMonitor scrapes `/metrics` per-pod; aggregate at
+  query time — `sum(rate(proxy_tts_cer_sum[30m]))/sum(rate(proxy_tts_cer_count[30m]))`. Histograms
+  (`_sum`/`_count`) are additive across pods; that's why drift is a histogram, not a gauge. Don't scrape
+  `/proxy/{name}/metrics` (render_proxy) through the LB — it's this-replica-only.
+
 ### Label platform (data-labelling app)
 
 A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)
