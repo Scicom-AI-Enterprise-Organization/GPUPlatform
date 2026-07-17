@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
-import { CheckSquare, GitMerge, Inbox, LayoutGrid, List, Loader2, Search, X } from "lucide-react";
+import { CheckSquare, GitMerge, Inbox, LayoutGrid, List, Loader2, Search, Trash2, X } from "lucide-react";
 import { useListUrlState, readParam } from "@/lib/list-url-state";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
@@ -112,6 +112,14 @@ export function DatasetsList({
   // typing the exact dataset name since it's irreversible.
   const [purge, setPurge] = useState(false);
   const [purgeConfirm, setPurgeConfirm] = useState("");
+  // Bulk delete (select mode) — mirrors the single-delete purge flow, applied to
+  // every currently-loaded selected dataset. purge gated behind typing "delete".
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkPurge, setBulkPurge] = useState(false);
+  const [bulkConfirm, setBulkConfirm] = useState("");
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
   const [renameTarget, setRenameTarget] = useState<DatasetRecord | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [renaming, setRenaming] = useState(false);
@@ -159,6 +167,65 @@ export function DatasetsList({
     if (!canMerge) return;
     const ids = selectedItems.map((d) => d.id);
     router.push(`/datasets/merge?ids=${ids.map(encodeURIComponent).join(",")}`);
+  };
+
+  // Selected datasets whose files live in our S3 storage → eligible for purge.
+  const purgeableSelected = useMemo(
+    () => selectedItems.filter((d) => PURGEABLE_KINDS.has(d.kind)),
+    [selectedItems],
+  );
+
+  const openBulkDelete = () => {
+    setBulkError(null);
+    setBulkPurge(false);
+    setBulkConfirm("");
+    setBulkProgress(null);
+    setBulkDeleteOpen(true);
+  };
+
+  // Delete every currently-loaded selected dataset (client-orchestrated, like
+  // merge). Successful deletes are dropped from the selection as they go, so a
+  // retry after a partial failure only reprocesses what actually failed.
+  const onBulkDelete = async () => {
+    const targets = selectedItems;
+    if (targets.length === 0) return;
+    setBulkError(null);
+    setBulkDeleting(true);
+    setBulkProgress({ done: 0, total: targets.length });
+    const errors: string[] = [];
+    for (const d of targets) {
+      try {
+        if (d.kind === "hosted") {
+          await gateway.deleteCatalogRepo(d.id);
+        } else {
+          await gateway.deleteDataset(d.id, bulkPurge && PURGEABLE_KINDS.has(d.kind));
+        }
+        setSelected((prev) => {
+          const next = new Set(prev);
+          next.delete(d.id);
+          return next;
+        });
+      } catch (e) {
+        errors.push(`${d.name}: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setBulkProgress((p) => ({ done: (p?.done ?? 0) + 1, total: targets.length }));
+      }
+    }
+    setBulkDeleting(false);
+    // Some deletes may have succeeded even on partial failure → always refresh.
+    router.refresh();
+    void load();
+    if (errors.length) {
+      const shown = errors.slice(0, 5).join("\n");
+      const more = errors.length > 5 ? `\n…and ${errors.length - 5} more` : "";
+      setBulkError(`${errors.length} of ${targets.length} failed:\n${shown}${more}`);
+      return;
+    }
+    const n = targets.length;
+    setBulkDeleteOpen(false);
+    setBulkProgress(null);
+    exitSelect();
+    toast.success(`Deleted ${n} dataset${n === 1 ? "" : "s"}${bulkPurge ? " + purged files" : ""}`);
   };
 
   // What actually renders. DB datasets arrive pre-filtered/sorted/paged from the
@@ -431,6 +498,20 @@ export function DatasetsList({
               <GitMerge className="h-3.5 w-3.5" />
               {`Merge ${canMerge ? selected.size : ""}`.trim()}
             </button>
+            <button
+              type="button"
+              onClick={openBulkDelete}
+              disabled={selectedItems.length === 0}
+              title={
+                selectedItems.length === 0
+                  ? "Select datasets to delete"
+                  : "Delete selected datasets (optionally purge their S3 files)"
+              }
+              className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive shadow-xs hover:bg-destructive/10 disabled:opacity-50"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              {`Delete ${selectedItems.length || ""}`.trim()}
+            </button>
           </div>
         </div>
       )}
@@ -585,6 +666,112 @@ export function DatasetsList({
               disabled={deleting || (purge && purgeConfirm.trim() !== deleteTarget?.name)}
             >
               {deleting ? "Deleting…" : purge ? "Delete + purge files" : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={bulkDeleteOpen}
+        onOpenChange={(o) => {
+          if (!bulkDeleting && !o) {
+            setBulkDeleteOpen(false);
+            setBulkError(null);
+            setBulkPurge(false);
+            setBulkConfirm("");
+            setBulkProgress(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              Delete {selectedItems.length} dataset{selectedItems.length === 1 ? "" : "s"}
+            </DialogTitle>
+            <DialogDescription>
+              This removes {selectedItems.length === 1 ? "the" : "these"} dataset record
+              {selectedItems.length === 1 ? "" : "s"}.{" "}
+              {bulkPurge && purgeableSelected.length > 0 ? (
+                <span className="text-destructive">
+                  Files in S3 storage for {purgeableSelected.length} of them will also be{" "}
+                  <span className="font-medium">permanently deleted</span>.
+                </span>
+              ) : (
+                <>Files already written to storage are not deleted.</>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="max-h-36 overflow-y-auto rounded-md border border-border/60 bg-muted/30 px-3 py-1.5 text-xs">
+            {selectedItems.map((d) => (
+              <div key={d.id} className="flex items-center justify-between gap-3 py-0.5">
+                <span className="truncate">{d.name}</span>
+                <span className="shrink-0 font-mono text-muted-foreground/70">{d.kind}</span>
+              </div>
+            ))}
+          </div>
+
+          {purgeableSelected.length > 0 && (
+            <div className="space-y-3">
+              <label className="flex items-start gap-2 text-sm">
+                <Checkbox
+                  checked={bulkPurge}
+                  onCheckedChange={(v) => {
+                    setBulkPurge(v === true);
+                    setBulkConfirm("");
+                  }}
+                  disabled={bulkDeleting}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="font-medium">Also delete the files in storage (S3)</span> — removes S3 objects for
+                  the {purgeableSelected.length} S3-backed dataset{purgeableSelected.length === 1 ? "" : "s"} in this
+                  selection. This cannot be undone.
+                </span>
+              </label>
+
+              {bulkPurge && (
+                <div className="space-y-1.5">
+                  <p className="text-xs text-muted-foreground">
+                    Type <span className="font-mono text-foreground">delete</span> to confirm
+                  </p>
+                  <Input
+                    value={bulkConfirm}
+                    onChange={(e) => setBulkConfirm(e.target.value)}
+                    placeholder="delete"
+                    autoComplete="off"
+                    aria-label="Type delete to confirm purging files"
+                    disabled={bulkDeleting}
+                    className="text-sm"
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {bulkError && (
+            <p className="whitespace-pre-wrap rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {bulkError}
+            </p>
+          )}
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setBulkDeleteOpen(false)} disabled={bulkDeleting}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={onBulkDelete}
+              disabled={
+                bulkDeleting ||
+                selectedItems.length === 0 ||
+                (bulkPurge && bulkConfirm.trim().toLowerCase() !== "delete")
+              }
+            >
+              {bulkDeleting
+                ? `Deleting… ${bulkProgress ? `${bulkProgress.done}/${bulkProgress.total}` : ""}`.trim()
+                : bulkPurge
+                  ? `Delete + purge (${selectedItems.length})`
+                  : `Delete ${selectedItems.length}`}
             </Button>
           </DialogFooter>
         </DialogContent>
