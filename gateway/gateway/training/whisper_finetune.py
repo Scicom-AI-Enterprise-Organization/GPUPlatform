@@ -733,6 +733,7 @@ def run(cfg: dict) -> None:
     )
     from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
     import evaluate as hf_evaluate
+    import jiwer
 
     # Checkpoints (model + Adam optimizer state) are huge — ~10 GB each, and
     # save_total_limit rotation briefly holds two. Put the run's work dir under
@@ -872,14 +873,13 @@ def run(cfg: dict) -> None:
     wer_metric = hf_evaluate.load("wer")
     cer_metric = hf_evaluate.load("cer")
 
-    # Whisper's standard eval normalizes text (lowercase, strip punctuation,
-    # spell-out numbers, …) BEFORE scoring — otherwise WER/CER are inflated by
-    # casing/punctuation and aren't comparable to any published number. Use the
-    # tokenizer's English normalizer for en, the multilingual basic normalizer
-    # otherwise; fall back to lowercasing if the helper isn't available. Opt out
-    # via normalize_text=false to score raw (cased + punctuated) text.
+    # Whisper-style eval normalization (lowercase + strip punctuation) BEFORE
+    # scoring — otherwise WER/CER are inflated by casing/punctuation. Always the
+    # multilingual basic normalizer, even for en: the English normalizer also
+    # spells out numbers ("25" → "twenty five"), which we deliberately DON'T
+    # want. Fall back to lowercasing if the helper isn't available. Opt out via
+    # normalize_text=false to score raw (cased + punctuated) text.
     _tok = processor.tokenizer
-    _is_en = (language or "").lower() in ("en", "english")
     _do_norm = bool(cfg.get("normalize_text", True))
     log(f"[train] WER/CER on {'normalized' if _do_norm else 'raw'} text")
 
@@ -888,7 +888,10 @@ def run(cfg: dict) -> None:
         if not _do_norm:
             return s.strip()
         try:
-            return _tok.normalize(s) if _is_en else _tok.basic_normalize(s)
+            # basic_normalize maps trailing punctuation to a trailing space —
+            # strip it, or CER counts a phantom char when only one side ends
+            # with punctuation.
+            return _tok.basic_normalize(s).strip()
         except Exception:
             return s.lower().strip()
 
@@ -905,8 +908,23 @@ def run(cfg: dict) -> None:
         ) if r.strip()]
         if not pairs:
             return {"wer": 0.0, "cer": 0.0}
-        preds = [p for p, _ in pairs]
-        refs = [r for _, r in pairs]
+        # Outlier filter: a row whose OWN WER or CER exceeds 1.0 (hallucinated
+        # loop, truncated/empty decode, language flip) is excluded from the
+        # corpus score entirely — one bad decode shouldn't swamp the epoch.
+        kept = []
+        for p, r in pairs:
+            try:
+                if jiwer.wer(r, p) > 1.0 or jiwer.cer(r, p) > 1.0:
+                    continue
+            except Exception:
+                continue
+            kept.append((p, r))
+        if len(kept) < len(pairs):
+            log(f"[eval] skipped {len(pairs) - len(kept)}/{len(pairs)} rows with WER/CER > 1.0")
+        if not kept:
+            return {"wer": 0.0, "cer": 0.0}
+        preds = [p for p, _ in kept]
+        refs = [r for _, r in kept]
         wer = 100 * wer_metric.compute(predictions=preds, references=refs)
         cer = 100 * cer_metric.compute(predictions=preds, references=refs)
         return {"wer": wer, "cer": cer}

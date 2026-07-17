@@ -1505,7 +1505,7 @@ export function TrainingForm() {
             <NumberField min={1} value={loggingSteps} onChange={setLoggingSteps} />
           </FieldWrap>
           {taskType === "asr" && (
-            <FieldWrap label="WER / CER text" hint="Normalize (Whisper-style: lowercase, strip punctuation, spell out numbers) before scoring, or score raw text.">
+            <FieldWrap label="WER / CER text" hint="Normalize (lowercase + strip punctuation — numbers kept as digits) before scoring, or score raw text. Rows scoring WER/CER > 1.0 are excluded as outliers.">
               <label className="flex cursor-pointer items-center gap-2 text-sm">
                 <input type="checkbox" checked={normalizeText} onChange={(e) => setNormalizeText(e.target.checked)}
                   className="h-4 w-4 accent-primary" />
