@@ -29,9 +29,11 @@ type UpstreamDraft = {
   enabled: boolean;
   hadKey: boolean;
   extraBody: string; // raw JSON text; parsed + validated on submit
-  testMode: "chat" | "embedding";
+  testMode: "chat" | "embedding" | "transcription" | "tts";
   test: { status: "idle" | "running" | "ok" | "fail"; message?: string };
 };
+
+type TestState = { status: "idle" | "running" | "ok" | "fail"; message?: string };
 
 function blankUpstream(): UpstreamDraft {
   return {
@@ -110,6 +112,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
     stt0?.has_inline_key ? "keep" : stt0?.api_key_secret ? "secret" : "paste");
   const [sttKeySecret, setSttKeySecret] = useState(stt0?.api_key_secret ?? "");
   const [sttKey, setSttKey] = useState("");
+  const [sttTest, setSttTest] = useState<TestState>({ status: "idle" });
   const [secretKeys, setSecretKeys] = useState<string[]>([]);
   // Capture drift samples — save audio (+ sidecar) to storage when a threshold is crossed.
   const cap0 = initial?.capture ?? undefined;
@@ -159,6 +162,26 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
       patch(i, { test: { status: r.ok ? "ok" : "fail", message: r.ok ? `${r.message} · ${r.latency_ms ?? "?"}ms` : r.message } });
     } catch (e) {
       patch(i, { test: { status: "fail", message: e instanceof Error ? e.message : String(e) } });
+    }
+  };
+
+  const onTestStt = async () => {
+    if (!sttBase.trim() || !sttModel.trim()) {
+      setSttTest({ status: "fail", message: "Set the STT base URL + model first" });
+      return;
+    }
+    setSttTest({ status: "running" });
+    try {
+      const r = await gateway.testProxyUpstream({
+        base_url: sttBase.trim(),
+        api_key_secret: sttKeyMode === "secret" ? (sttKeySecret.trim() || null) : null,
+        api_key: sttKeyMode === "paste" ? (sttKey.trim() || null) : null,
+        model: sttModel.trim(),
+        mode: "transcription",
+      });
+      setSttTest({ status: r.ok ? "ok" : "fail", message: r.ok ? `${r.message} · ${r.latency_ms ?? "?"}ms` : r.message });
+    } catch (e) {
+      setSttTest({ status: "fail", message: e instanceof Error ? e.message : String(e) });
     }
   };
 
@@ -370,10 +393,10 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
               {/* test — sends a real "hello" to the endpoint matching the chosen mode (chat or embeddings) */}
               <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
                 <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
-                  {(["chat", "embedding"] as const).map((m) => (
+                  {(["chat", "embedding", "transcription", "tts"] as const).map((m) => (
                     <button key={m} type="button" onClick={() => patch(i, { testMode: m, test: { status: "idle" } })}
                             className={"rounded px-2 py-1 " + (u.testMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
-                      {m === "chat" ? "Chat" : "Embedding"}
+                      {{ chat: "Chat", embedding: "Embedding", transcription: "Transcribe", tts: "TTS" }[m]}
                     </button>
                   ))}
                 </div>
@@ -381,9 +404,10 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
                   {u.test.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Test
                 </Button>
                 <span className="text-[11px] text-muted-foreground">
-                  {u.testMode === "embedding"
-                    ? "sends a “hello” embedding using the first model"
-                    : "sends a “hello” chat completion using the first model"}
+                  {u.testMode === "embedding" ? "sends a “hello” embedding"
+                    : u.testMode === "transcription" ? "sends a short tone to /audio/transcriptions"
+                    : u.testMode === "tts" ? "synthesizes “hello world” via /audio/speech"
+                    : "sends a “hello” chat completion"} using the first model
                 </span>
                 {u.test.status !== "idle" && u.test.status !== "running" && (
                   <span className={"text-xs " + (u.test.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>{u.test.message}</span>
@@ -443,6 +467,16 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             {sttKeyMode === "keep" && <span className="text-xs text-muted-foreground">existing key kept</span>}
             <span className="text-[11px] text-muted-foreground">optional — omit for a keyless / auth-disabled STT</span>
           </div>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
+          <Button type="button" variant="outline" size="xs" onClick={onTestStt}
+                  disabled={sttTest.status === "running" || !sttBase.trim() || !sttModel.trim()}>
+            {sttTest.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Test transcription
+          </Button>
+          <span className="text-[11px] text-muted-foreground">sends a short tone to <span className="font-mono">/audio/transcriptions</span> (paste/secret key only — kept keys can&apos;t be tested)</span>
+          {sttTest.status !== "idle" && sttTest.status !== "running" && (
+            <span className={"text-xs " + (sttTest.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>{sttTest.message}</span>
+          )}
         </div>
       </section>
 

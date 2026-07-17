@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import secrets as _secrets
@@ -246,7 +247,7 @@ class TestUpstreamRequest(BaseModel):
     api_key_secret: Optional[str] = None
     api_key: Optional[str] = None
     model: Optional[str] = None   # real upstream model to end-to-end test; None = just probe /models
-    mode: str = "chat"            # "chat" | "embedding" — which endpoint to end-to-end test
+    mode: str = "chat"            # chat | embedding | transcription | tts — endpoint to end-to-end test
     extra_body: Optional[dict] = None  # merged into the chat test body (e.g. provider pinning)
 
 
@@ -2614,6 +2615,62 @@ async def test_upstream(req: TestUpstreamRequest, request: Request,
         if dim <= 0:
             return TestUpstreamResponse(ok=False, message=f"no embedding returned — is '{model}' an embedding model?", latency_ms=lat)
         return TestUpstreamResponse(ok=True, message=f"embedding ok ({model}): dim {dim}", latency_ms=lat, models=[model])
+
+    # STT: send a short synthetic tone to /audio/transcriptions — validates the endpoint
+    # accepts audio + returns a transcription shape (the text may be empty for a bare tone).
+    if model and mode == "transcription":
+        sr = 16000
+        pcm = b"".join(struct.pack("<h", int(3000 * math.sin(2 * math.pi * 440 * i / sr))) for i in range(int(sr * 0.4)))
+        wav = _pcm_to_wav(pcm, sr, 1, 16)
+        try:
+            r = await cli.post(base + "/audio/transcriptions",
+                               data={"model": model, "response_format": "json"},
+                               files={"file": ("probe.wav", wav, "audio/wav")},
+                               headers=headers, timeout=httpx.Timeout(60.0))
+        except httpx.HTTPError as e:
+            return TestUpstreamResponse(ok=False, message=f"network error: {e}")
+        lat = int((time.perf_counter() - t0) * 1000)
+        if r.status_code in (401, 403):
+            return TestUpstreamResponse(ok=False, message="unauthorized — check the API key", latency_ms=lat)
+        if r.status_code != 200:
+            return TestUpstreamResponse(ok=False, message=f"HTTP {r.status_code}: {r.text[:160]}", latency_ms=lat)
+        try:
+            txt = (r.json() or {}).get("text") or ""
+        except Exception:
+            txt = r.text or ""
+        txt = " ".join(txt.split())[:60]
+        return TestUpstreamResponse(ok=True, message=f"transcription ok ({model})" + (f": “{txt}”" if txt else " (empty text)"), latency_ms=lat, models=[model])
+
+    # TTS: synthesize a short phrase via /audio/speech — validates audio bytes come back.
+    # Pick a speaker from /audio/speaker when the engine requires one.
+    if model and mode == "tts":
+        voice = None
+        try:
+            sp = await cli.get(base + "/audio/speaker", headers=headers, timeout=httpx.Timeout(15.0))
+            if sp.status_code == 200:
+                lst = sp.json()
+                cand = lst if isinstance(lst, list) else (lst.get("voices") or lst.get("speakers") or lst.get("data") or [])
+                if isinstance(cand, list) and cand:
+                    voice = cand[0] if isinstance(cand[0], str) else (cand[0].get("id") if isinstance(cand[0], dict) else None)
+        except Exception:
+            pass
+        body = {"model": model, "input": "hello world", "response_format": "wav"}
+        if voice:
+            body["voice"] = voice
+        try:
+            r = await cli.post(base + "/audio/speech", json=body, headers=headers, timeout=httpx.Timeout(60.0))
+        except httpx.HTTPError as e:
+            return TestUpstreamResponse(ok=False, message=f"network error: {e}")
+        lat = int((time.perf_counter() - t0) * 1000)
+        if r.status_code in (401, 403):
+            return TestUpstreamResponse(ok=False, message="unauthorized — check the API key", latency_ms=lat)
+        if r.status_code != 200:
+            return TestUpstreamResponse(ok=False, message=f"HTTP {r.status_code}: {r.text[:160]}", latency_ms=lat)
+        nbytes = len(r.content or b"")
+        if nbytes < 100:
+            return TestUpstreamResponse(ok=False, message=f"no audio returned — is '{model}' a TTS model?", latency_ms=lat)
+        vmsg = f", voice {voice}" if voice else ""
+        return TestUpstreamResponse(ok=True, message=f"tts ok ({model}{vmsg}): {nbytes // 1024 or 1} KB audio", latency_ms=lat, models=[model])
 
     # With a model, do a real end-to-end check: a tiny "hello" chat completion.
     if model:

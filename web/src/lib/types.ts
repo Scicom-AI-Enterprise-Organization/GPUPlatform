@@ -1668,7 +1668,7 @@ export type TestProxyUpstreamBody = {
   api_key_secret?: string | null;
   api_key?: string | null;
   model?: string | null; // real upstream model to end-to-end test; omitted = probe /models
-  mode?: "chat" | "embedding"; // which endpoint to test (default chat)
+  mode?: "chat" | "embedding" | "transcription" | "tts"; // which endpoint to test (default chat)
   extra_body?: Record<string, unknown> | null; // merged into the chat test body
 };
 
