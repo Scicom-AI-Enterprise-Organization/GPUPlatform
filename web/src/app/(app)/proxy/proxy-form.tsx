@@ -366,7 +366,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
                     <div key={k} className="flex items-center gap-2">
                       <Input value={m.alias} onChange={(e) => patch(i, { models: u.models.map((x, j) => j === k ? { ...x, alias: e.target.value } : x) })} placeholder="qwen" className="h-8 max-w-[200px] font-mono text-xs" />
                       <span className="text-muted-foreground">→</span>
-                      <Input value={m.real} onChange={(e) => patch(i, { models: u.models.map((x, j) => j === k ? { ...x, real: e.target.value } : x) })} placeholder="Qwen/Qwen2.5-72B-Instruct" className="h-8 font-mono text-xs" />
+                      <Input value={m.real} onChange={(e) => patch(i, { models: u.models.map((x, j) => j === k ? { ...x, real: e.target.value } : x) })} placeholder="Qwen/Qwen2.5-72B-Instruct" className="h-8 min-w-0 flex-1 font-mono text-xs" />
                       <Button type="button" variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-destructive"
                               onClick={() => patch(i, { models: u.models.filter((_, j) => j !== k) })} aria-label="Remove mapping">
                         <Trash2 className="h-3.5 w-3.5" />

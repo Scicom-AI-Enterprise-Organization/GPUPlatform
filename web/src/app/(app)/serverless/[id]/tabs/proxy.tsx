@@ -47,7 +47,7 @@ export function ProxyTab({
     <div className="space-y-4">
       <Card>
         <CardHeader>
-          <CardTitle className="text-sm font-medium">LLM API Proxy</CardTitle>
+          <CardTitle className="text-sm font-medium">API Proxy</CardTitle>
           <span className="text-xs text-muted-foreground">
             A proxy gives this endpoint a stable OpenAI-compatible URL + model alias with
             priority/health-aware failover across backends. Clients point at{" "}
@@ -69,7 +69,7 @@ export function ProxyTab({
 
           {links !== null && links.length === 0 && !error && (
             <p className="text-sm text-muted-foreground">
-              No {readOnly ? "public " : ""}LLM API proxy currently routes to this endpoint.
+              No {readOnly ? "public " : ""}API proxy currently routes to this endpoint.
               {isAdmin && " Create one below to give it a stable alias + failover."}
             </p>
           )}

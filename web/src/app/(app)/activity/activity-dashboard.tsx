@@ -437,7 +437,7 @@ export function ActivityDashboard() {
           </BarChart>
         </ChartCard>
 
-        <ChartCard title="Traffic by source" subtitle="Requests per bucket — serverless queue vs LLM-proxy."
+        <ChartCard title="Traffic by source" subtitle="Requests per bucket — serverless queue vs API proxy."
           empty={!sourceBuckets.length} loading={loading}>
           <BarChart data={sourceBuckets}>
             {commonAxes(true)}

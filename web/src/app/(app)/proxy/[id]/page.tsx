@@ -23,7 +23,7 @@ export default async function ProxyDetailPage({ params }: { params: Promise<{ id
   const username = await currentUsername();
   return (
     <div className="flex h-full flex-col">
-      <ConsoleTopbar crumbs={[{ label: "LLM API Proxy", href: "/proxy" }, { label: ep.name }]} username={username} />
+      <ConsoleTopbar crumbs={[{ label: "API Proxy", href: "/proxy" }, { label: ep.name }]} username={username} />
       <ProxyDetail initial={ep} baseUrl={gateway.baseUrl} readOnly={!isAdmin} />
     </div>
   );

@@ -28,10 +28,10 @@ export default async function ProxyPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <ConsoleTopbar crumbs={[{ label: "LLM API Proxy" }]} username={username} />
+      <ConsoleTopbar crumbs={[{ label: "API Proxy" }]} username={username} />
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         <div className="mb-6">
-          <h1 className="text-2xl font-semibold tracking-tight">LLM API Proxy</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">API Proxy</h1>
           <p className="mt-1 text-sm text-muted-foreground">
             One stable OpenAI-compatible endpoint + model name that routes to multiple backends
             behind the scenes — priority + health-aware failover, a per-endpoint queue, and

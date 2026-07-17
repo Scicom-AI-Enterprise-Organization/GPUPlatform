@@ -22,10 +22,10 @@ export default async function EditProxyPage({ params }: { params: Promise<{ id: 
   return (
     <div className="flex h-full flex-col">
       <ConsoleTopbar
-        crumbs={[{ label: "LLM API Proxy", href: "/proxy" }, { label: ep.name, href: `/proxy/${ep.id}` }, { label: "Edit" }]}
+        crumbs={[{ label: "API Proxy", href: "/proxy" }, { label: ep.name, href: `/proxy/${ep.id}` }, { label: "Edit" }]}
         username={username}
       />
-      <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         <h1 className="mb-6 text-2xl font-semibold tracking-tight">Edit {ep.name}</h1>
         <ProxyForm initial={ep} />
       </div>

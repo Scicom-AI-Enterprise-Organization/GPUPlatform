@@ -29,7 +29,7 @@ const RESOURCES: Item[] = [
   { label: "Quantization", href: "/quantization", icon: Shrink },
   { label: "Compute", href: "/compute", icon: Box, section: "compute" },
   { label: "GPU Providers", href: "/providers", icon: Cloud },
-  { label: "LLM API Proxy", href: "/proxy", icon: Network },
+  { label: "API Proxy", href: "/proxy", icon: Network },
 ];
 const ACCOUNT: Item[] = [
   { label: "API tokens", href: "/api-keys", icon: KeyRound },

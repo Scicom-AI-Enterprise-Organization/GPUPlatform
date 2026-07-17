@@ -171,6 +171,15 @@
   body {
     @apply bg-background text-foreground;
   }
+  /* The console shell (the (app) layout, marked [data-app-shell]) is a fixed-viewport
+   * frame that owns its own scrolling (`<main overflow-y-auto>`); the document itself
+   * must never scroll there. A body/html scrollbar in the console is always a leak — a
+   * portaled or overflowing element extending the page — so clip it. Scoped via :has()
+   * so landing / share / auth pages keep normal document flow + scrolling. */
+  html:has([data-app-shell]),
+  body:has([data-app-shell]) {
+    overflow: hidden;
+  }
 }
 
 /* Burn-rate flame: subtle flicker for the live-cost UI. Combines a quick
