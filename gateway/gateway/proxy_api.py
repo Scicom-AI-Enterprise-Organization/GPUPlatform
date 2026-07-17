@@ -465,17 +465,19 @@ async def _set_started(request_id: str, upstream: Optional[str] = None) -> None:
 async def _finish(request_id: str, status: str, *, status_code: Optional[int] = None,
                   latency_ms: Optional[int] = None, pt: Optional[int] = None,
                   ct: Optional[int] = None, error: Optional[str] = None,
-                  upstream: Optional[str] = None, ttft_ms: Optional[int] = None) -> None:
-    """Record a proxied request's terminal outcome (status / latency / TTFT / tokens)
-    + its per-proxy Prometheus metric. Enqueued to the batch stats writer rather
-    than committed inline: opening a pooled connection per completion exhausted the
-    DB pool under load and wedged the gateway. Still `async def` so every existing
-    `await _finish(...)` / `create_task(_finish(...))` call site is unchanged; the
-    DB write + metric now happen in the writer's batched flush (parity preserved)."""
+                  upstream: Optional[str] = None, ttft_ms: Optional[int] = None,
+                  avg_logprob: Optional[float] = None) -> None:
+    """Record a proxied request's terminal outcome (status / latency / TTFT / tokens
+    / audio logprob) + its per-proxy Prometheus metric. Enqueued to the batch stats
+    writer rather than committed inline: opening a pooled connection per completion
+    exhausted the DB pool under load and wedged the gateway. Still `async def` so every
+    existing `await _finish(...)` / `create_task(_finish(...))` call site is unchanged;
+    the DB write + metric now happen in the writer's batched flush (parity preserved)."""
     from . import stats_writer
     stats_writer.record_proxy_finish(
         request_id, status, status_code=status_code, latency_ms=latency_ms,
         pt=pt, ct=ct, error=error, upstream=upstream, ttft_ms=ttft_ms,
+        avg_logprob=avg_logprob,
     )
 
 
@@ -517,6 +519,41 @@ async def _do_unary(app, endpoint_id: str, candidates: list[dict], alias: str,
     raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
 
 
+def _extract_audio_logprob(data: object) -> Optional[float]:
+    """Pull a single mean token log-probability out of a whisper transcription/
+    translation response, for the drift metric. Prefers the duration-weighted mean
+    of per-segment `avg_logprob` (response_format=verbose_json); falls back to the
+    mean of top-level token `logprobs` (OpenAI include[]=logprobs shape). Returns
+    None when neither is present (e.g. response_format=json/text, or empty result).
+    Best-effort: never raises — a malformed body must not break the passthrough."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        segs = data.get("segments")
+        if isinstance(segs, list) and segs:
+            num = 0.0
+            wsum = 0.0
+            for s in segs:
+                if not isinstance(s, dict) or s.get("avg_logprob") is None:
+                    continue
+                w = (s.get("end") or 0) - (s.get("start") or 0)
+                if w <= 0:
+                    w = 1.0
+                num += float(s["avg_logprob"]) * w
+                wsum += w
+            if wsum > 0:
+                return num / wsum
+        lps = data.get("logprobs")
+        if isinstance(lps, list) and lps:
+            vals = [float(x["logprob"]) for x in lps
+                    if isinstance(x, dict) and x.get("logprob") is not None]
+            if vals:
+                return sum(vals) / len(vals)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
 async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], alias: str,
                               upstream_path: str, file_name: str, file_bytes: bytes,
                               content_type: str, form_fields: dict, timeout_s: float) -> dict:
@@ -551,7 +588,8 @@ async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], ali
         except Exception:
             data_out = {"text": r.text}  # response_format=text → plain string
         return {"upstream": u["name"], "upstream_url": u["base_url"], "status_code": r.status_code,
-                "data": data_out, "latency_ms": lat, "pt": None, "ct": None}
+                "data": data_out, "latency_ms": lat, "pt": None, "ct": None,
+                "avg_logprob": _extract_audio_logprob(data_out)}
     raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
 
 
@@ -591,7 +629,8 @@ async def _unary(app, request: Request, request_id: str, forward,
             if request_id in live:
                 live[request_id]["upstream"] = res["upstream"]
             await _finish(request_id, "completed", status_code=res["status_code"],
-                          latency_ms=res["latency_ms"], pt=res["pt"], ct=res["ct"], upstream=res["upstream"])
+                          latency_ms=res["latency_ms"], pt=res["pt"], ct=res["ct"], upstream=res["upstream"],
+                          avg_logprob=res.get("avg_logprob"))
             # Surface which upstream actually served this request so callers can tell
             # them apart (failover/health routing means it isn't always the primary).
             hdrs = {"X-Request-Id": request_id}
@@ -1179,9 +1218,166 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
                                     timeout_s, max_conc, request_id, payload, upstream_path)
 
 
+def _truthy(v: object) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _stream_audio(app, request, user, endpoint_id, candidates, alias, upstream_path,
+                        file_name, file_bytes, content_type, form_fields, timeout_s, max_conc) -> Response:
+    """Streaming audio forward (whisper SSE, `stream=true`). Buffers the (small) upload,
+    POSTs the multipart with `model` rewritten, then RELAYS the upstream response. Branches
+    on the upstream content-type — SSE `transcription.chunk` frames are relayed as they
+    arrive; a buffered JSON body (upstream ignored `stream`, or an error) is returned as
+    JSON — mirroring `_forward_passthrough`. Failover only before the first byte. Gate /
+    cancel / TTFT / logprob-sniff / `_finish` match the JSON streaming path."""
+    request_id = f"pxr-{_secrets.token_hex(8)}"
+    await _insert_request_row(request_id, endpoint_id, user, alias, True)
+    gate = _get_gate(app, endpoint_id, max_conc)
+    cancel_ev = asyncio.Event()
+    _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, True)
+    live = _live(app)
+    cli = _http(app)
+    token = None
+    gate_held = False
+    handed_off = False
+    try:
+        if gate is not None:
+            token = await gate.acquire(cancel_ev, live.get(request_id)); gate_held = True
+        if cancel_ev.is_set():
+            raise asyncio.CancelledError()
+        if request_id in live:
+            live[request_id]["state"] = "running"
+        await _set_started(request_id)
+
+        # Open the upstream stream, failing over before any byte reaches the client.
+        last_err = "no upstream"
+        chosen = None
+        for u in candidates:
+            data = {**form_fields, "model": u["models"][alias]}
+            files = {"file": (file_name, file_bytes, content_type)}
+            headers = {}
+            if u.get("_key"):
+                headers["Authorization"] = f"Bearer {u['_key']}"
+            url = u["base_url"].rstrip("/") + upstream_path
+            t0 = time.perf_counter()
+            try:
+                req = cli.build_request("POST", url, data=data, files=files, headers=headers,
+                                        timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
+                r = await cli.send(req, stream=True)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                _mark_health(app, endpoint_id, u["id"], False, error=str(e))
+                last_err = f"{u['name']}: {type(e).__name__}"
+                continue
+            lat = int((time.perf_counter() - t0) * 1000)
+            if r.status_code >= 500:
+                _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+                last_err = f"{u['name']}: HTTP {r.status_code}"
+                await r.aclose()
+                continue
+            _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
+            chosen = (r, u, t0, lat)
+            break
+        if chosen is None:
+            await _finish(request_id, "failed", status_code=502, error=last_err)
+            live.pop(request_id, None)
+            raise HTTPException(status_code=502, detail={"error": f"all upstreams failed: {last_err}"})
+
+        r, u, t0, lat = chosen
+        if request_id in live:
+            live[request_id]["upstream"] = u["name"]
+        await _set_started(request_id, upstream=u["name"])
+        base_hdrs = {"X-Request-Id": request_id, "X-Upstream-Url": u["base_url"], "X-Upstream-Name": u["name"]}
+
+        # Upstream didn't stream (ignored `stream`, or an error body) → buffer + return JSON.
+        if "text/event-stream" not in r.headers.get("content-type", ""):
+            body = await r.aread()
+            await r.aclose()
+            if gate_held and gate is not None:
+                await gate.release(token); gate_held = False
+            try:
+                obj = json.loads(body)
+            except Exception:
+                obj = {"text": body.decode("utf-8", "ignore")}
+            ok = r.status_code < 400
+            await _finish(request_id, "completed" if ok else "failed", status_code=r.status_code,
+                          latency_ms=lat, upstream=u["name"],
+                          avg_logprob=(_extract_audio_logprob(obj) if ok else None),
+                          error=None if ok else (json.dumps(obj)[:500] if isinstance(obj, dict) else str(obj)[:500]))
+            live.pop(request_id, None)
+            return JSONResponse(obj, status_code=r.status_code, headers=base_hdrs)
+
+        # SSE relay — hand the concurrency slot + cleanup to the generator's finally.
+        handed_off = True
+        sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **base_hdrs}
+
+        async def _relay():
+            nonlocal token, gate_held
+            ttft = None; lp = None; buf = ""; finished = False
+            try:
+                async for chunk in r.aiter_bytes():
+                    if cancel_ev.is_set():
+                        break
+                    if ttft is None:
+                        ttft = int((time.perf_counter() - t0) * 1000)
+                    yield chunk
+                    # Best-effort logprob sniff — only frames that could carry it (the
+                    # `avg_logprob`/`logprobs`/`segments` guard keeps the JSON parser off
+                    # the content deltas). Most whisper streams don't emit it; harmless if so.
+                    try:
+                        buf += chunk.decode("utf-8", "ignore")
+                        while "\n\n" in buf:
+                            frame, buf = buf.split("\n\n", 1)
+                            if "logprob" not in frame and "segments" not in frame:
+                                continue
+                            for ln in frame.split("\n"):
+                                if not ln.startswith("data:"):
+                                    continue
+                                d = ln[5:].strip()
+                                if not d or d == "[DONE]":
+                                    continue
+                                try:
+                                    got = _extract_audio_logprob(json.loads(d))
+                                    if got is not None:
+                                        lp = got
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                finished = True
+                await _finish(request_id, "completed", status_code=r.status_code,
+                              latency_ms=int((time.perf_counter() - t0) * 1000),
+                              ttft_ms=ttft, upstream=u["name"], avg_logprob=lp)
+            finally:
+                try:
+                    await r.aclose()
+                except Exception:
+                    pass
+                if gate_held and gate is not None:
+                    await gate.release(token); gate_held = False
+                live.pop(request_id, None)
+                if not finished:
+                    asyncio.create_task(_finish(request_id, "cancelled", status_code=499, error="client disconnected"))
+
+        return StreamingResponse(_relay(), media_type="text/event-stream", headers=sse_headers)
+    except asyncio.CancelledError:
+        await _finish(request_id, "cancelled", status_code=499, error="cancelled")
+        live.pop(request_id, None)
+        return Response(status_code=499)
+    except HTTPException:
+        raise
+    except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.WriteError) as e:
+        await _finish(request_id, "failed", status_code=502, error=f"{type(e).__name__}: {e}")
+        live.pop(request_id, None)
+        raise HTTPException(status_code=502, detail={"error": f"upstream failed: {type(e).__name__}"})
+    finally:
+        if gate_held and gate is not None and not handed_off:
+            await gate.release(token)
+
+
 async def _handle_audio(request: Request, user: User, endpoint_name: str, upstream_path: str) -> Response:
-    """Multipart audio forward (transcriptions / translations). Routes by the `model`
-    form field and rebuilds the multipart for the chosen upstream. Non-streaming."""
+    """Multipart audio forward (transcriptions / translations). Routes by the `model` form
+    field and rebuilds the multipart for the chosen upstream. Unary by default; when the
+    caller sends `stream=true` (whisper SSE), relays the upstream stream via _stream_audio."""
     app = request.app
     form = await request.form()
     alias = form.get("model")
@@ -1195,8 +1391,13 @@ async def _handle_audio(request: Request, user: User, endpoint_name: str, upstre
     file_name = getattr(up, "filename", None) or "audio"
     content_type = getattr(up, "content_type", None) or "application/octet-stream"
     # Pass through every other text form field (language, prompt, response_format,
-    # temperature, timestamp_granularities[], …) verbatim to the upstream.
+    # temperature, stream, timestamp_granularities[], …) verbatim to the upstream.
     extra = {k: v for k, v in form.multi_items() if k not in ("file", "model") and isinstance(v, str)}
+    is_stream = _truthy(extra.get("stream"))
+    if is_stream:
+        endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias)
+        return await _stream_audio(app, request, user, endpoint_id, candidates, alias, upstream_path,
+                                   file_name, file_bytes, content_type, extra, timeout_s, max_conc)
     endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, False)
     gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()

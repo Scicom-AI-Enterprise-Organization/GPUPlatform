@@ -105,6 +105,18 @@ _TTFT_BUCKETS = (
 _TPS_BUCKETS = (
     1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 500.0, float("inf"),
 )
+# Audio (whisper) mean token NEGATIVE log-likelihood = -avg_logprob (≥ 0), from
+# the upstream's `verbose_json` segments. We store the NEGATED logprob on purpose:
+# prometheus_client omits a histogram's `_sum` sample once it observes a negative
+# value (the spec bans rate() over a sum that can decrease), which would break the
+# windowed-mean drift query. NLL is non-negative, so `_sum` is emitted and the mean
+# is rate(_sum)/rate(_count). LOWER NLL = more confident; a persistent RISE is the
+# model-drift / degradation signal. Buckets (`le` upper bounds, ascending): a
+# healthy whisper turbo sits around 0.15..0.30, so resolution is densest there and
+# coarsens out toward hallucination (> 1).
+_NLL_BUCKETS = (
+    0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, float("inf"),
+)
 
 # Label is `route` (not `endpoint`): the kube scrape attaches its own target
 # label `endpoint` = the Service port name ("http"), which would shadow an app
@@ -267,16 +279,33 @@ PROXY_TPS = Histogram(
     buckets=_TPS_BUCKETS,
     registry=_registry,
 )
+# Audio (whisper) transcription/translation confidence: the duration-weighted mean
+# of -avg_logprob (NLL) over the upstream's per-segment `avg_logprob` (only present
+# when the caller asks for response_format=verbose_json). Watch its windowed mean
+# for MODEL DRIFT:
+#   rate(proxy_audio_nll_sum[30m]) / rate(proxy_audio_nll_count[30m])
+# alert if it RISES above a per-model baseline (e.g. > 0.45 for whisper turbo, which
+# baselines around 0.19). p95 via histogram_quantile(0.95, ...) catches tail decay.
+PROXY_AUDIO_NLL = Histogram(
+    "proxy_audio_nll",
+    "LLM-proxy audio (whisper) mean token negative log-likelihood (=-avg_logprob), "
+    "duration-weighted over verbose_json segments (drift signal; >= 0, LOWER = more confident)",
+    ["proxy", "model"],
+    buckets=_NLL_BUCKETS,
+    registry=_registry,
+)
 
 
 def observe_proxy(
     proxy: str, model: str, upstream: str, status: str, duration_s: float | None = None,
-    ttft_s: float | None = None, tps: float | None = None,
+    ttft_s: float | None = None, tps: float | None = None, avg_logprob: float | None = None,
 ) -> None:
     """Record one proxied request: bump the outcome counter and, when known, observe
     its latency / time-to-first-token / output throughput. `proxy` is the endpoint id;
     `status` is the terminal state (completed / failed / cancelled / timeout / …).
-    ttft_s/tps are only meaningful for completed requests (None otherwise)."""
+    ttft_s/tps are only meaningful for completed requests (None otherwise). avg_logprob
+    is the audio-drift signal (whisper verbose_json segments; None for non-audio or
+    when the caller didn't request verbose_json)."""
     PROXY_REQUESTS_TOTAL.labels(
         proxy=proxy, model=model or "", upstream=upstream or "", status=status
     ).inc()
@@ -286,6 +315,10 @@ def observe_proxy(
         PROXY_TTFT.labels(proxy=proxy, model=model or "").observe(ttft_s)
     if tps is not None:
         PROXY_TPS.labels(proxy=proxy, model=model or "").observe(tps)
+    if avg_logprob is not None:
+        # Store NLL (-logprob, >= 0) so the histogram keeps its _sum sample; see
+        # the PROXY_AUDIO_NLL / _NLL_BUCKETS notes for why.
+        PROXY_AUDIO_NLL.labels(proxy=proxy, model=model or "").observe(-avg_logprob)
 
 
 def render_proxy(proxy: str) -> bytes:
@@ -294,7 +327,8 @@ def render_proxy(proxy: str) -> bytes:
 
     class _ProxyFilter:
         def collect(self):
-            for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION, PROXY_TTFT, PROXY_TPS):
+            for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION, PROXY_TTFT, PROXY_TPS,
+                           PROXY_AUDIO_NLL):
                 for mf in metric.collect():
                     samples = [s for s in mf.samples if s.labels.get("proxy") == proxy]
                     if not samples:

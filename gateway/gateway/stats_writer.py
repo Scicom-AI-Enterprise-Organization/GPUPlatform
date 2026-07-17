@@ -86,11 +86,12 @@ def record_serverless_request(request_id: str, app_id: str, owner_id: Optional[i
 def record_proxy_finish(request_id: str, status: str, *, status_code: Optional[int] = None,
                         latency_ms: Optional[int] = None, pt: Optional[int] = None,
                         ct: Optional[int] = None, error: Optional[str] = None,
-                        upstream: Optional[str] = None, ttft_ms: Optional[int] = None) -> None:
+                        upstream: Optional[str] = None, ttft_ms: Optional[int] = None,
+                        avg_logprob: Optional[float] = None) -> None:
     """A proxied request reached a terminal state — record its outcome + stats."""
     _enqueue({"kind": "proxy", "id": request_id, "status": status, "status_code": status_code,
               "latency_ms": latency_ms, "pt": pt, "ct": ct, "error": error,
-              "upstream": upstream, "ttft_ms": ttft_ms})
+              "upstream": upstream, "ttft_ms": ttft_ms, "avg_logprob": avg_logprob})
 
 
 # ---------- coalescing + flush ----------------------------------------------
@@ -173,6 +174,7 @@ def _apply_proxy(row, it: dict, now: datetime) -> None:
         _metrics.observe_proxy(
             row.endpoint_id, row.model, (it.get("upstream") or row.upstream or ""), it["status"],
             (latency_ms / 1000.0) if latency_ms is not None else None, ttft_s=ttft_s, tps=tps,
+            avg_logprob=it.get("avg_logprob"),
         )
     except Exception:  # noqa: BLE001 — metrics are best-effort
         pass
