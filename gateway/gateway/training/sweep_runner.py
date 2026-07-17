@@ -79,9 +79,15 @@ def run(cfg: dict) -> None:
     log("[sweep] preparing dependencies …")
     subprocess.call([sys.executable, worker, "--deps-only", "--config", cfg["_config_path"]])
 
-    work = os.path.abspath(cfg.get("work_dir") or "/workspace/autotrain-sweep")
-    os.makedirs(work, exist_ok=True)
     base_prefix = (cfg.get("artifacts") or {}).get("prefix", "").rstrip("/")
+    # Namespace the sweep workdir by RUN — concurrent sweeps on one box used to
+    # share {work_dir}/trial{i}.json + trial{i}/ and silently swap each other's
+    # trial configs (observed: a turbo sweep training the sibling run's
+    # large-v2 config). basename(artifacts.prefix) = the run id.
+    run_tag = os.path.basename(base_prefix) or f"pid{os.getpid()}"
+    work = os.path.abspath(os.path.join(cfg.get("work_dir") or "/workspace",
+                                        f"autotrain-sweep-{run_tag}"))
+    os.makedirs(work, exist_ok=True)
 
     results: list[dict | None] = [None] * len(combos)
     sem = threading.Semaphore(concurrency)
