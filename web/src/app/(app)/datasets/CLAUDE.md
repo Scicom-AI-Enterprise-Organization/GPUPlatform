@@ -36,10 +36,43 @@ its **preference-pair** count + a per-pair decode.
     post-registration (re-counts rows on save). Mirrors `columns-card`'s edit/save/inline-error
     pattern (no toasts; errors render as `text-destructive`).
   - `transformation-card.tsx` / `transform-card.tsx` — materialise a `label`/`hf` source to an
-    HF repo or S3 (the **export** path; honours the cutoff).
+    HF repo or S3 (the **export** path; honours the cutoff). For a `kind=s3` audio dataset the
+    Transform tab adds a **Normalize transcription** mode (see below).
+  - `normalize-card.tsx` — **`kind=s3` only**: LLM-normalize the transcription column (see below).
   - `row-browser.tsx` — paged preview; include/exclude rows from training.
   - `hf-mirror-card.tsx` — publish an S3 dataset to the self-hosted HF mirror.
 - `merge/` — merge ≥2 `label` datasets into one audio dataset.
+
+## Transcription normalization (`kind=s3` → new `kind=s3`, LLM respelling)
+
+The Transform tab on a `kind=s3` audio dataset offers **Normalize transcription** (`normalize-card.tsx`
+→ `POST /v1/datasets/{id}/normalize-transcription`). It rewrites the `transcription` column with a
+constrained LLM respelling pass (particle/filler spellings la/lah, ya/ye, Malay affix spacing, zh
+spacing — *without* changing what was said), ported from
+`ucc_ai_research/speech/stt/llm_normalize_experiment.py` into `gateway/gateway/dataset_normalize.py`
+(prompt/few-shots/whitelist copied verbatim — edit both together). The LLM is any OpenAI-compatible
+chat endpoint (the card defaults to the gateway's own `…/proxy/for-agentic/v1` + `google/gemma-4-31b-it`).
+Orchestration is `dataset_transform.start_normalize` / `_run_normalize` (mirrors the other transforms:
+background task, `transform_status`/`transform_log`, cancellable, `[AUTOTRAIN_PROGRESS]` markers).
+
+Design decisions that are **load-bearing** (don't regress):
+- **Metadata-only, audio NOT copied.** The new dataset's metadata references the SAME S3 audio via
+  presigned URLs of `{base}/audio/{basename}` — the reader (`_read_s3_metadata_rows`) never downloads
+  and the writer (`_write_normalized_metadata`) never copies. Presigned https (7-day) is deliberate:
+  the whisper trainer re-fetches by key (`whisper_finetune._s3_url_key_for_bucket`) so expiry never
+  bites, and preview presigns fresh — matching `_materialise_s3`'s convention. **Do NOT write `s3://`
+  URIs** — `whisper_finetune._download_audio_s3` doesn't handle that scheme (would break training).
+- **New metadata goes in its OWN sub-folder** `{base}/normalized-{hex}/metadata.csv`, NOT the shared
+  source folder. This is a purge-safety requirement: `_dataset_storage_prefix` returns the metadata's
+  folder for `kind=s3`, so `DELETE ?purge=true` deletes that folder — a sub-folder scopes it to just
+  the one CSV, leaving the shared `{base}/audio/` (and the source dataset) intact. Verified: purge
+  removed 1 object, source audio still served.
+- **Two guards, fail-safe.** `dataset_normalize.validate_edits` (deterministic, always on) structurally
+  proves only whitelisted respells + affix joins happened (no add/delete/reorder/renumber, no CJK
+  romanization). The **LLM judge is OFF by default** — it's noisy (hallucinates violations on valid
+  respells, ~⅓ false-reject in testing) and only adds marginal safety over the deterministic guard. A
+  no-op normalization (LLM returns identical text) short-circuits both guards. A rejected/errored row
+  keeps its ORIGINAL transcription. `limit` (0/blank = all) supports cheap trial runs.
 
 ## `kind=label` import filter (review status + timestamp cutoff)
 

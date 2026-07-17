@@ -1104,6 +1104,19 @@ export type TransformDatasetRequest = {
   test_split_ref_dataset_id?: string | null; // reuse this dataset's exact test set (matched by audio); mutually exclusive with pct/count
 };
 
+// LLM-normalize the transcription column of a kind=s3 audio dataset (constrained
+// respelling) into a NEW kind=s3 dataset. Metadata-only: the audio objects are
+// referenced, not copied. Mirrors the gateway NormalizeTranscriptionRequest.
+// Background job; poll getDataset(id).transform_status / transform_log.
+export type NormalizeTranscriptionRequest = {
+  base_url: string; // OpenAI-compatible base, e.g. https://…/v1
+  model: string; // served model id, e.g. google/gemma-4-31b-it
+  api_key?: string | null; // Bearer token for the endpoint (if it needs one)
+  workers?: number; // concurrent LLM calls (clamped 1..32)
+  judge?: boolean; // also run the LLM-as-judge validation pass
+  limit?: number | null; // only the first N rows (0/omitted → all); for cheap trial runs
+};
+
 // NeuCodec-encode + multipack a {audio, transcription} dataset into a packed
 // (tts_packed) dataset on a GPU. Mirrors the gateway TtsPackRequest. provider_id
 // = a VM (SSH) or RunPod account; null → spawn a pod with the gpu_type/tier below.

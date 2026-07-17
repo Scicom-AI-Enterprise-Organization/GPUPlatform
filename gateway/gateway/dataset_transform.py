@@ -417,6 +417,301 @@ async def _run(
             shutil.rmtree(work, ignore_errors=True)
 
 
+# ---------------- LLM transcription normalization (kind=s3 → kind=s3) --------
+# Rewrite a materialised S3 audio dataset's transcription column with an LLM
+# constrained-respelling pass (see dataset_normalize.py) and register the result
+# as a NEW kind=s3 dataset. METADATA-ONLY: the new metadata CSV is written NEXT TO
+# the source's (same folder, so `{base}/audio/{basename}` still resolves) and its
+# `audio` column points at the SAME s3:// audio objects — nothing is copied or
+# re-uploaded. Fail-safe: a row whose normalization fails the guards keeps its
+# original transcription.
+
+
+async def start_normalize(
+    dataset_id: str,
+    *,
+    base_url: str,
+    model: str,
+    api_key: Optional[str] = None,
+    workers: int = 8,
+    judge: bool = True,
+    limit: Optional[int] = None,
+) -> None:
+    """Mark the dataset running and kick off the transcription-normalize job."""
+    async with session_factory()() as s:
+        d = await s.get(Dataset, dataset_id)
+        if d is None:
+            return
+        d.transform_status = "running"
+        d.transform_log = _append_log(
+            None, f"transcription normalize queued · model={model} "
+                  f"· workers={workers} · judge={'on' if judge else 'off'}"
+                  + (f" · limit={limit}" if limit else ""))
+        await s.commit()
+    task = asyncio.create_task(_run_normalize(
+        dataset_id, base_url=base_url, model=model, api_key=api_key,
+        workers=workers, judge=judge, limit=limit,
+    ))
+    _active[dataset_id] = task
+    task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
+
+
+async def _run_normalize(
+    dataset_id: str,
+    *,
+    base_url: str,
+    model: str,
+    api_key: Optional[str],
+    workers: int,
+    judge: bool,
+    limit: Optional[int] = None,
+) -> None:
+    import secrets
+
+    from fastapi.concurrency import run_in_threadpool
+
+    from . import dataset_normalize
+    from .datasets_api import _s3_target_and_prefix
+
+    progress = _make_progress(dataset_id, asyncio.get_running_loop())
+    cancel_event = threading.Event()
+    _cancel_events[dataset_id] = cancel_event
+    try:
+        async with session_factory()() as s:
+            d = await s.get(Dataset, dataset_id)
+            if d is None:
+                return
+            if d.kind != "s3":
+                await _finish(dataset_id, "failed", "transcription normalize only supports kind=s3 audio datasets")
+                return
+            s3_metadata_uri = d.s3_metadata_uri
+            audio_field = d.audio_field or "audio"
+            transcription_field = d.transcription_field or "transcription"
+            storage = await s.get(Storage, d.storage_id) if d.storage_id else None
+        if not (storage and s3_metadata_uri):
+            await _finish(dataset_id, "failed", "dataset has no S3 storage / metadata to normalize")
+            return
+
+        s3_target, _prefix = _s3_target_and_prefix(storage)
+
+        await _log(dataset_id, f"reading metadata {s3_metadata_uri} …")
+        bucket, base, rows = await run_in_threadpool(
+            _read_s3_metadata_rows, s3_target, s3_metadata_uri, audio_field, transcription_field,
+        )
+        if not rows:
+            await _finish(dataset_id, "failed", "no rows with audio + transcription in the source metadata")
+            return
+        if limit and limit > 0 and len(rows) > limit:
+            await _log(dataset_id, f"limiting to first {limit} of {len(rows)} rows (trial run)")
+            rows = rows[:limit]
+        await _log(dataset_id, f"normalizing {len(rows)} transcriptions with {model} "
+                               f"(workers={workers}, judge={'on' if judge else 'off'}) …")
+
+        normalizer = dataset_normalize.Normalizer(base_url, model, api_key, judge=judge)
+        new_rows, stats = await run_in_threadpool(
+            _normalize_rows, rows, normalizer, workers, progress, cancel_event,
+        )
+        if cancel_event.is_set():
+            return  # cancelled mid-run; status set by cancel_transform
+        await _log(
+            dataset_id,
+            f"normalized: {stats['changed']} changed / {stats['unchanged']} unchanged "
+            f"/ {stats['rejected']} rejected (kept original) / {stats['errors']} errors",
+        )
+
+        # Write the new metadata into its OWN sub-folder of the source's folder
+        # (so purge-on-delete is scoped to just this file, never the shared audio)
+        # and register a new kind=s3 dataset over the SAME audio (presigned URLs).
+        out_folder = f"{base}/normalized-{secrets.token_hex(3)}" if base else f"normalized-{secrets.token_hex(3)}"
+        uri = await run_in_threadpool(
+            _write_normalized_metadata, new_rows, transcription_field, s3_target, bucket, out_folder,
+        )
+        new_id = await _create_normalized_output(
+            dataset_id, transcription_field=transcription_field, num_rows=len(new_rows),
+            s3_metadata_uri=uri,
+        )
+        await _finish(
+            dataset_id, "done",
+            f"normalized → {uri}; created dataset {new_id} ({len(new_rows)} rows, "
+            f"{stats['changed']} transcriptions changed)",
+            audio_dataset_id=new_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        await _finish(dataset_id, "failed", f"transcription normalize failed: {e}")
+        logger.exception("normalize %s failed", dataset_id)
+    finally:
+        _cancel_events.pop(dataset_id, None)
+
+
+def _read_s3_metadata_rows(
+    s3_target, s3_metadata_uri: str, audio_field: str, transcription_field: str,
+) -> tuple[str, str, list[tuple[str, str, str, dict]]]:
+    """Read a materialised S3 audio metadata CSV WITHOUT downloading any audio.
+    Returns (bucket, base_folder, rows) where each row is
+    (split, audio_key, transcription, extra) and `audio_key` is the bucket-relative
+    key of the SAME `{base}/audio/{basename}` object the source references (the
+    writer presigns it — it is never copied). `base` is the source metadata file's
+    folder; the audio lives at `{base}/audio/`."""
+    import csv
+    import dataclasses
+    import io as _io
+    from urllib.parse import unquote, urlparse
+
+    from . import bench
+
+    u = urlparse(s3_metadata_uri or "")
+    meta_key = (u.path if u.scheme == "s3" else (s3_metadata_uri or "")).lstrip("/")
+    if not meta_key:
+        raise RuntimeError(f"unusable s3 metadata uri: {s3_metadata_uri!r}")
+    bucket = u.netloc if u.scheme == "s3" else getattr(s3_target, "bucket", "")
+    base = meta_key.rsplit("/", 1)[0] if "/" in meta_key else ""
+    target = dataclasses.replace(s3_target, bucket=bucket) if bucket else s3_target
+
+    text = bench.s3_get_text(meta_key, target)
+    if not text:
+        raise RuntimeError(f"could not read metadata at {s3_metadata_uri}")
+    reader = csv.DictReader(_io.StringIO(text))
+    cols = reader.fieldnames or []
+    a_col = audio_field if audio_field in cols else ("audio" if "audio" in cols else None)
+    t_col = transcription_field if transcription_field in cols else (
+        "transcription" if "transcription" in cols else None)
+    if not a_col:
+        raise RuntimeError(f"audio column '{audio_field}' not found in metadata (have {cols})")
+    if not t_col:
+        raise RuntimeError(f"transcription column '{transcription_field}' not found in metadata (have {cols})")
+    skip = {a_col, t_col, "split"}
+    rows: list[tuple[str, str, str, dict]] = []
+    for i, r in enumerate(reader):
+        ref = (r.get(a_col) or "").strip()
+        if not ref:
+            continue
+        basename = unquote(os.path.basename(urlparse(ref).path)) or f"row-{i}.wav"
+        audio_key = f"{base}/audio/{basename}" if base else f"audio/{basename}"
+        split = (r.get("split") or "train").strip() or "train"
+        extra = {k: v for k, v in r.items() if k not in skip and isinstance(v, str) and v != ""}
+        rows.append((split, audio_key, str(r.get(t_col) or ""), extra))
+    return bucket, base, rows
+
+
+def _normalize_rows(
+    rows: list[tuple[str, str, str, dict]],
+    normalizer,
+    workers: int,
+    progress: Optional[Callable[..., None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[list[tuple[str, str, str, dict]], dict]:
+    """Normalize every row's transcription concurrently, fail-safe per row. Returns
+    (new_rows, stats): new_rows mirrors `rows` with the transcription replaced by
+    the accepted normalization (or the original, if rejected / errored). Honours
+    `cancel_event` (stops dispatching + drains promptly)."""
+    workers = max(1, min(int(workers or 8), 32))
+    new_rows: list = [None] * len(rows)
+    stats = {"changed": 0, "unchanged": 0, "rejected": 0, "errors": 0}
+    total = len(rows)
+    every = max(1, total // 100)
+    done = 0
+
+    def _one(idx: int, row: tuple[str, str, str, dict]):
+        split, audio, text, extra = row
+        try:
+            res = normalizer.normalize_one(text)
+            return idx, (split, audio, res.text, extra), res, None
+        except Exception as e:  # noqa: BLE001 — fail-safe: keep the original text
+            return idx, (split, audio, text, extra), None, e
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_one, i, r) for i, r in enumerate(rows)]
+        for fut in as_completed(futures):
+            if cancel_event is not None and cancel_event.is_set():
+                ex.shutdown(wait=False, cancel_futures=True)
+                break
+            idx, new_row, res, err = fut.result()
+            new_rows[idx] = new_row
+            if err is not None:
+                stats["errors"] += 1
+            elif not res.ok:
+                stats["rejected"] += 1
+            elif res.changed:
+                stats["changed"] += 1
+            else:
+                stats["unchanged"] += 1
+            done += 1
+            if progress and (done % every == 0 or done == total):
+                progress("normalize", done, total)
+    # Rows never processed (cancelled before completion) keep their original tuple.
+    for i, r in enumerate(rows):
+        if new_rows[i] is None:
+            new_rows[i] = r
+    return new_rows, stats
+
+
+def _write_normalized_metadata(
+    rows: list[tuple[str, str, str, dict]],
+    transcription_field: str,
+    s3_target,
+    bucket: str,
+    out_folder: str,
+) -> str:
+    """Write a metadata CSV [audio, <transcription>, split, <extra…>] to
+    `{out_folder}/metadata.csv` in `bucket`. The audio column holds presigned URLs
+    (7-day) to the EXISTING `{...}/audio/` objects — nothing is copied, and the
+    trainer re-fetches them by key so the signature expiring never bites. Writing
+    into its OWN sub-folder (not the shared source folder) keeps purge-on-delete
+    scoped to just this metadata file. Returns the written file's s3:// URI."""
+    import csv
+    import dataclasses
+    import io as _io
+
+    from . import bench
+
+    target = dataclasses.replace(s3_target, bucket=bucket) if bucket else s3_target
+    expires = 7 * 24 * 3600
+    unique_keys = sorted({audio_key for _split, audio_key, _text, _extra in rows})
+    urls = bench.s3_presign_many(unique_keys, expires, target)
+    extra_cols = sorted({k for *_rest, extra in rows for k in extra})
+    buf = _io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["audio", transcription_field, "split"] + extra_cols)
+    for split, audio_key, text, extra in rows:
+        writer.writerow([urls[audio_key], text, split] + [extra.get(c, "") for c in extra_cols])
+    meta_key = f"{out_folder}/metadata.csv" if out_folder else "metadata.csv"
+    bench.s3_put_text(meta_key, buf.getvalue(), target)
+    return f"s3://{bucket}/{meta_key}"
+
+
+async def _create_normalized_output(
+    source_id: str,
+    *,
+    transcription_field: str,
+    num_rows: int,
+    s3_metadata_uri: str,
+) -> str:
+    """Register the normalized dataset as a NEW kind=s3 row over the same audio,
+    leaving the source intact + re-runnable. Returns the new dataset id."""
+    import secrets
+
+    async with session_factory()() as s:
+        src = await s.get(Dataset, source_id)
+        if src is None:
+            return ""
+        new = Dataset(
+            id=f"ds-{secrets.token_hex(4)}",
+            owner_id=src.owner_id,
+            name=f"{src.name}-normalized",
+            description=f"LLM transcription normalization of {src.name}",
+            kind="s3",
+            storage_id=src.storage_id,
+            s3_metadata_uri=s3_metadata_uri,
+            audio_field="audio",
+            transcription_field=transcription_field,
+            speaker_field=src.speaker_field,
+            num_rows=num_rows,
+        )
+        s.add(new)
+        await s.commit()
+        return new.id
+
+
 # ---------------- merge label datasets → one combined audio dataset ----------
 
 

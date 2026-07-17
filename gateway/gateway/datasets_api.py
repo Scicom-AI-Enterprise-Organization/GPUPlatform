@@ -159,6 +159,23 @@ class TransformRequest(BaseModel):
     test_split_ref_dataset_id: Optional[str] = None
 
 
+class NormalizeTranscriptionRequest(BaseModel):
+    """LLM-normalize the transcription column of a kind=s3 audio dataset (constrained
+    respelling — see dataset_normalize.py) into a NEW kind=s3 dataset. Metadata-only:
+    the audio objects in S3 are NOT copied; the new metadata references the same clips.
+    The LLM is any OpenAI-compatible chat endpoint (e.g. the gateway's own proxy)."""
+    base_url: str                          # OpenAI-compatible base, e.g. https://…/v1
+    model: str                             # served model id, e.g. google/gemma-4-31b-it
+    api_key: Optional[str] = None          # Bearer token for the endpoint (if it needs one)
+    workers: int = 8                       # concurrent LLM calls (clamped 1..32)
+    # Extra LLM-as-judge validation pass. OFF by default: the deterministic guard
+    # (dataset_normalize.validate_edits) already proves structurally that only
+    # whitelisted respells + affix joins happened, and the judge is noisy — it
+    # hallucinates violations on valid respells, wrongly dropping good rows.
+    judge: bool = False
+    limit: Optional[int] = None            # only the first N rows (0/None → all); for cheap trial runs
+
+
 class TtsPackRequest(BaseModel):
     """NeuCodec-encode + multipack a {audio, transcription} dataset into a
     ChiniDataset, on a GPU provider over SSH, → a new packed dataset. Provisioning
@@ -2919,6 +2936,49 @@ async def transform_dataset(
         test_split_ref_keys=ref_keys,
     )
     await audit_module.record(user, "dataset.transform", "dataset", dataset_id, d.name, details={"target": req.target})
+    await session.refresh(d)
+    return _to_record(d, user.username, None)
+
+
+@router.post("/{dataset_id}/normalize-transcription", response_model=DatasetRecord)
+async def normalize_transcription(
+    dataset_id: str,
+    req: NormalizeTranscriptionRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """LLM-normalize an S3 audio dataset's transcription column into a NEW kind=s3
+    dataset (metadata-only — the audio objects are referenced, not copied). Runs as
+    a gateway background job; poll GET /{id} (transform_status / transform_log)."""
+    d = await _require_dataset(session, dataset_id, user)
+    if d.kind != "s3":
+        raise HTTPException(status_code=400, detail="transcription normalize only supports kind=s3 audio datasets")
+    if not d.s3_metadata_uri:
+        raise HTTPException(status_code=400, detail="dataset has no S3 metadata to normalize")
+    if not d.storage_id:
+        raise HTTPException(status_code=400, detail="dataset has no S3 storage attached")
+    if d.transform_status == "running":
+        raise HTTPException(status_code=409, detail="a transform is already running for this dataset")
+    base_url = (req.base_url or "").strip()
+    model = (req.model or "").strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="base_url (an OpenAI-compatible endpoint) is required")
+    if not model:
+        raise HTTPException(status_code=400, detail="model (the served model id) is required")
+
+    from . import dataset_transform
+    await dataset_transform.start_normalize(
+        dataset_id,
+        base_url=base_url,
+        model=model,
+        api_key=(req.api_key or "").strip() or None,
+        workers=max(1, min(int(req.workers or 8), 32)),
+        judge=bool(req.judge),
+        limit=(int(req.limit) if req.limit and req.limit > 0 else None),
+    )
+    await audit_module.record(
+        user, "dataset.normalize", "dataset", dataset_id, d.name, details={"model": model},
+    )
     await session.refresh(d)
     return _to_record(d, user.username, None)
 

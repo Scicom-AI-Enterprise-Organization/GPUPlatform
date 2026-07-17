@@ -43,6 +43,7 @@ import type {
   CreateDatasetRequest,
   UpdateDatasetRequest,
   TransformDatasetRequest,
+  NormalizeTranscriptionRequest,
   TtsPackRequest,
   OmnivoicePackRequest,
   LlmPackRequest,
@@ -1116,6 +1117,14 @@ export const gateway = {
   // Background job; poll getDataset(id).transform_status / transform_log.
   transformDataset: (id: string, body: TransformDatasetRequest) =>
     request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/transform`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // LLM-normalize an S3 audio dataset's transcription column → a new kind=s3
+  // dataset (metadata-only; audio not copied). Background job; poll
+  // getDataset(id).transform_status / transform_log.
+  normalizeTranscription: (id: string, body: NormalizeTranscriptionRequest) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/normalize-transcription`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

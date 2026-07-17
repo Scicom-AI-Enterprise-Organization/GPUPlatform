@@ -155,11 +155,21 @@ def run(cfg: dict) -> None:
                     text=True, bufsize=1,
                 )
                 best = None
+                artifact = None
                 for line in proc.stdout:  # type: ignore[union-attr]
                     emit_line(f"[trial {i}] {line}")
-                    if line.startswith("@@DONE "):
+                    # Tags can be preceded by tqdm \r fragments on the same
+                    # \n-line — find them anywhere, not just at the start.
+                    di = line.find("@@DONE ")
+                    if di >= 0:
                         try:
-                            best = json.loads(line[len("@@DONE "):]).get("best")
+                            best = json.loads(line[di + len("@@DONE "):]).get("best")
+                        except Exception:
+                            pass
+                    ai = line.find("@@ARTIFACT ")
+                    if ai >= 0:
+                        try:
+                            artifact = json.loads(line[ai + len("@@ARTIFACT "):])
                         except Exception:
                             pass
                 proc.wait()
@@ -167,6 +177,7 @@ def run(cfg: dict) -> None:
                 results[i] = {
                     "trial": i, "params": params, "metric": m,
                     "status": "done" if proc.returncode == 0 else "failed",
+                    "artifact": artifact,
                 }
                 emit("TRIAL", results[i])
             except Exception as e:  # noqa: BLE001
@@ -188,6 +199,12 @@ def run(cfg: dict) -> None:
     best = ranked[0] if ranked else None
     if best:
         log(f"[sweep] best: trial {best['trial']} · {metric}={best['metric']} · {best['params']}")
+        # Re-emit the WINNING trial's artifact as the sweep-level one, LAST —
+        # trials' own @@ARTIFACT lines can lose their "[trial N]" prefix to the
+        # log stream's \r-splitting and clobber result_json.artifact with
+        # whichever trial finished last; this final emit always wins.
+        if best.get("artifact"):
+            emit("ARTIFACT", best["artifact"])
     emit("DONE", {"best": best, "trials": done})
 
 
