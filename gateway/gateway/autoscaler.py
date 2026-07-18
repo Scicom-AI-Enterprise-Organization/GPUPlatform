@@ -31,6 +31,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("gateway.autoscaler")
 
+
+def _heartbeat(name: str) -> None:
+    """Stamp loop liveness into gateway_loop_last_tick_timestamp_seconds — only
+    on a SUCCESSFUL tick, so a permanently-failing loop reads as stalled."""
+    try:
+        from . import metrics as _metrics
+        _metrics.loop_heartbeat(name)
+    except Exception:  # noqa: BLE001 — metrics are best-effort
+        pass
+
+
 TICK_S = 1.0
 REGISTRATION_TOKEN_TTL_S = 1800  # 30 min — covers slow ECR pulls + vLLM model load
 PROVISION_COOLDOWN_S = 60  # back off this long after a provider provision failure
@@ -275,6 +286,7 @@ async def autoscaler_loop(
         try:
             await asyncio.sleep(TICK_S)
             await tick(rdb, provider, sm, provider_cache)
+            _heartbeat("autoscaler")
         except asyncio.CancelledError:
             logger.info("autoscaler cancelled")
             raise
@@ -682,6 +694,7 @@ async def vm_watchdog_loop(
         try:
             await asyncio.sleep(WATCHDOG_INTERVAL_S)
             await _vm_watchdog_tick(rdb, sm, provider_cache)
+            _heartbeat("vm_watchdog")
         except asyncio.CancelledError:
             logger.info("vm_watchdog cancelled")
             raise

@@ -171,8 +171,8 @@ async def _push_redis(redis, job_id: str, line: str) -> None:
     try:
         await redis.rpush(key, line)
         await redis.ltrim(key, -LOG_LIST_CAP, -1)
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 — log tail is best-effort, but don't lose it silently
+        logger.debug("quant: redis log append failed for %s", job_id, exc_info=True)
 
 
 async def _push_log(redis, job_id: str, line: str) -> None:

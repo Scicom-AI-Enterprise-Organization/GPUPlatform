@@ -27,9 +27,46 @@ import os
 import re
 import sys
 import time
+from contextvars import ContextVar
 from typing import Optional
 
 _LOGGER = logging.getLogger("gateway.access")
+
+# Request-id correlation for ORDINARY module log lines (logger.info(...) in
+# training_api/proxy_api/...), not just the access log. metrics_mw sets this per
+# request; the filter below stamps it onto every record passing through the root
+# handlers, so `%(request_id)s` in the root format renders ` [req-…]` inside a
+# request and nothing outside one. ContextVars propagate into tasks spawned by
+# the handler, so background work started per-request stays correlated.
+request_id_var: ContextVar[Optional[str]] = ContextVar("gateway_request_id", default=None)
+
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        rid = request_id_var.get()
+        record.request_id = f" [{rid}]" if rid else ""
+        return True
+
+
+_ROOT_INIT = False
+
+
+def init_root_logging() -> None:
+    """Configure the root logger once (idempotent). Called from BOTH run() and
+    lifespan so an external ASGI server importing gateway.main:app still gets
+    formatted, request-id-correlated logs (basicConfig no-ops if something
+    already configured handlers — we still attach the request-id filter)."""
+    global _ROOT_INIT
+    if _ROOT_INIT:
+        return
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s%(request_id)s: %(message)s",
+    )
+    f = _RequestIdFilter()
+    for h in logging.getLogger().handlers:
+        h.addFilter(f)
+    _ROOT_INIT = True
 # Separate stream for serverless-endpoint (vLLM) logs re-emitted from
 # /workers/logs, so Loki/Alloy can ingest them as `service="vllm"` alongside
 # the gateway access log. Independent logger keeps its JSON lines unprefixed.

@@ -51,9 +51,21 @@ def _enqueue(item: dict) -> None:
         q.put_nowait(item)
     except asyncio.QueueFull:
         _dropped += 1
+        try:
+            from . import metrics as _metrics
+            _metrics.STATS_WRITER_DROPPED.inc()
+        except Exception:  # noqa: BLE001 — metrics are best-effort
+            pass
         if _dropped % 1000 == 1:
             logger.warning("stats queue full (max=%d) — dropped %d updates so far",
                            _QUEUE_MAX, _dropped)
+
+
+def queue_depth() -> int:
+    """Pending intents awaiting flush — sampled by /metrics
+    (gateway_stats_writer_queue_depth). 0 when the writer isn't running."""
+    q = _queue
+    return q.qsize() if q is not None else 0
 
 
 def record_stream_completion(request_id: str, ttft_ms: Optional[int],
@@ -260,7 +272,13 @@ async def _flush(items: list[dict]) -> None:
 async def _drain() -> list[dict]:
     q = _queue
     assert q is not None
-    first = await q.get()  # block until there is at least one update
+    # Bounded wait (not a bare get()) so the loop still ticks — and stamps its
+    # liveness heartbeat — on an idle gateway; a stale heartbeat must mean the
+    # writer is actually wedged, not merely that no requests are flowing.
+    try:
+        first = await asyncio.wait_for(q.get(), timeout=30.0)
+    except asyncio.TimeoutError:
+        return []
     items = [first]
     # Let a small batch accumulate, then sweep everything queued in one txn.
     await asyncio.sleep(_FLUSH_INTERVAL_S)
@@ -278,6 +296,11 @@ async def _run() -> None:
     while True:
         try:
             await _flush(await _drain())
+            try:
+                from . import metrics as _metrics
+                _metrics.loop_heartbeat("stats_writer")
+            except Exception:  # noqa: BLE001 — metrics are best-effort
+                pass
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — never let the writer die on a transient error

@@ -444,6 +444,27 @@ vLLM args are validated at create time — a stray shell-continuation `\`, unbal
 
 ## Testing
 
+### Python unit tests (gateway)
+
+Pure in-process tests — **no Postgres, no Redis, no network** — covering auth
+helpers, the SSRF/path-injection guards (`netsafe`/`pathsafe`), Fernet crypto,
+the Prometheus instrumentation (incl. the runtime-health gauges), the shared
+`retry` backoff helper, the stats-writer coalescing, the access-log JSON shape,
+and the global exception handler:
+
+```bash
+uv pip install -e './gateway[dev]'    # pytest + pytest-asyncio (declared in pyproject)
+.venv/bin/pytest gateway/tests/unit   # ~1s, 60+ tests
+```
+
+The rest of `gateway/tests/` is the **integration** suite — it drives a LIVE
+gateway/web stack over HTTP (datasets/storage CRUD, the HF mirror with the real
+`huggingface_hub` client) and self-skips when the stack is unreachable:
+
+```bash
+.venv/bin/pytest gateway/tests        # unit + integration (integration skips if no stack)
+```
+
 ### JS unit tests (gateway API layer)
 
 The web client's API calls are covered by [vitest](https://vitest.dev) specs that assert creating serverless endpoints and SSH/VM benchmarks produces the exact request the gateway expects. The network and the `sgpu_token` cookie → `Bearer` auth are mocked, so **no live gateway and no API key are needed**:
@@ -543,6 +564,8 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 | [docs/WORKER_AGENT_PROVISIONING.md](docs/WORKER_AGENT_PROVISIONING.md) | How the worker-agent gets onto a VM (source-tarball ship over SSH, no git clone) + the prod image-bundling requirement |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | Local-fake / local-real / k8s+helm deploy paths |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Auth, health probes, timeouts, observability, tear-down |
+| [docs/API_LATENCY_REPORT.md](docs/API_LATENCY_REPORT.md) | Measured gateway latency per endpoint (p50–p99, concurrency), findings + fixes |
+| [deploy/monitoring/README.md](deploy/monitoring/README.md) | Local Prometheus + Alertmanager + Loki + Grafana stack, incl. the gateway alert rules |
 | [deploy/helm/serverlessgpu/README.md](deploy/helm/serverlessgpu/README.md) | k8s chart values + production wiring |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Local dev, tests, code layout |
 

@@ -5,6 +5,46 @@ files here** (lazy — it costs nothing in sessions that don't touch the gateway
 setup, the run commands, the localhost↔RunPod reachability gotcha, and the `.env`/auth/reload reality
 live in the **repo-root `CLAUDE.md`** (always loaded).
 
+### Production-hardening conventions (added 2026-07-18 — keep these invariants)
+
+- **Global exception handler** (`main._unhandled_exception_handler`): every unhandled exception
+  returns the `{"error": {message, type: "internal_error", request_id}}` envelope + `X-Request-ID`
+  header and bumps `gateway_unhandled_exceptions_total{route}`. Deliberate errors stay
+  `HTTPException` (handled earlier in the stack, never counted here).
+- **Request-id log correlation**: `metrics_mw` sets `accesslog.request_id_var` (a ContextVar) per
+  request; `accesslog.init_root_logging()` (idempotent, called from BOTH `run()` and lifespan so
+  external ASGI servers get it too) installs a filter rendering ` [req-…]` into every module log
+  line via `%(request_id)s` in the root format. Don't `logging.basicConfig` anywhere else.
+- **`/ready` = Redis AND Postgres** (each behind a 2s timeout); `/health` stays dependency-free
+  liveness. Don't add dependency checks to `/health` — k8s would restart a healthy process over a
+  dependency outage.
+- **Loop heartbeats**: every background loop stamps `metrics.loop_heartbeat("<name>")` at the END
+  of a *successful* tick (never in an except branch). Current names: autoscaler, reconciler,
+  vm_watchdog, proxy_health, stats_writer, log_archive, leader (HA only). Alert =
+  `time() - max by (loop)(gateway_loop_last_tick_timestamp_seconds) > 600`. **Add the call when
+  you add a loop** — an unstamped loop looks permanently stalled once someone alerts on it.
+- **/metrics never 500s**: `metrics.render()` degrades on Redis failure (`gateway_redis_up 0`) and
+  samples DB-pool (`db.pool_status()`) + stats-writer gauges best-effort. Redis sampling is
+  **pipelined** — keep it that way (the old per-app awaits were 2+2·apps+workers round-trips/scrape).
+- **Alert rules live in TWO synced places**: `deploy/monitoring/prometheus/alerts.yml`
+  (docker stack, promtool-validated) and `deploy/helm/serverlessgpu/templates/prometheusrule.yaml`
+  (operator clusters, prom template vars escaped with `{{`…`}}`). Change one → change both.
+  Alertmanager (local stack) is `deploy/monitoring/alertmanager/alertmanager.yml` — ships with a
+  no-op default receiver; Slack/Telegram/webhook examples are in the header comment.
+- **Shared retry helper**: `retry.py` (`retry_async`/`retry_sync` — expo backoff + jitter, logs
+  each retry, never swallows `CancelledError`). Use it for new outbound calls instead of another
+  inline loop.
+- **Opt-in guards**: `MAX_REQUEST_BODY_MB` (Content-Length 413 check in `metrics_mw`, 0=off —
+  dataset uploads are multi-GB, only set where ingress doesn't enforce one);
+  `PROXY_HTTP_READ_TIMEOUT_S` (read ceiling for the shared proxy httpx client, unset=unbounded
+  because per-call sites override with the endpoint's own `timeout_s`).
+- **Unit tests**: `gateway/tests/unit/` (pure in-process, no stack — auth/netsafe/pathsafe/crypto/
+  metrics/retry/accesslog/stats-writer/exception-handler). Test deps: `[project.optional-dependencies].dev`.
+  When you harden something here, add its unit test there.
+- **Legacy `GET /v1/training-runs` slims `result_json` to `{"best": …}`** (like `/_page`) — the
+  full record is `GET /{run_id}`. Don't fatten the list responses back up; it was the slowest
+  control-plane endpoint (146ms p50 at 272 runs) before slimming. See `docs/API_LATENCY_REPORT.md`.
+
 ### VM reverse tunnel — autossh `ssh -R`, keyed by (host, **port**)
 
 A VM worker phones home (register/heartbeat/Redis) over a **reverse SSH tunnel** the gateway opens

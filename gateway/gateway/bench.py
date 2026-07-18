@@ -754,8 +754,8 @@ def _pick_engine_subcommand(raw_yaml: str) -> list[str]:
             engine = str(items[0].get("engine") or "vllm").lower()
             if engine == "sglang":
                 return ["sglang", "bench"]
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 — unparseable YAML falls back to the vllm default
+        logger.debug("bench: engine sniff failed, defaulting to vllm", exc_info=True)
     return ["vllm", "bench"]
 
 

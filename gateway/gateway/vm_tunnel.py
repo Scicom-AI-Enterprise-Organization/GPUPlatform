@@ -208,8 +208,9 @@ def _kill_fwd(fp: "_FwdProc") -> None:
             fp.proc.wait(timeout=3)
         except Exception:
             fp.proc.kill()
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 — already-dead proc is fine; log the odd case
+        logger.debug("vm-tunnel: forward-tunnel kill failed (pid=%s)",
+                     getattr(fp.proc, "pid", "?"), exc_info=True)
 
 
 @atexit.register

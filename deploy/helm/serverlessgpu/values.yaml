@@ -29,6 +29,12 @@ gateway:
   # REQUIRED before setting replicaCount > 1 with autoscaler: true — otherwise
   # every replica runs its own autoscaler and double-provisions.
   ha: false
+  # PodDisruptionBudget — rendered automatically once replicaCount >= 2 so a
+  # node drain / rollout can never evict every gateway at once. No-op (not
+  # rendered) at replicaCount: 1, where it would deadlock drains instead.
+  pdb:
+    enabled: true
+    minAvailable: 1
   resources:
     requests:
       cpu: 100m
@@ -216,6 +222,14 @@ metrics:
     # Separate, gentler interval for the /metrics/resources inventory exporter
     # (platform_* gauges) — it hits Postgres on every scrape and barely moves.
     resourceInterval: 60s
+  # Ship the gateway alert rules (availability, 5xx/latency, queue backlog,
+  # autotrain failures, LLM-proxy health) as a PrometheusRule so the cluster's
+  # prometheus-operator picks them up. Same CRD gate as the ServiceMonitor.
+  # Mirrors deploy/monitoring/prometheus/alerts.yml — keep the two in sync.
+  prometheusRule:
+    enabled: true
+    # Extra labels the operator's ruleSelector may require (e.g. release: kps).
+    additionalLabels: {}
 
 # GitOps mode: when true, the chart skips rendering Secret resources for
 # postgres/redis/runpod/primeintellect/auth/web. You must provision matching

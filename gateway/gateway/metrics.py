@@ -24,7 +24,9 @@ to scrape and alert on, e.g., non-2xx responses.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -41,6 +43,8 @@ from prometheus_client.core import Metric
 if TYPE_CHECKING:
     import redis.asyncio as redis_async
 
+
+logger = logging.getLogger("gateway.metrics")
 
 _registry = CollectorRegistry()
 
@@ -83,6 +87,87 @@ TERMINATE_TOTAL = Counter(
     "gateway_terminate_total",
     "Worker terminate attempts",
     ["provider", "ok"],
+    registry=_registry,
+)
+
+
+# ---- Gateway runtime health -------------------------------------------------
+# Self-observability for the control plane itself: is Redis reachable, is the DB
+# pool saturating, are the background loops actually ticking, is the stats writer
+# shedding. Sampled per scrape (Redis/pool/queue-depth) or bumped by the runtime
+# (heartbeats, exception counter). Alert rules over these live in
+# deploy/monitoring/prometheus/alerts.yml + the Helm PrometheusRule.
+
+# Unix timestamp of each background loop's last completed tick. Loops call
+# metrics.loop_heartbeat(<name>) at the END of a successful tick, so a loop that
+# is wedged (or died without cancelling) goes stale and
+#   time() - max by (loop) (gateway_loop_last_tick_timestamp_seconds) > <threshold>
+# catches it. In HA mode only the leader ticks the leader-only loops — aggregate
+# with max() across replicas so a clean failover doesn't page.
+LOOP_LAST_TICK = Gauge(
+    "gateway_loop_last_tick_timestamp_seconds",
+    "Unix time of each background loop's last completed tick",
+    ["loop"],
+    registry=_registry,
+)
+
+
+def loop_heartbeat(loop: str) -> None:
+    """Stamp a background loop's liveness. Call at the end of each successful
+    tick (never from an except branch — a permanently-failing loop should read
+    as stalled, not alive)."""
+    LOOP_LAST_TICK.labels(loop=loop).set_to_current_time()
+
+
+# Bumped by the global exception handler in main.py — every 500 that came from an
+# UNHANDLED exception (as opposed to a deliberate HTTPException). Any sustained
+# increase is a bug, not load.
+UNHANDLED_EXCEPTIONS = Counter(
+    "gateway_unhandled_exceptions_total",
+    "Unhandled exceptions that reached the global handler (returned as 500)",
+    ["route"],
+    registry=_registry,
+)
+
+# Redis reachability, sampled at scrape time by render(). When Redis is down the
+# scrape still succeeds (render degrades instead of raising) with this at 0 —
+# monitoring must not go blind exactly when the hot path's store dies.
+REDIS_UP = Gauge(
+    "gateway_redis_up",
+    "1 if Redis answered PING during the last /metrics sample, else 0",
+    registry=_registry,
+)
+REDIS_PING_SECONDS = Gauge(
+    "gateway_redis_ping_seconds",
+    "Redis PING round-trip observed during the last /metrics sample",
+    registry=_registry,
+)
+
+# SQLAlchemy pool pressure (per replica). checked_out at/near capacity for
+# minutes = the pool-exhaustion incident shape — alert before handlers block on
+# pool_timeout.
+DB_POOL_CHECKED_OUT = Gauge(
+    "gateway_db_pool_checked_out",
+    "DB connections currently checked out of the SQLAlchemy pool",
+    registry=_registry,
+)
+DB_POOL_CAPACITY = Gauge(
+    "gateway_db_pool_capacity",
+    "Max DB connections the pool can hand out (pool_size + max_overflow)",
+    registry=_registry,
+)
+
+# Stats-writer backpressure: queue depth (sampled) + total dropped intents
+# (bumped by stats_writer._enqueue on overflow). Sustained drops mean the
+# Activity dashboard is silently losing rows — raise STATS_FLUSH_MAX_BATCH.
+STATS_WRITER_QUEUE_DEPTH = Gauge(
+    "gateway_stats_writer_queue_depth",
+    "Pending stats-writer intents awaiting the batch flush",
+    registry=_registry,
+)
+STATS_WRITER_DROPPED = Counter(
+    "gateway_stats_writer_dropped_total",
+    "Stats-writer intents dropped because the bounded queue was full",
     registry=_registry,
 )
 
@@ -659,15 +744,26 @@ async def sample_gpu_busy(session, rdb) -> None:
             ).set(1)
 
     # Inference endpoints with at least one live worker registered in Redis.
+    # Pipelined: one round-trip for all apps' member sets, one for all liveness
+    # checks (was 1 + workers awaits per app).
     if rdb is not None:
-        for a in (await session.execute(select(App))).scalars().all():
-            members = await rdb.smembers(f"worker_index:{a.app_id}")
-            live = False
-            for mid in members:
-                if await rdb.exists(f"worker:{mid}"):
-                    live = True
-                    break
-            if not live:
+        apps = (await session.execute(select(App))).scalars().all()
+        pipe = rdb.pipeline(transaction=False)
+        for a in apps:
+            pipe.smembers(f"worker_index:{a.app_id}")
+        member_sets = await pipe.execute() if apps else []
+        flat: list[tuple[int, str]] = [
+            (i, mid) for i, members in enumerate(member_sets) for mid in (members or ())
+        ]
+        live_apps: set[int] = set()
+        if flat:
+            pipe = rdb.pipeline(transaction=False)
+            for _, mid in flat:
+                pipe.exists(f"worker:{mid}")
+            flags = await pipe.execute()
+            live_apps = {i for (i, _), alive in zip(flat, flags) if alive}
+        for i, a in enumerate(apps):
+            if i not in live_apps:
                 continue
             node = (provs.get(a.provider_id) if a.provider_id else None) or (a.gpu or "shared")
             gpus = _parse_gpu_ids(getattr(a, "visible_devices", None)) or list(range(int(a.gpu_count or 1)))
@@ -689,8 +785,32 @@ async def render_resources(session, rdb=None) -> tuple[bytes, str]:
     return generate_latest(_resource_registry), CONTENT_TYPE_LATEST
 
 
-async def render(rdb: "redis_async.Redis") -> tuple[bytes, str]:
-    """Sample point-in-time gauges from Redis, then serialize the registry."""
+def _sample_runtime_health() -> None:
+    """Sample the DB-pool and stats-writer gauges. Never raises — a scrape must
+    not fail because an internal sample did."""
+    try:
+        from . import db as _db
+        st = _db.pool_status()
+        if st is not None:
+            DB_POOL_CHECKED_OUT.set(st["checked_out"])
+            DB_POOL_CAPACITY.set(st["capacity"])
+    except Exception:  # noqa: BLE001 — best-effort self-observation
+        logger.debug("db pool sample failed", exc_info=True)
+    try:
+        from . import stats_writer as _sw
+        STATS_WRITER_QUEUE_DEPTH.set(_sw.queue_depth())
+    except Exception:  # noqa: BLE001
+        logger.debug("stats-writer depth sample failed", exc_info=True)
+
+
+async def _sample_redis(rdb: "redis_async.Redis") -> None:
+    """Sample the per-app queue/worker gauges from Redis, pipelined (the old
+    per-app awaits were 2 + 2·apps + workers round-trips per scrape). Raises on
+    Redis failure — the caller converts that into gateway_redis_up=0."""
+    t0 = time.perf_counter()
+    await rdb.ping()
+    REDIS_PING_SECONDS.set(time.perf_counter() - t0)
+
     # Discover app_ids from existing worker_index/queue keys (Postgres is the
     # source of truth for app metadata, but for metrics we just want anything
     # with active state in Redis).
@@ -699,16 +819,48 @@ async def render(rdb: "redis_async.Redis") -> tuple[bytes, str]:
         app_ids.add(key.split(":", 1)[1])
     async for key in rdb.scan_iter(match="queue:*"):
         app_ids.add(key.split(":", 1)[1])
+    ids = sorted(app_ids)
+
+    if ids:
+        pipe = rdb.pipeline(transaction=False)
+        for app_id in ids:
+            pipe.llen(f"queue:{app_id}")
+            pipe.smembers(f"worker_index:{app_id}")
+        res = await pipe.execute()
+    else:
+        res = []
 
     QUEUE_LENGTH.clear()
     WORKERS_TOTAL.clear()
-    for app_id in app_ids:
-        QUEUE_LENGTH.labels(app_id=app_id).set(await rdb.llen(f"queue:{app_id}"))
-        members = await rdb.smembers(f"worker_index:{app_id}")
-        live = 0
-        for mid in members:
-            if await rdb.exists(f"worker:{mid}"):
-                live += 1
-        WORKERS_TOTAL.labels(app_id=app_id).set(live)
+    flat_members: list[tuple[str, str]] = []
+    for i, app_id in enumerate(ids):
+        QUEUE_LENGTH.labels(app_id=app_id).set(int(res[2 * i] or 0))
+        flat_members.extend((app_id, mid) for mid in (res[2 * i + 1] or ()))
 
+    live_by_app: dict[str, int] = {app_id: 0 for app_id in ids}
+    if flat_members:
+        pipe = rdb.pipeline(transaction=False)
+        for _, mid in flat_members:
+            pipe.exists(f"worker:{mid}")
+        flags = await pipe.execute()
+        for (app_id, _), alive in zip(flat_members, flags):
+            if alive:
+                live_by_app[app_id] += 1
+    for app_id in ids:
+        WORKERS_TOTAL.labels(app_id=app_id).set(live_by_app[app_id])
+
+
+async def render(rdb: "redis_async.Redis") -> tuple[bytes, str]:
+    """Sample point-in-time gauges (Redis queue/worker state, DB pool, stats
+    writer), then serialize the registry. Degrades instead of raising when Redis
+    is unreachable — the scrape then serves gateway_redis_up=0 plus every
+    in-process counter/histogram, rather than 500ing and leaving monitoring
+    blind during exactly the outage it should be reporting."""
+    try:
+        await _sample_redis(rdb)
+        REDIS_UP.set(1)
+    except Exception:  # noqa: BLE001 — degrade, don't fail the scrape
+        REDIS_UP.set(0)
+        logger.warning("metrics: redis sample failed — serving degraded scrape", exc_info=True)
+    _sample_runtime_health()
     return generate_latest(_registry), CONTENT_TYPE_LATEST

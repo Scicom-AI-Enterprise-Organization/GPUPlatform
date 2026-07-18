@@ -631,7 +631,11 @@ async def leader_workload(app: FastAPI) -> list[asyncio.Task]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    accesslog.init_access_logging()  # idempotent; also covers the uvicorn reload subprocess
+    # Both idempotent; also covers the uvicorn reload subprocess AND an external
+    # ASGI server importing gateway.main:app without going through run() (which
+    # used to be the only place the root logger got configured).
+    accesslog.init_root_logging()
+    accesslog.init_access_logging()
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
     logger.info("connecting to redis at %s", redis_url)
     # Keepalive matters: prod Redis sits behind a public ELB with a ~60s idle
@@ -703,8 +707,15 @@ async def lifespan(app: FastAPI):
     # stats_writer, the log→storage redis backfill above, proxy health) stays inline.
 
     # LLM API proxy: shared httpx client + live state + health-check loop.
+    # Default read timeout is unbounded because streamed generations legitimately
+    # run for minutes and every request path overrides it per-call with the
+    # endpoint's own timeout_s; PROXY_HTTP_READ_TIMEOUT_S puts a global ceiling
+    # under any future call site that forgets (opt-in — a too-small value here
+    # kills long streams mid-generation).
+    _read_env = os.environ.get("PROXY_HTTP_READ_TIMEOUT_S", "").strip()
+    _read_timeout = float(_read_env) if _read_env else None
     app.state.proxy_http = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=10.0),
+        timeout=httpx.Timeout(connect=10.0, read=_read_timeout, write=None, pool=10.0),
         follow_redirects=True,
     )
     app.state.proxy_health = {}
@@ -888,16 +899,42 @@ app.include_router(catalog_module.router)
 app.include_router(hf_mirror_module.router)
 
 
+# Reject requests whose declared Content-Length exceeds this many MB (413)
+# before the body is read. 0 (default) = no limit — dataset uploads and model
+# pushes legitimately send multi-GB bodies, so only set this on deployments
+# where the ingress doesn't already enforce one.
+_MAX_BODY_BYTES = int(
+    float(os.environ.get("MAX_REQUEST_BODY_MB", "0") or "0") * 1024 * 1024
+)
+
+
 @app.middleware("http")
 async def metrics_mw(request: Request, call_next):
     metrics.INFLIGHT.inc()
     # Correlate metrics ↔ logs ↔ client. Honour an upstream X-Request-ID, else mint one.
     request_id = request.headers.get("x-request-id") or f"req-{uuid.uuid4().hex[:12]}"
     request.state.request_id = request_id
+    # Stamp the id into the logging context so every module log line emitted
+    # while handling this request carries it (see accesslog._RequestIdFilter).
+    _rid_token = accesslog.request_id_var.set(request_id)
     start = time.perf_counter()
     status_code = 500  # default if call_next raises before producing a response
     resp = None
     try:
+        if _MAX_BODY_BYTES:
+            cl = request.headers.get("content-length", "")
+            if cl.isdigit() and int(cl) > _MAX_BODY_BYTES:
+                resp = JSONResponse(
+                    status_code=413,
+                    content={"error": {
+                        "message": f"request body too large (limit {_MAX_BODY_BYTES // (1024 * 1024)} MB)",
+                        "type": "payload_too_large",
+                        "request_id": request_id,
+                    }},
+                )
+                status_code = 413
+                resp.headers["x-request-id"] = request_id
+                return resp
         resp = await call_next(request)
         status_code = resp.status_code
         # A route handler may have already set its OWN X-Request-Id — the proxy's
@@ -947,6 +984,38 @@ async def metrics_mw(request: Request, call_next):
             ip=ip,
             nbytes=nbytes,
         )
+        accesslog.request_id_var.reset(_rid_token)
+
+
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all for exceptions no route handled: return a structured JSON
+    envelope (same `{"error": {...}}` shape the proxy paths use) carrying the
+    request id instead of Starlette's bare text 500, bump
+    gateway_unhandled_exceptions_total, and log the traceback correlated to the
+    id. Starlette re-raises after this responds, so the ASGI server's own error
+    logging still fires."""
+    rid = getattr(request.state, "request_id", None) or request.headers.get("x-request-id") or ""
+    route_obj = request.scope.get("route")
+    # Collapse unmatched paths (metrics_mw does the same) so scanners can't
+    # explode the counter's label cardinality.
+    route = getattr(route_obj, "path", None) or "<unmatched>"
+    metrics.UNHANDLED_EXCEPTIONS.labels(route=route).inc()
+    logger.error(
+        "unhandled exception on %s %s (request_id=%s)",
+        request.method, request.url.path, rid or "-", exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"error": {
+            "message": "internal server error",
+            "type": "internal_error",
+            "request_id": rid or None,
+        }},
+        headers={"x-request-id": rid} if rid else None,
+    )
+
+
+app.add_exception_handler(Exception, _unhandled_exception_handler)
 
 
 # The build the gateway is serving. CI bakes the git short-sha in as APP_VERSION
@@ -1024,12 +1093,29 @@ async def version():
 
 @app.get("/ready")
 async def ready(request: Request):
-    rdb = request.app.state.redis
+    """Readiness = this replica can actually serve: BOTH Redis (queues, worker
+    registry) and Postgres (auth, app metadata) answer within 2s. A replica with
+    an exhausted DB pool or a dead Redis is pulled from the LB instead of
+    serving 500s. /health stays dependency-free (pure liveness — don't restart
+    a healthy process just because a dependency is down)."""
+    checks: dict[str, str] = {}
     try:
-        await rdb.ping()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail={"redis": "unreachable", "error": str(e)[:200]})
-    return {"ok": True, "redis": "ok"}
+        await asyncio.wait_for(request.app.state.redis.ping(), timeout=2.0)
+        checks["redis"] = "ok"
+    except Exception as e:  # noqa: BLE001 — any failure means not ready
+        checks["redis"] = f"unreachable: {str(e)[:200]}"
+    try:
+        from sqlalchemy import text as _text
+        async def _pg_ping() -> None:
+            async with session_factory()() as s:
+                await s.execute(_text("SELECT 1"))
+        await asyncio.wait_for(_pg_ping(), timeout=2.0)
+        checks["postgres"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        checks["postgres"] = f"unreachable: {str(e)[:200]}"
+    if any(v != "ok" for v in checks.values()):
+        raise HTTPException(status_code=503, detail={"ok": False, **checks})
+    return {"ok": True, **checks}
 
 
 @app.get("/leader")
@@ -5485,10 +5571,7 @@ async def get_worker_logs(
 
 def run():
     load_dotenv()
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    accesslog.init_root_logging()
     accesslog.init_access_logging()
     host, port = os.environ.get("GATEWAY_BIND", "0.0.0.0:8080").rsplit(":", 1)
     # Local-dev hot reload: set GATEWAY_RELOAD=1 to restart the server on any

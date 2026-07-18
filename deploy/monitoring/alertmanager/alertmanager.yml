@@ -1,0 +1,55 @@
+# Alertmanager routing for the GPUPlatform monitoring stack.
+#
+# Ships with a no-op default receiver so the stack boots without secrets.
+# To actually get paged, add an integration to the `default` receiver below
+# (or add routes per severity). Examples:
+#
+#   Slack:
+#     receivers:
+#       - name: default
+#         slack_configs:
+#           - api_url: https://hooks.slack.com/services/T000/B000/XXXX
+#             channel: "#gpu-platform-alerts"
+#             send_resolved: true
+#             title: '{{ .CommonAnnotations.summary }}'
+#             text: '{{ .CommonAnnotations.description }}'
+#
+#   Telegram (bot token from @BotFather, chat id from getUpdates):
+#     receivers:
+#       - name: default
+#         telegram_configs:
+#           - bot_token: "123456:ABC..."
+#             chat_id: -1001234567890
+#             send_resolved: true
+#
+#   Generic webhook (n8n / Make / custom):
+#     receivers:
+#       - name: default
+#         webhook_configs:
+#           - url: http://host.docker.internal:5678/webhook/alerts
+#             send_resolved: true
+
+route:
+  receiver: default
+  # One notification per alertname+severity burst, not one per app/route label.
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  # Re-remind about still-firing criticals every 4h; warnings stay quiet.
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity="critical"]
+      receiver: default
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+    # No integrations configured — alerts are visible in the Alertmanager UI
+    # (http://localhost:9093) and Grafana. Add slack/telegram/webhook configs
+    # here (see header) to push notifications.
+
+inhibit_rules:
+  # A dead gateway makes every downstream alert fire — page once, not five times.
+  - source_matchers: [alertname="GatewayDown"]
+    target_matchers: [severity="warning"]
+    equal: [instance]

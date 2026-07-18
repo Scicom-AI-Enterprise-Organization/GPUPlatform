@@ -66,11 +66,18 @@ they ask, move on.
 
 ### Testing the gateway locally (current `.env` reality)
 
-`gateway/.env` is currently `AUTH_DISABLED=0` + `GATEWAY_RELOAD=0` (despite older notes saying
-auth-disabled): backend edits need a **manual gateway restart**, and API calls need **real auth**.
-For testing, send an **API key** as `Authorization: Bearer sgpu_…` — do **not** write Redis
-`session:<token>` keys to forge a session (that's exactly the prod-Redis-exposure risk; the user
-flagged it). No active training run? a gateway restart is safe — runs detach and finalize from log.
+`gateway/.env` is back to `AUTH_DISABLED=1` (checked 2026-07-18) + `GATEWAY_RELOAD=0`: backend
+edits need a **manual gateway restart**; anonymous requests act as the seeded admin. Still prefer
+sending a real **API key** as `Authorization: Bearer sgpu_…` (one lives in `automation/config.yaml`)
+so tests behave the same against prod — and never write Redis `session:<token>` keys to forge a
+session (that's exactly the prod-Redis-exposure risk; the user flagged it). No active training run?
+a gateway restart is safe — runs detach and finalize from log. NOTE `AUTH_DISABLED=1` makes
+`gateway/tests/test_hf_mirror.py::test_pull_requires_auth` self-skip (anonymous = admin is
+intentional in that mode).
+
+**Unit tests** (no stack needed, ~1s): `.venv/bin/pytest gateway/tests/unit`. Test deps are a
+declared extra now: `uv pip install -e './gateway[dev]'`. The rest of `gateway/tests/` is the
+live-stack integration suite and self-skips when nothing is listening.
 
 ### What NOT to do
 

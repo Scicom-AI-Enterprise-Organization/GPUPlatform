@@ -684,6 +684,22 @@ def get_database_url() -> str:
     return url
 
 
+def pool_status() -> Optional[dict]:
+    """Point-in-time SQLAlchemy pool pressure for /metrics
+    (gateway_db_pool_checked_out / gateway_db_pool_capacity). None before
+    init_db or when the pool type doesn't expose counters (e.g. NullPool)."""
+    if _engine is None:
+        return None
+    pool = _engine.sync_engine.pool
+    try:
+        size = int(pool.size())
+        checked_out = int(pool.checkedout())
+        max_overflow = getattr(pool, "_max_overflow", 0) or 0
+    except (AttributeError, NotImplementedError):
+        return None
+    return {"checked_out": checked_out, "capacity": size + max(0, int(max_overflow))}
+
+
 async def init_db() -> None:
     global _engine, _sessionmaker
     # Import side-effect: registers Benchmark / BenchmarkJob / ComputePod /

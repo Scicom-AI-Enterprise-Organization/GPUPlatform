@@ -1,0 +1,21 @@
+{{- /*
+Only meaningful (and only rendered) with 2+ gateway replicas: guarantees at
+least `minAvailable` gateways survive voluntary disruptions (node drains,
+rollouts). At replicaCount: 1 a PDB with minAvailable: 1 would block every
+drain forever, so it is deliberately skipped.
+*/}}
+{{- if and .Values.gateway.pdb.enabled (gt (int .Values.gateway.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "serverlessgpu.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "serverlessgpu.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  minAvailable: {{ .Values.gateway.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "serverlessgpu.gateway.selectorLabels" . | nindent 6 }}
+{{- end }}

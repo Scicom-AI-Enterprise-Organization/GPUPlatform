@@ -2840,6 +2840,11 @@ async def proxy_health_loop(app) -> None:
             cli = _http(app)
             for endpoint_id, u, key in targets:
                 await _probe(app, cli, endpoint_id, u, key)
+            try:
+                from . import metrics as _metrics
+                _metrics.loop_heartbeat("proxy_health")
+            except Exception:  # noqa: BLE001 — metrics are best-effort
+                pass
         except asyncio.CancelledError:
             break
         except Exception:

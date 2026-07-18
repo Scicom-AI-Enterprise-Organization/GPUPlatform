@@ -95,12 +95,17 @@ That's it. **5 templates → 7-8 k8s objects** depending on values.
 
 ## What we deliberately don't create
 
-- **No PodDisruptionBudget** — start simple, add when needed
 - **No HorizontalPodAutoscaler** — gateway is stateless, scale manually with `replicaCount`
-- **No ServiceMonitor** — manual Prometheus scrape config in operator's main config
+  (+ `gateway.ha: true` so only one replica runs the mutating controllers)
 - **No NetworkPolicy** — operator's choice, depends on cluster security model
 - **No per-app Ingress** — one ingress routes everything in-gateway by path or body
 - **No GPU node pools** — workers run on PI, not in your cluster
+
+(Formerly on this list, now shipped: a **PodDisruptionBudget** renders
+automatically at `replicaCount >= 2` — see `gateway.pdb` in values; a
+**ServiceMonitor** and a **PrometheusRule** carrying the gateway alert rules
+render when the `monitoring.coreos.com/v1` CRDs exist — see
+`metrics.serviceMonitor` / `metrics.prometheusRule`.)
 
 ## Component responsibilities
 

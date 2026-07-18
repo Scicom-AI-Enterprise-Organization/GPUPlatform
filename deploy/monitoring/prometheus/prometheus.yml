@@ -2,6 +2,16 @@ global:
   scrape_interval: 15s
   scrape_timeout: 10s
 
+# Gateway alert rules (availability, 5xx/latency, queue backlog, autotrain
+# failures, LLM-proxy health). Kept in sync with the Helm PrometheusRule.
+rule_files:
+  - alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   # The gateway's API-layer RED metrics (gateway_requests_total /
   # gateway_request_duration_seconds) + queue/worker gauges, all from /metrics.

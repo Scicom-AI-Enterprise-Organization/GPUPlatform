@@ -1252,7 +1252,12 @@ def _download_parquet_urls(
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     paths: list[str] = []
     total = len(urls)
-    with httpx.Client(timeout=None, follow_redirects=True, headers=headers) as cli:
+    # Per-operation timeouts, NOT a total budget: httpx `read` applies per chunk,
+    # so a multi-GB parquet that keeps flowing still completes, while a stalled
+    # connection fails in 2 min instead of hanging the transform forever
+    # (this client was timeout=None — the one unbounded outbound call left).
+    _timeout = httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=30.0)
+    with httpx.Client(timeout=_timeout, follow_redirects=True, headers=headers) as cli:
         for i, url in enumerate(urls):
             local = os.path.join(dest, f"source-{i:05d}.parquet")
             with cli.stream("GET", url) as r:

@@ -1,0 +1,139 @@
+{{- /*
+Gateway alert rules for prometheus-operator clusters. MIRRORS
+deploy/monitoring/prometheus/alerts.yml (the docker-compose stack's copy) —
+keep the two in sync when adding/changing an alert.
+*/}}
+{{- if and .Values.metrics.prometheusRule.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "serverlessgpu.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "serverlessgpu.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+    {{- with .Values.metrics.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gateway-availability
+      rules:
+        - alert: GatewayRedisDown
+          expr: gateway_redis_up == 0
+          for: 2m
+          labels: {severity: critical}
+          annotations:
+            summary: "Gateway cannot reach Redis"
+            description: "The gateway's /metrics sampler has failed its Redis PING for 2 minutes. Queues, worker registry and leader election are down."
+        - alert: GatewayDbPoolSaturated
+          expr: gateway_db_pool_checked_out / gateway_db_pool_capacity > 0.9
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Gateway DB pool >90% checked out"
+            description: "{{`{{ $value | humanizePercentage }}`}} of the SQLAlchemy pool is checked out — the pool-exhaustion incident shape. Raise DB_POOL_SIZE/DB_MAX_OVERFLOW or find the leak."
+        - alert: GatewayControlLoopStalled
+          expr: (time() - max by (loop) (gateway_loop_last_tick_timestamp_seconds)) > 600
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Background loop {{`{{ $labels.loop }}`}} stalled"
+            description: "Loop {{`{{ $labels.loop }}`}} has not completed a tick in over 10 minutes (loops tick every 1s–120s). It is wedged or dying every tick — check gateway logs."
+    - name: gateway-api
+      rules:
+        - alert: GatewayHigh5xxRate
+          expr: |
+            sum(rate(serverless_http_requests_total{http_status=~"5.."}[5m]))
+              / sum(rate(serverless_http_requests_total[5m])) > 0.05
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Gateway 5xx rate above 5%"
+            description: "{{`{{ $value | humanizePercentage }}`}} of gateway API requests are failing with 5xx (5m window)."
+        - alert: GatewayUnhandledExceptions
+          expr: increase(gateway_unhandled_exceptions_total[10m]) > 5
+          labels: {severity: warning}
+          annotations:
+            summary: "Unhandled exceptions on {{`{{ $labels.route }}`}}"
+            description: "{{`{{ $value }}`}} unhandled exceptions reached the global handler in 10 minutes on route {{`{{ $labels.route }}`}} — this is a bug, not load."
+        - alert: GatewayControlPlaneLatencyHigh
+          expr: |
+            histogram_quantile(0.95, sum by (le) (
+              rate(serverless_http_request_duration_seconds_bucket{
+                route!~".*(chat/completions|/completions|/embeddings|/audio/|/run/).*"
+              }[5m])
+            )) > 2
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "Control-plane p95 latency above 2s"
+            description: "p95 latency of non-inference gateway routes has been over 2s for 10 minutes — check DB pool pressure and Redis latency."
+        - alert: GatewayStatsWriterDropping
+          expr: increase(gateway_stats_writer_dropped_total[10m]) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "Stats writer dropping updates"
+            description: "The bounded stats queue overflowed — Activity/history rows are being lost. Raise STATS_FLUSH_MAX_BATCH or investigate DB write latency."
+    - name: fleet
+      rules:
+        - alert: QueueBacklogNoWorkers
+          expr: (gateway_queue_length > 0) and on (app_id) (gateway_workers == 0)
+          for: 10m
+          labels: {severity: critical}
+          annotations:
+            summary: "App {{`{{ $labels.app_id }}`}} has queued jobs but zero workers"
+            description: "Jobs have been waiting 10+ minutes with no live worker. Autoscaler failing to provision, or provisioning is failing — check gateway_provision_total and the app's events."
+        - alert: QueueBacklogHigh
+          expr: gateway_queue_length > 50
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: "App {{`{{ $labels.app_id }}`}} queue depth over 50"
+            description: "Sustained backlog ({{`{{ $value }}`}} jobs) — raise max workers or tasks_per_container."
+        - alert: WorkerProvisionFailures
+          expr: increase(gateway_provision_total{ok="false"}[30m]) > 3
+          labels: {severity: warning}
+          annotations:
+            summary: "Worker provisioning failing on {{`{{ $labels.provider }}`}}"
+            description: "{{`{{ $value }}`}} failed provision attempts in 30 minutes — provider API errors, quota, or no GPU capacity."
+        - alert: WorkerTerminateFailures
+          expr: increase(gateway_terminate_total{ok="false"}[30m]) > 3
+          labels: {severity: warning}
+          annotations:
+            summary: "Worker termination failing on {{`{{ $labels.provider }}`}}"
+            description: "{{`{{ $value }}`}} failed terminate attempts in 30 minutes — pods may be leaking (and billing) on the provider."
+    - name: autotrain
+      rules:
+        - alert: AutotrainRunFailed
+          expr: increase(platform_autotrain_runs_finished_total{status="failed"}[15m]) > 0
+          labels: {severity: critical}
+          annotations:
+            summary: "Autotrain run failed ({{`{{ $labels.task }}`}})"
+            description: "A training run reached status=failed in the last 15 minutes. See /autotrain for the run log."
+        - alert: AutotrainRunStuck
+          expr: platform_autotrain_run_running_seconds > 14400
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "Autotrain run {{`{{ $labels.name }}`}} running over 4h"
+            description: "Run {{`{{ $labels.run_id }}`}} (owner {{`{{ $labels.owner }}`}}) has been in status=running for over 4 hours — verify it is still making progress."
+    - name: llm-proxy
+      rules:
+        - alert: ProxyHighFailureRate
+          expr: |
+            sum by (proxy) (rate(proxy_requests_total{status=~"failed|timeout"}[10m]))
+              / sum by (proxy) (rate(proxy_requests_total[10m])) > 0.2
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "LLM proxy {{`{{ $labels.proxy }}`}} failure rate above 20%"
+            description: "{{`{{ $value | humanizePercentage }}`}} of proxied requests are failing/timing out — check upstream health at /proxy/{{`{{ $labels.proxy }}`}}/health."
+        - alert: ProxyBgQueueSaturated
+          expr: proxy_bg_queue_depth > 500
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "Proxy background-job queue saturated"
+            description: "TTS-eval/drift-capture jobs are backing up ({{`{{ $value }}`}} pending) — raise PROXY_BG_WORKERS before jobs get shed."
+{{- end }}

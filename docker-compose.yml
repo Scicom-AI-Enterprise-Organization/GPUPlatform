@@ -68,6 +68,14 @@ services:
       PI_MAX_PRICE_HR: ${PI_MAX_PRICE_HR:-}
     ports:
       - "8080:8080"
+    # /ready checks Redis AND Postgres, so "healthy" means actually serveable —
+    # and worker-fake below only starts once the gateway can register it.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
 
   # Default profile: a single fake worker statically attached to the qwen
   # queue. Use this when you want predictable behavior — no scaling.
@@ -75,7 +83,8 @@ services:
     build: ./worker-agent
     restart: unless-stopped
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
     profiles: ["default", "static"]
     environment:
       APP_ID: ${PHASE0_APP_ID:-qwen}

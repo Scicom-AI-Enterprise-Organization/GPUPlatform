@@ -798,6 +798,19 @@ def run(cfg: dict) -> None:
     model.config.forced_decoder_ids = None
     model.config.suppress_tokens = []
 
+    # SpecAugment (time/feature masking on the input mel features, training only —
+    # HF applies it in the forward when model.training and apply_spec_augment).
+    # The standard Whisper-finetune regularizer for small corpora; independent of
+    # the waveform-level augment_techniques.
+    if bool(cfg.get("spec_augment", False)):
+        model.config.apply_spec_augment = True
+        model.config.mask_time_prob = float(cfg.get("mask_time_prob", 0.05))
+        model.config.mask_time_length = int(cfg.get("mask_time_length", 10))
+        model.config.mask_feature_prob = float(cfg.get("mask_feature_prob", 0.0))
+        model.config.mask_feature_length = int(cfg.get("mask_feature_length", 10))
+        log(f"[train] SpecAugment on: mask_time_prob={model.config.mask_time_prob} "
+            f"mask_feature_prob={model.config.mask_feature_prob}")
+
     # Freeze the encoder (train decoder only) — faster + less overfitting on
     # small corpora. Independent of LoRA.
     if cfg.get("freeze_encoder"):

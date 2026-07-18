@@ -166,6 +166,11 @@ async def flusher_loop(session_maker, redis) -> None:
         try:
             await asyncio.sleep(FLUSH_INTERVAL_S)
             await flush_once(session_maker, redis)
+            try:
+                from . import metrics as _metrics
+                _metrics.loop_heartbeat("log_archive")
+            except Exception:  # noqa: BLE001 — metrics are best-effort
+                pass
         except asyncio.CancelledError:
             # Final best-effort drain so a clean shutdown doesn't lose the tail.
             try:

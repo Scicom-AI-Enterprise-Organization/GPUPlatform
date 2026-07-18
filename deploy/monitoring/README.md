@@ -1,11 +1,11 @@
-# Gateway API-layer observability (Prometheus + Loki + Grafana)
+# Gateway API-layer observability (Prometheus + Alertmanager + Loki + Grafana)
 
 A self-contained monitoring stack for the gateway API layer — the same shape as
 SlurmUI's: RED metrics, latency percentiles, by-route tables, and a **filterable
 request-log panel**. It does not depend on any cluster's Grafana.
 
 ```
-gateway /metrics             ──scrape──▶ Prometheus ──┐
+gateway /metrics             ──scrape──▶ Prometheus ──┬──▶ Alertmanager (:9093, alerts.yml rules)
 gateway JSON access log file ──tail──▶ Promtail ▶ Loki┤──▶ Grafana (GPUPlatform — API Layer)
 gateway endpoint (vLLM) log  ──tail──▶ Promtail ▶ Loki┤   ({service="vllm"})
 Redis queue:{app_id} (sampled into /metrics)─────────┘
@@ -50,6 +50,15 @@ Redis queue:{app_id} (sampled into /metrics)─────────┘
 - **Logs (Loki):** the request-log panel, filterable by the `Log status (regex)`,
   `Min latency (ms)`, `app_id`, `route`, and `method` dashboard variables. E.g. set
   Log status to `5..` to see only 5xx, or Min latency to `1000` for slow requests.
+- **Alerts:** `prometheus/alerts.yml` — gateway down, Redis unreachable
+  (`gateway_redis_up`), DB-pool saturation, stalled background loops
+  (`gateway_loop_last_tick_timestamp_seconds`), 5xx/latency, queue backlog with
+  zero workers, provision/terminate failures, autotrain run failed/stuck, and
+  LLM-proxy failure rate. Routed to **Alertmanager** at <http://localhost:9093>;
+  wire Slack/Telegram/webhook receivers in `alertmanager/alertmanager.yml` (the
+  file ships with commented examples and a no-op default so the stack boots
+  without secrets). The Helm chart mirrors these rules as a `PrometheusRule` —
+  **keep the two files in sync**.
 
 ## Fleet URLs
 

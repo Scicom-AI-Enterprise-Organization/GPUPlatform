@@ -50,6 +50,16 @@ dependencies = [
     "benchmaq @ git+https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git@main",
 ]
 
+[project.optional-dependencies]
+# Test tooling (was previously undeclared — installed by hand):
+#   uv pip install -e './gateway[dev]'
+# Unit tests (no live stack needed): pytest gateway/tests/unit
+# Integration tests (live gateway/web): see gateway/tests/conftest.py.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
 [project.scripts]
 gateway = "gateway.main:run"
 

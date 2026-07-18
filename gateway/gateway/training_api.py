@@ -2965,6 +2965,14 @@ class CreateTrainingRunRequest(BaseModel):
     # One enabled technique is picked at random per augmented sample.
     augment_techniques: list[str] = []
     augment_prob: float = 0.5
+    # ASR-only: SpecAugment — time/feature masking on the mel input features during
+    # training (HF apply_spec_augment). Complements the waveform augmentations above;
+    # the standard Whisper-finetune regularizer for small corpora.
+    spec_augment: bool = False
+    mask_time_prob: float = 0.05
+    mask_time_length: int = 10
+    mask_feature_prob: float = 0.0
+    mask_feature_length: int = 10
     # TTS-only: audio eval methods to run on the test set (cer | mos | similarity).
     eval_methods: list[str] = []
     # TTS-only: how many generated clips the heavy eval scores (per method). The
@@ -3579,17 +3587,28 @@ async def list_training_runs(
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
+    """Back-compat full list. result_json is slimmed to `best` exactly like
+    /_page (each run's steps/epochs/gpu_samples can be thousands of points —
+    shipping them for EVERY run made this the slowest list endpoint in the API,
+    ~146ms p50 at 60 runs and growing linearly). The full record still comes
+    from GET /{run_id}."""
     q = select(TrainingRun).order_by(TrainingRun.created_at.desc())
     if not (scope == "all" and user.is_admin):
         q = q.where(TrainingRun.owner_id == user.id)
     rows = (await session.execute(q)).scalars().all()
-    # owner username map
+    # owner username map — one IN query, not one session.get per owner
     names: dict[int, str] = {}
-    for row in rows:
-        if row.owner_id not in names:
-            u = await session.get(User, row.owner_id)
-            names[row.owner_id] = u.username if u else "?"
-    return [_to_record(r, names.get(r.owner_id, "?")) for r in rows]
+    if rows:
+        urows = await session.execute(
+            select(User.id, User.username).where(User.id.in_({r.owner_id for r in rows}))
+        )
+        names = {uid: uname for uid, uname in urows.all()}
+    out: list[TrainingRunRecord] = []
+    for r in rows:
+        rec = _to_record(r, names.get(r.owner_id, "?"))
+        rec.result_json = {"best": rec.result_json.get("best")} if rec.result_json else None
+        out.append(rec)
+    return out
 
 
 class TrainingRunPageResponse(BaseModel):

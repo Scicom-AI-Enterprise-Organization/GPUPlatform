@@ -64,11 +64,20 @@ async def reconciler_loop(
         try:
             await asyncio.sleep(TICK_S)
             await tick(rdb, provider, sm, provider_cache)
+            _heartbeat()
         except asyncio.CancelledError:
             logger.info("reconciler cancelled")
             raise
         except Exception:
             logger.exception("reconciler tick failed")
+
+
+def _heartbeat() -> None:
+    try:
+        from . import metrics as _metrics
+        _metrics.loop_heartbeat("reconciler")
+    except Exception:  # noqa: BLE001 — metrics are best-effort
+        pass
 
 
 async def _collect_providers(

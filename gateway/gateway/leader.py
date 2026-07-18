@@ -107,6 +107,11 @@ class LeaderCoordinator:
                         ok = await renew(keys=[LOCK_KEY], args=[self.id, TTL_MS])
                         if ok:
                             last_renew_ok = time.monotonic()
+                            try:
+                                from . import metrics as _metrics
+                                _metrics.loop_heartbeat("leader")
+                            except Exception:  # noqa: BLE001 — metrics are best-effort
+                                pass
                         else:
                             logger.warning("leader: lost lock (renew rejected) — resigning, stopping workload")
                             await self._release_workload()
