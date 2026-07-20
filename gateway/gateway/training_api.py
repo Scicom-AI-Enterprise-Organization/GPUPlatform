@@ -4325,6 +4325,12 @@ class HfExportRequest(BaseModel):
     repo: str
     storage_id: Optional[str] = None   # a kind=huggingface Storage (provides token + custom endpoint)
     private: bool = False
+    # Push a SPECIFIC sweep trial instead of the run's stored "best" artifact. The sweep
+    # orchestrator ranks trials by sweep_metric (loss for TTS/LLM) — for TTS that doesn't
+    # track the metrics that actually matter (CER/MOS/speaker similarity), so the
+    # loss-ranked "best" is often not the trial you actually want to publish. Looked up
+    # from this run's own result_json.trials; 400s if the trial doesn't exist or didn't finish.
+    source_trial: Optional[int] = None
     # HF token for downloading a GATED BASE MODEL during an LLM merge (e.g. google/gemma-*),
     # mirrors serverless/new. This is NOT the destination/push token — that comes from the
     # storage (or platform HF_TOKEN). A pasted token or a referenced global-secret key;
@@ -4379,7 +4385,19 @@ async def export_to_huggingface(
     row = await _owned(run_id, user, session)
     if row.status != "done":
         raise HTTPException(status_code=400, detail="the run must finish successfully first")
-    model_s3 = (((row.result_json or {}).get("artifact") or {}).get("s3_uri"))
+    if body.source_trial is not None:
+        trials = ((row.result_json or {}).get("trials")) or []
+        trial = next((t for t in trials if t.get("trial") == body.source_trial), None)
+        if trial is None:
+            raise HTTPException(status_code=400, detail=f"trial {body.source_trial} not found on this run")
+        if trial.get("status") != "done":
+            raise HTTPException(status_code=400,
+                                 detail=f"trial {body.source_trial} status is {trial.get('status')!r}, not done")
+        model_s3 = ((trial.get("artifact") or {}).get("s3_uri"))
+        if not model_s3:
+            raise HTTPException(status_code=400, detail=f"trial {body.source_trial} has no model artifact")
+    else:
+        model_s3 = (((row.result_json or {}).get("artifact") or {}).get("s3_uri"))
     if not model_s3:
         raise HTTPException(status_code=400, detail="no trained model artifact for this run")
     repo = (body.repo or "").strip()
