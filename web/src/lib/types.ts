@@ -1101,6 +1101,7 @@ export type TransformDatasetRequest = {
   test_split_count?: number | null; // hold out this many rows as a `test` split (overrides pct)
   test_min_chars?: number | null; // min transcription length (chars) to be eligible for the test split; short/junk transcripts stay in train
   test_exclude_regex?: string | null; // regex; transcripts matching it (re.search) are excluded from the test split (kept in train)
+  test_split_per_speaker?: boolean; // TTS: draw the held-out subset per speaker (pct/count becomes a per-speaker size); needs a speaker column
   test_split_ref_dataset_id?: string | null; // reuse this dataset's exact test set (matched by audio); mutually exclusive with pct/count
 };
 

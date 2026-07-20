@@ -123,8 +123,14 @@ def run(cfg: dict) -> None:
                 # real bool, else the string "off" is truthy and freezes anyway.
                 if "freeze_encoder" in tcfg:
                     tcfg["freeze_encoder"] = str(tcfg["freeze_encoder"]).lower() in ("on", "true", "1", "yes")
-                # Sweeping a LoRA knob (r/alpha) implies LoRA is on for those trials.
-                if ("lora_r" in tcfg or "lora_alpha" in tcfg) and not tcfg.get("use_lora"):
+                # use_lora may likewise arrive as an on/off sweep value (comparing
+                # LoRA vs full finetune) — coerce to a real bool same as freeze_encoder.
+                if "use_lora" in tcfg:
+                    tcfg["use_lora"] = str(tcfg["use_lora"]).lower() in ("on", "true", "1", "yes")
+                # Sweeping a LoRA knob (r/alpha) implies LoRA is on for those trials —
+                # UNLESS use_lora is itself an explicit sweep dimension for this trial
+                # (e.g. comparing LoRA vs full FT), in which case its "off" arm must stay off.
+                if ("lora_r" in tcfg or "lora_alpha" in tcfg) and "use_lora" not in params and not tcfg.get("use_lora"):
                     tcfg["use_lora"] = True
                 tcfg["work_dir"] = os.path.join(work, f"trial{i}")
                 tcfg["run_name"] = f"{cfg.get('run_name', 'run')}-t{i}"

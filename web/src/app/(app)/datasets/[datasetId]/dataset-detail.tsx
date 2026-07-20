@@ -246,6 +246,7 @@ export function DatasetDetail({
                 hfRepo={dataset.hf_repo ?? null}
                 messagesField={dataset.messages_field ?? null}
                 rejectedField={dataset.rejected_field ?? null}
+                speakerField={dataset.speaker_field ?? null}
                 s3Storages={s3Storages}
                 initialStatus={dataset.transform_status ?? null}
                 initialLog={dataset.transform_log ?? null}

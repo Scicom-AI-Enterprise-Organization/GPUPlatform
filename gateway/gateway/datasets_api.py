@@ -150,6 +150,11 @@ class TransformRequest(BaseModel):
     # test split (kept in train). E.g. r"^\s*\[.*\]\s*$" drops bracketed placeholder
     # tags like "[silent]" / "[unintelligible]". None/blank = no exclusion.
     test_exclude_regex: Optional[str] = None
+    # TTS: draw the held-out subset PER SPEAKER (grouped by the dataset's
+    # speaker_field) so every speaker is represented in `test` and the pct/count is
+    # a per-speaker size, not a global one. Requires the dataset to have a
+    # speaker_field; combine with test_split_pct OR test_split_count.
+    test_split_per_speaker: bool = False
     # Reuse ANOTHER dataset's exact test set instead of carving a random one: the
     # rows whose audio matches that dataset's `test` split become `test` here, and
     # everything else becomes `train`. Guarantees no train/test overlap when this
@@ -2907,6 +2912,11 @@ async def transform_dataset(
         raise HTTPException(status_code=400, detail="test_split_count must be ≥ 0")
     if req.test_min_chars is not None and req.test_min_chars < 0:
         raise HTTPException(status_code=400, detail="test_min_chars must be ≥ 0")
+    if req.test_split_per_speaker:
+        if req.test_split_pct is None and req.test_split_count is None:
+            raise HTTPException(status_code=400, detail="test_split_per_speaker needs a test_split_pct or test_split_count")
+        if not (getattr(d, "speaker_field", None) or "").strip():
+            raise HTTPException(status_code=400, detail="test_split_per_speaker needs a speaker column mapped on the dataset")
     if (req.test_exclude_regex or "").strip():
         import re as _re
         try:
@@ -2934,6 +2944,7 @@ async def transform_dataset(
         test_min_chars=req.test_min_chars,
         test_exclude_regex=(req.test_exclude_regex or "").strip() or None,
         test_split_ref_keys=ref_keys,
+        test_split_per_speaker=req.test_split_per_speaker,
     )
     await audit_module.record(user, "dataset.transform", "dataset", dataset_id, d.name, details={"target": req.target})
     await session.refresh(d)

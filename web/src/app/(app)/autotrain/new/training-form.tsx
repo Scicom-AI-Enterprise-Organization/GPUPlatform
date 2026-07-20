@@ -392,6 +392,8 @@ export function TrainingForm() {
   const [sweepAugment, setSweepAugment] = useState(false);
   // compare freeze-encoder on/off as a sweep dimension.
   const [sweepFreeze, setSweepFreeze] = useState(false);
+  // compare LoRA vs full finetune as a sweep dimension (ASR/TTS — LLM is always LoRA).
+  const [sweepUseLora, setSweepUseLora] = useState(false);
   // run on (pod card — mirrors benchmark/new)
   const [target, setTarget] = useState<"cloud" | "vm">("cloud");
   const [providerId, setProviderId] = useState(""); // vm provider
@@ -585,6 +587,7 @@ export function TrainingForm() {
           setSweepPrecisions(arr(sweep.precision).map(String));
           setSweepAugment(arr(sweep.augment).length > 0);
           setSweepFreeze(arr(sweep.freeze_encoder).length > 0);
+          setSweepUseLora(arr(sweep.use_lora).length > 0);
         }
         // augmentation
         if (Array.isArray(c.augment_techniques)) setAugmentTechniques(arr(c.augment_techniques).map(String));
@@ -820,6 +823,47 @@ export function TrainingForm() {
     }
   }
 
+  // Autofill a sweep grid centered on the known-best whisper recipe from the
+  // asr-merged-v2-clean400 campaign (whisper-turbo-sweep-and-path-to-10pct-wer.md):
+  // the regularization matrix found LoRA r64 @ lr 2e-4 beating full finetune by
+  // ~5 WER (22.97 vs 28.01), with augmentation on. Rather than just replaying that
+  // one config, this sweeps a small grid around it — lr × LoRA-vs-full-finetune —
+  // so the user re-searches this neighborhood on their own dataset instead of
+  // trusting numbers measured on someone else's 400-clip test set. Only
+  // hyperparameters are touched; dataset/GPU/storage/provider stay whatever the
+  // user already picked.
+  function applyBestWhisperSweep() {
+    setModelChoice("openai/whisper-large-v3");
+    setCustomModel("");
+    setSweepOn(true);
+    setEvalMetric("wer");
+    setNormalizeText(true);
+    setDurationMode("epochs");
+    setSweepEpochs("8");
+    setPatience(3);
+    setEvalStrategy("epoch");
+    setBatchSize(8);
+    setGradAccum(8);
+    // Brackets the campaign's two regimes: ~5e-5 was the full-FT optimum, 2e-4 the
+    // LoRA optimum — the middle value covers ground between them.
+    setSweepLr("5e-5, 1e-4, 2e-4");
+    setLrScheduler("linear");
+    setWarmupSteps(100);
+    setWeightDecay(0.01);
+    setLoggingSteps(10);
+    setUseLora(true);
+    setSweepUseLora(true);
+    setSweepLoraR("");
+    setLoraR(64);
+    setLoraAlphaRatio(2);
+    setFreezeEncoder(false);
+    setSweepFreeze(false);
+    setAugmentTechniques(["telephone", "noise", "gain", "speed"]);
+    setAugmentProb(0.5);
+    setSweepAugment(false);
+    setLanguage("");
+    setGpusPerTrial(1);
+  }
 
   function buildSweep(): Record<string, (number | string)[]> {
     const s: Record<string, (number | string)[]> = {};
@@ -847,6 +891,8 @@ export function TrainingForm() {
     if (sweepAugment && augmentTechniques.length) s.augment = ["on", "off"];
     // Freeze-encoder vs full as a sweep dimension (ASR only).
     if (sweepFreeze && !isTts) s.freeze_encoder = ["on", "off"];
+    // LoRA vs full finetune as a sweep dimension (ASR/TTS — LLM is always LoRA).
+    if (sweepUseLora && !isLlm) s.use_lora = ["on", "off"];
     return s;
   }
   const sweepGrid = sweepOn ? buildSweep() : {};
@@ -961,7 +1007,7 @@ export function TrainingForm() {
       warmup_steps: warmupSteps,
       lr_scheduler_type: lrScheduler,
       // LLM finetune is always LoRA; for ASR/TTS it follows the toggle (or a sweep).
-      use_lora: isLlm || useLora || (sweepOn && sweepLoraR.trim() !== ""),
+      use_lora: isLlm || useLora || (sweepOn && (sweepLoraR.trim() !== "" || sweepUseLora)),
       lora_r: loraR,
       lora_alpha_ratio: loraAlphaRatio,
       lora_dropout: loraDropout,
@@ -1533,6 +1579,13 @@ export function TrainingForm() {
               {trialCount} trial{trialCount === 1 ? "" : "s"}
             </span>
           )}
+          {taskType === "asr" && (
+            <Button type="button" variant="outline" size="sm" onClick={applyBestWhisperSweep}
+              className="ml-auto gap-1.5 text-xs" title="Autofills a sweep around the best whisper recipe found in the asr-merged-v2-clean400 campaign: LoRA r64 @ lr 2e-4 (WER 22.97), swept against a lr grid and full finetune.">
+              <FlaskConical className="h-3.5 w-3.5" />
+              Best sweep (whisper-large-v3, LoRA vs full-FT)
+            </Button>
+          )}
         </div>
 
         <Grid>
@@ -1747,7 +1800,8 @@ export function TrainingForm() {
           </div>
         </div>
 
-        {/* LoRA — always-on for LLM (gemma4); a toggle for ASR/TTS. Freeze-encoder ASR-only. */}
+        {/* LoRA — always-on for LLM (gemma4); a toggle for ASR/TTS, or a sweep dimension
+            comparing LoRA vs full finetune. Freeze-encoder ASR-only. */}
         <div className="mt-4 space-y-3 border-t border-border pt-4">
           <div className="flex flex-wrap items-center gap-x-8 gap-y-2">
             {isLlm ? (
@@ -1755,11 +1809,26 @@ export function TrainingForm() {
                 <span className="ml-2 text-xs font-normal text-muted-foreground">always on for LLM finetune (gemma-4 FSDP2 adapters, merged at save)</span>
               </span>
             ) : (
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input type="checkbox" checked={useLora} onChange={(e) => setUseLora(e.target.checked)}
+              <label className={cn("flex items-center gap-2 text-sm", sweepUseLora && sweepOn ? "opacity-50" : "cursor-pointer")}>
+                <input type="checkbox" checked={useLora} disabled={sweepUseLora && sweepOn}
+                  onChange={(e) => setUseLora(e.target.checked)}
                   className="h-4 w-4 accent-primary" />
                 <span className="font-medium">Use LoRA</span>
-                <span className="text-xs text-muted-foreground">adapters on all linear layers, merged into the base at save</span>
+                <span className="text-xs text-muted-foreground">
+                  {sweepOn
+                    ? "baseline for trials — ignored once “Sweep LoRA vs full finetune” below is on"
+                    : "adapters on all linear layers, merged into the base at save"}
+                </span>
+              </label>
+            )}
+            {!isLlm && sweepOn && (
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={sweepUseLora} onChange={(e) => setSweepUseLora(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span className="font-medium">Sweep LoRA vs full finetune</span>
+                <span className="text-xs text-muted-foreground">
+                  compare adapters vs full FT (×2 trials){taskType === "asr" ? " — LoRA won by ~5 WER in the whisper campaign sweep" : ""}
+                </span>
               </label>
             )}
             {taskType === "asr" && (sweepOn ? (
@@ -1778,7 +1847,7 @@ export function TrainingForm() {
               </label>
             ))}
           </div>
-          {(useLora || isLlm) && (
+          {(useLora || sweepUseLora || isLlm) && (
             <div className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-3">
               {sweepOn ? (
                 <FieldWrap label="LoRA r" hint="e.g. 8, 16, 32">

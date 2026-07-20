@@ -3229,6 +3229,9 @@ def _validate_sweep(sweep: dict) -> None:
     for v in (sweep.get("freeze_encoder") or []):
         if str(v).lower() not in ("on", "off", "true", "false", "1", "0", "yes", "no"):
             raise HTTPException(status_code=400, detail=f"sweep freeze_encoder: {v!r} must be on/off")
+    for v in (sweep.get("use_lora") or []):
+        if str(v).lower() not in ("on", "off", "true", "false", "1", "0", "yes", "no"):
+            raise HTTPException(status_code=400, detail=f"sweep use_lora: {v!r} must be on/off")
 
 
 @router.post("", response_model=TrainingRunRecord)

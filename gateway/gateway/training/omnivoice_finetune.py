@@ -1,10 +1,13 @@
 """Autotrain orchestrator for an OmniVoice (k2-fsa/OmniVoice) TTS finetune.
 
-Sibling of `tts_finetune.py`, but a fundamentally different TTS stack: a FULL
-finetune of OmniVoice (Qwen3-0.6B diffusion LM) via OmniVoice's OWN pipeline
-(`accelerate -m omnivoice.cli.train`), with Higgs-codec audio tokens packed as
-WebDataset shards (NOT NeuCodec → ChiniDataset). The standalone authority is
-`autotrain/omnivoice/` — the vendored `omnivoice/` dir here mirrors its scripts.
+Sibling of `tts_finetune.py`, but a fundamentally different TTS stack: OmniVoice
+(Qwen3-0.6B diffusion LM) finetuned via OmniVoice's OWN pipeline
+(`accelerate -m omnivoice.cli.train`, full finetune — or the vendored
+`omnivoice/lora_train.py` when `use_lora` is set, which wraps the Qwen3 backbone
+in a peft LoRA adapter and merges it back into a plain checkpoint at the end),
+with Higgs-codec audio tokens packed as WebDataset shards (NOT NeuCodec →
+ChiniDataset). The standalone authority is `autotrain/omnivoice/` — the
+vendored `omnivoice/` dir here mirrors its scripts.
 
 Two modes (same `--config` contract + `@@…` log protocol the gateway parses):
   • pack-only  → resolve the audio dataset, build OmniVoice manifests, Higgs-
@@ -143,7 +146,7 @@ def _ensure_venv(cfg: dict) -> str:
 
     def _present() -> bool:
         try:
-            subprocess.check_call([py, "-c", "import omnivoice, torch, jiwer, utmosv2, webdataset"],
+            subprocess.check_call([py, "-c", "import omnivoice, torch, jiwer, utmosv2, webdataset, peft"],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except Exception:
@@ -190,8 +193,9 @@ def _ensure_venv(cfg: dict) -> str:
     _pip("-e", src, "numba>=0.59", "numpy<2.3")
     _pip("git+https://github.com/Scicom-AI-Enterprise-Organization/faster-UTMOSv2")
     _pip("jiwer", "webdataset", "hf_transfer", "huggingface_hub[cli]", "pyarrow",
-         "boto3", "soundfile", "librosa", "datasets")
-    subprocess.check_call([py, "-c", "import omnivoice, jiwer, utmosv2; print('omnivoice import OK')"], env=env)
+         "boto3", "soundfile", "librosa", "datasets",
+         "peft>=0.11")  # LoRA on the llm backbone (lora_train.py) — merged into base at save
+    subprocess.check_call([py, "-c", "import omnivoice, jiwer, utmosv2, peft; print('omnivoice import OK')"], env=env)
     log(f"[deps] OmniVoice venv ready: {py}")
     return py
 
@@ -566,10 +570,28 @@ def run(cfg: dict) -> None:
     exp_dir = os.path.join(work, "exp")
     os.makedirs(exp_dir, exist_ok=True)
     # `accelerate launch …` via the venv python (== python -m accelerate.commands.launch)
-    # so the launched omnivoice.cli.train runs under the venv interpreter.
+    # so the launched trainer runs under the venv interpreter. `use_lora` swaps
+    # `-m omnivoice.cli.train` for the vendored lora_train.py (same build_model_and_
+    # tokenizer/OmniTrainer calls, plus a peft wrap on model.llm + a merge-back-to-
+    # plain-checkpoint step at the end) — everything downstream (checkpoint-N naming,
+    # @@STEP parsing, make_clean_checkpoint.py) is unchanged either way.
+    lora_args: list[str] = []
+    if cfg.get("use_lora"):
+        _r = int(cfg.get("lora_r", 16))
+        _ratio = cfg.get("lora_alpha_ratio")
+        _alpha = int(round(_r * float(_ratio))) if _ratio is not None else int(cfg.get("lora_alpha", 32))
+        _dropout = float(cfg.get("lora_dropout", 0.05))
+        lora_args = ["--lora_r", str(_r), "--lora_alpha", str(_alpha),
+                     "--lora_dropout", str(_dropout), "--lora_target_modules", "all-linear"]
+        log(f"[train] LoRA enabled (r={_r}, alpha={_alpha}, dropout={_dropout}) — adapting the "
+            f"Qwen3 backbone only; audio_embeddings/audio_heads stay fully trainable, merged into "
+            f"a plain checkpoint at save (see lora_train.py)")
+        trainer_entry = [os.path.join(OMNI_DIR, "lora_train.py")]
+    else:
+        trainer_entry = ["-m", "omnivoice.cli.train"]
     cmd = [py, "-m", "accelerate.commands.launch", "--gpu_ids", "0", "--num_processes", "1",
-           "-m", "omnivoice.cli.train", "--train_config", train_cfg,
-           "--data_config", data_cfg, "--output_dir", exp_dir]
+           *trainer_entry, "--train_config", train_cfg,
+           "--data_config", data_cfg, "--output_dir", exp_dir, *lora_args]
     log(f"[gateway] $ {' '.join(cmd)}")
     p = subprocess.Popen(cmd, cwd=work, env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, bufsize=1)

@@ -600,7 +600,13 @@ def run(cfg: dict) -> None:
         _r = int(cfg.get("lora_r", 16))
         _ratio = cfg.get("lora_alpha_ratio")
         _alpha = int(round(_r * float(_ratio))) if _ratio is not None else int(cfg.get("lora_alpha", 32))
-        _tgt = str(cfg.get("lora_target_modules") or "all-linear")
+        # Always "all-linear" — the TTS form never exposes a target-module picker (that's
+        # LLM-only UI), so cfg["lora_target_modules"] is really the LLM field's default
+        # list ["q_proj", …] passed through unconditionally by the form. str()-ing that
+        # list here would send qwen3_tts_flash.py the Python repr "['q_proj', …]", which
+        # its `tgt.split(",")` turns into bracket/quote-mangled non-module names — peft
+        # then raises "Target modules … not found in the base model" on every TTS LoRA run.
+        _tgt = "all-linear"
         lora_args = [
             "--use_lora", "true",
             "--lora_r", str(_r),

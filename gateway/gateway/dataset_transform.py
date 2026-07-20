@@ -97,6 +97,7 @@ async def start_transform(
     test_min_chars: Optional[int] = None,
     test_exclude_regex: Optional[str] = None,
     test_split_ref_keys: Optional[list[str]] = None,
+    test_split_per_speaker: bool = False,
 ) -> None:
     """Mark the dataset running and kick off the background job."""
     async with session_factory()() as s:
@@ -111,6 +112,7 @@ async def start_transform(
         test_split_pct=test_split_pct, test_split_count=test_split_count,
         test_min_chars=test_min_chars, test_exclude_regex=test_exclude_regex,
         test_split_ref_keys=test_split_ref_keys,
+        test_split_per_speaker=test_split_per_speaker,
     ))
     _active[dataset_id] = task
     task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
@@ -260,6 +262,7 @@ async def _run(
     test_min_chars: Optional[int] = None,
     test_exclude_regex: Optional[str] = None,
     test_split_ref_keys: Optional[list[str]] = None,
+    test_split_per_speaker: bool = False,
 ) -> None:
     from fastapi.concurrency import run_in_threadpool
     from sqlalchemy import select
@@ -284,8 +287,16 @@ async def _run(
             src_repo = d.hf_repo
             src_revision = d.hf_revision  # commit/branch/tag to fetch (None → default)
             audio_field, transcription_field = d.audio_field, d.transcription_field
+            speaker_field = d.speaker_field  # TTS speaker column (for per-speaker test splits)
             split_fields = dict(d.split_fields or {})  # {split: transcription_column}
-            hf_store = (
+            # HF token + endpoint: prefer the dataset's OWN storage when it's a
+            # huggingface backend, else fall back to any configured huggingface
+            # storage (mirrors _run_llm_pack). Using the dataset's own storage is
+            # load-bearing: the mirror storage carries endpoint=<gw>/hf, which 404s
+            # a repo that actually lives on public huggingface.co (the source repo's
+            # storage has no endpoint → public HF).
+            own = await s.get(Storage, d.storage_id) if d.storage_id else None
+            hf_store = own if (own and own.kind == "huggingface") else (
                 await s.execute(select(Storage).where(Storage.kind == "huggingface").limit(1))
             ).scalars().first()
             token = await _hf_token(hf_store, s)
@@ -366,6 +377,7 @@ async def _run(
             pairs, n_test = _apply_test_split(
                 pairs, test_split_pct, test_split_count,
                 min_chars=int(test_min_chars or 0), exclude_regex=(test_exclude_regex or None),
+                per_speaker=test_split_per_speaker, speaker_field=speaker_field,
             )
             _filters = []
             if test_min_chars:
@@ -373,9 +385,10 @@ async def _run(
             if test_exclude_regex:
                 _filters.append(f"excl /{test_exclude_regex}/")
             _f = f" (test eligibility: {', '.join(_filters)})" if _filters else ""
+            _per = f" · per speaker ({speaker_field or 'speaker'})" if test_split_per_speaker else ""
             await _log(
                 dataset_id,
-                f"test split → {n_test} test / {len(pairs) - n_test} train rows{_f}",
+                f"test split → {n_test} test / {len(pairs) - n_test} train rows{_per}{_f}",
             )
 
         # Non-destructive: build the output, then create a NEW "-audio" dataset
@@ -1933,6 +1946,8 @@ def _apply_test_split(
     seed: int = 42,
     min_chars: int = 0,
     exclude_regex: Optional[str] = None,
+    per_speaker: bool = False,
+    speaker_field: Optional[str] = None,
 ) -> tuple[list[tuple[str, str, str, dict]], int]:
     """Reassign each pair's split to `train`/`test`, carving out a random held-out
     subset (collapsing any source splits). `count` (absolute) wins over `pct`
@@ -1941,7 +1956,12 @@ def _apply_test_split(
     match `exclude_regex` (a Python regex, `re.search`). So junk/placeholder
     transcripts (e.g. `[silent]`, `[unintelligible]`, matched by `^\\s*\\[.*\\]\\s*$`)
     stay in train instead of polluting eval; ineligible rows are never chosen as
-    test. Deterministic for a given `seed`. Returns (pairs, n_test)."""
+    test. Deterministic for a given `seed`.
+
+    `per_speaker` (TTS): draw the held-out subset SEPARATELY within each speaker's
+    rows (grouped by the row's `speaker_field` value in `extra`, blank/missing → one
+    `""` group), so `count`/`pct` becomes a PER-SPEAKER size and every speaker is
+    represented in `test`. Returns (pairs, n_test)."""
     import random
     import re
 
@@ -1957,24 +1977,45 @@ def _apply_test_split(
             return False
         return True
 
-    # Indices eligible to become test (mc=0 + no regex → all rows).
-    eligible = [i for i, (_s, _p, text, _e) in enumerate(pairs) if _eligible(text)]
-    if count is not None:
-        k = count
-    elif pct is not None:
-        k = round(n * pct / 100.0)
-    else:
+    if count is None and pct is None:
         return pairs, 0
-    # Can't hold out more than the eligible pool (short transcripts stay in train).
-    k = max(0, min(k, len(eligible)))
-    if k == 0:
+
+    def _pick(pool: list[int], total: int, rng: random.Random) -> set[int]:
+        """Choose ≤ len(pool) held-out indices from `pool` — `count` rows, else
+        `pct`% of `total`. `total` is the group size the pct is measured against."""
+        k = count if count is not None else round(total * (pct or 0) / 100.0)
+        k = max(0, min(int(k), len(pool)))
+        if k == 0:
+            return set()
+        shuffled = list(pool)
+        rng.shuffle(shuffled)
+        return set(shuffled[:k])
+
+    rng = random.Random(seed)
+    test_idx: set[int] = set()
+    if per_speaker:
+        # Group eligible rows by speaker, then hold out `count`/`pct` within each.
+        groups: dict[str, list[int]] = {}
+        for i, (_s, _p, text, extra) in enumerate(pairs):
+            if not _eligible(text):
+                continue
+            spk = ""
+            if speaker_field:
+                spk = str(extra.get(speaker_field) or "").strip()
+            groups.setdefault(spk, []).append(i)
+        for spk in sorted(groups):
+            test_idx |= _pick(groups[spk], len(groups[spk]), rng)
+    else:
+        # Indices eligible to become test (mc=0 + no regex → all rows).
+        eligible = [i for i, (_s, _p, text, _e) in enumerate(pairs) if _eligible(text)]
+        test_idx = _pick(eligible, n, rng)
+
+    if not test_idx:
         return [("train", path, text, extra) for _split, path, text, extra in pairs], 0
-    random.Random(seed).shuffle(eligible)
-    test_idx = set(eligible[:k])
     return [
         ("test" if i in test_idx else "train", path, text, extra)
         for i, (_split, path, text, extra) in enumerate(pairs)
-    ], k
+    ], len(test_idx)
 
 
 def _pair_stem(src) -> str:

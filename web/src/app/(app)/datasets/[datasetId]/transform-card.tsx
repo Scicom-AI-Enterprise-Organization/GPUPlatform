@@ -36,6 +36,7 @@ export function TransformCard({
   datasetId,
   kind,
   hfRepo,
+  speakerField,
   s3Storages,
   initialStatus,
   initialLog,
@@ -44,6 +45,7 @@ export function TransformCard({
   datasetId: string;
   kind: DatasetKind;
   hfRepo: string | null;
+  speakerField?: string | null;
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
@@ -58,6 +60,10 @@ export function TransformCard({
   const [testSplitOn, setTestSplitOn] = useState(false);
   const [testSplitMode, setTestSplitMode] = useState<"pct" | "count" | "ref">("pct");
   const [testSplitValue, setTestSplitValue] = useState("10");
+  // TTS: hold out the pct/count within each unique speaker (so every speaker is in
+  // test). Only meaningful when the dataset has a speaker column mapped.
+  const hasSpeaker = !!(speakerField && speakerField.trim());
+  const [testPerSpeaker, setTestPerSpeaker] = useState(false);
   // "From dataset" mode: reuse another dataset's exact test set (no overlap when
   // this dataset is a superset of it). The candidate list is fetched client-side.
   const [refDatasetId, setRefDatasetId] = useState("");
@@ -139,7 +145,7 @@ export function TransformCard({
     }
     let testSplit: Pick<
       TransformDatasetRequest,
-      "test_split_pct" | "test_split_count" | "test_min_chars" | "test_exclude_regex" | "test_split_ref_dataset_id"
+      "test_split_pct" | "test_split_count" | "test_min_chars" | "test_exclude_regex" | "test_split_ref_dataset_id" | "test_split_per_speaker"
     > = {};
     if (testSplitOn && testSplitMode === "ref") {
       if (!refDatasetId) {
@@ -177,6 +183,7 @@ export function TransformCard({
         }
         testSplit.test_exclude_regex = testExcludeRegex.trim();
       }
+      if (hasSpeaker && testPerSpeaker) testSplit.test_split_per_speaker = true;
     }
     setStarting(true);
     try {
@@ -370,14 +377,38 @@ export function TransformCard({
                       className="h-8 w-24 text-xs"
                     />
                     <span className="text-xs text-muted-foreground">
-                      {testSplitMode === "pct" ? "% of rows" : "rows"}
+                      {testSplitMode === "pct" ? (testPerSpeaker ? "% per speaker" : "% of rows") : (testPerSpeaker ? "rows / speaker" : "rows")}
                     </span>
                   </div>
+                  {hasSpeaker && (
+                    <label className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-primary"
+                        checked={testPerSpeaker}
+                        onChange={(e) => setTestPerSpeaker(e.target.checked)}
+                        disabled={running}
+                      />
+                      Per speaker (hold out from each{" "}
+                      <span className="font-mono">{speakerField}</span>)
+                    </label>
+                  )}
                   <p className="text-xs text-muted-foreground">
-                    Randomly holds out{" "}
-                    {testSplitMode === "pct" ? `${testSplitValue || "0"}%` : `${testSplitValue || "0"} row(s)`} as a{" "}
-                    <span className="font-mono">test</span> split; the rest become{" "}
-                    <span className="font-mono">train</span>. Any source splits are collapsed.
+                    {testPerSpeaker ? (
+                      <>
+                        Within each unique <span className="font-mono">{speakerField}</span>, holds out{" "}
+                        {testSplitMode === "pct" ? `${testSplitValue || "0"}% of that speaker's rows` : `${testSplitValue || "0"} row(s)`} as{" "}
+                        <span className="font-mono">test</span>; the rest become{" "}
+                        <span className="font-mono">train</span>. Every speaker is represented in the test set.
+                      </>
+                    ) : (
+                      <>
+                        Randomly holds out{" "}
+                        {testSplitMode === "pct" ? `${testSplitValue || "0"}%` : `${testSplitValue || "0"} row(s)`} as a{" "}
+                        <span className="font-mono">test</span> split; the rest become{" "}
+                        <span className="font-mono">train</span>. Any source splits are collapsed.
+                      </>
+                    )}
                   </p>
                   <div className="flex items-center gap-2 pt-1">
                     <label className="text-xs text-muted-foreground">Min transcription length</label>
