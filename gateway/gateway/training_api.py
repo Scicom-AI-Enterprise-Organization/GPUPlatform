@@ -2735,6 +2735,22 @@ async def cleanup_orphaned_running(redis) -> int:
         )).scalars().all()
     n = 0
     for row in rows:
+        # A multi-node sweep PARENT has no provider_id of its own (each trial has
+        # its own) — _reconcile_orphan would just no-op "can't reach the box" on it
+        # forever. Its dispatcher is a plain in-process asyncio task (unlike a
+        # single run, which the generic SSH-reconcile below can finalize-from-log),
+        # so a restart kills it outright while the already-dispatched trials keep
+        # training untouched (each IS a normal single run, reconciled below like
+        # any other). Route it to run_multi_node_sweep(resume=True) instead, which
+        # re-adopts result_json["trials"] rather than resetting/double-dispatching.
+        if row.status == "running" and (row.config_json or {}).get("nodes"):
+            if row.id not in _active_runners:
+                t = asyncio.create_task(_safe_run_multi_node(redis, row.id, resume=True))
+                _active_runners[row.id] = t
+                t.add_done_callback(
+                    lambda _t, rid=row.id: (_active_runners.pop(rid, None)
+                                            if _active_runners.get(rid) is _t else None))
+            continue
         # Queued rows never launched a detached process → re-run them (a restart
         # mid-queue shouldn't drop the run). _redispatch_run is bounded + VM-only.
         if row.status == "queued":
@@ -3661,9 +3677,9 @@ async def _validate_and_resolve_nodes(nodes: list[NodeSpec], user: User,
     return resolved
 
 
-async def _safe_run_multi_node(redis, run_id: str) -> None:
+async def _safe_run_multi_node(redis, run_id: str, *, resume: bool = False) -> None:
     try:
-        await run_multi_node_sweep(redis, run_id)
+        await run_multi_node_sweep(redis, run_id, resume=resume)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -3671,21 +3687,34 @@ async def _safe_run_multi_node(redis, run_id: str) -> None:
         await _finalize(run_id, "failed", None, "internal error — see gateway logs")
 
 
-async def run_multi_node_sweep(redis, run_id: str) -> None:
+async def run_multi_node_sweep(redis, run_id: str, *, resume: bool = False) -> None:
     """Dispatcher for a multi-node sweep TrainingRun: fans the sweep grid out across
     `cfg["nodes"]`, one real independent TrainingRun (via _create_and_launch_run) per
     trial, written into THIS row's result_json in the same {"trials": […], "best": …}
     shape sweep_runner.py produces (so hf-export?source_trial=N, listings, etc. all
     treat this exactly like an ASR/TTS/single-box-LLM sweep). NOT cross-host
-    distributed training — each trial is single-node, on whichever node picks it up."""
+    distributed training — each trial is single-node, on whichever node picks it up.
+
+    `resume=True` (set by `_resume_orphaned_sweeps` on gateway startup): unlike a
+    single-run TrainingRun, this dispatcher lives ONLY as an in-process asyncio task
+    — a gateway restart kills it outright while the already-dispatched trials (each
+    a normal detached TrainingRun) keep training untouched, and the generic
+    `_reconcile_orphan` re-attaches THEIR live log streaming fine (they have a real
+    provider_id). But nothing was left polling/merging their metrics into the
+    parent, dispatching any still-pending trial once a slot frees, or ever finalizing
+    the sweep — it just sits at status=running with a permanently frozen loss curve.
+    Resuming re-adopts whatever's already in `result_json["trials"]` instead of
+    resetting every trial back to "pending" and double-dispatching fresh children."""
     async with session_factory()() as s:
         row = await s.get(TrainingRun, run_id)
         if row is None:
             return
         cfg = row.config_json or {}
         owner_id = row.owner_id
-        row.status = "running"
-        row.started_at = datetime.now(timezone.utc)
+        existing_trials = list((row.result_json or {}).get("trials") or []) if resume else []
+        if not resume:
+            row.status = "running"
+            row.started_at = datetime.now(timezone.utc)
         await s.commit()
 
     req_dict = cfg.get("_multi_node_request") or {}
@@ -3709,13 +3738,19 @@ async def run_multi_node_sweep(redis, run_id: str) -> None:
                          f"no node offers >= {gpus_per_trial} GPU(s) per trial (gpus_per_trial)")
         return
 
-    await _push_log(redis, run_id,
-                     f"[sweep] {len(combos)} trial(s) · {len(slots)} slot(s) across {len(nodes)} node(s) "
-                     f"· {gpus_per_trial} GPU/trial · rank by {sweep_metric} (asc)")
-
-    trials = [{"trial": i, "params": c, "node": None, "run_id": None,
-               "status": "pending", "metric": None, "artifact": None}
-              for i, c in enumerate(combos)]
+    if resume and len(existing_trials) == len(combos):
+        trials = existing_trials
+        await _push_log(redis, run_id,
+                         f"[sweep] resuming after a gateway restart · "
+                         f"{sum(1 for t in trials if t.get('status') == 'running')} trial(s) still in flight, "
+                         f"{sum(1 for t in trials if t.get('status') == 'pending')} pending")
+    else:
+        trials = [{"trial": i, "params": c, "node": None, "run_id": None,
+                   "status": "pending", "metric": None, "artifact": None}
+                  for i, c in enumerate(combos)]
+        await _push_log(redis, run_id,
+                         f"[sweep] {len(combos)} trial(s) · {len(slots)} slot(s) across {len(nodes)} node(s) "
+                         f"· {gpus_per_trial} GPU/trial · rank by {sweep_metric} (asc)")
     # Each child already runs its own gpu_sampler + @@STEP log parser (it's a normal
     # single run under the hood) — no separate SSH polling needed here. We just pull
     # its result_json.steps/gpu_samples on the same poll cadence, tag them by trial
@@ -3735,6 +3770,10 @@ async def run_multi_node_sweep(redis, run_id: str) -> None:
         await _flush_result(run_id, {
             "trials": trials, "best": None,
             "steps": _merged_steps(), "gpu_samples": _merged_gpu_samples(),
+            # Directly observable staleness: if this stops advancing while the row
+            # still says status=running, the dispatcher died (e.g. a gateway restart
+            # with no resume) — see run_multi_node_sweep's `resume` path.
+            "metrics_updated_at": _iso(datetime.now(timezone.utc)),
         })
 
     def _pull_child_metrics(i: int, res: dict) -> None:
@@ -3744,15 +3783,31 @@ async def run_multi_node_sweep(redis, run_id: str) -> None:
             for gs in (res.get("gpu_samples") or [])
         ]
 
+    # Trials already dispatched (have a run_id) and still running when this
+    # dispatcher started — only possible on `resume` (a fresh start never has
+    # any). Queue only the genuinely not-yet-dispatched trials; each already-
+    # running one is handed to whichever slot it originally occupied (matched by
+    # node+GPU list) so that slot's worker adopts it — monitor first, THEN fall
+    # into the normal queue-draining loop once it completes, exactly like a
+    # freshly dispatched trial finishing and picking up the next pending one.
     queue: asyncio.Queue = asyncio.Queue()
-    for i, combo in enumerate(combos):
-        queue.put_nowait((i, combo))
+    adopt_by_slot: dict[tuple[str, str], tuple[int, str]] = {}
+    for i, t in enumerate(trials):
+        if t.get("status") == "running" and t.get("run_id"):
+            node_desc = t.get("node") or {}
+            key = (node_desc.get("provider_id"), node_desc.get("visible_devices"))
+            adopt_by_slot[key] = (i, t["run_id"])
+        elif t.get("status") == "pending":
+            queue.put_nowait((i, t["params"]))
+        # else: already done/failed/cancelled from before the restart — nothing to do.
 
     # Relay each child's meaningful log lines into the parent's own log stream
     # (tagged [trial N]) — mirrors sweep_runner.py's `[trial i] {line}` prefixing
     # for a single-box sweep, so the parent's Logs tab visibly moves instead of
     # only updating on trial start/finish. Filtered (not every line) since 3+
     # concurrent children's raw stdout (pip/deps/HF download noise) would flood it.
+    # On resume this replays each adopted trial's FULL history once (last_idx starts
+    # at 0) — a one-time catch-up burst, not incorrect, just noisier than usual.
     _RELAY_MARKERS = ("@@STEP", "@@DONE", "@@ERROR", "[train]", "[trainer]",
                       "[deps]", "[model]", "[preflight]", "error", "Error", "Traceback")
     last_idx: dict[int, int] = {}
@@ -3769,8 +3824,47 @@ async def run_multi_node_sweep(redis, run_id: str) -> None:
                 await _push_log(redis, run_id, f"[trial {i}] {text}")
         last_idx[i] = len(raw)
 
+    async def _monitor_trial(i: int, child_id: str) -> None:
+        trial = trials[i]
+        try:
+            tick = 0
+            while True:
+                await asyncio.sleep(5)
+                await _relay_child_log(i, child_id)
+                tick += 1
+                if tick % 2:  # metrics/status every ~10s, log relay every ~5s
+                    continue
+                async with session_factory()() as s:
+                    child = await s.get(TrainingRun, child_id)
+                    if child is None:
+                        trial["status"] = "failed"
+                        break
+                    res = child.result_json or {}
+                    _pull_child_metrics(i, res)
+                    if child.status in ("done", "failed", "cancelled"):
+                        await _relay_child_log(i, child_id)  # catch any tail lines
+                        trial["status"] = child.status
+                        trial["metric"] = ((res.get("best") or {}).get(
+                            "loss" if sweep_metric == "loss" else sweep_metric))
+                        trial["artifact"] = res.get("artifact")
+                        break
+                await flush()  # persist the just-pulled steps/gpu_samples live, not only at trial end
+            await _push_log(redis, run_id,
+                             f"[sweep] trial {i} {trial['status'].upper()} "
+                             f"({sweep_metric}={trial['metric']}) -> {child_id}")
+            await flush()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("multi-node sweep %s trial %d crashed", run_id, i)
+            trial["status"] = "failed"
+            trial["error"] = str(e)
+            await _push_log(redis, run_id, f"[sweep] trial {i} FAILED (dispatcher error): {e}")
+            await flush()
+
     async def worker(node: NodeSpec, gpu_slice: list[str]) -> None:
         vis = ",".join(gpu_slice)
+        adopted = adopt_by_slot.get((node.provider_id, vis))
+        if adopted is not None:
+            await _monitor_trial(*adopted)
         while True:
             try:
                 i, combo = queue.get_nowait()
@@ -3798,38 +3892,14 @@ async def run_multi_node_sweep(redis, run_id: str) -> None:
                                  f"[sweep] trial {i} START params={json.dumps(combo)} "
                                  f"node={node.provider_id}:{vis} -> {child_id}")
                 await flush()
-                tick = 0
-                while True:
-                    await asyncio.sleep(5)
-                    await _relay_child_log(i, child_id)
-                    tick += 1
-                    if tick % 2:  # metrics/status every ~10s, log relay every ~5s
-                        continue
-                    async with session_factory()() as s:
-                        child = await s.get(TrainingRun, child_id)
-                        if child is None:
-                            trial["status"] = "failed"
-                            break
-                        res = child.result_json or {}
-                        _pull_child_metrics(i, res)
-                        if child.status in ("done", "failed", "cancelled"):
-                            await _relay_child_log(i, child_id)  # catch any tail lines
-                            trial["status"] = child.status
-                            trial["metric"] = ((res.get("best") or {}).get(
-                                "loss" if sweep_metric == "loss" else sweep_metric))
-                            trial["artifact"] = res.get("artifact")
-                            break
-                    await flush()  # persist the just-pulled steps/gpu_samples live, not only at trial end
-                await _push_log(redis, run_id,
-                                 f"[sweep] trial {i} {trial['status'].upper()} "
-                                 f"({sweep_metric}={trial['metric']}) -> {child_id}")
-                await flush()
             except Exception as e:  # noqa: BLE001
                 logger.exception("multi-node sweep %s trial %d (node %s) crashed", run_id, i, node.provider_id)
                 trial["status"] = "failed"
                 trial["error"] = str(e)
                 await _push_log(redis, run_id, f"[sweep] trial {i} FAILED (dispatcher error): {e}")
                 await flush()
+                continue
+            await _monitor_trial(i, child_id)
 
     await asyncio.gather(*[worker(node, gpu_slice) for node, gpu_slice in slots])
 
