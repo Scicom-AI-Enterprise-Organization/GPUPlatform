@@ -1604,12 +1604,26 @@ function SweepPlaygroundTab({ run, trials, isVmRun }: {
     return a.metric - b.metric;
   });
   const [opened, setOpened] = useState<number[]>(() => (sorted[0] ? [sorted[0].trial] : []));
+  const [closing, setClosing] = useState<number[]>([]);
 
   function openTrial(idx: number) {
     setOpened((o) => (o.includes(idx) ? o : [...o, idx]));
   }
-  function closeTrial(idx: number) {
-    setOpened((o) => o.filter((x) => x !== idx));
+  // The X on a trial's card actually unloads it (stops vLLM / tears down the pod) —
+  // just hiding the card would leave the server running (and, on a cloud target,
+  // still billing) with no way to see or stop it again short of reopening the tab.
+  async function closeTrial(idx: number) {
+    const t = sorted.find((x) => x.trial === idx);
+    if (!t?.run_id) { setOpened((o) => o.filter((x) => x !== idx)); return; }
+    setClosing((c) => [...c, idx]);
+    try {
+      await gateway.playgroundStop(t.run_id);
+    } catch {
+      // best-effort — still remove the card so the user isn't stuck
+    } finally {
+      setClosing((c) => c.filter((x) => x !== idx));
+      setOpened((o) => o.filter((x) => x !== idx));
+    }
   }
 
   const availableToAdd = sorted.filter((t) => !opened.includes(t.trial));
@@ -1662,8 +1676,9 @@ function SweepPlaygroundTab({ run, trials, isVmRun }: {
                 {t.metric != null && <span className="ml-2 font-mono text-xs text-muted-foreground">· {fmt(t.metric, 3)}</span>}
                 <span className="ml-2 font-mono text-xs text-muted-foreground">({runId})</span>
               </CardTitle>
-              <Button type="button" variant="ghost" className="h-7 shrink-0 px-2" onClick={() => closeTrial(idx)} aria-label="close">
-                <X className="h-4 w-4" />
+              <Button type="button" variant="ghost" className="h-7 shrink-0 px-2" disabled={closing.includes(idx)}
+                onClick={() => closeTrial(idx)} aria-label="stop and close" title="Unload this trial's model and close">
+                {closing.includes(idx) ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
               </Button>
             </CardHeader>
             <CardContent>
