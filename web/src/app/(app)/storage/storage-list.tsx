@@ -1,8 +1,8 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
-import { Cloud, Database, Inbox, KeyRound, LayoutGrid, List, MoreHorizontal, Power, Search, Trash2, User, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Check, Cloud, Database, HardDrive, Inbox, KeyRound, LayoutGrid, List, Loader2, MoreHorizontal, Power, RefreshCw, Search, Sparkles, Trash2, TriangleAlert, User, X } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -21,7 +21,7 @@ import {
 import { gateway } from "@/lib/gateway";
 import { avatarFor } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
-import type { StorageKind, StorageRecord } from "@/lib/types";
+import type { PurgeJobStatus, PurgeScanResult, StorageKind, StorageRecord } from "@/lib/types";
 
 const KIND_LABEL: Record<StorageKind, string> = {
   s3: "s3",
@@ -49,6 +49,16 @@ function scopeOf(s: StorageRecord): string | null {
   return `s3://${s.bucket}${prefix}`;
 }
 
+function formatBytes(b?: number | null): string {
+  if (b == null) return "—";
+  let n = b;
+  for (const u of ["B", "KB", "MB", "GB", "TB", "PB"]) {
+    if (n < 1024) return `${n < 10 && u !== "B" ? n.toFixed(1) : Math.round(n)} ${u}`;
+    n /= 1024;
+  }
+  return `${n.toFixed(1)} EB`;
+}
+
 export function StorageList({
   items,
   canWrite,
@@ -58,6 +68,7 @@ export function StorageList({
 }) {
   const router = useRouter();
   const [target, setTarget] = useState<StorageRecord | null>(null);
+  const [cleanup, setCleanup] = useState<StorageRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -204,6 +215,11 @@ export function StorageList({
                           disabled
                         </span>
                       )}
+                      {s.purge_running && (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                          <Loader2 className="h-2.5 w-2.5 animate-spin" /> cleaning…
+                        </span>
+                      )}
                     </div>
                     <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
                       <span className="truncate font-mono" title={s.id}>{s.id}</span>
@@ -231,6 +247,17 @@ export function StorageList({
                         <Power className="h-4 w-4" />
                         {s.enabled ? "Disable" : "Enable"}
                       </DropdownMenuItem>
+                      {s.kind === "s3" && (
+                        <DropdownMenuItem
+                          onSelect={(e) => {
+                            e.preventDefault();
+                            setCleanup(s);
+                          }}
+                        >
+                          <Sparkles className="h-4 w-4" />
+                          Clean up storage
+                        </DropdownMenuItem>
+                      )}
                       <DropdownMenuItem
                         variant="destructive"
                         onSelect={(e) => {
@@ -269,6 +296,15 @@ export function StorageList({
                   <KeyRound className="h-3 w-3" />
                   {s.has_credentials ? "stored key" : "env fallback"}
                 </span>
+                {s.kind === "s3" && s.total_size_bytes != null && (
+                  <span
+                    className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground"
+                    title={`${(s.object_count ?? 0).toLocaleString()} objects${s.size_computed_at ? ` · as of ${new Date(s.size_computed_at).toLocaleString()}` : ""}`}
+                  >
+                    <HardDrive className="h-3 w-3" />
+                    {formatBytes(s.total_size_bytes)}
+                  </span>
+                )}
               </div>
 
               <div className="mt-3 flex items-center justify-end border-t border-border/60 pt-2 text-xs text-muted-foreground">
@@ -311,6 +347,332 @@ export function StorageList({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {cleanup && (
+        <CleanupDialog
+          storage={cleanup}
+          onClose={() => setCleanup(null)}
+          onChanged={() => router.refresh()}
+        />
+      )}
     </div>
+  );
+}
+
+const CATEGORY_LABEL: Record<string, string> = {
+  orphan: "Orphaned (owner deleted)",
+  aged: "Aged (old, regenerable)",
+};
+
+/**
+ * Manual storage cleanup: scan (dry-run) → review orphaned + aged object groups →
+ * confirm delete. Auto-scans on open; nothing is deleted until the user ticks groups
+ * and confirms, and the server re-validates each prefix at delete time.
+ */
+function CleanupDialog({
+  storage,
+  onClose,
+  onChanged,
+}: {
+  storage: StorageRecord;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [scan, setScan] = useState<PurgeScanResult | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [ageDays, setAgeDays] = useState(30);
+  const [confirm, setConfirm] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [job, setJob] = useState<PurgeJobStatus | null>(null); // running / done / error
+  const [error, setError] = useState<string | null>(null);
+
+  const runScan = useCallback(async (age = ageDays) => {
+    setScanning(true);
+    setError(null);
+    setJob(null);
+    try {
+      const r = await gateway.storagePurgeScan(storage.id, age);
+      setScan(r);
+      // default: every purgeable group ticked
+      setSelected(new Set(r.groups.filter((g) => g.purgeable).map((g) => g.prefix)));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanning(false);
+    }
+  }, [storage.id, ageDays]);
+
+  useEffect(() => {
+    // On open: resume an in-flight cleanup (so closing + reopening shows live
+    // progress), else run a fresh dry-run scan.
+    let cancelled = false;
+    (async () => {
+      try {
+        const st = await gateway.storagePurgeStatus(storage.id);
+        if (cancelled) return;
+        if (st.state === "running") {
+          setJob(st);
+          return;
+        }
+      } catch {
+        /* fall through to a scan */
+      }
+      if (!cancelled) void runScan();
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    // Poll while a delete runs; refresh the list once it finishes (updates size +
+    // clears the "cleaning…" badge).
+    if (job?.state !== "running") return;
+    const t = setInterval(async () => {
+      try {
+        const st = await gateway.storagePurgeStatus(storage.id);
+        setJob(st);
+        if (st.state !== "running") onChanged();
+      } catch {
+        /* transient — keep polling */
+      }
+    }, 1500);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.state, storage.id]);
+
+  const purgeable = useMemo(() => (scan?.groups ?? []).filter((g) => g.purgeable), [scan]);
+  const keptCount = (scan?.groups ?? []).length - purgeable.length;
+  const selectedGroups = purgeable.filter((g) => selected.has(g.prefix));
+  const selectedBytes = selectedGroups.reduce((a, g) => a + g.bytes, 0);
+  const selectedObjects = selectedGroups.reduce((a, g) => a + g.objects, 0);
+
+  const toggle = (prefix: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(prefix)) next.delete(prefix);
+      else next.add(prefix);
+      return next;
+    });
+
+  const onDelete = async () => {
+    setStarting(true);
+    setError(null);
+    try {
+      const st = await gateway.storagePurge(storage.id, [...selected], ageDays);
+      setJob(st); // running — the poll effect takes over
+      setConfirm(false);
+      setScan(null);
+      onChanged(); // reflect the "cleaning…" badge on the card
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const busy = scanning || starting;
+  const jobPct =
+    job && job.target_objects
+      ? Math.min(100, Math.round((100 * (job.deleted_objects ?? 0)) / job.target_objects))
+      : job?.state === "done"
+        ? 100
+        : 0;
+
+  return (
+    <Dialog open onOpenChange={(o) => !busy && !o && onClose()}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Sparkles className="h-4 w-4" /> Clean up {storage.name}
+          </DialogTitle>
+          <DialogDescription>
+            Finds objects safe to delete — <b>orphaned</b> (the dataset / run / job / app that
+            owned them is gone) and <b>aged</b> (old artifacts in ephemeral folders). Live data
+            and unrecognized files are never touched. Deletion is permanent.
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* progress view (a background delete is running or finished) */}
+        {job ? (
+          <div className="space-y-3 text-sm">
+            {job.state === "running" ? (
+              <p className="flex items-center gap-2 text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Deleting… {(job.deleted_objects ?? 0).toLocaleString()} /{" "}
+                {(job.target_objects ?? 0).toLocaleString()} objects ·{" "}
+                {formatBytes(job.freed_bytes)} / {formatBytes(job.target_bytes)} freed
+              </p>
+            ) : job.state === "error" ? (
+              <p className="flex items-center gap-2 text-destructive">
+                <TriangleAlert className="h-4 w-4" /> Cleanup failed after freeing{" "}
+                {formatBytes(job.freed_bytes)}: {job.error}
+              </p>
+            ) : (
+              <p className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400">
+                <Check className="h-4 w-4" /> Freed {formatBytes(job.freed_bytes)} across{" "}
+                {(job.deleted?.length ?? 0).toLocaleString()} group
+                {(job.deleted?.length ?? 0) === 1 ? "" : "s"} (
+                {(job.deleted_objects ?? 0).toLocaleString()} objects).
+              </p>
+            )}
+            {/* progress bar */}
+            <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className={cn(
+                  "h-full rounded-full transition-all",
+                  job.state === "error" ? "bg-destructive" : "bg-emerald-500",
+                )}
+                style={{ width: `${jobPct}%` }}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {job.done_prefixes ?? 0} / {job.total_prefixes ?? 0} groups
+              {job.state === "running" && (
+                <> · runs in the background — you can close this dialog and it keeps deleting.</>
+              )}
+              {(job.skipped?.length ?? 0) > 0 && (
+                <> · {job.skipped!.length} skipped (became live or already gone).</>
+              )}
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div
+                className="flex items-center gap-2 text-muted-foreground"
+                title="Ephemeral = benchmarks, quantization-jobs, serverless-logs. A group is flagged only if its NEWEST file is older than this — i.e. the whole group has sat untouched. Orphaned files (owner deleted) are always flagged regardless of age; datasets/ and training-runs/ are never aged-out."
+              >
+                <span>Also flag benchmark / quant-job / log files untouched for over</span>
+                <select
+                  value={ageDays}
+                  onChange={(e) => {
+                    const d = Number(e.target.value);
+                    setAgeDays(d);
+                    void runScan(d);
+                  }}
+                  disabled={busy}
+                  className="h-7 rounded-md border border-input bg-background px-2 text-xs"
+                >
+                  {[7, 30, 90, 180, 365].map((d) => (
+                    <option key={d} value={d}>{d} days</option>
+                  ))}
+                  <option value={0}>— off (orphans only) —</option>
+                </select>
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => runScan()} disabled={busy}>
+                  <RefreshCw className={cn("mr-1 h-3 w-3", scanning && "animate-spin")} /> Rescan
+                </Button>
+              </div>
+              {scan && (
+                <span className="text-muted-foreground">
+                  total {formatBytes(scan.total_bytes)} · {scan.total_objects.toLocaleString()} objects
+                </span>
+              )}
+            </div>
+
+            {scanning ? (
+              <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
+                <Loader2 className="h-5 w-5 animate-spin" /> scanning the bucket…
+              </div>
+            ) : scan && purgeable.length === 0 ? (
+              <p className="py-8 text-center text-sm text-muted-foreground">
+                Nothing to clean up — no orphaned or aged objects found
+                {keptCount > 0 ? ` (${keptCount} live/kept groups).` : "."}
+              </p>
+            ) : scan ? (
+              <>
+                <div className="flex items-center justify-between text-xs">
+                  <button
+                    type="button"
+                    className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                    onClick={() =>
+                      setSelected(
+                        selected.size === purgeable.length ? new Set() : new Set(purgeable.map((g) => g.prefix)),
+                      )
+                    }
+                  >
+                    {selected.size === purgeable.length ? "deselect all" : "select all"}
+                  </button>
+                  <span className="text-muted-foreground">
+                    reclaimable {formatBytes(scan.reclaimable_bytes)} · {keptCount} kept
+                  </span>
+                </div>
+                <div className="max-h-72 space-y-1 overflow-auto rounded-md border border-border p-1 scrollbar-thin">
+                  {purgeable.map((g) => (
+                    <label
+                      key={g.prefix}
+                      className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-muted/50"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selected.has(g.prefix)}
+                        onChange={() => toggle(g.prefix)}
+                        className="h-3.5 w-3.5"
+                      />
+                      <span
+                        className={cn(
+                          "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium",
+                          g.category === "orphan"
+                            ? "bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                            : "bg-sky-500/10 text-sky-700 dark:text-sky-400",
+                        )}
+                        title={CATEGORY_LABEL[g.category]}
+                      >
+                        {g.category}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate font-mono" title={`${g.prefix} — ${g.reason}`}>
+                        {g.prefix}
+                      </span>
+                      <span className="shrink-0 tabular-nums text-muted-foreground">{g.objects}</span>
+                      <span className="w-16 shrink-0 text-right tabular-nums">{formatBytes(g.bytes)}</span>
+                    </label>
+                  ))}
+                </div>
+              </>
+            ) : null}
+          </div>
+        )}
+
+        <DialogFooter>
+          {error && <p className="mr-auto max-w-[60%] truncate text-sm text-destructive" title={error}>{error}</p>}
+          {job ? (
+            job.state === "running" ? (
+              <Button onClick={onClose}>Run in background</Button>
+            ) : (
+              <Button onClick={onClose}>Done</Button>
+            )
+          ) : confirm ? (
+            <>
+              <span className="mr-auto text-sm text-destructive">
+                Permanently delete {selectedGroups.length} group{selectedGroups.length === 1 ? "" : "s"} ({formatBytes(selectedBytes)})?
+              </span>
+              <Button variant="outline" onClick={() => setConfirm(false)} disabled={starting}>
+                Cancel
+              </Button>
+              <Button variant="destructive" onClick={onDelete} disabled={starting}>
+                {starting ? <Loader2 className="mr-1 h-4 w-4 animate-spin" /> : <Trash2 className="mr-1 h-4 w-4" />}
+                Delete permanently
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button variant="outline" onClick={onClose} disabled={busy}>
+                Close
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => setConfirm(true)}
+                disabled={busy || selectedGroups.length === 0}
+              >
+                <TriangleAlert className="mr-1 h-4 w-4" />
+                Delete selected · {formatBytes(selectedBytes)} ({selectedObjects.toLocaleString()} obj)
+              </Button>
+            </>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

@@ -394,6 +394,13 @@ export function TrainingForm() {
   const [sweepFreeze, setSweepFreeze] = useState(false);
   // compare LoRA vs full finetune as a sweep dimension (ASR/TTS — LLM is always LoRA).
   const [sweepUseLora, setSweepUseLora] = useState(false);
+  // multi-node sweep (any task type): several (VM provider, GPU-range) targets instead
+  // of one — each contributes floor(its GPUs / gpus_per_trial) concurrent trial slots.
+  // Empty visible_devices per node = all of that provider's GPUs.
+  const [multiNodeOn, setMultiNodeOn] = useState(false);
+  const [sweepNodes, setSweepNodes] = useState<{ providerId: string; visibleDevices: string }[]>([
+    { providerId: "", visibleDevices: "" },
+  ]);
   // run on (pod card — mirrors benchmark/new)
   const [target, setTarget] = useState<"cloud" | "vm">("cloud");
   const [providerId, setProviderId] = useState(""); // vm provider
@@ -588,6 +595,13 @@ export function TrainingForm() {
           setSweepAugment(arr(sweep.augment).length > 0);
           setSweepFreeze(arr(sweep.freeze_encoder).length > 0);
           setSweepUseLora(arr(sweep.use_lora).length > 0);
+          const cfgNodes = c.nodes as { provider_id?: string; visible_devices?: string | null }[] | undefined;
+          if (Array.isArray(cfgNodes) && cfgNodes.length) {
+            setMultiNodeOn(true);
+            setSweepNodes(cfgNodes.map((n) => ({
+              providerId: n.provider_id ?? "", visibleDevices: n.visible_devices ?? "",
+            })));
+          }
         }
         // augmentation
         if (Array.isArray(c.augment_techniques)) setAugmentTechniques(arr(c.augment_techniques).map(String));
@@ -961,13 +975,19 @@ export function TrainingForm() {
           return setError(`${f.label} (sweep): ${bad.map((b) => `"${b}"`).join(", ")} — use ${want}.`);
         }
       }
-      // GPUs per trial can't exceed the GPUs available to the sweep
-      const slots = pinned.length || gpuBound;
-      if (slots > 0 && gpusPerTrial > slots) {
-        return setError(
-          `GPUs per trial (${gpusPerTrial}) exceeds the ${slots} GPU${slots === 1 ? "" : "s"} ` +
-          `available to the sweep${pinned.length ? " (pinned)" : ` on ${target === "vm" ? "this VM" : "the pod"}`}.`,
-        );
+      if (multiNodeOn) {
+        if (sweepNodes.some((n) => !n.providerId)) {
+          return setError("Every sweep node needs a VM provider selected (or remove the empty row).");
+        }
+      } else {
+        // GPUs per trial can't exceed the GPUs available to the sweep
+        const slots = pinned.length || gpuBound;
+        if (slots > 0 && gpusPerTrial > slots) {
+          return setError(
+            `GPUs per trial (${gpusPerTrial}) exceeds the ${slots} GPU${slots === 1 ? "" : "s"} ` +
+            `available to the sweep${pinned.length ? " (pinned)" : ` on ${target === "vm" ? "this VM" : "the pod"}`}.`,
+          );
+        }
       }
     }
 
@@ -1054,16 +1074,25 @@ export function TrainingForm() {
           }
         : {}),
       ...(sweepOn && Object.keys(sweepGrid).length
-        ? { sweep: sweepGrid, gpus_per_trial: gpusPerTrial }
+        ? {
+            sweep: sweepGrid, gpus_per_trial: gpusPerTrial,
+            ...(multiNodeOn
+              ? {
+                  nodes: sweepNodes
+                    .filter((n) => n.providerId)
+                    .map((n) => ({ provider_id: n.providerId, visible_devices: n.visibleDevices.trim() || null })),
+                }
+              : {}),
+          }
         : {}),
-      provider_id: target === "vm" ? providerId : runpodProviderId,
+      provider_id: sweepOn && multiNodeOn ? null : target === "vm" ? providerId : runpodProviderId,
       gpu_type: gpuType,
       gpu_count: gpuCount,
       secure_cloud: secureCloud,
       data_center_id: dataCenterId.trim() || undefined,
       disk_gb: diskGb,
       volume_gb: volumeGb,
-      visible_devices: visibleDevices.trim() || null,
+      visible_devices: sweepOn && multiNodeOn ? null : visibleDevices.trim() || null,
       ...(Object.keys(envVars).length ? { env_vars: envVars } : {}),
       storage_id: storageId,
       hf_push_repo: hfPushRepo.trim() || null,
@@ -1279,245 +1308,6 @@ export function TrainingForm() {
             )}
           </FieldWrap>
         </Grid>
-      </Section>
-
-      {/* Run on — pod card (mirrors benchmark/new) */}
-      <Section icon={<Server className="h-4 w-4" />} title="Run on"
-        description="Default cloud spawns a fresh RunPod pod. Bare metal uses a VM you've registered under GPU Providers.">
-        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-          <button type="button" onClick={() => setTarget("cloud")}
-            className={cn("flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
-              target === "cloud" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
-            <Cpu className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0">
-              <div className="font-medium">Default cloud (RunPod)</div>
-              <div className="text-xs text-muted-foreground">Provision a fresh pod on demand. Pay-per-second.</div>
-            </div>
-          </button>
-          <button type="button" onClick={() => setTarget("vm")}
-            className={cn("flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
-              target === "vm" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
-            <Server className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0">
-              <div className="font-medium">Bare metal (VM)</div>
-              <div className="text-xs text-muted-foreground">SSH onto a registered VM. No spin-up cost.</div>
-            </div>
-          </button>
-        </div>
-      </Section>
-
-      <Section icon={<Server className="h-4 w-4" />} title="Pod"
-        description={target === "cloud"
-          ? "GPU, count, and cloud tier for the RunPod instance the trainer spawns."
-          : "Which registered VM to SSH into. Hardware is fixed by the VM."}>
-        {target === "vm" && (
-          <div className="space-y-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="train-provider" className="text-xs uppercase tracking-wide text-muted-foreground">VM provider</Label>
-              {vmProviders.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  No VM providers registered. Add one at{" "}
-                  <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">GPU Providers → New provider</a>.
-                </p>
-              ) : (
-                <Select value={providerId} onValueChange={setProviderId}>
-                  <SelectTrigger id="train-provider"><SelectValue placeholder="Pick a VM…" /></SelectTrigger>
-                  <SelectContent>
-                    {vmProviders.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name}
-                        {p.gpu_count != null && p.gpu_count > 0 ? ` · ${p.gpu_count} GPU` : ""}
-                        {p.host ? ` · ${p.host}` : ""}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
-              <p className="text-xs text-muted-foreground">
-                The trainer runs directly on the VM via SSH. The VM&apos;s GPUs, disk, and Python are used as-is.
-              </p>
-              {providerId && <VmAvailabilityRow state={vmAvail} onRefresh={() => refreshVmAvail(providerId)} />}
-            </div>
-          </div>
-        )}
-        {target === "cloud" && (
-          <div className="space-y-5">
-            <FieldWrap label="RunPod account" hint="Which RunPod provider to bill against.">
-              <Select value={runpodProviderId} onValueChange={setRunpodProviderId}>
-                <SelectTrigger><SelectValue placeholder="Choose a RunPod account…" /></SelectTrigger>
-                <SelectContent>
-                  {runpodProviders.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>
-                      {p.name}{p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {runpodProviders.length === 0 && (
-                <p className="text-xs text-muted-foreground">
-                  None registered. <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add a RunPod account →</a>
-                </p>
-              )}
-            </FieldWrap>
-
-            <FieldWrap label="Cloud tier" hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity.">
-              <div className="grid grid-cols-2 gap-2">
-                {([["secure", "Secure", "vetted hosts, more capacity"], ["community", "Community", "cheaper, variable hosts"]] as const).map(
-                  ([val, title, sub]) => {
-                    const selected = (val === "secure") === secureCloud;
-                    return (
-                      <button key={val} type="button" onClick={() => setSecureCloud(val === "secure")}
-                        className={cn("rounded-md border p-3 text-left transition-colors",
-                          selected ? "border-foreground/60 ring-1 ring-foreground/20" : "border-border hover:border-foreground/40")}>
-                        <div className="text-sm font-medium">{title}</div>
-                        <div className="mt-0.5 text-xs text-muted-foreground">{sub}</div>
-                      </button>
-                    );
-                  },
-                )}
-              </div>
-            </FieldWrap>
-
-            <FieldWrap label="Region" hint="Pin the training pod to a RunPod data center, or Auto to let RunPod pick any region with capacity.">
-              <RegionSelect value={dataCenterId} onChange={setDataCenterId} className="text-sm" />
-            </FieldWrap>
-
-            <FieldWrap label="GPU"
-              hint={(() => {
-                const g = gpuOptions.find((o) => o.id === gpuType);
-                return g ? capacityHint(g.vram_gb, gpuCount) : undefined;
-              })()}
-              extra={<AvailabilityBadge state={availability} count={gpuCount} />}>
-              <div className="flex gap-2">
-                <SearchableSelect
-                  className="flex-1"
-                  value={gpuType}
-                  onChange={setGpuType}
-                  options={gpuOptions.map((g) => ({ value: g.id, label: g.label, hint: capacityHint(g.vram_gb, 1) }))}
-                  placeholder="Choose a GPU"
-                  searchPlaceholder="Search GPUs (e.g. h100, 24gb, ada)…"
-                />
-                <Select value={String(gpuCount)} onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}>
-                  <SelectTrigger className="w-24 shrink-0"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {GPU_COUNT_CHOICES.map((n) => <SelectItem key={n} value={String(n)}>×{n}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-            </FieldWrap>
-
-            <div className="grid grid-cols-2 gap-3">
-              <FieldWrap label="Container disk (GB)" hint="Ephemeral workspace. Resets when the pod stops.">
-                <NumberField min={20} value={diskGb} onChange={setDiskGb} />
-              </FieldWrap>
-              <FieldWrap label="Volume (GB)" hint="Persistent volume mounted at /workspace (model cache).">
-                <NumberField min={0} value={volumeGb} onChange={setVolumeGb} />
-              </FieldWrap>
-            </div>
-
-            <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>Pick a GPU with enough VRAM for the model + batch. Whisper-large needs ~24 GB+ at modest batch sizes.</span>
-            </div>
-          </div>
-        )}
-
-        <div className="mt-5 space-y-1.5 border-t border-border pt-4">
-          <Label htmlFor="train-cuda" className="text-xs uppercase tracking-wide text-muted-foreground">CUDA_VISIBLE_DEVICES</Label>
-          <Input id="train-cuda"
-            className={cn("font-mono text-xs", vdError && "border-destructive focus-visible:ring-destructive")}
-            placeholder="e.g. 0,1 (empty = all GPUs)"
-            value={visibleDevices} onChange={(e) => setVisibleDevices(e.target.value)} />
-          {vdError ? (
-            <p className="text-xs text-destructive">{vdError}</p>
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              Pins which GPUs the trainer uses. Empty = all visible GPUs.
-              {gpuBound > 0 && (
-                <> {target === "vm" ? "This VM" : "The pod"} has {gpuBound} GPU{gpuBound === 1 ? "" : "s"} — valid indices <span className="font-mono">0–{gpuBound - 1}</span>.</>
-              )}
-            </p>
-          )}
-        </div>
-
-        {/* DDP — only meaningful for a multi-GPU single run (sweeps pin 1/trial) */}
-        {!sweepOn && !isTts && (() => {
-          const n = visibleDevices.trim()
-            ? visibleDevices.split(",").filter((x) => x.trim()).length
-            : gpuBound;
-          if (n <= 1) return null;
-          return (
-            <label className="mt-4 flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-sm hover:bg-muted/50">
-              <input type="checkbox" checked={useDdp} onChange={(e) => setUseDdp(e.target.checked)}
-                className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary" />
-              <span className="min-w-0">
-                <span className="font-medium">Distributed training (DDP)</span>
-                <span className="block text-xs text-muted-foreground">
-                  One process per GPU via <span className="font-mono">torchrun</span> ({n} GPUs) — faster + balanced than
-                  single-process DataParallel. Uncheck to use DataParallel.
-                </span>
-              </span>
-            </label>
-          );
-        })()}
-
-        <div className="mt-4 space-y-1.5">
-          <Label htmlFor="train-workdir" className="text-xs uppercase tracking-wide text-muted-foreground">Checkpoint / temp directory</Label>
-          <Input id="train-workdir" className="font-mono text-xs" placeholder="/share"
-            value={workDir} onChange={(e) => setWorkDir(e.target.value)} />
-          <p className="text-xs text-muted-foreground">
-            Roomy dir on the VM for checkpoints + temp (<span className="font-mono">TMPDIR</span>). Default{" "}
-            <span className="font-mono">/share</span> — avoid <span className="font-mono">/tmp</span> (small disk).
-            The best model is uploaded to S3 regardless.
-          </p>
-        </div>
-
-        <div className="mt-4 space-y-1.5">
-          <Label htmlFor="train-venv" className="text-xs uppercase tracking-wide text-muted-foreground">uv venv path</Label>
-          <Input id="train-venv" className="font-mono text-xs" placeholder="/share/autotrain-whisper"
-            value={venvPath} onChange={(e) => setVenvPath(e.target.value)} />
-          <p className="text-xs text-muted-foreground">
-            Isolated <span className="font-mono">uv</span> venv for the trainer&apos;s deps (like serverless&apos;s vLLM venv) —
-            keeps the stack off the box&apos;s system Python so {isTts ? "TTS" : "Whisper"} can&apos;t clobber another task&apos;s
-            torch. Default <span className="font-mono">{isTts ? "/share/autotrain-tts" : isLlm ? llmVenvFor(baseModel) : "/share/autotrain-whisper"}</span>; reused + cached across runs.
-          </p>
-        </div>
-
-        <label className="mt-4 flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-sm hover:bg-muted/50">
-          <input type="checkbox" checked={cleanupCheckpoints}
-            onChange={(e) => setCleanupCheckpoints(e.target.checked)}
-            className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary" />
-          <span className="min-w-0">
-            <span className="font-medium">Clean checkpoints after run</span>
-            <span className="block text-xs text-muted-foreground">
-              Delete the checkpoint/work dir on the VM when the run ends (the best model is already on S3).
-              Keeps the disk from filling across runs.
-            </span>
-          </span>
-        </label>
-
-        <div className="mt-4 space-y-1.5">
-          <Label htmlFor="train-env" className="text-xs uppercase tracking-wide text-muted-foreground">Environment variables</Label>
-          <Textarea
-            id="train-env"
-            rows={8}
-            spellCheck={false}
-            className="font-mono text-xs"
-            placeholder={'export HOME="/share/home"\nexport HF_HOME="/share/huggingface"\nexport XDG_CACHE_HOME="/share/.cache"\nexport TRITON_CACHE_DIR="/share/triton_cache"'}
-            value={envText}
-            onChange={(e) => setEnvText(e.target.value)}
-          />
-          <p className="text-xs text-muted-foreground">
-            One <span className="font-mono">KEY=value</span> per line (<span className="font-mono">export</span> prefix ok).
-            Exported before the run; absolute-path values are <span className="font-mono">mkdir -p</span>&apos;d. Useful to
-            redirect HOME + caches (HF/Triton/torchinductor/vLLM/…) to a shared disk.
-            {Object.keys(parseEnvVars(envText)).length > 0 && (
-              <>
-                {" "}· parsed: <span className="font-mono">{Object.keys(parseEnvVars(envText)).join(", ")}</span>
-              </>
-            )}
-          </p>
-        </div>
       </Section>
 
       {/* Training — single run vs. hyperparameter sweep (tab) */}
@@ -2249,6 +2039,304 @@ export function TrainingForm() {
           )}
         </div>
         )}
+      </Section>
+
+      {/* Run on — pod card (mirrors benchmark/new) */}
+      <Section icon={<Server className="h-4 w-4" />} title="Run on"
+        description="Default cloud spawns a fresh RunPod pod. Bare metal uses a VM you've registered under GPU Providers.">
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+          <button type="button" onClick={() => setTarget("cloud")}
+            className={cn("flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
+              target === "cloud" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
+            <Cpu className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+            <div className="min-w-0">
+              <div className="font-medium">Default cloud (RunPod)</div>
+              <div className="text-xs text-muted-foreground">Provision a fresh pod on demand. Pay-per-second.</div>
+            </div>
+          </button>
+          <button type="button" onClick={() => setTarget("vm")}
+            className={cn("flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
+              target === "vm" ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
+            <Server className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+            <div className="min-w-0">
+              <div className="font-medium">Bare metal (VM)</div>
+              <div className="text-xs text-muted-foreground">SSH onto a registered VM. No spin-up cost.</div>
+            </div>
+          </button>
+        </div>
+      </Section>
+
+      <Section icon={<Server className="h-4 w-4" />} title="Pod"
+        description={target === "cloud"
+          ? "GPU, count, and cloud tier for the RunPod instance the trainer spawns."
+          : "Which registered VM to SSH into. Hardware is fixed by the VM."}>
+        {target === "vm" && (
+          <div className="space-y-3">
+            {sweepOn && (
+              <div className="flex gap-2">
+                {([["single", "Single VM"], ["multi", "Multi-node sweep"]] as const).map(([v, label]) => {
+                  const active = (v === "multi") === multiNodeOn;
+                  return (
+                    <button key={v} type="button" onClick={() => setMultiNodeOn(v === "multi")}
+                      className={cn("rounded-md border px-3 py-1.5 text-xs font-medium transition-colors",
+                        active ? "border-primary/60 bg-primary/5" : "border-border hover:border-primary/40 hover:bg-muted/40")}>
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {!(sweepOn && multiNodeOn) ? (
+              <div className="space-y-1.5">
+                <Label htmlFor="train-provider" className="text-xs uppercase tracking-wide text-muted-foreground">VM provider</Label>
+                {vmProviders.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No VM providers registered. Add one at{" "}
+                    <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">GPU Providers → New provider</a>.
+                  </p>
+                ) : (
+                  <Select value={providerId} onValueChange={setProviderId}>
+                    <SelectTrigger id="train-provider"><SelectValue placeholder="Pick a VM…" /></SelectTrigger>
+                    <SelectContent>
+                      {vmProviders.map((p) => (
+                        <SelectItem key={p.id} value={p.id}>
+                          {p.name}
+                          {p.gpu_count != null && p.gpu_count > 0 ? ` · ${p.gpu_count} GPU` : ""}
+                          {p.host ? ` · ${p.host}` : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  The trainer runs directly on the VM via SSH. The VM&apos;s GPUs, disk, and Python are used as-is.
+                </p>
+                {providerId && <VmAvailabilityRow state={vmAvail} onRefresh={() => refreshVmAvail(providerId)} />}
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">Sweep nodes</Label>
+                {sweepNodes.map((n, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <Select value={n.providerId} onValueChange={(v) => {
+                      const next = [...sweepNodes]; next[i] = { ...next[i], providerId: v }; setSweepNodes(next);
+                    }}>
+                      <SelectTrigger className="flex-1"><SelectValue placeholder="Pick a VM…" /></SelectTrigger>
+                      <SelectContent>
+                        {vmProviders.map((p) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.name}
+                            {p.gpu_count != null && p.gpu_count > 0 ? ` · ${p.gpu_count} GPU` : ""}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Input className="w-36 shrink-0 font-mono text-xs" placeholder="GPU ids (empty=all)"
+                      value={n.visibleDevices}
+                      onChange={(e) => {
+                        const next = [...sweepNodes]; next[i] = { ...next[i], visibleDevices: e.target.value }; setSweepNodes(next);
+                      }} />
+                    <Button type="button" variant="outline" size="sm" className="shrink-0 px-2"
+                      disabled={sweepNodes.length <= 1}
+                      onClick={() => setSweepNodes(sweepNodes.filter((_, j) => j !== i))}>
+                      <X className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ))}
+                <Button type="button" variant="outline" size="sm"
+                  onClick={() => setSweepNodes([...sweepNodes, { providerId: "", visibleDevices: "" }])}>
+                  + Add node
+                </Button>
+                <p className="text-xs text-muted-foreground">
+                  Each node runs its own trial(s) on its own GPUs — floor(its GPU count ÷ &quot;GPUs per
+                  trial&quot;) concurrently — drawing from the shared sweep grid as slots free up. No
+                  cross-host distributed training: each trial is single-node. Leave GPU ids empty to use
+                  all of that provider&apos;s GPUs.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+        {target === "cloud" && (
+          <div className="space-y-5">
+            <FieldWrap label="RunPod account" hint="Which RunPod provider to bill against.">
+              <Select value={runpodProviderId} onValueChange={setRunpodProviderId}>
+                <SelectTrigger><SelectValue placeholder="Choose a RunPod account…" /></SelectTrigger>
+                <SelectContent>
+                  {runpodProviders.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}{p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {runpodProviders.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  None registered. <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add a RunPod account →</a>
+                </p>
+              )}
+            </FieldWrap>
+
+            <FieldWrap label="Cloud tier" hint="Community is cheaper with variable hosts; Secure uses vetted hosts with more capacity.">
+              <div className="grid grid-cols-2 gap-2">
+                {([["secure", "Secure", "vetted hosts, more capacity"], ["community", "Community", "cheaper, variable hosts"]] as const).map(
+                  ([val, title, sub]) => {
+                    const selected = (val === "secure") === secureCloud;
+                    return (
+                      <button key={val} type="button" onClick={() => setSecureCloud(val === "secure")}
+                        className={cn("rounded-md border p-3 text-left transition-colors",
+                          selected ? "border-foreground/60 ring-1 ring-foreground/20" : "border-border hover:border-foreground/40")}>
+                        <div className="text-sm font-medium">{title}</div>
+                        <div className="mt-0.5 text-xs text-muted-foreground">{sub}</div>
+                      </button>
+                    );
+                  },
+                )}
+              </div>
+            </FieldWrap>
+
+            <FieldWrap label="Region" hint="Pin the training pod to a RunPod data center, or Auto to let RunPod pick any region with capacity.">
+              <RegionSelect value={dataCenterId} onChange={setDataCenterId} className="text-sm" />
+            </FieldWrap>
+
+            <FieldWrap label="GPU"
+              hint={(() => {
+                const g = gpuOptions.find((o) => o.id === gpuType);
+                return g ? capacityHint(g.vram_gb, gpuCount) : undefined;
+              })()}
+              extra={<AvailabilityBadge state={availability} count={gpuCount} />}>
+              <div className="flex gap-2">
+                <SearchableSelect
+                  className="flex-1"
+                  value={gpuType}
+                  onChange={setGpuType}
+                  options={gpuOptions.map((g) => ({ value: g.id, label: g.label, hint: capacityHint(g.vram_gb, 1) }))}
+                  placeholder="Choose a GPU"
+                  searchPlaceholder="Search GPUs (e.g. h100, 24gb, ada)…"
+                />
+                <Select value={String(gpuCount)} onValueChange={(v) => setGpuCount(Number.parseInt(v, 10))}>
+                  <SelectTrigger className="w-24 shrink-0"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {GPU_COUNT_CHOICES.map((n) => <SelectItem key={n} value={String(n)}>×{n}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            </FieldWrap>
+
+            <div className="grid grid-cols-2 gap-3">
+              <FieldWrap label="Container disk (GB)" hint="Ephemeral workspace. Resets when the pod stops.">
+                <NumberField min={20} value={diskGb} onChange={setDiskGb} />
+              </FieldWrap>
+              <FieldWrap label="Volume (GB)" hint="Persistent volume mounted at /workspace (model cache).">
+                <NumberField min={0} value={volumeGb} onChange={setVolumeGb} />
+              </FieldWrap>
+            </div>
+
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>Pick a GPU with enough VRAM for the model + batch. Whisper-large needs ~24 GB+ at modest batch sizes.</span>
+            </div>
+          </div>
+        )}
+
+        {!(target === "vm" && sweepOn && multiNodeOn) && (
+          <div className="mt-5 space-y-1.5 border-t border-border pt-4">
+            <Label htmlFor="train-cuda" className="text-xs uppercase tracking-wide text-muted-foreground">CUDA_VISIBLE_DEVICES</Label>
+            <Input id="train-cuda"
+              className={cn("font-mono text-xs", vdError && "border-destructive focus-visible:ring-destructive")}
+              placeholder="e.g. 0,1 (empty = all GPUs)"
+              value={visibleDevices} onChange={(e) => setVisibleDevices(e.target.value)} />
+            {vdError ? (
+              <p className="text-xs text-destructive">{vdError}</p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Pins which GPUs the trainer uses. Empty = all visible GPUs.
+                {gpuBound > 0 && (
+                  <> {target === "vm" ? "This VM" : "The pod"} has {gpuBound} GPU{gpuBound === 1 ? "" : "s"} — valid indices <span className="font-mono">0–{gpuBound - 1}</span>.</>
+                )}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* DDP — only meaningful for a multi-GPU single run (sweeps pin 1/trial) */}
+        {!sweepOn && !isTts && (() => {
+          const n = visibleDevices.trim()
+            ? visibleDevices.split(",").filter((x) => x.trim()).length
+            : gpuBound;
+          if (n <= 1) return null;
+          return (
+            <label className="mt-4 flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-sm hover:bg-muted/50">
+              <input type="checkbox" checked={useDdp} onChange={(e) => setUseDdp(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary" />
+              <span className="min-w-0">
+                <span className="font-medium">Distributed training (DDP)</span>
+                <span className="block text-xs text-muted-foreground">
+                  One process per GPU via <span className="font-mono">torchrun</span> ({n} GPUs) — faster + balanced than
+                  single-process DataParallel. Uncheck to use DataParallel.
+                </span>
+              </span>
+            </label>
+          );
+        })()}
+
+        <div className="mt-4 space-y-1.5">
+          <Label htmlFor="train-workdir" className="text-xs uppercase tracking-wide text-muted-foreground">Checkpoint / temp directory</Label>
+          <Input id="train-workdir" className="font-mono text-xs" placeholder="/share"
+            value={workDir} onChange={(e) => setWorkDir(e.target.value)} />
+          <p className="text-xs text-muted-foreground">
+            Roomy dir on the VM for checkpoints + temp (<span className="font-mono">TMPDIR</span>). Default{" "}
+            <span className="font-mono">/share</span> — avoid <span className="font-mono">/tmp</span> (small disk).
+            The best model is uploaded to S3 regardless.
+          </p>
+        </div>
+
+        <div className="mt-4 space-y-1.5">
+          <Label htmlFor="train-venv" className="text-xs uppercase tracking-wide text-muted-foreground">uv venv path</Label>
+          <Input id="train-venv" className="font-mono text-xs" placeholder="/share/autotrain-whisper"
+            value={venvPath} onChange={(e) => setVenvPath(e.target.value)} />
+          <p className="text-xs text-muted-foreground">
+            Isolated <span className="font-mono">uv</span> venv for the trainer&apos;s deps (like serverless&apos;s vLLM venv) —
+            keeps the stack off the box&apos;s system Python so {isTts ? "TTS" : "Whisper"} can&apos;t clobber another task&apos;s
+            torch. Default <span className="font-mono">{isTts ? "/share/autotrain-tts" : isLlm ? llmVenvFor(baseModel) : "/share/autotrain-whisper"}</span>; reused + cached across runs.
+          </p>
+        </div>
+
+        <label className="mt-4 flex cursor-pointer items-start gap-2.5 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-sm hover:bg-muted/50">
+          <input type="checkbox" checked={cleanupCheckpoints}
+            onChange={(e) => setCleanupCheckpoints(e.target.checked)}
+            className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary" />
+          <span className="min-w-0">
+            <span className="font-medium">Clean checkpoints after run</span>
+            <span className="block text-xs text-muted-foreground">
+              Delete the checkpoint/work dir on the VM when the run ends (the best model is already on S3).
+              Keeps the disk from filling across runs.
+            </span>
+          </span>
+        </label>
+
+        <div className="mt-4 space-y-1.5">
+          <Label htmlFor="train-env" className="text-xs uppercase tracking-wide text-muted-foreground">Environment variables</Label>
+          <Textarea
+            id="train-env"
+            rows={8}
+            spellCheck={false}
+            className="font-mono text-xs"
+            placeholder={'export HOME="/share/home"\nexport HF_HOME="/share/huggingface"\nexport XDG_CACHE_HOME="/share/.cache"\nexport TRITON_CACHE_DIR="/share/triton_cache"'}
+            value={envText}
+            onChange={(e) => setEnvText(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            One <span className="font-mono">KEY=value</span> per line (<span className="font-mono">export</span> prefix ok).
+            Exported before the run; absolute-path values are <span className="font-mono">mkdir -p</span>&apos;d. Useful to
+            redirect HOME + caches (HF/Triton/torchinductor/vLLM/…) to a shared disk.
+            {Object.keys(parseEnvVars(envText)).length > 0 && (
+              <>
+                {" "}· parsed: <span className="font-mono">{Object.keys(parseEnvVars(envText)).join(", ")}</span>
+              </>
+            )}
+          </p>
+        </div>
       </Section>
 
       {/* Experiment tracking */}

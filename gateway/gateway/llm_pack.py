@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import types
 from typing import Any, Callable, Optional
@@ -57,25 +58,48 @@ COLUMNS = {
 # assistant turn's reasoning is trained. The swap is a surgical substring replace
 # per arch; if no known guard substring is present we fall back to the stock
 # template UNCHANGED rather than raising — this packer is generic.
-# Each entry: arch -> (stock_guard_substring, relaxed_replacement). Mirrors the
-# standalone packers: autotrain/gemma4/pack_dataset.py + autotrain/minimax-m2/pack_dataset.py.
-_REASONING_GUARDS: dict[str, tuple[str, str]] = {
-    "gemma": (
-        "if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
-        "if thinking_text and role == 'model'",
-    ),
-    "minimax": (
-        "if reasoning_content and loop.index0 > ns.last_user_index",
-        "if reasoning_content",
-    ),
+# Each entry: arch -> list of (stock_guard_substring, relaxed_replacement) candidates,
+# tried in order (first match wins) — lets a template revision be added without
+# dropping support for the previous shape. Mirrors the standalone packers:
+# autotrain/gemma4/pack_dataset.py + autotrain/minimax-m2/pack_dataset.py.
+#
+# ⚠ 2026-07-21: google/gemma-4-26B-A4B-it's template (dated 2026-07-09 in its own
+# header) restructured the inline `if thinking_text and loop.index0 > ... and
+# message.get('tool_calls')` guard into a separate `{%- set thinking_gate = ... -%}`
+# assignment — the old anchor below silently stopped matching (this packer degrades
+# to the stock template rather than raising), so `all_reasoning=True` quietly did
+# nothing: every dataset packed since then trained reasoning on only the LAST
+# assistant turn of each conversation instead of every turn. Verified against the
+# live template pulled from HF; added the new anchor as candidate #1, kept the old
+# one as a fallback for any tokenizer still shipping the earlier shape.
+_REASONING_GUARDS: dict[str, list[tuple[str, str]]] = {
+    "gemma": [
+        (
+            "{%- set thinking_gate = (loop.index0 > ns_turn.last_user_idx) or "
+            "(preserve_thinking and message.get('tool_calls')) -%}",
+            "{%- set thinking_gate = true -%}",
+        ),
+        (
+            "if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
+            "if thinking_text and role == 'model'",
+        ),
+    ],
+    "minimax": [
+        (
+            "if reasoning_content and loop.index0 > ns.last_user_index",
+            "if reasoning_content",
+        ),
+    ],
     # Qwen3.5 (legacy) template guards reasoning to turns after the last user query.
     # Qwen3.6 combines it with a `preserve_thinking` clause (so this exact substring is
     # absent) — there build_chat_template falls back to stock and pack_rows passes
     # preserve_thinking=True instead (see tokenize_row). Harmless either way.
-    "qwen": (
-        "{%- if loop.index0 > ns.last_query_index %}",
-        "{%- if loop.index0 >= 0 %}",
-    ),
+    "qwen": [
+        (
+            "{%- if loop.index0 > ns.last_query_index %}",
+            "{%- if loop.index0 >= 0 %}",
+        ),
+    ],
 }
 
 
@@ -135,13 +159,22 @@ def _import_parquet_writer():
 # assistant spans). `\n` below matches the literal backslash-n in the jinja string
 # literals. If any anchor is missing (template changed upstream) we log + skip
 # rather than raise, so packing still works (falls back to full-sequence labels).
+#
+# ⚠ 2026-07-21: anchors (B)'s opener and (D) drifted when google/gemma-4-26B-A4B-it's
+# template was updated (dated 2026-07-09) — (B) changed `message['tool_calls']`
+# (bracket access) to `message.get('tool_calls')`, and (D) added an `and not
+# next_nt.found` clause to the elif condition. Both silently missed since the
+# fallback is non-fatal (see `_add_gemma_generation_mask`) — every dataset packed
+# since then trained on the FULL sequence (system tool-declarations + user turns
+# included in labels), not just the assistant's own output. Re-verified against the
+# live template; fixed below.
 _GEMMA_GENERATION_REPS: list[tuple[str, str]] = [
     # (A) reasoning / thinking channel
     ("{{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}",
      "{% generation %}{{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}{% endgeneration %}"),
     # (B) tool_calls block (open at the `if`, close before the prev_message_type set)
-    ("{%- if message['tool_calls'] -%}",
-     "{%- if message['tool_calls'] -%}{% generation %}"),
+    ("{%- if message.get('tool_calls') -%}",
+     "{%- if message.get('tool_calls') -%}{% generation %}"),
     ("{%- set ns.prev_message_type = 'tool_call' -%}",
      "{% endgeneration %}{%- set ns.prev_message_type = 'tool_call' -%}"),
     # (C) captured text content — only for model turns (user/system content stays unmasked)
@@ -149,8 +182,8 @@ _GEMMA_GENERATION_REPS: list[tuple[str, str]] = [
      "{%- if role == 'model' -%}{% generation %}{{- captured_content -}}{% endgeneration %}"
      "{%- else -%}{{- captured_content -}}{%- endif -%}"),
     # (D) model turn-end delimiter (the elif branch fires for user/system too → gate on role)
-    ("{%- elif not (ns_tr_out.flag and not has_content) -%}\n            {{- '<turn|>\\n' -}}",
-     "{%- elif not (ns_tr_out.flag and not has_content) -%}\n            "
+    ("{%- elif not (ns_tr_out.flag and not has_content and not next_nt.found) -%}\n            {{- '<turn|>\\n' -}}",
+     "{%- elif not (ns_tr_out.flag and not has_content and not next_nt.found) -%}\n            "
      "{%- if role == 'model' -%}{% generation %}{{- '<turn|>\\n' -}}{% endgeneration %}"
      "{%- else -%}{{- '<turn|>\\n' -}}{%- endif -%}"),
 ]
@@ -181,12 +214,13 @@ def build_chat_template(tokenizer, all_reasoning: bool, arch: str = "generic") -
     if not tpl:
         return tpl
     if all_reasoning:
-        # Prefer this arch's guard; otherwise try any known guard (the arch detection
-        # is a name heuristic — a custom finetune name might not match).
+        # Prefer this arch's guard candidates (newest template shape first); otherwise
+        # try any known guard (the arch detection is a name heuristic — a custom
+        # finetune name might not match).
         candidates = []
         if arch in _REASONING_GUARDS:
-            candidates.append(_REASONING_GUARDS[arch])
-        candidates += [g for a, g in _REASONING_GUARDS.items() if a != arch]
+            candidates += _REASONING_GUARDS[arch]
+        candidates += [g for a, gs in _REASONING_GUARDS.items() if a != arch for g in gs]
         relaxed = None
         for stock_guard, replacement in candidates:
             if stock_guard in tpl:
@@ -744,6 +778,69 @@ def assert_invariants(sample: dict) -> None:
     assert int(np.sum(sample["attention_mask"])) == n, (
         f"sum(attention_mask)={int(np.sum(sample['attention_mask']))} != len(input_ids)={n}"
     )
+
+
+# ── post-hoc verification (the datasets UI "Verify pack" button) ────────────────
+# The packer asserts invariants at WRITE time; these read a written bin back and
+# re-check it non-destructively so the UI can prove a shard on disk is still sound.
+
+def check_bin(rec: dict) -> dict:
+    """Non-raising structural check of ONE packed bin read back from parquet. `rec`
+    carries whatever columns were read — input_ids/attention_mask always, labels &
+    position_ids when available. Mirrors `assert_invariants` + the assistant-mask
+    intent (a real mask trains SOME but not ALL tokens; an all-trained bin is the
+    gemma "no {% generation %}" regression that trains on the whole sequence)."""
+    ids = list(rec.get("input_ids") or [])
+    labels = list(rec.get("labels") or [])
+    pos = list(rec.get("position_ids") or [])
+    mask = list(rec.get("attention_mask") or [])
+    n = len(ids)
+    have_labels = len(labels) == n and n > 0
+    lengths_ok = (n > 0 and int(sum(mask)) == n
+                  and (not labels or len(labels) == n)
+                  and (not pos or len(pos) == n))
+    # position_ids reset per document: each doc's slice must be 0..L-1
+    pos_ok = True
+    if pos and lengths_ok:
+        p = 0
+        for length in mask:
+            if pos[p:p + length] != list(range(length)):
+                pos_ok = False
+                break
+            p += length
+    trained = sum(1 for x in labels if x != IGNORE_INDEX) if have_labels else 0
+    return {
+        "tokens": n,
+        "docs": len(mask),
+        "trained": trained,
+        "have_labels": have_labels,
+        "lengths_ok": bool(lengths_ok),
+        "position_ids_ok": bool(pos_ok),
+        # a genuine assistant-only mask trains a strict, non-empty subset
+        "assistant_masked": bool(have_labels and 0 < trained < n),
+    }
+
+
+# gemma renders a native tool call as `call:NAME{key:<|"|>value<|"|>}`; a str-typed
+# `arguments` cell that skipped str→dict normalization renders the args VERBATIM as
+# raw JSON — `call:NAME{"key": "value"}` — i.e. an ASCII quote right after the brace.
+# That's the silent gemma regression (see gateway CLAUDE.md llm_pack section). Other
+# archs use JSON args natively, so this is gemma-only.
+_GEMMA_RAWJSON_TOOLCALL = re.compile(r"call:[A-Za-z0-9_.\-]+\s*\{\s*\"")
+_TOOLCALL_MARKER = re.compile(r"\bcall:[A-Za-z0-9_.\-]+")
+
+
+def find_raw_json_toolcalls(text: str, arch: str) -> int:
+    """Count BROKEN (raw-JSON-args) tool-call renders in `text`. gemma-only defect —
+    returns 0 for any other arch (their native tool-call format IS JSON)."""
+    if arch != "gemma" or not text:
+        return 0
+    return len(_GEMMA_RAWJSON_TOOLCALL.findall(text))
+
+
+def count_toolcalls(text: str) -> int:
+    """How many `call:NAME` tool-call markers the decoded render contains."""
+    return len(_TOOLCALL_MARKER.findall(text)) if text else 0
 
 
 def pack_rows(

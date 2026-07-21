@@ -257,10 +257,16 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   // VM — see TryItCompute), decoupled from where the run trained, so every task type
   // (ASR / TTS / LLM) can try-it + export regardless of the training provider.
   const isVmRun = run.provider_kind === "vm";
+  // A multi-node sweep parent has NO top-level artifact of its own — each trial is
+  // its own independent TrainingRun (run_multi_node_sweep in training_api.py), with
+  // its own artifact. Try-it works on those directly via trial.run_id (verified:
+  // playground/start|status|chat|stop all operate on any completed run_id, sweep
+  // child or not — see SweepPlaygroundTab below), so show the tab once at least one
+  // trial has finished, even while the sweep as a whole is still running.
+  const tryitableTrials = trials.filter((t) => t.status === "done" && !!t.run_id);
   const canTryIt =
-    run.status === "done" &&
-    !!run.result_json?.artifact?.s3_uri &&
-    ((run.task_type ?? "asr") === "asr" || run.task_type === "tts" || run.task_type === "llm");
+    ((run.task_type ?? "asr") === "asr" || run.task_type === "tts" || run.task_type === "llm") &&
+    ((run.status === "done" && !!run.result_json?.artifact?.s3_uri) || tryitableTrials.length > 0);
   const metricLabel = run.task_type === "tts"
     ? "loss"
     : String((run.config_json?.eval_metric as string) || "wer").toUpperCase();
@@ -762,16 +768,18 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
 
         {canTryIt && (
           <TabsContent value="tryit" className="!flex-none">
-            {(run.task_type ?? "asr") === "tts"
-              ? <TtsPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
-                  runProviderId={run.provider_id ?? null} trainedOnVm={isVmRun}
-                  gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />
-              : run.task_type === "llm"
-                ? <LlmPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
-                    runProviderId={run.provider_id ?? null} />
-                : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
+            {tryitableTrials.length > 0
+              ? <SweepPlaygroundTab run={run} trials={tryitableTrials} isVmRun={isVmRun} />
+              : (run.task_type ?? "asr") === "tts"
+                ? <TtsPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
                     runProviderId={run.provider_id ?? null} trainedOnVm={isVmRun}
-                    gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />}
+                    gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />
+                : run.task_type === "llm"
+                  ? <LlmPlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
+                      runProviderId={run.provider_id ?? null} />
+                  : <PlaygroundTab runId={run.id} visibleDevices={run.visible_devices ?? null}
+                      runProviderId={run.provider_id ?? null} trainedOnVm={isVmRun}
+                      gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />}
           </TabsContent>
         )}
         {canTryIt && (
@@ -1578,6 +1586,101 @@ const LLM_SAMPLE_TOOLS = JSON.stringify([
   { type: "function", function: { name: "get_stock_price", description: "Latest stock price for a ticker symbol",
     parameters: { type: "object", properties: { ticker: { type: "string", description: "e.g. AAPL, MAYBANK" } }, required: ["ticker"] } } },
 ], null, 2);
+
+// Try-it for a sweep run — each trial is its OWN independent TrainingRun (multi-node
+// sweeps: run_multi_node_sweep in training_api.py), with its own artifact + provider/
+// GPU pin, so it try-it's exactly like a plain run via its own `run_id`. This wrapper
+// lets the user pick which trial(s) to load from a dropdown and load SEVERAL at once
+// — each opened trial renders its own independent playground tab (own poll loop, own
+// compute picker, own chat), so picking non-overlapping GPUs per trial serves them
+// concurrently (verified end-to-end: two trials merged + served simultaneously on
+// separate GPU pairs of the same box, each answering chat independently).
+function SweepPlaygroundTab({ run, trials, isVmRun }: {
+  run: TrainingRunRecord; trials: TrainingTrial[]; isVmRun: boolean;
+}) {
+  const sorted = [...trials].sort((a, b) => {
+    if (a.metric == null) return 1;
+    if (b.metric == null) return -1;
+    return a.metric - b.metric;
+  });
+  const [opened, setOpened] = useState<number[]>(() => (sorted[0] ? [sorted[0].trial] : []));
+
+  function openTrial(idx: number) {
+    setOpened((o) => (o.includes(idx) ? o : [...o, idx]));
+  }
+  function closeTrial(idx: number) {
+    setOpened((o) => o.filter((x) => x !== idx));
+  }
+
+  const availableToAdd = sorted.filter((t) => !opened.includes(t.trial));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2">
+        <span className="text-sm font-medium">Sweep trials</span>
+        {availableToAdd.length > 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button type="button" variant="outline" className="h-7 gap-1 text-xs">
+                + Add model <ChevronDown className="h-3.5 w-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              {availableToAdd.map((t) => (
+                <DropdownMenuItem key={t.trial} onClick={() => openTrial(t.trial)} className="font-mono text-xs">
+                  t{t.trial} — {Object.entries(t.params || {}).map(([k, v]) => `${k}=${v}`).join(", ") || "—"}
+                  {t.metric != null ? ` · ${fmt(t.metric, 3)}` : ""}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        <span className="text-[11px] text-muted-foreground">
+          Each trial loads its own vLLM server — pick different GPUs per trial (in its own Run-on picker below) to run them concurrently.
+        </span>
+      </div>
+
+      {opened.length === 0 && (
+        <p className="text-sm text-muted-foreground">No models loaded — add one above.</p>
+      )}
+
+      {opened.map((idx) => {
+        const t = sorted.find((x) => x.trial === idx);
+        if (!t || !t.run_id) return null;
+        const runId = t.run_id;
+        const visibleDevices = t.node?.visible_devices ?? null;
+        const runProviderId = t.node?.provider_id ?? run.provider_id ?? null;
+        return (
+          <Card key={idx}>
+            <CardHeader className="flex flex-row items-center justify-between gap-2 pb-2">
+              <CardTitle className="text-sm">
+                <span className="font-mono">t{idx}</span>
+                {" — "}
+                <span className="font-mono text-xs text-muted-foreground">
+                  {Object.entries(t.params || {}).map(([k, v]) => `${k}=${v}`).join(", ") || "—"}
+                </span>
+                {t.metric != null && <span className="ml-2 font-mono text-xs text-muted-foreground">· {fmt(t.metric, 3)}</span>}
+                <span className="ml-2 font-mono text-xs text-muted-foreground">({runId})</span>
+              </CardTitle>
+              <Button type="button" variant="ghost" className="h-7 shrink-0 px-2" onClick={() => closeTrial(idx)} aria-label="close">
+                <X className="h-4 w-4" />
+              </Button>
+            </CardHeader>
+            <CardContent>
+              {(run.task_type ?? "asr") === "tts"
+                ? <TtsPlaygroundTab runId={runId} visibleDevices={visibleDevices} runProviderId={runProviderId}
+                    trainedOnVm={isVmRun} gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />
+                : run.task_type === "llm"
+                  ? <LlmPlaygroundTab runId={runId} visibleDevices={visibleDevices} runProviderId={runProviderId} />
+                  : <PlaygroundTab runId={runId} visibleDevices={visibleDevices} runProviderId={runProviderId}
+                      trainedOnVm={isVmRun} gpuType={run.gpu_type ?? null} gpuCount={run.gpu_count ?? null} />}
+            </CardContent>
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
 
 // Try-it playground (LLM, gemma-4) — load the finetuned model via vLLM (eager) on
 // the run's VM (download LoRA → merge → save → serve), then stream chat completions.

@@ -31,13 +31,14 @@ import sys
 import threading
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-WORKERS = {"asr": "whisper_finetune.py", "tts": "tts_finetune.py"}
+WORKERS = {"asr": "whisper_finetune.py", "tts": "tts_finetune.py", "llm": "llm_finetune.py"}
 # Tasks whose worker is an ORCHESTRATOR — it launches its own torch.distributed.run
-# (TTS: tts_finetune spawns torchrun for qwen3). Such a worker must be run DIRECTLY
+# (TTS: tts_finetune spawns torchrun for qwen3; LLM: llm_finetune reads CUDA_VISIBLE_DEVICES
+# via its own _nproc() and torchruns the per-arch trainer). Such a worker must be run DIRECTLY
 # (never under an outer torchrun, which would nest launchers); it reads the GPU
 # slice from CUDA_VISIBLE_DEVICES and picks its own nproc. ASR's worker IS the
 # trainer, so it's run as N ranks under torchrun for a multi-GPU trial.
-ORCHESTRATOR_TASKS = {"tts"}
+ORCHESTRATOR_TASKS = {"tts", "llm"}
 
 
 def log(m: str) -> None:

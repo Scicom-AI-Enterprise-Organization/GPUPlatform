@@ -18,6 +18,7 @@ credentials and platform-wide infra config, like GPU Providers.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -38,7 +39,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from . import audit as audit_module
 from . import crypto
 from .auth import current_user, require_admin
-from .db import Storage, User, get_session
+from .db import Storage, User, get_session, session_factory
 
 logger = logging.getLogger("gateway.storage")
 
@@ -170,6 +171,13 @@ class StorageRecord(BaseModel):
     notes: Optional[str] = None
     created_at: str
     created_by: str
+    # Cached storage usage (s3 only) — computed on demand (usage/scan), NOT per list
+    # request (a full-bucket walk is O(objects)). Null until first computed.
+    total_size_bytes: Optional[int] = None
+    object_count: Optional[int] = None
+    size_computed_at: Optional[str] = None
+    # True while a background cleanup is deleting from this storage (s3 only).
+    purge_running: bool = False
 
 
 # ---------- helpers -----------------------------------------------------
@@ -177,6 +185,7 @@ class StorageRecord(BaseModel):
 
 def _to_record(s: Storage, owner_username: str) -> StorageRecord:
     cfg = s.config or {}
+    usage = cfg.get("usage") or {}
     return StorageRecord(
         id=s.id,
         name=s.name,
@@ -185,6 +194,10 @@ def _to_record(s: Storage, owner_username: str) -> StorageRecord:
         prefix=cfg.get("prefix"),
         region=cfg.get("region"),
         endpoint=cfg.get("endpoint"),
+        total_size_bytes=usage.get("bytes"),
+        object_count=usage.get("objects"),
+        size_computed_at=usage.get("computed_at"),
+        purge_running=(_PURGE_JOBS.get(s.id, {}).get("state") == "running"),
         has_credentials=(
             bool(cfg.get("credentials_enc"))
             or bool(cfg.get("hf_token_secret"))
@@ -704,3 +717,246 @@ async def delete_storage(
         details={"kind": kind},
     )
     return {"ok": True, "id": storage_id}
+
+
+# ---------- usage + cleanup (s3 only) -----------------------------------
+# Computing total size or scanning for junk means a full-bucket LIST (O(objects)),
+# so it's on-demand + cached in config["usage"], never inline on the list route.
+
+DEFAULT_PURGE_AGE_DAYS = 30
+
+
+class PurgeScanRequest(BaseModel):
+    max_age_days: Optional[int] = None  # ephemeral-dir age cutoff; None → 30, 0 → no age rule
+
+
+class PurgeRequest(BaseModel):
+    prefixes: list[str]                 # exactly the group prefixes the scan proposed
+    max_age_days: Optional[int] = None  # re-validated at delete time with the same rule
+
+
+def _s3_for_storage(s: Storage):
+    """(S3Target, normalized base prefix) for a kind=s3 storage — absolute keys are
+    passed to the s3 helpers, so `prefix_root` is irrelevant here."""
+    from . import bench
+    target = bench._target_from_storage_row(s)
+    base = ((s.config or {}).get("prefix") or "").strip().strip("/")
+    return target, (f"{base}/" if base else "")
+
+
+async def _live_owner_ids(session: AsyncSession) -> dict[str, set[str]]:
+    """The set of ids still alive per owner-kind, for orphan detection. Ids are
+    globally unique, so membership (not storage_id) decides ownership."""
+    from .db import Dataset, App
+    from .bench import Benchmark
+    from .training_api import TrainingRun
+    from .quantization_api import QuantizationJob
+
+    async def ids(col):
+        return set((await session.execute(select(col))).scalars().all())
+
+    return {
+        "dataset": await ids(Dataset.id),
+        "app": await ids(App.app_id),  # serverless-logs/<app_id>/… — App PK is app_id
+        "benchmark": await ids(Benchmark.id),
+        "training_run": await ids(TrainingRun.id),
+        "quant_job": await ids(QuantizationJob.id),
+    }
+
+
+async def _live_repo_prefixes(session: AsyncSession, storage_id: str) -> list[str]:
+    """Key prefixes of live catalog (HF-mirror) repos on this storage — protected."""
+    from .db import CatalogRepo
+    rows = (await session.execute(
+        select(CatalogRepo.prefix).where(CatalogRepo.storage_id == storage_id)
+    )).scalars().all()
+    return [p for p in rows if p]
+
+
+async def _require_s3_storage(session: AsyncSession, storage_id: str) -> Storage:
+    s = await session.get(Storage, storage_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="storage not found")
+    if s.kind != "s3":
+        raise HTTPException(status_code=400, detail="usage/cleanup is only available for s3 storage")
+    return s
+
+
+async def _cache_usage(session: AsyncSession, s: Storage, total_bytes: int, total_objects: int) -> None:
+    cfg = dict(s.config or {})
+    cfg["usage"] = {
+        "bytes": int(total_bytes),
+        "objects": int(total_objects),
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    s.config = cfg
+    flag_modified(s, "config")
+    await session.commit()
+
+
+@router.get("/{storage_id}/usage")
+async def storage_usage(
+    storage_id: str,
+    refresh: bool = False,
+    user: User = Depends(require_admin),  # noqa: ARG001 — a full-bucket walk is an infra op
+    session: AsyncSession = Depends(get_session),
+):
+    """Total size + object count for an s3 storage. Returns the cached value unless
+    `refresh=true`, which re-walks the bucket (O(objects)) and re-caches it."""
+    s = await _require_s3_storage(session, storage_id)
+    cfg = s.config or {}
+    if not refresh and cfg.get("usage"):
+        return {"storage_id": storage_id, "cached": True, **cfg["usage"]}
+    target, base = _s3_for_storage(s)
+    from . import bench
+    objs = await run_in_threadpool(bench.s3_list, base, target)
+    total_bytes = sum(int(o.get("size") or 0) for o in objs)
+    await _cache_usage(session, s, total_bytes, len(objs))
+    return {"storage_id": storage_id, "cached": False,
+            "bytes": total_bytes, "objects": len(objs),
+            "computed_at": (s.config or {}).get("usage", {}).get("computed_at")}
+
+
+async def _scan_storage(session: AsyncSession, s: Storage, max_age_days: Optional[int]) -> dict:
+    """List the bucket once, classify (orphan + aged), cache usage. Shared by the
+    dry-run scan and the delete re-validation so both see identical classification."""
+    from . import bench
+    from . import storage_purge
+    from datetime import timedelta
+    target, base = _s3_for_storage(s)
+    objs = await run_in_threadpool(bench.s3_list, base, target)
+    live = await _live_owner_ids(session)
+    repos = await _live_repo_prefixes(session, s.id)
+    days = DEFAULT_PURGE_AGE_DAYS if max_age_days is None else int(max_age_days)
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat() if days > 0 else None
+    result = storage_purge.categorize(
+        objs, base=base, live_ids=live, repo_prefixes=repos, cutoff_iso=cutoff_iso,
+    )
+    await _cache_usage(session, s, result["total_bytes"], result["total_objects"])
+    result["age_days"] = days
+    return result
+
+
+@router.post("/{storage_id}/purge-scan")
+async def storage_purge_scan(
+    storage_id: str,
+    req: PurgeScanRequest,
+    user: User = Depends(require_admin),  # noqa: ARG001
+    session: AsyncSession = Depends(get_session),
+):
+    """DRY RUN — list what cleanup WOULD delete (orphaned + aged), grouped, with
+    reclaimable bytes. Deletes nothing. Also refreshes the cached total size."""
+    s = await _require_s3_storage(session, storage_id)
+    result = await _scan_storage(session, s, req.max_age_days)
+    return {"storage_id": storage_id, **result}
+
+
+# Deleting hundreds of GB / 100k+ objects takes minutes, so purge runs as a
+# BACKGROUND task and the UI polls progress — the request returns as soon as the
+# job is launched. One job per storage at a time; state is in-memory (a manual
+# admin op, re-runnable, so it's not persisted like training runs).
+_PURGE_JOBS: dict[str, dict] = {}
+_PURGE_TASKS: set = set()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _job_public(job: dict) -> dict:
+    """The status shape the UI polls (drops internal bookkeeping keys)."""
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+async def _run_purge(storage_id: str, job: dict, todo: list[dict], target) -> None:
+    """Delete each group's prefix, updating `job` progress after every batch /
+    prefix. Refreshes the cached usage at the end. Never raises to the caller —
+    failures land in job['state']='error'."""
+    from . import bench
+    try:
+        for g in todo:
+            prefix = g["prefix"]
+            n = await run_in_threadpool(
+                bench.s3_delete_prefix, prefix, target,
+                lambda k: job.__setitem__("deleted_objects", job["deleted_objects"] + k),
+            )
+            job["freed_bytes"] += g["bytes"]
+            job["done_prefixes"] += 1
+            job["deleted"].append({"prefix": prefix, "objects": n, "bytes": g["bytes"]})
+        job["state"] = "done"
+    except Exception as e:  # noqa: BLE001 — surface to the poller, don't crash the loop
+        job["state"] = "error"
+        job["error"] = str(e)
+        logger.warning("storage purge %s failed: %s", storage_id, e)
+    finally:
+        job["finished_at"] = _now_iso()
+        try:
+            async with session_factory()() as sess:
+                s = await sess.get(Storage, storage_id)
+                if s is not None:
+                    await _cache_usage(
+                        sess, s,
+                        max(0, job["_scan_bytes"] - job["freed_bytes"]),
+                        max(0, job["_scan_objects"] - job["deleted_objects"]),
+                    )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("storage purge %s usage refresh failed: %s", storage_id, e)
+
+
+@router.post("/{storage_id}/purge")
+async def storage_purge_delete(
+    storage_id: str,
+    req: PurgeRequest,
+    user: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    """Launch a background delete of the confirmed prefixes. RE-VALIDATES each
+    against a fresh scan first (a prefix that became live is skipped, never
+    deleted), then returns immediately with a running job; poll `/purge-status`."""
+    s = await _require_s3_storage(session, storage_id)
+    requested = {p.strip() for p in (req.prefixes or []) if p and p.strip()}
+    if not requested:
+        raise HTTPException(status_code=400, detail="no prefixes to delete")
+    running = _PURGE_JOBS.get(storage_id)
+    if running and running.get("state") == "running":
+        raise HTTPException(status_code=409, detail="a cleanup is already running for this storage")
+    scan = await _scan_storage(session, s, req.max_age_days)
+    purgeable = {g["prefix"]: g for g in scan["groups"] if g["purgeable"]}
+    todo = [purgeable[p] for p in requested if p in purgeable]
+    skipped = [{"prefix": p, "reason": "no longer purgeable (now live or gone)"}
+               for p in requested if p not in purgeable]
+    target, _base = _s3_for_storage(s)
+    job = _PURGE_JOBS[storage_id] = {
+        "storage_id": storage_id, "job_id": "purge-" + secrets.token_hex(6),
+        "state": "running", "started_at": _now_iso(), "finished_at": None,
+        "total_prefixes": len(todo), "done_prefixes": 0,
+        "target_objects": sum(g["objects"] for g in todo),
+        "target_bytes": sum(g["bytes"] for g in todo),
+        "deleted_objects": 0, "freed_bytes": 0,
+        "deleted": [], "skipped": skipped, "error": None,
+        "_scan_bytes": scan["total_bytes"], "_scan_objects": scan["total_objects"],
+    }
+    task = asyncio.create_task(_run_purge(storage_id, job, todo, target))
+    _PURGE_TASKS.add(task)
+    task.add_done_callback(_PURGE_TASKS.discard)
+    await audit_module.record(
+        user, "storage.purge", "storage", storage_id, s.name,
+        details={"prefixes": len(todo), "target_objects": job["target_objects"],
+                 "target_bytes": job["target_bytes"]},
+    )
+    return _job_public(job)
+
+
+@router.get("/{storage_id}/purge-status")
+async def storage_purge_status(
+    storage_id: str,
+    user: User = Depends(require_admin),  # noqa: ARG001
+    session: AsyncSession = Depends(get_session),
+):
+    """Progress of the current/last cleanup for this storage (`state=idle` if none).
+    The UI polls this while a delete runs, and on reopen to resume the progress view."""
+    await _require_s3_storage(session, storage_id)
+    job = _PURGE_JOBS.get(storage_id)
+    if not job:
+        return {"storage_id": storage_id, "state": "idle"}
+    return _job_public(job)

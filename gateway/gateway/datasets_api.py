@@ -1865,38 +1865,79 @@ def _read_packed_parquet(target: "S3Target", s3_uri: str, cap: int = 5000) -> li
     return out
 
 
+def _fast_tokenizer(repo_id: str, hf_token: Optional[str]):
+    """A cached `tokenizers.Tokenizer` for `repo_id` (downloads only tokenizer.json —
+    no torch/transformers). Shared by the packed decode + verify paths."""
+    tok = _TTS_TOKENIZER_CACHE.get(repo_id)
+    if tok is None:
+        from tokenizers import Tokenizer
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(repo_id, "tokenizer.json", token=hf_token or None)
+        tok = Tokenizer.from_file(path)
+        _TTS_TOKENIZER_CACHE[repo_id] = tok
+    return tok
+
+
+def _mask_segments(tok, ids: list, labels: list) -> tuple[list[dict], int]:
+    """Split `ids` into contiguous [{text, trained}] runs at every labels != -100
+    transition, so the UI can highlight exactly the assistant-trained spans. Returns
+    (segments, trained_token_count). Decoding run-by-run is clean here because the
+    boundaries fall on turn edges (whitespace), not mid-word BPE merges."""
+    segs: list[dict] = []
+    trained = 0
+    i, n = 0, len(ids)
+    while i < n:
+        on = labels[i] != -100
+        j = i
+        while j < n and (labels[j] != -100) == on:
+            j += 1
+        segs.append({"text": tok.decode(ids[i:j], skip_special_tokens=False), "trained": on})
+        if on:
+            trained += j - i
+        i = j
+    return segs, trained
+
+
 def _decode_packed_record(repo_id: str, hf_token: Optional[str], rec: dict,
                           objective: Optional[str] = None) -> dict:
-    """Decode one packed record's token ids to text with the run's Qwen3 tokenizer
+    """Decode one packed record's token ids to text with the pack's tokenizer
     (cached). Splits by attention_mask so each multipacked utterance shows on its
     own; speech tokens render as `<|s_N|>`, control tokens kept (not stripped).
+
+    When the record carries a `labels` column (llm packs), each utterance also gets
+    `segments` ([{text, trained}]) + a `trained` token count so the UI can highlight
+    the assistant-only mask; a top-level `assistant_masked`/`num_trained` summarizes it.
 
     For a DPO pack (`objective="dpo"`) the bin holds 2K docs — first K chosen, last K
     rejected (llm_pack.collate_dpo_bin) — so it ALSO returns `pairs`: a list of
     {index, chosen, rejected} so the UI can show each preference pair side by side
     instead of a flat 2K-utterance list."""
-    from tokenizers import Tokenizer
-
-    tok = _TTS_TOKENIZER_CACHE.get(repo_id)
-    if tok is None:
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id, "tokenizer.json", token=hf_token or None)
-        tok = Tokenizer.from_file(path)
-        _TTS_TOKENIZER_CACHE[repo_id] = tok
+    tok = _fast_tokenizer(repo_id, hf_token)
 
     ids = rec.get("input_ids") or []
     mask = rec.get("attention_mask") or []
-    utts, pos = [], 0
+    labels = rec.get("labels") or []
+    have_labels = len(labels) == len(ids) and len(ids) > 0
+    utts, pos, total_trained = [], 0, 0
     for length in mask:
         seg = ids[pos:pos + length]
+        u = {"tokens": len(seg), "text": tok.decode(seg, skip_special_tokens=False)}
+        if have_labels:
+            segs, tr = _mask_segments(tok, seg, labels[pos:pos + length])
+            u["segments"] = segs
+            u["trained"] = tr
+            total_trained += tr
+        utts.append(u)
         pos += length
-        utts.append({"tokens": len(seg), "text": tok.decode(seg, skip_special_tokens=False)})
     out = {
         "num_tokens": len(ids),
         "num_utterances": len(utts),
         "utterances": utts,
         "full_text": tok.decode(ids, skip_special_tokens=False),
     }
+    if have_labels:
+        out["num_trained"] = total_trained
+        out["assistant_masked"] = 0 < total_trained < len(ids)
     if objective == "dpo" and utts and len(utts) % 2 == 0:
         K = len(utts) // 2
         out["objective"] = "dpo"
@@ -2010,15 +2051,22 @@ def _read_shard_columns(target: "S3Target", prefix: str, basename: str, columns:
     try:
         fs = _arrow_s3fs(target)
         with fs.open_input_file(f"{target.bucket}/{key}") as f:
-            tbl = pq.ParquetFile(f).read(columns=columns)
+            pf = pq.ParquetFile(f)
+            # Only request columns the shard actually has — legacy/tts packs may lack
+            # `labels`/`position_ids`, and pyarrow raises on a missing column name.
+            use = [c for c in columns if c in pf.schema_arrow.names]
+            tbl = pf.read(columns=use)
     except Exception as e:  # noqa: BLE001 — range read unavailable → whole-shard fallback
         logger.info("packed shard range-read fell back to full download (%s): %s", key, e)
         body = bench.s3_get_bytes(key, target)
         if body is None:
             raise RuntimeError(f"packed shard not found: {key}")
-        tbl = pq.read_table(_io.BytesIO(body), columns=columns)
-    cols = {c: tbl.column(c).to_pylist() for c in columns}
-    return [{c: list(cols[c][i] or []) for c in columns} for i in range(tbl.num_rows)]
+        avail = set(pq.read_schema(_io.BytesIO(body)).names)
+        use = [c for c in columns if c in avail]
+        tbl = pq.read_table(_io.BytesIO(body), columns=use)
+    got = tbl.column_names
+    cols = {c: tbl.column(c).to_pylist() for c in got}
+    return [{c: list(cols[c][i] or []) for c in got} for i in range(tbl.num_rows)]
 
 
 def _read_shard_masks(target: "S3Target", prefix: str, basename: str) -> list[list[int]]:
@@ -2033,15 +2081,20 @@ def _read_shard_masks(target: "S3Target", prefix: str, basename: str) -> list[li
     return masks
 
 
-def _read_shard_records(target: "S3Target", prefix: str, basename: str) -> list[dict]:
-    """Full {input_ids, attention_mask} records for one shard (bounded LRU — the
-    decode path re-hits the same shard as the user expands several rows in it)."""
-    ck = f"{target.bucket}/{prefix}{basename}"
+def _read_shard_records(target: "S3Target", prefix: str, basename: str,
+                        columns: tuple[str, ...] = ("input_ids", "attention_mask")) -> list[dict]:
+    """Full records for one shard (bounded LRU — the decode path re-hits the same
+    shard as the user expands several rows in it). `columns` selects which parquet
+    columns to pull; the decode/verify paths add `labels` (+ `position_ids`) to
+    inspect the assistant mask. Cache key includes the column set so a labels-less
+    read and a labels-ful read don't alias."""
+    cols = tuple(columns)
+    ck = f"{target.bucket}/{prefix}{basename}::{','.join(cols)}"
     hit = _PACKED_REC_CACHE.get(ck)
     if hit is not None:
         _PACKED_REC_CACHE.move_to_end(ck)
         return hit
-    recs = _read_shard_columns(target, prefix, basename, ["input_ids", "attention_mask"])
+    recs = _read_shard_columns(target, prefix, basename, list(cols))
     _PACKED_REC_CACHE[ck] = recs
     _PACKED_REC_CACHE.move_to_end(ck)
     while len(_PACKED_REC_CACHE) > _PACKED_REC_CACHE_MAX:
@@ -2075,9 +2128,11 @@ def _packed_page_meta(target: "S3Target", s3_uri: str, split: Optional[str],
 
 
 def _packed_one_record(target: "S3Target", s3_uri: str, split: Optional[str],
-                       index: int) -> Optional[tuple[Optional[dict], int]]:
-    """(one {input_ids, attention_mask} record at global `index`, total) read from its
-    single shard. None → no manifest (legacy pack). (None, total) → index out of range."""
+                       index: int,
+                       columns: tuple[str, ...] = ("input_ids", "attention_mask")) -> Optional[tuple[Optional[dict], int]]:
+    """(one record at global `index`, total) read from its single shard. `columns`
+    selects the parquet columns (decode/verify add `labels`/`position_ids`).
+    None → no manifest (legacy pack). (None, total) → index out of range."""
     t, prefix = _packed_target_prefix(target, s3_uri, split)
     shards = _packed_shard_index(t, prefix)
     if shards is None:
@@ -2088,7 +2143,7 @@ def _packed_one_record(target: "S3Target", s3_uri: str, split: Optional[str],
         n = s["samples"]
         start, seen = seen, seen + n
         if start <= index < start + n:
-            recs = _read_shard_records(t, prefix, s["basename"])
+            recs = _read_shard_records(t, prefix, s["basename"], columns)
             local = index - start
             return (recs[local] if 0 <= local < len(recs) else None), total
     return None, total
@@ -2412,6 +2467,108 @@ async def set_row_inclusion(
     return {"excluded_count": len(cur)}
 
 
+def _sample_indices(total: int, m: int) -> list[int]:
+    """`m` evenly-spaced unique bin indices spanning 0..total-1 (endpoints included),
+    so a verify sweep covers the whole shard set, not just the first page."""
+    if total <= 0:
+        return []
+    m = min(m, total)
+    if m == 1:
+        return [0]
+    return sorted({round(k * (total - 1) / (m - 1)) for k in range(m)})
+
+
+def _aggregate_verify(sampled: list[tuple[int, dict]], arch: str,
+                      objective: Optional[str], tok, total: int) -> dict:
+    """Run the pure per-bin checks over the sampled records + a gemma-only decoded
+    tool-call scan, and roll them up into the summary the UI renders."""
+    from .llm_pack import check_bin, find_raw_json_toolcalls, count_toolcalls
+
+    bins: list[dict] = []
+    bad_len, bad_pos, unmasked, trained_pcts = [], [], [], []
+    any_labels = False
+    tc_bins = rawjson_bins = 0
+    for gi, rec in sampled:
+        c = check_bin(rec)
+        c["index"] = gi
+        bins.append(c)
+        if not c["lengths_ok"]:
+            bad_len.append(gi)
+        if not c["position_ids_ok"]:
+            bad_pos.append(gi)
+        if c["have_labels"]:
+            any_labels = True
+            trained_pcts.append(100.0 * c["trained"] / c["tokens"] if c["tokens"] else 0.0)
+            if not c["assistant_masked"]:
+                unmasked.append(gi)
+        if tok is not None:  # gemma: decode + scan for raw-JSON tool-call args
+            text = tok.decode(rec.get("input_ids") or [], skip_special_tokens=False)
+            if count_toolcalls(text) > 0:
+                tc_bins += 1
+                if find_raw_json_toolcalls(text, arch) > 0:
+                    rawjson_bins += 1
+    n = len(sampled)
+    avg_trained = round(sum(trained_pcts) / len(trained_pcts), 1) if trained_pcts else None
+    checks = {
+        "invariants": {"ok": len(bad_len) == 0, "failed_bins": bad_len[:10]},
+        "position_ids": {"ok": len(bad_pos) == 0, "failed_bins": bad_pos[:10]},
+        "assistant_mask": {
+            "applicable": any_labels,
+            "ok": bool(any_labels and not unmasked),
+            "masked_bins": sum(1 for b in bins if b.get("assistant_masked")),
+            "sampled": n,
+            "avg_trained_pct": avg_trained,
+            "unmasked_bins": unmasked[:10],
+        },
+        "tool_calls": {
+            "applicable": tok is not None,
+            "ok": rawjson_bins == 0,
+            "bins_with_tool_calls": tc_bins,
+            "raw_json_bins": rawjson_bins,
+        },
+    }
+    return {"sampled": n, "total_bins": total, "arch": arch,
+            "objective": objective, "checks": checks, "bins": bins}
+
+
+def _verify_pack_sync(target: "S3Target", s3_uri: str, split: Optional[str],
+                      repo_id: str, hf_token: Optional[str], arch: str,
+                      objective: Optional[str], sample: int) -> dict:
+    """Read a sampled set of bins (grouping reads by shard) and verify each. The
+    tool-call scan needs the tokenizer, so it's loaded once — and only for gemma
+    (the only arch whose native tool-call format a JSON-string args cell breaks)."""
+    t, prefix = _packed_target_prefix(target, s3_uri, split)
+    cols = ("input_ids", "attention_mask", "labels", "position_ids")
+    tok = _fast_tokenizer(repo_id, hf_token) if arch == "gemma" else None
+    shards = _packed_shard_index(t, prefix)
+    if shards is None:
+        # legacy pack (no manifest): read everything (ids+mask only — no labels).
+        recs = _read_packed_parquet(t, s3_uri)
+        total = len(recs)
+        sampled = [(i, recs[i]) for i in _sample_indices(total, sample) if i < len(recs)]
+        return _aggregate_verify(sampled, arch, objective, tok, total)
+    ranges, seen = [], 0
+    for s in shards:
+        n = s["samples"]
+        ranges.append((seen, seen + n, s["basename"]))
+        seen += n
+    total = seen
+    by_shard: dict[str, list[tuple[int, int]]] = {}
+    for gi in _sample_indices(total, sample):
+        for start, end, base in ranges:
+            if start <= gi < end:
+                by_shard.setdefault(base, []).append((gi, gi - start))
+                break
+    sampled: list[tuple[int, dict]] = []
+    for base, items in by_shard.items():
+        recs = _read_shard_records(t, prefix, base, cols)
+        for gi, local in items:
+            if 0 <= local < len(recs):
+                sampled.append((gi, recs[local]))
+    sampled.sort()
+    return _aggregate_verify(sampled, arch, objective, tok, total)
+
+
 @router.get("/{dataset_id}/packed-row")
 async def packed_row(
     dataset_id: str,
@@ -2432,9 +2589,14 @@ async def packed_row(
     target, _base = _s3_target_and_prefix(storage)
     pack_splits = list((_pack_meta(d).get("splits") or {}).keys())
     used_split = (split if (split and split in pack_splits) else (pack_splits[0] if pack_splits else None))
+    # LLM packs carry a `labels` column (assistant mask) — pull it so the decode can
+    # highlight the trained spans. tts packs have no meaningful mask (skip → lighter read).
+    want_cols = (("input_ids", "attention_mask", "labels")
+                 if d.kind in ("llm_packed", "llm_dpo_packed")
+                 else ("input_ids", "attention_mask"))
     # Read just the one shard holding `index` (via the index.json manifest); legacy
     # packs with no manifest fall back to the read-everything path.
-    one = await _run_sync(_packed_one_record, target, d.s3_metadata_uri, used_split, index)
+    one = await _run_sync(_packed_one_record, target, d.s3_metadata_uri, used_split, index, want_cols)
     if one is None:
         recs = await _packed_records_cached(dataset_id, target, d.s3_metadata_uri, used_split)
         rec, total = (recs[index] if index < len(recs) else None), len(recs)
@@ -2452,6 +2614,43 @@ async def packed_row(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"decode failed (tokenizer {repo_id}): {e}")
     return {"index": index, "tokenizer": repo_id, **decoded}
+
+
+@router.get("/{dataset_id}/verify-pack")
+async def verify_pack(
+    dataset_id: str,
+    sample: int = Query(20, ge=1, le=200, description="how many bins to sample across the pack"),
+    split: Optional[str] = Query(None, description="which packed split to verify"),
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Sample `sample` bins evenly across an llm_packed / llm_dpo_packed dataset and
+    re-check them against the tokenizer chat template: the write-time invariants
+    (ids==labels==position_ids==Σattention_mask, position_ids reset per doc), that a
+    real assistant-only label mask is present (trains a strict subset — an all-trained
+    bin is the gemma no-`{% generation %}` regression), and (gemma only) that tool
+    calls render native instead of raw-JSON args. Powers the UI 'Verify pack' button."""
+    d = await _require_dataset(session, dataset_id, user)
+    if d.kind not in ("llm_packed", "llm_dpo_packed"):
+        raise HTTPException(status_code=400, detail="verify is only for llm_packed / llm_dpo_packed datasets")
+    if not (d.storage_id and d.s3_metadata_uri):
+        raise HTTPException(status_code=400, detail="packed dataset has no storage / shards")
+    storage = await _load_storage(session, d.storage_id)
+    target, _base = _s3_target_and_prefix(storage)
+    meta = _pack_meta(d)
+    pack_splits = list((meta.get("splits") or {}).keys())
+    used_split = (split if (split and split in pack_splits) else (pack_splits[0] if pack_splits else None))
+    repo_id = _pack_tokenizer(d)
+    arch = meta.get("arch") or ""  # empty → gemma-only tool-call scan is skipped
+    objective = meta.get("objective")
+    from .global_env_api import load_global_env
+    hf_token = (await load_global_env(session)).get("HF_TOKEN") or os.environ.get("HF_TOKEN")
+    try:
+        result = await _run_sync(_verify_pack_sync, target, d.s3_metadata_uri, used_split,
+                                 repo_id, hf_token, arch, objective, sample)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"verify failed (tokenizer {repo_id}): {e}")
+    return {"tokenizer": repo_id, "split": used_split, **result}
 
 
 # ---------- persistent NeuCodec decoder (play a packed utterance as audio) ------

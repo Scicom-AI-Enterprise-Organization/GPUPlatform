@@ -14,6 +14,7 @@ is collecting); `cleanup_orphaned_running()` marks such rows failed on startup.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ import re
 import shlex
 import subprocess
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
@@ -2845,6 +2847,13 @@ async def training_janitor_loop(redis, interval: int = 90) -> None:
 # ---------- schemas ------------------------------------------------------
 
 
+class NodeSpec(BaseModel):
+    """One (provider, GPU-range) target for a multi-node sweep. `visible_devices`
+    empty/None -> resolve to ALL of that provider's GPUs at create time."""
+    provider_id: str
+    visible_devices: Optional[str] = None
+
+
 class CreateTrainingRunRequest(BaseModel):
     name: str
     dataset_id: str
@@ -2867,6 +2876,18 @@ class CreateTrainingRunRequest(BaseModel):
     # box (concurrency = #gpus / gpus_per_trial). Empty = single run.
     sweep: dict = {}
     gpus_per_trial: int = 1
+    # Multi-node sweep: several (provider, GPU-range) targets instead of one
+    # provider_id/visible_devices pool. Each node contributes floor(its GPU
+    # count / gpus_per_trial) concurrent trial slots; trials are drawn from a
+    # shared queue as slots free up. Each trial is still a normal single-node
+    # run (NO cross-host distributed training) — this only fans a sweep's
+    # grid out across boxes. None/empty -> the existing single-box sweep path.
+    nodes: Optional[list[NodeSpec]] = None
+    # Internal: set by run_multi_node_sweep on each per-trial child body it creates
+    # (never sent by a real client) — marks this run as a child of a multi-node sweep
+    # so the list endpoints can hide it by default (the parent row is what users browse;
+    # children stay individually reachable via GET /{run_id} and the parent's trials[]).
+    sweep_parent_id: Optional[str] = None
     # Hyperparams + split + eval settings (all optional; trainer has defaults).
     eval_metric: str = "wer"           # "wer" | "cer" (ASR only)
     # Normalize text (case/punctuation/numbers) before WER/CER, Whisper-style.
@@ -3234,13 +3255,14 @@ def _validate_sweep(sweep: dict) -> None:
             raise HTTPException(status_code=400, detail=f"sweep use_lora: {v!r} must be on/off")
 
 
-@router.post("", response_model=TrainingRunRecord)
-async def create_training_run(
-    body: CreateTrainingRunRequest,
-    request: Request,
-    user: User = Depends(require_section("autotrain")),
-    session: AsyncSession = Depends(get_session),
-):
+async def _create_and_launch_run(
+    body: CreateTrainingRunRequest, user: User, session: AsyncSession, redis,
+) -> TrainingRun:
+    """Validate + insert + launch ONE training run. Shared by the HTTP endpoint
+    (create_training_run) and the multi-node sweep dispatcher (_run_multi_node_sweep),
+    which calls this once per trial with a node-specific provider_id/visible_devices
+    and that trial's swept hyperparams overlaid — each trial is a normal single
+    (non-sweep) run under the hood, just launched programmatically instead of over HTTP."""
     ds = await session.get(Dataset, body.dataset_id)
     if ds is None or (ds.owner_id != user.id and not user.is_admin):
         raise HTTPException(status_code=400, detail="unknown dataset_id")
@@ -3366,51 +3388,74 @@ async def create_training_run(
             vm_gpus = (prov.config or {}).get("gpus") or []
             if vm_gpus:
                 eff_gpu_type = vm_gpus[0]
+    elif body.nodes:
+        # Multi-node sweep: no single provider_id — reflect the first node's VM
+        # hardware instead of falling through to the RunPod gpu_type default.
+        is_vm_run = True
+        first_prov = await session.get(Provider, body.nodes[0].provider_id)
+        if first_prov is not None:
+            first_gpus = (first_prov.config or {}).get("gpus") or []
+            if first_gpus:
+                eff_gpu_type = first_gpus[0]
 
     # ---- validate GPU pin, learning rate, and sweep values (clear 400s) ----
-    if is_vm_run:
-        gpu_bound = len(vm_gpus) or int((prov.config or {}).get("gpu_count") or 0)
-        target_label = "this VM"
-    else:
-        gpu_bound = body.gpu_count
-        target_label = "the pod"
-    pinned_ids = _parse_gpu_indices(body.visible_devices)
-    if gpu_bound and pinned_ids:
-        oob = sorted({i for i in pinned_ids if i >= gpu_bound})
-        if oob:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"visible_devices out of range: {oob} — {target_label} has {gpu_bound} "
-                        f"GPU(s), valid indices are 0–{gpu_bound - 1}"),
-            )
-    # Context-parallel group size: must evenly divide the run's GPU count (world = cp_size × dp_size).
-    if body.context_parallel and body.cp_size:
-        eff_world = len(pinned_ids) if pinned_ids else gpu_bound
-        if body.cp_size < 2:
-            raise HTTPException(status_code=400, detail="cp_size must be >= 2 when context parallelism is on")
-        if eff_world and (body.cp_size > eff_world or eff_world % body.cp_size != 0):
-            raise HTTPException(
-                status_code=400,
-                detail=(f"cp_size ({body.cp_size}) must evenly divide the run's GPU count "
-                        f"({eff_world}); data parallelism runs across the {eff_world // body.cp_size if body.cp_size else 0} CP groups"),
-            )
+    # A multi-node sweep's top-level provider_id/visible_devices/gpu_count are unused
+    # (each node carries its own) — validate + resolve the node list instead. Each
+    # CHILD trial is created by recursing into this same function with a concrete
+    # single provider_id/visible_devices (nodes=None), so it goes through the normal
+    # single-pool checks below on its own — no duplicated logic needed here.
     if not math.isfinite(body.learning_rate) or body.learning_rate <= 0:
         raise HTTPException(
             status_code=400,
             detail=f"learning_rate must be a positive number like 1e-4 (got {body.learning_rate!r})",
         )
-    _validate_sweep(body.sweep or {})
-    sweep_on = any(isinstance(v, list) and v for v in (body.sweep or {}).values())
-    if sweep_on:
+    if body.nodes:
+        resolved_nodes = await _validate_and_resolve_nodes(body.nodes, user, session)
+        body = body.model_copy(update={"nodes": resolved_nodes})
+        _validate_sweep(body.sweep or {})
+        if not any(isinstance(v, list) and v for v in (body.sweep or {}).values()):
+            raise HTTPException(status_code=400, detail="nodes requires a non-empty sweep grid")
         if body.gpus_per_trial < 1:
             raise HTTPException(status_code=400, detail="gpus_per_trial must be at least 1")
-        slots = len(pinned_ids) if pinned_ids else gpu_bound
-        if slots and body.gpus_per_trial > slots:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"gpus_per_trial ({body.gpus_per_trial}) exceeds the {slots} GPU(s) "
-                        f"available to the sweep on {target_label}"),
-            )
+        pinned_ids = []
+        gpu_bound = sum(len(_parse_gpu_indices(n.visible_devices)) for n in body.nodes)
+    else:
+        if is_vm_run:
+            gpu_bound = len(vm_gpus) or int((prov.config or {}).get("gpu_count") or 0)
+            target_label = "this VM"
+        else:
+            gpu_bound = body.gpu_count
+            target_label = "the pod"
+        pinned_ids = _parse_gpu_indices(body.visible_devices)
+        if gpu_bound and pinned_ids:
+            oob = sorted({i for i in pinned_ids if i >= gpu_bound})
+            if oob:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"visible_devices out of range: {oob} — {target_label} has {gpu_bound} "
+                            f"GPU(s), valid indices are 0–{gpu_bound - 1}"),
+                )
+        # Context-parallel group size: must evenly divide the run's GPU count (world = cp_size × dp_size).
+        if body.context_parallel and body.cp_size:
+            eff_world = len(pinned_ids) if pinned_ids else gpu_bound
+            if body.cp_size < 2:
+                raise HTTPException(status_code=400, detail="cp_size must be >= 2 when context parallelism is on")
+            if eff_world and (body.cp_size > eff_world or eff_world % body.cp_size != 0):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"cp_size ({body.cp_size}) must evenly divide the run's GPU count "
+                            f"({eff_world}); data parallelism runs across the {eff_world // body.cp_size if body.cp_size else 0} CP groups"),
+                )
+        _validate_sweep(body.sweep or {})
+        sweep_on = any(isinstance(v, list) and v for v in (body.sweep or {}).values())
+        if sweep_on:
+            slots = len(pinned_ids) if pinned_ids else gpu_bound
+            if slots and body.gpus_per_trial > slots:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"gpus_per_trial ({body.gpus_per_trial}) exceeds the {slots} GPU(s) "
+                            f"available to the sweep on {target_label}"),
+                )
 
     run_id = _gen_id()
     target = await _training_s3_target(body.storage_id)
@@ -3526,6 +3571,13 @@ async def create_training_run(
             k: str(v) for k, v in (body.env_vars or {}).items()
             if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(k))
         },
+        # Multi-node sweep bookkeeping: the resolved node list (concrete visible_devices,
+        # empty already expanded to "all") + a full copy of this request so
+        # run_multi_node_sweep can reconstruct per-trial child bodies later (the
+        # transformed `config` dict above isn't 1:1 invertible back to the request shape).
+        "nodes": [n.model_dump() for n in body.nodes] if body.nodes else None,
+        "_multi_node_request": body.model_dump() if body.nodes else None,
+        "sweep_parent_id": body.sweep_parent_id,
     }
     row = TrainingRun(
         id=run_id, name=body.name.strip() or run_id, dataset_id=body.dataset_id,
@@ -3536,19 +3588,264 @@ async def create_training_run(
         # A VM's hardware is fixed by the box: record its full GPU count when the run
         # isn't pinned to a subset (so the row/display reflect what it'll actually use),
         # else the pinned count. RunPod pods use body.gpu_count (the pod's GPU count).
+        # A multi-node sweep's "GPU count" is the sum across all its nodes.
         gpu_type=eff_gpu_type,
-        gpu_count=((len(pinned_ids) or gpu_bound or body.gpu_count) if is_vm_run else body.gpu_count),
-        visible_devices=body.visible_devices,
+        gpu_count=(gpu_bound if body.nodes else
+                   ((len(pinned_ids) or gpu_bound or body.gpu_count) if is_vm_run else body.gpu_count)),
+        visible_devices=(None if body.nodes else body.visible_devices),
     )
     session.add(row)
     await session.commit()
 
-    redis = request.app.state.redis
-    task = asyncio.create_task(_safe_run(redis, run_id))
+    if body.nodes:
+        task = asyncio.create_task(_safe_run_multi_node(redis, run_id))
+    else:
+        task = asyncio.create_task(_safe_run(redis, run_id))
     _active_runners[run_id] = task
     task.add_done_callback(lambda _t: _active_runners.pop(run_id, None))
 
+    return row
+
+
+@router.post("", response_model=TrainingRunRecord)
+async def create_training_run(
+    body: CreateTrainingRunRequest,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    row = await _create_and_launch_run(body, user, session, request.app.state.redis)
     return _to_record(row, user.username)
+
+
+def _expand_sweep(sweep: dict) -> list[dict]:
+    """{param: [v1, v2]} -> [{param: v1}, {param: v2}, …] (cross-product). Mirrors
+    training/sweep_runner.py's expand() — kept as its own tiny copy here rather than
+    importing the box-shipped script as a gateway module."""
+    keys = [k for k, v in (sweep or {}).items() if isinstance(v, list) and v]
+    if not keys:
+        return [{}]
+    grids = [sweep[k] for k in keys]
+    return [dict(zip(keys, combo)) for combo in itertools.product(*grids)]
+
+
+async def _validate_and_resolve_nodes(nodes: list[NodeSpec], user: User,
+                                       session: AsyncSession) -> list[NodeSpec]:
+    """Check ownership + GPU bounds for each node, and expand an empty/None
+    visible_devices into ALL of that provider's GPUs ("0,1,…,N-1")."""
+    resolved: list[NodeSpec] = []
+    for n in nodes:
+        prov = await session.get(Provider, n.provider_id)
+        if prov is None:
+            raise HTTPException(status_code=400, detail=f"unknown provider_id: {n.provider_id}")
+        if prov.owner_id != user.id and not user.is_admin:
+            raise HTTPException(status_code=403, detail=f"provider {n.provider_id} isn't yours")
+        gpu_bound = (len((prov.config or {}).get("gpus") or [])
+                     if prov.kind == "vm" else int((prov.config or {}).get("gpu_count") or 0))
+        vis = (n.visible_devices or "").strip()
+        if not vis:
+            if not gpu_bound:
+                raise HTTPException(status_code=400,
+                                     detail=f"node {n.provider_id}: no visible_devices given and the "
+                                            f"provider's GPU count is unknown — pass an explicit list")
+            vis = ",".join(str(i) for i in range(gpu_bound))
+        else:
+            pinned = _parse_gpu_indices(vis)
+            if gpu_bound:
+                oob = sorted({i for i in pinned if i >= gpu_bound})
+                if oob:
+                    raise HTTPException(status_code=400,
+                                         detail=f"node {n.provider_id}: visible_devices out of range "
+                                                f"{oob} (has {gpu_bound} GPUs)")
+        resolved.append(NodeSpec(provider_id=n.provider_id, visible_devices=vis))
+    return resolved
+
+
+async def _safe_run_multi_node(redis, run_id: str) -> None:
+    try:
+        await run_multi_node_sweep(redis, run_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("multi-node sweep %s crashed", run_id)
+        await _finalize(run_id, "failed", None, "internal error — see gateway logs")
+
+
+async def run_multi_node_sweep(redis, run_id: str) -> None:
+    """Dispatcher for a multi-node sweep TrainingRun: fans the sweep grid out across
+    `cfg["nodes"]`, one real independent TrainingRun (via _create_and_launch_run) per
+    trial, written into THIS row's result_json in the same {"trials": […], "best": …}
+    shape sweep_runner.py produces (so hf-export?source_trial=N, listings, etc. all
+    treat this exactly like an ASR/TTS/single-box-LLM sweep). NOT cross-host
+    distributed training — each trial is single-node, on whichever node picks it up."""
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None:
+            return
+        cfg = row.config_json or {}
+        owner_id = row.owner_id
+        row.status = "running"
+        row.started_at = datetime.now(timezone.utc)
+        await s.commit()
+
+    req_dict = cfg.get("_multi_node_request") or {}
+    base_body = CreateTrainingRunRequest(**req_dict)
+    nodes = [NodeSpec(**n) for n in (cfg.get("nodes") or [])]
+    sweep_metric = "loss" if cfg.get("task_type") in ("tts", "llm") else (cfg.get("eval_metric") or "wer")
+    combos = _expand_sweep(cfg.get("sweep") or {})
+    gpus_per_trial = max(1, int(cfg.get("gpus_per_trial") or 1))
+
+    # Each node contributes floor(its GPU count / gpus_per_trial) concurrent slots,
+    # sliced the same way sweep_runner.py slices a single box's pool.
+    slots: list[tuple[NodeSpec, list[str]]] = []
+    for node in nodes:
+        gpus = [x for x in node.visible_devices.split(",") if x.strip()]
+        chunks = [gpus[i:i + gpus_per_trial] for i in range(0, len(gpus), gpus_per_trial)]
+        chunks = [c for c in chunks if len(c) == gpus_per_trial]
+        for c in chunks:
+            slots.append((node, c))
+    if not slots:
+        await _finalize(run_id, "failed", None,
+                         f"no node offers >= {gpus_per_trial} GPU(s) per trial (gpus_per_trial)")
+        return
+
+    await _push_log(redis, run_id,
+                     f"[sweep] {len(combos)} trial(s) · {len(slots)} slot(s) across {len(nodes)} node(s) "
+                     f"· {gpus_per_trial} GPU/trial · rank by {sweep_metric} (asc)")
+
+    trials = [{"trial": i, "params": c, "node": None, "run_id": None,
+               "status": "pending", "metric": None, "artifact": None}
+              for i, c in enumerate(combos)]
+    # Each child already runs its own gpu_sampler + @@STEP log parser (it's a normal
+    # single run under the hood) — no separate SSH polling needed here. We just pull
+    # its result_json.steps/gpu_samples on the same poll cadence, tag them by trial
+    # (steps) / offset GPU indices by trial (gpu_samples, so an H20 "GPU 0" on trial 1
+    # doesn't overplot trial 0's "GPU 0"), and merge into THIS row's result_json so
+    # the run-detail page's LossCurve/GpuCard render the whole sweep like a single-box one.
+    trial_steps: dict[int, list] = {}
+    trial_gpu: dict[int, list] = {}
+
+    def _merged_steps() -> list:
+        return [pt for i in sorted(trial_steps) for pt in trial_steps[i]]
+
+    def _merged_gpu_samples() -> list:
+        return [s for i in sorted(trial_gpu) for s in trial_gpu[i]]
+
+    async def flush() -> None:
+        await _flush_result(run_id, {
+            "trials": trials, "best": None,
+            "steps": _merged_steps(), "gpu_samples": _merged_gpu_samples(),
+        })
+
+    def _pull_child_metrics(i: int, res: dict) -> None:
+        trial_steps[i] = [{**st, "trial": i} for st in (res.get("steps") or [])]
+        trial_gpu[i] = [
+            {"t": gs.get("t"), "gpus": [{**g, "index": (g.get("index") or 0) + i * 100} for g in (gs.get("gpus") or [])]}
+            for gs in (res.get("gpu_samples") or [])
+        ]
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for i, combo in enumerate(combos):
+        queue.put_nowait((i, combo))
+
+    # Relay each child's meaningful log lines into the parent's own log stream
+    # (tagged [trial N]) — mirrors sweep_runner.py's `[trial i] {line}` prefixing
+    # for a single-box sweep, so the parent's Logs tab visibly moves instead of
+    # only updating on trial start/finish. Filtered (not every line) since 3+
+    # concurrent children's raw stdout (pip/deps/HF download noise) would flood it.
+    _RELAY_MARKERS = ("@@STEP", "@@DONE", "@@ERROR", "[train]", "[trainer]",
+                      "[deps]", "[model]", "[preflight]", "error", "Error", "Traceback")
+    last_idx: dict[int, int] = {}
+
+    async def _relay_child_log(i: int, child_id: str) -> None:
+        try:
+            raw = await redis.lrange(f"train:logs:{child_id}", 0, -1)
+        except Exception:
+            return
+        start = last_idx.get(i, 0)
+        for line in raw[start:]:
+            text = line.decode() if isinstance(line, bytes) else line
+            if any(m in text for m in _RELAY_MARKERS):
+                await _push_log(redis, run_id, f"[trial {i}] {text}")
+        last_idx[i] = len(raw)
+
+    async def worker(node: NodeSpec, gpu_slice: list[str]) -> None:
+        vis = ",".join(gpu_slice)
+        while True:
+            try:
+                i, combo = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            trial = trials[i]
+            trial["node"] = {"provider_id": node.provider_id, "visible_devices": vis}
+            trial_body = base_body.model_copy(update={
+                "sweep": {}, "gpus_per_trial": 1, "nodes": None,
+                "provider_id": node.provider_id, "visible_devices": vis,
+                "gpu_count": len(gpu_slice),
+                "name": f"{base_body.name}-t{i}",
+                "sweep_parent_id": run_id,
+                **combo,
+            })
+            try:
+                async with session_factory()() as s:
+                    user = await s.get(User, owner_id)
+                    child = await _create_and_launch_run(trial_body, user, s, redis)
+                    await s.commit()
+                    child_id = child.id
+                trial["run_id"] = child_id
+                trial["status"] = "running"
+                await _push_log(redis, run_id,
+                                 f"[sweep] trial {i} START params={json.dumps(combo)} "
+                                 f"node={node.provider_id}:{vis} -> {child_id}")
+                await flush()
+                tick = 0
+                while True:
+                    await asyncio.sleep(5)
+                    await _relay_child_log(i, child_id)
+                    tick += 1
+                    if tick % 2:  # metrics/status every ~10s, log relay every ~5s
+                        continue
+                    async with session_factory()() as s:
+                        child = await s.get(TrainingRun, child_id)
+                        if child is None:
+                            trial["status"] = "failed"
+                            break
+                        res = child.result_json or {}
+                        _pull_child_metrics(i, res)
+                        if child.status in ("done", "failed", "cancelled"):
+                            await _relay_child_log(i, child_id)  # catch any tail lines
+                            trial["status"] = child.status
+                            trial["metric"] = ((res.get("best") or {}).get(
+                                "loss" if sweep_metric == "loss" else sweep_metric))
+                            trial["artifact"] = res.get("artifact")
+                            break
+                    await flush()  # persist the just-pulled steps/gpu_samples live, not only at trial end
+                await _push_log(redis, run_id,
+                                 f"[sweep] trial {i} {trial['status'].upper()} "
+                                 f"({sweep_metric}={trial['metric']}) -> {child_id}")
+                await flush()
+            except Exception as e:  # noqa: BLE001
+                logger.exception("multi-node sweep %s trial %d (node %s) crashed", run_id, i, node.provider_id)
+                trial["status"] = "failed"
+                trial["error"] = str(e)
+                await _push_log(redis, run_id, f"[sweep] trial {i} FAILED (dispatcher error): {e}")
+                await flush()
+
+    await asyncio.gather(*[worker(node, gpu_slice) for node, gpu_slice in slots])
+
+    done = [t for t in trials if t["status"] != "pending"]
+    ranked = sorted((t for t in done if t.get("metric") is not None), key=lambda t: t["metric"])
+    best = ranked[0] if ranked else None
+    if best:
+        await _push_log(redis, run_id,
+                         f"[sweep] best: trial {best['trial']} · {sweep_metric}={best['metric']} "
+                         f"· {json.dumps(best['params'])}")
+    else:
+        await _push_log(redis, run_id, "[sweep] done — no trial reported a metric")
+    await _finalize(run_id, "done", 0, None, {
+        "trials": done, "best": best,
+        "steps": _merged_steps(), "gpu_samples": _merged_gpu_samples(),
+    })
 
 
 @router.post("/{run_id}/restart", response_model=TrainingRunRecord)
@@ -3627,6 +3924,7 @@ async def list_training_runs_page(
     sort: str = "newest",
     limit: int = Query(12, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    include_children: bool = False,
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -3641,6 +3939,12 @@ async def list_training_runs_page(
         stmt = stmt.where(TrainingRun.owner_id == user.id)
     if status:
         stmt = stmt.where(TrainingRun.status == status)
+    if not include_children:
+        # Hide multi-node sweep child trials by default — they're real TrainingRun
+        # rows (so logs/hf-export/etc. work unmodified) but only the parent sweep
+        # row is meant to be browsed; children stay reachable via GET /{run_id} or
+        # the parent's own result_json.trials[].run_id.
+        stmt = stmt.where(TrainingRun.config_json.op("->>")("sweep_parent_id").is_(None))
     # Multi-token search (every token must match), mirroring the old client-side
     # filter: name/id/status/model/dataset/gpu + owner username + the config JSON
     # (sweep params, task type, …) as text.
@@ -6073,6 +6377,29 @@ async def training_gpu(
     if row.status != "running":
         _GPU_SSH.pop(run_id, None)
         return {"status": row.status, "gpus": []}
+    if (row.config_json or {}).get("nodes"):
+        # Multi-node sweep parent: no single SSH target of its own — poll each
+        # currently-running child trial's own GPUs and merge (same trial-offset
+        # scheme as the persisted gpu_samples in run_multi_node_sweep, so the live
+        # view and the historical chart use consistent GPU indices).
+        trials = (row.result_json or {}).get("trials") or []
+        gpus: list[dict] = []
+        for t in trials:
+            if t.get("status") != "running" or not t.get("run_id"):
+                continue
+            child = await session.get(TrainingRun, t["run_id"])
+            if child is None:
+                continue
+            ssh = await _resolve_run_ssh(child)
+            if ssh is None:
+                continue
+            try:
+                cgpus = await asyncio.to_thread(_gpu_query_sync, t["run_id"], *ssh, _run_gpu_id_csv(child))
+            except Exception:  # noqa: BLE001
+                continue
+            trial_i = t.get("trial") or 0
+            gpus.extend({**g, "index": (g.get("index") or 0) + trial_i * 100} for g in cgpus)
+        return {"status": row.status, "gpus": gpus}
     ssh = await _resolve_run_ssh(row)
     if ssh is None:
         return {"status": row.status, "gpus": [], "error": "ssh coords unavailable"}

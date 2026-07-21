@@ -57,6 +57,9 @@ import type {
   ProviderRecord,
   SectionKey,
   StorageRecord,
+  StorageUsage,
+  PurgeScanResult,
+  PurgeJobStatus,
   TestStorageRequest,
   TestStorageResponse,
   UpdateStorageRequest,
@@ -881,6 +884,22 @@ export const gateway = {
       `/v1/storage/${encodeURIComponent(id)}`,
       { method: "DELETE" },
     ),
+  storageUsage: (id: string, refresh = false) =>
+    request<StorageUsage>(
+      `/v1/storage/${encodeURIComponent(id)}/usage${refresh ? "?refresh=true" : ""}`,
+    ),
+  storagePurgeScan: (id: string, maxAgeDays?: number) =>
+    request<PurgeScanResult>(`/v1/storage/${encodeURIComponent(id)}/purge-scan`, {
+      method: "POST",
+      body: JSON.stringify(maxAgeDays == null ? {} : { max_age_days: maxAgeDays }),
+    }),
+  storagePurge: (id: string, prefixes: string[], maxAgeDays?: number) =>
+    request<PurgeJobStatus>(`/v1/storage/${encodeURIComponent(id)}/purge`, {
+      method: "POST",
+      body: JSON.stringify({ prefixes, ...(maxAgeDays == null ? {} : { max_age_days: maxAgeDays }) }),
+    }),
+  storagePurgeStatus: (id: string) =>
+    request<PurgeJobStatus>(`/v1/storage/${encodeURIComponent(id)}/purge-status`),
 
   // ---- GitOps ----
   listGitopsRepos: () => request<GitopsRepo[]>("/v1/gitops"),

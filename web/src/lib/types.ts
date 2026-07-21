@@ -356,6 +356,12 @@ export type TrainingTrial = {
   params: Record<string, number | string>;
   metric?: number | null;
   status?: string;
+  // Multi-node sweep only: each trial is its own independent TrainingRun row
+  // (run_multi_node_sweep in training_api.py), so it can be try-it'd / hf-export'd
+  // directly via its own run_id — the single-node (inline) sweep path has neither.
+  run_id?: string | null;
+  node?: { provider_id: string; visible_devices?: string | null } | null;
+  artifact?: { s3_uri?: string | null; hf_repo?: string | null } | null;
 };
 
 export type TrainingStep = {
@@ -565,6 +571,13 @@ export type CreateTrainingRunRequest = {
   // values are numbers for most knobs; `precision` is a string list.
   sweep?: Record<string, (number | string)[]>;
   gpus_per_trial?: number;
+  // Multi-node sweep: several (provider, GPU-range) targets instead of one
+  // provider_id/visible_devices pool — each node contributes floor(its GPU count /
+  // gpus_per_trial) concurrent trial slots; trials are drawn from a shared queue as
+  // slots free up. Each trial is still a normal single-node run (no cross-host
+  // distributed training). visible_devices empty/null → all of that provider's GPUs.
+  // Set alongside `sweep`; when present, top-level provider_id/visible_devices are unused.
+  nodes?: { provider_id: string; visible_devices?: string | null }[] | null;
   eval_metric?: "wer" | "cer";
   max_epochs?: number;
   max_steps?: number;
@@ -948,6 +961,62 @@ export type StorageRecord = {
   notes?: string | null;
   created_at: string;
   created_by: string;
+  // Cached storage usage (s3) — null until first computed via usage/scan.
+  total_size_bytes?: number | null;
+  object_count?: number | null;
+  size_computed_at?: string | null;
+  // True while a background cleanup is deleting from this storage.
+  purge_running?: boolean;
+};
+
+export type StorageUsage = {
+  storage_id: string;
+  cached: boolean;
+  bytes: number;
+  objects: number;
+  computed_at?: string | null;
+};
+
+// One owner-keyed group in a cleanup scan (a dataset/run/job/app's object subtree).
+export type PurgeGroup = {
+  prefix: string;
+  category: "orphan" | "aged" | "kept";
+  owner_kind?: string | null;
+  owner_id?: string | null;
+  objects: number;
+  bytes: number;
+  newest?: string;
+  reason: string;
+  purgeable: boolean;
+};
+
+export type PurgeScanResult = {
+  storage_id: string;
+  total_objects: number;
+  total_bytes: number;
+  reclaimable_objects: number;
+  reclaimable_bytes: number;
+  age_days: number;
+  groups: PurgeGroup[];
+};
+
+// Purge runs as a background job (deleting 100k+ objects takes minutes); the UI
+// polls this. `idle` = no job yet; `running` while deleting; `done`/`error` terminal.
+export type PurgeJobStatus = {
+  storage_id: string;
+  state: "idle" | "running" | "done" | "error";
+  job_id?: string;
+  started_at?: string;
+  finished_at?: string | null;
+  total_prefixes?: number;
+  done_prefixes?: number;
+  target_objects?: number;
+  target_bytes?: number;
+  deleted_objects?: number;
+  freed_bytes?: number;
+  deleted?: { prefix: string; objects: number; bytes: number }[];
+  skipped?: { prefix: string; reason: string }[];
+  error?: string | null;
 };
 
 // ---- Datasets (Autotrain) ----

@@ -422,9 +422,12 @@ def s3_list(prefix: str, target: Optional[S3Target] = None) -> list[dict]:
     return out
 
 
-def s3_delete_prefix(prefix: str, target: Optional[S3Target] = None) -> int:
+def s3_delete_prefix(prefix: str, target: Optional[S3Target] = None,
+                     on_deleted: Optional["Callable[[int], None]"] = None) -> int:
     """Delete every object under `prefix` (batched, 1000/req). Returns the count
-    deleted. Refuses an empty/root prefix — that would wipe the whole bucket."""
+    deleted. Refuses an empty/root prefix — that would wipe the whole bucket.
+    `on_deleted(n)` is called after each batch with that batch's size, so a
+    long-running caller (the storage-cleanup job) can report incremental progress."""
     if not (prefix and prefix.strip("/")):
         raise ValueError("refusing to delete an empty/root S3 prefix")
     t = target or _env_s3_target()
@@ -433,6 +436,8 @@ def s3_delete_prefix(prefix: str, target: Optional[S3Target] = None) -> int:
     for i in range(0, len(keys), 1000):
         batch = [{"Key": k} for k in keys[i : i + 1000]]
         cli.delete_objects(Bucket=t.bucket, Delete={"Objects": batch})
+        if on_deleted:
+            on_deleted(len(batch))
     return len(keys)
 
 

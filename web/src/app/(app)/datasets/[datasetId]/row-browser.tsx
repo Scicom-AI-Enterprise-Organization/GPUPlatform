@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Bot, ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Mic, Play, Terminal, User, Volume2, Wrench } from "lucide-react";
+import { Bot, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Mic, Play, ShieldCheck, Terminal, TriangleAlert, User, Volume2, Wrench } from "lucide-react";
 import type { DecoderState } from "./decoder-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -581,19 +581,146 @@ function DpoRowItem({
 
 // ── TTS packed row ───────────────────────────────────────────────────────────
 
-type PackedUtt = { tokens: number; text: string };
+// A contiguous run of an utterance, tagged by whether the label mask trains it.
+// llm packs carry these so the decode can highlight the assistant-only spans.
+type PackedSegment = { text: string; trained: boolean };
+type PackedUtt = { tokens: number; text: string; segments?: PackedSegment[]; trained?: number };
 type PackedDecode = {
   tokenizer: string;
   num_tokens: number;
   num_utterances: number;
   utterances: PackedUtt[];
   full_text: string;
+  // llm packs: assistant-mask summary for this bin.
+  num_trained?: number;
+  assistant_masked?: boolean;
   // DPO packs (kind=llm_dpo_packed) also return preference pairs so the block can
   // render chosen ↔ rejected side by side instead of a flat 2K-utterance list.
   objective?: string;
   num_pairs?: number;
   pairs?: { index: number; chosen: PackedUtt; rejected: PackedUtt }[];
 };
+
+// GET /v1/datasets/{id}/verify-pack — sampled soundness check of an llm pack.
+type VerifyCheck = { ok: boolean; applicable?: boolean };
+type VerifyResult = {
+  tokenizer: string;
+  arch: string;
+  objective?: string;
+  sampled: number;
+  total_bins: number;
+  checks: {
+    invariants: VerifyCheck & { failed_bins: number[] };
+    position_ids: VerifyCheck & { failed_bins: number[] };
+    assistant_mask: VerifyCheck & {
+      applicable: boolean;
+      masked_bins: number;
+      sampled: number;
+      avg_trained_pct: number | null;
+      unmasked_bins: number[];
+    };
+    tool_calls: VerifyCheck & {
+      applicable: boolean;
+      bins_with_tool_calls: number;
+      raw_json_bins: number;
+    };
+  };
+};
+
+/** One assistant-trained span highlighted; masked context stays dim. */
+function MaskedText({ segments, text }: { segments?: PackedSegment[]; text: string }) {
+  if (!segments || segments.length === 0) {
+    return <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed scrollbar-thin">{text}</pre>;
+  }
+  return (
+    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed scrollbar-thin">
+      {segments.map((s, k) =>
+        s.trained ? (
+          <span key={k} className="rounded-sm bg-emerald-500/15 text-emerald-800 dark:text-emerald-300">{s.text}</span>
+        ) : (
+          <span key={k} className="text-muted-foreground/70">{s.text}</span>
+        ),
+      )}
+    </pre>
+  );
+}
+
+/** One line in the Verify-pack summary. `applicable=false` renders a neutral "n/a". */
+function CheckRow({ ok, applicable = true, label, detail }: { ok: boolean; applicable?: boolean; label: string; detail: string }) {
+  return (
+    <div className="flex items-start gap-2">
+      {!applicable ? (
+        <span className="mt-0.5 h-3.5 w-3.5 shrink-0 rounded-full border border-muted-foreground/40" />
+      ) : ok ? (
+        <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+      ) : (
+        <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+      )}
+      <div>
+        <span className={!applicable ? "text-muted-foreground" : ok ? "" : "text-amber-700 dark:text-amber-400"}>{label}</span>{" "}
+        <span className="text-muted-foreground">{!applicable ? "— n/a" : detail}</span>
+      </div>
+    </div>
+  );
+}
+
+/** Green/amber summary of a sampled Verify-pack sweep (see `VerifyResult`). */
+function VerifyPanel({ result, onClose }: { result: VerifyResult; onClose: () => void }) {
+  const c = result.checks;
+  const allOk =
+    c.invariants.ok &&
+    c.position_ids.ok &&
+    (!c.assistant_mask.applicable || c.assistant_mask.ok) &&
+    (!c.tool_calls.applicable || c.tool_calls.ok);
+  return (
+    <div className={cn("rounded-md border p-3 text-xs", allOk ? "border-emerald-500/40 bg-emerald-500/5" : "border-amber-500/40 bg-amber-500/5")}>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-x-1.5 font-medium">
+          {allOk ? <ShieldCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-400" /> : <TriangleAlert className="h-4 w-4 text-amber-600 dark:text-amber-400" />}
+          {allOk ? "Pack looks correct" : "Pack has warnings"}
+          <span className="font-normal text-muted-foreground">· sampled {result.sampled} / {result.total_bins.toLocaleString()} bins</span>
+        </div>
+        <button type="button" onClick={onClose} className="shrink-0 text-muted-foreground hover:text-foreground" aria-label="dismiss">✕</button>
+      </div>
+      <div className="space-y-1">
+        <CheckRow
+          ok={c.invariants.ok}
+          label="invariants"
+          detail={c.invariants.ok ? "ids = labels = position_ids = Σattention_mask" : `failed bins: ${c.invariants.failed_bins.join(", ")}`}
+        />
+        <CheckRow
+          ok={c.position_ids.ok}
+          label="position_ids reset per doc"
+          detail={c.position_ids.ok ? "0..L-1 per document" : `failed bins: ${c.position_ids.failed_bins.join(", ")}`}
+        />
+        <CheckRow
+          ok={c.assistant_mask.ok}
+          applicable={c.assistant_mask.applicable}
+          label="assistant-only mask"
+          detail={
+            c.assistant_mask.ok
+              ? `${c.assistant_mask.masked_bins}/${c.assistant_mask.sampled} bins${c.assistant_mask.avg_trained_pct != null ? ` · avg ${c.assistant_mask.avg_trained_pct}% trained` : ""}`
+              : `whole-sequence-trained bins: ${c.assistant_mask.unmasked_bins.join(", ")}`
+          }
+        />
+        <CheckRow
+          ok={c.tool_calls.ok}
+          applicable={c.tool_calls.applicable}
+          label="tool calls native"
+          detail={
+            c.tool_calls.raw_json_bins === 0
+              ? `${c.tool_calls.bins_with_tool_calls} bin(s) with tool calls · no raw-JSON args`
+              : `${c.tool_calls.raw_json_bins} bin(s) with raw-JSON args`
+          }
+        />
+      </div>
+      <div className="mt-2 text-[10px] text-muted-foreground">
+        tokenizer <span className="font-mono">{result.tokenizer}</span> · arch {result.arch || "?"}
+        {result.objective ? ` · ${result.objective}` : ""}
+      </div>
+    </div>
+  );
+}
 
 /**
  * One multipacked block. TTS/LLM packs show token + utterance counts; a DPO pack
@@ -735,10 +862,35 @@ function PackedRowItem({
             </>
           ) : data ? (
             <>
-              <div className="text-[11px] text-muted-foreground">
-                {data.num_utterances} utterance{data.num_utterances === 1 ? "" : "s"} multipacked into{" "}
-                {data.num_tokens} tokens · decoded with <span className="font-mono">{data.tokenizer}</span>
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+                <span>
+                  {data.num_utterances} utterance{data.num_utterances === 1 ? "" : "s"} multipacked into{" "}
+                  {data.num_tokens} tokens · decoded with <span className="font-mono">{data.tokenizer}</span>
+                </span>
+                {data.assistant_masked !== undefined &&
+                  (data.assistant_masked ? (
+                    <span className="inline-flex items-center gap-1 rounded bg-emerald-500/10 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-400">
+                      <Check className="h-3 w-3" /> assistant-only mask
+                      {data.num_trained != null && data.num_tokens
+                        ? ` · ${Math.round((100 * data.num_trained) / data.num_tokens)}% trained`
+                        : ""}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-700 dark:text-amber-400" title="No assistant-only mask — every token is trained (labels == input_ids). For gemma this is the missing-{% generation %} regression.">
+                      <TriangleAlert className="h-3 w-3" /> no mask · whole sequence trained
+                    </span>
+                  ))}
               </div>
+              {data.utterances.some((u) => u.segments?.length) && (
+                <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+                  <span className="inline-flex items-center gap-1">
+                    <span className="inline-block h-2.5 w-3 rounded-sm bg-emerald-500/25" /> trained (assistant)
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <span className="inline-block h-2.5 w-3 rounded-sm bg-muted-foreground/25" /> masked (not trained)
+                  </span>
+                </div>
+              )}
               <ol className="space-y-1.5">
                 {data.utterances.map((u, j) => (
                   <li key={j} className="rounded border border-border/60 bg-muted/30 p-2">
@@ -754,9 +906,12 @@ function PackedRowItem({
                           {decoding === j ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
                         </button>
                       )}
-                      <span>utt {j + 1} · {u.tokens} tokens</span>
+                      <span>
+                        utt {j + 1} · {u.tokens} tokens
+                        {u.trained != null ? ` · ${u.trained} trained` : ""}
+                      </span>
                     </div>
-                    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed scrollbar-thin">{u.text}</pre>
+                    <MaskedText segments={u.segments} text={u.text} />
                     {audioUrls[j] && (
                       <div className="mt-2">
                         <WaveformPlayer key={audioUrls[j]} src={audioUrls[j]} />
@@ -803,6 +958,8 @@ export function RowBrowser({
   const rejField = (rejectedField ?? "").trim() || "rejected";
   // Use chat-bubble view whenever a messages column is configured, regardless of kind.
   const isLlm = !isDpo && !!(messagesField ?? "").trim();
+  // A packed LLM dataset can be sampled + soundness-checked against its tokenizer.
+  const isPackedLlm = kind === "llm_packed" || kind === "llm_dpo_packed";
   const [limit, setLimit] = useState(initial.limit && initial.limit > 0 ? initial.limit : 20);
   const [offset, setOffset] = useState(initial.offset ?? 0);
   // Subsets (HF splits) are a MULTISELECT: pick several and the rows are merged
@@ -831,9 +988,37 @@ export function RowBrowser({
   // Manual training-inclusion curation: count of rows un-ticked (excluded).
   const [excludedCount, setExcludedCount] = useState(initial.excluded_count ?? 0);
   const [toggleErr, setToggleErr] = useState<string | null>(null);
+  // Verify-pack sweep (packed LLM datasets): sampled soundness check vs the tokenizer.
+  const [verify, setVerify] = useState<VerifyResult | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyErr, setVerifyErr] = useState<string | null>(null);
   // Skip the very first fetch only if the seed already carries rows; otherwise the
   // mount effect fetches page 1 (spinner shows immediately via `loading` above).
   const seeded = useRef(hasSeededRows);
+
+  const runVerify = useCallback(async () => {
+    setVerifying(true);
+    setVerifyErr(null);
+    try {
+      const sp = selected[0] ?? "";
+      const r = await fetch(
+        `/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/verify-pack?sample=20` +
+          (sp ? `&split=${encodeURIComponent(sp)}` : ""),
+        { cache: "no-store" },
+      );
+      const j = await r.json();
+      if (!r.ok) {
+        setVerify(null);
+        setVerifyErr((j && (j.detail || j.error)) || `verify failed (${r.status})`);
+      } else {
+        setVerify(j as VerifyResult);
+      }
+    } catch (e) {
+      setVerifyErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setVerifying(false);
+    }
+  }, [datasetId, selected]);
 
   // Tick/un-tick a row → include/exclude it from training. Optimistic; reverts
   // on failure. The server is the source of truth for the excluded count.
@@ -1005,6 +1190,19 @@ export function RowBrowser({
               </SelectContent>
             </Select>
           )}
+          {isPackedLlm && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 text-xs font-normal"
+              onClick={runVerify}
+              disabled={verifying}
+              title="Sample bins and check them against the tokenizer chat template"
+            >
+              {verifying ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="mr-1 h-3.5 w-3.5" />}
+              Verify pack
+            </Button>
+          )}
           <Select
             value={String(limit)}
             onValueChange={(v) => {
@@ -1026,6 +1224,8 @@ export function RowBrowser({
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
+        {verifyErr && <p className="text-sm text-destructive">{verifyErr}</p>}
+        {verify && <VerifyPanel result={verify} onClose={() => setVerify(null)} />}
         {error ? (
           <p className="text-sm text-destructive">{error}</p>
         ) : rows.length === 0 && loading ? (
