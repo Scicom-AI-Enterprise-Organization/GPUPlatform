@@ -8,7 +8,7 @@ Pipeline, logged step-by-step (the gateway tails this script's stdout for the
      --merged-out, in a SUBPROCESS so its GPU memory is fully freed before vLLM)
   3. (merge_infer also writes preprocessor_config.json for the multimodal dir)
   4. ensure a dedicated vLLM venv exists (build once with uv if missing)
-  5. `vllm serve <merged> --enforce-eager --tensor-parallel-size N` and poll /health
+  5. `vllm serve <merged> --tensor-parallel-size N` and poll /health (CUDA graphs ON)
 
 Runs under the TRAINING venv (needs boto3 + transformers 5.5.0 for the merge);
 launches vLLM from a separate vLLM venv (`vllm_venv`). The merged model is cached
@@ -338,8 +338,10 @@ def main():
     if user_args:
         log(f"[playground] custom vLLM args: {user_args}")
     vbin = os.path.join(cfg["vllm_venv"], "bin", "vllm")
+    # NOTE: no --enforce-eager — CUDA-graph capture costs ~1-3 min at startup but buys
+    # 10-30% decode throughput, which dominates for benchmarking against try-it servers.
+    # Pass --enforce-eager via the custom vLLM args box to get fast-boot behaviour back.
     cmd = [vbin, "serve", merged,
-           "--enforce-eager",
            "--tensor-parallel-size", str(tp),
            "--port", str(port),
            "--served-model-name", served,

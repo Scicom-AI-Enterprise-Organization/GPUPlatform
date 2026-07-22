@@ -6096,7 +6096,7 @@ def _playground_start_ssh(host, port, user, key_filename, run_id, kind, model_s3
             pass
 
 
-def _playground_stop_ssh(host, port, user, key_filename, run_id, cfg, kind):
+def _playground_stop_ssh(host, port, user, key_filename, run_id, cfg, kind, purge: bool = True):
     """Stop the run's persistent server — SIGTERM its process group (own session),
     then clean up the socket/pid/ready files. Precise: only the recorded pid."""
     cli = _ssh_connect(host, int(port), user, key_filename)
@@ -6107,8 +6107,12 @@ def _playground_stop_ssh(host, port, user, key_filename, run_id, cfg, kind):
         # from /share — KEEPS the shared vLLM venv (/share/autotrain-llm-vllm, reused by
         # every LLM run). Done AFTER the kill so vLLM's mmap'd safetensors are released.
         # run_id is `train-<hex>` (no shell metachars), so the controlled path is safe.
+        # purge=False (…/playground/stop?purge=false) keeps the downloaded ckpt +
+        # merged model on /share so an immediate relaunch (e.g. changed vllm_args)
+        # skips the S3 re-download + re-merge — llm_playground reuses a merged dir
+        # whose config.json exists. Default True = reclaim the ~52GB as before.
         extra = (f' rm -rf {paths["tryit_dir"]} 2>/dev/null;'
-                 if (kind == "llm" and paths.get("tryit_dir")) else "")
+                 if (purge and kind == "llm" and paths.get("tryit_dir")) else "")
         cmd = (f'P="$(cat {paths["pid"]} 2>/dev/null)"; '
                f'if [ -n "$P" ]; then kill -TERM -"$P" 2>/dev/null || kill -TERM "$P" 2>/dev/null; sleep 1; '
                f'kill -KILL -"$P" 2>/dev/null || true; fi; sleep 1;'
@@ -7372,6 +7376,10 @@ async def playground_status(
 @router.post("/{run_id}/playground/stop", response_model=PlaygroundStatus)
 async def playground_stop(
     run_id: str,
+    purge: bool = Query(True, description="LLM/VM only: also delete the downloaded ckpt + "
+                                          "merged model from /share. false = keep them so an "
+                                          "immediate relaunch (changed vllm_args) skips the "
+                                          "re-download + re-merge."),
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -7389,7 +7397,7 @@ async def playground_stop(
                                 logs=["[try-it] pod torn down"])
     row, kind, _m, _c, ssh, cfg = await _playground_ctx(run_id, user, session)
     try:
-        st = await asyncio.to_thread(_playground_stop_ssh, *ssh, run_id, cfg, kind)
+        st = await asyncio.to_thread(_playground_stop_ssh, *ssh, run_id, cfg, kind, purge)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"stop failed: {e}")
     return PlaygroundStatus(**st)
