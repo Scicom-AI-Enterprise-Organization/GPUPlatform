@@ -186,6 +186,24 @@ _GEMMA_GENERATION_REPS: list[tuple[str, str]] = [
      "{%- elif not (ns_tr_out.flag and not has_content and not next_nt.found) -%}\n            "
      "{%- if role == 'model' -%}{% generation %}{{- '<turn|>\\n' -}}{% endgeneration %}"
      "{%- else -%}{{- '<turn|>\\n' -}}{%- endif -%}"),
+    # (E) the model's STOP TOKEN after tool calls — found 2026-07-22 via a finetune that
+    # looped identical tool calls forever. gemma-4's generation_config eos_token_id is
+    # [<eos>, <turn|>, <|tool_response>]: the intended stop after the last <tool_call|>
+    # is the model emitting `<|tool_response>` (the serving stack treats it as EOS; in
+    # transcripts it doubles as the env's response opener). Under assistant-only masking
+    # that position was label=-100 — the finetune never learned to stop, while parallel-
+    # call examples DID train `<|tool_call>`-after-`<tool_call|>` → infinite call loops.
+    # (E1) every tool-response opener (macro): the first one after a tool_call block is
+    # the trained stop; later ones (between stacked responses) are contexts the model
+    # never decodes in — harmless to label, and the render stays byte-identical.
+    ("{%- macro format_tool_response_block(tool_name, response) -%}\n    {{- '<|tool_response>' -}}",
+     "{%- macro format_tool_response_block(tool_name, response) -%}\n    "
+     "{% generation %}{{- '<|tool_response>' -}}{% endgeneration %}"),
+    # (E2) the bare `<|tool_response>` a tool-call turn ends with when NO responses
+    # follow in-transcript (rare in packed data, but it's the same stop token).
+    ("{%- if ns.prev_message_type == 'tool_call' and not ns_tr_out.flag -%}\n            {{- '<|tool_response>' -}}",
+     "{%- if ns.prev_message_type == 'tool_call' and not ns_tr_out.flag -%}\n            "
+     "{% generation %}{{- '<|tool_response>' -}}{% endgeneration %}"),
 ]
 
 
@@ -204,7 +222,8 @@ def _add_gemma_generation_mask(template: str) -> str:
     return out
 
 
-def build_chat_template(tokenizer, all_reasoning: bool, arch: str = "generic") -> Optional[str]:
+def build_chat_template(tokenizer, all_reasoning: bool, arch: str = "generic",
+                        assistant_mask: bool = True) -> Optional[str]:
     """Return the chat-template string to render with. Two orthogonal transforms:
     (1) `all_reasoning` relaxes the arch's reasoning guard so EVERY assistant turn's
     reasoning is trained (surgical substring swap); (2) gemma gets `{% generation %}`
@@ -233,8 +252,9 @@ def build_chat_template(tokenizer, all_reasoning: bool, arch: str = "generic") -
             tpl = relaxed
     # Assistant-only label masking (gemma-4 only — the one shipped template lacking
     # {% generation %}; other archs' templates already carry it). Applied whether or
-    # not reasoning was relaxed.
-    if arch == "gemma":
+    # not reasoning was relaxed. `assistant_mask=False` (the pack card's full-sequence-
+    # labels option) skips the injection — tokenize_row then trains the whole sequence.
+    if arch == "gemma" and assistant_mask:
         tpl = _add_gemma_generation_mask(tpl)
     return tpl
 
@@ -484,7 +504,8 @@ def extract_tools(value: Any) -> list:
 
 
 def tokenize_row(tokenizer, messages, tools=None, chat_template=None, reasoning_effort=None,
-                 preserve_thinking=False, truncate_history_thinking=None):
+                 preserve_thinking=False, truncate_history_thinking=None,
+                 full_seq_labels=False):
     """Render + tokenize one conversation; return (input_ids, labels, used_mask).
 
     Prefers assistant-only labels via `return_assistant_tokens_mask=True`; falls
@@ -492,7 +513,9 @@ def tokenize_row(tokenizer, messages, tools=None, chat_template=None, reasoning_
     all-zero) or the kwarg is unsupported. `reasoning_effort` (mistral) is passed
     to the template only when set. `preserve_thinking` (qwen3.6) makes the template
     render EVERY assistant turn's `<think>` block. `truncate_history_thinking` (nemotron)
-    False keeps every assistant turn's `<think>` (templates ignore unknown kwargs)."""
+    False keeps every assistant turn's `<think>` (templates ignore unknown kwargs).
+    `full_seq_labels=True` (pack option) skips the mask entirely — labels = input_ids
+    even on templates that carry `{% generation %}` natively (qwen/minimax/mistral)."""
     kw: dict[str, Any] = {}
     if tools:
         kw["tools"] = tools
@@ -504,6 +527,11 @@ def tokenize_row(tokenizer, messages, tools=None, chat_template=None, reasoning_
         kw["truncate_history_thinking"] = truncate_history_thinking
     if chat_template is not None:
         kw["chat_template"] = chat_template
+
+    if full_seq_labels:
+        out = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=True, **kw)
+        ids = list(out["input_ids"])
+        return ids, list(ids), False
 
     try:
         out = tokenizer.apply_chat_template(
@@ -855,6 +883,7 @@ def pack_rows(
     hf_endpoint: Optional[str] = None,
     all_reasoning: bool = True,
     arch: Optional[str] = None,
+    full_seq_labels: bool = False,
     progress: Optional[Callable[[int, int], None]] = None,
     progress_every: int = 100,
 ) -> dict:
@@ -876,7 +905,8 @@ def pack_rows(
     arch = arch or detect_arch(tokenizer_name)
     logger.info("llm_pack: loading tokenizer %s (arch=%s, tokenizer only)", tokenizer_name, arch)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=hf_token or None)
-    chat_template = build_chat_template(tokenizer, all_reasoning, arch)
+    chat_template = build_chat_template(tokenizer, all_reasoning, arch,
+                                        assistant_mask=not full_seq_labels)
     # mistral relaxes reasoning by folding [THINK] blocks in extract_messages (not a
     # template guard swap) AND passing reasoning_effort to the template.
     reasoning_effort = ("high" if all_reasoning else "none") if arch == "mistral" else None
@@ -927,6 +957,7 @@ def pack_rows(
                         tokenizer, messages, tools=tools, chat_template=chat_template,
                         reasoning_effort=reasoning_effort, preserve_thinking=preserve_thinking,
                         truncate_history_thinking=truncate_history_thinking,
+                        full_seq_labels=full_seq_labels,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("llm_pack: row %d tokenize failed (%s); skipping", i, e)

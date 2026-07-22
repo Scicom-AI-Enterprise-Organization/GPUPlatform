@@ -497,6 +497,37 @@ changed upstream) → logs a WARNING + degrades to full-sequence labels rather t
 (other archs' templates already carry `{% generation %}`); the pack summary's `assistant_masked_rows` now
 reports how many rows got a real mask.
 
+**⚠ Correction (verified 2026-07-22): the other archs do NOT carry `{% generation %}`.** The claim
+above that qwen/minimax/mistral templates "already carry it" is false — rendered each with
+`return_assistant_tokens_mask=True` and transformers warns + returns an all-zero mask, so
+**qwen3.6 / MiniMax-M2.7 / Mistral-Small-4 have always packed FULL-SEQUENCE labels** (tokenize_row's
+fallback). That's also why none of them ever exhibited gemma's tool-call loop: their stop tokens
+(`<|im_end|>` / `[e~[` after `</minimax:tool_call>` / `</s>`) are trained for free under full-seq.
+If anyone adds generation-masking for those archs, the stop-token-after-tool-calls lesson below
+applies to them too.
+
+**⚠ The silent-degrade path FIRED for real (found 2026-07-21):** Google updated gemma-4's upstream
+template and both the reasoning guard and 2 of the 4 generation-mask anchors stopped matching —
+every gemma pack since silently trained full-sequence labels with history-reasoning stripped, and
+the resulting finetune regressed hard (part of the Tool-F1 0.918→0.481 post-mortem). Fixed:
+`_REASONING_GUARDS` is now per-arch **candidate lists** (new anchor first, old kept as fallback,
+then other archs' candidates), and the `_GEMMA_GENERATION_REPS` B (tool_calls-open, now
+`message.get('tool_calls')`) + D (turn-end, now with `and not next_nt.found`) anchors match the
+live template. **After any gemma pack, check `assistant_masked_rows` ≈ row count** — a collapse
+to 0 means Google moved the template again; update the anchors, don't trust the WARNING alone.
+
+**⚠ Masking MUST include the model's STOP token (anchor E, found 2026-07-22 the hard way):**
+gemma-4 stops after tool calls by emitting `<|tool_response>` (it's in generation_config
+`eos_token_id` alongside `<eos>`/`<turn|>`) — in transcripts that token doubles as the env's
+response opener, so assistant-only masking left it label=-100 and the finetune NEVER LEARNED TO
+STOP calling tools (identical call looped 12x+ per turn; parallel-call examples trained
+`<|tool_call>`-after-`<tool_call|>`, making another call the preferred continuation). Anchors
+E1/E2 wrap the tool-response opener in `{% generation %}` so the stop is a trained target.
+General rule: for ANY masked arch, every token in `eos_token_id` that terminates an assistant
+span must be INSIDE the mask. The pack card also has a **full-sequence-labels** option
+(`LlmPackRequest.full_seq_labels` → `_llm_pack.full_seq_labels` in the packed metadata) — the
+escape hatch that skips masking entirely (pre-07-10 behaviour, structurally immune to this bug).
+
 **⚠ Nemotron-H (hybrid Mamba2/attention MoE) packs ONE-DOC-PER-BIN, added 2026-07-10.** `detect_arch`
 maps `nvidia/…nemotron…` → `nemotron`; `_normalize_nemotron_turn` parses tool-call `arguments` str→dict
 (REQUIRED — the template does `arguments|items`) + maps `reasoning`→`reasoning_content`;
@@ -507,6 +538,13 @@ state across doc boundaries. The nemotron trainer then PADS a batch of single-do
 concatenating collator). No `{% generation %}` (full-sequence labels for now). ⚠ The Nemotron tokenizer
 needs **sentencepiece** in the gateway env to instantiate at pack time. See
 `training/llm/CLAUDE.md` → "Nemotron-H" for the trainer/merge/dry-run detail.
+
+**⚠ Pack shard-upload concurrency is capped at 6 (`dataset_transform._upload_chinidataset_dir`,
+`max_workers=6`, was 16 — fixed 2026-07-21).** 16 concurrent HTTPS/TLS handshakes to S3 hit a
+genuine thread-safety bug in this Python build's bundled OpenSSL (`SIGSEGV` in `X509_verify_cert`
+on a background pthread — two identical macOS crash reports, the whole gateway process died
+mid-pack both times, leaving the dataset stuck at `transform_status="running"` with no automatic
+un-sticking; reset the row via direct DB write before retrying). Don't raise it back for speed.
 
 **Verified e2e (2026-07-09)** on the real source `ds-f2116ddc` (635 tool rows / ~6.5k tool calls) by
 rendering each row through the REAL tokenizer template + round-tripping vLLM's own tool parser (gemma4 /

@@ -1,0 +1,7 @@
+# Temporary override: slow the mock so requests sit queued long enough to
+# demonstrate cross-replica cancel (the 2s cluster sync loop must mirror the
+# queued entries to Redis before a flush on the other replica can see them).
+services:
+  mock-upstream:
+    environment:
+      DELAY_S: "12"

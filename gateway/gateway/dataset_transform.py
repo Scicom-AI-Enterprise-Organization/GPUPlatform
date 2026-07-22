@@ -127,6 +127,7 @@ async def start_llm_pack(
     storage_id: str,
     tools_field: Optional[str] = None,
     all_reasoning: bool = True,
+    full_seq_labels: bool = False,
     objective: str = "sft",
     chosen_field: str = "chosen",
     rejected_field: str = "rejected",
@@ -146,11 +147,13 @@ async def start_llm_pack(
         d.transform_log = _append_log(
             None, f"LLM pack queued · objective={objective} "
                   f"· subsets={', '.join(subsets) if subsets else '(first)'} "
-                  f"· tokenizer={tokenizer} · seq_len {sequence_length}")
+                  f"· tokenizer={tokenizer} · seq_len {sequence_length}"
+                  + (" · FULL-SEQUENCE labels" if full_seq_labels else ""))
         await s.commit()
     task = asyncio.create_task(_run_llm_pack(
         dataset_id, subsets=subsets, tokenizer=tokenizer, sequence_length=sequence_length,
         storage_id=storage_id, tools_field=tools_field, all_reasoning=all_reasoning,
+        full_seq_labels=full_seq_labels,
         objective=objective, chosen_field=chosen_field, rejected_field=rejected_field,
         prompt_field=prompt_field,
     ))
@@ -939,7 +942,7 @@ async def _create_llm_packed_output(
     source_id: str, *, new_id: str, name: str, description: str, storage_id: str,
     s3_uri: str, num_rows: int, messages_field: str, tokenizer: str,
     sequence_length: int, subset: Optional[str], arch: Optional[str] = None,
-    objective: str = "sft",
+    objective: str = "sft", full_seq_labels: bool = False,
 ) -> str:
     """Create the packed (chat multipack) dataset as a NEW row, leaving the source
     intact + re-runnable. `_llm_pack` metadata (in split_fields) mirrors tts_packed's
@@ -974,6 +977,9 @@ async def _create_llm_packed_output(
                 # and lets a run reject a base-model/dataset arch mismatch.
                 "arch": arch,
                 "objective": objective,
+                # True → labels = the whole sequence (assistant masking deliberately
+                # OFF — the pack card's escape hatch); absent/False → assistant-only.
+                "full_seq_labels": full_seq_labels,
             }},
         )
         s.add(new)
@@ -1014,7 +1020,13 @@ def _upload_chinidataset_dir(out_dir: str, target, key_prefix: str,
         if progress and (done % every == 0 or done == total):
             progress("upload_s3", done, total)
 
-    bench.s3_put_files(to_upload, target, max_workers=16, on_done=_on_done)
+    # max_workers was 16 — high thread-count concurrent HTTPS/TLS handshakes hit a
+    # genuine SIGSEGV in this Python build's bundled OpenSSL (X509_verify_cert on a
+    # background thread; crash reports confirmed the exact same fault twice in a
+    # row uploading this step's shards, taking the whole gateway process down each
+    # time — not a code bug, a threading race in the interpreter's SSL module).
+    # Lower concurrency trades some upload speed for not crashing the process.
+    bench.s3_put_files(to_upload, target, max_workers=6, on_done=_on_done)
     bucket = getattr(target, "bucket", "")
     return f"s3://{bucket}/{key_prefix}"
 
@@ -1028,6 +1040,7 @@ async def _run_llm_pack(
     storage_id: str,
     tools_field: Optional[str],
     all_reasoning: bool,
+    full_seq_labels: bool = False,
     objective: str = "sft",
     chosen_field: str = "chosen",
     rejected_field: str = "rejected",
@@ -1194,7 +1207,8 @@ async def _run_llm_pack(
                 tokenizer_name=tokenizer, out_dir=out_dir,
                 messages_field=messages_field, tools_field=(tools_field or ""),
                 max_seq_len=int(sequence_length), hf_token=token, hf_endpoint=hf_endpoint,
-                all_reasoning=all_reasoning, progress=_pack_progress,
+                all_reasoning=all_reasoning, full_seq_labels=full_seq_labels,
+                progress=_pack_progress,
             )
         n_bins = int(stats.get("n_bins") or 0)
         if n_bins == 0:
@@ -1235,7 +1249,7 @@ async def _run_llm_pack(
             storage_id=storage_id, s3_uri=s3_uri, num_rows=n_bins,
             messages_field=messages_field, tokenizer=tokenizer,
             sequence_length=int(sequence_length), subset=label, arch=stats.get("arch"),
-            objective=objective,
+            objective=objective, full_seq_labels=full_seq_labels,
         )
         await _finish(
             dataset_id, "done",

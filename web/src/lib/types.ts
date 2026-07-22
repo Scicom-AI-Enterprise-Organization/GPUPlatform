@@ -1238,6 +1238,7 @@ export type LlmPackRequest = {
   sequence_length?: number; // multipack bin length (tokens); longer convs dropped
   tools_field?: string | null; // source tool/function column (blank → no tools)
   all_reasoning?: boolean; // render every assistant turn's reasoning (gemma-4/MiniMax-M2 templates; no-op otherwise)
+  full_seq_labels?: boolean; // train on the FULL sequence (skip assistant-only masking) — labels = every token
   objective?: "sft" | "dpo"; // dpo = pack chosen/rejected preference pairs → kind=llm_dpo_packed
   chosen_field?: string; // objective=dpo: preferred-response column (messages list or string)
   rejected_field?: string; // objective=dpo: dispreferred-response column

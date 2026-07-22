@@ -641,7 +641,21 @@ def main(
                     except Exception as e:
                         logger.warning(f"wandb.log failed (continuing): {e}")
 
-            reached_max = max_steps > 0 and do_step and (opt_step + 1) >= max_steps
+            # Graceful early-stop: the gateway's /stop-early `touch`es $SGPU_STOP_FLAG
+            # (whisper/TTS already poll it; LLM runs silently ignored it until 2026-07-21).
+            # Rank 0 polls and the decision is BROADCAST so every rank saves + breaks on
+            # the SAME step — the checkpoint save below runs collectives (full_tensor()),
+            # so a divergent decision across ranks would deadlock the job.
+            early_stop = False
+            if do_step and os.environ.get("SGPU_STOP_FLAG"):
+                stop_t = torch.tensor(
+                    1 if (rank == 0 and os.path.exists(os.environ["SGPU_STOP_FLAG"])) else 0,
+                    device=f'cuda:{rank}')
+                dist.broadcast(stop_t, src=0)
+                early_stop = bool(stop_t.item())
+                if early_stop and rank == 0:
+                    logger.info("early-stop flag seen -> checkpointing and stopping after this step")
+            reached_max = (max_steps > 0 and do_step and (opt_step + 1) >= max_steps) or early_stop
             if idx == len(dataloader)-1 or (do_step and (idx + 1) % checkpointing_step == 0) or reached_max:
                 logger.info("Checkpointing LoRA adapters..")
                 # Save every trainable param — the LoRA adapters AND (with --train_embeddings)

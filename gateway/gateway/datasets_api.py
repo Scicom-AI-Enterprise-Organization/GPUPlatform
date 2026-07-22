@@ -257,6 +257,11 @@ class LlmPackRequest(BaseModel):
     # message (gemma-4, MiniMax-M2, …): render EVERY assistant turn's reasoning.
     # No-op on templates without that guard. See llm_pack.build_chat_template.
     all_reasoning: bool = True
+    # Train on the FULL sequence (labels = every token: system tool-declarations,
+    # user turns, tool responses) instead of assistant-only masking. Escape hatch:
+    # full-sequence was the packing behaviour before 2026-07-10 and never produced
+    # a tool-call-looping model, at the cost of also training on env/user text.
+    full_seq_labels: bool = False
     # Packing objective: "sft" (default — the messages column → kind=llm_packed) or
     # "dpo" (preference PAIRS → kind=llm_dpo_packed: chosen/rejected columns, each a
     # full message list sharing the prompt turns — ultrafeedback-binarized style — or
@@ -3368,6 +3373,7 @@ async def pack_llm_dataset(
         storage_id=req.storage_id,
         tools_field=(req.tools_field or "").strip() or None,
         all_reasoning=bool(req.all_reasoning),
+        full_seq_labels=bool(req.full_seq_labels),
         objective=req.objective,
         chosen_field=(req.chosen_field or "chosen").strip(),
         rejected_field=(req.rejected_field or "rejected").strip(),

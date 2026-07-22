@@ -131,7 +131,13 @@ def _merge_lora(cfg: dict) -> str:
     if tok:
         env["HF_TOKEN"] = tok
         env["HUGGING_FACE_HUB_TOKEN"] = tok
-        env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        # Do NOT force hf_transfer on here: it's known to STALL on the tm/tm-2 boxes
+        # (see training/llm/CLAUDE.md — the same reason training's own env_vars sets
+        # HF_HUB_ENABLE_HF_TRANSFER=0 there). This used to setdefault it to "1",
+        # silently re-enabling the exact accelerator training explicitly avoids —
+        # `env` already started as a copy of this process's inherited os.environ, so
+        # whatever the run's own env_vars decided (e.g. explicitly "0") carries through
+        # unmodified; only opt in if the caller's config says so.
     train_py = cfg.get("train_py") or _sys.executable
     log(f"merging LoRA into {base_model} → {merged} (dtype={cfg.get('merge_dtype') or 'fp16'}) …")
     rc = merge_lora_to_dir(base_model, lora, merged, train_py, llm_dir,

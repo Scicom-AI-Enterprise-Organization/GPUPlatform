@@ -78,7 +78,14 @@ MODEL_ID/target_modules edits: preserve on re-sync (or port DPO to the standalon
    `python llm_finetune.py --deps-only` (builds the arch venv), then launches it from that venv.
    `llm_finetune.run()` downloads the pack → `./packed_data`, pre-fetches the base model, runs the
    pre-flight, then `torchrun <arch trainer>`. The LoRA checkpoint (`lora.pt` + `lora_meta.json`)
-   uploads to S3 (+ optional HF push).
+   uploads to S3 (+ optional HF push). Checkpoints save at every EPOCH END + every
+   `checkpointing_step` + at `max_steps` — `lora.pt` is a single overwritten file, so to keep an
+   exact epoch-boundary snapshot, copy it off the work dir before the next save lands.
+   **`/stop-early` works for gemma since 2026-07-21** (`gemma4.py` polls `$SGPU_STOP_FLAG` per
+   optimizer step, rank-0 decision broadcast so all ranks checkpoint+break on the same step —
+   trainer files ship per-run, no gateway restart). ⚠ The other LLM trainers (qwen/minimax/
+   mistral/nemotron) still IGNORE the flag — /stop-early on those runs does nothing; port the
+   same block if needed.
 
 ## Architecture auto-detect (the core of this subsystem)
 
@@ -264,7 +271,11 @@ now fixed in `_ensure_venv`/`_pip`/`_install_fa4` (they ship per-run, so a re-ru
 - **Model pre-fetch**: set `env_vars.HF_HOME=/share/huggingface` (reuse/persist the 62GB cache, NOT
   root's `~/.cache`) + `HF_HUB_DISABLE_XET=1` AND `HF_HUB_ENABLE_HF_TRANSFER=0` (both Xet *and*
   hf_transfer stall on tm → plain HTTP is slow ~1.5–3h for 62GB but doesn't hang). The first run caches
-  the model in `/share`; later gemma runs skip the download.
+  the model in `/share`; later gemma runs skip the download. ⚠ `training/hf_export.py` used to
+  **re-enable hf_transfer itself** (`env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")`) for the
+  base-model download during merge — contradicting this exact finding; removed 2026-07-21 (the file
+  ships per-request, no gateway restart needed). If an hf-export stalls at the download step again,
+  check nothing reintroduced that env.
 
 Net: `train-250eeaa2` (gemma-4-31B FA4, 2× H20 GPUs 6,7, `batch_size=2 grad_accum=1`, 64k block) trained
 end-to-end (~73→120GB/GPU, 100% util). `batch_size=2` is what makes 64k context fit on H20s.

@@ -74,6 +74,7 @@ export function LlmPackCard({
   const [storageId, setStorageId] = useState(s3Storages[0]?.id ?? "");
   const [toolsField, setToolsField] = useState("functions");
   const [allReasoning, setAllReasoning] = useState(true);
+  const [fullSeqLabels, setFullSeqLabels] = useState(false);
   // Objective: sft = the messages column → kind=llm_packed; dpo = chosen/rejected
   // preference pairs → kind=llm_dpo_packed (whole pairs per bin, for DPO runs).
   // Default to the dataset's configured mode: a mapped rejected column ⇒ DPO, with
@@ -189,6 +190,7 @@ export function LlmPackCard({
         sequence_length: seqLen,
         tools_field: toolsField.trim() || null,
         all_reasoning: allReasoning,
+        full_seq_labels: fullSeqLabels,
         objective,
         ...(objective === "dpo"
           ? {
@@ -457,6 +459,22 @@ export function LlmPackCard({
                   train on every assistant turn&apos;s reasoning. No-op on templates without that guard.
                 </span>
               </label>
+              {objective === "sft" && (
+              <label className="flex items-start gap-2 text-xs">
+                <Checkbox
+                  checked={fullSeqLabels}
+                  onCheckedChange={(v) => setFullSeqLabels(v === true)}
+                  disabled={running}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="font-medium">Full-sequence labels</span> — train on EVERY token
+                  (system tool declarations, user turns, tool responses) instead of assistant-only
+                  masking. More robust stop-token behaviour at the cost of also learning to imitate
+                  environment/user text.
+                </span>
+              </label>
+              )}
             </div>
           )}
 

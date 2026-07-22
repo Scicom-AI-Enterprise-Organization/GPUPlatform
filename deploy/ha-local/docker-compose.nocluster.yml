@@ -1,0 +1,11 @@
+# Negative-control override: turn the proxy cluster OFF on both replicas.
+# With PROXY_CLUSTER=0 the max_concurrency cap is per-replica, so 2 replicas
+# => the mock should see up to 4 concurrent (2 per replica), not 2.
+#   docker compose -f docker-compose.yml -f docker-compose.nocluster.yml up -d
+services:
+  gateway1:
+    environment:
+      PROXY_CLUSTER: "0"
+  gateway2:
+    environment:
+      PROXY_CLUSTER: "0"

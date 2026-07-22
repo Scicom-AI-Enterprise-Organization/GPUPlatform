@@ -198,7 +198,10 @@ def main():
     if scaling is None:
         raise SystemExit("scaling unknown: pass --scaling alpha/r (no lora_meta.json found)")
     # gemma-4-MoE routed experts were adapted with a separate (smaller) moe_r/moe_alpha.
-    moe_scaling = float(meta.get("moe_alpha", 32)) / float(meta.get("moe_r", 16))
+    # DENSE checkpoints record moe_r=0 (no experts) — .get defaults don't help since the
+    # key EXISTS as 0, so guard the division; moe_scaling is unused without expert adapters.
+    _moe_r = float(meta.get("moe_r") or 0)
+    moe_scaling = (float(meta.get("moe_alpha") or 0) / _moe_r) if _moe_r > 0 else scaling
     use_dora = bool(meta.get("use_dora", False))
 
     print(f">> loading base {model_id} (bf16, sdpa, device_map=auto)")

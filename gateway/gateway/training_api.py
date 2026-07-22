@@ -3550,7 +3550,11 @@ async def _create_and_launch_run(
             [a.strip() for a in (body.llm_label_mos_axes or []) if str(a).strip()]
             or ["Relevance", "Accuracy", "Helpfulness", "Tone"]
         ) if body.task_type == "llm" else [],
-        "precision": body.precision, "language": body.language, "task": body.task,
+        # LLM trainers are native bf16 end-to-end (gemma4.py loads torch.bfloat16 +
+        # FSDP param_dtype=bf16) and never read this field — record bf16-bf16 so the
+        # config tab reflects reality instead of the ASR default's fp32 load.
+        "precision": "bf16-bf16" if body.task_type == "llm" else body.precision,
+        "language": body.language, "task": body.task,
         "base_model": body.base_model,
         # Cloud-pod knobs are irrelevant on a VM — omit them so the config tab
         # matches reality (VM hardware is fixed; gpu_type reflects the VM).

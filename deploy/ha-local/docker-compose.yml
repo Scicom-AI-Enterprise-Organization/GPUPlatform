@@ -1,0 +1,113 @@
+# Local multi-container HA harness for the gateway + LLM API proxy.
+#
+#   2x gateway  (GATEWAY_HA=1 + PROXY_CLUSTER=1)  <- the two switches under test
+#   nginx lb    (:8090, round-robins the replicas = the "one endpoint" clients hit)
+#   mock upstream (OpenAI-compatible, sleeps + logs peak concurrency)
+#   own postgres + redis (isolated project 'sgpu-ha' -> zero clash with your
+#                         running dev stack; no host ports published for them)
+#
+# Run:    docker compose -f deploy/ha-local/docker-compose.yml up --build -d
+# Stop:   docker compose -f deploy/ha-local/docker-compose.yml down -v
+#
+# NOTE this builds the gateway IMAGE, not your working tree. Rebuild (--build)
+# after backend edits, or use the process-based recipe in README.md to iterate.
+name: sgpu-ha
+
+volumes:
+  ha-pg: {}
+  ha-redis: {}
+
+x-gateway: &gateway
+  # The Dockerfile COPYs the sibling worker-agent/, so its context is the repo
+  # ROOT (matches CI + Makefile), not gateway/.
+  build:
+    context: ../..
+    dockerfile: gateway/Dockerfile
+  restart: unless-stopped
+  environment: &gw-env
+    REDIS_URL: redis://redis:6379
+    WORKER_REDIS_URL: redis://redis:6379
+    DATABASE_URL: postgresql+asyncpg://serverlessgpu:devpassword@postgres:5432/serverlessgpu
+    GATEWAY_BIND: 0.0.0.0:8080
+    LOG_LEVEL: INFO
+    AUTH_DISABLED: "1"          # anonymous == admin, so no key needed for the tests
+    ADMIN_USERNAME: admin       # AUTH_DISABLED still needs a seeded admin to map to
+    ADMIN_PASSWORD: admin
+    PROVIDER: fake              # no real RunPod pods, no billing
+    AUTOSCALER: "0"             # proxy path forwards straight to the mock; no workers
+    # --- the two HA switches this harness exists to exercise ---
+    GATEWAY_HA: "1"             # only the leader runs the singleton controllers
+    PROXY_CLUSTER: "1"          # proxy cap/queue/cancel become cluster-wide via Redis
+    # snappier failover than the 15s/5s prod default, for a quick local test
+    LEADER_TTL_S: "6"
+    LEADER_RENEW_S: "2"
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/ready"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+    start_period: 20s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: serverlessgpu
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: serverlessgpu
+    volumes:
+      - ha-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U serverlessgpu -d serverlessgpu"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ha-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  gateway1:
+    <<: *gateway
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    ports:
+      - "8091:8080"     # direct access to replica 1 (GET /leader, per-replica view)
+
+  gateway2:
+    <<: *gateway
+    depends_on:
+      # wait for gw1 to be healthy so it creates the DB schema first — avoids two
+      # replicas racing create_all() on a brand-new database.
+      gateway1: {condition: service_healthy}
+    ports:
+      - "8092:8080"     # direct access to replica 2
+
+  lb:
+    image: nginx:1.27-alpine
+    depends_on:
+      gateway1: {condition: service_healthy}
+      gateway2: {condition: service_healthy}
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8090:8090"     # <- clients hit this; round-robins gw1/gw2
+
+  mock-upstream:
+    image: python:3.12-slim
+    restart: unless-stopped
+    volumes:
+      - ./mock_upstream.py:/mock_upstream.py:ro
+    environment:
+      MODEL_ID: mock
+      DELAY_S: "3"      # hold each request 3s so the cap is easy to watch
+      PORT: "9000"
+    command: ["python", "/mock_upstream.py"]

@@ -29,6 +29,12 @@ gateway:
   # REQUIRED before setting replicaCount > 1 with autoscaler: true — otherwise
   # every replica runs its own autoscaler and double-provisions.
   ha: false
+  # Cross-replica correctness for the LLM proxy (PROXY_CLUSTER). Auto-on whenever
+  # HA is on or replicaCount > 1 — leave unset and it follows scaling. Set true to
+  # force it on at replicaCount: 1 (e.g. a single replica you expect to scale).
+  # Without it, a proxy endpoint's max_concurrency is enforced per-replica, so N
+  # replicas allow N× the cap. Fails open on Redis errors.
+  proxyCluster: false
   # PodDisruptionBudget — rendered automatically once replicaCount >= 2 so a
   # node drain / rollout can never evict every gateway at once. No-op (not
   # rendered) at replicaCount: 1, where it would deadlock drains instead.

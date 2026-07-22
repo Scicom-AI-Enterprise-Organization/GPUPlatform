@@ -267,7 +267,10 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   const canTryIt =
     ((run.task_type ?? "asr") === "asr" || run.task_type === "tts" || run.task_type === "llm") &&
     ((run.status === "done" && !!run.result_json?.artifact?.s3_uri) || tryitableTrials.length > 0);
-  const metricLabel = run.task_type === "tts"
+  // Matches run_multi_node_sweep's own `sweep_metric` rule (training_api.py):
+  // TTS and LLM sweeps rank by loss (no WER/CER concept); everything else (ASR)
+  // ranks by its configured eval_metric, default WER.
+  const metricLabel = (run.task_type === "tts" || run.task_type === "llm")
     ? "loss"
     : String((run.config_json?.eval_metric as string) || "wer").toUpperCase();
   // TTS has no WER/CER (ASR-only metrics). Its eval signal is the held-out loss
@@ -414,7 +417,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   // an effect flips asr→tts, which leaves the model/dataset/test Selects applying
   // their (tts) values against the wrong (asr) option set, so they don't inherit.
   function onEditAsNew() {
-    const task = run.task_type === "tts" ? "tts" : "asr";
+    const task = run.task_type === "tts" || run.task_type === "llm" ? run.task_type : "asr";
     router.push(`/autotrain/new?from=${encodeURIComponent(run.id)}&task=${task}`);
   }
 

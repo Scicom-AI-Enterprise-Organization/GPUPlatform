@@ -115,6 +115,15 @@ spec:
                   autoscalers. */}}
             - name: GATEWAY_HA
               value: "{{ if or .Values.gateway.ha (gt (int .Values.gateway.replicaCount) 1) }}1{{ else }}0{{ end }}"
+            {{- /* Proxy cluster: makes the LLM proxy's concurrency cap, live queue
+                  view, and cancel/flush span replicas via Redis. WITHOUT it each
+                  replica enforces max_concurrency on its own → N replicas give N×
+                  the intended cap (can overrun the backend the cap protects).
+                  Auto-on with HA / scaling — same condition as GATEWAY_HA — so a
+                  scaled gateway is correct by default. Fails OPEN if Redis is
+                  unreachable, so enabling it never blocks proxy traffic. */}}
+            - name: PROXY_CLUSTER
+              value: "{{ if or .Values.gateway.proxyCluster .Values.gateway.ha (gt (int .Values.gateway.replicaCount) 1) }}1{{ else }}0{{ end }}"
             - name: PROVIDER
               value: {{ .Values.gateway.provider | quote }}
             - name: DISABLE_CLOUD_PROVIDERS
