@@ -504,49 +504,10 @@ def main(
     local_shard = sum(v.to_local().numel() if hasattr(v, "to_local") else v.numel() for _ , v in model_sd.items())
     logger.info(f"[Rank{rank}]: Total local/shard param: {local_shard/(1024*1024):.2f}M")
 
-    # ---- torch.compile (opt-in, --torch_compile) ---------------------------------------
-    # PER-BLOCK compile, applied AFTER fully_shard but BEFORE activation checkpointing:
-    #   * per-block (not whole-model): whole-model torch.compile wraps the root in an
-    #     OptimizedModule and prefixes every param name with `_orig_mod.` — that would
-    #     break the LoRA checkpoint keys merge_infer.py reads. layer.compile() is in-place
-    #     and leaves named_parameters() untouched. It's also the FSDP2-recommended shape.
-    #   * before AC: the clean nesting is checkpoint(compiled_fn), so compile the raw
-    #     sharded layer, then checkpoint_layers wraps the compiled forward below.
-    #   * dynamic=True is LOAD-BEARING: multipacked bins have a DIFFERENT packed length
-    #     every step, so a static compile would recompile each step (minutes each →
-    #     unusable). dynamic=True builds ONE symbolic-shape graph reused for all lengths.
-    #     The FA4 cute kernel is a custom CUDA op dynamo can't trace → it graph-breaks
-    #     there automatically (expected; only the norm/activation/elementwise regions fuse).
-    # ⚠ UNVERIFIED on GPU yet — enable on a smoke run first and confirm the recompiles log
-    # stays quiet after step 1 (that's the whole point of "make sure it will not recompile").
-    if torch_compile:
-        import torch._dynamo as _dynamo
-        _dynamo.config.cache_size_limit = 64   # headroom; blowing past this == something IS recompiling
-        try:
-            _dynamo.config.recompile_limit = 16
-        except Exception:  # noqa: BLE001 — older torch names it differently; non-fatal
-            pass
-        # Log every (re)compilation with its guard reason so the smoke test can PROVE it
-        # compiles once. Equivalent to running with TORCH_LOGS=recompiles.
-        try:
-            torch._logging.set_logs(recompiles=True)
-        except Exception:  # noqa: BLE001
-            pass
-        n_compiled = 0
-        for _m in model.modules():
-            if isinstance(_m, modeling_gemma4.Gemma4TextDecoderLayer):
-                try:
-                    _m.compile(dynamic=True)
-                    n_compiled += 1
-                except Exception as e:  # noqa: BLE001 — a compile failure must NOT kill the run
-                    if rank == 0:
-                        logger.warning(f"[torch.compile] layer compile failed, staying eager: {e}")
-                    break
-        if rank == 0:
-            logger.info(f"[torch.compile] per-block dynamic compile on {n_compiled} decoder layers "
-                        f"(FA4 attention graph-breaks; recompiles are logged). The FIRST optimizer "
-                        f"step will be SLOW (tracing/compiling); steps after should be steady with "
-                        f"NO further 'recompiling' log lines.")
+    # torch.compile (opt-in, --torch_compile): per-block dynamic compile AFTER fully_shard,
+    # BEFORE activation checkpointing (gemma's FA4 cute kernel graph-breaks). Shared helper.
+    tc.maybe_torch_compile(model, modeling_gemma4.Gemma4TextDecoderLayer,
+                           enabled=torch_compile, rank=rank, logger=logger)
 
     tc.checkpoint_layers(model, modeling_gemma4.Gemma4TextDecoderLayer)
     
@@ -812,10 +773,7 @@ if __name__ == "__main__":
                         help="Use DoRA (weight-decomposed LoRA) instead of plain LoRA for the "
                              "target_modules + (for MoE) the routed experts: adds a trainable "
                              "per-output-row magnitude.")
-    parser.add_argument("--torch_compile", action="store_true",
-                        help="Per-block torch.compile(dynamic=True) on the decoder layers "
-                             "(FA4 attention graph-breaks; dynamic avoids per-bin-length recompiles). "
-                             "Off by default; smoke-test + check the recompiles log before real use.")
+    # --torch_compile is a common flag now (add_common_args); the trainer threads it to main().
     args = parser.parse_args()
     main(
         args.r,

@@ -57,6 +57,11 @@ def add_common_args(parser, *, lr_default: float = 1e-4, wandb_project: str = "a
     parser.add_argument("--lr", type=float, default=lr_default, help="AdamW learning rate.")
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases.")
     parser.add_argument("--wandb_project", default=wandb_project, help="wandb project name.")
+    parser.add_argument(
+        "--torch_compile", action="store_true",
+        help="Per-block torch.compile(dynamic=True) on the decoder layers (see maybe_torch_compile). "
+             "dynamic avoids per-bin-length recompiles; custom attention/SSM kernels graph-break. "
+             "Off by default — smoke-test + check the recompiles log before relying on it.")
 
 
 def unfreeze_embeddings(model, *, rank: int = 0, logger=None) -> int:
@@ -132,3 +137,59 @@ def checkpoint_layers(model, decoder_classes) -> None:
         checkpoint_wrapper_fn=partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
         check_fn=lambda m: isinstance(m, classes),
     )
+
+
+def maybe_torch_compile(model, decoder_classes, *, enabled: bool, rank: int = 0, logger=None) -> int:
+    """Opt-in (`--torch_compile`) PER-BLOCK `torch.compile(dynamic=True)` on each decoder layer,
+    shared by every LLM trainer. Returns the number of layers compiled (0 when disabled).
+
+    Call AFTER `shard_layers` (fully_shard) but BEFORE `checkpoint_layers`:
+      * PER-BLOCK (not whole-model): whole-model `torch.compile` wraps the root in an
+        `OptimizedModule` and prefixes every param with `_orig_mod.` — that would break the
+        LoRA checkpoint keys the merges read. `layer.compile()` is in-place and leaves
+        `named_parameters()` untouched. It's also the FSDP2-recommended shape.
+      * BEFORE activation checkpointing: the clean nesting is `checkpoint(compiled_fn)`, so
+        compile the raw sharded layer, then `checkpoint_layers` wraps the compiled forward.
+      * `dynamic=True` is LOAD-BEARING: multipacked bins (and nemotron's padded batches) have a
+        DIFFERENT length every step, so a static compile would recompile each step (minutes each
+        → unusable). dynamic builds ONE symbolic-shape graph reused for all lengths.
+
+    Each arch's custom attention / state-space kernel (gemma FA4 cute, qwen GatedDeltaNet,
+    minimax/mistral FP8 dequant, nemotron Mamba2) is a custom op dynamo can't trace → it
+    graph-breaks there automatically (expected; only the norm/activation/elementwise regions
+    fuse). A per-layer compile failure is caught and the run stays eager rather than dying.
+
+    ⚠ Opt-in + UNVERIFIED per arch: enable on a smoke run first and confirm the recompiles log
+    stays quiet after step 1 ("make sure it will not recompile").
+    """
+    if not enabled:
+        return 0
+    import torch._dynamo as _dynamo
+    _dynamo.config.cache_size_limit = 64   # headroom; blowing past this == something IS recompiling
+    try:
+        _dynamo.config.recompile_limit = 16
+    except Exception:  # noqa: BLE001 — older torch names it differently; non-fatal
+        pass
+    # Log every (re)compilation with its guard reason so a smoke test can PROVE it compiles
+    # once. Equivalent to running with TORCH_LOGS=recompiles.
+    try:
+        torch._logging.set_logs(recompiles=True)
+    except Exception:  # noqa: BLE001
+        pass
+    classes = decoder_classes if isinstance(decoder_classes, tuple) else (decoder_classes,)
+    n = 0
+    for m in model.modules():
+        if isinstance(m, classes):
+            try:
+                m.compile(dynamic=True)
+                n += 1
+            except Exception as e:  # noqa: BLE001 — a compile failure must NOT kill the run
+                if rank == 0 and logger is not None:
+                    logger.warning(f"[torch.compile] layer compile failed, staying eager: {e}")
+                break
+    if rank == 0 and logger is not None:
+        logger.info(f"[torch.compile] per-block dynamic compile on {n} decoder layers "
+                    f"(custom attention/SSM kernels graph-break; recompiles are logged). The FIRST "
+                    f"optimizer step will be SLOW (tracing/compiling); steps after should be steady "
+                    f"with NO further 'recompiling' log lines.")
+    return n

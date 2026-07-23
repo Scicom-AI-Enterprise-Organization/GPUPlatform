@@ -2996,10 +2996,10 @@ class CreateTrainingRunRequest(BaseModel):
     # per-output-row magnitude and takes the direction from W+ΔW. Incompatible with DPO (the
     # LoRA-disabled reference assumes the base is untouched). All LLM archs.
     use_dora: bool = False
-    # LLM gemma-only: per-block torch.compile(dynamic=True) on the decoder layers. dynamic
-    # avoids per-bin-length recompiles (multipacked bins vary in length); the FA4 cute kernel
-    # graph-breaks (custom op). Off by default — a modest fuse of the non-attention ops, and
-    # unverified on GPU: smoke-test + check the recompiles log before relying on it.
+    # torch.compile — ALL task types. LLM (every arch) + TTS: per-block torch.compile(dynamic=True)
+    # on the decoder layers (dynamic avoids per-length recompiles; custom attention/SSM/flash-attn
+    # kernels graph-break, the rest fuses). ASR/Whisper: HF Trainer whole-model compile (inductor).
+    # Off by default — opt-in / experimental: smoke-test + check the recompiles log before relying on it.
     torch_compile: bool = False
     # LLM MoE-only: skip the fused routed-expert adapter (adapt attention only). The experts are
     # 3D tensors (not nn.Linear), so they're NOT in lora_target_modules — they're adapted by
@@ -3527,7 +3527,7 @@ async def _create_and_launch_run(
                                  if m in _LORA_TARGET_MODULES] or list(_LORA_TARGET_DEFAULT)),
         "train_embeddings": bool(body.train_embeddings),  # gemma4: full-train embed+lm_head
         "use_dora": bool(body.use_dora),  # LLM: DoRA instead of LoRA (attention + MoE experts)
-        "torch_compile": bool(body.torch_compile),  # LLM gemma: per-block dynamic torch.compile
+        "torch_compile": bool(body.torch_compile),  # all tasks: torch.compile (LLM/TTS per-block, ASR HF Trainer)
         "no_moe_lora": bool(body.no_moe_lora),  # LLM MoE: opt out of the routed-expert adapter
         "freeze_encoder": body.freeze_encoder, "use_ddp": body.use_ddp,
         "logging_steps": body.logging_steps,

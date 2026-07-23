@@ -470,6 +470,11 @@ def run(cfg: dict) -> None:
     # JIT tool resolve from the venv too).
     env["VIRTUAL_ENV"] = os.path.dirname(venv_bin)
     env["PATH"] = venv_bin + ":" + env.get("PATH", "")
+    # torch.compile (opt-in): per-block dynamic compile of the Qwen3 backbone (model.llm) decoder
+    # layers inside lora_train.py, signalled by env. Only the LoRA path (lora_train.py) reads it —
+    # the upstream `-m omnivoice.cli.train` full-finetune path has no compile hook.
+    if cfg.get("torch_compile") and cfg.get("use_lora"):
+        env["SGPU_TORCH_COMPILE"] = "1"
     art = cfg.get("artifacts") or {}  # NB: training_api sets "artifacts" (plural)
     # Higgs AUDIO codec id (NOT the LM tokenizer). On a PACK run cfg["tokenizer"] is
     # the codec from the pack request; on a TRAIN run the gateway sets cfg["tokenizer"]

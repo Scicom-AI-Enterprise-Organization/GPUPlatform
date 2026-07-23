@@ -259,6 +259,7 @@ def main(
         target_modules=None,
         train_embeddings: bool = False,
         use_dora: bool = False,
+        torch_compile: bool = False,
     ):
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -333,6 +334,10 @@ def main(
 
     kw = tc.fsdp_kwargs(mesh_device, param_dtype=torch.bfloat16, cpu_offload=cpu_offload)
     tc.shard_layers(model, modeling_nemotron_h.NemotronHBlock, kw)
+    # torch.compile (opt-in): per-block dynamic compile after sharding, before AC. The Mamba2
+    # fused kernels / attention graph-break; dynamic handles the padded one-doc-per-bin lengths.
+    tc.maybe_torch_compile(model, modeling_nemotron_h.NemotronHBlock,
+                           enabled=torch_compile, rank=rank, logger=logger)
     tc.checkpoint_layers(model, modeling_nemotron_h.NemotronHBlock)
 
     model_sd = model.state_dict()
@@ -484,4 +489,5 @@ if __name__ == "__main__":
         target_modules=[t.strip() for t in (args.target_modules or "").split(",") if t.strip()],
         train_embeddings=args.train_embeddings,
         use_dora=args.use_dora,
+        torch_compile=args.torch_compile,
     )

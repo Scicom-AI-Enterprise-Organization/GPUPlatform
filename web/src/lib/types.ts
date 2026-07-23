@@ -627,9 +627,9 @@ export type CreateTrainingRunRequest = {
   // LLM-only: use DoRA (weight-decomposed LoRA) instead of plain LoRA for every adapted module
   // (attention + the fused MoE experts on minimax/mistral/qwen-MoE/gemma-MoE). Incompatible with DPO.
   use_dora?: boolean;
-  // LLM gemma-only: per-block torch.compile(dynamic=True) on the decoder layers. dynamic avoids
-  // per-bin-length recompiles (multipacked bins vary in length); the FA4 cute attention kernel
-  // graph-breaks (custom op). Off by default — only the gemma trainer consumes it.
+  // torch.compile — all task types. LLM (every arch) + TTS: per-block torch.compile(dynamic=True)
+  // on the decoder layers (custom attention/SSM/flash-attn kernels graph-break, the rest fuses).
+  // ASR/Whisper: HF Trainer whole-model compile. Off by default; opt-in / experimental.
   torch_compile?: boolean;
   // LLM MoE-only: skip the fused routed-expert adapter (adapt attention only). Experts are 3D
   // tensors, not nn.Linear, so they're not in lora_target_modules — they're adapted by default;

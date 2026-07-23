@@ -1046,8 +1046,9 @@ export function TrainingForm() {
       // (its LoRA-disabled reference needs frozen base weights) → forced off there.
       train_embeddings: isLlm && !isDpo ? trainEmbeddings : false,
       use_dora: isLlm && !isDpo ? useDora : false,
-      // gemma-only: per-block torch.compile (only the gemma trainer's cmd builder reads it).
-      torch_compile: isGemma ? torchCompile : false,
+      // torch.compile — supported for every task type now: all LLM archs (per-block dynamic
+      // compile), ASR/Whisper (HF Trainer), and TTS (Qwen3 + OmniVoice-LoRA per-block).
+      torch_compile: torchCompile,
       // MoE-only opt-out of the routed-expert adapter (default: adapt them). Positive UI toggle.
       no_moe_lora: moeAdaptable ? !adaptMoeExperts : false,
       freeze_encoder: freezeEncoder,
@@ -1299,7 +1300,7 @@ export function TrainingForm() {
             {testDatasetId === NO_TEST && (
               <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
                 Trains on the full dataset with <span className="font-medium">no evaluation</span> —
-                no {isTts ? "eval loss" : "WER/CER"}, no best-checkpoint selection, no early stopping.
+                no {isTts || isLlm ? "eval loss" : "WER/CER"}, no best-checkpoint selection, no early stopping.
                 The final (last-step) model is saved.
               </p>
             )}
@@ -1501,6 +1502,23 @@ export function TrainingForm() {
             <FieldWrap label="Weight decay (AdamW)" hint="L2 regularization. 0 = off.">
               <Input className="font-mono" type="number" min={0} step={0.01} value={weightDecay}
                 onChange={(e) => setWeightDecay(Math.max(0, Number(e.target.value) || 0))} />
+            </FieldWrap>
+          )}
+          {/* torch.compile — every task type. LLM/TTS: per-block dynamic compile of the decoder
+              layers (custom attention/SSM/flash-attn kernels graph-break, the rest fuses). ASR:
+              HF Trainer whole-model compile (Whisper is a stock encoder-decoder). Opt-in. */}
+          {!sweepOn && (
+            <FieldWrap label="torch.compile"
+              hint={torchCompile
+                ? ((isLlm || isTts)
+                    ? "Per-block torch.compile(dynamic=True) on the decoder layers — custom attention/SSM/flash-attn kernels graph-break, the rest fuses. dynamic avoids per-step recompiles on variable-length packs. First step is slow (tracing); recompiles are logged. Opt-in / experimental."
+                    : "HF Trainer compiles the (PEFT-wrapped) Whisper model with the inductor backend. First step is slow (tracing). Opt-in / experimental.")
+                : "Off — eager execution. Turn on to JIT-compile the model for a per-step speedup after a slow first (tracing) step."}>
+              <label className="flex h-9 cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" checked={torchCompile} onChange={(e) => setTorchCompile(e.target.checked)}
+                  className="h-4 w-4 accent-primary" />
+                <span className="font-medium">{torchCompile ? "On" : "Off"}</span>
+              </label>
             </FieldWrap>
           )}
           {/* Memory / parallelism (LLM). */}
@@ -1780,25 +1798,6 @@ export function TrainingForm() {
               )}
             </div>
           )}
-          {/* gemma-4 only: per-block torch.compile on the decoder layers. Only the gemma trainer
-              consumes --torch_compile; qwen/minimax/mistral/nemotron ignore it, so hide it there. */}
-          {isGemma && (
-            <div className="space-y-1.5 border-t border-border pt-3">
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input type="checkbox" className="h-4 w-4 accent-primary"
-                  checked={torchCompile} onChange={(e) => setTorchCompile(e.target.checked)} />
-                <span className="font-medium">torch.compile decoder layers</span>
-                <span className="rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground">gemma</span>
-              </label>
-              <p className="text-xs text-muted-foreground">
-                Per-block <span className="font-mono">torch.compile(dynamic=True)</span> on the gemma-4 decoder
-                layers — fuses the norm/activation/elementwise regions. <span className="font-medium">dynamic</span> is
-                load-bearing: multipacked bins have a different length every step, so a static compile would recompile
-                (minutes) each step. The FA4 attention kernel is a custom CUDA op and graph-breaks automatically. The
-                first optimizer step is slow (tracing); recompiles are logged so you can confirm it compiles once.
-              </p>
-            </div>
-          )}
         </div>
 
         {sweepOn && (
@@ -1806,7 +1805,7 @@ export function TrainingForm() {
             Trials are pinned via <span className="font-mono">CUDA_VISIBLE_DEVICES</span> across the GPUs from{" "}
             <span className="font-medium">Run on</span> (the pin on a VM, or the GPU count on RunPod), {gpusPerTrial} each —
             e.g. GPUs <span className="font-mono">6,7</span> with 1/trial → 2 at a time. Best model chosen by{" "}
-            {isTts ? "lowest final loss" : "lowest WER/CER"}; each trial&apos;s checkpoint lands under{" "}
+            {isTts || isLlm ? "lowest final loss" : "lowest WER/CER"}; each trial&apos;s checkpoint lands under{" "}
             <span className="font-mono">…/trials/&lt;i&gt;/</span>.
           </p>
         )}

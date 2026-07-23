@@ -477,6 +477,7 @@ def main(
         no_moe_lora:bool = False,
         no_shared_lora:bool = False,
         use_dora:bool = False,
+        torch_compile:bool = False,
     ):
     if dpo and use_dora:
         # DoRA retrains a per-row magnitude on the frozen base; the DPO reference (LoRA disabled
@@ -594,6 +595,11 @@ def main(
         model_sd = model.state_dict()
         local_shard = sum(v.to_local().numel() if hasattr(v, "to_local") else v.numel() for _, v in model_sd.items())
         logger.info(f"[Rank{rank}]: Total local/shard param: {local_shard/(1024*1024):.2f}M")
+
+    # torch.compile (opt-in, --torch_compile): per-block dynamic compile AFTER sharding, BEFORE
+    # activation checkpointing. Qwen's GatedDeltaNet + full-attn kernels graph-break; compile the
+    # decoder class (dense or MoE). Applies to the FSDP and replicate-CP paths (layers exist in both).
+    tc.maybe_torch_compile(model, classes["decoder"], enabled=torch_compile, rank=rank, logger=logger)
 
     # Activation checkpointing (NO_REENTRANT) — the DOMINANT memory lever (64 layers × intermediate
     # 17408 MLP intermediates); disabling it is what forced the CP OOM at long context. ON by default
@@ -949,4 +955,5 @@ if __name__ == "__main__":
         args.no_moe_lora,
         args.no_shared_lora,
         args.use_dora,
+        args.torch_compile,
     )

@@ -79,6 +79,35 @@ def main():
     model.llm = get_peft_model(model.llm, peft_config)
     model.llm.print_trainable_parameters()
 
+    # torch.compile (opt-in via SGPU_TORCH_COMPILE, set by omnivoice_finetune when the run enables
+    # it): PER-BLOCK dynamic compile of the Qwen3 backbone (model.llm) decoder layers. Per-block
+    # keeps named_parameters()/LoRA keys intact (the merge-back at save reads them); dynamic=True
+    # avoids per-length recompiles; custom ops graph-break; a failure stays eager (try/except).
+    # OmniVoice's small audio heads/embeddings stay eager. Applied before OmniTrainer builds.
+    if os.environ.get("SGPU_TORCH_COMPILE") == "1":
+        import torch
+        import torch._dynamo as _dynamo
+        _dynamo.config.cache_size_limit = 64
+        try:
+            _dynamo.config.recompile_limit = 16
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            torch._logging.set_logs(recompiles=True)
+        except Exception:  # noqa: BLE001
+            pass
+        _n_compiled = 0
+        for _m in model.llm.modules():
+            if type(_m).__name__.endswith("DecoderLayer"):
+                try:
+                    _m.compile(dynamic=True)
+                    _n_compiled += 1
+                except Exception as e:  # noqa: BLE001 — a compile failure must NOT kill the run
+                    print(f"[torch.compile] layer compile failed, staying eager: {e}", flush=True)
+                    break
+        print(f"[torch.compile] per-block dynamic compile on {_n_compiled} Qwen3 backbone decoder "
+              f"layers (custom ops graph-break; recompiles logged). First step is slow.", flush=True)
+
     train_loader, eval_loader = build_dataloaders(config, tokenizer)
 
     # 3. Initialize Trainer and Start (same as omnivoice.cli.train)

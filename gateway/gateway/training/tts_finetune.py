@@ -489,6 +489,12 @@ def run(cfg: dict) -> None:
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     if report_to and cfg.get("run_name"):
         env.setdefault("WANDB_NAME", cfg["run_name"])
+    # torch.compile (opt-in): per-block dynamic compile of the Qwen3 decoder layers inside
+    # qwen3_tts_flash.py (NOT HF Trainer's whole-model torch_compile — the FA3 varlen custom op
+    # would risk a hard dynamo error). Signalled by env so we don't touch the HfArgumentParser
+    # dataclasses (a `torch_compile` field there collides with TrainingArguments' own).
+    if cfg.get("torch_compile"):
+        env["SGPU_TORCH_COMPILE"] = "1"
 
     def step(cmd: list[str], cwd: str) -> None:
         log(f"[gateway] $ {' '.join(cmd)}")

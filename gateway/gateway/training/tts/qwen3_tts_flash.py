@@ -382,6 +382,41 @@ def main():
             model.enable_input_require_grads()
         model.print_trainable_parameters()
 
+    # torch.compile (opt-in via SGPU_TORCH_COMPILE, set by tts_finetune when the run enables it):
+    # PER-BLOCK dynamic compile of the Qwen3 decoder layers — deliberately NOT HF Trainer's
+    # whole-model torch_compile (left off), because this model runs a flash-attn *varlen* custom
+    # op that dynamo can't trace and would risk a hard error with no fallback. Per-block keeps
+    # named_parameters()/LoRA keys intact, dynamic=True avoids per-pack-length recompiles, the FA
+    # op graph-breaks automatically, and a compile failure stays eager (try/except). Applied here,
+    # after the (optional) LoRA wrap and before the Trainer builds.
+    if os.environ.get("SGPU_TORCH_COMPILE") == "1":
+        import torch._dynamo as _dynamo
+        _dynamo.config.cache_size_limit = 64
+        try:
+            _dynamo.config.recompile_limit = 16
+        except Exception:  # noqa: BLE001 — older torch names it differently
+            pass
+        try:
+            torch._logging.set_logs(recompiles=True)  # PROVE it compiles once (TORCH_LOGS=recompiles)
+        except Exception:  # noqa: BLE001
+            pass
+        _rank0 = int(os.environ.get("LOCAL_RANK", "0")) == 0
+        _n_compiled = 0
+        for _m in model.modules():
+            if type(_m).__name__.endswith("DecoderLayer"):
+                try:
+                    _m.compile(dynamic=True)
+                    _n_compiled += 1
+                except Exception as e:  # noqa: BLE001 — a compile failure must NOT kill the run
+                    if _rank0:
+                        logger.warning(f"[torch.compile] layer compile failed, staying eager: {e}")
+                    break
+        if _rank0:
+            logger.info(f"[torch.compile] per-block dynamic compile on {_n_compiled} Qwen3 decoder "
+                        f"layers (flash-attn varlen graph-breaks; recompiles logged). The FIRST "
+                        f"optimizer step will be SLOW (tracing); steps after should be steady with "
+                        f"NO further 'recompiling' log lines.")
+
     # Split-aware packed dataset keeps train/ + test/ subdirs (StreamingDataset
     # reads local/<split>/); a flat packed dir (legacy) has shards at the root.
     # Train on `train`, evaluate on `test` when present.

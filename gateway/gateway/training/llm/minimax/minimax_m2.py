@@ -344,6 +344,12 @@ def main(args):
         _reinit_lora_(model)                            # A=kaiming, B=0 on the real tensors
         logger.info(f"[Rank{rank}] low-CPU sharded load complete")
 
+    # torch.compile (opt-in, --torch_compile): per-block dynamic compile after sharding, before
+    # AC. The FP8 dequant + fused-MoE grouped_mm are custom ops that graph-break; only the
+    # norm/activation/elementwise regions fuse.
+    tc.maybe_torch_compile(model, modeling_minimax_m2.MiniMaxM2DecoderLayer,
+                           enabled=args.torch_compile, rank=rank, logger=logger)
+
     # ---- activation checkpointing (REQUIRED for the dequant memory trick) ----
     # Each decoder layer's forward (incl. the transient bf16 weight dequant) is recomputed in
     # the backward instead of retained, so peak memory stays ~ one layer's bf16 weights.

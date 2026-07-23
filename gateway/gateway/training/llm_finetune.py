@@ -789,6 +789,9 @@ def _qwen_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     # DoRA (weight-decomposed LoRA). Form-set.
     if cfg.get("use_dora"):
         cmd.append("--use_dora")
+    # torch.compile: per-block dynamic compile of the decoder layers (GatedDeltaNet graph-breaks).
+    if cfg.get("torch_compile"):
+        cmd.append("--torch_compile")
     # MoE (Qwen3.6-35B-A3B / Qwen3.5-122B-A10B) adapts routed + shared experts by default.
     if cfg.get("no_moe_lora"):
         cmd.append("--no_moe_lora")
@@ -835,6 +838,9 @@ def _nemotron_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     # DoRA (weight-decomposed LoRA) for the attn/mamba linears — experts stay frozen either way.
     if cfg.get("use_dora"):
         cmd.append("--use_dora")
+    # torch.compile: per-block dynamic compile (Mamba2/attention kernels graph-break).
+    if cfg.get("torch_compile"):
+        cmd.append("--torch_compile")
     return cmd
 
 
@@ -875,6 +881,9 @@ def _moe_cmd(py: str, cfg: dict, nproc: int, packed: str, ckpt: str, arch: str) 
     # DoRA (weight-decomposed LoRA) for attention + the fused MoE experts. Form-set.
     if cfg.get("use_dora"):
         cmd.append("--use_dora")
+    # torch.compile: per-block dynamic compile (FP8 dequant + fused-MoE grouped_mm graph-break).
+    if cfg.get("torch_compile"):
+        cmd.append("--torch_compile")
     # Full-train the (bf16) token embeddings + LM head on top of LoRA (minimax/mistral are
     # untied → both weights) — helps the finetune reliably emit special tokens. Form-set.
     if cfg.get("train_embeddings"):

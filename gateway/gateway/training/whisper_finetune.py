@@ -1002,6 +1002,10 @@ def run(cfg: dict) -> None:
         generation_max_length=int(cfg.get("generation_max_length", 225)),
         fp16=(amp == "fp16"),
         bf16=(amp == "bf16"),
+        # torch.compile (opt-in, cfg["torch_compile"]): HF Trainer compiles the (PEFT-wrapped)
+        # Whisper model with the default inductor backend. Off by default; the first step is slow
+        # (tracing). Whisper is a stock encoder-decoder so it compiles cleanly (no custom kernels).
+        torch_compile=bool(cfg.get("torch_compile", False)),
         # No eval → no "best" to load (load_best needs eval==save strategy); keep
         # the last checkpoint instead.
         load_best_model_at_end=(not no_eval),
