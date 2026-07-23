@@ -353,7 +353,7 @@ export type TrainingEpoch = {
 
 export type TrainingTrial = {
   trial: number;
-  params: Record<string, number | string>;
+  params: Record<string, number | string | boolean>;
   metric?: number | null;
   status?: string;
   // Multi-node sweep only: each trial is its own independent TrainingRun row
@@ -398,7 +398,7 @@ export type TrainingResult = {
     epoch?: number; wer?: number | null; cer?: number | null; eval_loss?: number | null;
     loss?: number | null;
     // sweep winner
-    trial?: number; params?: Record<string, number | string>; metric?: number | null;
+    trial?: number; params?: Record<string, number | string | boolean>; metric?: number | null;
   } | null;
   artifact?: { s3_uri?: string | null; hf_repo?: string | null } | null;
   stopped_early?: boolean;
@@ -569,7 +569,7 @@ export type CreateTrainingRunRequest = {
   speaker_field?: string | null;
   // hyperparameter sweep: {param: [values]} → cross-product = trials.
   // values are numbers for most knobs; `precision` is a string list.
-  sweep?: Record<string, (number | string)[]>;
+  sweep?: Record<string, (number | string | boolean)[]>;
   gpus_per_trial?: number;
   // Multi-node sweep: several (provider, GPU-range) targets instead of one
   // provider_id/visible_devices pool — each node contributes floor(its GPU count /
@@ -627,6 +627,10 @@ export type CreateTrainingRunRequest = {
   // LLM-only: use DoRA (weight-decomposed LoRA) instead of plain LoRA for every adapted module
   // (attention + the fused MoE experts on minimax/mistral/qwen-MoE/gemma-MoE). Incompatible with DPO.
   use_dora?: boolean;
+  // LLM gemma-only: per-block torch.compile(dynamic=True) on the decoder layers. dynamic avoids
+  // per-bin-length recompiles (multipacked bins vary in length); the FA4 cute attention kernel
+  // graph-breaks (custom op). Off by default — only the gemma trainer consumes it.
+  torch_compile?: boolean;
   // LLM MoE-only: skip the fused routed-expert adapter (adapt attention only). Experts are 3D
   // tensors, not nn.Linear, so they're not in lora_target_modules — they're adapted by default;
   // set this to opt out. No effect on dense models / nemotron (experts always frozen there).

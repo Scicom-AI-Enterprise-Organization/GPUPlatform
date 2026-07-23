@@ -733,6 +733,9 @@ def _gemma_cmd(py: str, cfg: dict, nproc: int) -> list[str]:
     # DoRA (weight-decomposed LoRA): per-output-row magnitude + direction from W+ΔW. Form-set.
     if cfg.get("use_dora"):
         cmd.append("--use_dora")
+    # torch.compile (gemma only): per-block dynamic compile. Off by default; see gemma4.py.
+    if cfg.get("torch_compile"):
+        cmd.append("--torch_compile")
     # gemma-4-MoE (e.g. 26B-A4B) adapts the routed experts by default; opt out to attention-only.
     if cfg.get("no_moe_lora"):
         cmd.append("--no_moe_lora")

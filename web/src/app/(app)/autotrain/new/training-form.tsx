@@ -371,6 +371,11 @@ export function TrainingForm() {
   const [trainEmbeddings, setTrainEmbeddings] = useState(false);
   // LLM: DoRA (weight-decomposed LoRA) instead of plain LoRA — attention + the MoE experts.
   const [useDora, setUseDora] = useState(false);
+  // LLM sweep: DoRA vs LoRA as a sweep dimension (use_dora ∈ {false, true}). LLM-only, non-DPO.
+  const [sweepUseDora, setSweepUseDora] = useState(false);
+  // LLM gemma-only: per-block torch.compile(dynamic=True) on the decoder layers (FA4 attention
+  // graph-breaks; dynamic avoids per-bin-length recompiles). Only the gemma trainer consumes it.
+  const [torchCompile, setTorchCompile] = useState(false);
   // LLM MoE: adapt the fused routed-expert weights (default on; maps to no_moe_lora = !this).
   const [adaptMoeExperts, setAdaptMoeExperts] = useState(true);
   const [freezeEncoder, setFreezeEncoder] = useState(false);
@@ -573,6 +578,7 @@ export function TrainingForm() {
           setLoraTargets(c.lora_target_modules as string[]);
         if (c.train_embeddings != null) setTrainEmbeddings(!!c.train_embeddings);
         if (c.use_dora != null) setUseDora(!!c.use_dora);
+        if (c.torch_compile != null) setTorchCompile(!!c.torch_compile);
         if (c.no_moe_lora != null) setAdaptMoeExperts(!c.no_moe_lora);
         if (c.freeze_encoder != null) setFreezeEncoder(!!c.freeze_encoder);
         if (c.use_ddp != null) setUseDdp(!!c.use_ddp);
@@ -580,6 +586,7 @@ export function TrainingForm() {
         if (c.language != null) setLanguage(str(c.language));
         // sweep
         const sweep = (c.sweep ?? {}) as Record<string, unknown>;
+        if (Array.isArray(sweep.use_dora) && sweep.use_dora.length) setSweepUseDora(true);
         if (Object.values(sweep).some((v) => Array.isArray(v) && v.length)) {
           setSweepOn(true);
           if (c.gpus_per_trial != null) setGpusPerTrial(num(c.gpus_per_trial, 1));
@@ -879,8 +886,8 @@ export function TrainingForm() {
     setGpusPerTrial(1);
   }
 
-  function buildSweep(): Record<string, (number | string)[]> {
-    const s: Record<string, (number | string)[]> = {};
+  function buildSweep(): Record<string, (number | string | boolean)[]> {
+    const s: Record<string, (number | string | boolean)[]> = {};
     const lr = parseCsvNums(sweepLr, false);
     if (lr.length) s.learning_rate = lr;
     const b = parseCsvNums(sweepBatch, true);
@@ -907,6 +914,9 @@ export function TrainingForm() {
     if (sweepFreeze && !isTts) s.freeze_encoder = ["on", "off"];
     // LoRA vs full finetune as a sweep dimension (ASR/TTS — LLM is always LoRA).
     if (sweepUseLora && !isLlm) s.use_lora = ["on", "off"];
+    // DoRA vs plain LoRA as a sweep dimension (LLM-only, non-DPO). Real booleans so the
+    // per-trial child body sets use_dora correctly; applies to attention + MoE experts.
+    if (sweepUseDora && isLlm && !isDpo) s.use_dora = [false, true];
     return s;
   }
   const sweepGrid = sweepOn ? buildSweep() : {};
@@ -1036,6 +1046,8 @@ export function TrainingForm() {
       // (its LoRA-disabled reference needs frozen base weights) → forced off there.
       train_embeddings: isLlm && !isDpo ? trainEmbeddings : false,
       use_dora: isLlm && !isDpo ? useDora : false,
+      // gemma-only: per-block torch.compile (only the gemma trainer's cmd builder reads it).
+      torch_compile: isGemma ? torchCompile : false,
       // MoE-only opt-out of the routed-expert adapter (default: adapt them). Positive UI toggle.
       no_moe_lora: moeAdaptable ? !adaptMoeExperts : false,
       freeze_encoder: freezeEncoder,
@@ -1745,9 +1757,10 @@ export function TrainingForm() {
               LoRA-disabled reference assumes the base stays frozen (DoRA retrains a magnitude). */}
           {isLlm && !isDpo && (
             <div className="space-y-1.5 border-t border-border pt-3">
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <label className={cn("flex items-center gap-2 text-sm", sweepUseDora && sweepOn ? "opacity-50" : "cursor-pointer")}>
                 <input type="checkbox" className="h-4 w-4 accent-primary"
-                  checked={useDora} onChange={(e) => setUseDora(e.target.checked)} />
+                  checked={useDora} disabled={sweepUseDora && sweepOn}
+                  onChange={(e) => setUseDora(e.target.checked)} />
                 <span className="font-medium">Use DoRA</span>
                 <span className="rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground">LLM</span>
               </label>
@@ -1757,6 +1770,32 @@ export function TrainingForm() {
                 often closer to full finetuning than LoRA at the same rank. Applies to every adapted module,
                 including the fused MoE experts on MiniMax / Mistral / Qwen-MoE / gemma-4-MoE. Slightly heavier
                 per step (it composes the full weight each forward). Incompatible with DPO.
+              </p>
+              {sweepOn && (
+                <label className="flex cursor-pointer items-center gap-2 text-sm pt-1">
+                  <input type="checkbox" className="h-4 w-4 accent-primary"
+                    checked={sweepUseDora} onChange={(e) => setSweepUseDora(e.target.checked)} />
+                  <span>Sweep <span className="font-medium">DoRA vs LoRA</span> (doubles trials: each combo runs once with LoRA, once with DoRA)</span>
+                </label>
+              )}
+            </div>
+          )}
+          {/* gemma-4 only: per-block torch.compile on the decoder layers. Only the gemma trainer
+              consumes --torch_compile; qwen/minimax/mistral/nemotron ignore it, so hide it there. */}
+          {isGemma && (
+            <div className="space-y-1.5 border-t border-border pt-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input type="checkbox" className="h-4 w-4 accent-primary"
+                  checked={torchCompile} onChange={(e) => setTorchCompile(e.target.checked)} />
+                <span className="font-medium">torch.compile decoder layers</span>
+                <span className="rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground">gemma</span>
+              </label>
+              <p className="text-xs text-muted-foreground">
+                Per-block <span className="font-mono">torch.compile(dynamic=True)</span> on the gemma-4 decoder
+                layers — fuses the norm/activation/elementwise regions. <span className="font-medium">dynamic</span> is
+                load-bearing: multipacked bins have a different length every step, so a static compile would recompile
+                (minutes) each step. The FA4 attention kernel is a custom CUDA op and graph-breaks automatically. The
+                first optimizer step is slow (tracing); recompiles are logged so you can confirm it compiles once.
               </p>
             </div>
           )}
