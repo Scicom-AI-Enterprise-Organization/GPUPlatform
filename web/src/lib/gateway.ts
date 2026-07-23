@@ -578,6 +578,14 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/restart`,
       { method: "POST" },
     ),
+  /** Re-attach to a run whose detached trainer is still alive but got marked
+   * failed by a dropped log-tail SSH (transient box blip). Probes the pid:
+   * alive → resume streaming; exited → finalize-from-log. */
+  reconnectTrainingRun: (id: string) =>
+    request<TrainingRunRecord>(
+      `/v1/training-runs/${encodeURIComponent(id)}/reconnect`,
+      { method: "POST" },
+    ),
   listTrainingFiles: (id: string) =>
     request<TrainingFile[]>(`/v1/training-runs/${encodeURIComponent(id)}/files`),
   /** Live per-GPU utilisation for the run's GPUs only (poll while running). */

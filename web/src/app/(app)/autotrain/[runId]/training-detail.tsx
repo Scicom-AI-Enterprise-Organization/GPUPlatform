@@ -336,6 +336,18 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     });
   }
 
+  const [reconnecting, setReconnecting] = useState(false);
+  async function onReconnect() {
+    setReconnecting(true);
+    try {
+      setRun(await gateway.reconnectTrainingRun(run.id));
+    } catch (e) {
+      setConfirmError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReconnecting(false);
+    }
+  }
+
   function onDelete() {
     setConfirmError(null);
     setConfirmOpts({
@@ -551,6 +563,15 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       {run.error_text && run.status === "failed" && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           <pre className="whitespace-pre-wrap break-words font-mono text-xs">{run.error_text}</pre>
+          <div className="mt-2 flex items-center gap-3">
+            <Button size="sm" variant="outline" onClick={onReconnect} disabled={reconnecting}>
+              {reconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+              Reconnect
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              If the trainer is still running on the box (a dropped log-tail can false-fail a run), this re-attaches and finalizes it properly.
+            </span>
+          </div>
         </div>
       )}
 

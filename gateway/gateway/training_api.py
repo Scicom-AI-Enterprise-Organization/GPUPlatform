@@ -2649,12 +2649,21 @@ async def _resume_orphan_stream(redis, run_id: str) -> None:
     await _teardown_run_pod_if_any(row, redis)
 
 
-async def _reconcile_orphan(row, redis) -> str:
+async def _reconcile_orphan(row, redis, *, allow_redispatch: bool = True) -> str:
     """Reconcile one orphaned (gateway-untracked) training run over SSH: the
     detached trainer survives a gateway restart, so check its pid — still alive →
     leave it running (finalized later when it exits); exited with a log → finalize
     from it; interrupted before it detached (no log) → re-queue + relaunch; box
-    transiently unreachable → leave running for the janitor to re-probe."""
+    transiently unreachable → leave running for the janitor to re-probe.
+
+    `allow_redispatch=False` (the on-demand /reconnect path): NEVER relaunch a
+    fresh trainer. Relaunch-from-scratch is only safe at startup for a run that
+    never detached; on an explicit reconnect the original trainer is very likely
+    still ALIVE, and a transient SSH glitch in the pid-probe could otherwise
+    misfire into starting a SECOND trainer on GPUs the first still holds (observed
+    2026-07-23 — a flaky-box probe false-negatived and double-launched two runs).
+    With it False, an unconfirmable/dead probe leaves the run as-is (the caller
+    reports it) rather than doing anything destructive."""
     rlog, rpid, _sh = _remote_run_paths(row.id)
     try:
         ssh = await _resolve_run_ssh(row)
@@ -2695,8 +2704,12 @@ async def _reconcile_orphan(row, redis) -> str:
                                         if _active_runners.get(rid) is _t else None))
         return "running"  # detached trainer survived; the streamer finalizes it on exit
     if not (log or "").strip():
-        # No process AND no log → the run was cut short before the trainer detached
-        # (during config/deps/launch). Re-run it instead of losing it.
+        # No process AND no log. At startup: the run was cut short before the trainer
+        # detached (config/deps/launch) → re-run it. On an explicit /reconnect
+        # (allow_redispatch=False): DON'T relaunch — a glitchy probe here would
+        # double-launch onto a live trainer's GPUs. Leave it and let the caller report.
+        if not allow_redispatch:
+            return row.status
         return await _redispatch_run(redis, row.id, "process gone, no log")
     rc, result = _parse_remote_log(log)
     # @@DONE (best) or @@ARTIFACT means the trainer finished + uploaded → treat as
@@ -3953,6 +3966,53 @@ async def restart_training_run(
     _active_runners[new_id] = task
     task.add_done_callback(lambda _t: _active_runners.pop(new_id, None))
     return _to_record(row, user.username)
+
+
+@router.post("/{run_id}/reconnect", response_model=TrainingRunRecord)
+async def reconnect_training_run(
+    run_id: str,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Re-attach the gateway to a run whose detached (setsid) trainer is still
+    alive but which got marked failed/terminal because the log-tail SSH dropped
+    (a transient box/network blip). SSH-probes the pidfile: still alive → flip
+    back to running + resume the live log/loss stream (finalized when it exits);
+    already exited → finalize-from-log (done/failed from the real @@RC/@@ARTIFACT);
+    box unreachable → left running for the janitor to re-probe. Idempotent — a run
+    already being streamed just stays as-is. This is the on-demand form of the
+    startup `cleanup_orphaned_running` reconcile, exposed so a false-failed run
+    doesn't require a gateway restart to recover."""
+    row = await _owned(run_id, user, session)
+    redis = request.app.state.redis
+    if row.id in _active_runners:
+        # Already tracked/streaming — nothing to reconnect.
+        return _to_record(row, user.username)
+    await _push_log(redis, run_id, "[gateway] reconnect requested — probing the detached trainer …")
+    # Probe WITHOUT pre-flipping status (a dead/unconfirmable probe must not strand
+    # the run in a fake 'running'). allow_redispatch=False → never relaunch.
+    # Outcome: "running" = trainer alive, live stream re-attached (flip DB to running);
+    # "done"/"failed" = finalized-from-log already; else (box unreachable / can't
+    # confirm) = leave the terminal state and tell the user to retry.
+    outcome = await _reconcile_orphan(row, redis, allow_redispatch=False)
+    if outcome == "running" and row.status not in ("running", "queued"):
+        async with session_factory()() as s:
+            r2 = await s.get(TrainingRun, run_id)
+            if r2 is not None:
+                r2.status = "running"
+                r2.exit_code = None
+                r2.error_text = None
+                await s.commit()
+        await _push_log(redis, run_id, "[gateway] re-attached to the live trainer — resuming stream")
+    elif outcome not in ("done", "failed"):
+        await _push_log(redis, run_id,
+                        "[gateway] couldn't confirm a live trainer (box unreachable or process gone); "
+                        "left as-is — retry when the box is reachable, or use Duplicate & run for a fresh run")
+    async with session_factory()() as s:
+        r3 = await s.get(TrainingRun, run_id)
+        u = await s.get(User, r3.owner_id) if r3 else None
+        return _to_record(r3, u.username if u else user.username)
 
 
 @router.get("", response_model=list[TrainingRunRecord])
