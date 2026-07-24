@@ -51,7 +51,7 @@ function fixWavSizes(buf: ArrayBuffer): ArrayBuffer {
 // Generic TTS playground — reused by the proxy playground (and any serverless TTS
 // endpoint). POSTs to `${basePath}/audio/speech`, plays the returned audio, and
 // pulls the speaker list from `${basePath}/audio/speaker`.
-export function SpeechPlayground({ models, basePath, storageKey }: { models: string[]; basePath: string; storageKey: string }) {
+export function SpeechPlayground({ models, basePath, storageKey, extraHeaders }: { models: string[]; basePath: string; storageKey: string; extraHeaders?: Record<string, string> }) {
   const [model, setModel] = useState(models[0] ?? "");
   const [text, setText] = useState("Hello, this is a test of the text to speech system.");
   const [voice, setVoice] = useState("");
@@ -65,9 +65,10 @@ export function SpeechPlayground({ models, basePath, storageKey }: { models: str
 
   // Speaker dropdown — from the endpoint's /v1/audio/speaker (array of names, or
   // {voices:[…]} / {speakers:[…]}). Best-effort; a failure just leaves it free-text-less.
+  const ehKey = JSON.stringify(extraHeaders ?? {});
   useEffect(() => {
     let cancelled = false;
-    fetch(`${basePath}/audio/speaker`, { cache: "no-store" })
+    fetch(`${basePath}/audio/speaker`, { cache: "no-store", headers: { ...(extraHeaders ?? {}) } })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((list) => {
         if (cancelled) return;
@@ -82,7 +83,8 @@ export function SpeechPlayground({ models, basePath, storageKey }: { models: str
       })
       .catch((e) => { if (!cancelled) setVoicesErr(e instanceof Error ? e.message : String(e)); });
     return () => { cancelled = true; };
-  }, [basePath]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- ehKey stands in for the extraHeaders object identity
+  }, [basePath, ehKey]);
 
   // Revoke object URLs on unmount to avoid leaking blobs.
   useEffect(() => () => { runsRef.current.forEach((r) => URL.revokeObjectURL(r.url)); }, []);
@@ -102,7 +104,7 @@ export function SpeechPlayground({ models, basePath, storageKey }: { models: str
       // Ask for wav so the browser can play it (the engine's default is raw PCM).
       const r = await fetch(`${basePath}/audio/speech`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(extraHeaders ?? {}) },
         body: JSON.stringify({ model, input: text, voice: voice || undefined, response_format: "wav" }),
       });
       if (!r.ok) {

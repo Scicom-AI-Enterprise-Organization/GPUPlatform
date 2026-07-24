@@ -50,7 +50,7 @@ export function EmbeddingTab({ app }: { app: AppRecord }) {
 
 // Generic embedding playground — reused by serverless + the proxy. `basePath` is the
 // Next-proxy prefix fronting the OpenAI data plane (…/v1); POSTs `${basePath}/embeddings`.
-export function EmbeddingPlayground({ models, basePath, storageKey }: { models: string[]; basePath: string; storageKey: string }) {
+export function EmbeddingPlayground({ models, basePath, storageKey, extraHeaders }: { models: string[]; basePath: string; storageKey: string; extraHeaders?: Record<string, string> }) {
   const [model, setModel] = useState(models[0] ?? "");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -82,7 +82,7 @@ export function EmbeddingPlayground({ models, basePath, storageKey }: { models: 
     try {
       const r = await fetch(`${basePath}/embeddings`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(extraHeaders ?? {}) },
         body: JSON.stringify({ model, input: inputs }),
       });
       const raw = await r.text();

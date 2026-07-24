@@ -445,6 +445,14 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/terminate`,
       { method: "POST" },
     ),
+  /** Re-run a sweep's FAILED trials IN PLACE — back into this same run under their
+   * original trial numbers, keeping the completed trials. Requires the sweep to be
+   * terminal (its runner exited, GPUs free). Returns the (same) run, now re-running. */
+  retryFailedTrials: (id: string) =>
+    request<TrainingRunRecord>(
+      `/v1/training-runs/${encodeURIComponent(id)}/retry-failed`,
+      { method: "POST" },
+    ),
   /** Gracefully stop a running run: the trainer saves + uploads the partial model
    * and finalizes (vs terminate, which hard-kills + discards). */
   stopTrainingEarly: (id: string) =>
@@ -947,6 +955,13 @@ export const gateway = {
     request<ProxyEndpoint>("/v1/proxy", { method: "POST", body: JSON.stringify(body) }),
   updateProxy: (id: string, body: UpdateProxyBody) =>
     request<ProxyEndpoint>(`/v1/proxy/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  /** Enable/disable (or re-prioritise) ONE upstream without resending the whole
+   * config — preserves the other upstreams' keys/models/extra_body. */
+  patchProxyUpstream: (id: string, upstreamId: string, body: { enabled?: boolean; priority?: number }) =>
+    request<ProxyEndpoint>(
+      `/v1/proxy/${encodeURIComponent(id)}/upstreams/${encodeURIComponent(upstreamId)}`,
+      { method: "PATCH", body: JSON.stringify(body) },
+    ),
   deleteProxy: (id: string) =>
     request<{ ok: boolean; id: string }>(`/v1/proxy/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getProxyHealth: (id: string) =>

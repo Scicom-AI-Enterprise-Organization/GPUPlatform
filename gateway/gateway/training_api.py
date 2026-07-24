@@ -1835,10 +1835,16 @@ async def run_training(redis, run_id: str) -> None:
         row = await s.get(TrainingRun, run_id)
         if row is None:
             return
-        row.status = "running"
-        row.started_at = datetime.now(timezone.utc)
-        await s.commit()
         cfg = dict(row.config_json or {})
+        # In-place retry (POST /{id}/retry-failed): re-run only the failed trials INTO
+        # this same run. Carry the existing result_json forward so the good trials +
+        # their curves survive, and keep the original started_at (don't reset the clock).
+        _retry_trials = cfg.get("_retry_trials") or None
+        _retry_result = json.loads(json.dumps(row.result_json)) if (_retry_trials and row.result_json) else None
+        row.status = "running"
+        if not _retry_trials:
+            row.started_at = datetime.now(timezone.utc)
+        await s.commit()
         provider_id = row.provider_id
         storage_id = row.storage_id
         dataset_id = row.dataset_id
@@ -2010,8 +2016,11 @@ async def run_training(redis, run_id: str) -> None:
         return
 
     # ---- ship + run the trainer over SSH, streaming stdout ----
-    result: dict = {"epochs": [], "steps": [], "gpu_samples": [], "best": None,
-                    "artifact": None, "stopped_early": False, "progress": None}
+    # A retry starts from the parent run's results (keep the done trials + their curves
+    # + best/artifact) and merges the re-run trials back in; a normal run starts fresh.
+    result: dict = _retry_result if _retry_result is not None else {
+        "epochs": [], "steps": [], "gpu_samples": [], "best": None,
+        "artifact": None, "stopped_early": False, "progress": None}
     line_buf: list[str] = []
 
     def on_line(line: str) -> None:
@@ -2068,10 +2077,20 @@ async def run_training(redis, run_id: str) -> None:
                     obj["trial"] = trial_idx
                 result["steps"].append(obj)
             elif key == "done":
-                result["best"] = obj.get("best")
                 result["stopped_early"] = bool(obj.get("stopped_early"))
-                if obj.get("trials") is not None:  # sweep summary (final)
-                    result["trials"] = obj["trials"]
+                if _retry_trials:
+                    # Retry: the re-run trials were already merged into result["trials"] by
+                    # @@TRIAL (which updates by index). Don't let this partial summary (only
+                    # the retried trials) replace the full plan; recompute best across ALL
+                    # trials with a metric, else keep the parent's best.
+                    _ranked = sorted((t for t in (result.get("trials") or []) if t.get("metric") is not None),
+                                     key=lambda t: t["metric"])
+                    if _ranked:
+                        result["best"] = _ranked[0]
+                else:
+                    result["best"] = obj.get("best")
+                    if obj.get("trials") is not None:  # sweep summary (final)
+                        result["trials"] = obj["trials"]
             elif key == "trial":  # a finished sweep trial → update its plan entry
                 t = obj.get("trial")
                 trials = result.get("trials") or []
@@ -2080,7 +2099,10 @@ async def run_training(redis, run_id: str) -> None:
                 else:
                     result.setdefault("trials", []).append(obj)
             elif key == "artifact":
-                result["artifact"] = obj
+                # On a retry, keep the parent sweep's artifact — per-trial artifacts live
+                # on each trial entry; the retry's sweep-level pick shouldn't clobber it.
+                if not _retry_trials:
+                    result["artifact"] = obj
             elif key == "packed":  # TTS pack-only transform → packed dataset spec
                 result["packed"] = obj
             elif key == "error":
@@ -2168,15 +2190,18 @@ async def run_training(redis, run_id: str) -> None:
             else:
                 cfg["sweep_gpus"] = []  # VM, no pin → single slot (all GPUs)
             cfg["sweep_metric"] = "loss" if task_type in ("tts", "llm") else (cfg.get("eval_metric") or "wer")
-            # Seed the full trial plan (cross-product) as "pending" so the UI can
-            # list every trial up front; on_line flips each to running/done/failed.
-            import itertools
-            _sk = [k for k, v in (cfg.get("sweep") or {}).items() if isinstance(v, list) and v]
-            _grid = [dict(zip(_sk, combo)) for combo in itertools.product(*[cfg["sweep"][k] for k in _sk])]
-            result["trials"] = [
-                {"trial": i, "params": p, "status": "pending", "metric": None}
-                for i, p in enumerate(_grid)
-            ]
+            # Seed the trial plan as "pending" so the UI can list every trial up front;
+            # on_line flips each to running/done/failed. A retry carries the parent's plan
+            # forward (failed already flipped to pending) — don't reseed, or the good
+            # trials would be dropped. Otherwise seed from the grid's cross-product.
+            if not _retry_trials:
+                import itertools
+                _sk = [k for k, v in (cfg.get("sweep") or {}).items() if isinstance(v, list) and v]
+                _plan = [dict(zip(_sk, combo)) for combo in itertools.product(*[cfg["sweep"][k] for k in _sk])]
+                result["trials"] = [
+                    {"trial": i, "params": p, "status": "pending", "metric": None}
+                    for i, p in enumerate(_plan)
+                ]
         cfg_path = work / "config.json"
         cfg_path.write_text(json.dumps(cfg))
         cli = await asyncio.to_thread(_ssh_connect, host, int(port), user, key_filename)
@@ -5341,6 +5366,53 @@ async def terminate_training_run(
     await session.commit()
     u = await session.get(User, row.owner_id)
     return _to_record(row, u.username if u else "?")
+
+
+@router.post("/{run_id}/retry-failed", response_model=TrainingRunRecord)
+async def retry_failed_trials(
+    run_id: str,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Re-run a sweep's FAILED trials IN PLACE — back into THIS same run, under their
+    original trial numbers, keeping every completed trial's results + curves. Requires the
+    sweep to be terminal (its runner has exited and its GPUs are free); a running sweep
+    can't re-inject a trial. Trainer code ships per-run, so a retry automatically picks up
+    any since-fixed bug. Single-node (inline) sweeps only."""
+    row = await _owned(run_id, user, session)
+    if row.status not in ("done", "failed", "cancelled"):
+        raise HTTPException(
+            status_code=409,
+            detail="wait for the sweep to finish before retrying failed trials — its GPUs are still in use",
+        )
+    cfg = dict(row.config_json or {})
+    if cfg.get("nodes"):
+        raise HTTPException(status_code=400, detail="in-place retry isn't supported for multi-node sweeps yet")
+    rj = json.loads(json.dumps(row.result_json or {}))  # deep copy before mutating
+    trials = rj.get("trials") or []
+    combos = []
+    for t in trials:
+        if t.get("status") == "failed":
+            combos.append({"_trial": t["trial"], **(t.get("params") or {})})
+            t["status"] = "pending"    # flip back so on_line can re-drive it running→done
+            t["metric"] = None
+    if not combos:
+        raise HTTPException(status_code=400, detail="no failed trials to retry")
+    # Carry the parent grid (so it's still recognized as a sweep) + the explicit failed
+    # combos WITH their original indices; run_training reads _retry_trials to merge-not-reset.
+    cfg["sweep_combos"] = combos
+    cfg["_retry_trials"] = [c["_trial"] for c in combos]
+    row.config_json = cfg
+    row.result_json = rj
+    row.status = "queued"
+    row.ended_at = None
+    row.exit_code = None
+    row.error_text = None
+    await session.commit()
+    task = asyncio.create_task(_safe_run(request.app.state.redis, run_id))
+    _active_runners[run_id] = task
+    return _to_record(row, user.username)
 
 
 @router.post("/{run_id}/stop-early", response_model=TrainingRunRecord)

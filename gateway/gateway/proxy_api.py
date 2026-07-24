@@ -38,6 +38,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, del
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
+from . import audit
 from . import crypto
 from . import proxy_cluster
 from .auth import current_user, require_admin
@@ -550,10 +551,30 @@ def _capture_record(cfg: dict) -> Optional[CaptureRecord]:
     )
 
 
-def _select_candidates(app, endpoint_id: str, cfg: dict, alias: str) -> list[dict]:
+def _match_upstream(u: dict, force: str) -> bool:
+    """True if `force` (an X-SGPU-Upstream header value) names this upstream —
+    matched case-insensitively against either its human name or its id."""
+    f = force.strip().lower()
+    return f == (u.get("name") or "").strip().lower() or f == (u.get("id") or "").strip().lower()
+
+
+def _forced_upstream(request: Request) -> Optional[str]:
+    """The `X-SGPU-Upstream` request header, if set — pins routing to a single
+    upstream (by name or id) for this one request, overriding priority/health
+    routing and disabling failover. Blank/absent → normal routing."""
+    v = (request.headers.get("x-sgpu-upstream") or "").strip()
+    return v or None
+
+
+def _select_candidates(app, endpoint_id: str, cfg: dict, alias: str,
+                       force: Optional[str] = None) -> list[dict]:
     """Upstreams serving `alias`, enabled, ordered: alive-or-unknown first, then
-    by priority (lower = preferred); known-dead pushed to the back (still tried)."""
+    by priority (lower = preferred); known-dead pushed to the back (still tried).
+    When `force` is set (X-SGPU-Upstream header) the list is pinned to the single
+    matching upstream — a hard provider override with no failover to the others."""
     ups = [u for u in cfg.get("upstreams", []) if u.get("enabled", True) and alias in (u.get("models") or {})]
+    if force:
+        ups = [u for u in ups if _match_upstream(u, force)]
     health = _health(app)
 
     def sort_key(u: dict):
@@ -1008,19 +1029,23 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
             asyncio.create_task(_finish(request_id, "cancelled", status_code=499, error="client disconnected"))
 
 
-async def _route(app, endpoint_name: str, alias: str):
+async def _route(app, endpoint_name: str, alias: str, force: Optional[str] = None):
     """Resolve the endpoint + candidate upstreams for `alias` and their keys (NO DB row).
     Returns (endpoint_id, candidates, timeout_s, max_conc). Raises 404 if the endpoint or
-    model alias is unknown/disabled. Split out of _prepare so the streaming-passthrough path
-    can decide single-vs-multi upstream BEFORE committing a request row."""
+    model alias is unknown/disabled. `force` (X-SGPU-Upstream header) pins to one upstream.
+    Split out of _prepare so the streaming-passthrough path can decide single-vs-multi
+    upstream BEFORE committing a request row."""
     async with session_factory()() as s:
         ep = (await s.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint_name))).scalar_one_or_none()
         if ep is None or not ep.enabled:
             raise HTTPException(status_code=404, detail={"error": f"proxy endpoint '{endpoint_name}' not found or disabled"})
         cfg = ep.config or {}
         endpoint_id = ep.id
-        candidates = _select_candidates(app, endpoint_id, cfg, alias)
+        candidates = _select_candidates(app, endpoint_id, cfg, alias, force)
         if not candidates:
+            if force:
+                raise HTTPException(status_code=404, detail={"error":
+                    f"forced upstream '{force}' not found, disabled, or does not serve model '{alias}' on endpoint '{endpoint_name}'"})
             raise HTTPException(status_code=404, detail={"error": f"model '{alias}' is not served by endpoint '{endpoint_name}'"})
         genv = await load_global_env(s)
         for u in candidates:
@@ -1030,18 +1055,22 @@ async def _route(app, endpoint_name: str, alias: str):
     return endpoint_id, candidates, timeout_s, max_conc
 
 
-async def _resolve_speech_route(app, endpoint_name: str, alias: str):
+async def _resolve_speech_route(app, endpoint_name: str, alias: str, force: Optional[str] = None):
     """Like _route, but also resolves the endpoint's stt_callback (base_url/model +
     decrypted key) for the TTS CER/WER round-trip. Returns
-    (endpoint_id, candidates, timeout_s, max_conc, stt) where stt is None if unset/disabled."""
+    (endpoint_id, candidates, timeout_s, max_conc, stt) where stt is None if unset/disabled.
+    `force` (X-SGPU-Upstream header) pins to one upstream."""
     async with session_factory()() as s:
         ep = (await s.execute(select(ProxyEndpoint).where(ProxyEndpoint.name == endpoint_name))).scalar_one_or_none()
         if ep is None or not ep.enabled:
             raise HTTPException(status_code=404, detail={"error": f"proxy endpoint '{endpoint_name}' not found or disabled"})
         cfg = ep.config or {}
         endpoint_id = ep.id
-        candidates = _select_candidates(app, endpoint_id, cfg, alias)
+        candidates = _select_candidates(app, endpoint_id, cfg, alias, force)
         if not candidates:
+            if force:
+                raise HTTPException(status_code=404, detail={"error":
+                    f"forced upstream '{force}' not found, disabled, or does not serve model '{alias}' on endpoint '{endpoint_name}'"})
             raise HTTPException(status_code=404, detail={"error": f"model '{alias}' is not served by endpoint '{endpoint_name}'"})
         genv = await load_global_env(s)
         for u in candidates:
@@ -1066,11 +1095,12 @@ async def _insert_request_row(request_id, endpoint_id, user, alias, is_stream) -
         await s.commit()
 
 
-async def _prepare(app, endpoint_name: str, alias: str, user: User, is_stream: bool):
+async def _prepare(app, endpoint_name: str, alias: str, user: User, is_stream: bool,
+                   force: Optional[str] = None):
     """Resolve routing (via _route) + record a queued ProxyRequest. Returns
     (endpoint_id, candidates, timeout_s, max_conc, request_id)."""
     request_id = f"pxr-{_secrets.token_hex(8)}"
-    endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias)
+    endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias, force)
     await _insert_request_row(request_id, endpoint_id, user, alias, is_stream)
     return endpoint_id, candidates, timeout_s, max_conc, request_id
 
@@ -1093,7 +1123,8 @@ async def _handle(request: Request, user: User, endpoint_name: str, payload: dic
         raise HTTPException(status_code=400, detail={"error": "missing 'model' in request body"})
     alias = alias.strip()
     is_stream = bool(payload.get("stream"))
-    endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, is_stream)
+    endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(
+        app, endpoint_name, alias, user, is_stream, force=_forced_upstream(request))
     return await _dispatch_buffered(app, request, user, endpoint_id, candidates, alias, is_stream,
                                     timeout_s, max_conc, request_id, payload, upstream_path)
 
@@ -1427,7 +1458,8 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
             raise HTTPException(status_code=400, detail={"error": "invalid JSON body"})
         return await _handle(request, user, endpoint_name, payload, upstream_path)
 
-    endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias)
+    endpoint_id, candidates, timeout_s, max_conc = await _route(
+        app, endpoint_name, alias, force=_forced_upstream(request))
     # The passthrough fast path only rewrites the `model` value in-place in the byte
     # stream; it can't inject new top-level keys. An upstream with extra_body (e.g.
     # OpenRouter provider pinning) must go through the buffered path so extra_body is
@@ -1913,7 +1945,8 @@ async def _handle_speech(request: Request, user: User, endpoint_name: str) -> Re
     input_text = payload["input"] if isinstance(payload.get("input"), str) else ""
     voice = payload["voice"] if isinstance(payload.get("voice"), str) else ""
     is_stream = bool(payload.get("stream"))
-    endpoint_id, candidates, timeout_s, max_conc, stt, capture = await _resolve_speech_route(app, endpoint_name, alias)
+    endpoint_id, candidates, timeout_s, max_conc, stt, capture = await _resolve_speech_route(
+        app, endpoint_name, alias, force=_forced_upstream(request))
     request_id = f"pxr-{_secrets.token_hex(8)}"
     ev = {"stt": stt, "input": input_text, "voice": voice, "capture": capture,
           "request_id": request_id, "sample_id": _trace_sample_id(request, request_id)}
@@ -1939,12 +1972,15 @@ async def _handle_speaker(request: Request, user: User, endpoint_name: str) -> R
             raise HTTPException(status_code=404, detail={"error": f"proxy endpoint '{endpoint_name}' not found or disabled"})
         cfg = ep.config or {}
         genv = await load_global_env(s)
-        ups = [dict(u) for u in cfg.get("upstreams", []) if u.get("enabled", True)]
+        force = _forced_upstream(request)
+        ups = [dict(u) for u in cfg.get("upstreams", [])
+               if u.get("enabled", True) and (not force or _match_upstream(u, force))]
         for u in ups:
             u["_key"] = _resolve_key(u, genv)
         timeout_s = float(cfg.get("timeout_s") or DEFAULT_TIMEOUT_S)
     if not ups:
-        raise HTTPException(status_code=404, detail={"error": "endpoint has no enabled upstreams"})
+        raise HTTPException(status_code=404, detail={"error":
+            (f"forced upstream '{force}' not found or disabled" if force else "endpoint has no enabled upstreams")})
     cli = _http(app)
     last_err = "no upstream"
     for u in ups:
@@ -2143,11 +2179,12 @@ async def _handle_audio(request: Request, user: User, endpoint_name: str, upstre
     # temperature, stream, timestamp_granularities[], …) verbatim to the upstream.
     extra = {k: v for k, v in form.multi_items() if k not in ("file", "model") and isinstance(v, str)}
     is_stream = _truthy(extra.get("stream"))
+    force = _forced_upstream(request)
     if is_stream:
-        endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias)
+        endpoint_id, candidates, timeout_s, max_conc = await _route(app, endpoint_name, alias, force)
         return await _stream_audio(app, request, user, endpoint_id, candidates, alias, upstream_path,
                                    file_name, file_bytes, content_type, extra, timeout_s, max_conc)
-    endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, False)
+    endpoint_id, candidates, timeout_s, max_conc, request_id = await _prepare(app, endpoint_name, alias, user, False, force=force)
     # Low-logprob sample capture (best-effort) — skipped for a TTS proxy's own round-trip
     # transcription so it doesn't double-capture the same audio as an STT sample.
     capture = None if request.headers.get("x-sgpu-tts-eval") else await _resolve_capture_cfg(endpoint_name)
@@ -2286,6 +2323,135 @@ async def proxy_endpoint_health(endpoint: str, request: Request, session: AsyncS
 
 # ---------- management routes (admin) ----------------------------------------
 
+# ---------- audit detail builders -------------------------------------------
+# Redacted, diff-friendly views of a proxy's config for the immutable audit log.
+# They NEVER include key material — only WHICH key mechanism is set — so an admin
+# can see exactly what an edit changed (upstreams added/removed, model aliases,
+# base URLs, extra_body, stt_callback, capture, enable/disable) without the audit
+# row leaking a decrypted key, an encrypted blob, or a secret-ref name.
+
+def _audit_key_kind(d: dict) -> Optional[str]:
+    """How this upstream/callback's key is supplied, without revealing it.
+    (Ciphertext can't be diffed anyway — Fernet is non-deterministic — so we
+    only ever report the mechanism, not whether the key value itself changed.)"""
+    if d.get("api_key_secret"):
+        return "secret-ref"
+    if d.get("api_key_enc"):
+        return "inline"
+    return None
+
+
+def _audit_upstream_view(u: dict) -> dict:
+    return {
+        "id": u.get("id", ""),
+        "name": u.get("name", ""),
+        "base_url": u.get("base_url", ""),
+        "models": u.get("models") or {},
+        "priority": int(u.get("priority", 0)),
+        "enabled": bool(u.get("enabled", True)),
+        "extra_body": u.get("extra_body") or {},
+        "api_key": _audit_key_kind(u),
+    }
+
+
+def _audit_stt_view(c: Optional[dict]) -> Optional[dict]:
+    if not isinstance(c, dict) or not c.get("base_url"):
+        return None
+    return {
+        "enabled": bool(c.get("enabled", True)),
+        "base_url": c.get("base_url", ""),
+        "model": c.get("model", ""),
+        "api_key": _audit_key_kind(c),
+    }
+
+
+def _audit_capture_view(c: Optional[dict]) -> Optional[dict]:
+    if not isinstance(c, dict) or not c.get("storage_id"):
+        return None
+    return {
+        "enabled": bool(c.get("enabled", False)),
+        "storage_id": c.get("storage_id", ""),
+        "prefix": c.get("prefix", "drift/"),
+        "logprob_threshold": c.get("logprob_threshold"),
+        "cer_threshold": c.get("cer_threshold"),
+        "wer_threshold": c.get("wer_threshold"),
+    }
+
+
+def _proxy_audit_snapshot(name: str, enabled: bool, public: bool, cfg: Optional[dict]) -> dict:
+    """A fully-resolved, secret-free view of a proxy endpoint used as the before/
+    after basis for the audit diff. Reads into fresh dicts so it's isolated from
+    later in-place mutation of the row's config."""
+    cfg = cfg or {}
+    return {
+        "name": name,
+        "enabled": bool(enabled),
+        "public": bool(public),
+        "max_concurrency": int(cfg.get("max_concurrency") or 0),
+        "timeout_s": int(cfg.get("timeout_s") or int(DEFAULT_TIMEOUT_S)),
+        "upstreams": [_audit_upstream_view(u) for u in cfg.get("upstreams", [])],
+        "stt_callback": _audit_stt_view(cfg.get("stt_callback")),
+        "capture": _audit_capture_view(cfg.get("capture")),
+    }
+
+
+def _diff_upstreams(before: list[dict], after: list[dict]) -> dict:
+    """Per-upstream diff keyed by id: {added:[…], removed:[…], modified:[{id,name,
+    changes:{field:{from,to}}}]}. Empty keys omitted."""
+    b = {u["id"]: u for u in before if u.get("id")}
+    a = {u["id"]: u for u in after if u.get("id")}
+    added = [a[i] for i in a if i not in b]
+    removed = [b[i] for i in b if i not in a]
+    modified = []
+    for i in a:
+        if i in b and a[i] != b[i]:
+            fields = {
+                f: {"from": b[i].get(f), "to": a[i].get(f)}
+                for f in ("name", "base_url", "models", "priority", "enabled", "extra_body", "api_key")
+                if b[i].get(f) != a[i].get(f)
+            }
+            modified.append({"id": i, "name": a[i].get("name", ""), "changes": fields})
+    out: dict[str, Any] = {}
+    if added:
+        out["added"] = added
+    if removed:
+        out["removed"] = removed
+    if modified:
+        out["modified"] = modified
+    return out
+
+
+def _diff_proxy_snapshots(before: dict, after: dict) -> dict:
+    """Structured diff of two _proxy_audit_snapshot dicts. Captures exactly the
+    edits the proxy form exposes: enable/disable, visibility, concurrency/timeout,
+    upstream add/remove/modify (name, base_url, model aliases, priority, enabled,
+    extra_body, key mechanism), and the stt_callback / capture blocks."""
+    changes: dict[str, Any] = {}
+    for f in ("name", "enabled", "public", "max_concurrency", "timeout_s"):
+        if before.get(f) != after.get(f):
+            changes[f] = {"from": before.get(f), "to": after.get(f)}
+    ups = _diff_upstreams(before.get("upstreams") or [], after.get("upstreams") or [])
+    if ups:
+        changes["upstreams"] = ups
+    for f in ("stt_callback", "capture"):
+        if before.get(f) != after.get(f):
+            changes[f] = {"from": before.get(f), "to": after.get(f)}
+    return changes
+
+
+def _proxy_create_details(snap: dict) -> dict:
+    return {
+        "enabled": snap["enabled"],
+        "public": snap["public"],
+        "max_concurrency": snap["max_concurrency"],
+        "timeout_s": snap["timeout_s"],
+        "upstreams": [u["name"] for u in snap["upstreams"]],
+        "models": sorted({a for u in snap["upstreams"] for a in (u["models"] or {}).keys()}),
+        "stt_callback": snap["stt_callback"] is not None,
+        "capture": snap["capture"] is not None,
+    }
+
+
 async def _owner_username(session: AsyncSession, owner_id: int) -> str:
     u = await session.get(User, owner_id)
     return u.username if u else "?"
@@ -2332,6 +2498,10 @@ async def create_proxy(req: CreateProxyRequest, request: Request, user: User = D
     session.add(row)
     await session.commit()
     await session.refresh(row)
+    await audit.record(
+        user, "proxy.create", "proxy", row.id, row.name,
+        details=_proxy_create_details(_proxy_audit_snapshot(row.name, row.enabled, row.public, row.config)),
+    )
     logger.info("created proxy endpoint %s (%s) for user=%s", row.id, name, user.username)
     return _endpoint_record(request.app, row, user.username)
 
@@ -2373,11 +2543,12 @@ async def get_public_proxy(proxy_id: str, request: Request, user: User = Depends
 
 @router.patch("/{proxy_id}", response_model=ProxyEndpointRecord)
 async def update_proxy(proxy_id: str, req: UpdateProxyRequest, request: Request,
-                       user: User = Depends(require_admin),  # noqa: ARG001
+                       user: User = Depends(require_admin),
                        session: AsyncSession = Depends(get_session)):
     row = await session.get(ProxyEndpoint, proxy_id)
     if row is None:
         raise HTTPException(status_code=404, detail="proxy endpoint not found")
+    before = _proxy_audit_snapshot(row.name, row.enabled, row.public, row.config)
     cfg = dict(row.config or {})
     if req.name is not None:
         n = req.name.strip().lower()
@@ -2413,17 +2584,71 @@ async def update_proxy(proxy_id: str, req: UpdateProxyRequest, request: Request,
     flag_modified(row, "config")
     await session.commit()
     await session.refresh(row)
+    after = _proxy_audit_snapshot(row.name, row.enabled, row.public, row.config)
+    await audit.record(
+        user, "proxy.update", "proxy", row.id, row.name,
+        details={"changes": _diff_proxy_snapshots(before, after)},
+    )
+    return _endpoint_record(request.app, row, await _owner_username(session, row.owner_id))
+
+
+class UpstreamPatchRequest(BaseModel):
+    """Targeted single-upstream change. Omitted fields are left untouched."""
+    enabled: Optional[bool] = None
+    priority: Optional[int] = None
+
+
+@router.patch("/{proxy_id}/upstreams/{upstream_id}", response_model=ProxyEndpointRecord)
+async def patch_upstream(proxy_id: str, upstream_id: str, req: UpstreamPatchRequest, request: Request,
+                         user: User = Depends(require_admin),
+                         session: AsyncSession = Depends(get_session)):
+    """Enable/disable (or re-prioritise) ONE upstream without resending the whole
+    proxy config — so flipping a provider off can't accidentally clobber the other
+    upstreams' keys / models / extra_body. A disabled upstream is dropped from
+    candidate selection (no traffic, no failover target). Audited as proxy.update
+    with the field diff, exactly like the full-config edit."""
+    row = await session.get(ProxyEndpoint, proxy_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="proxy endpoint not found")
+    before = _proxy_audit_snapshot(row.name, row.enabled, row.public, row.config)
+    cfg = dict(row.config or {})
+    ups = [dict(u) for u in cfg.get("upstreams", [])]
+    target = next((u for u in ups if u.get("id") == upstream_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"upstream '{upstream_id}' not found on this proxy")
+    if req.enabled is not None:
+        target["enabled"] = bool(req.enabled)
+    if req.priority is not None:
+        target["priority"] = int(req.priority)
+    cfg["upstreams"] = ups
+    row.config = cfg
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(row, "config")
+    await session.commit()
+    await session.refresh(row)
+    after = _proxy_audit_snapshot(row.name, row.enabled, row.public, row.config)
+    await audit.record(
+        user, "proxy.update", "proxy", row.id, row.name,
+        details={"changes": _diff_proxy_snapshots(before, after)},
+    )
     return _endpoint_record(request.app, row, await _owner_username(session, row.owner_id))
 
 
 @router.delete("/{proxy_id}")
-async def delete_proxy(proxy_id: str, user: User = Depends(require_admin),  # noqa: ARG001
+async def delete_proxy(proxy_id: str, user: User = Depends(require_admin),
                        session: AsyncSession = Depends(get_session)):
     row = await session.get(ProxyEndpoint, proxy_id)
     if row is None:
         raise HTTPException(status_code=404, detail="proxy endpoint not found")
+    name = row.name
+    snap = _proxy_audit_snapshot(row.name, row.enabled, row.public, row.config)
     await session.delete(row)
     await session.commit()
+    await audit.record(
+        user, "proxy.delete", "proxy", proxy_id, name,
+        details={"enabled": snap["enabled"], "public": snap["public"],
+                 "upstreams": [u["name"] for u in snap["upstreams"]]},
+    )
     return {"ok": True, "id": proxy_id}
 
 

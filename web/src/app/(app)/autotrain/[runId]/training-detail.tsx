@@ -264,6 +264,9 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
   // child or not — see SweepPlaygroundTab below), so show the tab once at least one
   // trial has finished, even while the sweep as a whole is still running.
   const tryitableTrials = trials.filter((t) => t.status === "done" && !!t.run_id);
+  // Failed trials → "Retry failed" (re-runs just these as a new sweep). Offered only
+  // when the sweep is terminal, since a running one still holds its GPUs.
+  const failedTrials = trials.filter((t) => t.status === "failed");
   const canTryIt =
     ((run.task_type ?? "asr") === "asr" || run.task_type === "tts" || run.task_type === "llm") &&
     ((run.status === "done" && !!run.result_json?.artifact?.s3_uri) || tryitableTrials.length > 0);
@@ -419,6 +422,24 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       run: async () => {
         const created = await gateway.restartTrainingRun(run.id);
         router.push(`/autotrain/${encodeURIComponent(created.id)}`);
+      },
+    });
+  }
+
+  // Re-run this sweep's FAILED trials IN PLACE — back into THIS run, under their
+  // original trial numbers, keeping the completed trials. Only offered once the sweep
+  // is terminal (its runner has exited + GPUs are free). Trainer code ships per-run,
+  // so a retry picks up any since-fixed bug.
+  function onRetryFailed() {
+    setConfirmError(null);
+    setConfirmOpts({
+      title: "Retry failed trials?",
+      description:
+        "Re-runs only the failed trials, back into this same sweep under their original trial numbers — the completed trials and their curves are kept. Runs on this run's same GPUs. Trainer code ships per-run, so any since-fixed bug is picked up.",
+      confirmLabel: "Retry failed",
+      busyLabel: "Relaunching…",
+      run: async () => {
+        setRun(await gateway.retryFailedTrials(run.id));
       },
     });
   }
@@ -646,9 +667,26 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       {isSweep && (
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm">
-              Sweep · {trials.length} trial{trials.length === 1 ? "" : "s"} · best by {metricLabel} (lower is better)
-            </CardTitle>
+            <div className="flex items-center justify-between gap-3">
+              <CardTitle className="text-sm">
+                Sweep · {trials.length} trial{trials.length === 1 ? "" : "s"} · best by {metricLabel} (lower is better)
+              </CardTitle>
+              {failedTrials.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onRetryFailed}
+                  disabled={busy || !terminal}
+                  title={
+                    terminal
+                      ? `Re-run the ${failedTrials.length} failed trial${failedTrials.length === 1 ? "" : "s"} as a new sweep on the same GPUs`
+                      : "Available once the sweep finishes — its GPUs are still in use"
+                  }
+                >
+                  Retry {failedTrials.length} failed
+                </Button>
+              )}
+            </div>
           </CardHeader>
           <CardContent>
             <div className="overflow-x-auto rounded-md border border-border">

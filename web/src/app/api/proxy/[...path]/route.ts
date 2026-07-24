@@ -43,6 +43,12 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
   // Forward Range so media elements can request byte ranges (audio seeking).
   const range = req.headers.get("range");
   if (range) headers["Range"] = range;
+  // Forward SGPU control headers (e.g. X-SGPU-Upstream, which pins a proxy request
+  // to one upstream) + an inbound trace id. Everything else is intentionally
+  // dropped so the browser can't smuggle arbitrary headers to the gateway.
+  req.headers.forEach((v, k) => {
+    if (k.startsWith("x-sgpu-") || k === "x-request-id") headers[k] = v;
+  });
 
   const init: RequestInit & { duplex?: "half" } = { method: req.method, headers };
   if (req.method !== "GET" && req.method !== "HEAD") {

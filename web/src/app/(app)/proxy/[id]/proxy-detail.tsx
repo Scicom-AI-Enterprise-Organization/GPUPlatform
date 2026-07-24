@@ -65,6 +65,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
   const visibleTabs = readOnly ? TABS.filter((t) => t.value === "overview" || t.value === "playground") : TABS;
   const visibleValues = visibleTabs.map((t) => t.value) as readonly string[];
   const [togglingPublic, setTogglingPublic] = useState(false);
+  const [togglingUp, setTogglingUp] = useState<string | null>(null);
 
   // The active tab is derived from the URL (?tab=), and each trigger is a real
   // <Link> — so right-click / middle-click / ⌘-click "open in new tab" works.
@@ -192,6 +193,15 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
     try { await gateway.updateProxy(ep.id, { public: !isPublic }); router.refresh(); }
     catch (e) { alert(e instanceof Error ? e.message : String(e)); }
     finally { setTogglingPublic(false); }
+  };
+  const onToggleUpstream = async (upstreamId: string, name: string, enabled: boolean) => {
+    setTogglingUp(upstreamId);
+    try {
+      await gateway.patchProxyUpstream(ep.id, upstreamId, { enabled });
+      toast.success(`Upstream "${name}" ${enabled ? "enabled" : "disabled"}`);
+      router.refresh();
+    } catch (e) { toast.error(e instanceof Error ? e.message : String(e)); }
+    finally { setTogglingUp(null); }
   };
 
   const model0 = aliases[0] ?? "qwen";
@@ -342,6 +352,12 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                     <span className="ml-auto text-xs text-muted-foreground">
                       {alive == null ? "not probed" : alive ? `alive · ${h?.latency_ms ?? "?"}ms` : `down · ${h?.error ?? ""}`}
                     </span>
+                    <Button variant="outline" size="xs" disabled={togglingUp === u.id}
+                      onClick={() => onToggleUpstream(u.id, u.name, !u.enabled)}
+                      title={u.enabled ? "Disable this upstream (stops routing to it)" : "Enable this upstream"}>
+                      {togglingUp === u.id && <Loader2 className="h-3 w-3 animate-spin" />}
+                      {u.enabled ? "Disable" : "Enable"}
+                    </Button>
                   </div>
                 );
               })}
@@ -352,7 +368,8 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
 
         {/* ---- Playground ---- */}
         <TabsContent value="playground">
-          <ProxyPlayground name={ep.name} aliases={aliases} baseUrl={baseUrl} />
+          <ProxyPlayground name={ep.name} aliases={aliases} baseUrl={baseUrl}
+            upstreams={ep.upstreams.map((u) => ({ id: u.id, name: u.name, enabled: u.enabled }))} />
         </TabsContent>
 
         {/* ---- Metrics ---- */}

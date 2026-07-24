@@ -72,7 +72,19 @@ def run(cfg: dict) -> None:
         slices = [None]  # no pin → one slot, all visible GPUs
     concurrency = max(1, len(slices))
 
-    combos = expand(cfg.get("sweep") or {})
+    # `sweep_combos` (an explicit list of per-trial param dicts) overrides the grid —
+    # the "retry failed trials" path passes exactly the combos that failed, which need
+    # not be a clean cross-product of any grid. Each combo may carry a `_trial` key = its
+    # ORIGINAL trial index in the parent sweep, so an in-place retry re-runs (e.g.) trials
+    # 0 & 2 under those exact numbers and the gateway merges the results back by index.
+    _raw = cfg.get("sweep_combos")
+    if _raw:
+        combos = [{k: v for k, v in c.items() if k != "_trial"} for c in _raw]
+        combo_ix = [int(c["_trial"]) if isinstance(c, dict) and "_trial" in c else i
+                    for i, c in enumerate(_raw)]
+    else:
+        combos = expand(cfg.get("sweep") or {})
+        combo_ix = list(range(len(combos)))
     log(f"[sweep] {len(combos)} trial(s) · {concurrency} GPU slot(s) · "
         f"{per} GPU/trial · rank by {metric} (asc)")
 
@@ -90,7 +102,9 @@ def run(cfg: dict) -> None:
                                         f"autotrain-sweep-{run_tag}"))
     os.makedirs(work, exist_ok=True)
 
-    results: list[dict | None] = [None] * len(combos)
+    # Keyed by trial INDEX (not thread position) — retry combos carry non-contiguous
+    # original indices (e.g. {0, 2}), so a fixed-length list would index out of range.
+    results: dict[int, dict] = {}
     sem = threading.Semaphore(concurrency)
     slot_lock = threading.Lock()
     free_slots = list(range(len(slices)))
@@ -108,7 +122,7 @@ def run(cfg: dict) -> None:
             gpu_slice = slices[slot]
             try:
                 tcfg = copy.deepcopy(cfg)
-                for k in ("sweep", "sweep_gpus", "sweep_metric", "gpus_per_trial", "_config_path"):
+                for k in ("sweep", "sweep_combos", "_retry_trials", "sweep_gpus", "sweep_metric", "gpus_per_trial", "_config_path"):
                     tcfg.pop(k, None)
                 tcfg.update(params)  # override the swept hyperparameters
                 # The `augment` sweep dimension is a scalar flag (on/off) for a
@@ -201,13 +215,13 @@ def run(cfg: dict) -> None:
                 with slot_lock:
                     free_slots.append(slot)
 
-    threads = [threading.Thread(target=run_trial, args=(i, c)) for i, c in enumerate(combos)]
+    threads = [threading.Thread(target=run_trial, args=(combo_ix[i], c)) for i, c in enumerate(combos)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    done = [r for r in results if r]
+    done = [results[k] for k in sorted(results) if results[k]]  # ordered by trial index
     ranked = sorted((r for r in done if r["metric"] is not None), key=lambda r: r["metric"])
     best = ranked[0] if ranked else None
     if best:

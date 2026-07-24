@@ -59,7 +59,7 @@ export function TranscribeTab({ app }: { app: AppRecord }) {
 
 // Generic transcription playground — reused by serverless + the proxy. POSTs the
 // multipart upload to `${basePath}/audio/{transcriptions|translations}`.
-export function TranscribePlayground({ models, basePath, storageKey }: { models: string[]; basePath: string; storageKey: string }) {
+export function TranscribePlayground({ models, basePath, storageKey, extraHeaders }: { models: string[]; basePath: string; storageKey: string; extraHeaders?: Record<string, string> }) {
   const [model, setModel] = useState(models[0] ?? "");
   const [task, setTask] = useState<"transcriptions" | "translations">("transcriptions");
   const [language, setLanguage] = useState("");
@@ -97,6 +97,7 @@ export function TranscribePlayground({ models, basePath, storageKey }: { models:
       // No explicit Content-Type — the browser sets multipart/form-data + boundary.
       const r = await fetch(`${basePath}/audio/${task}`, {
         method: "POST",
+        headers: { ...(extraHeaders ?? {}) },
         body: fd,
       });
       const raw = await r.text();

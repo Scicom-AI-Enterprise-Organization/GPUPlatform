@@ -13,7 +13,8 @@ is the FP8-free distillation of that same machinery, shared by both bf16 MoE tra
     experts module and rebinds its `forward` to the fused grouped version below.
   * `fused_adapter_experts_forward` — sort tokens by expert, grouped matmul, restore order,
     weighted top-k sum. Two modes per projection:
-      - **LoRA** : out = grouped(base) + scaling·grouped(grouped(x, A), B)   (base + low-rank delta)
+      - **LoRA** : W_eff = base + scaling·(B@A) per expert, then ONE grouped matmul (folded delta —
+                   avoids a rank-r grouped_mm operand that trips the kernel's 16-byte stride check)
       - **DoRA** : compose W_eff = magnitude · normalize(base + scaling·(B@A)) per expert per
                    output row, then ONE grouped matmul with the composed weight (the direction
                    normalization is non-linear, so base+delta cannot be split after the matmul).
@@ -115,11 +116,17 @@ def _adapter_project(
         direction = adapted / adapted.norm(dim=2, keepdim=True).clamp_min(1e-8)
         w_eff = mag.unsqueeze(-1) * direction             # (E, out, in)
         return grouped_linear(x_g, w_eff, offsets)
-    # LoRA: frozen base + low-rank delta, both grouped.
-    out = grouped_linear(x_g, base_weight, offsets)       # (S, out)
-    lo = grouped_linear(x_g, a, offsets)                  # (S, r)
-    lo = grouped_linear(lo, b, offsets)                   # (S, out)
-    return out + experts.lora_scaling * lo
+    # LoRA: fold the low-rank delta INTO the base weight, then ONE grouped matmul (same
+    # single-matmul structure as the DoRA branch and the `grouped_linear(x_g, base_weight)`
+    # path above). The old two-step form (grouped(x, A) -> grouped(_, B)) fed the rank-r
+    # intermediate straight into torch._grouped_mm, whose Hopper kernel rejects a rank-32
+    # operand with "strides should be multiple of 16 bytes" (r64/128 slipped through; r32 did
+    # not). Folding keeps every matmul full-width (H / 2I / out), so every rank works — and it's
+    # strictly cheaper than the DoRA path (no norm/magnitude), which already runs fine at r32,
+    # so memory/throughput are non-issues.
+    delta = torch.bmm(b.to(a.dtype), a)                   # (E, out, in) = B·A per expert
+    w_eff = base_weight.to(a.dtype) + experts.lora_scaling * delta
+    return grouped_linear(x_g, w_eff, offsets)            # (S, out)
 
 
 # ---------------------------------------------------------------------------

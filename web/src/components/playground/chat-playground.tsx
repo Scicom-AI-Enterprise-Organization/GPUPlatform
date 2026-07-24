@@ -95,20 +95,22 @@ export function openAiBody(p: ChatParams, withStream: boolean): Record<string, u
   return b;
 }
 
-export function openAiTransport(opts: { fetchPath: string; curlUrl: string }): ChatTransport {
+export function openAiTransport(opts: { fetchPath: string; curlUrl: string; extraHeaders?: Record<string, string> }): ChatTransport {
+  const extra = opts.extraHeaders ?? {};
   return {
     curl: (p, token) => {
       const body = openAiBody(p, p.stream);
       const flag = p.stream ? "-N " : "";
+      const extraLines = Object.entries(extra).map(([k, v]) => `  -H '${k}: ${v}' \\\n`).join("");
       return `curl ${flag}-X POST '${opts.curlUrl}' \\
   -H 'Content-Type: application/json' \\
   -H 'Authorization: Bearer ${token}' \\
-  -d '${JSON.stringify(body, null, 2)}'`;
+${extraLines}  -d '${JSON.stringify(body, null, 2)}'`;
     },
     send: async (p, h) => {
       const res = await fetch(opts.fetchPath, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...extra },
         body: JSON.stringify(openAiBody(p, p.stream)),
         signal: h.signal,
       });
