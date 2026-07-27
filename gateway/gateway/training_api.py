@@ -111,6 +111,9 @@ _active_label_exports: dict[str, asyncio.Task] = {}
 # On-demand "Export to Hugging Face" pushes in flight (per run id → task), so a
 # re-click supersedes a stuck attempt rather than running two pushes at once.
 _active_hf_exports: dict[str, asyncio.Task] = {}
+# On-demand HF→S3 model restores in flight (the /hf-import endpoint), keyed by run id →
+# its background task. Re-click supersedes; cancel targets this task.
+_active_hf_imports: dict[str, asyncio.Task] = {}
 # Cached SSH client per run for the live GPU-util poll (reused across polls).
 _GPU_SSH: dict[str, Any] = {}
 
@@ -2821,6 +2824,7 @@ async def _reconcile_orphaned_exports(redis) -> None:
             rows = (await s.execute(select(TrainingRun).where(or_(
                 TrainingRun.result_json["label_export"]["status"].as_string() == "running",
                 TrainingRun.result_json["hf_export"]["status"].as_string() == "running",
+                TrainingRun.result_json["hf_import"]["status"].as_string() == "running",
             )))).scalars().all()
     except Exception as e:  # noqa: BLE001 — JSON-path query unsupported? skip (never break boot)
         logger.warning("training: orphaned-export reconcile query failed: %s", e)
@@ -2828,7 +2832,7 @@ async def _reconcile_orphaned_exports(redis) -> None:
     for row in rows:
         rj = dict(row.result_json or {})
         changed: list[str] = []
-        for k in ("label_export", "hf_export"):
+        for k in ("label_export", "hf_export", "hf_import"):
             st = rj.get(k)
             if isinstance(st, dict) and st.get("status") == "running":
                 rj[k] = {**st, "status": "failed", "error": "interrupted by a gateway restart"}
@@ -4707,6 +4711,21 @@ async def _set_hf_export_state(run_id: str, state: dict) -> None:
         await s.commit()
 
 
+async def _set_hf_import_state(run_id: str, state: dict) -> None:
+    """Merge an hf-import status object into result_json.hf_import so the UI can show
+    'restoring from Hugging Face' + the outcome. Twin of _set_hf_export_state."""
+    async with session_factory()() as s:
+        row = await s.get(TrainingRun, run_id)
+        if row is None or row.status == "cancelled":
+            return
+        rj = dict(row.result_json or {})
+        cur = dict(rj.get("hf_import") or {})
+        cur.update(state)
+        rj["hf_import"] = cur
+        row.result_json = rj
+        await s.commit()
+
+
 async def _hf_token_for_storage(storage_id: Optional[str], session: AsyncSession) -> Optional[str]:
     """HF token from a kind=huggingface Storage: a referenced global secret
     (config.hf_token_secret) wins, else the storage's own encrypted token."""
@@ -5211,6 +5230,155 @@ async def cancel_huggingface_export(
     await _set_hf_export_state(run_id, {"status": "cancelled", "error": "stopped by user"})
     await _push_log(redis, run_id, "[gateway] HF export stopped by user.")
     return {"status": "cancelled", "vm_process_killed": killed}
+
+
+class HfImportRequest(BaseModel):
+    """Restore a run's model artifact FROM a Hugging Face repo (the inverse of
+    HfExportRequest). Runs on the gateway (no GPU / no VM — the artifact is a complete
+    model). Used when the trained model was deleted from S3 and Try-it / label-export
+    fail with 'no model files found'."""
+    repo: str                              # source HF repo (org/name)
+    revision: Optional[str] = None         # branch / tag / commit — None → default branch
+    storage_id: Optional[str] = None       # kind=huggingface Storage → read token + endpoint
+    hf_token: Optional[str] = None         # pasted token (wins) — the source repo may be private
+    hf_token_secret: Optional[str] = None  # a global-secret key holding the token
+    overwrite: bool = False                # allow clobbering a model that's already present in S3
+
+
+@router.post("/{run_id}/hf-import")
+async def import_from_huggingface(
+    run_id: str,
+    body: HfImportRequest,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Restore this run's model artifact from a Hugging Face repo into its S3 model prefix.
+
+    The exact inverse of /hf-export: it downloads a standard HF model folder and uploads
+    every file under the run's `…/model/` prefix (the same URI Try-it and the label export
+    read), so a run whose weights were deleted from S3 becomes usable again. Runs on the
+    GATEWAY in the background (no GPU, no training box); status lands in
+    result_json.hf_import. The source repo may be private — pass a token (pasted, a global
+    secret, or a HuggingFace storage) with read access to it."""
+    row = await _owned(run_id, user, session)
+    # The artifact METADATA (s3_uri) survives in the DB even after the S3 OBJECTS are
+    # deleted — that prefix is exactly where Try-it / label-export look, so restore there.
+    model_s3 = (((row.result_json or {}).get("artifact") or {}).get("s3_uri"))
+    if not model_s3:
+        raise HTTPException(status_code=400, detail=(
+            "this run has no model artifact prefix to restore into (no result.artifact.s3_uri)"))
+    if (row.task_type or "").lower() == "llm":
+        # LLM artifacts are a raw LoRA checkpoint (lora.pt + meta), not an HF model folder —
+        # importing full safetensors there would not be loadable by the merge/try-it paths.
+        raise HTTPException(status_code=400, detail=(
+            "HF import restores a complete model folder; LLM runs store a raw LoRA checkpoint, "
+            "so this only applies to ASR/TTS runs."))
+    repo = (body.repo or "").strip()
+    if not repo:
+        raise HTTPException(status_code=400, detail="a source repo (org/name) is required")
+
+    # HF read token for the (possibly private) SOURCE repo: pasted > global secret >
+    # the selected HuggingFace storage's token > platform HF_TOKEN.
+    token = (body.hf_token or "").strip() or None
+    if not token and body.hf_token_secret:
+        from .global_env_api import load_global_env
+        token = (await load_global_env(session)).get(body.hf_token_secret)
+    if not token:
+        token = await _hf_token_for_storage(body.storage_id, session)
+    if not token:
+        token = (await _resolve_global_env()).get("HF_TOKEN")
+    # A custom HF endpoint (self-hosted mirror) as the source, if the storage names one.
+    hf_endpoint = await _hf_endpoint_for_storage(body.storage_id, session)
+
+    creds = _s3_creds_from_storage(await session.get(Storage, row.storage_id) if row.storage_id else None)
+    # Refuse to clobber a model that's already present unless the caller opts in — the point
+    # of a restore is to repopulate an EMPTY prefix.
+    if not body.overwrite and await asyncio.to_thread(_s3_uri_has_objects, model_s3, creds):
+        raise HTTPException(status_code=400, detail=(
+            f"a model already exists at {model_s3} — set overwrite to replace it."))
+    redis = request.app.state.redis
+
+    # Re-click supersedes a stuck import (the orphaned upload just finishes + is discarded).
+    prev = _active_hf_imports.pop(run_id, None)
+    if prev is not None and not prev.done():
+        prev.cancel()
+        await _push_log(redis, run_id, "[gateway] HF import: superseded by a new request — restarting")
+    await _set_hf_import_state(run_id, {
+        "status": "running", "repo": repo, "revision": (body.revision or None),
+        "s3": model_s3, "error": None,
+    })
+
+    async def _bg() -> None:
+        import_lines: list[str] = []
+        _sent = {"n": 0}
+
+        async def _pump() -> None:
+            while True:
+                await asyncio.sleep(0.5)
+                while _sent["n"] < len(import_lines):
+                    await _push_log(redis, run_id, import_lines[_sent["n"]])
+                    _sent["n"] += 1
+
+        pump_task = asyncio.create_task(_pump())
+        try:
+            await _push_log(redis, run_id,
+                            f"[gateway] restoring model from Hugging Face {repo}"
+                            + (f"@{body.revision}" if body.revision else "")
+                            + f" → {model_s3} (from the gateway) …")
+            res = await asyncio.to_thread(
+                _run_hf_import_local, run_id, model_s3, creds, repo,
+                (body.revision or None), token, hf_endpoint, import_lines.append)
+            await _set_hf_import_state(run_id, {
+                "status": "done", "repo": res.get("repo", repo), "s3": res.get("s3", model_s3),
+                "files": res.get("files"), "bytes": res.get("bytes"), "error": None,
+            })
+            await _push_log(redis, run_id,
+                            f"[gateway] restored {res.get('files')} file(s) · "
+                            f"{(res.get('bytes') or 0) / 1e6:.0f} MB → {model_s3}")
+        except asyncio.CancelledError:
+            await _push_log(redis, run_id, "[gateway] HF import: cancelled (superseded)")
+            raise
+        except Exception as e:  # noqa: BLE001
+            await _set_hf_import_state(run_id, {"status": "failed", "error": str(e)[:1200]})
+            await _push_log(redis, run_id, f"[gateway] HF import failed: {e}")
+        finally:
+            pump_task.cancel()
+            try:
+                await pump_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            while _sent["n"] < len(import_lines):
+                try:
+                    await _push_log(redis, run_id, import_lines[_sent["n"]])
+                except Exception:  # noqa: BLE001
+                    pass
+                _sent["n"] += 1
+            if _active_hf_imports.get(run_id) is asyncio.current_task():
+                _active_hf_imports.pop(run_id, None)
+
+    task = asyncio.create_task(_bg())
+    _active_hf_imports[run_id] = task
+    return {"status": "started"}
+
+
+@router.post("/{run_id}/hf-import/cancel")
+async def cancel_huggingface_import(
+    run_id: str,
+    request: Request,
+    user: User = Depends(require_section("autotrain")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stop a running HF import. Cancels the in-memory task; the orphaned gateway-side
+    download/upload subprocess (if any) finishes harmlessly and its result is discarded."""
+    row = await _owned(run_id, user, session)
+    redis = request.app.state.redis
+    t = _active_hf_imports.pop(run_id, None)
+    if t is not None and not t.done():
+        t.cancel()
+    await _set_hf_import_state(run_id, {"status": "cancelled", "error": "stopped by user"})
+    await _push_log(redis, run_id, "[gateway] HF import stopped by user.")
+    return {"status": "cancelled"}
 
 
 @router.get("/{run_id}/metrics")
@@ -7035,6 +7203,75 @@ def _run_hf_export_local(run_id: str, model_s3: str, creds: dict, repo: str,
     if not out["result"]:
         tail = "\n".join(out["lines"][-15:])
         raise RuntimeError(f"HF export produced no result (rc={rc}):\n{tail}")
+    return out["result"]
+
+
+def _run_hf_import_local(run_id: str, model_s3: str, creds: dict, repo: str,
+                         revision: Optional[str], token: Optional[str],
+                         hf_endpoint: Optional[str] = None, line_sink=None) -> dict:
+    """The inverse of _run_hf_export_local: run hf_import.py on the GATEWAY as a subprocess
+    in the gateway venv, streaming its lines to `line_sink`. Downloads the HF repo to a
+    local temp dir and uploads every file back under the run's S3 model prefix — used to
+    restore a run whose trained model was deleted from S3 (Try-it / label-export then find
+    it again). No GPU / no VM (the artifact is already a complete model). Blocking — call
+    via to_thread."""
+    import subprocess
+    import sys as _sys
+    import tempfile
+
+    script = str(_trainer_script_path().parent / "hf_import.py")
+    model_dir = os.path.join(tempfile.gettempdir(), "sgpu-hf-import", run_id, "model")
+    tconf = {
+        "repo": repo, "revision": revision or None,
+        "token": token or None, "hf_endpoint": hf_endpoint or None,
+        "model_s3": model_s3,
+        "region": creds.get("region"), "endpoint": creds.get("endpoint"),
+        "access_key": creds.get("access_key"), "secret_key": creds.get("secret_key"),
+        "model_dir": model_dir,
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(tconf, f)
+        cfg_path = f.name
+    out: dict = {"result": None, "error": None, "lines": []}
+    rc = -1
+    try:
+        # stderr→stdout so HF's download progress bars stream alongside the script's lines.
+        proc = subprocess.Popen(
+            [_sys.executable, "-u", script, "--config", cfg_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            j = line.find("@@HFIMPORT ")
+            if j < 0:
+                if line_sink is not None:
+                    try:
+                        line_sink(line)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if len(out["lines"]) < 400:
+                    out["lines"].append(line)
+                continue
+            try:
+                obj = json.loads(line[j + len("@@HFIMPORT "):])
+            except Exception:  # noqa: BLE001
+                continue
+            if obj.get("error"):
+                out["error"] = obj["error"]
+            else:
+                out["result"] = obj
+        rc = proc.wait()
+    finally:
+        try:
+            os.unlink(cfg_path)
+        except OSError:
+            pass
+    if out["error"]:
+        raise RuntimeError(out["error"])
+    if not out["result"]:
+        tail = "\n".join(out["lines"][-15:])
+        raise RuntimeError(f"HF import produced no result (rc={rc}):\n{tail}")
     return out["result"]
 
 

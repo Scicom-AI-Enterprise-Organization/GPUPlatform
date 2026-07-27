@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { ExternalLink, Loader2, Upload, X } from "lucide-react";
+import { DownloadCloud, ExternalLink, Loader2, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -293,6 +293,199 @@ export function HfExportTab({
 
       {/* Export status — pushing (while running), a link when done, or a failed/cancelled note. */}
       {hf && <HfExportStatus run={run} />}
+
+      {/* Restore-FROM-HF — the inverse of export. ASR/TTS only (the artifact is a complete
+          model folder); LLM stores a raw LoRA checkpoint, which this can't reconstruct. */}
+      {!isLlm && (
+        <HfImportSection
+          run={run}
+          storages={storages}
+          secretKeys={secretKeys}
+          onStarted={onStarted}
+        />
+      )}
+    </div>
+  );
+}
+
+// "Restore from Hugging Face": repopulate the run's S3 model prefix from a HF repo when the
+// trained model was deleted from S3 (Try-it / label-export then work again). Gateway-side —
+// no GPU, no training box needed. The source repo may be private → pass a read token.
+function HfImportSection({
+  run,
+  storages,
+  secretKeys,
+  onStarted,
+}: {
+  run: TrainingRunRecord;
+  storages: StorageRecord[];
+  secretKeys: string[];
+  onStarted?: () => void;
+}) {
+  const [repo, setRepo] = useState("");
+  const [revision, setRevision] = useState("");
+  const [storageId, setStorageId] = useState("");
+  const [tokenSource, setTokenSource] = useState<"storage" | "secret" | "paste">("storage");
+  const [hfToken, setHfToken] = useState("");
+  const [hfTokenSecret, setHfTokenSecret] = useState("");
+  const [overwrite, setOverwrite] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
+
+  const imp = run.result_json?.hf_import;
+  const running = imp?.status === "running";
+
+  async function submit() {
+    setErr(null);
+    if (!repo.trim()) return setErr("Enter a source repo (org/model-name).");
+    setBusy(true);
+    try {
+      await gateway.importFromHuggingFace(run.id, {
+        repo: repo.trim(),
+        revision: revision.trim() || null,
+        storage_id: storageId || null,
+        ...(tokenSource === "paste" && hfToken.trim() ? { hf_token: hfToken.trim() } : {}),
+        ...(tokenSource === "secret" && hfTokenSecret ? { hf_token_secret: hfTokenSecret } : {}),
+        overwrite,
+      });
+      onStarted?.(); // parent refreshes → hf_import.status flips to "running"
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    setStopping(true);
+    try {
+      await gateway.cancelHuggingFaceImport(run.id);
+      onStarted?.();
+    } catch {
+      // best-effort; the next poll reflects the real state
+    } finally {
+      setStopping(false);
+    }
+  }
+
+  return (
+    <Section
+      title="Restore from Hugging Face"
+      description="Repopulate this run's model in S3 from a Hugging Face repo — for when the trained model was deleted from storage and Try-it / the label export report “no model files found”. Runs on the gateway; no GPU needed."
+    >
+      <div className="space-y-3">
+        <div className="space-y-1.5">
+          <Label className="text-xs uppercase tracking-wide text-muted-foreground">Source repo</Label>
+          <Input className="font-mono" value={repo} placeholder="org/model-name"
+            onChange={(e) => setRepo(e.target.value)} />
+        </div>
+        <div className="space-y-1.5">
+          <Label className="text-xs uppercase tracking-wide text-muted-foreground">Revision (optional)</Label>
+          <Input className="font-mono" value={revision} placeholder="main / a branch, tag, or commit"
+            onChange={(e) => setRevision(e.target.value)} />
+        </div>
+
+        <div className="space-y-1.5">
+          <Label className="text-xs uppercase tracking-wide text-muted-foreground">HF token — source repo</Label>
+          <p className="text-[11px] text-muted-foreground">
+            Needed if the source repo is private. Reuses a HuggingFace storage token, a global secret, or a pasted token.
+          </p>
+          <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+            {(["storage", "secret", "paste"] as const).map((src) => (
+              <button
+                key={src}
+                type="button"
+                onClick={() => setTokenSource(src)}
+                className={`rounded px-2.5 py-1 transition-colors ${
+                  tokenSource === src ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {src === "storage" ? "HuggingFace storage" : src === "secret" ? "Global secret" : "Paste a token"}
+              </button>
+            ))}
+          </div>
+          {tokenSource === "storage" ? (
+            <Select value={storageId} onValueChange={setStorageId}>
+              <SelectTrigger>
+                <SelectValue placeholder={storages.length ? "Choose a HuggingFace storage" : "None configured — platform HF_TOKEN used"} />
+              </SelectTrigger>
+              <SelectContent>
+                {storages.map((s) => (
+                  <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          ) : tokenSource === "secret" ? (
+            secretKeys.length > 0 ? (
+              <Select value={hfTokenSecret} onValueChange={setHfTokenSecret}>
+                <SelectTrigger><SelectValue placeholder="Select a secret (e.g. HF_TOKEN)" /></SelectTrigger>
+                <SelectContent>
+                  {secretKeys.map((k) => <SelectItem key={k} value={k}>{k}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            ) : (
+              <p className="text-[11px] text-muted-foreground">
+                No global secrets yet — add one under{" "}
+                <a href="/admin/secrets" className="underline underline-offset-2 hover:text-foreground">Secrets</a>, or switch to Paste.
+              </p>
+            )
+          ) : (
+            <Input type="password" value={hfToken} onChange={(e) => setHfToken(e.target.value)}
+              placeholder="hf_…" autoComplete="off" className="font-mono text-xs" />
+          )}
+        </div>
+
+        <label className="flex cursor-pointer items-center gap-2 text-sm">
+          <input type="checkbox" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)}
+            className="h-4 w-4 accent-primary" />
+          <span>Overwrite if a model already exists in S3</span>
+        </label>
+
+        <div className="flex items-center justify-end gap-3 pt-1">
+          {err && <p className="mr-auto text-sm text-destructive">{err}</p>}
+          {running && (
+            <Button variant="destructive" onClick={stop} disabled={stopping}>
+              {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+              Cancel restore
+            </Button>
+          )}
+          <Button onClick={submit} disabled={busy || running || !repo.trim()}>
+            {(busy || running) ? <Loader2 className="h-4 w-4 animate-spin" /> : <DownloadCloud className="h-4 w-4" />}
+            {running ? "Restoring…" : "Restore from HF"}
+          </Button>
+        </div>
+
+        {imp && <HfImportStatus run={run} />}
+      </div>
+    </Section>
+  );
+}
+
+// The HF-import status line: restoring (while running), a done note with file/byte counts,
+// or a failed/cancelled note.
+function HfImportStatus({ run }: { run: TrainingRunRecord }) {
+  const imp = run.result_json?.hf_import;
+  if (!imp) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-x-6 gap-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2 text-sm">
+      {imp.status === "running" && (
+        <span className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> restoring {imp.repo} → S3 …
+        </span>
+      )}
+      {imp.status === "done" && (
+        <span className="text-emerald-600 dark:text-emerald-400">
+          restored {imp.files ?? "?"} file(s)
+          {typeof imp.bytes === "number" ? ` · ${(imp.bytes / 1e6).toFixed(0)} MB` : ""} from {imp.repo}
+        </span>
+      )}
+      {imp.status === "cancelled" && (
+        <span className="text-muted-foreground">restore stopped{imp.error ? ` — ${imp.error}` : ""}</span>
+      )}
+      {imp.status === "failed" && (
+        <span className="text-destructive">restore failed: {imp.error}</span>
+      )}
     </div>
   );
 }
