@@ -32,6 +32,15 @@ logger = logging.getLogger("gateway.vm_provider")
 SSH_TIMEOUT_S = 20
 REMOTE_DIR = "~/.sgpu"
 
+# Reverse-tunnel VM-side bind ports fall back to these high ports when the
+# free-port probe can't run (SSH hiccup). NEVER fall back to 8080/6379 — those are
+# the exact ports a shared box / PAI-DSW container tends to have taken (an unrelated
+# uvicorn app owned :8080 on the tm box → `ssh -R` bind failed → register hit it →
+# 404). A high port is safe: each container has its own loopback namespace, so two
+# providers on one host don't clash.
+_FALLBACK_TUNNEL_GW_PORT = 47080
+_FALLBACK_TUNNEL_REDIS_PORT = 47079
+
 
 def _worker_agent_src_dir() -> str:
     """Where the worker-agent SOURCE lives so the gateway can ship it to the VM
@@ -145,9 +154,21 @@ class VMProvider(Provider):
             )
             if rd_host in ("", "0.0.0.0"):
                 rd_host = "127.0.0.1"
+            # `_tunnel_gw`/`_tunnel_redis` are the LOCAL targets (host:port reachable
+            # from the gateway process) — the `-R` forward's far end. Unchanged.
             self._tunnel_gw = (gw_host, gw_port)
             self._tunnel_redis = (rd_host, rd_port)
-            # Worker hits the VM's loopback (mirror ports); the tunnel maps it home.
+            # The VM-side loopback port the tunnel BINDS for the GATEWAY forward (and
+            # the worker dials as GATEWAY_URL). Do NOT assume the gateway's own :8080
+            # is free on the VM — a shared box / PAI-DSW container often already runs
+            # something there. _resolve_tunnel_vm_ports() overwrites this with a
+            # genuinely-free, per-provider-persisted port before we build the worker
+            # env or open the tunnel; this mirror-port value is only a pre-resolve
+            # default. Redis keeps its standard VM-side port (rd_port) — see
+            # _resolve_tunnel_vm_ports for why it must match the register response.
+            self._tunnel_gw_vm_port = gw_port
+            # Worker hits the VM's loopback; the tunnel maps it home. Gateway URL is
+            # overwritten by _resolve_tunnel_vm_ports() with the resolved free port.
             self._gateway_url = f"http://127.0.0.1:{gw_port}"
             self._worker_redis_url = f"redis://127.0.0.1:{rd_port}"
 
@@ -166,6 +187,9 @@ class VMProvider(Provider):
         data_center_id: Optional[str] = None,  # noqa: ARG002 — VM hardware is fixed
     ) -> ProvisionResult:
         machine_id = f"m-vm-{uuid.uuid4().hex[:8]}"
+        # Resolve the VM-side tunnel ports FIRST — _build_worker_env bakes them into
+        # the worker's GATEWAY_URL / WORKER_REDIS_URL (written to its config file).
+        await self._resolve_tunnel_vm_ports()
         worker_env = self._build_worker_env(app_id, machine_id, model, env)
         import asyncio
         # Bring up the reverse tunnel before the worker boots so its first
@@ -355,14 +379,63 @@ class VMProvider(Provider):
             )
         return self._private_key_pem
 
+    async def _resolve_tunnel_vm_ports(self) -> None:
+        """Pick the VM-side loopback port the reverse tunnel binds for the GATEWAY
+        forward — a genuinely FREE port, NOT the gateway's own :8080, which is often
+        already taken on a shared box / PAI-DSW container. Binding a busy port makes
+        `ssh -R` fail (ExitOnForwardFailure kills the WHOLE tunnel) → an autossh
+        respawn storm, and the worker's register POST then lands on whatever squats
+        on :8080 → HTTP 404 (seen on the tm box: an unrelated uvicorn app owned :8080,
+        so every worker there 404'd forever).
+
+        We probe the VM once for a free port and persist it per-provider in Redis so
+        it stays STABLE across gateway restarts — a running worker's baked-in
+        GATEWAY_URL keeps resolving to the same port.
+
+        Redis keeps its STANDARD VM-side port (`rd_port`, 6379): the gateway's
+        register RESPONSE hands the worker a GLOBAL redis URL
+        (`WORKER_REDIS_URL`/`REDIS_URL`, main.register_worker) — not this provider's
+        value — so the VM-side redis tunnel MUST bind that same port for the worker
+        to reach it. 6379 is effectively always free inside a GPU container anyway.
+        Idempotent + cheap; safe to call before every _build_worker_env/_ensure_tunnel."""
+        if not self._reverse_tunnel:
+            return
+        import asyncio
+
+        gw_key = f"vm_tunnel:{self._provider_id}:gw_port"
+        gw_vm = await self._rdb.get(gw_key)
+        if not gw_vm:
+            try:
+                gw_vm = str((await asyncio.to_thread(self._probe_free_vm_ports, 1))[0])
+            except Exception as e:  # noqa: BLE001 — never regress to :8080 on a probe hiccup
+                logger.warning(
+                    "vm-tunnel: free-port probe on %s failed (%s); using fallback high port",
+                    self._host, e,
+                )
+                gw_vm = str(_FALLBACK_TUNNEL_GW_PORT)
+            await self._rdb.set(gw_key, gw_vm)
+            logger.info(
+                "vm-tunnel: %s VM-side gateway port gw=%s (free-probed, persisted); redis stays :%d",
+                self._provider_id, gw_vm, self._tunnel_redis[1],
+            )
+        self._tunnel_gw_vm_port = int(gw_vm)
+        self._gateway_url = f"http://127.0.0.1:{self._tunnel_gw_vm_port}"
+
     async def _ensure_tunnel(self) -> None:
         if not self._reverse_tunnel:
             return
         import asyncio
 
         from . import vm_tunnel
+        # Ensure the free VM-side gateway port is resolved (covers the
+        # ensure_connectivity tick path, where provision()'s explicit resolve didn't run).
+        await self._resolve_tunnel_vm_ports()
         forwards = [
-            vm_tunnel.Forward(self._tunnel_gw[1], self._tunnel_gw[0], self._tunnel_gw[1]),
+            # gateway: bind a FREE VM port (not 8080), pump it back to the gateway's
+            # real port. Decoupling vm_port from local_port is the :8080-squatter fix.
+            vm_tunnel.Forward(self._tunnel_gw_vm_port, self._tunnel_gw[0], self._tunnel_gw[1]),
+            # redis: keep the STANDARD VM-side port — the register response hands the
+            # worker a global redis URL on this port (see _resolve_tunnel_vm_ports).
             vm_tunnel.Forward(self._tunnel_redis[1], self._tunnel_redis[0], self._tunnel_redis[1]),
         ]
         await asyncio.to_thread(
@@ -616,6 +689,29 @@ class VMProvider(Provider):
                 client.close()
             except Exception:
                 pass
+
+    def _probe_free_vm_ports(self, n: int) -> list[int]:
+        """SSH in and ask the VM's OS for `n` free loopback ports (bind ephemeral
+        sockets, read the assigned ports, close). Each is guaranteed free at bind
+        time; a high ephemeral port is very unlikely to be grabbed in the sub-second
+        before autossh's `-R` binds it. One SSH round-trip; raises on failure (the
+        caller falls back to fixed high ports so we never regress to :8080)."""
+        n = int(n)
+        py = (
+            "import socket;"
+            f"ss=[socket.socket() for _ in range({n})];"
+            "[s.bind(('127.0.0.1',0)) for s in ss];"
+            "print(' '.join(str(s.getsockname()[1]) for s in ss))"
+        )
+        client = self._connect_sync()
+        try:
+            out = self._run(client, f"python3 -c {shlex.quote(py)}").strip()
+        finally:
+            client.close()
+        ports = [int(x) for x in out.split() if x.strip().isdigit()]
+        if len(ports) < n:
+            raise RuntimeError(f"probe returned {out!r}")
+        return ports[:n]
 
     @staticmethod
     def _run(client, cmd: str, timeout: float = SSH_TIMEOUT_S) -> str:

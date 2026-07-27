@@ -187,11 +187,20 @@ def _kill_stale_reverse(host: str, port: int, forwards: "tuple[Forward, ...]") -
     marker = f"-R 127.0.0.1:{forwards[0].vm_port}:"
     port_marker = f" -p {port} "
     try:
-        out = subprocess.run(["pgrep", "-af", "sgpu_vmkey"], capture_output=True, text=True, timeout=5).stdout
+        # `ps -A -ww` (portable), NOT `pgrep -af`: BSD/macOS pgrep has no `-a`, so on
+        # a dev laptop the old call errored → reaped nothing → stale autossh piled up
+        # across restarts and blocked the fresh `-R` bind (the redis forward silently
+        # never came up). `-A -o pid=,command=` selects all procs with full args on
+        # both Linux (procps) and macOS (BSD); `-ww` = unlimited width so procps
+        # doesn't clip the long autossh line before our late `-R`/`-p` markers.
+        out = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
     except Exception:
         return
     import signal
     for line in out.splitlines():
+        line = line.strip()
+        if "sgpu_vmkey" not in line:
+            continue
         pid_str, _, cmd = line.partition(" ")
         if host in cmd and marker in cmd and port_marker in cmd:
             try:

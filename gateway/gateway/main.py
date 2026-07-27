@@ -3849,9 +3849,36 @@ async def run(
     # chat_template_kwargs.enable_thinking) actually apply. Popped so it isn't
     # forwarded to vLLM as an unknown body field.
     ep = payload.pop("endpoint", None)
-    endpoint = ep if isinstance(ep, str) and ep.startswith("/v1/") else "/v1/completions"
+    app = await _load_owned_app(session, app_id, user)
+    # Proxy mode has no job queue / worker dispatch — the gateway forwards straight
+    # to the VM's vLLM over the (autossh) tunnel, exactly like /stream and the unary
+    # /{app_id}/v1/... path. Enqueuing instead would land the job in a queue nobody
+    # consumes, so the /result poll never leaves "pending" (streaming worked because
+    # /stream already branches on mode; non-streaming didn't). Forward synchronously,
+    # then stash the response under result:{id} so the existing poll contract serves
+    # it back unchanged.
+    if (getattr(app, "mode", "single") or "single") == "proxy":
+        vllm_path = ep if isinstance(ep, str) and ep.startswith("/v1/") else "/v1/chat/completions"
+        payload["stream"] = False
+        await rdb.set(f"app:{app_id}:last_request_ts", str(time.time()))
+        limit, queue_max = _proxy_concurrency_config(app)
+        resp = await _proxy_to_upstream(
+            request, app_id, payload, vllm_path, int(app.request_timeout_s),
+            owner_id=user.id, limit=limit, queue_max=queue_max,
+        )
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        try:
+            output = json.loads(resp.body)
+        except (AttributeError, TypeError, ValueError):
+            output = None
+        status = "completed" if resp.status_code < 400 else "failed"
+        await rdb.set(f"result:{request_id}", json.dumps({"status": status, "output": output}), ex=3600)
+        logger.info("proxy run %s on %s (user=%s, status=%s, http=%s)",
+                    request_id, app_id, user.username, status, resp.status_code)
+        return RunResponse(request_id=request_id, poll_url=f"/result/{request_id}")
     # Multi-model endpoints route by the member-model name in `payload.model`;
     # single-mode workers serve one model and ignore target_model.
+    endpoint = ep if isinstance(ep, str) and ep.startswith("/v1/") else "/v1/completions"
     model_field = payload.get("model")
     target_model = model_field if isinstance(model_field, str) and model_field else None
     request_id, _ = await _admit_and_enqueue(
