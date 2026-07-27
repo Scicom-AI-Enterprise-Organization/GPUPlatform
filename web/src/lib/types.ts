@@ -433,6 +433,17 @@ export type TrainingResult = {
     url?: string | null;
     error?: string | null;
   } | null;
+  // On-demand "Restore from Hugging Face" (the inverse of hf_export) — repopulates the
+  // run's S3 model prefix from a HF repo when the trained model was deleted from S3.
+  hf_import?: {
+    status: "running" | "done" | "failed" | "cancelled";
+    repo?: string | null;
+    revision?: string | null;
+    s3?: string | null;
+    files?: number | null;
+    bytes?: number | null;
+    error?: string | null;
+  } | null;
   error?: string;
 };
 

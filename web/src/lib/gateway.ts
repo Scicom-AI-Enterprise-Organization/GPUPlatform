@@ -580,6 +580,31 @@ export const gateway = {
       `/v1/training-runs/${encodeURIComponent(id)}/hf-export/cancel`,
       { method: "POST" },
     ),
+  /** Restore a run's model artifact FROM a Hugging Face repo into its S3 model prefix —
+   * the inverse of exportToHuggingFace. Runs on the gateway (no GPU / no VM). Used when
+   * the trained model was deleted from S3 and Try-it / label-export fail with "no model
+   * files found". The source repo may be private → pass a token with read access. */
+  importFromHuggingFace: (
+    id: string,
+    body: {
+      repo: string;
+      revision?: string | null;
+      storage_id?: string | null;
+      hf_token?: string;
+      hf_token_secret?: string;
+      overwrite?: boolean;
+    },
+  ) =>
+    request<{ status: string }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/hf-import`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  /** Stop a running HF import (cancels the gateway task). */
+  cancelHuggingFaceImport: (id: string) =>
+    request<{ status: string }>(
+      `/v1/training-runs/${encodeURIComponent(id)}/hf-import/cancel`,
+      { method: "POST" },
+    ),
   /** Clone a run's config into a fresh queued run and launch it. */
   restartTrainingRun: (id: string) =>
     request<TrainingRunRecord>(
