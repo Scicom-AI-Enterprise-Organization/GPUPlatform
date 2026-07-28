@@ -70,6 +70,11 @@ gateway:
   # this before exposing the ingress publicly. Stored in a Secret.
   apiKeys: ""
 
+  # Pin the gateway to a node pool (e.g. a dedicated/tainted one). Empty =
+  # scheduler default, which is what every existing deployment gets.
+  nodeSelector: {}
+  tolerations: []
+
   # Affinity / anti-affinity to spread replicas across nodes.
   podAntiAffinity: true
 

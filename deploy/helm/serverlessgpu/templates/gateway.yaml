@@ -49,6 +49,14 @@ spec:
                   matchLabels:
                     {{- include "serverlessgpu.gateway.selectorLabels" . | nindent 20 }}
       {{- end }}
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: gateway
           image: {{ .Values.image.spec | default (printf "%s/%s:%s" .Values.image.registry .Values.image.repository .Values.image.tag) | quote }}
