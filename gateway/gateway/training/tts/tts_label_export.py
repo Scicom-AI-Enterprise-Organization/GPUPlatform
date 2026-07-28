@@ -20,6 +20,9 @@ then prints ONE structured line the gateway parses:
 Config (JSON via --config):
   {model_s3, region, endpoint, access_key, secret_key,
    packed_uri,                 # s3:// prefix of the packed ChiniDataset to read texts from
+   fallback_uri?,              # s3:// prefix scanned to TOP UP when packed_uri is short of N
+                               # (the train split — a held-out test split is usually smaller
+                               #  than the requested per-speaker count)
    split_subdir,               # "" (flat root) | "train" | "test" — subdir under packed_uri with index.json
    random,                     # true → random.sample N (train); false → first N (test)
    n_samples, seed,
@@ -63,10 +66,44 @@ def _upload_client(cfg: dict):
     )
 
 
+def _resolve_read_dir(cfg: dict, uri: str, local_dir: str, subdir: str = "") -> str:
+    """Download a packed s3:// prefix and return the dir that actually holds index.json:
+    the requested subdir → a flat pack (index.json at the root) → else a single named
+    split subdir (e.g. `default`, produced when the source dataset had no split column),
+    preferring train/. `_read_packed` reads `<read_dir>/index.json` directly, so the
+    returned dir must be the split dir itself."""
+    from tts_infer import _download_model
+
+    # Reuse the model download helper to pull the packed shards (same listing /
+    # size-cached fetch); point it at the packed prefix instead of the model.
+    _download_model({**cfg, "model_s3": uri, "model_dir": local_dir})
+    read_dir = os.path.join(local_dir, subdir) if subdir else local_dir
+    if not os.path.exists(os.path.join(read_dir, "index.json")):
+        read_dir = local_dir  # flat?
+        if not os.path.exists(os.path.join(read_dir, "index.json")):
+            try:
+                subs = [d for d in sorted(os.listdir(local_dir))
+                        if os.path.isdir(os.path.join(local_dir, d))
+                        and os.path.exists(os.path.join(local_dir, d, "index.json"))]
+            except OSError:
+                subs = []
+            # prefer train/ then default/ then the first split with an index
+            pick = next((s for s in ("train", "default") if s in subs), subs[0] if subs else None)
+            if pick:
+                read_dir = os.path.join(local_dir, pick)
+    return read_dir
+
+
 def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
     """Download the chosen packed split + decode utterances → [(prompt_text, ref_text, speaker)].
     For the train split a random sample of N is taken (scanning a bounded pool);
     for the test split the first N well-formed utterances are used.
+
+    ⚠ A held-out **test** split is often SMALLER than the requested count (it's
+    `eval_test_per_speaker` clips/speaker, packed at pack time — e.g. 20 while the
+    export asks for 25). When the primary source can't fill N, `fallback_uri` (the
+    train split) is scanned to TOP UP the shortfall — randomly sampled, deduped
+    against what's already selected — instead of silently returning fewer clips.
 
     Two optional filters/groupings (config):
       * reject_keywords — drop any utterance whose transcript contains one of these
@@ -89,14 +126,15 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
     from transformers import AutoTokenizer
     # tts_eval lives in the same shipped dir; importing it pulls only stdlib.
     from tts_eval import _read_packed, _utterance_parts, _IM_START, _SPEECH_START
-    from tts_infer import _download_model
 
     n = max(1, int(cfg.get("n_samples") or 8))
     packed_uri = cfg["packed_uri"]
+    fallback_uri = (cfg.get("fallback_uri") or "").strip()
     subdir = (cfg.get("split_subdir") or "").strip("/")
     is_random = bool(cfg.get("random"))
-    if is_random:
-        _random.seed(int(cfg.get("seed") or 42))
+    # Seed unconditionally: even a first-N (test-split) selection samples randomly
+    # when it has to top up from the train split, and a retry should reproduce it.
+    _random.seed(int(cfg.get("seed") or 42))
 
     # Reject keywords: case-insensitive substring match on the transcript, with
     # whitespace collapsed on BOTH sides so a spaced keyword ("E M G S") still
@@ -118,66 +156,79 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
     speakers = [str(s).strip() for s in (cfg.get("label_speakers") or []) if str(s).strip()]
     per_speaker = bool(cfg.get("per_speaker")) and bool(speakers)
 
-    # Reuse the model download helper to pull the packed shards (same listing /
-    # size-cached fetch); point it at the packed prefix instead of the model.
     packed_dir = cfg.get("packed_dir") or "/tmp/sgpu-tts-label-packed"
-    _download_model({**cfg, "model_s3": packed_uri, "model_dir": packed_dir})
-    # Resolve the dir that actually holds index.json: the requested subdir → a flat
-    # pack (index.json at the root) → else a single named split subdir (e.g.
-    # `default`, produced when the source dataset had no split column), preferring
-    # train/. _read_packed reads <read_dir>/index.json directly, so read_dir must be
-    # the split dir itself.
-    read_dir = os.path.join(packed_dir, subdir) if subdir else packed_dir
-    if not os.path.exists(os.path.join(read_dir, "index.json")):
-        read_dir = packed_dir  # flat?
-        if not os.path.exists(os.path.join(read_dir, "index.json")):
-            try:
-                subs = [d for d in sorted(os.listdir(packed_dir))
-                        if os.path.isdir(os.path.join(packed_dir, d))
-                        and os.path.exists(os.path.join(packed_dir, d, "index.json"))]
-            except OSError:
-                subs = []
-            # prefer train/ then default/ then the first split with an index
-            pick = next((s for s in ("train", "default") if s in subs), subs[0] if subs else None)
-            if pick:
-                read_dir = os.path.join(packed_dir, pick)
+    read_dir = _resolve_read_dir(cfg, packed_uri, packed_dir, subdir)
     log(f"reading texts from {read_dir} (random={is_random}, want {n}"
         f"{', per-speaker' if per_speaker else ''}{f', rejecting {len(reject)} keyword(s)' if reject else ''})")
 
     tok = AutoTokenizer.from_pretrained(cfg["model_dir"])
 
+    def _fallback_dir() -> str:
+        """Download + resolve the top-up source (the train split). Cached per process."""
+        return _resolve_read_dir(cfg, fallback_uri,
+                                 cfg.get("fallback_dir") or "/tmp/sgpu-tts-label-packed-fallback")
+
     if per_speaker:
         # Bucket utterances by their source speaker (case-insensitive match to the
         # requested names), then take N from each speaker's own clips. Scan a
         # bounded pool per speaker so a huge split doesn't decode end-to-end.
-        per_pool = n if not is_random else max(n * 20, 500)
         want = {s.lower(): s for s in speakers}             # lower → canonical name
         buckets: dict[str, list[tuple[str, str, str]]] = {s: [] for s in speakers}
-        scan_cap = per_pool * len(speakers)
-        scanned = 0
-        for utt in _read_packed(read_dir):
-            if scanned >= scan_cap or all(len(buckets[s]) >= per_pool for s in speakers):
-                break
-            parts = _utterance_parts(tok, utt)
-            if parts is None:
-                continue
-            prompt_text, _ref_codes, ref_text = parts
-            ref_text = (ref_text or "").strip()
-            if not ref_text or _rejected(ref_text):
-                continue
-            canon = want.get(_spk(prompt_text).lower())
-            if canon is None or len(buckets[canon]) >= per_pool:
-                continue
-            buckets[canon].append((prompt_text, ref_text, canon))
-            scanned += 1
+        picked: set[tuple[str, str]] = set()                # (speaker, text) already selected
+
+        def _fill(rdir: str, randomize: bool) -> None:
+            """Top the short buckets up from `rdir`, sampling within a bounded pool."""
+            need = {s: n - len(buckets[s]) for s in speakers if len(buckets[s]) < n}
+            if not need:
+                return
+            caps = {s: (k if not randomize else max(k * 20, 500)) for s, k in need.items()}
+            pools: dict[str, list[tuple[str, str, str]]] = {s: [] for s in need}
+            for utt in _read_packed(rdir):
+                if all(len(pools[s]) >= caps[s] for s in need):
+                    break
+                parts = _utterance_parts(tok, utt)
+                if parts is None:
+                    continue
+                prompt_text, _ref_codes, ref_text = parts
+                ref_text = (ref_text or "").strip()
+                if not ref_text or _rejected(ref_text):
+                    continue
+                canon = want.get(_spk(prompt_text).lower())
+                if canon is None or canon not in pools or len(pools[canon]) >= caps[canon]:
+                    continue
+                if (canon, ref_text) in picked:      # already taken from another split
+                    continue
+                picked.add((canon, ref_text))
+                pools[canon].append((prompt_text, ref_text, canon))
+            for spk, k in need.items():
+                pool_s = pools[spk]
+                sel = _random.sample(pool_s, min(k, len(pool_s))) if randomize else pool_s[:k]
+                buckets[spk].extend(sel)
+                # Release what we pooled but didn't take (the selected ones stay
+                # marked), so a later top-up pass can still consider them.
+                keep = {rt for _pt, rt, _s in sel}
+                for _pt, rt, _s in pool_s:
+                    if rt not in keep:
+                        picked.discard((spk, rt))
+
+        _fill(read_dir, is_random)
+        short = {s: n - len(buckets[s]) for s in speakers if len(buckets[s]) < n}
+        if short and fallback_uri:
+            # A held-out test split is usually smaller than the requested count —
+            # make up the difference from the train split rather than under-delivering.
+            log(f"short of {n}/speaker after {read_dir} (missing "
+                + ", ".join(f"{s}×{k}" for s, k in sorted(short.items()))
+                + f") — topping up from {fallback_uri}")
+            _fill(_fallback_dir(), True)
         out: list[tuple[str, str, str]] = []
         for spk in speakers:
             b = buckets[spk]
             if not b:
                 log(f"speaker {spk!r}: no matching clips in the dataset — skipped")
                 continue
-            sel = _random.sample(b, min(n, len(b))) if is_random else b[:n]
-            out.extend(sel)
+            if len(b) < n:
+                log(f"speaker {spk!r}: only {len(b)} of {n} clip(s) available")
+            out.extend(b[:n])
         from collections import Counter
         bal = ", ".join(f"{s}×{c}" for s, c in sorted(Counter(s for _, _, s in out).items()))
         log(f"per-speaker selection ({len(out)} clip(s)): {bal or 'none'}")
@@ -185,22 +236,31 @@ def _collect_texts(cfg: dict) -> list[tuple[str, str, str]]:
 
     # Single-pool modes: scan a bounded pool of utterances (a packed record holds
     # several) so a huge train split doesn't decode end-to-end just to sample N.
+    def _scan_pool(rdir: str, cap: int, skip: set[str]) -> list[tuple[str, str]]:
+        acc: list[tuple[str, str]] = []
+        for utt in _read_packed(rdir):
+            parts = _utterance_parts(tok, utt)
+            if parts is None:
+                continue
+            prompt_text, _ref_codes, ref_text = parts
+            ref_text = (ref_text or "").strip()
+            if not ref_text or _rejected(ref_text) or ref_text in skip:
+                continue
+            acc.append((prompt_text, ref_text))
+            if len(acc) >= cap:
+                break
+        return acc
+
     pool_cap = n if not is_random else max(n * 20, 500)
-    pool: list[tuple[str, str]] = []
-    for utt in _read_packed(read_dir):
-        parts = _utterance_parts(tok, utt)
-        if parts is None:
-            continue
-        prompt_text, _ref_codes, ref_text = parts
-        ref_text = (ref_text or "").strip()
-        if not ref_text or _rejected(ref_text):
-            continue
-        pool.append((prompt_text, ref_text))
-        if len(pool) >= pool_cap:
-            break
-    if not pool:
+    pool = _scan_pool(read_dir, pool_cap, set())
+    selected = (_random.sample(pool, min(n, len(pool))) if is_random else pool[:n]) if pool else []
+    if len(selected) < n and fallback_uri:
+        missing = n - len(selected)
+        log(f"short of {n} clip(s) after {read_dir} ({missing} missing) — topping up from {fallback_uri}")
+        extra_pool = _scan_pool(_fallback_dir(), max(missing * 20, 500), {t for _p, t in selected})
+        selected += _random.sample(extra_pool, min(missing, len(extra_pool)))
+    if not selected:
         return []
-    selected = _random.sample(pool, min(n, len(pool))) if is_random else pool[:n]
 
     # Balance the generation across named speakers: reassign each clip's voice
     # round-robin so e.g. 2 speakers + 32 samples → 16 each. The model is
@@ -308,8 +368,13 @@ def main() -> int:
         g = _pick_gpu()
         os.environ["CUDA_VISIBLE_DEVICES"] = g if g is not None else ""
 
+    # NeuCodec pulls public HF repos (neuphonic/neucodec + facebook/w2v-bert-2.0); a
+    # stale ~/.cache/huggingface/token on the box 401s them into
+    # "… is not a valid model identifier". Drop the bad token before anything loads.
+    from tts_infer import _download_model, ensure_hf_token_usable
+    ensure_hf_token_usable(log)
+
     # Download the model first (also used by the tokenizer in _collect_texts).
-    from tts_infer import _download_model
     _download_model(cfg)
 
     utts = _collect_texts(cfg)

@@ -22,6 +22,18 @@ import { cn } from "@/lib/utils";
 
 const POLL_MS = 4000;
 
+// A VM session's jupyter_url is a gateway-RELATIVE path (`/compute/jupyter/…`)
+// unless the gateway has GATEWAY_PUBLIC_URL set — it can't know which origin a
+// browser reaches it on. The browser does: it's the same base the API client
+// uses. Resolve here rather than server-side so one gateway can serve several
+// origins (localhost dev + the deployed hostname).
+function resolveJupyterUrl(url: string | null): string | null {
+  if (!url) return null;
+  if (!url.startsWith("/")) return url;
+  const base = (process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080").replace(/\/$/, "");
+  return `${base}${url}`;
+}
+
 export function PodDetail({ initial }: { initial: ComputePod }) {
   const router = useRouter();
   const [pod, setPod] = useState<ComputePod>(initial);
@@ -42,8 +54,10 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
       .catch(() => {});
   }, [pod.provider_id]);
 
-  const providerLabel =
-    provider?.kind === "pi"
+  const isVm = pod.kind === "vm";
+  const providerLabel = isVm
+    ? `${provider?.name ?? "Machine"} (SSH)`
+    : provider?.kind === "pi"
       ? "Prime Intellect"
       : provider?.kind === "runpod"
         ? "RunPod"
@@ -51,6 +65,7 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
           ? "Custom account"
           : "RunPod (gateway default)";
   const keyHint = pod.provider_id ? `sgpu-${pod.provider_id}` : "sgpu-runpod";
+  const jupyterUrl = resolveJupyterUrl(pod.jupyter_url);
 
   // Poll while we're waiting for the pod to move out of an in-flight state.
   // 'pending_approval' polls so the requester sees the status flip the moment
@@ -173,7 +188,9 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
             <DialogDescription>
               {pod.status === "pending_approval"
                 ? "The approval request will be cancelled. You can submit a new one any time."
-                : `Stops billing immediately and deletes the pod from ${providerLabel}. Anything not saved to a persistent volume is lost. This can't be undone.`}
+                : isVm
+                  ? `Stops JupyterLab (and its kernels) on ${providerLabel}, freeing the GPUs, and deletes this session's uv environment — anything you pip-installed into it is gone and a new session rebuilds it from scratch. Your files in ${pod.workdir ?? "the working directory"} are kept.`
+                  : `Stops billing immediately and deletes the pod from ${providerLabel}. Anything not saved to a persistent volume is lost. This can't be undone.`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -201,27 +218,57 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
         </DialogContent>
       </Dialog>
 
-      {/* Spec — neutral metadata, no colour. */}
+      {/* Spec — neutral metadata, no colour. A VM session has no disk/tier/
+          image/billing to report, so it gets its own (shorter) field set. */}
       <Card title="Specification">
-        <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
-          <Field label="GPU" value={`${shortGpu(pod.gpu_type)} × ${pod.gpu_count}`} />
-          <Field label="Container disk" value={`${pod.container_disk_gb} GB`} />
-          <Field label="Volume" value={pod.volume_gb > 0 ? `${pod.volume_gb} GB` : "—"} />
-          <Field label="Cloud" value={pod.cloud_type.toLowerCase()} />
-          <Field label="Provider" value={providerLabel} />
-          <Field label="Template" value={pod.template_id ?? "—"} />
-          <Field label="Rate" value={formatRateUSD(pod.cost_per_hr)} />
-          <Field
-            label="Auto-terminate"
-            value={
-              pod.idle_terminate_after_s > 0
-                ? `idle ${formatIdle(pod.idle_terminate_after_s)}`
-                : "off"
-            }
-          />
-          <LiveCostField pod={pod} />
-          <Field label="Image" value={pod.image} className="col-span-full font-mono text-xs" />
-        </dl>
+        {isVm ? (
+          <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+            <Field label="Machine" value={providerLabel} />
+            <Field label="GPU" value={`${shortGpu(pod.gpu_type)} × ${pod.gpu_count}`} />
+            <Field
+              label="Visible devices"
+              value={pod.visible_devices ? `CUDA_VISIBLE_DEVICES=${pod.visible_devices}` : "all GPUs"}
+            />
+            <Field
+              label="Auto-stop"
+              value={
+                pod.idle_terminate_after_s > 0
+                  ? `idle ${formatIdle(pod.idle_terminate_after_s)}`
+                  : "off"
+              }
+            />
+            <Field
+              label="Environment"
+              value={`uv venv · jupyterlab${pod.jupyter_version ? ` ${pod.jupyter_version}` : ""}`}
+            />
+            <Field label="Cost" value="—" />
+            <Field
+              label="Working directory"
+              value={pod.workdir ?? "—"}
+              className="col-span-full font-mono text-xs"
+            />
+          </dl>
+        ) : (
+          <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+            <Field label="GPU" value={`${shortGpu(pod.gpu_type)} × ${pod.gpu_count}`} />
+            <Field label="Container disk" value={`${pod.container_disk_gb} GB`} />
+            <Field label="Volume" value={pod.volume_gb > 0 ? `${pod.volume_gb} GB` : "—"} />
+            <Field label="Cloud" value={pod.cloud_type.toLowerCase()} />
+            <Field label="Provider" value={providerLabel} />
+            <Field label="Template" value={pod.template_id ?? "—"} />
+            <Field label="Rate" value={formatRateUSD(pod.cost_per_hr)} />
+            <Field
+              label="Auto-terminate"
+              value={
+                pod.idle_terminate_after_s > 0
+                  ? `idle ${formatIdle(pod.idle_terminate_after_s)}`
+                  : "off"
+              }
+            />
+            <LiveCostField pod={pod} />
+            <Field label="Image" value={pod.image} className="col-span-full font-mono text-xs" />
+          </dl>
+        )}
       </Card>
 
       {/* Pending / rejected — explain what's happening before showing connect UI. */}
@@ -255,7 +302,9 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
         <Card title="Connect">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
-            Provisioning — SSH and JupyterLab will appear here once the pod is ready.
+            {isVm
+              ? "Building the uv venv and starting JupyterLab on the machine — the link appears here once it answers. First run installs jupyterlab, so it can take a few minutes."
+              : "Provisioning — SSH and JupyterLab will appear here once the pod is ready."}
           </div>
         </Card>
       )}
@@ -269,53 +318,74 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
       )}
 
       {pod.status === "terminated" && (
-        <Card title="Terminated">
+        <Card title={isVm ? "Stopped" : "Terminated"}>
           <p className="text-sm text-muted-foreground">
-            This pod has been terminated. Billing stopped at{" "}
-            {pod.terminated_at ? new Date(pod.terminated_at).toLocaleString() : "—"}.
+            {isVm ? (
+              <>
+                JupyterLab was stopped at{" "}
+                {pod.terminated_at ? new Date(pod.terminated_at).toLocaleString() : "—"}.
+                Files in {pod.workdir ?? "the working directory"} are still on the machine.
+              </>
+            ) : (
+              <>
+                This pod has been terminated. Billing stopped at{" "}
+                {pod.terminated_at ? new Date(pod.terminated_at).toLocaleString() : "—"}.
+              </>
+            )}
           </p>
         </Card>
       )}
 
       {pod.status === "running" && (
         <>
-          {pod.jupyter_url && (
+          {jupyterUrl && (
           <Card
             title="JupyterLab"
-            subtitle="One-time token baked into the URL — click Open, no password prompt."
+            subtitle={
+              isVm
+                ? "Served through the gateway over an SSH tunnel — the machine itself stays unexposed. Token baked into the URL."
+                : "One-time token baked into the URL — click Open, no password prompt."
+            }
           >
             <div className="space-y-3">
               <Row label="URL">
                 <div className="flex flex-1 items-center gap-2">
                   <a
-                    href={pod.jupyter_url ?? "#"}
+                    href={jupyterUrl}
                     target="_blank"
                     rel="noreferrer"
                     className="flex-1 truncate font-mono text-xs text-foreground underline-offset-2 hover:underline"
                   >
-                    {pod.jupyter_url}
+                    {jupyterUrl}
                   </a>
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon"
-                    onClick={() => pod.jupyter_url && copy(pod.jupyter_url, "URL")}
+                    onClick={() => copy(jupyterUrl, "URL")}
                     title="Copy URL"
                   >
                     <Copy className="h-4 w-4" />
                   </Button>
                   <Button asChild type="button" variant="outline" size="sm" title="Open">
-                    <a href={pod.jupyter_url ?? "#"} target="_blank" rel="noreferrer">
+                    <a href={jupyterUrl} target="_blank" rel="noreferrer">
                       <ExternalLink className="h-4 w-4" />
                       Open
                     </a>
                   </Button>
                 </div>
               </Row>
+              {isVm && (
+                <p className="text-xs text-muted-foreground">
+                  Anyone with this link gets the notebook — it carries its own
+                  access token. Use JupyterLab&apos;s built-in terminal for shell access.
+                </p>
+              )}
             </div>
           </Card>
           )}
 
+          {!isVm && (
           <Card title="SSH" subtitle="For terminal access. Download the key once and chmod 0600.">
             <div className="space-y-3">
               <Row label="Command">
@@ -342,6 +412,7 @@ export function PodDetail({ initial }: { initial: ComputePod }) {
               </Row>
             </div>
           </Card>
+          )}
         </>
       )}
     </div>

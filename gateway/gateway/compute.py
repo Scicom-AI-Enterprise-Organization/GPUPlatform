@@ -255,8 +255,29 @@ class ComputePod(Base):
     # Persisted Jupyter URL. For RunPod we derive it from runpod_pod_id at
     # render time so we leave it NULL; for PI we resolve the external 8888
     # port at poll time and write the full URL here so the renderer stays
-    # kind-agnostic.
+    # kind-agnostic. VM sessions store the gateway-relative proxy path.
     jupyter_url_override: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    # runpod | pi | vm. Derivable from the provider row, but denormalized so
+    # teardown/idle paths still dispatch correctly if the provider is deleted.
+    kind: Mapped[str] = mapped_column(String(16), default="runpod", server_default="runpod")
+
+    # ---- kind=vm only (see compute_vm.py) ----
+    # CUDA_VISIBLE_DEVICES pinned at jupyter launch. NULL = every GPU on the box.
+    visible_devices: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # The VM-loopback port jupyter binds; the gateway `ssh -L`s to it on demand.
+    vm_port: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # pid of the jupyter process group, for a precise teardown on a shared box.
+    vm_pid: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Notebook root on the VM (defaults to the per-pod dir; survives terminate).
+    vm_workdir: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    # Pinned JupyterLab version for the session venv. NULL = whatever uv resolves.
+    vm_jupyter_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Where the uv venv lives. NULL = the per-pod dir. Point it at a big/shared
+    # disk when $HOME is small, or at an existing env to reuse it.
+    vm_venv_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    # Capability secret embedded in the proxy URL — the only auth a browser can
+    # carry to the WebSocket path. See compute_proxy.py.
+    proxy_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
 
 # ---------- RunPod REST helpers ----------------------------------------
@@ -1251,6 +1272,149 @@ async def _delete_runpod(runpod_id: str, provider_id: Optional[str] = None) -> N
             logger.exception("compute: delete request for %s crashed", runpod_id)
 
 
+# ---------- VM sessions (uv venv + JupyterLab, proxied) ------------------
+
+
+async def _vm_conn_for_pod(s: AsyncSession, pod: ComputePod) -> dict[str, Any]:
+    from . import compute_vm
+
+    if not pod.provider_id:
+        raise RuntimeError("VM session has no provider")
+    return await compute_vm.vm_conn_for_provider(s, pod.provider_id)
+
+
+async def _create_vm_session(pod_id: str) -> None:
+    """Bootstrap + launch JupyterLab on the VM, then publish the proxy URL.
+
+    Everything slow (uv venv, `uv pip install jupyterlab`) happens inside the
+    single SSH exec in `compute_vm.provision_sync`, so the row just sits in
+    `creating` until the server answers through the tunnel."""
+    from . import compute_vm
+
+    async with session_factory()() as s:
+        pod = await s.get(ComputePod, pod_id)
+        if pod is None or pod.status != "creating":
+            return
+        conn = await _vm_conn_for_pod(s, pod)
+        # Fail fast on a provider that can't carry the tunnel, before we install
+        # a venv on a box we'd never be able to reach.
+        compute_vm.require_tunnel_key(conn)
+        compute_vm.tunnel_jump(conn)
+        proxy_token = pod.proxy_token or secrets.token_hex(16)
+        jupyter_token = pod.jupyter_password or secrets.token_hex(16)
+        visible = pod.visible_devices
+        workdir = pod.vm_workdir
+        jupyter_version = pod.vm_jupyter_version
+        pod.proxy_token = proxy_token
+        pod.jupyter_password = jupyter_token
+        # Record the box's SSH coords so the list/detail views and the idle
+        # sweep have somewhere to point (there's no cloud API to ask).
+        pod.public_ip = conn["host"]
+        pod.ssh_port = int(conn["port"])
+        pod.ssh_user = conn["user"]
+        await s.commit()
+
+    base = compute_vm.base_path(pod_id, proxy_token)
+    try:
+        launched = await asyncio.to_thread(
+            compute_vm.provision_sync, conn,
+            pod_id=pod_id, workdir=workdir, visible_devices=visible,
+            base=base, jupyter_token=jupyter_token,
+            jupyter_version=jupyter_version,
+        )
+    except RuntimeError as e:
+        # Bootstrap/launch failures already carry the remote log tail — surface
+        # it verbatim rather than wrapping it in "provisioner crashed".
+        await _mark_failed(pod_id, str(e))
+        return
+    local_port = await asyncio.to_thread(
+        compute_vm.ensure_forward_sync, conn, launched["vm_port"]
+    )
+    ready = await compute_vm.wait_ready(local_port, base)
+    if not ready:
+        tail = await asyncio.to_thread(compute_vm.read_log_sync, conn, pod_id)
+        await _mark_failed(
+            pod_id,
+            "JupyterLab did not come up on the VM within "
+            f"{compute_vm.READY_TIMEOUT_S}s.\n\n{tail.strip()[-2000:]}",
+        )
+        # Don't leave a half-started server holding GPUs on a shared box.
+        try:
+            await asyncio.to_thread(compute_vm.teardown_sync, conn, pod_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("compute %s: cleanup after failed start failed", pod_id, exc_info=True)
+        return
+
+    now = datetime.now(timezone.utc)
+    async with session_factory()() as s:
+        row = await s.get(ComputePod, pod_id)
+        if row is None or row.status != "creating":
+            # Raced with a delete: the terminate task ran while we were still
+            # installing, so it found no pidfile and left the server we've just
+            # started running. Reap it here.
+            logger.info("compute %s: deleted mid-provision — reaping the server", pod_id)
+            try:
+                await asyncio.to_thread(compute_vm.teardown_sync, conn, pod_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("compute %s: mid-provision reap failed", pod_id, exc_info=True)
+            compute_vm.close_forward(conn, launched["vm_port"])
+            return
+        row.vm_port = int(launched["vm_port"])
+        row.vm_pid = int(launched["vm_pid"]) or None
+        row.vm_workdir = launched["workdir"]
+        # No `?token=` — the proxy injects Jupyter's token upstream on every
+        # request (compute_proxy._upstream_headers), so the path's proxy_token
+        # is the single capability and the notebook token never reaches the
+        # browser's URL bar or history.
+        row.jupyter_url_override = base
+        row.status = "running"
+        row.ready_at = now
+        row.last_active_at = now
+        await s.commit()
+    logger.info(
+        "compute %s: VM JupyterLab up (host=%s vm_port=%s devices=%s)",
+        pod_id, conn["host"], launched["vm_port"], visible or "all",
+    )
+
+
+async def _terminate_vm_session(pod_id: str) -> None:
+    """Kill the session's jupyter process group and drop the forward tunnel.
+    Notebooks in the workdir are left in place."""
+    from . import compute_proxy, compute_vm
+
+    compute_proxy.invalidate(pod_id)
+    async with session_factory()() as s:
+        pod = await s.get(ComputePod, pod_id)
+        if pod is None:
+            return
+        vm_port = pod.vm_port
+        try:
+            conn = await _vm_conn_for_pod(s, pod)
+        except Exception as e:  # noqa: BLE001 — provider deleted / creds gone
+            logger.warning("compute %s: VM teardown skipped — %s", pod_id, e)
+            return
+    try:
+        # purge=True: an explicit terminate reclaims the uv venv (~300 MB each,
+        # one per session on a shared box). Notebooks in the workdir survive —
+        # the confirm dialog states both.
+        await asyncio.to_thread(compute_vm.teardown_sync, conn, pod_id, True)
+    except Exception:
+        # Leave vm_port set so the startup sweep retries — an un-reaped jupyter
+        # holds GPU memory on the box with nothing in the UI to show for it.
+        logger.exception("compute %s: VM teardown failed (will retry at startup)", pod_id)
+        return
+    compute_vm.close_forward(conn, vm_port)
+    # Clear the launch markers: their presence on a terminal row is exactly what
+    # `cleanup_orphaned_running` treats as "teardown never finished".
+    async with session_factory()() as s:
+        row = await s.get(ComputePod, pod_id)
+        if row is not None and row.status != "running":
+            row.vm_port = None
+            row.vm_pid = None
+            await s.commit()
+    logger.info("compute %s: VM session torn down on %s", pod_id, conn["host"])
+
+
 # ---------- Idle auto-terminate ----------------------------------------
 #
 # A pod with idle_terminate_after_s > 0 is torn down once it has shown no GPU
@@ -1296,6 +1460,7 @@ async def _resolve_pod_private_key(s: AsyncSession, pod: ComputePod) -> Optional
 async def _fetch_pod_busy(pod_id: str) -> Optional[bool]:
     """SSH into the pod, read nvidia-smi. True=busy, False=idle, None=can't tell
     (unreachable / unparseable → caller treats as active, fail-safe)."""
+    only: Optional[set[int]] = None
     async with session_factory()() as s:
         pod = await s.get(ComputePod, pod_id)
         if (
@@ -1303,13 +1468,27 @@ async def _fetch_pod_busy(pod_id: str) -> Optional[bool]:
             or not pod.public_ip or not pod.ssh_port
         ):
             return None
-        host, port, user = pod.public_ip, pod.ssh_port, pod.ssh_user
-        key = await _resolve_pod_private_key(s, pod)
-    if not key:
-        logger.info("compute %s: idle-probe no SSH key resolved -> treat as active", pod_id)
-        return None
+        if pod.kind == "vm":
+            # A VM box is SHARED — probe only the GPUs this session pinned, else
+            # a neighbour's job keeps it alive forever (or, worse, an idle
+            # session looks busy and is never reclaimed).
+            try:
+                conn = await _vm_conn_for_pod(s, pod)
+            except Exception as e:  # noqa: BLE001
+                logger.info("compute %s: idle-probe conn resolve failed (%s)", pod_id, e)
+                return None
+            if pod.visible_devices:
+                only = {int(x) for x in pod.visible_devices.split(",") if x.strip().isdigit()}
+        else:
+            conn = None
+            host, port, user = pod.public_ip, pod.ssh_port, pod.ssh_user
+            key = await _resolve_pod_private_key(s, pod)
+            if not key:
+                logger.info("compute %s: idle-probe no SSH key resolved -> treat as active", pod_id)
+                return None
+            conn = {"host": host, "port": port, "user": user, "private_key": key}
     try:
-        res = await vm_probe.availability_vm(host, port, user, key)
+        res = await vm_probe.availability_vm(**conn)
     except Exception as e:
         logger.warning("compute %s: nvidia-smi probe crashed: %s", pod_id, e)
         return None
@@ -1319,9 +1498,13 @@ async def _fetch_pod_busy(pod_id: str) -> Optional[bool]:
             pod_id, res.ok, res.message, len(res.gpus),
         )
         return None
+    gpus = [g for g in res.gpus if only is None or g.index in only]
+    if not gpus:
+        logger.info("compute %s: idle-probe matched no pinned GPU -> treat as active", pod_id)
+        return None
     busy = False
     detail = []
-    for g in res.gpus:
+    for g in gpus:
         mem_used_mib = g.mem_total_mib - g.mem_free_mib
         detail.append(f"gpu{g.index} util={g.util_pct}% mem_used={mem_used_mib}MiB")
         if g.util_pct > _IDLE_UTIL_PCT or mem_used_mib > _IDLE_MEM_MIB:
@@ -1351,7 +1534,9 @@ async def _idle_terminate(pod_id: str) -> None:
         await s.commit()
 
     kind = await _resolve_pod_kind(pod_id)
-    if runpod_id:
+    if kind == "vm":
+        asyncio.create_task(_terminate_vm_session(pod_id))
+    elif runpod_id:
         if kind == "pi":
             asyncio.create_task(_delete_pi(runpod_id, provider_id=pod_provider_id))
         else:
@@ -1464,7 +1649,15 @@ async def cleanup_orphaned_running() -> int:
 
     failed_ids: list[str] = []
     for row in all_rows:
-        if row.runpod_pod_id:
+        if row.kind == "vm":
+            # A VM session's provisioner is a plain SSH call — there's no
+            # upstream to resume against, and re-running the bootstrap would
+            # race the (possibly still-live) jupyter the dead process started.
+            # Mark it failed and reap anything it did launch.
+            failed_ids.append(row.id)
+            if row.vm_pid or row.vm_port:
+                asyncio.create_task(_terminate_vm_session(row.id))
+        elif row.runpod_pod_id:
             # Has an upstream id — resume polling on the new event loop.
             asyncio.create_task(_safe_create(row.id))
             resumed += 1
@@ -1475,6 +1668,29 @@ async def cleanup_orphaned_running() -> int:
         else:
             failed_ids.append(row.id)
 
+    # Retry teardowns that never finished. `delete_compute` schedules the VM
+    # teardown as a fire-and-forget task, so a gateway restart (or a deploy)
+    # landing right after a delete kills it mid-SSH and leaves a jupyter running
+    # on the box — invisible in the UI and holding whatever GPU memory the
+    # user's kernels had. A terminal row that still carries vm_port is exactly
+    # that case; a successful teardown clears the markers.
+    async with session_factory()() as s:
+        stale = (
+            await s.execute(
+                select(ComputePod).where(
+                    ComputePod.kind == "vm",
+                    ComputePod.status.in_(
+                        ["terminated", "auto_terminated", "failed", "rejected"]
+                    ),
+                    ComputePod.vm_port.is_not(None),
+                )
+            )
+        ).scalars().all()
+        stale_ids = [r.id for r in stale]
+    for sid in stale_ids:
+        logger.info("compute %s: retrying VM teardown orphaned by a restart", sid)
+        asyncio.create_task(_terminate_vm_session(sid))
+
     if failed_ids:
         async with session_factory()() as s:
             await s.execute(
@@ -1482,7 +1698,7 @@ async def cleanup_orphaned_running() -> int:
                 .where(ComputePod.id.in_(failed_ids))
                 .values(
                     status="failed",
-                    error_text="orphaned by gateway restart before upstream create completed",
+                    error_text="orphaned by gateway restart while still provisioning",
                     terminated_at=datetime.now(timezone.utc),
                 )
             )
@@ -1515,8 +1731,17 @@ class CreateComputeRequest(BaseModel):
     # billing "forever".
     idle_terminate_after_s: int = Field(default=0, ge=0, le=86400)
     # NULL = use the gateway-wide RUNPOD_API_KEY env var. When set, must
-    # refer to a kind=runpod or kind=pi Provider row.
+    # refer to a kind=runpod, kind=pi or kind=vm Provider row.
     provider_id: Optional[str] = None
+
+    # ---- kind=vm only ----
+    # CUDA_VISIBLE_DEVICES for the JupyterLab process, e.g. "0,1". Blank/None =
+    # don't set it (the session sees every GPU on the box).
+    visible_devices: Optional[str] = Field(default=None, max_length=128)
+    # Notebook root on the VM. Blank → ~/.sgpu/compute/{pod_id}/work.
+    workdir: Optional[str] = Field(default=None, max_length=512)
+    # Pin JupyterLab, e.g. "4.2.5". Blank → whatever uv resolves as latest.
+    jupyter_version: Optional[str] = Field(default=None, max_length=64)
 
 
 class ComputeRecord(BaseModel):
@@ -1548,6 +1773,12 @@ class ComputeRecord(BaseModel):
     terminated_at: Optional[str] = None
     idle_terminate_after_s: int = 0
     last_active_at: Optional[str] = None
+    # runpod | pi | vm. VM sessions have no cost, no image and no downloadable
+    # key — the UI branches on this.
+    kind: str = "runpod"
+    visible_devices: Optional[str] = None
+    workdir: Optional[str] = None
+    jupyter_version: Optional[str] = None
 
 
 class SshInfoResponse(BaseModel):
@@ -1596,7 +1827,15 @@ def _to_record(p: ComputePod, owner_username: str) -> ComputeRecord:
     # same token, just exposed separately for advanced uses (e.g. reusing in
     # a different client). The UI hides the password field by default.
     if p.jupyter_url_override:
+        # VM sessions store a gateway-RELATIVE path (`/compute/jupyter/…`) — the
+        # gateway can't know the origin a browser reaches it on. Absolutize it
+        # when GATEWAY_PUBLIC_URL is configured, else hand the path to the web
+        # app, which prefixes NEXT_PUBLIC_GATEWAY_URL.
         jurl = p.jupyter_url_override
+        if jurl.startswith("/"):
+            base = os.environ.get("GATEWAY_PUBLIC_URL", "").strip().rstrip("/")
+            if base:
+                jurl = base + jurl
     elif p.runpod_pod_id:
         jurl = _jupyter_url(p.runpod_pod_id, p.jupyter_password)
     else:
@@ -1629,6 +1868,10 @@ def _to_record(p: ComputePod, owner_username: str) -> ComputeRecord:
         terminated_at=p.terminated_at.isoformat() if p.terminated_at else None,
         idle_terminate_after_s=p.idle_terminate_after_s or 0,
         last_active_at=p.last_active_at.isoformat() if p.last_active_at else None,
+        kind=p.kind or "runpod",
+        visible_devices=p.visible_devices,
+        workdir=p.vm_workdir,
+        jupyter_version=p.vm_jupyter_version,
     )
 
 
@@ -2014,35 +2257,63 @@ async def create_compute(
     user: User = Depends(require_section("compute")),
     session: AsyncSession = Depends(get_session),
 ):
-    # Compute pods are cloud-only (runpod/pi — there is no vm kind here), so the
-    # whole feature is refused when cloud providers are disabled (CAE/CCE).
-    if cloud_providers_disabled():
-        raise HTTPException(
-            status_code=403,
-            detail={"error": "cloud GPU providers (RunPod / Prime Intellect) are disabled on this deployment"},
-        )
-
     # Dispatch on provider kind. NULL provider_id = legacy RunPod env path.
     kind = "runpod"
+    prov = None
     if body.provider_id:
         from .db import Provider
         prov = await session.get(Provider, body.provider_id)
         if prov is None:
             raise HTTPException(status_code=400, detail={"error": "unknown provider_id"})
-        if prov.kind not in ("runpod", "pi"):
+        if prov.kind not in ("runpod", "pi", "vm"):
             raise HTTPException(
                 status_code=400,
-                detail={"error": f"provider {body.provider_id} is kind={prov.kind}, compute requires runpod or pi"},
+                detail={"error": f"provider {body.provider_id} is kind={prov.kind}, compute requires runpod, pi or vm"},
             )
         kind = prov.kind
-    elif not os.environ.get("RUNPOD_API_KEY", "").strip():
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "no RunPod credentials — register a provider or set RUNPOD_API_KEY"},
-        )
+
+    # Cloud pods (runpod/pi) are refused when cloud providers are disabled
+    # (CAE/CCE). A VM session touches no cloud API, so it stays available.
+    if kind != "vm":
+        if cloud_providers_disabled():
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "cloud GPU providers (RunPod / Prime Intellect) are disabled on this deployment"},
+            )
+        if not body.provider_id and not os.environ.get("RUNPOD_API_KEY", "").strip():
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "no RunPod credentials — register a provider or set RUNPOD_API_KEY"},
+            )
 
     # Resolve the image + template_id we'll persist on the row.
-    if kind == "pi":
+    if kind == "vm":
+        from . import compute_vm
+        from .pathsafe import validate_path_field
+
+        try:
+            visible_devices = compute_vm.validate_visible_devices(body.visible_devices)
+            jupyter_version = compute_vm.validate_jupyter_version(body.jupyter_version)
+            # workdir is interpolated into a remote `bash -lc` (quoted, but the
+            # house rule is to validate at ingress too — see pathsafe.py).
+            validate_path_field(body.workdir, "workdir")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail={"error": str(e)}) from e
+        cfg = prov.config or {}
+        # No image/template/disk on a VM — the box is what it is. Describe the
+        # hardware from the provider's last probe so the list view isn't blank.
+        probed = [g for g in (cfg.get("gpus") or []) if isinstance(g, str)]
+        image_resolved = "jupyterlab (uv venv)"
+        template_id_resolved = None
+        gpu_type = (probed[0] if probed else "") or "VM"
+        gpu_count = (
+            len(visible_devices.split(",")) if visible_devices
+            else int(cfg.get("gpu_count") or 0) or 1
+        )
+    elif kind == "pi":
+        visible_devices = None
+        jupyter_version = None
+        gpu_type, gpu_count = body.gpu_type, body.gpu_count
         pi_img = _resolve_pi_image(body.template_id)
         if pi_img is None:
             raise HTTPException(
@@ -2055,6 +2326,9 @@ async def create_compute(
         image_resolved = pi_img["id"]
         template_id_resolved = pi_img["id"]
     else:
+        visible_devices = None
+        jupyter_version = None
+        gpu_type, gpu_count = body.gpu_type, body.gpu_count
         curated = _resolve_template(body.template_id)
         if curated is not None:
             image_resolved = curated["image"]
@@ -2081,10 +2355,10 @@ async def create_compute(
     row = ComputePod(
         id=pod_id,
         name=body.name.strip(),
-        gpu_type=body.gpu_type,
-        gpu_count=body.gpu_count,
-        container_disk_gb=body.container_disk_gb,
-        volume_gb=body.volume_gb,
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+        container_disk_gb=0 if kind == "vm" else body.container_disk_gb,
+        volume_gb=0 if kind == "vm" else body.volume_gb,
         image=image_resolved,
         template_id=template_id_resolved,
         cloud_type=body.cloud_type,
@@ -2093,6 +2367,13 @@ async def create_compute(
         idle_terminate_after_s=body.idle_terminate_after_s,
         owner_id=user.id,
         provider_id=body.provider_id,
+        kind=kind,
+        visible_devices=visible_devices,
+        vm_workdir=((body.workdir or "").strip() or None) if kind == "vm" else None,
+        vm_jupyter_version=jupyter_version if kind == "vm" else None,
+        # Minted up front so the approval path doesn't have to.
+        proxy_token=secrets.token_hex(16) if kind == "vm" else None,
+        jupyter_password=secrets.token_hex(16) if kind == "vm" else None,
     )
     session.add(row)
     await session.commit()
@@ -2105,9 +2386,10 @@ async def create_compute(
         "compute.request" if needs_approval else "compute.create",
         "compute", pod_id, body.name.strip(),
         details={
-            "gpu_type": body.gpu_type, "gpu_count": body.gpu_count,
+            "gpu_type": gpu_type, "gpu_count": gpu_count,
             "template_id": template_id_resolved, "cloud_type": body.cloud_type,
             "provider_kind": kind,
+            **({"visible_devices": visible_devices or "all"} if kind == "vm" else {}),
         },
     )
 
@@ -2116,12 +2398,17 @@ async def create_compute(
 
 
 async def _resolve_pod_kind(pod_id: str) -> str:
-    """Look up the provider kind for a compute pod row. NULL provider → runpod
-    (legacy env-key path)."""
+    """The pod's provider kind. Prefers the denormalized `kind` column (set at
+    create time, survives a provider deletion) and falls back to the provider
+    row for pods created before that column existed."""
     from .db import Provider
     async with session_factory()() as s:
         row = await s.get(ComputePod, pod_id)
-        if row is None or not row.provider_id:
+        if row is None:
+            return "runpod"
+        if row.kind in ("runpod", "pi", "vm"):
+            return row.kind
+        if not row.provider_id:
             return "runpod"
         prov = await s.get(Provider, row.provider_id)
         return prov.kind if prov is not None else "runpod"
@@ -2130,7 +2417,9 @@ async def _resolve_pod_kind(pod_id: str) -> str:
 async def _safe_create(pod_id: str) -> None:
     try:
         kind = await _resolve_pod_kind(pod_id)
-        if kind == "pi":
+        if kind == "vm":
+            await _create_vm_session(pod_id)
+        elif kind == "pi":
             await _create_pi_pod(pod_id)
         else:
             await _create_pod(pod_id)
@@ -2198,6 +2487,19 @@ async def get_ssh_info(
         raise HTTPException(status_code=404, detail={"error": "compute pod not found"})
     if not user.is_admin and p.owner_id != user.id:
         raise HTTPException(status_code=403, detail={"error": "forbidden"})
+    if p.kind == "vm":
+        # The "key" for a VM session is the PROVIDER's key — a box-wide
+        # credential (often root on a shared GPU machine). Handing it to
+        # whoever was approved for a notebook would be a privilege escalation,
+        # so VM sessions are JupyterLab-only.
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "VM sessions don't expose SSH — the provider's key is a "
+                         "box-wide credential. Use JupyterLab (it has a terminal), "
+                         "or ask an admin for box access."
+            },
+        )
     if p.status != "running" or not p.public_ip or not p.ssh_port:
         raise HTTPException(
             status_code=409,
@@ -2251,14 +2553,18 @@ async def delete_compute(
     await session.commit()
 
     # Dispatch teardown by provider kind. NULL provider_id → legacy env-RunPod.
-    pod_kind = "runpod"
-    if pod_provider_id:
+    pod_kind = p.kind if p.kind in ("runpod", "pi", "vm") else "runpod"
+    if pod_kind == "runpod" and pod_provider_id:
         from .db import Provider
         prov = await session.get(Provider, pod_provider_id)
         if prov is not None:
             pod_kind = prov.kind
 
-    if runpod_id:
+    if pod_kind == "vm":
+        # Kills the jupyter process group + drops the forward tunnel. The box
+        # itself (and the notebooks in the workdir) stays.
+        asyncio.create_task(_terminate_vm_session(pod_id))
+    elif runpod_id:
         # Fire-and-forget — gateway shouldn't block on the upstream API.
         if pod_kind == "pi":
             asyncio.create_task(_delete_pi(runpod_id, provider_id=pod_provider_id))

@@ -1020,6 +1020,34 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP WITH TIME ZONE"
         ))
+        # VM-backed Compute sessions (uv venv + JupyterLab on a kind=vm provider,
+        # reverse-proxied by the gateway — see compute_vm.py / compute_proxy.py).
+        # `kind` is denormalized from the provider so teardown still dispatches
+        # correctly after a provider row is deleted.
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'runpod'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS visible_devices VARCHAR(128)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS vm_port INTEGER"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS vm_pid INTEGER"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS vm_workdir VARCHAR(512)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS vm_jupyter_version VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS vm_venv_path VARCHAR(512)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE compute_pods ADD COLUMN IF NOT EXISTS proxy_token VARCHAR(64)"
+        ))
         # GitHub SSO: column for linking platform accounts to GitHub user IDs.
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS github_id VARCHAR(64)"

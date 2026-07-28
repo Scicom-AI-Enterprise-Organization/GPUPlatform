@@ -58,6 +58,46 @@ def _pick_gpu() -> str | None:
     return best if (best is not None and best_free > 5000) else None
 
 
+def ensure_hf_token_usable(log_fn=None) -> bool:
+    """Neutralize a STALE stored HF token for this process. Returns True if the hub
+    is usable (no token, or a token that whoami() accepts).
+
+    A leftover `~/.cache/huggingface/token` — e.g. an expired `hf_oauth_…` JWT from
+    someone's `hf auth login` on a shared box — is attached to EVERY hub request, so
+    even PUBLIC repos come back 401 and transformers reports them as
+    `<repo> is not a local folder and is not a valid model identifier listed on …`.
+    That's exactly how NeuCodec's `facebook/w2v-bert-2.0` fetch died on tm-2 while
+    the repo was both public AND already in the box's cache.
+
+    So: if a token is present but rejected, flip huggingface_hub's implicit-token off
+    for the rest of the process (the constant is read per-call in `build_hf_headers`,
+    so patching the live module works) → public repos resolve anonymously. Nothing is
+    lost: a rejected token couldn't have opened a private repo either."""
+    say = log_fn or log
+    try:
+        from huggingface_hub import HfApi, constants
+        from huggingface_hub.utils import get_token
+    except Exception:  # noqa: BLE001 — hub not installed / old layout: nothing to guard
+        return True
+    try:
+        token = get_token()
+    except Exception:  # noqa: BLE001
+        return True
+    if not token:
+        return True
+    try:
+        HfApi().whoami(token=token)
+        return True
+    except Exception as e:  # noqa: BLE001
+        say(f"stored HF token rejected ({str(e)[:120]}) — continuing anonymously "
+            f"(a stale ~/.cache/huggingface/token 401s even public repos)")
+    constants.HF_HUB_DISABLE_IMPLICIT_TOKEN = True
+    os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    os.environ.pop("HF_TOKEN", None)
+    os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+    return False
+
+
 def _download_model(cfg: dict) -> str:
     import boto3
     from botocore.client import Config as BotoConfig
@@ -126,6 +166,8 @@ def main() -> int:
         os.environ["CUDA_VISIBLE_DEVICES"] = sel; want_cuda = True
     else:
         g = _pick_gpu(); os.environ["CUDA_VISIBLE_DEVICES"] = g if g is not None else ""; want_cuda = g is not None
+
+    ensure_hf_token_usable()  # NeuCodec pulls public HF repos — a stale token 401s them
 
     import soundfile as sf
     import torch

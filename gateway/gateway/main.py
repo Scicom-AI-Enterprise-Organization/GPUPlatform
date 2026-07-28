@@ -44,6 +44,7 @@ from .db import ApiKey, App, AuditLog, PolicyRole, Request as ReqRow, StressRun,
 from . import audit as audit_module
 from . import bench as bench_module
 from . import compute as compute_module
+from . import compute_proxy as compute_proxy_module
 from . import providers_api as providers_module
 from . import storage_api as storage_module
 from . import datasets_api as datasets_module
@@ -584,9 +585,15 @@ async def leader_workload(app: FastAPI) -> list[asyncio.Task]:
             logger.exception("compute: orphan reconcile failed")
         await compute_module.compute_idle_loop()
 
-    if os.environ.get("RUNPOD_API_KEY", "").strip():
-        tasks.append(asyncio.create_task(_compute_subsystem(), name="compute_idle"))
-        logger.info("compute enabled")
+    # Unconditional: the RUNPOD_API_KEY gate was from when Compute was env-key-only.
+    # Pods now come from registered providers — including **kind=vm sessions, which
+    # need no cloud key at all** — so gating here meant a VM-only (or CAE/CCE
+    # cloud-disabled) deployment silently ran neither the idle auto-terminate loop
+    # nor the orphan reconcile, while the UI still offered "stop after idle". Both
+    # are cheap: the reconcile runs once, and the sweep only queries rows that
+    # actually set a timeout.
+    tasks.append(asyncio.create_task(_compute_subsystem(), name="compute_idle"))
+    logger.info("compute enabled")
 
     async def _training_subsystem():
         try:
@@ -860,6 +867,10 @@ async def lifespan(app: FastAPI):
                 await proxy_http.aclose()
             except Exception:
                 pass
+        try:
+            await compute_proxy_module.aclose()
+        except Exception:  # noqa: BLE001
+            pass
         if app.state.provider:
             await app.state.provider.shutdown()
         # Flush any queued stats before the engine is disposed.
@@ -884,6 +895,10 @@ app = FastAPI(
 )
 app.include_router(bench_module.router)
 app.include_router(compute_module.router)
+# JupyterLab reverse proxy for VM Compute sessions. Auth is the per-session
+# capability token in the path (a browser can't send a Bearer header on a link
+# click, and WebSockets can't go through Next's /api/proxy) — see compute_proxy.
+app.include_router(compute_proxy_module.router)
 app.include_router(providers_module.router)
 app.include_router(storage_module.router)
 app.include_router(datasets_module.router)

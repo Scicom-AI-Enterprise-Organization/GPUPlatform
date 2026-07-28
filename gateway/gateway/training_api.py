@@ -1432,11 +1432,17 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
 
     # Pick the text source: a separate test dataset → else the main dataset's
     # held-out test split → else a random sample of the train split (or flat root).
+    # `fallback_uri` is the train split, scanned by the exporter to TOP UP when the
+    # test split holds fewer clips than requested (it's only eval_test_per_speaker
+    # per speaker, packed at pack time — e.g. 20 while the export asks for 25).
+    fallback_uri = ""
     if test_ds is not None and test_ds.s3_metadata_uri:
         base = test_ds.s3_metadata_uri.rstrip("/")
         tsp = _tts_pack_splits(test_ds)
         packed_uri = f"{base}/test" if "test" in tsp else base
         is_random, source_desc = False, "test dataset"
+        if "test" in tsp and "train" in tsp:
+            fallback_uri = f"{base}/train"
     else:
         base = (main_ds.s3_metadata_uri or "").rstrip("/") if main_ds else ""
         if not base:
@@ -1445,6 +1451,8 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
         msp = _tts_pack_splits(main_ds)
         if "test" in msp:
             packed_uri, is_random, source_desc = f"{base}/test", False, "held-out test split"
+            if "train" in msp:
+                fallback_uri = f"{base}/train"
         elif "train" in msp:
             packed_uri, is_random, source_desc = f"{base}/train", True, "random train sample"
         else:
@@ -1567,7 +1575,7 @@ async def _create_label_project_for_run(run_id: str, cfg: dict, result: dict, re
         manifest = await asyncio.to_thread(
             _run_tts_label_export_ssh, *ssh, run_id, model_s3, creds, packed_uri, "",
             is_random, n, speaker, creds["bucket"], upload_prefix, dict(cfg), gpu_for_synth,
-            export_lines.append,
+            export_lines.append, fallback_uri,
         )
         items = manifest.get("items") or []
         if not items:
@@ -6956,7 +6964,8 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
                               run_id: str, model_s3: str, creds: dict, packed_uri: str,
                               split_subdir: str, is_random: bool, n_samples: int,
                               speaker: str, upload_bucket: str, upload_prefix: str,
-                              cfg: dict, gpu: str = "auto", line_sink=None) -> dict:
+                              cfg: dict, gpu: str = "auto", line_sink=None,
+                              fallback_uri: str = "") -> dict:
     """SSH to the run's VM, ship the whole tts/ dir, synthesize n_samples clips from
     the finetuned model + upload them to S3, and return the parsed @@LABEL manifest
     {bucket, items:[{key,text}], count}. Blocking — call via to_thread. The TTS
@@ -6979,6 +6988,10 @@ def _run_tts_label_export_ssh(host: str, port: int, user: str, key_filename: str
             "model_dir": f"{work_dir}/sgpu-tts-label/{run_id}/model",
             "packed_dir": f"{work_dir}/sgpu-tts-label/{run_id}/packed",
             "packed_uri": packed_uri, "split_subdir": split_subdir or "",
+            # Top-up source when packed_uri (a small held-out test split) can't fill
+            # n_samples — the exporter samples the shortfall from here.
+            "fallback_uri": fallback_uri or "",
+            "fallback_dir": f"{work_dir}/sgpu-tts-label/{run_id}/packed-fallback",
             "random": bool(is_random), "n_samples": int(n_samples), "seed": 42,
             "speaker": speaker or "", "gpu": gpu or "auto", "max_new_tokens": 1024,
             "upload_bucket": upload_bucket, "upload_prefix": upload_prefix,

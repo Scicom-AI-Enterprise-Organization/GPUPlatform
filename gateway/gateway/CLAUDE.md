@@ -67,6 +67,117 @@ its own `-R`. autossh subprocesses are detached (`start_new_session`) so they su
 it never kills a sibling provider's tunnel). Verified e2e on tm: both `-p 1023` and `-p 1024` reverse
 tunnels coexist, the `:1024` worker registers + serves.
 
+### Compute on a VM — uv venv + JupyterLab, proxied (`compute_vm.py` + `compute_proxy.py`)
+
+`/compute/new` takes a **`kind=vm` provider** alongside runpod/pi. There's no pod to
+provision: the gateway SSHes into the registered box, builds `~/.sgpu/compute/{pod_id}/venv`
+(`uv venv --seed --python 3.11` → `uv pip install jupyterlab ipywidgets`, both idempotent), and
+`setsid nohup`s `jupyter lab` on the VM's **loopback** on a free port. An optional
+`visible_devices` ("0,1") becomes `CUDA_VISIBLE_DEVICES` on that process — the box is shared,
+so an unpinned session sees every GPU. `compute_pods.kind` is denormalized from the provider so
+teardown still dispatches after a provider row is deleted.
+
+- **uv ONLY — never the box's python (user requirement).** There is no `python3 -m venv` / system
+  `pip` fallback: missing uv is installed on demand (`astral.sh/uv/install.sh` → `~/.local/bin`)
+  and a box where that fails is an error. Even the free-port probe runs on the *venv's* python,
+  so nothing in the flow invokes the system interpreter. Three details make this hold in practice:
+  1. **`uv venv --seed`** — a plain uv venv has NO pip, so `which pip` in the notebook terminal
+     falls through PATH to the box's `/usr/local/bin/pip` and a `pip install` silently writes into
+     the machine's default python. `--seed` also makes the `%pip` cell magic work.
+  2. **The terminal gets a generated rcfile** (`{rundir}/shellrc`, wired via
+     `--ServerApp.terminado_settings`): it sources `~/.bashrc` FIRST and re-asserts
+     `VIRTUAL_ENV`/`PATH` after, because terminado's default `bash -l` sources a box profile that
+     usually prepends conda and would shadow the venv. Prompt shows `(sgpu:{pod_id})`.
+  3. `VIRTUAL_ENV`/`PATH` are exported into the **server's** env too, so kernels inherit the venv
+     with no activation step.
+  Verified on tm-2: terminal `python`, `pip` and `sys.prefix` all resolve inside the session venv,
+  `uv` on PATH, and the box's own python (which already shipped jupyterlab, dated 2025-10-17) is
+  untouched.
+- **`jupyter_version` pins JupyterLab** (`jupyterlab=={ver}` in the install; blank = whatever uv
+  resolves). `compute_vm.validate_jupyter_version` accepts a **bare PEP 440 version only** —
+  `>=4,<5` is rejected because a specifier needs `<`/`>` on a remote command line and "which Lab
+  do I get" should have one answer. A pasted `==4.2.5` has its `==` stripped. ⚠ `BASE_PACKAGES[0]`
+  must stay `jupyterlab` — `_launch_script` swaps that first element for the pinned spec.
+  Verified e2e: `4.2.5` requested → `jupyterlab.__version__ == 4.2.5` in the session venv.
+- **The form's Run-on choice is in the URL** (`/compute/new?run_on=vm`), same `router.replace`
+  pattern as the benchmark form's `?tab=` — shareable, survives a refresh, and renders the
+  bare-metal shape server-side. The switch (not the selected provider) is the source of truth for
+  cloud-vs-VM, so the right form shape paints before `listProviders()` resolves; an effect
+  re-snaps the account when the target flips so a RunPod account can't stay selected under
+  "Bare metal" and 400 at create.
+
+- **Jupyter is launched with `--ServerApp.base_url=/compute/jupyter/{pod_id}/{proxy_token}/`,
+  identical to the gateway route serving it** — that's what makes `compute_proxy.py` a dumb
+  byte proxy with **zero** HTML/JSON rewriting. Change one, change the other.
+- **`--allow-root` is load-bearing.** Most GPU boxes SSH in as root and jupyter *refuses* to
+  start as root without it — it logs "Running as root is not recommended" and exits, which
+  looks exactly like a slow boot until the ready poll times out 5 min later. The launch script
+  now reports `ALIVE=0` + the log tail after 4s so that failure lands in `error_text` fast.
+- **Auth = the `proxy_token` in the path, and the routes are auth-exempt on purpose.** Gateway
+  auth is Bearer-header-only: a browser can't attach a header to a link click, and Next's
+  `/api/proxy` (which does the cookie→Bearer swap for the rest of the UI) **cannot proxy
+  WebSockets**, so kernels would never connect through it. Hence a 32-byte capability token
+  compared with `compare_digest` — **on every request, cache hit included** (caching authz by
+  pod id alone would make a guessed id enough).
+- **⚠ The GATEWAY authenticates to Jupyter, on both paths — `?token=` in the URL is NOT enough.**
+  Jupyter issues **no session cookie** for a `?token=` login (verified: the cookie jar comes back
+  empty), and JupyterLab's frontend only reaches the server because it replays the token from page
+  config as an `Authorization` header on *fetch* — which a **WebSocket cannot carry**. Result
+  before the fix: pages and `/api/*` worked while every kernel / terminal / `api/events/subscribe`
+  socket got `403 Couldn't authenticate WebSocket connection`, and Lab sat in a
+  "Connection lost, reconnecting in 60 seconds" loop. `_upstream_headers` now drops any
+  client-supplied `Authorization` and injects `token {jupyter_password}` itself, HTTP and WS
+  alike. Consequences worth keeping: the published URL carries **no** `?token=` (the path's
+  proxy_token is the single capability and the notebook token stays out of browser history), and
+  token-authenticated requests skip Jupyter's XSRF check so proxied POSTs need no `_xsrf`.
+  **A scripted WS test that passes `?token=` in the query will pass even when the browser is
+  fully broken** — that's what hid this; test the way a browser connects (no token, no cookie).
+- **`Host`/`Origin` are rewritten to the upstream's `127.0.0.1:{port}`** so jupyter's
+  same-origin check passes without `allow_origin='*'`. Response headers go back via
+  `multi_items()`→`raw_headers`, **not** a dict — jupyter emits multiple `Set-Cookie`s
+  (`_xsrf` + session) and a dict keeps only the last, silently breaking XSRF on POSTs.
+  The upstream path comes from `scope["raw_path"]` (the router's `path` param is already
+  percent-decoded, which mangles notebook filenames containing `?`/`#`).
+- **The tunnel is `vm_tunnel.ensure_forward`** (same autossh `-L` as proxy-mode endpoints),
+  re-ensured **lazily on each proxied request** — that's what heals it after a gateway restart
+  with no background loop. `ensure_forward` only gives autossh 15s to bind and the TM boxes
+  can take ~30s, so `_resolve` waits for the local listener (`_FORWARD_WAIT_S`) before caching;
+  otherwise the first request after a restart always 502s. Teardown closes **only this
+  session's** forward (`close_forwards(host, vm_port)`) — an unported `close_forwards(host)`
+  would reap the box's live inference tunnels.
+- **No SSH key is ever served for a VM session** (`GET /{id}/ssh` → 403): the "key" is the
+  *provider's* box-wide credential, usually root on a shared machine. JupyterLab's terminal is
+  the shell.
+- **Terminate purges the uv venv, keeps the notebooks — and both confirm dialogs say so.**
+  Reclaiming the venv matters (~300 MB per session, one per session on a shared box), but a
+  blanket `rm -rf {rundir}` would take the DEFAULT workdir (`{rundir}/work`) with it, so the
+  purge is scoped to `venv`/`shellrc`/`jupyter.log` + an `rmdir` (not `rm -rf`) that removes the
+  per-pod dir only when nothing is left in it. Failure/abort paths pass `purge=False` so a retry
+  reuses the venv. The kill is the recorded pgid, with a **pod-scoped `pkill -f {rundir}/`**
+  fallback for a lost pidfile — the rundir carries the pod id, so it can't match a neighbour's
+  server; never a bare `pkill jupyter`.
+- **Teardown is retried at startup.** `delete_compute` schedules the teardown as a fire-and-forget
+  task, so a restart/deploy landing right after a delete kills it mid-SSH and strands a jupyter on
+  the box — invisible in the UI, still holding kernel GPU memory. A terminal row that still has
+  `vm_port` set is exactly that state; `cleanup_orphaned_running` re-runs the teardown and a
+  successful one NULLs `vm_port`/`vm_pid`. (Hit this for real while testing: two sessions deleted
+  moments before a `pkill gateway` kept running.)
+- **⚠ The compute subsystem no longer requires `RUNPOD_API_KEY`.** It used to be
+  `if os.environ.get("RUNPOD_API_KEY")` in `main.lifespan` — a leftover from when Compute was
+  env-key-only. On a VM-only (or cloud-disabled) deployment that silently started **neither** the
+  idle auto-terminate loop nor the orphan reconcile, while the UI still offered "stop after idle".
+  Both loops are cheap; they now always start.
+- **Idle auto-terminate is scoped to the pinned GPUs** for VM rows, else a neighbour's job on
+  the box keeps every session alive forever. Unpinned sessions effectively never auto-stop
+  (fail-safe direction). Cost fields stay NULL — nothing is billed.
+- **Verified e2e on tm-2** (2026-07-28), simulating a browser (no `?token=`, no cookie, no
+  `Authorization`): `/lab` 200, all three sockets connect (`api/events/subscribe`,
+  `terminals/websocket/N`, `api/kernels/{id}/channels` with the
+  `v1.kernel.websocket.jupyter.org` subprotocol + binary frames), a real kernel executed code,
+  `CUDA_VISIBLE_DEVICES` confirmed as `0` and `1,2` inside the kernel, custom `/share/...`
+  workdir honoured, terminal resolved python/pip to the session venv, terminate left no jupyter
+  or kernel processes.
+
 ### Benchmarks (benchmaq) + the provider metrics page
 
 The **Benchmark** section (`web/.../benchmark/new/benchmark-form.tsx` → `POST /v1/benchmarks` in

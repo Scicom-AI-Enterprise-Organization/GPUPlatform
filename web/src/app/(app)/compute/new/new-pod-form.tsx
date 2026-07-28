@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
-import { Loader2 } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { Cpu, Loader2, Server } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,6 +18,7 @@ import { SearchableSelect } from "@/components/ui/searchable-select";
 import { AvailabilityBadge } from "@/components/availability-badge";
 import { RegionSelect } from "@/components/region-select";
 import { useGpuAvailability } from "@/lib/use-gpu-availability";
+import { shortGpu } from "@/lib/gpu-format";
 import { gateway } from "@/lib/gateway";
 import type {
   ComputeTemplate,
@@ -109,6 +110,8 @@ function capacityHint(vramPerGpu: number, count: number): string {
 
 export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [name, setName] = useState("dev-pod");
   const [gpuType, setGpuType] = useState<string>(RUNPOD_GPU_FALLBACK[0].id);
   const [runpodGpus, setRunpodGpus] = useState<GpuTypeOption[]>(RUNPOD_GPU_FALLBACK);
@@ -133,6 +136,24 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const [dataCenterId, setDataCenterId] = useState("");
   const [providerId, setProviderId] = useState<string>("");
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
+  // Where it runs. Drives which providers the picker offers and which of the
+  // cloud-only sections (hardware / template / region) render at all.
+  // `?run_on=` in the URL wins so the choice is shareable and survives a
+  // refresh — same pattern as the benchmark form's ?tab=.
+  const [target, setTargetState] = useState<"cloud" | "vm">(
+    searchParams.get("run_on") === "vm" ? "vm" : "cloud",
+  );
+  const setTarget = (next: "cloud" | "vm") => {
+    setTargetState(next);
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("run_on", next);
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+  };
+  // VM sessions only: pinned GPUs (CUDA_VISIBLE_DEVICES), notebook root, and
+  // the jupyterlab version to install into the session venv.
+  const [visibleDevices, setVisibleDevices] = useState("");
+  const [workdir, setWorkdir] = useState("");
+  const [jupyterVersion, setJupyterVersion] = useState("");
   const [piImages, setPiImages] = useState<PiImageOption[]>([]);
   const [piImagesError, setPiImagesError] = useState<string | null>(null);
   const [piImagesFiltered, setPiImagesFiltered] = useState<boolean>(false);
@@ -144,12 +165,6 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       .listProviders()
       .then((rows) => {
         setProviders(rows);
-        // No gateway-default key anymore — preselect the first registered
-        // cloud account so the form is usable without an extra click.
-        const eligible = rows.filter((p) => p.kind === "runpod" || p.kind === "pi");
-        if (eligible.length > 0) {
-          setProviderId((cur) => cur || eligible[0].id);
-        }
       })
       .catch(() => {});
     gateway
@@ -179,8 +194,42 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
     () => providers.find((p) => p.id === providerId) ?? null,
     [providers, providerId],
   );
-  const providerKind: "runpod" | "pi" = selectedProvider?.kind === "pi" ? "pi" : "runpod";
+  // The switch is the source of truth for cloud-vs-VM; the account picker only
+  // narrows which cloud (runpod vs pi). So `isVm` never depends on a provider
+  // being loaded yet — the form renders the right shape immediately.
+  const isVm = target === "vm";
+  // Which cloud the selected account is — also the GPU catalog / image picker
+  // to show. Meaningless (and unused) when the target is a VM.
+  const cloudKind: "runpod" | "pi" = selectedProvider?.kind === "pi" ? "pi" : "runpod";
+  const providerKind: "runpod" | "pi" | "vm" = isVm ? "vm" : cloudKind;
+  const eligibleProviders = useMemo(
+    () => providers.filter((p) => (isVm ? p.kind === "vm" : p.kind === "runpod" || p.kind === "pi")),
+    [providers, isVm],
+  );
   const gpuCatalog: GpuTypeOption[] = providerKind === "pi" ? piGpus : runpodGpus;
+  // "0,1" / "" — validated the same way the gateway does before we submit.
+  const devicesInvalid =
+    visibleDevices.trim() !== "" &&
+    !/^\d+(\s*,\s*\d+)*$/.test(visibleDevices.trim());
+  // Mirrors compute_vm.validate_jupyter_version: a bare PEP 440 version, not a
+  // specifier (a range would need shell metacharacters on the remote install).
+  const jupyterVersionInvalid =
+    jupyterVersion.trim() !== "" &&
+    !/^\d+(\.(\d+|\*))*([._-]?[A-Za-z0-9]+)*$/.test(jupyterVersion.trim().replace(/^=+/, ""));
+
+  // Keep the selected account valid for the current target: flipping the switch
+  // (or the provider list arriving) must never leave a RunPod account selected
+  // under "Bare metal", which would 400 at create time.
+  useEffect(() => {
+    if (eligibleProviders.length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setProviderId("");
+      return;
+    }
+    if (!eligibleProviders.some((p) => p.id === providerId)) {
+      setProviderId(eligibleProviders[0].id);
+    }
+  }, [eligibleProviders, providerId]);
 
   // Snap gpuType to the active catalog when provider kind changes (or when
   // catalogs first load) so we never send a RunPod-form name to PI's API.
@@ -251,9 +300,12 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
   const availability = useGpuAvailability(
     gpuType,
     gpuCount,
-    true,
+    // A VM has no capacity to check — its GPUs are whatever the box has.
+    !isVm,
     secureCloud ? "SECURE" : "COMMUNITY",
-    { kind: providerKind, id: providerId || null },
+    // Availability is a cloud-only concept, so this is always a cloud kind —
+    // the hook is disabled above when the target is a VM.
+    { kind: cloudKind, id: providerId || null },
   );
 
   const parsedDisk = Number.parseInt(containerDisk, 10);
@@ -275,14 +327,14 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       return;
     }
     if (!providerId) {
-      setSubmitError("Select a cloud account to bill against.");
+      setSubmitError(isVm ? "Select a machine." : "Select a cloud account to bill against.");
       return;
     }
-    if (diskInvalid) {
+    if (!isVm && diskInvalid) {
       setSubmitError("Container disk must be between 10 and 2000 GB.");
       return;
     }
-    if (volumeInvalid) {
+    if (!isVm && volumeInvalid) {
       setSubmitError("Volume must be between 0 and 2000 GB.");
       return;
     }
@@ -290,25 +342,40 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
       setSubmitError("Auto-terminate must be between 0 and 1440 minutes (0 = off).");
       return;
     }
+    if (isVm && devicesInvalid) {
+      setSubmitError("GPUs must be comma-separated indices (e.g. 0 or 0,1).");
+      return;
+    }
+    if (isVm && jupyterVersionInvalid) {
+      setSubmitError("JupyterLab version must be a plain version like 4.2.5 (blank = latest).");
+      return;
+    }
     setSubmitting(true);
     try {
       const pod = await gateway.createCompute({
         name: name.trim(),
-        gpu_type: gpuType,
-        gpu_count: gpuCount,
-        container_disk_gb: parsedDisk,
-        volume_gb: parsedVolume,
-        template_id: templateId,
-        image: imageOverride,
+        // A VM's GPU/disk/template fields are ignored server-side (the box is
+        // fixed) — send the defaults so the request body stays one shape.
+        gpu_type: isVm ? "VM" : gpuType,
+        gpu_count: isVm ? 1 : gpuCount,
+        container_disk_gb: isVm ? 40 : parsedDisk,
+        volume_gb: isVm ? 0 : parsedVolume,
+        template_id: isVm ? "" : templateId,
+        image: isVm ? null : imageOverride,
         cloud_type: secureCloud ? "SECURE" : "COMMUNITY",
         data_center_id: providerKind === "runpod" ? (dataCenterId || undefined) : undefined,
         idle_terminate_after_s: idleSeconds,
         provider_id: providerId,
+        visible_devices: isVm ? visibleDevices.trim() || null : null,
+        workdir: isVm ? workdir.trim() || null : null,
+        jupyter_version: isVm ? jupyterVersion.trim() || null : null,
       });
       toast.success(
         pod.status === "pending_approval"
           ? "Request submitted — an admin will review and approve."
-          : "Pod creating — provisioning takes a few minutes",
+          : isVm
+            ? "Session starting — installing JupyterLab on the machine"
+            : "Pod creating — provisioning takes a few minutes",
         { duration: 4000 },
       );
       router.push(`/compute/${pod.id}`);
@@ -322,7 +389,10 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
     <FormShell>
     <form onSubmit={onSubmit} className="space-y-6">
       {/* Section: identity */}
-      <Section title="Pod" description="A short name to remember this pod by.">
+      <Section
+        title={isVm ? "Session" : "Pod"}
+        description={`A short name to remember this ${isVm ? "session" : "pod"} by.`}
+      >
         <div className="space-y-1.5">
           <Label htmlFor="cmp-name" className="text-xs uppercase tracking-wide text-muted-foreground">Name</Label>
           <Input
@@ -336,39 +406,161 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         </div>
       </Section>
 
-      {/* Section: cloud account */}
+      {/* Section: where it runs. Same target switch as the serverless / benchmark
+          / quantization forms — cloud pod vs a registered VM. */}
       <Section
-        title="Cloud account"
-        description="Which registered cloud account (API key) to bill against."
+        title="Run on"
+        description="Default cloud spawns a fresh pod you pay for by the second. Bare metal runs a JupyterLab session on a VM you've registered under GPU Providers — no pod, no billing."
       >
-        <div className="space-y-1.5">
-          <Label className="text-xs uppercase tracking-wide text-muted-foreground">API key</Label>
-          <Select value={providerId} onValueChange={setProviderId}>
-            <SelectTrigger>
-              <SelectValue placeholder="Select a cloud account" />
-            </SelectTrigger>
-            <SelectContent>
-              {providers
-                .filter((p) => p.kind === "runpod" || p.kind === "pi")
-                .map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name}
-                    {" · "}
-                    {p.kind === "pi" ? "Prime Intellect" : "RunPod"}
-                    {p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""}
-                  </SelectItem>
-                ))}
-            </SelectContent>
-          </Select>
-          {providers.filter((p) => p.kind === "runpod" || p.kind === "pi").length === 0 && (
-            <p className="text-xs text-muted-foreground">
-              None registered. <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">Add a cloud account →</a>
-            </p>
-          )}
+        <div className="space-y-5">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setTarget("cloud")}
+              className={cn(
+                "flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
+                target === "cloud"
+                  ? "border-primary/60 bg-primary/5"
+                  : "border-border hover:border-primary/40 hover:bg-muted/40",
+              )}
+            >
+              <Cpu className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="font-medium">Default cloud (RunPod / PI)</div>
+                <div className="text-xs text-muted-foreground">
+                  Provision a fresh pod on demand. Pay-per-second.
+                </div>
+              </div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setTarget("vm")}
+              className={cn(
+                "flex items-start gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition-colors",
+                target === "vm"
+                  ? "border-primary/60 bg-primary/5"
+                  : "border-border hover:border-primary/40 hover:bg-muted/40",
+              )}
+            >
+              <Server className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="font-medium">Bare metal (VM)</div>
+                <div className="text-xs text-muted-foreground">
+                  JupyterLab on a registered VM. No spin-up cost.
+                </div>
+              </div>
+            </button>
+          </div>
+
+          <Field
+            label={isVm ? "Machine" : "Cloud account"}
+            hint={
+              isVm
+                ? "Which registered VM to run the session on. Hardware is fixed by the machine."
+                : "Which registered cloud account (API key) to bill against."
+            }
+          >
+            {eligibleProviders.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No {isVm ? "VM" : "cloud"} providers registered.{" "}
+                <a href="/providers/new" className="underline underline-offset-2 hover:text-foreground">
+                  Add one
+                </a>{" "}
+                under GPU Providers.
+              </p>
+            ) : (
+              <Select value={providerId} onValueChange={setProviderId}>
+                <SelectTrigger>
+                  <SelectValue placeholder={isVm ? "Choose a machine…" : "Choose a cloud account…"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {eligibleProviders.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}
+                      {p.kind === "vm"
+                        ? `${p.host ? ` · ${p.host}` : ""}${
+                            p.gpu_count ? ` · ${p.gpu_count} × ${shortGpu(p.gpus?.[0] ?? "GPU")}` : ""
+                          }`
+                        : `${p.kind === "pi" ? " · Prime Intellect" : " · RunPod"}${
+                            p.api_key_last4 ? ` · ****${p.api_key_last4}` : ""
+                          }`}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </Field>
         </div>
       </Section>
 
-      {/* Section: hardware */}
+      {/* Section: machine session (VM only) */}
+      {isVm && (
+        <Section
+          title="Session"
+          description="The box already exists, so there's no hardware to pick — only which GPUs this notebook may use."
+        >
+          <div className="space-y-5">
+            <Field
+              label="GPUs (CUDA_VISIBLE_DEVICES)"
+              hint={
+                visibleDevices.trim()
+                  ? `JupyterLab starts with CUDA_VISIBLE_DEVICES=${visibleDevices.trim().replace(/\s/g, "")} — torch sees only these, renumbered from 0.`
+                  : "Leave blank to see every GPU on the machine. On a shared box, pin the ones you were given."
+              }
+            >
+              <Input
+                value={visibleDevices}
+                onChange={(e) => setVisibleDevices(e.target.value)}
+                placeholder="0,1"
+                aria-invalid={devicesInvalid}
+                className="max-w-40 font-mono"
+              />
+              {devicesInvalid && (
+                <p className="mt-1.5 text-xs text-destructive">
+                  Comma-separated GPU indices only, e.g. <code>0</code> or <code>0,1</code>.
+                </p>
+              )}
+            </Field>
+
+            <Field
+              label="Working directory"
+              hint="Notebook root on the machine. Blank = ~/.sgpu/compute/{session}/work. Point it at shared storage (e.g. /share/me) to keep notebooks across sessions."
+            >
+              <Input
+                value={workdir}
+                onChange={(e) => setWorkdir(e.target.value)}
+                placeholder="~/.sgpu/compute/…/work"
+                className="font-mono"
+              />
+            </Field>
+
+            <Field
+              label="JupyterLab version"
+              hint={
+                jupyterVersion.trim()
+                  ? `Installs jupyterlab==${jupyterVersion.trim()} into the session's uv venv.`
+                  : "Blank = whatever uv resolves as latest. Pin it when an extension you rely on isn't ready for the newest Lab."
+              }
+            >
+              <Input
+                value={jupyterVersion}
+                onChange={(e) => setJupyterVersion(e.target.value)}
+                placeholder="latest"
+                aria-invalid={jupyterVersionInvalid}
+                className="max-w-40 font-mono"
+              />
+              {jupyterVersionInvalid && (
+                <p className="mt-1.5 text-xs text-destructive">
+                  Plain version only, e.g. <code>4.2.5</code> — not a range.
+                </p>
+              )}
+            </Field>
+          </div>
+        </Section>
+      )}
+
+      {/* Section: hardware — cloud only; a VM's hardware is already registered */}
+      {!isVm && (
       <Section title="Hardware" description="GPU type, count, and storage.">
         <div className="space-y-5">
           {/* Cloud tier first — it scopes which hosts (and therefore GPU
@@ -471,17 +663,24 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
           </div>
         </div>
       </Section>
+      )}
 
       {/* Section: auto-terminate */}
       <Section
         title="Auto-terminate"
-        description="Automatically delete this pod once it sits idle — no GPU compute and no GPU memory in use — for the given time. Stops a forgotten pod from billing indefinitely."
+        description={
+          isVm
+            ? "Automatically stop the session once its GPUs sit idle — no compute and no memory in use — for the given time. Frees the GPUs on a shared machine."
+            : "Automatically delete this pod once it sits idle — no GPU compute and no GPU memory in use — for the given time. Stops a forgotten pod from billing indefinitely."
+        }
       >
         <Field
-          label="Terminate after idle (minutes)"
+          label={isVm ? "Stop after idle (minutes)" : "Terminate after idle (minutes)"}
           hint={
             idleSeconds > 0
-              ? `Pod is deleted after ${parsedIdleMin} min with no GPU or memory activity. 0 = never.`
+              ? isVm
+                ? `JupyterLab is stopped after ${parsedIdleMin} min with no activity on the pinned GPUs. 0 = never.`
+                : `Pod is deleted after ${parsedIdleMin} min with no GPU or memory activity. 0 = never.`
               : "0 = never auto-terminate (delete manually when done)."
           }
         >
@@ -503,8 +702,9 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         </Field>
       </Section>
 
-      {/* Section: template / image */}
-      {providerKind === "pi" ? (
+      {/* Section: template / image — cloud only. A VM session is always the
+          same thing: a uv venv with jupyterlab in it. */}
+      {isVm ? null : providerKind === "pi" ? (
         <Section
           title="Image"
           description="Prime Intellect provides a fixed set of pre-baked images."
@@ -549,7 +749,7 @@ export function NewPodForm({ templates }: { templates: ComputeTemplate[] }) {
         </Button>
         <Button type="submit" disabled={submitting || !providerId}>
           {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
-          {submitting ? "Creating…" : "Create pod"}
+          {submitting ? "Creating…" : isVm ? "Start session" : "Create pod"}
         </Button>
       </FormFooter>
     </form>

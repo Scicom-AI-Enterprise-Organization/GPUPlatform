@@ -25,6 +25,7 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 import io
 import json
 import queue as _queue
+import sys
 import threading
 import time
 import urllib.request
@@ -127,6 +128,12 @@ def loop(items_device):
     """One GPU worker: prefetch+decode audio on threads, encode on the GPU."""
     items, device = items_device
     os.environ['CUDA_VISIBLE_DEVICES'] = str(device)
+
+    # A stale ~/.cache/huggingface/token 401s even the public neucodec /
+    # facebook/w2v-bert-2.0 repos — see tts_infer.ensure_hf_token_usable.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tts_infer import ensure_hf_token_usable
+    ensure_hf_token_usable(lambda m: print(f'[convert_neucodec] {m}', flush=True))
 
     from neucodec import NeuCodec
     import torch

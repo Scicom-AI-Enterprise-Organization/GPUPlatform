@@ -852,6 +852,15 @@ export type ComputePod = {
   // in use). 0 = disabled.
   idle_terminate_after_s: number;
   last_active_at: string | null;
+  // "vm" = a uv venv + JupyterLab on a registered bare-metal box, reverse-proxied
+  // by the gateway. No billing, no image, no downloadable SSH key.
+  kind: "runpod" | "pi" | "vm";
+  // kind=vm: CUDA_VISIBLE_DEVICES pinned at launch (null = all GPUs on the box).
+  visible_devices: string | null;
+  // kind=vm: notebook root on the VM.
+  workdir: string | null;
+  // kind=vm: pinned JupyterLab version (null = whatever uv resolved).
+  jupyter_version: string | null;
 };
 
 export type CreateComputeRequest = {
@@ -870,6 +879,12 @@ export type CreateComputeRequest = {
   // Auto-terminate after this many idle seconds. 0 = off (default).
   idle_terminate_after_s?: number;
   provider_id?: string | null;
+  // kind=vm only: GPUs to pin as CUDA_VISIBLE_DEVICES ("0,1"); blank = all.
+  visible_devices?: string | null;
+  // kind=vm only: notebook root on the VM; blank = ~/.sgpu/compute/{id}/work.
+  workdir?: string | null;
+  // kind=vm only: pin JupyterLab, e.g. "4.2.5". Blank = latest.
+  jupyter_version?: string | null;
 };
 
 export type RunpodTemplateSearchResult = {

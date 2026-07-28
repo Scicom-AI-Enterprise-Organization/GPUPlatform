@@ -253,6 +253,12 @@ def main():
         log("[eval] no eval methods selected; nothing to do")
         return
 
+    # A stale ~/.cache/huggingface/token 401s even public repos (NeuCodec's
+    # facebook/w2v-bert-2.0, the whisper ASR) — see tts_infer.ensure_hf_token_usable.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tts_infer import ensure_hf_token_usable
+    ensure_hf_token_usable(log)
+
     pairs = generate_pairs(a.model_dir, a.eval_dir, a.out_dir, a.max_samples)
     if not pairs:
         # Best-effort: training already succeeded — never emit @@ERROR (it would

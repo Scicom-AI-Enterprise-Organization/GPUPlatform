@@ -38,13 +38,14 @@ const STATUS_OPTIONS = [
 ] as const;
 type StatusFilter = (typeof STATUS_OPTIONS)[number];
 
-const PROVIDER_OPTIONS = ["all", "runpod", "pi"] as const;
+const PROVIDER_OPTIONS = ["all", "runpod", "pi", "vm"] as const;
 type ProviderFilter = (typeof PROVIDER_OPTIONS)[number];
 
 const PROVIDER_LABEL: Record<ProviderFilter, string> = {
   all: "All providers",
   runpod: "RunPod",
   pi: "Prime Intellect",
+  vm: "Machines (SSH)",
 };
 
 function searchableText(p: ComputePod): string {
@@ -113,12 +114,13 @@ export function ComputeList({ items }: { items: ComputePod[] }) {
     return items.filter((p) => {
       if (status !== "all" && p.status !== status) return false;
       if (providerFilter !== "all") {
-        // Resolve kind for the row; NULL provider_id = legacy RunPod env path.
-        const kind = p.provider_id
-          ? providerKindById.get(p.provider_id) ?? "runpod"
-          : "runpod";
-        if (providerFilter === "runpod" && kind !== "runpod") return false;
-        if (providerFilter === "pi" && kind !== "pi") return false;
+        // Trust the row's own kind (set at create time); fall back to the
+        // provider lookup for rows created before that column existed.
+        // NULL provider_id = legacy RunPod env path.
+        const kind =
+          p.kind ??
+          (p.provider_id ? providerKindById.get(p.provider_id) ?? "runpod" : "runpod");
+        if (providerFilter !== kind) return false;
       }
       if (tokens.length === 0) return true;
       const text = searchableText(p);
@@ -127,6 +129,13 @@ export function ComputeList({ items }: { items: ComputePod[] }) {
   }, [items, q, status, providerFilter, providerKindById]);
 
   const hasFilter = q.trim().length > 0 || status !== "all" || providerFilter !== "all";
+
+  // Bulk delete spans kinds, so the dialog only mentions the uv-purge when at
+  // least one machine session is in the selection.
+  const selectedHasVm = useMemo(
+    () => items.some((p) => selected.has(p.id) && p.kind === "vm"),
+    [items, selected],
+  );
 
   const onSingleDelete = async () => {
     if (!single) return;
@@ -358,6 +367,14 @@ export function ComputeList({ items }: { items: ComputePod[] }) {
             <DialogDescription>
               Terminates the RunPod instances and removes the records. Billing
               stops once the pod is fully torn down.
+              {selectedHasVm && (
+                <>
+                  {" "}
+                  For machine (SSH) sessions this stops JupyterLab and deletes the
+                  session&apos;s uv environment — anything pip-installed into it is gone.
+                  Files in the working directory are kept.
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -387,8 +404,19 @@ export function ComputeList({ items }: { items: ComputePod[] }) {
           <DialogHeader>
             <DialogTitle>Delete {single?.name}?</DialogTitle>
             <DialogDescription>
-              Terminates the RunPod instance and removes the record. Billing
-              stops once the pod is fully torn down.
+              {single?.kind === "vm" ? (
+                <>
+                  Stops JupyterLab (and its kernels) on the machine, freeing the GPUs,
+                  and deletes this session&apos;s uv environment — anything pip-installed
+                  into it is gone and a new session rebuilds it from scratch. Files in{" "}
+                  {single?.workdir ?? "the working directory"} are kept.
+                </>
+              ) : (
+                <>
+                  Terminates the RunPod instance and removes the record. Billing
+                  stops once the pod is fully torn down.
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
