@@ -18,13 +18,14 @@ import { gateway } from "@/lib/gateway";
 import type { PolicyRole, SectionKey } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-const SECTIONS: SectionKey[] = ["inference", "benchmark", "compute", "datasets", "quantization", "catalog"];
+const SECTIONS: SectionKey[] = ["inference", "benchmark", "compute", "datasets", "quantization", "catalog", "experiments"];
 const SECTION_LABEL: Record<SectionKey, string> = {
   inference: "Serverless Inference",
   benchmark: "Benchmark",
   compute: "Compute",
   datasets: "Datasets",
   quantization: "Quantization",
+  experiments: "Experiments",
   catalog: "Model catalog",
 };
 
@@ -254,6 +255,7 @@ function CreateRoleDialog({
     compute: false,
     datasets: false,
     quantization: false,
+    experiments: false,
     catalog: false,
   });
   const [pending, setPending] = useState(false);
@@ -266,7 +268,7 @@ function CreateRoleDialog({
     setName("");
     setId("");
     setIdTouched(false);
-    setSections({ inference: false, benchmark: false, compute: false, datasets: false, quantization: false, catalog: false });
+    setSections({ inference: false, benchmark: false, compute: false, datasets: false, quantization: false, catalog: false, experiments: false });
   };
 
   const submit = async (e: React.FormEvent) => {

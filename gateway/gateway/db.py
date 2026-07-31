@@ -709,6 +709,8 @@ async def init_db() -> None:
     from . import training_api  # noqa: F401
     from . import quantization_api  # noqa: F401  # registers QuantizationJob
     from . import proxy_api  # noqa: F401  # registers ProxyEndpoint / ProxyRequest
+    # registers EvalDataset / EvalCase / Experiment / ExperimentSample
+    from . import experiments_api  # noqa: F401
     # Explicit pool sizing — the SQLAlchemy async default (pool_size=5,
     # max_overflow=10 → 15 conns, pool_timeout=30s) is small; under load a burst
     # of concurrent requests exhausted it and every new checkout blocked 30s,
@@ -1159,6 +1161,12 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS messages_field VARCHAR(128)"
+        ))
+        # Custom evaluators gained an `api` mode, whose endpoint/parsing settings
+        # live in a JSON blob (expression + python modes keep using `code`).
+        await conn.execute(text(
+            "ALTER TABLE custom_evaluators ADD COLUMN IF NOT EXISTS "
+            "config JSON NOT NULL DEFAULT '{}'"
         ))
         # Worker lifecycle timeline: the calendar/analytics query is always
         # "events for app X between t0 and t1", so a composite (app_id,

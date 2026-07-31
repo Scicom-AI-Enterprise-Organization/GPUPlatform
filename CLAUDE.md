@@ -13,12 +13,50 @@ code and are pulled in automatically only when you touch that subtree:
 - **`gateway/gateway/CLAUDE.md`** — gateway internals: benchmaq + the `HOME`-breaks-RunPod-SSH /
   cu1300 / fork-install / crash-abort gotchas, the provider metrics page (NVML + `/proc`), the VM
   reverse tunnel, VM Compute sessions (uv venv + proxied JupyterLab), Activity + proxy-mode
-  recording, the Label platform, the HF catalog/mirror, and Quantization (llm-compressor —
-  scheme sync, calib datasets, mirror-push Xet gotcha).
+  recording, the Label platform, the HF catalog/mirror, Quantization (llm-compressor —
+  scheme sync, calib datasets, mirror-push Xet gotcha), and Experiments (the evaluator registry,
+  the no-retry rule, and the silent Langfuse-import corruptions).
 - **`worker-agent/worker_agent/CLAUDE.md`** — the multi-model fleet: vLLM venv self-bootstrap,
   `vllm_version` / `vllm_install_args` / git forks / `pre_script`, and serving Whisper/audio.
+- **`web/src/app/(app)/experiments/CLAUDE.md`** — the Experiments UI (agent observability): the
+  Runs/Evaluators tabs, the server-driven evaluator form, the two capture sources, the
+  row-not-case vocabulary rule, and the CVD-validated tradeoff-plot palette.
 - **`web/src/app/(app)/quantization/CLAUDE.md`** — the Quantization UI: mirrors Autotrain 1:1
   (the file↔file mapping table), server-driven scheme dropdown, HF-export tab conventions.
+
+### Experiments: the two benchmark unit tests (ports of out-of-tree benchmarks)
+
+`/experiments` ships two evaluators — **Function Call Unit Tests** (`function_call_units`) and
+**Multilingual Unit Tests** (`multilingual_units`) — that are **ports of standalone research
+benchmarks maintained out of tree**, not original work here.
+
+Those benchmarks (their own harnesses, venvs and model fleet) **remain the source of truth for the
+published numbers.** Only the *scoring* halves were ported, into `gateway/gateway/evaluators.py`
++ `langid.py`; the replay harnesses, eval datasets and result tables stayed there. If a metric
+definition changes, change it upstream first and mirror it here — and don't present this platform's
+figures as the benchmark's own (see caveat 3).
+
+**Three things that make the numbers wrong if you forget them:**
+1. **They need reference data on the dataset row.** `function_call_units` reads
+   `expected.tool_calls`; `multilingual_units` reads `expected.language`. A row without it is
+   **skipped, not failed** — so a suite can report a clean 100% while having scored almost nothing.
+   Both aggregators return `scored` — check it against the row count (`turns` on the
+   function-call one). `scored: 0` with a green pass rate means the dataset carries no
+   reference data at all.
+2. **fastText is needed for parity.** `multilingual_units` matches the published table only with
+   `EXPERIMENT_FASTTEXT_MODEL=/path/to/lid.176.bin` (+ the `fasttext` wheel). Without it a built-in
+   detector runs — good, but not identical. Every result stamps `detector: fasttext|builtin`;
+   **never compare two runs whose detector differs.**
+3. **⚠ Experiments replays ONE request per row; the function-call benchmark replays a whole
+   conversation.** The real harness walks 10–20 turns, injecting reference tool results so the
+   model accumulates context. Here each row is a single request, so on a multi-turn corpus (e.g.
+   `Scicom-intl/Function-Call-TaaS`) this **effectively scores the first turn only** and will read
+   higher than the benchmark. Fine for regression-watching one turn; **not a substitute for the
+   real run**. Multi-turn replay is unimplemented — it needs the runner to thread tool results
+   back into the request, which is the one genuinely missing piece.
+
+Both report **corpus-level** metrics (F1, per-language accuracy) that cannot be averaged from
+per-sample rates — see the `aggregate` hook in `gateway/gateway/CLAUDE.md`.
 
 ### What's already running / configured
 

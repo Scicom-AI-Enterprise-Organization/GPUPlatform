@@ -77,6 +77,24 @@ import type {
   QuantizationJobRecord,
   CreateQuantizationJobRequest,
   QuantizationSchemesResponse,
+  EvaluatorRegistry,
+  CustomEvaluatorRecord,
+  CustomEvaluatorSpec,
+  CustomEvaluatorTestRequest,
+  CustomEvaluatorTestResponse,
+  ExperimentLimits,
+  ExperimentDatasetOption,
+  ExperimentRowPreview,
+  CaptureResult,
+  CaptureLangfuseRequest,
+  CapturePlatformRequest,
+  ExperimentRecord,
+  ExperimentSummary,
+  ExperimentSampleRecord,
+  ExperimentTargetsResponse,
+  CreateExperimentRequest,
+  LangfusePreviewRequest,
+  LangfusePreviewResponse,
   TryItTarget,
   TrackingCredentialRecord,
   CreateTrackingCredentialRequest,
@@ -1292,6 +1310,115 @@ export const gateway = {
       `/admin/audit-logs${qs ? `?${qs}` : ""}`,
     );
   },
+
+  // ---- Experiments (agent observability) ----
+  /** Evaluator registry — the form renders its option fields from this, so the
+   * UI can never drift from what the runner actually supports. */
+  listEvaluators: () => request<EvaluatorRegistry>("/v1/experiments/evaluators"),
+  experimentLimits: () => request<ExperimentLimits>("/v1/experiments/limits"),
+  listExperimentTargets: () =>
+    request<ExperimentTargetsResponse>("/v1/experiments/targets"),
+
+  // ---- Custom (user-written) evaluators ----
+  listCustomEvaluators: () =>
+    request<CustomEvaluatorRecord[]>("/v1/custom-evaluators"),
+  createCustomEvaluator: (body: CustomEvaluatorSpec) =>
+    request<CustomEvaluatorRecord>("/v1/custom-evaluators", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateCustomEvaluator: (id: string, body: Partial<CustomEvaluatorSpec>) =>
+    request<CustomEvaluatorRecord>(`/v1/custom-evaluators/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteCustomEvaluator: (id: string) =>
+    request<{ ok: boolean }>(`/v1/custom-evaluators/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  /** Dry-run an evaluator against one sample reply before committing to a run. */
+  testCustomEvaluator: (body: CustomEvaluatorTestRequest) =>
+    request<CustomEvaluatorTestResponse>("/v1/custom-evaluators/test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /** Platform Datasets that can supply replayable requests (the /datasets
+   * section, filtered to chat-shaped kinds). Experiments owns no dataset store. */
+  listExperimentDatasets: (includeUnusable = false) =>
+    request<ExperimentDatasetOption[]>(
+      `/v1/experiments/datasets${includeUnusable ? "?include_unusable=true" : ""}`,
+    ),
+  previewExperimentRows: (datasetId: string, limit = 20) =>
+    request<ExperimentRowPreview[]>(
+      `/v1/experiments/datasets/${encodeURIComponent(datasetId)}/rows?limit=${limit}`,
+    ),
+
+  previewLangfuseTrace: (body: LangfusePreviewRequest) =>
+    request<LangfusePreviewResponse>("/v1/experiments/capture/langfuse/preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Capture requests into a NEW platform dataset (kind=upload, chat-shaped). */
+  captureLangfuseTrace: (body: CaptureLangfuseRequest) =>
+    request<CaptureResult>("/v1/experiments/capture/langfuse", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  capturePlatformRequests: (body: CapturePlatformRequest) =>
+    request<CaptureResult>("/v1/experiments/capture/platform", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  listExperimentsPage: (p: PageQuery & { dataset_id?: string } = {}) => {
+    const qs = new URLSearchParams(pageQs(p));
+    if (p.dataset_id) qs.set("dataset_id", p.dataset_id);
+    return request<PageResponse<ExperimentRecord>>(`/v1/experiments/_page?${qs.toString()}`);
+  },
+  getExperiment: (id: string) =>
+    request<ExperimentRecord>(`/v1/experiments/${encodeURIComponent(id)}`),
+  createExperiment: (body: CreateExperimentRequest) =>
+    request<ExperimentRecord>("/v1/experiments", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  cancelExperiment: (id: string) =>
+    request<ExperimentRecord>(`/v1/experiments/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+    }),
+  deleteExperiment: (id: string) =>
+    request<{ ok: boolean }>(`/v1/experiments/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  listExperimentSamples: (
+    id: string,
+    p: {
+      target?: string;
+      variant?: string;
+      case_id?: string;
+      only_failed?: boolean;
+      q?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) => {
+    const qs = new URLSearchParams();
+    if (p.target) qs.set("target", p.target);
+    if (p.variant) qs.set("variant", p.variant);
+    if (p.case_id) qs.set("case_id", p.case_id);
+    if (p.only_failed) qs.set("only_failed", "true");
+    if (p.q) qs.set("q", p.q);
+    qs.set("limit", String(p.limit ?? 50));
+    qs.set("offset", String(p.offset ?? 0));
+    return request<PageResponse<ExperimentSampleRecord>>(
+      `/v1/experiments/${encodeURIComponent(id)}/samples?${qs.toString()}`,
+    );
+  },
+  compareExperiments: (id: string, against: string[]) =>
+    request<{ experiments: Array<{ id: string; name: string; status: string; created_at: string; summary: ExperimentSummary | null }> }>(
+      `/v1/experiments/${encodeURIComponent(id)}/compare?against=${encodeURIComponent(against.join(","))}`,
+    ),
 };
 
 // Per-model state reported by a multi-model worker's heartbeat.

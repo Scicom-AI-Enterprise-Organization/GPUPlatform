@@ -331,6 +331,197 @@ self-throttle. `PROXY_RETRY_AFTER_S` (default 5) tunes the Retry-After hint. Set
 model's vLLM `max_num_seqs` (or just below). NOTE this bounds a single replica (see the multi-replica
 section below for the cluster-wide cap on the *separate* LLM-proxy feature).
 
+### Experiments — behavioural stress testing + agent observability (`experiments_api.py`)
+
+The generic half of every ad-hoc stress-test script ever written against a served model. Those
+scripts are ~90% identical (load a captured request → replay it N times across endpoints/variants
+at concurrency C → assemble the stream → classify → tally → SUMMARY.json) and differ only in the
+**classifier**. So the classifiers live in **`evaluators.py`** as a registry and everything else is
+config. Section key `experiments` in `auth.SECTIONS`.
+
+    EvalDataset ── EvalCase (replayable {messages, tools, params})
+         └── Experiment = dataset × targets × variants × repeats
+                  └── ExperimentSample = one completion + its evaluator verdicts
+
+- **Restart rules**: everything here is imported, so **any edit needs a gateway restart**
+  (`GATEWAY_RELOAD=0`). New tables are created by `create_all`; no ALTER migration was needed.
+- **`evaluators.py` is the extension point.** Detectors are pure sync functions of one
+  `Completion` → `EvalOutcome`; add a `_check_*` + a `SPECS` entry and **nothing else changes** —
+  `GET /v1/experiments/evaluators` serves the registry (id/label/description/option schema) and
+  the web form renders it, the same server-driven-dropdown convention as quantization schemes.
+  Unit tests: `gateway/tests/unit/test_evaluators.py` + `test_experiments_unit.py`.
+- **Targets are always plain `{base_url, model, key}`**, even for this platform's own apps/proxies.
+  `GET /targets` only *prefills* them from the app + proxy registry. One code path in the runner,
+  and a third-party endpoint is a first-class target — mirrors `proxy_api`'s `stt_callback`.
+  Inline keys are Fernet-encrypted into `config_json`; `_public_config` strips them on the way out
+  (it deep-copies first — mutating the ORM row's JSON dict would flush the redaction back to the DB).
+- **⚠ `retries` defaults to 1 — no retry, on purpose.** Retrying masks the failure being measured:
+  a fast 500 or a 0-token reply IS the finding. `request_error` is in `ALWAYS_ON`, and a sample
+  with a transport error is force-failed (its content checks ran against `""`, so their "passes"
+  are meaningless).
+- **⚠ Read reasoning under BOTH names.** Dynamo emits `reasoning_content`, plain vLLM emits
+  `reasoning` (`_reasoning_of`). Reading one silently turns a "reasoning-only empty" into a plain
+  "empty" on the other backend. Streaming also always injects `stream_options.include_usage` or
+  every token-derived metric (cost, empty-with-0-tokens) reads zero.
+- **⚠ Streamed tool-call arguments arrive char-by-char** — `_merge_stream_tool_calls` reassembles
+  them by `index`. Without it every streamed tool call looks like malformed JSON.
+- **The runner is in-process** (asyncio + a dedicated httpx client, separate from the proxy's so a
+  long run can't starve live proxy traffic). Bounded by a worker pool + a hard `EXPERIMENT_MAX_UNITS`
+  cap (20k; a 4-target × 3-variant × 200-repeat × 20-case sweep is 48k real billed calls). Stored
+  sample text is capped at `EXPERIMENT_MAX_STORED_CHARS` (8k).
+- **⚠ Restart cleanup is heartbeat-gated, not blind.** `cleanup_orphaned_running` only fails rows
+  whose `heartbeat_at` is stale (>120s) or absent — the runner stamps it on every ~2s progress
+  flush. A blind sweep would kill runs legitimately in flight on **another HA replica**.
+- **Cancel is cooperative**: in-flight units finish, queued ones are skipped, and the partial
+  results are still summarized (verified: 525/2000 → `cancelled` with a usable summary).
+- `summary_json` = one **cell** per (target, variant) with per-evaluator pass rates + latency/
+  token/cost stats. That's the matrix the UI's parallel-coordinates plot draws.
+
+**Benchmark-derived unit tests** (`evaluators.py` + `langid.py`). Two built-ins port the *scoring*
+halves of two standalone research benchmarks maintained **out of tree** (function-calling quality
+and code-switching / reply-language), so a suite that needed its own repo, venv and fleet run is
+now a checkbox:
+- **`function_call_units`** — the function-call benchmark's per-turn metrics. Reads
+  `expected.tool_calls` off the dataset row and resolves each call against the request's OWN
+  `tools` (plumbed through as `expected._tools` by the runner) so hallucination and parameter
+  checks need no configuration. Optional `expected.{available_ids,tool_results,out_of_context}`
+  enable id-propagation and the refusal metric.
+- **`multilingual_units`** — the code-switching benchmark: did the reply come back in
+  `expected.language`? ⚠ **`__label__id` maps to `malay`** exactly as the benchmark does, so an
+  Indonesian reply would be credited as Malay; `langid.indonesian_leak()` (the ported 475-word
+  lexicon, whole-token matched) surfaces `malay_corrected`/`overall_corrected` alongside the raw
+  numbers. `strict_malay` (default on) makes a leak an outright failure.
+- **`langid.py` uses fastText when it's there, its own detector otherwise.** Set
+  `EXPERIMENT_FASTTEXT_MODEL=/path/to/lid.176.bin` (+ the `fasttext` wheel) for exact parity with
+  the published tables; without it, script ranges settle Chinese/Tamil exactly and function words
+  decide Malay-vs-English. **Every result records `detector: fasttext|builtin`** so two runs
+  scored by different paths are never silently compared.
+
+**⚠ Single-turn replay ≠ the benchmark's multi-turn replay.** The real function-call harness walks
+a conversation 10–20 turns deep, feeding the *reference* tool results back in after each turn so
+the model accumulates context (it has no live telco backend). The Experiments runner sends **one
+request per dataset row**. On a single-turn row that's equivalent; on a multi-turn corpus like
+`Scicom-intl/Function-Call-TaaS` it scores **only the first turn** and reads higher than the
+published figure. Don't present the two as the same measurement. Implementing real multi-turn
+replay means threading `expected.tool_results` back into `build_request` and looping per row —
+the runner's `run_unit` is one-shot today, so it's a genuine addition, not a config flag.
+
+**⚠ A row missing its reference is SKIPPED, not failed.** No `expected.tool_calls` /
+`expected.language` → the detector abstains with `flags.skipped` and `passed=True`, because
+inventing a verdict is worse than none. The consequence: a suite pointed at a dataset with no
+`expected` column reports a clean 100% having scored nothing. Both aggregators return **`scored`** for exactly this
+reason — **compare it against the row count** (`turns` on the function-call one) before believing
+a result. `scored: 0` with a green pass rate means the dataset carries no reference data.
+
+**⚠ The `aggregate` hook exists because F1 cannot be averaged.** These two score one reply at a
+time like every other detector, but their headline numbers are **corpus-level**: `tool_call_f1`
+pools tp/fp/fn across every reply, and per-language accuracy pools per class. So
+`EvaluatorSpec.aggregate(flags_list) -> dict` runs once per (target, variant) cell in
+`summarize()`, and its output lands on `cell.evals[id].metrics` (+ `headline` for the ones worth
+reading first). Averaging the per-sample rates instead would NOT reproduce the benchmark's tables.
+The per-sample `flags` that feed it are pooled and discarded — never stored on the cell.
+
+**Custom evaluators** (`custom_eval.py` + the `CustomEvaluator` table). The escape hatch for a
+check the built-ins don't cover, authored on the **Evaluators tab** (`/experiments/evaluators`)
+rather than in the run form — they're a reusable resource, not a per-run setting. Saved entries
+are a per-user library; an experiment **snapshots the whole definition into its config** at
+create time, so editing a library entry can never retroactively change what a finished run
+measured (verified). Referenced as `custom:<ce-id>`, or `custom` with the definition inline.
+Results are keyed by the evaluator's **name**, which is why a name colliding with a built-in id
+is rejected. **Three modes:**
+
+1. **`expression`** (default, always on) — ONE Python expression, checked by a whitelisting AST
+   walker: no statements, no imports, no comprehensions, calls only into a fixed helper registry,
+   attributes only from `SAFE_METHODS` (never a dunder). Everything in scope is plain data, so
+   there's no object graph to climb toward `__subclasses__`. It runs **in the gateway process**,
+   which is why two compute bombs are also blocked: **`**` is rejected outright** (`2**(10**10)`
+   is a three-character DoS) and a constant multiplier above `_MAX_REPEAT_CONST` (1000) is
+   rejected (`content * 100000000` allocates a gigabyte). Adding to `_ALLOWED_NODES`? Re-check both.
+2. **`api`** (always on) — POST the completion to an endpoint the user already runs; read the
+   verdict out of the JSON via **dotted paths** (`result.verdict`, `result.detail.why` — `dig()`
+   walks dicts AND list indices; `""` means the whole response, for an endpoint answering a bare
+   `true`). String verdicts are understood (`PASS`/`fail`/`yes`/`no`). Nothing executes on the
+   gateway, so there's no sandbox to reason about — only **`netsafe.assert_safe_fetch_url`**,
+   which permits internal hosts (an in-cluster scorer is legitimate) but blocks link-local /
+   cloud-metadata, is re-checked on first use (a saved hostname could be re-pointed), and pairs
+   with `follow_redirects=False` so a 3xx can't bounce onto a blocked host. Keys are **global-secret
+   references**, never stored inline. Config lives in the `config` JSON column (added by an
+   idempotent ALTER in `db.init_db`).
+   ⚠️ **`api_config()` treats only `None` as "unset", NOT `""`** — empty string is a *meaningful*
+   value for `passed_field` (whole response) and `auth_prefix` (no `Bearer `). An earlier version
+   skipped `""` and silently reinstated the defaults for both; two unit tests pin it.
+3. **`python`** (opt-in, OFF by default) — a real `def check(c)`. Gated **twice**:
+   `EXPERIMENT_ALLOW_PYTHON_EVALUATORS=1` **and** admin role, re-checked at experiment-create time
+   (not just at save). Runs in a child process with the gateway's env **scrubbed** to
+   `PATH/LANG/LC_ALL/SYSTEMROOT/TMPDIR` (no `DATABASE_URL`, no `PROVIDER_SECRET_KEY`, no cloud
+   keys — a unit test asserts this), CPU/address-space/NOFILE rlimits the child sets on itself
+   (`preexec_fn` is unsafe from a threaded parent), and a wall-clock kill.
+   ⚠️ **This is blast-radius reduction, not a jail** — user code can still read what the gateway
+   user can read. Enabling it grants code execution on the gateway host to anyone who can reach
+   the endpoint. Prefer `expression` (sandboxed) or `api` (runs nowhere near us).
+
+- **One child process per python evaluator per run**, not per sample (`PythonEvaluatorWorker`
+  serves one JSON line per call) — a 10k-sample run would otherwise be 10k process launches. A
+  hang kills+respawns; a *fatal* definition error latches so it doesn't respawn-storm. api mode
+  gets its own concurrency semaphore so a slow scorer can't starve the replay connections.
+- **An author's bug never fails a sample.** A bad regex, a `None.get()`, a timeout, a crashed
+  child, an unreachable endpoint, a response missing the configured field — all return
+  `passed=True` with `flags.evaluator_error`, because silently marking real replies as failures
+  is worse than a missing signal. `POST /v1/custom-evaluators/test` dry-runs one against a pasted
+  reply or a real `sample_id`; the UI leans on it because `fail_when_true` inverts every result
+  if you pick it wrong.
+
+**Cases come from the platform's own Datasets section — Experiments has NO dataset store.**
+(Vocabulary: everything **user-facing** says "row" — `max_rows`, `n_rows`, `/datasets/{id}/rows`.
+`Case` survives as the Python name because it's a row *resolved into* a replayable request, which
+is a real distinction: rows without a usable messages cell are dropped, so cases ≤ rows and
+`n_planned` is an estimate. Don't put "case" back into UI copy or the API.)
+`resolve_cases()` reads rows out of a `Dataset` through that section's own readers
+(`_hf_preview_rows` for `llm`/`hf`, `dataset_metadata.parse_rows_any` over the S3 metadata file
+for `upload`/`s3`), so a dataset behaves identically here and in its row browser. A `Case` is a
+plain dataclass built per run, never a table. `dataset_usable()` is the gate: kind must be one of
+`CASE_DATASET_KINDS` and a **messages column must be mapped** (`Dataset.messages_field`) — that's
+what `GET /v1/experiments/datasets` filters on, and the reason an audio dataset shows up as
+`usable=false` with a fixable reason rather than silently missing.
+- A row's `tools` OR `functions` column becomes the tool declarations; `params` (or flat
+  `temperature`/`top_k`/… columns) become the replay parameters; `expected` feeds the evaluators.
+  Each is accepted as a real object OR a JSON **string**, because a CSV/JSONL round-trip gives
+  either (`_coerce_json_cell`).
+- **`excluded_rows` is honoured** — a row the owner un-ticked in the row browser is excluded from
+  training, so excluding it here too keeps one meaning of "this dataset".
+- `Experiment.n_planned` is an **estimate** at create time (`Dataset.num_rows` × the matrix); the
+  true count is only known once rows are read, and the `MAX_UNITS` cap is re-checked at run time.
+- A deleted dataset leaves its runs readable — `_dataset_names` renders `(deleted dataset)`
+  rather than failing the row.
+
+**Capturing INTO a dataset** (`langfuse_import.py` + the `/experiments/capture/*` routes). Both
+importers now **create a real `kind=upload`, chat-shaped Dataset** (JSONL to the chosen S3
+storage, `messages_field="messages"`) instead of writing to a private store — so a captured
+corpus is browsable, publishable and packable like anything else. Two sources: a Langfuse trace,
+and **this platform's own served traffic** (serverless `requests` rows store the whole OpenAI
+body). ⚠ **Proxy-mode rows can't be captured**: `main._record_proxy_request` writes a deliberately
+*slim* row (model + usage only, for throughput), so there's no body to replay; the route says so
+rather than returning nothing.
+
+Two Langfuse details are load-bearing because they fail **silently**:
+1. **`traceId=` beats `peek=`.** In the newer UI `peek=` can be a *span* id that 404s against
+   `/api/public/traces/{id}`.
+2. **PII-scrubbed JSON-string inputs.** Some observations store the request as a JSON *string*
+   whose scrubber left **unquoted** placeholders (`"created_at": <id>`). `json.loads` fails, a
+   naive caller iterates the string, and the "request" becomes thousands of **single-character
+   messages** with no error. `_repair_scrubbed_json` re-quotes placeholders only in structural
+   value positions (never inside customer text), and `extract_request` **refuses** >500 messages
+   or non-object messages outright. An AGENT span (`*.arun`) whose input is a task string gets an
+   error naming its child GENERATIONs.
+Also recovered: `modelParameters` (incl. a JSON-string `extra_body` → `top_k` /
+`chat_template_kwargs.enable_thinking`), because replaying with library defaults reproduces a
+*different* request than the one that misbehaved.
+
+**Verified e2e locally** (2026-07-30) against a mock upstream with injected faults: 80 units
+across 2 targets × 2 variants, every detector firing at its designed rate (control-token leak,
+empty+0-token, fenced JSON, degeneration, HTTP 500), the clean target at 100% pass, cancel keeping
+partial results, and all five web routes rendering the live data.
+
 ### Multi-replica HA — leader election (`leader.py`) + proxy cluster (`proxy_cluster.py`)
 
 The gateway is a monolith: it serves a **stateless data plane** (the LLM proxy in `proxy_api.py`, API

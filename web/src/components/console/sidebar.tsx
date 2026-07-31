@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { Activity, BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Network, Package, ScrollText, Server, Settings, Shield, Shrink, Sparkles, Users } from "lucide-react";
+import { Activity, BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Microscope, Network, Package, ScrollText, Server, Settings, Shield, Shrink, Sparkles, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ScicomLogo } from "@/components/scicom-logo";
 import { useSidebarState } from "./sidebar-state";
@@ -16,7 +16,7 @@ type Item = {
   locked?: boolean;
   // If set, this item is dropped from the nav when the section is turned off
   // platform-wide via DISABLED_SECTIONS.
-  section?: "inference" | "benchmark" | "compute" | "datasets" | "catalog";
+  section?: "inference" | "benchmark" | "compute" | "datasets" | "catalog" | "experiments";
 };
 
 const RESOURCES: Item[] = [
@@ -27,6 +27,7 @@ const RESOURCES: Item[] = [
   { label: "Datasets", href: "/datasets", icon: Library, section: "datasets" },
   { label: "Autotrain", href: "/autotrain", icon: Sparkles },
   { label: "Quantization", href: "/quantization", icon: Shrink },
+  { label: "Experiments", href: "/experiments", icon: Microscope, section: "experiments" },
   { label: "Compute", href: "/compute", icon: Box, section: "compute" },
   { label: "GPU Providers", href: "/providers", icon: Cloud },
   { label: "API Proxy", href: "/proxy", icon: Network },
@@ -123,6 +124,9 @@ export function ConsoleSidebar({
     }
     if (href === "/quantization") {
       return pathname === "/quantization" || pathname.startsWith("/quantization/");
+    }
+    if (href === "/experiments") {
+      return pathname === "/experiments" || pathname.startsWith("/experiments/");
     }
     if (href === "/gitops") {
       return pathname === "/gitops" || pathname.startsWith("/gitops/");

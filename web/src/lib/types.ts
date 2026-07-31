@@ -1478,7 +1478,7 @@ export type ProviderBandwidth = {
 
 // ---- Admin: roles + audit ----
 
-export type SectionKey = "inference" | "benchmark" | "compute" | "datasets" | "catalog" | "quantization";
+export type SectionKey = "inference" | "benchmark" | "compute" | "datasets" | "catalog" | "quantization" | "experiments";
 
 // ---- Model/Dataset catalog (self-hosted HuggingFace mirror) ----
 
@@ -1897,3 +1897,325 @@ export type ActivityLogsResponse = {
   has_more: boolean;
   jobs: ActivityLogRow[];
 };
+
+// ---- Experiments (agent observability) ----------------------------------
+// Mirrors the pydantic models in gateway/gateway/experiments_api.py and the
+// evaluator registry in gateway/gateway/evaluators.py. The evaluator option
+// schema is SERVER-DRIVEN — the form renders whatever /evaluators returns, so
+// adding a detector in Python needs no change here.
+
+export type EvaluatorOption = {
+  name: string;
+  type: "number" | "boolean" | "text" | "list" | "select";
+  label: string;
+  default: unknown;
+  help?: string;
+  options?: unknown[];
+};
+
+export type EvaluatorSpec = {
+  id: string;
+  label: string;
+  description: string;
+  options: EvaluatorOption[];
+  deferred: boolean;
+  /** Corpus-level metric keys worth plotting/reading first. */
+  headline?: string[];
+};
+
+export type CustomEvaluatorRecord = {
+  id: string;
+  name: string;
+  description: string;
+  mode: "expression" | "api" | "python" | string;
+  code: string;
+  /** api mode only: {url, method, *_field, auth_*, timeout_s, concurrency}. */
+  config: Record<string, unknown>;
+  fail_when_true: boolean;
+  owner: string;
+  created_at: string;
+  updated_at: string | null;
+};
+
+export type CustomEvaluatorSpec = {
+  name: string;
+  description?: string;
+  mode: string;
+  code: string;
+  config?: Record<string, unknown>;
+  fail_when_true: boolean;
+};
+
+/** What an author can reference in a custom evaluator. Server-supplied so the
+ * help text and the validator can never disagree. */
+export type CustomEvaluatorContext = {
+  variables: Array<{ name: string; type: string }>;
+  helpers: string[];
+  safe_methods: string[];
+  modes: string[];
+  python_enabled: boolean;
+  python_allowed: boolean;
+  python_env_var: string;
+  /** Default api-mode config the editor prefills (never contains a secret). */
+  api_defaults?: Record<string, unknown>;
+  examples: Array<{
+    name: string;
+    mode: string;
+    fail_when_true: boolean;
+    code: string;
+    note?: string;
+  }>;
+};
+
+export type CustomEvaluatorTestRequest = {
+  mode: string;
+  code: string;
+  config?: Record<string, unknown>;
+  fail_when_true: boolean;
+  name?: string;
+  content?: string;
+  reasoning?: string;
+  finish_reason?: string | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  latency_ms?: number | null;
+  ttft_ms?: number | null;
+  expected?: Record<string, unknown>;
+  sample_id?: string;
+};
+
+export type CustomEvaluatorTestResponse = {
+  ok: boolean;
+  passed?: boolean;
+  score?: number | null;
+  reason?: string | null;
+  flags?: Record<string, unknown>;
+  error?: string | null;
+};
+
+export type EvaluatorRegistry = {
+  evaluators: EvaluatorSpec[];
+  always_on: string[];
+  /** The caller's saved custom evaluators (present on /experiments/evaluators). */
+  custom?: CustomEvaluatorRecord[];
+  custom_context?: CustomEvaluatorContext;
+};
+
+/** Run-size ceilings, so the form can enforce them before submit. */
+export type ExperimentLimits = {
+  max_units: number;
+  max_rows: number;
+  max_concurrency: number;
+  default_concurrency: number;
+  sweep_row_threshold: number;
+  sweep_sample_rows: number;
+};
+
+/** A platform Dataset that can supply replayable requests. */
+export type ExperimentDatasetOption = {
+  id: string;
+  name: string;
+  kind: string;
+  messages_field: string | null;
+  num_rows: number | null;
+  owner: string;
+  usable: boolean;
+  reason?: string | null;
+};
+
+export type ExperimentRowPreview = {
+  id: string;
+  name: string;
+  n_messages: number;
+  n_tools: number;
+  prompt_chars: number;
+  params: Record<string, unknown>;
+};
+
+export type CaptureResult = {
+  dataset_id: string;
+  name: string;
+  n_rows: number;
+};
+
+export type CaptureLangfuseRequest = LangfusePreviewRequest & {
+  name: string;
+  storage_id: string;
+  observation_ids?: string[];
+};
+
+export type CapturePlatformRequest = {
+  name: string;
+  storage_id: string;
+  app_id?: string;
+  limit?: number;
+  status?: string;
+  search?: string;
+};
+
+export type ExperimentTargetSpec = {
+  label: string;
+  base_url: string;
+  model: string;
+  api_key_secret?: string | null;
+  api_key?: string | null;
+  extra_body?: Record<string, unknown>;
+  path?: string;
+};
+
+export type ExperimentVariantSpec = {
+  label: string;
+  params?: Record<string, unknown>;
+  system_prefix?: string;
+  system_suffix?: string;
+  user_suffix?: string;
+  assistant_prefill?: string;
+  response_format?: string | Record<string, unknown> | null;
+  strip_tools?: boolean;
+  extra_body?: Record<string, unknown>;
+};
+
+export type EvaluatorSelection = {
+  id: string;
+  options?: Record<string, unknown>;
+};
+
+export type CreateExperimentRequest = {
+  name: string;
+  dataset_id: string;
+  targets: ExperimentTargetSpec[];
+  variants?: ExperimentVariantSpec[];
+  evaluators?: EvaluatorSelection[];
+  repeats?: number;
+  concurrency?: number;
+  retries?: number;
+  timeout_s?: number;
+  stream?: boolean;
+  max_rows?: number;
+};
+
+export type ExperimentEvalStat = {
+  n: number;
+  n_failed: number;
+  fail_rate: number;
+  pass_rate: number;
+  mean_score: number | null;
+  /** Corpus-level metrics pooled across every sample in the cell — an F1 or a
+   * per-class accuracy can't be recovered by averaging per-sample rates. Only
+   * present for evaluators that declare an aggregator. */
+  metrics?: Record<string, number | string | null>;
+  /** The metrics worth reading first, in order. */
+  headline?: string[];
+};
+
+export type ExperimentCell = {
+  target: string;
+  variant: string;
+  n: number;
+  n_ok: number;
+  n_error: number;
+  error_rate: number;
+  n_passed: number;
+  pass_rate: number;
+  latency_ms: { mean: number | null; p50: number | null; p95: number | null };
+  ttft_ms: { mean: number | null; p50: number | null; p95: number | null };
+  prompt_tokens_mean: number | null;
+  completion_tokens_mean: number | null;
+  cost_usd_total: number | null;
+  cost_usd_mean: number | null;
+  evals: Record<string, ExperimentEvalStat>;
+};
+
+export type ExperimentSummary = {
+  cells: ExperimentCell[];
+  evaluator_ids: string[];
+  totals: { n: number; n_error: number; n_passed: number; pass_rate: number; error_rate: number };
+};
+
+export type ExperimentRecord = {
+  id: string;
+  name: string;
+  dataset_id: string;
+  dataset_name: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | string;
+  config: Record<string, unknown>;
+  summary: ExperimentSummary | null;
+  n_planned: number;
+  n_completed: number;
+  n_failed: number;
+  error_text: string | null;
+  owner: string;
+  created_at: string;
+  started_at: string | null;
+  ended_at: string | null;
+};
+
+export type ExperimentSampleEval = {
+  passed: boolean;
+  score: number | null;
+  reason: string | null;
+  flags: Record<string, unknown>;
+};
+
+export type ExperimentSampleRecord = {
+  id: string;
+  case_id: string;
+  case_name: string;
+  target: string;
+  variant: string;
+  repeat: number;
+  passed: boolean;
+  content: string;
+  reasoning: string;
+  finish_reason: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  latency_ms: number | null;
+  ttft_ms: number | null;
+  status_code: number | null;
+  error_text: string | null;
+  evals: Record<string, ExperimentSampleEval>;
+};
+
+export type ExperimentTargetSuggestion = {
+  kind: "app" | "proxy";
+  id: string;
+  label: string;
+  base_url: string;
+  model: string;
+  models?: string[];
+};
+
+export type ExperimentTargetsResponse = {
+  targets: ExperimentTargetSuggestion[];
+  gateway_url: string;
+};
+
+export type LangfuseGeneration = {
+  id: string;
+  name: string | null;
+  model: string | null;
+  start_time: string | null;
+  n_messages: number;
+  n_tools: number;
+  replayable: boolean;
+};
+
+export type LangfusePreviewResponse = {
+  trace_id: string;
+  trace_name: string | null;
+  used_trace_id_param: boolean;
+  suggested_observation: string | null;
+  generations: LangfuseGeneration[];
+};
+
+export type LangfusePreviewRequest = {
+  url: string;
+  base_url?: string;
+  public_key?: string;
+  secret_key?: string;
+  public_key_secret?: string;
+  secret_key_secret?: string;
+};
+
+

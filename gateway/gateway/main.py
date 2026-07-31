@@ -59,6 +59,7 @@ from . import log_archive
 from . import history_api as history_module
 from . import catalog_api as catalog_module
 from . import hf_mirror_api as hf_mirror_module
+from . import experiments_api as experiments_module
 
 logger = logging.getLogger("gateway")
 
@@ -616,6 +617,18 @@ async def leader_workload(app: FastAPI) -> list[asyncio.Task]:
 
     tasks.append(asyncio.create_task(_quant_reconcile(), name="quant_reconcile"))
 
+    async def _experiments_reconcile():
+        try:
+            e_orphaned = await experiments_module.cleanup_orphaned_running()
+            if e_orphaned:
+                logger.warning(
+                    "experiments: failed %d orphaned run(s) after gateway restart", e_orphaned
+                )
+        except Exception:
+            logger.exception("experiments: orphan reconcile failed")
+
+    tasks.append(asyncio.create_task(_experiments_reconcile(), name="experiments_reconcile"))
+
     # GitOps loop (self-disables with GITOPS_POLL=0; manual sync + webhook always work).
     tasks.append(asyncio.create_task(gitops_module.gitops_reconcile_loop(app), name="gitops"))
 
@@ -912,6 +925,7 @@ app.include_router(proxy_module.data_router)
 app.include_router(history_module.router)
 app.include_router(catalog_module.router)
 app.include_router(hf_mirror_module.router)
+app.include_router(experiments_module.router)
 
 
 # Reject requests whose declared Content-Length exceeds this many MB (413)
