@@ -6,12 +6,12 @@
 // chat dataset into /datasets — browsable, publishable, packable, and reusable
 // by anything else on the platform. This dialog is just the front end for that.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Cloud, Database, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
-import type { LangfuseGeneration, StorageRecord } from "@/lib/types";
+import type { GlobalEnvRecord, LangfuseGeneration, StorageRecord } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -32,14 +32,33 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+export type CaptureSource = "platform" | "langfuse";
+
+export const CAPTURE_SOURCES: readonly CaptureSource[] = ["platform", "langfuse"] as const;
+
+/** Map the `?capture=` param to dialog state. Exported so the mapping is
+ * testable and the accepted values live in one place — an unknown value leaves
+ * the dialog closed rather than opening it on a guessed tab. */
+export function captureStateFromParam(
+  param: string | null,
+): { open: boolean; source: CaptureSource } {
+  const match = CAPTURE_SOURCES.find((s) => s === param);
+  return { open: !!match, source: match ?? "platform" };
+}
+
 export function CaptureDialog({
   open,
+  source,
   onOpenChange,
+  onSourceChange,
   storages,
   onCaptured,
 }: {
   open: boolean;
+  /** Which tab is showing. Controlled so the URL owns it (?capture=…). */
+  source: CaptureSource;
   onOpenChange: (o: boolean) => void;
+  onSourceChange: (s: CaptureSource) => void;
   storages: StorageRecord[];
   onCaptured: (datasetId: string, name: string, nRows: number) => void;
 }) {
@@ -47,6 +66,15 @@ export function CaptureDialog({
   const [storageId, setStorageId] = useState(storages[0]?.id ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Global secrets, for picking Langfuse keys instead of pasting them.
+  const [secrets, setSecrets] = useState<GlobalEnvRecord[]>([]);
+  useEffect(() => {
+    if (!open) return;
+    gateway
+      .listGlobalEnv()
+      .then((rows) => setSecrets(rows.filter((r) => r.is_secret)))
+      .catch(() => {});
+  }, [open]);
 
   const common = { name: name.trim(), storage_id: storageId };
   const ready = !!name.trim() && !!storageId;
@@ -61,7 +89,7 @@ export function CaptureDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-3xl">
         <DialogHeader>
           <DialogTitle>Capture requests into a dataset</DialogTitle>
           <DialogDescription>
@@ -108,7 +136,11 @@ export function CaptureDialog({
           </div>
         </div>
 
-        <Tabs defaultValue="platform" className="mt-2">
+        <Tabs
+          value={source}
+          onValueChange={(v) => onSourceChange(v as CaptureSource)}
+          className="mt-2"
+        >
           <TabsList>
             <TabsTrigger value="platform">
               <Database className="h-3.5 w-3.5" />
@@ -138,6 +170,7 @@ export function CaptureDialog({
               setBusy={setBusy}
               setError={setError}
               onDone={done}
+              secrets={secrets}
             />
           </TabsContent>
         </Tabs>
@@ -226,20 +259,40 @@ function PlatformCapture({ common, ready, busy, setBusy, setError, onDone }: Sha
   );
 }
 
-function LangfuseCapture({ common, ready, busy, setBusy, setError, onDone }: Shared) {
+function LangfuseCapture({
+  common, ready, busy, setBusy, setError, onDone, secrets,
+}: Shared & { secrets: GlobalEnvRecord[] }) {
   const [url, setUrl] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  // Langfuse keys come as a project-scoped PAIR, so one toggle covers both
+  // rather than two independent source pickers.
+  const [keyMode, setKeyMode] = useState<"secret" | "paste">("secret");
   const [publicKey, setPublicKey] = useState("");
   const [secretKey, setSecretKey] = useState("");
+  const [publicKeySecret, setPublicKeySecret] = useState("");
+  const [secretKeySecret, setSecretKeySecret] = useState("");
   const [gens, setGens] = useState<LangfuseGeneration[] | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
 
-  const creds = {
-    url,
-    base_url: baseUrl || undefined,
-    public_key: publicKey || undefined,
-    secret_key: secretKey || undefined,
-  };
+  const useSecrets = keyMode === "secret";
+  // The gateway resolves *_key_secret against the global secrets at call time, so
+  // the key itself never reaches the browser or the experiment config.
+  const creds = useSecrets
+    ? {
+        url,
+        base_url: baseUrl || undefined,
+        public_key_secret: publicKeySecret || undefined,
+        secret_key_secret: secretKeySecret || undefined,
+      }
+    : {
+        url,
+        base_url: baseUrl || undefined,
+        public_key: publicKey || undefined,
+        secret_key: secretKey || undefined,
+      };
+  const credsReady = useSecrets
+    ? !!publicKeySecret && !!secretKeySecret
+    : !!publicKey && !!secretKey;
 
   async function preview() {
     setBusy(true);
@@ -294,24 +347,123 @@ function LangfuseCapture({ common, ready, busy, setBusy, setError, onDone }: Sha
           className="font-mono text-xs"
         />
       </div>
-      <div className="grid gap-3 sm:grid-cols-3">
-        <div className="space-y-1.5">
-          <Label>Base URL</Label>
-          <Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
-                 placeholder="https://cloud.langfuse.com" />
-        </div>
-        <div className="space-y-1.5">
-          <Label>Public key</Label>
-          <Input value={publicKey} onChange={(e) => setPublicKey(e.target.value)} placeholder="pk-lf-…" />
-        </div>
-        <div className="space-y-1.5">
-          <Label>Secret key</Label>
-          <Input type="password" value={secretKey} onChange={(e) => setSecretKey(e.target.value)}
-                 placeholder="sk-lf-…" />
-        </div>
+      <div className="space-y-1.5">
+        <Label>Base URL</Label>
+        <Input
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+          placeholder="https://cloud.langfuse.com"
+        />
       </div>
 
-      <Button variant="outline" onClick={() => void preview()} disabled={busy || !url.trim()}>
+      {/* Keys get their own full-width row: two selects squeezed beside the base
+          URL truncated their placeholders into indistinguishable stubs. Each one
+          keeps its own label for the same reason. */}
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <Label>API keys</Label>
+          {/* Same segmented toggle as the HF-token field on /serverless/new. */}
+          <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+            {(["secret", "paste"] as const).map((src) => (
+              <button
+                key={src}
+                type="button"
+                onClick={() => setKeyMode(src)}
+                className={cn(
+                  "rounded px-2.5 py-1 transition-colors",
+                  keyMode === src
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {src === "secret" ? "Global secret" : "Paste keys"}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {useSecrets ? (
+          secrets.length > 0 ? (
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs text-muted-foreground">Public key</Label>
+                <Select value={publicKeySecret} onValueChange={setPublicKeySecret}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select a secret" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {secrets.map((sec) => (
+                      <SelectItem key={sec.key} value={sec.key}>
+                        {sec.key}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs text-muted-foreground">Secret key</Label>
+                <Select value={secretKeySecret} onValueChange={setSecretKeySecret}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select a secret" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {secrets.map((sec) => (
+                      <SelectItem key={sec.key} value={sec.key}>
+                        {sec.key}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No global secrets yet. Add the pair under{" "}
+              <a
+                href="/admin/secrets"
+                className="underline underline-offset-2 hover:text-foreground"
+              >
+                Secrets
+              </a>{" "}
+              (e.g. <span className="font-mono">LANGFUSE_PUBLIC_KEY</span> /{" "}
+              <span className="font-mono">LANGFUSE_SECRET_KEY</span>), or switch to{" "}
+              <span className="font-medium">Paste keys</span>.
+            </p>
+          )
+        ) : (
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">Public key</Label>
+              <Input
+                value={publicKey}
+                onChange={(e) => setPublicKey(e.target.value)}
+                placeholder="pk-lf-…"
+                autoComplete="off"
+                className="font-mono text-xs"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">Secret key</Label>
+              <Input
+                type="password"
+                value={secretKey}
+                onChange={(e) => setSecretKey(e.target.value)}
+                placeholder="sk-lf-…"
+                autoComplete="off"
+                className="font-mono text-xs"
+              />
+            </div>
+          </div>
+        )}
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          {useSecrets
+            ? "Referenced, resolved server-side at call time — rotate it in Secrets. The key never reaches the browser."
+            : "Sent to the gateway for this call only; nothing is stored."}
+        </p>
+      </div>
+
+      <Button variant="outline" onClick={() => void preview()}
+              disabled={busy || !url.trim() || !credsReady}>
         {busy && <Loader2 className="h-4 w-4 animate-spin" />}
         Fetch trace
       </Button>

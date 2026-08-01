@@ -7,8 +7,8 @@
 // forms' patterns evolve, this one should follow — diff against benchmark-form.tsx.
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   ChevronDown,
   ChevronRight,
@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type {
   CustomEvaluatorRecord,
+  GlobalEnvRecord,
   ExperimentDatasetOption,
   ExperimentLimits,
   StorageRecord,
@@ -58,9 +59,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { CaptureDialog } from "./capture-dialog";
+import {
+  CaptureDialog,
+  captureStateFromParam,
+  type CaptureSource,
+} from "./capture-dialog";
 
-type TargetDraft = ExperimentTargetSpec & { _id: number };
+// `_keyMode` is client-only: which side of the API-key toggle this target is on.
+type TargetDraft = ExperimentTargetSpec & { _id: number; _keyMode: "secret" | "paste" };
 type VariantDraft = ExperimentVariantSpec & { _id: number };
 
 let seq = 0;
@@ -68,6 +74,7 @@ const nextId = () => ++seq;
 
 const emptyTarget = (init: Partial<ExperimentTargetSpec> = {}): TargetDraft => ({
   _id: nextId(),
+  _keyMode: "secret",
   label: "",
   base_url: "",
   model: "",
@@ -135,13 +142,34 @@ export function ExperimentForm({
   // Datasets come from the platform's /datasets section — Experiments has no
   // corpus of its own. A capture appends a freshly created one to this list.
   const [datasets, setDatasets] = useState(initialDatasets);
-  const [captureOpen, setCaptureOpen] = useState(false);
+  // The capture dialog and its source tab live in the URL (?capture=platform |
+  // langfuse), same router.replace convention as the benchmark form's ?tab= —
+  // shareable, survives a refresh, and adds no history entries.
+  const searchParams = useSearchParams();
+  const pathname = usePathname();
+  const { open: captureOpen, source: captureSource } = captureStateFromParam(
+    searchParams.get("capture"),
+  );
+
+  const setCapture = (next: CaptureSource | null) => {
+    const params = new URLSearchParams(searchParams.toString());
+    if (next) params.set("capture", next);
+    else params.delete("capture");
+    const qs = params.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  };
   const [name, setName] = useState(clone ? `${clone.name}-copy` : "");
   const [datasetId, setDatasetId] = useState(firstDatasetId);
   const [targets, setTargets] = useState<TargetDraft[]>(() => {
     const src = (cfg.targets as ExperimentTargetSpec[] | undefined) ?? [];
     // Keys are never returned by the API, so a clone always re-asks for them.
-    return src.length ? src.map((t) => emptyTarget({ ...t, api_key: "", api_key_secret: t.api_key_secret ?? "" })) : [emptyTarget()];
+    if (!src.length) return [emptyTarget()];
+    return src.map((t) => ({
+      ...emptyTarget({ ...t, api_key: "", api_key_secret: t.api_key_secret ?? "" }),
+      // Keys are never returned by the API, so a clone re-asks; land on the tab
+      // the original used so the prompt makes sense.
+      _keyMode: (t.api_key_secret ? "secret" : "paste") as "secret" | "paste",
+    }));
   });
   const [variants, setVariants] = useState<VariantDraft[]>(() => {
     const src = (cfg.variants as ExperimentVariantSpec[] | undefined) ?? [];
@@ -165,6 +193,15 @@ export function ExperimentForm({
   const [maxRows, setMaxRows] = useState(cloneNum("max_rows", initialDefaults.maxRows));
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // Global secrets a target's API key can reference — keys only, resolved
+  // server-side at call time so the value never reaches the browser.
+  const [secrets, setSecrets] = useState<GlobalEnvRecord[]>([]);
+  useEffect(() => {
+    gateway
+      .listGlobalEnv()
+      .then((rows) => setSecrets(rows.filter((r) => r.is_secret)))
+      .catch(() => {});
+  }, []);
 
   // Custom evaluators are AUTHORED on the Evaluators tab (they're reusable across
   // experiments); this form only picks from the library. Selecting one stores
@@ -238,8 +275,8 @@ export function ExperimentForm({
           label: t.label.trim() || t.model || t.base_url,
           base_url: t.base_url.trim(),
           model: t.model.trim(),
-          api_key_secret: t.api_key_secret || undefined,
-          api_key: t.api_key || undefined,
+          api_key_secret: t._keyMode === "secret" ? t.api_key_secret || undefined : undefined,
+          api_key: t._keyMode === "paste" ? t.api_key || undefined : undefined,
           extra_body: t.extra_body,
           path: t.path,
         })),
@@ -289,7 +326,7 @@ export function ExperimentForm({
           description="Any dataset from the Datasets section with a messages column. Rows become replayable requests, keeping whatever sampling parameters they were captured with."
           action={
             <div className="flex items-center gap-2">
-              <Button type="button" variant="outline" size="sm" onClick={() => setCaptureOpen(true)}>
+              <Button type="button" variant="outline" size="sm" onClick={() => setCapture("platform")}>
                 <Download className="h-4 w-4" />
                 Capture requests
               </Button>
@@ -304,7 +341,7 @@ export function ExperimentForm({
               No chat datasets yet. Either{" "}
               <button
                 type="button"
-                onClick={() => setCaptureOpen(true)}
+                onClick={() => setCapture("platform")}
                 className="font-medium text-foreground underline underline-offset-2"
               >
                 capture requests
@@ -456,20 +493,74 @@ export function ExperimentForm({
                       placeholder="https://example.com"
                     />
                   </FieldWrap>
-                  <FieldWrap label="API key secret" hint="Name of a global secret.">
-                    <Input
-                      value={t.api_key_secret ?? ""}
-                      onChange={(e) => patchTarget(t._id, { api_key_secret: e.target.value })}
-                      placeholder="OPENAI_API_KEY"
-                    />
-                  </FieldWrap>
-                  <FieldWrap label="…or inline key" hint="Encrypted at rest.">
-                    <Input
-                      type="password"
-                      value={t.api_key ?? ""}
-                      onChange={(e) => patchTarget(t._id, { api_key: e.target.value })}
-                      placeholder="sgpu_…"
-                    />
+                  <FieldWrap
+                    label="API key (optional)"
+                    hint={
+                      t._keyMode === "secret"
+                        ? "Referenced, resolved at run time — rotate it in Secrets."
+                        : "Encrypted at rest; never returned by the API."
+                    }
+                    wide
+                  >
+                    <div className="space-y-2">
+                      {/* Same segmented toggle as the HF-token field on /serverless/new. */}
+                      <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                        {(["secret", "paste"] as const).map((src) => (
+                          <button
+                            key={src}
+                            type="button"
+                            onClick={() => patchTarget(t._id, { _keyMode: src })}
+                            className={cn(
+                              "rounded px-2.5 py-1 transition-colors",
+                              t._keyMode === src
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground hover:text-foreground",
+                            )}
+                          >
+                            {src === "secret" ? "Global secret" : "Paste a key"}
+                          </button>
+                        ))}
+                      </div>
+                      {t._keyMode === "secret" ? (
+                        secrets.length > 0 ? (
+                          <Select
+                            value={t.api_key_secret ?? ""}
+                            onValueChange={(v) => patchTarget(t._id, { api_key_secret: v })}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select a secret (e.g. OPENAI_API_KEY)" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {secrets.map((sec) => (
+                                <SelectItem key={sec.key} value={sec.key}>
+                                  {sec.key}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">
+                            No global secrets yet. Add one under{" "}
+                            <Link
+                              href="/admin/secrets"
+                              className="underline underline-offset-2 hover:text-foreground"
+                            >
+                              Secrets
+                            </Link>
+                            , or switch to <span className="font-medium">Paste a key</span>.
+                          </p>
+                        )
+                      ) : (
+                        <Input
+                          type="password"
+                          value={t.api_key ?? ""}
+                          onChange={(e) => patchTarget(t._id, { api_key: e.target.value })}
+                          placeholder="sgpu_…"
+                          autoComplete="off"
+                          className="font-mono text-xs"
+                        />
+                      )}
+                    </div>
                   </FieldWrap>
                 </Grid>
               </div>
@@ -730,7 +821,9 @@ export function ExperimentForm({
 
       <CaptureDialog
         open={captureOpen}
-        onOpenChange={setCaptureOpen}
+        source={captureSource}
+        onOpenChange={(o) => setCapture(o ? captureSource : null)}
+        onSourceChange={(next) => setCapture(next)}
         storages={storages}
         onCaptured={(id, dsName, nRows) => {
           setDatasets((xs) => [
@@ -742,6 +835,7 @@ export function ExperimentForm({
           ]);
           setDatasetId(id);
           if (!name.trim()) setName(`${dsName}-run`);
+          setCapture(null);
         }}
       />
     </FormShell>

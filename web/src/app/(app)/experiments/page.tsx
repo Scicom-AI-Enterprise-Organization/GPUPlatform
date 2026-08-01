@@ -45,14 +45,14 @@ export default async function ExperimentsPage({
       <ConsoleTopbar crumbs={[{ label: "Experiments" }]} username={username} />
       <div className="flex-1 overflow-y-auto px-6 py-6 lg:px-10 lg:py-8 scrollbar-thin">
         <div className="mb-6 flex items-start justify-between gap-4">
-          <div>
+          <div className="min-w-0 flex-1">
             <h1 className="text-2xl font-semibold tracking-tight">Experiments</h1>
-            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-              Replay captured requests against your endpoints and score every reply. Build a
-              any chat dataset from the Datasets section — or capture one from a Langfuse trace
-              or your own served traffic — then sweep it across endpoints and prompt variants to
-              find control-token leaks, empty replies, degeneration, broken JSON, and latency or
-              cost regressions.
+            <p className="mt-1 text-sm text-muted-foreground">
+              Replay captured requests against your endpoints and score every reply. Point one at
+              any chat dataset from the Datasets section — or capture one from a Langfuse trace or
+              your own served traffic — then sweep it across endpoints and prompt variants to find
+              control-token leaks, empty replies, degeneration, broken JSON, and latency or cost
+              regressions.
             </p>
           </div>
           {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
