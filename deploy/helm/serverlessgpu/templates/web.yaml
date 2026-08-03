@@ -39,6 +39,14 @@ spec:
         - name: {{ . }}
         {{- end }}
       {{- end }}
+      {{- with .Values.web.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.web.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: web
           image: {{ .Values.web.image.spec | default (printf "%s/%s:%s" .Values.web.image.registry .Values.web.image.repository .Values.web.image.tag) | quote }}
