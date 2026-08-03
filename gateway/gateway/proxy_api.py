@@ -4,6 +4,10 @@ One stable endpoint + model name (`POST /proxy/{endpoint}/v1/chat/completions`,
 `model: "qwen"`) fans out to multiple external OpenAI-compatible backends. The
 team never changes anything; backends are added/swapped/health-routed here.
 
+Data-plane surface: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+`/v1/rerank` (+ `/v2/rerank`, `/rerank`), `/v1/score`, `/v1/audio/{transcriptions,
+translations,speech,speaker}`, `/v1/models`.
+
 - **Priority + failover** routing across the upstreams that serve a model alias,
   skipping ones a background health loop marked dead (look-ahead).
 - **Per-endpoint concurrency cap** → excess requests wait in a visible queue.
@@ -248,7 +252,7 @@ class TestUpstreamRequest(BaseModel):
     api_key_secret: Optional[str] = None
     api_key: Optional[str] = None
     model: Optional[str] = None   # real upstream model to end-to-end test; None = just probe /models
-    mode: str = "chat"            # chat | embedding | transcription | tts — endpoint to end-to-end test
+    mode: str = "chat"            # chat | embedding | rerank | transcription | tts — endpoint to end-to-end test
     extra_body: Optional[dict] = None  # merged into the chat test body (e.g. provider pinning)
 
 
@@ -2219,6 +2223,30 @@ async def proxy_embeddings(endpoint: str, payload: dict, request: Request, user:
     return await _handle(request, user, endpoint, payload, "/embeddings")
 
 
+# Cross-encoder reranking. vLLM serves the same handler at /rerank, /v1/rerank and
+# /v2/rerank (the last two are the Jina / Cohere client shapes), so we mirror all
+# three path spellings onto the ONE upstream path `/rerank` — a client pointed at
+# `…/proxy/{name}` (Cohere SDK → /v2/rerank) and one pointed at `…/proxy/{name}/v1`
+# both work against the same upstream. Unary + non-streaming, so `_handle` (the
+# buffered engine, with failover) is all that's needed.
+@data_router.post("/proxy/{endpoint}/v1/rerank")
+@data_router.post("/proxy/{endpoint}/v2/rerank")
+@data_router.post("/proxy/{endpoint}/rerank")
+async def proxy_rerank(endpoint: str, payload: dict, request: Request, user: User = Depends(current_user)):
+    payload.pop("stream", None)  # rerank is unary — never SSE
+    return await _handle(request, user, endpoint, payload, "/rerank")
+
+
+@data_router.post("/proxy/{endpoint}/v1/score")
+@data_router.post("/proxy/{endpoint}/score")
+async def proxy_score(endpoint: str, payload: dict, request: Request, user: User = Depends(current_user)):
+    """Pairwise scoring on the same cross-encoder — `text_1` vs `text_2` (string or
+    array), unsorted, in input order. No `documents`/`query`, so it can't share the
+    rerank route."""
+    payload.pop("stream", None)
+    return await _handle(request, user, endpoint, payload, "/score")
+
+
 @data_router.post("/proxy/{endpoint}/v1/audio/transcriptions")
 async def proxy_audio_transcriptions(endpoint: str, request: Request, user: User = Depends(current_user)):
     return await _handle_audio(request, user, endpoint, "/audio/transcriptions")
@@ -2840,6 +2868,60 @@ async def test_upstream(req: TestUpstreamRequest, request: Request,
         if dim <= 0:
             return TestUpstreamResponse(ok=False, message=f"no embedding returned — is '{model}' an embedding model?", latency_ms=lat)
         return TestUpstreamResponse(ok=True, message=f"embedding ok ({model}): dim {dim}", latency_ms=lat, models=[model])
+
+    # Reranker (cross-encoder): POST /rerank with one clearly relevant document and two
+    # negatives — one same-domain-but-wrong-intent, one unrelated. Three docs on purpose:
+    # a single-document smoke test returns HTTP 200 even when the model is misconfigured.
+    #
+    # The failure this is really looking for: vLLM never auto-applies a reranker's chat
+    # template, so a job started without `--chat-template` scores a bare query+document
+    # concatenation and returns 200 with meaningless scores. The signature is scores
+    # bunched in the middle with no separation (and often the relevant doc NOT first) —
+    # not a borderline match. So we assert the ranking, not just the response shape.
+    if model and mode == "rerank":
+        probe_docs = [
+            "To view your latest statement, log in to the billing portal and open the Billing tab.",
+            "Restart your router by holding the reset pin for ten seconds.",
+            "The Great Wall of China is over 20,000 km long.",
+        ]
+        try:
+            r = await cli.post(
+                base + "/rerank",
+                json={"model": model, "query": "How do I check my bill?", "documents": probe_docs},
+                headers=headers, timeout=httpx.Timeout(60.0),
+            )
+        except httpx.HTTPError as e:
+            return TestUpstreamResponse(ok=False, message=f"network error: {e}")
+        lat = int((time.perf_counter() - t0) * 1000)
+        if r.status_code in (401, 403):
+            return TestUpstreamResponse(ok=False, message="unauthorized — check the API key", latency_ms=lat)
+        if r.status_code != 200:
+            return TestUpstreamResponse(ok=False, message=f"HTTP {r.status_code}: {r.text[:160]}", latency_ms=lat)
+        ranked: list[tuple[int, float]] = []
+        try:
+            for it in ((r.json() or {}).get("results") or []):
+                if not isinstance(it, dict):
+                    continue
+                sc = it.get("relevance_score", it.get("score"))
+                if sc is None:
+                    continue
+                ranked.append((int(it.get("index", len(ranked))), float(sc)))
+        except Exception:
+            ranked = []
+        if not ranked:
+            return TestUpstreamResponse(ok=False, message=f"no rerank results returned — is '{model}' a reranker/cross-encoder?", latency_ms=lat)
+        ranked.sort(key=lambda x: -x[1])  # servers SHOULD sort by score desc; don't rely on it
+        top_idx, top_score = ranked[0]
+        gap = top_score - ranked[1][1] if len(ranked) > 1 else top_score
+        if top_idx != 0:
+            return TestUpstreamResponse(
+                ok=False, latency_ms=lat,
+                message=(f"ranked doc #{top_idx} (@{top_score:.3f}) above the relevant one — "
+                         f"scores look untemplated; a vLLM reranker needs --chat-template"))
+        note = "" if gap >= 0.2 else "  ⚠ weak separation — check the job's --chat-template"
+        return TestUpstreamResponse(
+            ok=True, latency_ms=lat, models=[model],
+            message=f"rerank ok ({model}): top #{top_idx} @{top_score:.3f}, gap {gap:.3f} over next of {len(ranked)}{note}")
 
     # STT: send a short synthetic tone to /audio/transcriptions — validates the endpoint
     # accepts audio + returns a transcription shape (the text may be empty for a bare tone).

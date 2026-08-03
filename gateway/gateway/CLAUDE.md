@@ -695,6 +695,34 @@ the call. LB/k8s semantics: **200** `healthy`/`degraded` (≥1 upstream not-know
 **503** `unhealthy` (all known-dead) / `disabled` / `misconfigured`, **404** unknown endpoint. Per-replica
 view (right for a per-pod probe). Excluded from the HTTP metrics (`METRICS_IGNORE_PATHS`).
 
+### Rerank / score proxy (cross-encoders) — `/v1/rerank`, `/v1/score`
+
+The LLM-proxy also fronts cross-encoder rerankers. `POST /proxy/{name}/v1/rerank`
+(+ `/v2/rerank` and bare `/rerank` — the Jina/Cohere client spellings, all mapped onto the ONE
+upstream path `/rerank`, mirroring what vLLM itself serves) and `POST /proxy/{name}/v1/score`
+(+ `/score`). Both are plain unary JSON with a top-level `model`, so they ride the same buffered
+engine as embeddings (`_handle` → `_do_unary`): alias→real rewrite, priority + failover, gate,
+`X-Upstream-*` headers, request-history rows. Verified e2e against `tm-h20-reranker`
+(Qwen/Qwen3-Reranker-8B). Nothing rerank-specific in the forwarding path — the only rerank-aware
+code is the **upstream test probe** and the playground.
+
+- ⚠️ **The failure mode is a silent HTTP 200, and it's why the probe asserts the RANKING.** vLLM
+  never auto-applies a reranker's chat template, so a job started without `--chat-template` scores
+  a bare query+document concatenation and still returns 200 — with meaningless scores. Signature:
+  everything bunched in ~0.3–0.85 with no separation, often the relevant doc NOT first (a relevant
+  doc once ranked last at 0.318 under an unrelated one at 0.851). That is **not** a borderline
+  match. Real scores are calibrated hard toward 0/1 — relevant ~0.9+, irrelevant ~0.0.
+- **So `mode=rerank` on `POST /v1/proxy/test` sends THREE documents** — one relevant, one
+  same-domain-wrong-intent, one unrelated — and fails the upstream if the relevant one isn't
+  ranked #1, warning on a top-to-next gap < 0.2. A single-document smoke test passes even when the
+  template is broken, which is exactly the trap. The playground surfaces the same gap + warning.
+- **`instruction` genuinely changes the ranking**, it isn't cosmetic — the default is generic
+  web-search retrieval; override it to score for a domain task (churn intent, policy match,
+  triage). Passed through verbatim like any other body field.
+- **Serverless (`/{app_id}/v1/...`) has NO rerank** — that data plane goes through the worker
+  queue, which has no rerank job type. This is proxy-only; the playground mode lives in the proxy
+  playground, not the serverless tabs.
+
 ### Label platform (data-labelling app)
 
 A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)

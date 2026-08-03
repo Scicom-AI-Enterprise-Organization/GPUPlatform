@@ -14,10 +14,16 @@ import {
 import { gateway } from "@/lib/gateway";
 import type { ProxyEndpoint, ProxyUpstreamSpec, StorageRecord } from "@/lib/types";
 import { FormFooter, FormShell } from "@/components/form-shell";
+import { RoutingPanel } from "./routing-panel";
+import { modelKind } from "./model-kind";
 
 type KeyMode = "secret" | "paste" | "keep";
 type ModelPair = { alias: string; real: string };
 type UpstreamDraft = {
+  // Stable React key. A new upstream is PREPENDED, so every other card's index
+  // shifts — keying on the index would hand the new blank card the old one's DOM
+  // node (stale focus, mis-animated switches). Saved upstreams reuse their real id.
+  uid: string;
   id?: string;
   name: string;
   base_url: string;
@@ -29,18 +35,33 @@ type UpstreamDraft = {
   enabled: boolean;
   hadKey: boolean;
   extraBody: string; // raw JSON text; parsed + validated on submit
-  testMode: "chat" | "embedding" | "transcription" | "tts";
+  testMode: "chat" | "embedding" | "rerank" | "transcription" | "tts";
+  // true once the admin picks a mode by hand — stops guessTestMode from overriding it
+  testModeTouched: boolean;
   test: { status: "idle" | "running" | "ok" | "fail"; message?: string };
 };
 
 type TestState = { status: "idle" | "running" | "ok" | "fail"; message?: string };
 
+let uidSeq = 0;
+const newUid = () => `draft-${++uidSeq}`;
+
 function blankUpstream(): UpstreamDraft {
   return {
+    uid: newUid(),
     name: "", base_url: "", keyMode: "secret", api_key_secret: "", api_key: "",
     models: [{ alias: "", real: "" }], priority: 0, enabled: true, hadKey: false,
-    extraBody: "", testMode: "chat", test: { status: "idle" },
+    extraBody: "", testMode: "chat", testModeTouched: false, test: { status: "idle" },
   };
+}
+
+// Guess which endpoint an upstream serves from its model names, so the Test toggle
+// opens on the right one instead of always "Chat" (a reranker upstream 404s the chat
+// test, which reads as a broken upstream when it's really the wrong probe).
+// Shares modelKind with the Routing panel so the two can't disagree about a model.
+// Only a hint — the admin's own click always overrides it.
+function guessTestMode(models: ModelPair[]): UpstreamDraft["testMode"] {
+  return modelKind(...models.map((m) => `${m.alias} ${m.real}`));
 }
 
 // Parse an upstream's raw extra_body text. "" → undefined (field omitted). Non-empty
@@ -68,6 +89,7 @@ function seededUpstream(prefill?: ProxyPrefill): UpstreamDraft {
   if (prefill.model) {
     const alias = prefill.name || prefill.model.split("/").pop() || prefill.model;
     u.models = [{ alias, real: prefill.model }];
+    u.testMode = guessTestMode(u.models);
   }
   return u;
 }
@@ -75,21 +97,26 @@ function seededUpstream(prefill?: ProxyPrefill): UpstreamDraft {
 export type ProxyPrefill = { name?: string; base?: string; model?: string };
 
 function fromEndpoint(ep: ProxyEndpoint): UpstreamDraft[] {
-  return ep.upstreams.map((u) => ({
-    id: u.id,
-    name: u.name,
-    base_url: u.base_url,
-    keyMode: u.has_inline_key ? "keep" : u.api_key_secret ? "secret" : "paste",
-    api_key_secret: u.api_key_secret ?? "",
-    api_key: "",
-    models: Object.entries(u.models).map(([alias, real]) => ({ alias, real })),
-    priority: u.priority,
-    enabled: u.enabled,
-    hadKey: u.has_inline_key || !!u.api_key_secret,
-    extraBody: u.extra_body && Object.keys(u.extra_body).length ? JSON.stringify(u.extra_body, null, 2) : "",
-    testMode: "chat",
-    test: { status: "idle" },
-  }));
+  return ep.upstreams.map((u) => {
+    const models = Object.entries(u.models).map(([alias, real]) => ({ alias, real }));
+    return {
+      uid: u.id,
+      id: u.id,
+      name: u.name,
+      base_url: u.base_url,
+      keyMode: u.has_inline_key ? "keep" : u.api_key_secret ? "secret" : "paste",
+      api_key_secret: u.api_key_secret ?? "",
+      api_key: "",
+      models,
+      priority: u.priority,
+      enabled: u.enabled,
+      hadKey: u.has_inline_key || !!u.api_key_secret,
+      extraBody: u.extra_body && Object.keys(u.extra_body).length ? JSON.stringify(u.extra_body, null, 2) : "",
+      testMode: guessTestMode(models),
+      testModeTouched: false,
+      test: { status: "idle" },
+    };
+  });
 }
 
 export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefill?: ProxyPrefill }) {
@@ -139,7 +166,14 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   }, []);
 
   const patch = (i: number, p: Partial<UpstreamDraft>) =>
-    setUps((arr) => arr.map((u, j) => (j === i ? { ...u, ...p } : u)));
+    setUps((arr) => arr.map((u, j) => {
+      if (j !== i) return u;
+      const next = { ...u, ...p };
+      // Re-guess on every model edit until the admin picks a mode by hand: typing
+      // "Qwen3-Reranker-8B" should move the toggle off Chat without being told.
+      if (p.models && !next.testModeTouched) next.testMode = guessTestMode(next.models);
+      return next;
+    }));
 
   const onTest = async (i: number) => {
     const u = ups[i];
@@ -295,10 +329,37 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         </div>
       </section>
 
+      <section data-form-section="Routing" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
+        <h2 className="text-base font-medium">Routing</h2>
+        <p className="mb-4 mt-1 text-xs text-muted-foreground">
+          Which backend serves each model, and where it goes when that backend fails. Expand a model
+          for the full chain — take a backend down to watch the route move.
+        </p>
+        <RoutingPanel
+          upstreams={ups}
+          maxConcurrency={Number(maxConc) || 0}
+          timeoutS={Number(timeoutS) || 0}
+          proxyId={initial?.id}
+          defaultOpen={false}
+          // Ties break on list position, so moving an upstream to the front is what makes
+          // it the primary — the only way to change the winner without editing a priority.
+          onPromote={(uid) => setUps((a) => {
+            const i = a.findIndex((u) => u.uid === uid);
+            if (i <= 0) return a;
+            const next = [...a];
+            next.unshift(next.splice(i, 1)[0]);
+            return next;
+          })}
+        />
+      </section>
+
       <section data-form-section="Upstreams" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="mb-1 flex items-center justify-between">
           <h2 className="text-base font-medium">Upstreams</h2>
-          <Button type="button" variant="outline" size="sm" onClick={() => setUps((a) => [...a, blankUpstream()])}>
+          {/* PREPEND, not append: a new upstream lands in view instead of below the
+              fold. Position is cosmetic — routing sorts by `priority` + liveness, and
+              the save path matches kept API keys by upstream id, not list order. */}
+          <Button type="button" variant="outline" size="sm" onClick={() => setUps((a) => [blankUpstream(), ...a])}>
             <Plus className="h-4 w-4" /> Add upstream
           </Button>
         </div>
@@ -307,7 +368,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         </p>
         <div className="space-y-4">
           {ups.map((u, i) => (
-            <div key={i} className="rounded-md border border-border p-3">
+            <div key={u.uid} className="rounded-md border border-border p-3">
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs font-medium text-muted-foreground">Upstream {i + 1}</span>
                 <div className="flex items-center gap-2">
@@ -393,10 +454,10 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
               {/* test — sends a real "hello" to the endpoint matching the chosen mode (chat or embeddings) */}
               <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
                 <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
-                  {(["chat", "embedding", "transcription", "tts"] as const).map((m) => (
-                    <button key={m} type="button" onClick={() => patch(i, { testMode: m, test: { status: "idle" } })}
+                  {(["chat", "embedding", "rerank", "transcription", "tts"] as const).map((m) => (
+                    <button key={m} type="button" onClick={() => patch(i, { testMode: m, testModeTouched: true, test: { status: "idle" } })}
                             className={"rounded px-2 py-1 " + (u.testMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
-                      {{ chat: "Chat", embedding: "Embedding", transcription: "Transcribe", tts: "TTS" }[m]}
+                      {{ chat: "Chat", embedding: "Embedding", rerank: "Rerank", transcription: "Transcribe", tts: "TTS" }[m]}
                     </button>
                   ))}
                 </div>
@@ -405,6 +466,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
                 </Button>
                 <span className="text-[11px] text-muted-foreground">
                   {u.testMode === "embedding" ? "sends a “hello” embedding"
+                    : u.testMode === "rerank" ? "ranks 3 docs (incl. a hard negative) via /rerank"
                     : u.testMode === "transcription" ? "sends a short tone to /audio/transcriptions"
                     : u.testMode === "tts" ? "synthesizes “hello world” via /audio/speech"
                     : "sends a “hello” chat completion"} using the first model
