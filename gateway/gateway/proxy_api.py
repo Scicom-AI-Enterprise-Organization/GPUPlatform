@@ -369,6 +369,46 @@ def _mark_health(app, endpoint_id: str, upstream_id: str, alive: bool,
     }
 
 
+# Markers that make a 429 a HARD quota failure (this upstream will not recover
+# inside this request's lifetime) rather than a transient throttle. Matched
+# case-insensitively against the response body.
+_HARD_QUOTA_MARKERS = ("insufficient_quota", "billing_hard_limit_reached",
+                       "billing_not_active", "quota_exceeded")
+
+
+def _failover_verdict(status_code: int, body: Optional[str] = None):
+    """Classify an upstream HTTP response for failover + health purposes.
+
+    Returns (should_failover, health_alive) where health_alive is None to mean
+    "leave this upstream's health mark untouched".
+
+    Why this exists: the previous rule was `status_code >= 500`, so 429/401/403
+    were passed straight through to the caller AND the upstream was marked
+    healthy. On 2026-07-13 an OpenAI `429 insufficient_quota` therefore took down
+    three deployments that each had to be repointed by hand — the backup upstream
+    was never tried. A 429 is at least three different errors and only some of
+    them mean "this box is sick":
+
+      * 429 + insufficient_quota / billing → hard, fail over AND mark dead so we
+        stop paying the latency to re-discover it every request.
+      * 429 otherwise (rate limit / vLLM queue full) → fail over, but do NOT mark
+        dead: the upstream is alive and will serve the next request fine.
+      * 401 / 403 → credential failure. Fail over and mark dead; retrying the
+        same key cannot succeed, and an expired key would otherwise look exactly
+        like a healthy upstream forever.
+    """
+    if status_code >= 500:
+        return True, False
+    if status_code == 429:
+        blob = (body or "").lower()
+        if any(m in blob for m in _HARD_QUOTA_MARKERS):
+            return True, False
+        return True, None
+    if status_code in (401, 403):
+        return True, False
+    return False, True
+
+
 # ---------- helpers ----------------------------------------------------------
 
 def _upstream_record(u: dict) -> UpstreamRecord:
@@ -572,8 +612,15 @@ def _forced_upstream(request: Request) -> Optional[str]:
 
 def _select_candidates(app, endpoint_id: str, cfg: dict, alias: str,
                        force: Optional[str] = None) -> list[dict]:
-    """Upstreams serving `alias`, enabled, ordered: alive-or-unknown first, then
-    by priority (lower = preferred); known-dead pushed to the back (still tried).
+    """Upstreams serving `alias`, enabled, ordered by priority (lower = preferred).
+
+    Known-dead upstreams are EXCLUDED when at least one live candidate remains —
+    previously they were merely pushed to the back and still dialled, so a
+    hard-down box cost every single request a full 10s connect timeout whenever it
+    sorted ahead of the survivor. If every candidate is known-dead we fall back to
+    trying them all in priority order rather than returning nothing: a stale or
+    wrong health mark must degrade to today's behaviour, never to a hard 502.
+
     When `force` is set (X-SGPU-Upstream header) the list is pinned to the single
     matching upstream — a hard provider override with no failover to the others."""
     ups = [u for u in cfg.get("upstreams", []) if u.get("enabled", True) and alias in (u.get("models") or {})]
@@ -581,12 +628,17 @@ def _select_candidates(app, endpoint_id: str, cfg: dict, alias: str,
         ups = [u for u in ups if _match_upstream(u, force)]
     health = _health(app)
 
-    def sort_key(u: dict):
+    def is_dead(u: dict) -> bool:
         h = health.get((endpoint_id, u.get("id")))
-        dead = bool(h) and not h.get("alive", True) and (time.time() - h.get("checked_at", 0)) < HEALTH_TTL_S
-        return (1 if dead else 0, int(u.get("priority", 0)))
+        return bool(h) and not h.get("alive", True) and (time.time() - h.get("checked_at", 0)) < HEALTH_TTL_S
 
-    return sorted(ups, key=sort_key)
+    def by_priority(u: dict):
+        return int(u.get("priority", 0))
+
+    live_ups = [u for u in ups if not is_dead(u)]
+    if live_ups:
+        return sorted(live_ups, key=by_priority)
+    return sorted(ups, key=by_priority)
 
 
 # ---------- DB record updates (own session, safe from disconnect path) -------
@@ -645,8 +697,10 @@ async def _do_unary(app, endpoint_id: str, candidates: list[dict], alias: str,
             last_err = f"{u['name']}: {type(e).__name__}"
             continue
         lat = int((time.perf_counter() - t0) * 1000)
-        if r.status_code >= 500:
-            _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+        failover, alive = _failover_verdict(r.status_code, r.text)
+        if failover:
+            if alive is not None:
+                _mark_health(app, endpoint_id, u["id"], alive, latency_ms=lat, error=f"HTTP {r.status_code}")
             last_err = f"{u['name']}: HTTP {r.status_code}"
             continue
         _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
@@ -787,8 +841,10 @@ async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], ali
                 last_err = f"{u['name']}: {type(e).__name__}"
                 break  # → next candidate
             lat = int((time.perf_counter() - t0) * 1000)
-            if r.status_code >= 500:
-                _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+            failover, alive = _failover_verdict(r.status_code, r.text)
+            if failover:
+                if alive is not None:
+                    _mark_health(app, endpoint_id, u["id"], alive, latency_ms=lat, error=f"HTTP {r.status_code}")
                 last_err = f"{u['name']}: HTTP {r.status_code}"
                 break  # → next candidate (failover)
             if force_verbose and 400 <= r.status_code < 500:
@@ -942,8 +998,21 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
             try:
                 async with cli.stream("POST", url, json=body, headers=headers,
                                       timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0)) as r:
-                    if r.status_code >= 500:
-                        _mark_health(app, endpoint_id, u["id"], False, error=f"HTTP {r.status_code}")
+                    # Nothing has been yielded to the client yet, so the error body
+                    # can still be read to tell a hard-quota 429 from a soft
+                    # throttle. Previously only >=500 failed over here, so a
+                    # streaming 429/401 reached the caller as a dead stream with
+                    # the upstream left marked healthy.
+                    err_body = None
+                    if r.status_code in (401, 403, 429):
+                        try:
+                            err_body = (await r.aread()).decode("utf-8", "replace")
+                        except Exception:
+                            err_body = None
+                    failover, alive = _failover_verdict(r.status_code, err_body)
+                    if failover:
+                        if alive is not None:
+                            _mark_health(app, endpoint_id, u["id"], alive, error=f"HTTP {r.status_code}")
                         last_err = f"{u['name']}: HTTP {r.status_code}"
                         continue  # failover (nothing sent yet)
                     _mark_health(app, endpoint_id, u["id"], True, latency_ms=int((time.perf_counter() - t0) * 1000))
@@ -1341,8 +1410,13 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
                                 timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
         r = await cli.send(req, stream=True)
         lat = int((time.perf_counter() - t0) * 1000)
-        _mark_health(app, endpoint_id, cand["id"], r.status_code < 500,
-                     latency_ms=lat, error=None if r.status_code < 500 else f"HTTP {r.status_code}")
+        # Single-candidate path (no failover loop here), so this only corrects the
+        # health verdict: a 401/403 must mark the upstream dead rather than healthy,
+        # and a 429 must leave the mark untouched (rate-limited, not sick).
+        _, _alive = _failover_verdict(r.status_code)
+        if _alive is not None:
+            _mark_health(app, endpoint_id, cand["id"], _alive, latency_ms=lat,
+                         error=None if _alive else f"HTTP {r.status_code}")
         base_hdrs = {"X-Request-Id": request_id, "X-Upstream-Url": cand["base_url"], "X-Upstream-Name": cand["name"]}
         if "text/event-stream" not in r.headers.get("content-type", ""):
             data = await r.aread()
