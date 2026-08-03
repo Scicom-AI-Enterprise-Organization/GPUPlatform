@@ -44,6 +44,7 @@ export function ColumnsCard({
   splitFields,
   messagesField,
   rejectedField,
+  promptField,
 }: {
   datasetId: string;
   kind: string;
@@ -53,6 +54,7 @@ export function ColumnsCard({
   splitFields?: Record<string, string> | null;
   messagesField?: string | null;
   rejectedField?: string | null;
+  promptField?: string | null;
 }) {
   const router = useRouter();
   const isHfLike = kind === "hf" || kind === "llm"; // column list comes from HF splits API
@@ -84,6 +86,9 @@ export function ColumnsCard({
   // A rejected column on the dataset means it's already a preference dataset.
   const [dpoMode, setDpoMode] = useState(!!(rejectedField ?? "").trim());
   const [rejected, setRejected] = useState(rejectedField ?? "");
+  // DPO continuation shape: the shared-prompt column. "" → chosen/rejected are full
+  // conversations and the prompt is their common prefix.
+  const [prompt, setPrompt] = useState(promptField ?? "");
   // TTS-only speaker column (one global column, like audio). "" → one voice.
   const [speaker, setSpeaker] = useState(speakerField ?? "");
   // Per-split transcription column choices (only when the HF source exposes splits).
@@ -151,6 +156,7 @@ export function ColumnsCard({
     setMessages(messagesField ?? "messages");
     setDpoMode(!!(rejectedField ?? "").trim());
     setRejected(rejectedField ?? "");
+    setPrompt(promptField ?? "");
     setSpeaker(speakerField ?? "");
     setErr(null);
     setEditing(true);
@@ -179,8 +185,17 @@ export function ColumnsCard({
         setErr("Chosen and rejected must be different columns.");
         return;
       }
+      if (dpoMode && prompt.trim() && (prompt.trim() === messages.trim() || prompt.trim() === rejected.trim())) {
+        setErr("Prompt must be a different column from chosen and rejected.");
+        return;
+      }
       // rejected_field: a name → DPO (preference) mode; "" → chat mode.
-      const body = { messages_field: messages.trim(), rejected_field: dpoMode ? rejected.trim() : "" };
+      // prompt_field: a name → continuation shape; "" → infer from the common prefix.
+      const body = {
+        messages_field: messages.trim(),
+        rejected_field: dpoMode ? rejected.trim() : "",
+        prompt_field: dpoMode ? prompt.trim() : "",
+      };
       setSaving(true);
       try {
         const r = await fetch(`/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}`, {
@@ -364,6 +379,14 @@ export function ColumnsCard({
                 <span className="font-mono text-xs">{rejectedField}</span>
               </div>
             )}
+            {showMessages && (rejectedField ?? "").trim() && (promptField ?? "").trim() && (
+              <div className="flex items-baseline justify-between gap-4 py-1.5">
+                <span className="text-xs text-muted-foreground">
+                  Prompt column <span className="text-[10px]">(DPO)</span>
+                </span>
+                <span className="font-mono text-xs">{promptField}</span>
+              </div>
+            )}
           </div>
         ) : isChatOnly ? (
           // Pure-chat dataset (kind=llm, or an uploaded chat file). Chat (SFT) maps a
@@ -448,6 +471,37 @@ export function ColumnsCard({
                 )}
                 <p className="text-[11px] text-muted-foreground">
                   The dispreferred response. Chosen &amp; rejected should share the prompt turns.
+                </p>
+              </div>
+            )}
+
+            {dpoMode && (
+              <div className="space-y-1 sm:max-w-xs">
+                <Label htmlFor="ds-prompt" className="text-xs">Prompt column (optional)</Label>
+                {!loadingSplits && allColumns.length > 0 ? (
+                  <Select value={prompt || "__none__"} onValueChange={(v) => setPrompt(v === "__none__" ? "" : v)} disabled={saving}>
+                    <SelectTrigger className="font-mono text-xs"><SelectValue placeholder="Choose a column" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__" className="text-xs text-muted-foreground">— none (shared prefix) —</SelectItem>
+                      {allColumns.map((c) => (
+                        <SelectItem key={c} value={c} className="font-mono text-xs">{c}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input
+                    id="ds-prompt"
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    placeholder="prompt"
+                    disabled={saving}
+                    className="font-mono text-xs"
+                  />
+                )}
+                <p className="text-[11px] text-muted-foreground">
+                  Only for the <span className="font-medium">continuation</span> shape: chosen &amp; rejected hold
+                  just the turns AFTER the prompt (an agentic pair that diverges from turn 0). Leave empty when
+                  they are full conversations — the prompt is then their common prefix.
                 </p>
               </div>
             )}

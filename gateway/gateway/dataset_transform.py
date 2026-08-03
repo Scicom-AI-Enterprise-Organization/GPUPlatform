@@ -1129,7 +1129,12 @@ async def _run_llm_pack(
             # 3. Read the objective's columns → rows (messages+tools for SFT;
             #    chosen/rejected (+prompt) preference columns for DPO).
             if objective == "dpo":
-                cols = [chosen_field, rejected_field] + ([prompt_field] if prompt_field else [])
+                # The tools column matters for DPO exactly as much as for SFT: a
+                # preference over tool calls is meaningless against a prompt that
+                # never declared the tools.
+                cols = ([chosen_field, rejected_field]
+                        + ([prompt_field] if prompt_field else [])
+                        + ([tools_field] if tools_field else []))
             else:
                 cols = [messages_field] + ([tools_field] if tools_field else [])
             rows = await run_in_threadpool(_read_split_columns, paths, cols)
@@ -1197,9 +1202,10 @@ async def _run_llm_pack(
                 llm_pack.pack_dpo_rows, rows,
                 tokenizer_name=tokenizer, out_dir=out_dir,
                 chosen_field=chosen_field, rejected_field=rejected_field,
-                prompt_field=prompt_field,
+                prompt_field=prompt_field, tools_field=(tools_field or None),
                 max_seq_len=int(sequence_length), hf_token=token, hf_endpoint=hf_endpoint,
-                all_reasoning=all_reasoning, progress=_pack_progress,
+                all_reasoning=all_reasoning, full_seq_labels=full_seq_labels,
+                progress=_pack_progress,
             )
         else:
             stats = await run_in_threadpool(
@@ -1223,7 +1229,10 @@ async def _run_llm_pack(
                 dataset_id,
                 f"packed {n_bins} bins from {stats.get('pairs_packed')} preference pairs "
                 f"(dropped {stats.get('dropped_long')} too-long, {stats.get('dropped_empty')} bad rows; "
-                f"efficiency {stats.get('efficiency', 0) * 100:.1f}%); uploading shards …")
+                f"{stats.get('rows_with_tools')} pairs had tools; scored "
+                f"{stats.get('scored_tokens')} tokens, masked {stats.get('env_tokens_masked')} "
+                f"environment tokens; efficiency {stats.get('efficiency', 0) * 100:.1f}%); "
+                f"uploading shards …")
         else:
             await _log(
                 dataset_id,

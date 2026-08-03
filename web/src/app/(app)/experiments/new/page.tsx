@@ -9,7 +9,7 @@ import { ExperimentForm } from "./experiment-form";
 export default async function NewExperimentPage({
   searchParams,
 }: {
-  searchParams: Promise<{ dataset?: string; from?: string }>;
+  searchParams: Promise<{ dataset?: string; from?: string; prompt?: string }>;
 }) {
   const me = await getMe();
   const sections = me?.sections as Record<string, boolean> | undefined;
@@ -46,6 +46,29 @@ export default async function NewExperimentPage({
     }
   }
 
+  // "?prompt=opt-…" — confirm a GEPA result. The form opens with TWO variants,
+  // baseline and optimized, on the dataset the search used: the optimizer's own
+  // number is measured on a validation slice, and this is the run that checks it
+  // on the whole corpus with the full evaluator stack.
+  let optimized;
+  if (sp.prompt && !noAccess) {
+    try {
+      const run = await gateway.getPromptOpt(sp.prompt);
+      const text = run.result?.best?.texts?.system_prompt ?? "";
+      if (text) {
+        optimized = {
+          id: run.id,
+          name: run.name,
+          prompt: text,
+          user_suffix: run.result?.best?.texts?.user_suffix ?? "",
+          dataset_id: run.dataset_id,
+        };
+      }
+    } catch {
+      // ignore — fall back to the default empty form
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
       <ConsoleTopbar
@@ -67,8 +90,9 @@ export default async function NewExperimentPage({
             registry={registry}
             suggestions={targets}
             limits={limits}
-            initialDatasetId={sp.dataset ?? ""}
+            initialDatasetId={sp.dataset ?? optimized?.dataset_id ?? ""}
             clone={clone}
+            optimized={optimized}
           />
         )}
       </div>

@@ -522,6 +522,76 @@ across 2 targets × 2 variants, every detector firing at its designed rate (cont
 empty+0-token, fenced JSON, degeneration, HTTP 500), the clean target at 100% pass, cancel keeping
 partial results, and all five web routes rendering the live data.
 
+### Prompt optimization — GEPA (`prompt_opt.py` + `prompt_opt_api.py`)
+
+Reflective prompt evolution (https://dspy.ai/getting-started/gepa-optimization/): replay the
+dataset under a candidate prompt, score every reply, show the failures + their written critique to
+a **reflection LM**, keep the rewrite only if it measurably wins, and sample the next parent from a
+**Pareto frontier** so the search doesn't collapse onto one strategy. Section key `experiments`;
+routes are `/v1/prompt-optimizations/*`; new table `prompt_optimizations` (created by `create_all`,
+registered in `db.init_db`).
+
+**The split is the point.** `prompt_opt.py` is the algorithm and touches nothing — it takes
+`evaluate(texts, row_ids)` and `reflect(component, current, examples)` as injected coroutines, so a
+whole search runs against a two-line fake in `tests/unit/test_prompt_opt.py`. `prompt_opt_api.py`
+is the glue, and it deliberately reuses the experiment runner's own parts:
+`resolve_cases()` → `build_request()` → `call_once()` → **`EvaluatorStack`**.
+
+- **⚠ Not the `gepa` pypi package, and not dspy.** `gepa`'s *base* deps are litellm + mlflow +
+  wandb + datasets + pandas + pyarrow, and its engine is sync (thread-bridging past our cancel flag
+  and heartbeat). DSPy optimizes typed `Signature` fields; Experiments replays raw captured chat
+  messages that have no field structure to bind to. The published algorithm is ~250 lines.
+- **`EvaluatorStack` (in `experiments_api.py`) was extracted for this and is now used by BOTH.**
+  Same detectors, same order, same short-circuit on transport errors, same one-child-process-per-run
+  rule for python evaluators. Two scoring paths that drift would make an optimized prompt's "+14pp"
+  unreproducible in the experiment meant to confirm it. Same reason `snapshot_evaluators()` is
+  shared. **Verified**: a search reporting 0%→100% reproduced exactly as 0.00 / 1.00 in an ordinary
+  two-variant experiment.
+- **The evaluators ARE the metric, `reason` IS the feedback channel.** Score = weighted mean of the
+  detectors that scored; the written half is their `reason` strings. So every built-in, custom and
+  judge evaluator is a GEPA feedback source with no extra authoring.
+  - **ALWAYS_ON diagnostics are excluded from the scalar.** `request_error` passes unconditionally
+    on a successful request, so counting it would score a prompt that fails its only real check 0.5
+    instead of 0 and halve every reported gain. A request that *did* fail is forced to 0.0.
+  - **An abstention is not a pass** (`skipped` / `evaluator_error` / `judge_error` are dropped, not
+    counted as 1.0). A dataset with no reference data makes every detector abstain → flat score →
+    nothing beats the seed → a "completed" run that measured nothing. `result_json` carries
+    **`unscored_rollouts` / `rollouts`** for exactly this, and the UI warns on it.
+- **A candidate IS a variant.** Components map onto `VariantSpec` fields (`system_prompt` →
+  **`system_override`**, a new field that REPLACES the row's system message where prefix/suffix
+  decorate it; `user_suffix` → `user_suffix`). That's why the winner replays through the ordinary
+  runner with no special case, and why `/experiments/new?prompt=opt-…` is one click.
+- **⚠ Budget is denominated in REAL BILLED CALLS and enforced before each iteration**, covering its
+  worst case (two minibatch passes + a validation sweep), so a run cannot overshoot what the user
+  approved — at the cost of up to one unspent sweep at the end. Presets are multiples of the
+  validation-set size (`AUTO_BUDGETS` light 6 / medium 15 / heavy 40), hard ceiling
+  `PROMPT_OPT_MAX_METRIC_CALLS` (5000), rows capped at `PROMPT_OPT_MAX_ROWS` (200 — cost is
+  rows × candidates, so a 2000-row corpus would spend everything on one sweep). Reflection calls hit
+  a *different* endpoint and are counted separately.
+- **⚠ The budget alone does NOT bound the loop — there is an iteration ceiling too.** Parent
+  rollouts are cached (round-robin minibatches mean a surviving parent meets the same rows again),
+  so a reflection model stuck re-proposing the current text hits the cache, is rejected before the
+  child ever runs, spends **zero** metric calls, and spins forever billing the *reflection*
+  endpoint. `max_iterations` = what the budget could pay for uncached. This hung the first test run;
+  `test_a_zero_cost_iteration_cannot_spin_forever` pins it.
+- **Pareto selection keeps a specialist alive**: per-row best scores → each candidate's winning-row
+  set → drop strict subsets → sample proportional to breadth. Hill-climbing the mean walks into the
+  first local optimum; that's the "genetic-Pareto" half of the name. The paper's **merge** across
+  lineages is NOT implemented (nothing to recombine with one component); `Candidate.origin` exists
+  so it can be added without a schema change.
+- **Seed defaults to the dataset's own most common system message** (`GET /prompt-optimizations/seed`).
+  Optimizing a prompt the rows were never captured under measures a different thing.
+- Cancel is cooperative (finishes the turn, keeps the best prompt so far, status `cancelled`);
+  restart cleanup is heartbeat-gated like experiments. `include_expected` shows the row's `expected`
+  block to the reflector — powerful, and the main way a run overfits.
+- **⚠ The gain is measured on the validation split, not held-out data.** With too few rows to split
+  the minibatches reuse the validation rows (`in_sample: true` on the record) and the number is
+  in-sample outright. Treat the confirmation experiment as the real measurement.
+- **Verified e2e locally** (2026-08-02) against a mock upstream whose reply quality depends on the
+  system prompt: seed 0.0 → best 1.0 in one accepted rewrite, budget respected (34/45), correct
+  feedback text, cancel mid-run leaving a usable best prompt at 10/120 calls, both validation errors
+  (no evaluators / half-filled reflection endpoint), and all three web routes rendering live data.
+
 ### Multi-replica HA — leader election (`leader.py`) + proxy cluster (`proxy_cluster.py`)
 
 The gateway is a monolith: it serves a **stateless data plane** (the LLM proxy in `proxy_api.py`, API

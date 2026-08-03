@@ -357,7 +357,24 @@ function ToolCallArgs({ tc }: { tc: ToolCall }) {
 
 /** Chat-bubble rendering for a message list — shared by the SFT row view and the
  * DPO chosen/rejected view. Per-role colours, reasoning traces, tool calls. */
-function ChatBubbles({ msgs }: { msgs: ChatMessage[] }) {
+/** "4 turns · 2 scored" — how much of a DPO completion actually carries gradient. */
+function turnCount(tail: ChatMessage[], fallback: ChatMessage[] | null): string {
+  const msgs = tail.length ? tail : fallback ?? [];
+  const scored = msgs.filter((m) => m.role === "assistant").length;
+  return `${msgs.length} turn${msgs.length === 1 ? "" : "s"} · ${scored} scored`;
+}
+
+/**
+ * `markScored` — DPO completions only. An agentic preference pair interleaves the
+ * policy's assistant turns with `role: tool` results, and the packer masks those
+ * environment turns out of the loss (`llm_pack.tokenize_pair(mask_env=True)`), so a
+ * flat render overstates what the pair actually trains. Non-assistant turns are dimmed
+ * and tagged "not scored". This is a ROLE-level approximation of a TOKEN-level mask —
+ * the real boundary is the template's `{% generation %}` span, and where a template
+ * carries no mask the packer scores everything. The packed-dataset decode
+ * (`PackedRowItem`) shows the true per-token mask.
+ */
+function ChatBubbles({ msgs, markScored = false }: { msgs: ChatMessage[]; markScored?: boolean }) {
   return (
     <div className="space-y-2">
       {msgs.map((m, i) => {
@@ -365,6 +382,8 @@ function ChatBubbles({ msgs }: { msgs: ChatMessage[] }) {
         const isSystem = m.role === "system";
         const isTool = m.role === "tool";
         const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
+        // The policy generates assistant turns; everything else is environment text.
+        const notScored = markScored && m.role !== "assistant";
 
         // ── avatar ──
         const avatarCls = cn(
@@ -395,17 +414,34 @@ function ChatBubbles({ msgs }: { msgs: ChatMessage[] }) {
           :               "assistant";
 
         return (
-          <div key={i} className={cn("flex items-start gap-2", isUser ? "flex-row-reverse" : "flex-row")}>
+          <div
+            key={i}
+            className={cn(
+              "flex items-start gap-2",
+              isUser ? "flex-row-reverse" : "flex-row",
+              // Dim is the ambient cue; the "not scored" tag below is the one that
+              // actually carries the meaning (opacity alone is too weak a signal).
+              notScored && "opacity-60",
+            )}
+          >
             {/* avatar */}
             <div className={avatarCls} title={m.role}>
               <AvatarIcon className="h-3 w-3" />
             </div>
 
             {/* bubble */}
-            <div className={bubbleCls}>
-              {roleLabel && (
-                <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide opacity-60">
-                  {roleLabel}
+            <div className={cn(bubbleCls, notScored && "border-dashed")}>
+              {(roleLabel || notScored) && (
+                <span className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide">
+                  {roleLabel && <span className="opacity-60">{roleLabel}</span>}
+                  {notScored && (
+                    <span
+                      className="rounded-sm border border-current px-1 py-px font-medium normal-case tracking-normal opacity-70"
+                      title="Environment text — masked out of the DPO loss (llm_pack mask_env)"
+                    >
+                      not scored
+                    </span>
+                  )}
                 </span>
               )}
 
@@ -498,32 +534,56 @@ function LlmRowItem({
  * One DPO preference row — the shared prompt shown once, then the chosen (✓) and
  * rejected (✕) responses side by side. `chosenField`/`rejectedField` name the two
  * message-list columns (chosen defaults to the dataset's messages column).
+ *
+ * Two corpus shapes, matching `llm_pack._normalize_pair`:
+ *   * **shared-prefix** — chosen/rejected are FULL conversations that agree on the
+ *     prompt turns; the prompt is their common prefix. `promptField` is unset.
+ *   * **continuation** — `promptField` names a column holding the prompt turns and
+ *     chosen/rejected hold ONLY what follows. An agentic pair diverges from turn 0,
+ *     so there is no common prefix to infer and the prompt MUST come from the column
+ *     (without it the viewer showed no prompt at all).
  */
 function DpoRowItem({
   index,
   row,
   chosenField,
   rejectedField,
+  promptField,
 }: {
   index: number;
   row: DatasetPreviewRow;
   chosenField: string;
   rejectedField: string;
+  promptField?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const chosen = isChatMessages(row[chosenField]) ? (row[chosenField] as ChatMessage[]) : null;
   const rejected = isChatMessages(row[rejectedField]) ? (row[rejectedField] as ChatMessage[]) : null;
+  const promptCol =
+    promptField && isChatMessages(row[promptField]) ? (row[promptField] as ChatMessage[]) : null;
 
-  // Chosen & rejected agree on the prompt turns; find how far, so the shared prompt
-  // is shown once and only the divergent tails go under chosen/rejected.
-  let shared = 0;
-  if (chosen && rejected) {
+  let prompt: ChatMessage[] = [];
+  let chosenTail: ChatMessage[] = chosen ?? [];
+  let rejectedTail: ChatMessage[] = rejected ?? [];
+  if (promptCol) {
+    // Continuation shape. Tolerate a corpus that ALSO repeats the prompt turns at the
+    // head of chosen/rejected — same leniency as the packer.
+    prompt = promptCol;
+    const n = promptCol.length;
+    const repeats = (m: ChatMessage[] | null) =>
+      !!m && m.length >= n && JSON.stringify(m.slice(0, n)) === JSON.stringify(promptCol);
+    chosenTail = repeats(chosen) ? chosen!.slice(n) : chosen ?? [];
+    rejectedTail = repeats(rejected) ? rejected!.slice(n) : rejected ?? [];
+  } else if (chosen && rejected) {
+    // Shared-prefix shape: find how far the two agree, so the prompt is shown once
+    // and only the divergent tails go under chosen/rejected.
+    let shared = 0;
     const n = Math.min(chosen.length, rejected.length);
     while (shared < n && JSON.stringify(chosen[shared]) === JSON.stringify(rejected[shared])) shared++;
+    prompt = chosen.slice(0, shared);
+    chosenTail = chosen.slice(shared);
+    rejectedTail = rejected.slice(shared);
   }
-  const prompt = chosen ? chosen.slice(0, shared) : [];
-  const chosenTail = chosen ? chosen.slice(shared) : [];
-  const rejectedTail = rejected ? rejected.slice(shared) : [];
   const firstUser = prompt.find((m) => m.role === "user") ?? prompt[0] ?? chosen?.[0];
 
   return (
@@ -555,24 +615,38 @@ function DpoRowItem({
         <div className="space-y-3 border-t border-border p-3">
           {prompt.length > 0 && (
             <div className="space-y-1">
-              <div className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">prompt</div>
+              <div className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+                prompt <span className="normal-case opacity-70">· shared, not scored ({prompt.length} turns)</span>
+              </div>
               <ChatBubbles msgs={prompt} />
             </div>
           )}
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <div className="rounded-md border border-emerald-600/40 bg-emerald-500/5 p-2">
-              <div className="mb-1 font-mono text-[10px] font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
-                ✓ chosen
+              <div className="mb-1 flex items-baseline justify-between gap-2">
+                <span className="font-mono text-[10px] font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+                  ✓ chosen
+                </span>
+                <span className="font-mono text-[10px] text-muted-foreground">{turnCount(chosenTail, chosen)}</span>
               </div>
-              <ChatBubbles msgs={chosenTail.length ? chosenTail : chosen} />
+              <ChatBubbles msgs={chosenTail.length ? chosenTail : chosen} markScored />
             </div>
             <div className="rounded-md border border-destructive/40 bg-destructive/5 p-2">
-              <div className="mb-1 font-mono text-[10px] font-semibold uppercase tracking-wide text-destructive">
-                ✕ rejected
+              <div className="mb-1 flex items-baseline justify-between gap-2">
+                <span className="font-mono text-[10px] font-semibold uppercase tracking-wide text-destructive">
+                  ✕ rejected
+                </span>
+                <span className="font-mono text-[10px] text-muted-foreground">{turnCount(rejectedTail, rejected)}</span>
               </div>
-              <ChatBubbles msgs={rejectedTail.length ? rejectedTail : rejected} />
+              <ChatBubbles msgs={rejectedTail.length ? rejectedTail : rejected} markScored />
             </div>
           </div>
+          <p className="text-[11px] text-muted-foreground">
+            Turns tagged <span className="font-medium">not scored</span> are environment output
+            (tool results), masked out of the DPO loss — only the assistant turns get gradient.
+            Role-level approximation of the packer&apos;s token-level{" "}
+            <span className="font-mono text-[10px]">{"{% generation %}"}</span> mask.
+          </p>
         </div>
       )}
     </div>
@@ -941,6 +1015,7 @@ export function RowBrowser({
   speakerField,
   messagesField,
   rejectedField,
+  promptField,
   decoder,
 }: {
   datasetId: string;
@@ -949,6 +1024,7 @@ export function RowBrowser({
   speakerField?: string | null;
   messagesField?: string | null;
   rejectedField?: string | null;
+  promptField?: string | null;
   decoder?: DecoderState | null;
 }) {
   // A rejected column set → DPO (preference) dataset: render chosen ↔ rejected pairs.
@@ -956,6 +1032,7 @@ export function RowBrowser({
   const isDpo = !!(rejectedField ?? "").trim();
   const chosenField = (messagesField ?? "").trim() || "chosen";
   const rejField = (rejectedField ?? "").trim() || "rejected";
+  const promptCol = (promptField ?? "").trim() || null;
   // Use chat-bubble view whenever a messages column is configured, regardless of kind.
   const isLlm = !isDpo && !!(messagesField ?? "").trim();
   // A packed LLM dataset can be sampled + soundness-checked against its tokenizer.
@@ -1252,7 +1329,7 @@ export function RowBrowser({
               const item = r.packed === true ? (
                 <PackedRowItem datasetId={datasetId} index={offset + i} row={r} split={rowSplit ?? selected[0] ?? null} decoder={decoder} />
               ) : isDpo ? (
-                <DpoRowItem index={offset + i} row={r} chosenField={chosenField} rejectedField={rejField} />
+                <DpoRowItem index={offset + i} row={r} chosenField={chosenField} rejectedField={rejField} promptField={promptCol} />
               ) : isLlm ? (
                 <LlmRowItem index={offset + i} row={r} messagesField={messagesField ?? "messages"} />
               ) : (

@@ -308,8 +308,11 @@ only structural difference is qwen builds the custom class via `make_custom_cls(
 (two base classes) while gemma sets it on the single subclass via `model.enable_dpo(beta)`.
 
 - **Dataset**: `kind=llm_dpo_packed` — packed by 'Pack for LLM' with **objective=dpo**
-  (`llm_pack.pack_dpo_rows`). Sources: `chosen`/`rejected` columns as full message lists sharing
-  the prompt turns (ultrafeedback style) OR plain strings + a `prompt_field`. Same ChiniDataset
+  (`llm_pack.pack_dpo_rows`). Three source shapes (`extract_pair_messages`): **continuation** —
+  a `prompt_field` messages column + `chosen`/`rejected` holding only the turns AFTER it (agentic
+  trajectories: differing lengths, `role: tool` results interleaved); **ultrafeedback** — full
+  message lists sharing the prompt turns, no prompt column; **plain strings** + a `prompt_field`.
+  See "Agentic DPO" below — the first shape needs the tools column and env masking. Same ChiniDataset
   columns as llm_packed but: every bin holds WHOLE pairs, doc count is even, **first half of the
   docs are the chosen responses** (pair k = (doc k, doc K+k)), and `labels` are **pre-aligned
   next-token targets** (targets[j]=ids[j+1] on response positions, −100 on prompt + final; NO
@@ -346,6 +349,62 @@ only structural difference is qwen builds the custom class via `make_custom_cls(
   gateway needs a gemma-authorized `HF_TOKEN` in its env to pack the gated gemma tokenizer. The
   Triton kernel `__main__` gates (`python triton_func.py` / `triton_dpo.py`) are still worth a run
   when re-syncing from small-ablation.
+
+### Agentic DPO — tool declarations + environment masking, 2026-08-02
+
+The original DPO packer assumed the textbook shape: **one** assistant reply per side, no tools. A
+**tool-calling** preference corpus (each side a whole trajectory — assistant turns interleaved with
+`role: tool` results) broke it three ways, all of which packed *successfully* and trained the wrong
+objective. Found on `ucc_ai_research/synthetic-generation/tm-text-assist-simulation/dpo-v2` (678
+rows / 320 with `has_pair & pair_guard_ok`), gemma-4:
+
+1. **⚠ A JSON-STRING message-list cell was packed as a literal JSON dump.** `extract_pair_messages`
+   dispatched on `isinstance(cell, str)` → the plain-response branch → `{"role": "assistant",
+   "content": '[{"role": "assistant", "content": "", "tool_calls": …}]'}`. The finetune learns to
+   emit the serialized transcript. Parquets store message lists as JSON strings all the time (it's
+   why `extract_messages` exists) — so **parse first, and treat a cell as a response string only
+   when it does NOT parse into messages**. Without a `prompt_field` the same rows instead hit the
+   ultrafeedback equal-length + identical-prefix check and **all 320 dropped → 0 bins**.
+2. **⚠ `pack_dpo_rows` never rendered the tools column** (no `tools_field` at all, while
+   `pack_rows` has had one since day one). A preference over tool CALLS trained against a prompt
+   that never declared the tools — train/serve mismatch on every row. Now plumbed end-to-end
+   (`datasets_api` already forwarded `tools_field`; only the DPO branch of `dataset_transform`
+   dropped it), and `dataset_transform` reads the column for DPO too.
+3. **⚠ Environment tokens were inside the DPO log-ratio — `mask_env=True` is the new default.**
+   This is NOT the SFT masking rationale, and the usual "DPO needs no mask, mask the prompt and
+   score the rest" instinct is right *only* for a single-reply completion. Here **37.0% of the
+   scored tokens were KB search results** — text the policy cannot emit — and the chosen/rejected
+   env spans share **48% of their vocabulary**, so the loss pushed the *same* KB sentences up on
+   one side and down on the other. 41/320 pairs had env tokens outnumbering model tokens.
+   `tokenize_pair` now scores only tokens the template's `{% generation %}` mask marks. A template
+   with **no** generation mask (all-zero → every arch but gemma-4, see the 2026-07-22 correction in
+   `gateway/CLAUDE.md`) **silently degrades to the old full-completion behaviour** rather than
+   scoring nothing; `full_seq_labels=true` on the pack card is the explicit opt-out.
+
+**The gemma stop token stays scored.** Mask anchor E1 wraps `<|tool_response>` — gemma-4's actual
+stop after a tool call — so the scored span runs reasoning → `<|tool_call>…<tool_call|>` →
+`<|tool_response>` and then cuts, excluding the response body. Same lesson as the SFT
+tool-call-looping bug: whatever masks, the eos that terminates an assistant span must stay inside.
+
+**Read `env_tokens_masked` / `scored_tokens` / `rows_with_tools` off the pack summary.**
+`env_tokens_masked: 0` on a corpus you know carries tool results means the generation mask didn't
+apply and the loss is scoring environment output — the same failure mode as `assistant_masked_rows`
+collapsing to 0 on the SFT side.
+
+**Verified on the real corpus** (local, `google/gemma-4-31B-it`): 320/320 pairs packed, 0 dropped,
+67 bins @ 65536, 89.1% efficiency, 320 with tools, 568,014 scored vs 333,545 env tokens masked
+(37.0%). Bin layout re-checked (even doc count, first-half chosen, `position_ids` reset per doc,
+`sum(attention_mask) == len(input_ids)`), targets confirmed pre-aligned, and the prompt boundary
+verified to land **past** the true prompt on all 320 pairs (0 prompt tokens scored). ⚠ gemma-4's
+prompt render is **not** prefix-stable — `add_generation_prompt=True` emits an *empty* thought
+channel (`<|channel>thought\n<channel|>`) where the real turn emits reasoning, so it diverges ~1
+token before the end and `tokenize_pair` takes the common-prefix fallback on **every** row. That's
+benign (it lands +6..+698 past the prompt, shared tokens cancel) — don't "fix" it. Sizing: the
+pair (chosen+rejected) max is **46,618 tokens**, so `sequence_length` must be ≥ 65536 to keep every
+pair; at 32768 four pairs drop, at 16384 sixty-three do.
+
+Unit tests: `gateway/tests/unit/test_llm_pack_dpo.py` (tokenizer-free — a fake template reports a
+generation mask the way gemma's injected blocks do).
 
 ## Context parallelism — zigzag ring attention (gemma-4 only), 2026-07-04
 

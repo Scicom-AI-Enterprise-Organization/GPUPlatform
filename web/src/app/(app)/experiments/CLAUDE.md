@@ -13,8 +13,9 @@ Server pages fetch via `gateway.*` (`web/src/lib/gateway.ts`); client components
 | `/experiments/new` | `new/experiment-form.tsx` | **mirrors `/benchmark/new`** — see below |
 | `/experiments/[id]` | `[id]/experiment-detail.tsx` | header KPIs + `?tab=`-less Tabs: Overview / Tradeoff / Samples / Config |
 | `/experiments/evaluators` | `evaluators/*` | your reusable evaluator library (author/test/edit) + the built-ins for reference |
+| `/experiments/optimize` | `optimize/*` | GEPA prompt optimization — see below |
 | — | `tradeoff-plot.tsx` | the parallel-coordinates chart, shared by the detail tabs |
-| — | `section-tabs.tsx` | Runs · Evaluators. **No Datasets tab on purpose** — see below |
+| — | `section-tabs.tsx` | Runs · Optimize · Evaluators. **No Datasets tab on purpose** — see below |
 | — | `new/capture-dialog.tsx` | capture requests (Langfuse / served traffic) into a NEW platform dataset |
 
 ## The one rule for `new/`: mirror `/benchmark/new`
@@ -117,6 +118,39 @@ rows without a usable messages cell are dropped. That distinction is why the foo
 - Live updates: the list polls every 4s while any run is `running`/`queued`; the detail polls
   every 3s while its own run is active. No SSE — a run writes progress to the row every ~2s and
   there's no log stream to follow.
+
+## Optimize (`optimize/`) — GEPA, and the loop back into Runs
+
+`optimize/page.tsx` + `optimize-list.tsx` (runs) · `optimize/new/optimize-form.tsx` (create) ·
+`optimize/[id]/optimize-detail.tsx` (result). All three mirror their Runs counterparts —
+diff `optimize-list.tsx` against `experiments-list.tsx` and `optimize-form.tsx` against
+`experiment-form.tsx` before changing structure. Backend + the algorithm's gotchas are in
+**`gateway/gateway/CLAUDE.md` → "Prompt optimization — GEPA"**. What's UI-specific:
+
+- **It's a peer tab, not a sub-page of Runs.** A search *uses* the same datasets and evaluators, and
+  its output is a prompt you then run an experiment with — siblings in one loop.
+- **The form PRICES the run, and that number must match the server.** GEPA's budget is real billed
+  requests, so the Budget card resolves it client-side with the same arithmetic as
+  `resolve_budget()` in `prompt_opt_api.py` (preset × validation rows, floored at one full
+  iteration, clamped to the ceiling) and prints "Up to N billed requests" above the submit bar.
+  Ceilings come from `GET /v1/prompt-optimizations/limits` — never hardcode them here. Change the
+  Python, change this.
+- **The component list is server-driven** (`limits.components`), same convention as the evaluator
+  registry: adding a mutable slot in `prompt_opt.COMPONENTS` needs no change in this directory.
+- **Two warnings on the detail page are load-bearing, not decoration.** `unscored_rollouts > 0`
+  means replies no evaluator graded (all of them = the run measured nothing however green it looks);
+  `in_sample` means the minibatches reused the validation rows so the gain is in-sample. Both come
+  straight off `result_json`; don't quietly drop them to tidy the layout.
+- **The loop closes through `?prompt=opt-…`.** `/experiments/new` fetches the run server-side and
+  seeds **two** variants — `baseline` and `optimized` (the winner in `system_override`) — on the
+  dataset the search used, with a banner naming its origin. A GEPA result is a comparison, not a
+  single prompt: the optimizer scored it on a validation slice, and that run confirms it on the
+  whole corpus. Don't "simplify" it to one variant.
+- **`system_override` is a new VariantSpec field** (replaces the row's system message; prefix/suffix
+  still decorate on top) and is a normal part of the experiment form now — it is where an optimized
+  prompt lands, but it's useful on its own.
+- `react-hooks/set-state-in-effect` fires on `optimize-form.tsx`'s seed-prompt fetch, same as the
+  ~44 pre-existing instances noted below. The build does not gate on it.
 
 ## The two benchmark unit tests
 

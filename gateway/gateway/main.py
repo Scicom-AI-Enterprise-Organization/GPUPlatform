@@ -60,6 +60,7 @@ from . import history_api as history_module
 from . import catalog_api as catalog_module
 from . import hf_mirror_api as hf_mirror_module
 from . import experiments_api as experiments_module
+from . import prompt_opt_api as prompt_opt_module
 
 logger = logging.getLogger("gateway")
 
@@ -629,6 +630,18 @@ async def leader_workload(app: FastAPI) -> list[asyncio.Task]:
 
     tasks.append(asyncio.create_task(_experiments_reconcile(), name="experiments_reconcile"))
 
+    async def _prompt_opt_reconcile():
+        try:
+            p_orphaned = await prompt_opt_module.cleanup_orphaned_running()
+            if p_orphaned:
+                logger.warning(
+                    "prompt-opt: failed %d orphaned run(s) after gateway restart", p_orphaned
+                )
+        except Exception:
+            logger.exception("prompt-opt: orphan reconcile failed")
+
+    tasks.append(asyncio.create_task(_prompt_opt_reconcile(), name="prompt_opt_reconcile"))
+
     # GitOps loop (self-disables with GITOPS_POLL=0; manual sync + webhook always work).
     tasks.append(asyncio.create_task(gitops_module.gitops_reconcile_loop(app), name="gitops"))
 
@@ -926,6 +939,7 @@ app.include_router(history_module.router)
 app.include_router(catalog_module.router)
 app.include_router(hf_mirror_module.router)
 app.include_router(experiments_module.router)
+app.include_router(prompt_opt_module.router)
 
 
 # Reject requests whose declared Content-Length exceeds this many MB (413)

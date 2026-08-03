@@ -464,6 +464,12 @@ class Dataset(Base):
     # (chosen = messages_field). NULL → chat/SFT mode (no preference pairing). Its
     # presence is what flips the dataset into "dpo" mode (columns card + preview).
     rejected_field: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # kind=llm preference (DPO) mode, CONTINUATION shape only: the column holding the
+    # shared prompt turns, when chosen/rejected carry ONLY the turns after them (an
+    # agentic pair that diverges from turn 0 shares no prefix to infer). Also used
+    # when chosen/rejected are plain response strings. NULL → the prompt is the
+    # common prefix of chosen/rejected. See llm_pack._normalize_pair.
+    prompt_field: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # When this (s3-backed) dataset has been published to the self-hosted HF mirror
     # — the id of the CatalogRepo (repo_type=dataset) serving its files over /hf, so
     # the dataset page can show pull snippets + link to it. NULL = not published.
@@ -711,6 +717,7 @@ async def init_db() -> None:
     from . import proxy_api  # noqa: F401  # registers ProxyEndpoint / ProxyRequest
     # registers EvalDataset / EvalCase / Experiment / ExperimentSample
     from . import experiments_api  # noqa: F401
+    from . import prompt_opt_api  # noqa: F401  # registers PromptOptimization
     # Explicit pool sizing — the SQLAlchemy async default (pool_size=5,
     # max_overflow=10 → 15 conns, pool_timeout=30s) is small; under load a burst
     # of concurrent requests exhausted it and every new checkout blocked 30s,
@@ -798,6 +805,11 @@ async def init_db() -> None:
         # messages_field). NULL on existing rows → chat/SFT mode (unchanged).
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS rejected_field VARCHAR(128)"
+        ))
+        # DPO continuation shape: the shared-prompt column. NULL on existing rows →
+        # prompt inferred as the chosen/rejected common prefix (previous behaviour).
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS prompt_field VARCHAR(128)"
         ))
         # Per-clip audio-download retry cap for kind=label transforms. NULL on existing
         # rows → retry until success (the new default; fixes the silent-drop bug).

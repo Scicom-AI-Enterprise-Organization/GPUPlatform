@@ -22,6 +22,33 @@ is the contract — keep it in sync with the gateway's pydantic models of the sa
 renders a DPO source as chosen ✓ / rejected ✗ pairs (`DpoRowItem`) and a packed DPO dataset shows
 its **preference-pair** count + a per-pair decode.
 
+**⚠ Two DPO corpus shapes — `prompt_field` is what tells them apart.** `DpoRowItem` and
+`llm_pack._normalize_pair` must agree here or the viewer and the packer disagree about the data:
+
+- **shared-prefix** (ultrafeedback style) — chosen/rejected are FULL conversations agreeing on the
+  prompt turns. `prompt_field` is unset; the prompt is their **common prefix**.
+- **continuation** (agentic pairs) — a `prompt_field` column holds the prompt turns and
+  chosen/rejected hold **only the turns after** them. Such a pair diverges at turn 0, so the common
+  prefix is *empty* and the prompt **cannot** be inferred — it must come from the column. (This is
+  exactly what silently broke: with `prompt_field` unmapped the row viewer rendered no prompt at
+  all and summarised each row by the first *assistant* turn.) Both sides tolerate a corpus that
+  ALSO repeats the prompt turns at the head of chosen/rejected.
+
+**Scored vs environment turns.** `DpoRowItem` renders the chosen/rejected tails with
+`<ChatBubbles markScored>`: non-assistant turns are dimmed + tagged **not scored**, and each panel
+headers a `N turns · M scored` count. An agentic completion interleaves the policy's assistant
+turns with `role: tool` results, and the packer masks those out of the loss
+(`llm_pack.tokenize_pair(mask_env=True)`) — a flat render overstates what the pair trains. ⚠ This is
+a **role-level approximation of a token-level mask**: the real boundary is the template's
+`{% generation %}` span, and on a template that carries no mask the packer scores the whole
+completion while this UI still shows tool turns as "not scored". The packed-dataset decode
+(`PackedRowItem`) is the one that reflects the TRUE per-token mask.
+
+`prompt_field` is a **stored dataset column mapping** (`Dataset.prompt_field`, columns card →
+`PATCH`), not just a pack-time argument: the row browser reads it, and `POST /datasets/{id}/pack-llm`
+falls back to it when the request omits `prompt_field`. A continuation corpus registered without it
+still *packs* (`llm_pack` accepts it per-request) but previews wrong — set it on the dataset.
+
 ## Pages & cards
 
 - `new/dataset-form.tsx` — register a dataset (one branch per `kind`). The `label` branch collects
@@ -30,7 +57,8 @@ its **preference-pair** count + a per-pair decode.
 - `[datasetId]/dataset-detail.tsx` — tabbed detail. Editable cards PATCH then `router.refresh()`:
   - `columns-card.tsx` — audio/transcription/speaker/messages column mapping. For a chat-only
     dataset it also has a **Chat (SFT) / Preference (DPO)** mode toggle: DPO mode maps a **chosen**
-    (= `messages_field`) + **rejected** (`rejected_field`) column; saving `rejected_field` flips the
+    (= `messages_field`) + **rejected** (`rejected_field`) column, plus an optional **prompt**
+    (`prompt_field`) column for the continuation shape above; saving `rejected_field` flips the
     dataset into DPO mode (row viewer → pairs; Pack for LLM defaults to objective=dpo).
   - `label-import-card.tsx` — **`kind=label` only**: edit the review status + timestamp cutoff
     post-registration (re-counts rows on save). Mirrors `columns-card`'s edit/save/inline-error

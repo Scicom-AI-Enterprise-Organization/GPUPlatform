@@ -76,6 +76,10 @@ class CreateDatasetRequest(BaseModel):
     # kind=llm preference (DPO) mode — the rejected-response column. Set it (chat→dpo mode)
     # to pack chosen/rejected pairs and preview them side by side. Blank/None → chat mode.
     rejected_field: Optional[str] = None
+    # kind=llm DPO continuation shape — the shared-prompt column, when chosen/rejected
+    # hold only the turns AFTER it (or are plain response strings). Blank/None → the
+    # prompt is inferred as the chosen/rejected common prefix.
+    prompt_field: Optional[str] = None
     # kind=label — live import from a labeling-platform project's export API.
     label_base_url: Optional[str] = None     # e.g. http://localhost:3002
     label_project_id: Optional[str] = None   # project UUID
@@ -105,6 +109,9 @@ class UpdateDatasetRequest(BaseModel):
     # kind=llm DPO mode — the rejected-response column. Pass "" to clear (→ chat mode),
     # a name to enable preference (DPO) mode. None → leave unchanged.
     rejected_field: Optional[str] = None
+    # kind=llm DPO continuation shape — the shared-prompt column. Pass "" to clear
+    # (→ infer from the common prefix). None → leave unchanged.
+    prompt_field: Optional[str] = None
     # kind=label import filters. None → leave unchanged. label_status switches the
     # review-status filter; label_updated_until sets/clears (pass "") the ISO-8601
     # point-in-time cutoff. Changing either re-counts the dataset's rows.
@@ -326,6 +333,8 @@ class DatasetRecord(BaseModel):
     messages_field: Optional[str] = None
     # kind=llm DPO (preference) mode: the rejected-response column (None → chat mode)
     rejected_field: Optional[str] = None
+    # kind=llm DPO continuation shape: the shared-prompt column (None → infer from prefix)
+    prompt_field: Optional[str] = None
     # When published to the self-hosted HF mirror: the CatalogRepo id serving it
     # over /hf (None = not published). The dataset page links + shows pull snippets.
     catalog_repo_id: Optional[str] = None
@@ -440,6 +449,7 @@ def _to_record(
         label_token_secret=getattr(d, "label_token_secret", None),
         messages_field=getattr(d, "messages_field", None) or None,
         rejected_field=getattr(d, "rejected_field", None) or None,
+        prompt_field=getattr(d, "prompt_field", None) or None,
         transform_status=getattr(d, "transform_status", None),
         transform_log=getattr(d, "transform_log", None),
         catalog_repo_id=getattr(d, "catalog_repo_id", None),
@@ -846,6 +856,7 @@ async def create_dataset(
         row.messages_field = mf
         # A rejected column flips it into DPO (preference) mode (messages = chosen).
         row.rejected_field = (req.rejected_field or "").strip() or None
+        row.prompt_field = (req.prompt_field or "").strip() or None
     elif req.kind in ("hf", "upload"):
         # A HF-repo or uploaded dataset is a CHAT dataset when a messages column is
         # mapped; empty → a plain audio dataset. (kind=hf and kind=llm are otherwise
@@ -853,6 +864,7 @@ async def create_dataset(
         # Upload rows are introspected later by /upload; HF rows lazily by preview.)
         row.messages_field = (req.messages_field or "").strip() or None
         row.rejected_field = (req.rejected_field or "").strip() or None
+        row.prompt_field = (req.prompt_field or "").strip() or None
     elif req.kind == "tts_packed":
         # Register existing ChiniDataset shards: introspect the prefix for splits +
         # per-split counts + total size, and stamp the _tts_pack metadata so preview
@@ -1084,6 +1096,9 @@ async def update_dataset(
     if req.rejected_field is not None:
         # A non-blank value flips the dataset into DPO (preference) mode; "" clears it → chat.
         d.rejected_field = req.rejected_field.strip() or None
+    if req.prompt_field is not None:
+        # "" → infer the prompt from the chosen/rejected common prefix.
+        d.prompt_field = req.prompt_field.strip() or None
     # kind=label import filters. Changing the status or the point-in-time cutoff
     # changes which tasks the dataset materialises, so re-count the rows (best-effort
     # — a transient platform/token issue must not block the metadata edit).
@@ -1883,20 +1898,31 @@ def _fast_tokenizer(repo_id: str, hf_token: Optional[str]):
     return tok
 
 
-def _mask_segments(tok, ids: list, labels: list) -> tuple[list[dict], int]:
+def _mask_segments(tok, ids: list, labels: list,
+                   pre_aligned: bool = False) -> tuple[list[dict], int]:
     """Split `ids` into contiguous [{text, trained}] runs at every labels != -100
     transition, so the UI can highlight exactly the assistant-trained spans. Returns
     (segments, trained_token_count). Decoding run-by-run is clean here because the
-    boundaries fall on turn edges (whitespace), not mid-word BPE merges."""
+    boundaries fall on turn edges (whitespace), not mid-word BPE merges.
+
+    ⚠ `pre_aligned=True` for **DPO** packs. SFT labels are positional
+    (`labels[j] == ids[j]` on a trained token), but `llm_pack.tokenize_pair` stores
+    NEXT-TOKEN targets (`labels[j] == ids[j+1]`) so the fused kernel needs no shift.
+    Decoding those runs as `ids[i:j]` renders every highlighted span ONE TOKEN EARLY
+    — the mask looks like it starts on the env's `<tool_response|>` closer instead of
+    the model's own text, i.e. exactly like a masking bug in the one view you'd use to
+    rule one out. The counts are unaffected either way (same number of positions)."""
     segs: list[dict] = []
     trained = 0
     i, n = 0, len(ids)
+    shift = 1 if pre_aligned else 0
     while i < n:
         on = labels[i] != -100
         j = i
         while j < n and (labels[j] != -100) == on:
             j += 1
-        segs.append({"text": tok.decode(ids[i:j], skip_special_tokens=False), "trained": on})
+        text = tok.decode(ids[i + shift:min(j + shift, n)], skip_special_tokens=False)
+        segs.append({"text": text, "trained": on})
         if on:
             trained += j - i
         i = j
@@ -1928,7 +1954,8 @@ def _decode_packed_record(repo_id: str, hf_token: Optional[str], rec: dict,
         seg = ids[pos:pos + length]
         u = {"tokens": len(seg), "text": tok.decode(seg, skip_special_tokens=False)}
         if have_labels:
-            segs, tr = _mask_segments(tok, seg, labels[pos:pos + length])
+            segs, tr = _mask_segments(tok, seg, labels[pos:pos + length],
+                                      pre_aligned=(objective == "dpo"))
             u["segments"] = segs
             u["trained"] = tr
             total_trained += tr
@@ -3377,7 +3404,10 @@ async def pack_llm_dataset(
         objective=req.objective,
         chosen_field=(req.chosen_field or "chosen").strip(),
         rejected_field=(req.rejected_field or "rejected").strip(),
-        prompt_field=(req.prompt_field or "").strip() or None,
+        # Fall back to the dataset's mapped prompt column so a continuation-shape
+        # corpus packs correctly without re-typing it on every pack.
+        prompt_field=((req.prompt_field or "").strip()
+                      or (getattr(d, "prompt_field", None) or "").strip() or None),
     )
     await audit_module.record(user, "dataset.pack-llm", "dataset", dataset_id, d.name,
                               details={"tokenizer": req.tokenizer, "subsets": subsets,

@@ -6,13 +6,17 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { FlaskConical, Microscope } from "lucide-react";
+import { FlaskConical, Microscope, Wand2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Datasets deliberately absent: experiments read from the platform's own
 // /datasets section rather than keeping a parallel corpus of their own.
+// Optimize is a peer, not a sub-page of Runs: a GEPA search *uses* the same
+// datasets and evaluators, and its output is a prompt you then run an
+// experiment with — the two are siblings in the same loop.
 const TABS = [
   { label: "Runs", href: "/experiments", icon: Microscope },
+  { label: "Optimize", href: "/experiments/optimize", icon: Wand2 },
   { label: "Evaluators", href: "/experiments/evaluators", icon: FlaskConical },
 ];
 

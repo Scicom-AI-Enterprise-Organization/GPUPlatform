@@ -1097,6 +1097,9 @@ export type DatasetRecord = {
   hf_synced_at?: string | null;
   messages_field?: string | null; // kind=llm: column holding the messages array (= chosen in DPO mode)
   rejected_field?: string | null; // kind=llm DPO (preference) mode: rejected-response column (null → chat mode)
+  // kind=llm DPO continuation shape: column holding the shared prompt turns, when
+  // chosen/rejected hold only what follows them (null → infer from the common prefix)
+  prompt_field?: string | null;
   label_base_url?: string | null; // kind=label source (token never returned)
   label_project_id?: string | null;
   label_status?: string | null; // approved | rejected | not_reviewed | all
@@ -1126,6 +1129,7 @@ export type CreateDatasetRequest = {
   hf_revision?: string | null; // kind=hf/llm — commit/branch/tag to pin
   messages_field?: string | null; // kind=llm / llm_packed — column holding the messages array (= chosen in DPO mode)
   rejected_field?: string | null; // kind=llm DPO mode — rejected-response column
+  prompt_field?: string | null; // kind=llm DPO continuation shape — shared-prompt column
   // kind=label — import from a labeling-platform project
   label_base_url?: string | null;
   label_project_id?: string | null;
@@ -1147,6 +1151,8 @@ export type UpdateDatasetRequest = {
   // set → DPO (preference) mode, "" → chat mode. null → leave unchanged.
   messages_field?: string | null;
   rejected_field?: string | null;
+  // DPO continuation shape — the shared-prompt column ("" → infer from the common prefix).
+  prompt_field?: string | null;
   // kind=label import filters (null → unchanged; pass "" for label_updated_until to clear the cutoff)
   label_status?: string | null;
   label_updated_until?: string | null;
@@ -2066,6 +2072,9 @@ export type ExperimentTargetSpec = {
 export type ExperimentVariantSpec = {
   label: string;
   params?: Record<string, unknown>;
+  /** REPLACES the row's system message (prefix/suffix decorate it instead).
+   * Where a GEPA-optimized prompt lands when you run an experiment with it. */
+  system_override?: string;
   system_prefix?: string;
   system_suffix?: string;
   user_suffix?: string;
@@ -2175,6 +2184,137 @@ export type ExperimentSampleRecord = {
   status_code: number | null;
   error_text: string | null;
   evals: Record<string, ExperimentSampleEval>;
+};
+
+// ---- Prompt optimization (GEPA) -----------------------------------------
+// Mirrors gateway/gateway/prompt_opt_api.py. A run searches for a better system
+// prompt by replaying dataset rows, scoring them with the SAME evaluators an
+// experiment uses, and having a reflection model rewrite the prompt from the
+// failures. The winner is a plain variant (`system_override`) so it drops
+// straight into an ordinary experiment.
+
+export type PromptOptLimits = {
+  max_metric_calls: number;
+  max_rows: number;
+  default_rows: number;
+  max_concurrency: number;
+  default_concurrency: number;
+  /** Budget presets, as multiples of the validation-set size. */
+  auto_budgets: Record<string, number>;
+  default_minibatch: number;
+  components: Array<{ id: string; label: string; description: string }>;
+};
+
+export type PromptOptSeedResponse = {
+  seed_prompt: string;
+  n_rows: number;
+  n_with_system: number;
+  distinct_system: number;
+  source: "dataset" | "none" | string;
+};
+
+export type PromptOptCandidate = {
+  index: number;
+  parent: number | null;
+  iteration: number;
+  component: string | null;
+  origin: string;
+  score: number;
+  texts: Record<string, string>;
+};
+
+export type PromptOptIteration = {
+  i: number;
+  parent: number;
+  component: string;
+  origin: string;
+  row_ids: string[];
+  parent_score: number;
+  child_score: number | null;
+  accepted: boolean;
+  val_score: number | null;
+  candidate: number | null;
+  calls: number;
+  note: string;
+  proposal: string;
+  /** The failures the reflection model was shown — why the prompt changed. */
+  examples: Array<{
+    row_id: string;
+    row_name: string;
+    score: number;
+    prompt: string;
+    output: string;
+    feedback: string;
+  }>;
+};
+
+export type PromptOptResult = {
+  components: string[];
+  seed: PromptOptCandidate;
+  best: PromptOptCandidate;
+  improved: number;
+  candidates: PromptOptCandidate[];
+  iterations: PromptOptIteration[];
+  metric_calls: number;
+  reflection_calls: number;
+  budget: number;
+  stopped: "budget" | "iterations" | "cancelled" | string;
+  val_rows: number;
+  train_rows: number;
+  /** Too few rows to split — the gain is measured on the rows it tuned against. */
+  in_sample: boolean;
+  n_rows: number;
+  rollouts: number;
+  /** Replies no evaluator scored. All of them = the run measured nothing. */
+  unscored_rollouts: number;
+  /** Present only while the run is in flight. */
+  progress?: { metric_calls: number; budget: number };
+};
+
+export type PromptOptRecord = {
+  id: string;
+  name: string;
+  dataset_id: string;
+  dataset_name: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | string;
+  config: Record<string, unknown>;
+  result: PromptOptResult | null;
+  budget: number;
+  metric_calls: number;
+  reflection_calls: number;
+  seed_score: number | null;
+  best_score: number | null;
+  error_text: string | null;
+  owner: string;
+  created_at: string;
+  started_at: string | null;
+  ended_at: string | null;
+};
+
+export type CreatePromptOptRequest = {
+  name: string;
+  dataset_id: string;
+  target: ExperimentTargetSpec;
+  reflection?: ExperimentTargetSpec | null;
+  reflection_guidance?: string;
+  reflection_temperature?: number;
+  reflection_max_tokens?: number;
+  evaluators?: EvaluatorSelection[];
+  components?: string[];
+  seed_prompt?: string;
+  seed_user_suffix?: string;
+  max_rows?: number;
+  val_rows?: number;
+  budget?: string;
+  max_metric_calls?: number;
+  minibatch_size?: number;
+  max_examples?: number;
+  concurrency?: number;
+  timeout_s?: number;
+  stream?: boolean;
+  weights?: Record<string, number>;
+  include_expected?: boolean;
+  rng_seed?: number;
 };
 
 export type ExperimentTargetSuggestion = {

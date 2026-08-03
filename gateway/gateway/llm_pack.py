@@ -557,12 +557,25 @@ def extract_pair_messages(row_get: Callable[[str], Any], *, chosen_field: str,
                           arch: str, all_reasoning: bool) -> Optional[tuple[list, list, list]]:
     """Normalize one preference row into (prompt_msgs, chosen_msgs, rejected_msgs),
     each a full message list (chosen/rejected INCLUDE the prompt turns + the final
-    assistant turn). Two source shapes are accepted:
-      * chosen/rejected are message lists sharing the prompt turns (ultrafeedback-
-        binarized style) — the prompt is everything before the final assistant turn;
-      * chosen/rejected are plain strings + a `prompt_field` column (a string or a
-        messages list) holding the shared prompt.
-    Returns None when the row doesn't parse (caller counts it dropped)."""
+    assistant turn). Three source shapes are accepted:
+      * **continuation** — a `prompt_field` messages column + chosen/rejected message
+        lists holding ONLY the turns AFTER the prompt. This is what an agentic
+        preference corpus looks like: each side is a whole trajectory (assistant turns
+        interleaved with `role: tool` results), so the two sides have DIFFERENT lengths
+        and share no suffix. Requires prompt_field.
+      * **ultrafeedback-binarized** — chosen/rejected are full message lists sharing
+        the prompt turns; the prompt is everything before the final assistant turn.
+      * **plain strings** — chosen/rejected are response strings + a `prompt_field`
+        column (a string or a messages list) holding the shared prompt.
+    Returns None when the row doesn't parse (caller counts it dropped).
+
+    ⚠ Message lists are tried BEFORE the plain-string branch, because a parquet
+    routinely stores a message list as a JSON *string* (this whole module's
+    `extract_messages` exists for that). Dispatching on `isinstance(cell, str)` sent
+    such a cell down the string branch, which wrapped the raw JSON text as ONE
+    assistant `content` — the finetune then trained gemma to emit a literal
+    `[{"role": "assistant", …}]` dump, with no error anywhere. Parse first, and only
+    treat a cell as a response string when it does NOT parse into messages."""
     def _as_prompt_msgs(value: Any) -> Optional[list]:
         msgs = extract_messages(value, arch, all_reasoning)
         if msgs:
@@ -572,6 +585,34 @@ def extract_pair_messages(row_get: Callable[[str], Any], *, chosen_field: str,
         return None
 
     c_raw, r_raw = row_get(chosen_field), row_get(rejected_field)
+    chosen = extract_messages(c_raw, arch, all_reasoning)
+    rejected = extract_messages(r_raw, arch, all_reasoning)
+
+    if chosen and rejected:
+        if chosen[-1].get("role") not in ("assistant", "model") or \
+                rejected[-1].get("role") not in ("assistant", "model"):
+            return None
+        prompt = _as_prompt_msgs(row_get(prompt_field)) if prompt_field else None
+        if prompt:
+            # Continuation shape. Tolerate a corpus that ALSO repeats the prompt turns
+            # inside chosen/rejected (don't render them twice).
+            n = len(prompt)
+            c_cont = chosen[n:] if chosen[:n] == prompt else chosen
+            r_cont = rejected[n:] if rejected[:n] == prompt else rejected
+            if not c_cont or not r_cont:
+                return None
+            return prompt, prompt + c_cont, prompt + r_cont
+        prompt = chosen[:-1]
+        # The pair must share its prompt turns — otherwise the DPO log-ratio compares
+        # apples to oranges. (Content compare, not identity: rows often duplicate them.)
+        if len(rejected) != len(chosen) or \
+                json.dumps(prompt, sort_keys=True, default=str) != \
+                json.dumps(rejected[:-1], sort_keys=True, default=str):
+            return None
+        if not prompt:
+            return None
+        return prompt, chosen, rejected
+
     if isinstance(c_raw, str) and isinstance(r_raw, str):
         if not prompt_field:
             return None
@@ -582,23 +623,7 @@ def extract_pair_messages(row_get: Callable[[str], Any], *, chosen_field: str,
         rejected = prompt + [{"role": "assistant", "content": r_raw}]
         return prompt, chosen, rejected
 
-    chosen = extract_messages(c_raw, arch, all_reasoning)
-    rejected = extract_messages(r_raw, arch, all_reasoning)
-    if not chosen or not rejected:
-        return None
-    if chosen[-1].get("role") not in ("assistant", "model") or \
-            rejected[-1].get("role") not in ("assistant", "model"):
-        return None
-    prompt = chosen[:-1]
-    # The pair must share its prompt turns — otherwise the DPO log-ratio compares
-    # apples to oranges. (Content compare, not identity: rows often duplicate them.)
-    if len(rejected) != len(chosen) or \
-            json.dumps(prompt, sort_keys=True, default=str) != \
-            json.dumps(rejected[:-1], sort_keys=True, default=str):
-        return None
-    if not prompt:
-        return None
-    return prompt, chosen, rejected
+    return None
 
 
 def _common_prefix_len(a: list, b: list) -> int:
@@ -610,7 +635,8 @@ def _common_prefix_len(a: list, b: list) -> int:
 
 
 def tokenize_pair(tokenizer, prompt_msgs, chosen_msgs, rejected_msgs,
-                  chat_template=None, **kw) -> Optional[tuple[list, list, list, list]]:
+                  chat_template=None, tools: Optional[list] = None,
+                  mask_env: bool = True, **kw) -> Optional[tuple[list, list, list, list]]:
     """Tokenize one preference pair → (chosen_ids, chosen_targets, rejected_ids,
     rejected_targets), with targets PRE-ALIGNED per the fused-DPO contract:
     targets[j] = ids[j+1] on response positions, IGNORE_INDEX on prompt tokens and
@@ -620,20 +646,46 @@ def tokenize_pair(tokenizer, prompt_msgs, chosen_msgs, rejected_msgs,
     add_generation_prompt=True and checking it prefixes both full renders; templates
     that aren't prefix-stable fall back to the longest common prefix of the two full
     renders (equivalent for DPO: any shared-prefix tokens contribute identical
-    log-probs to both sides and cancel in the pairwise loss)."""
+    log-probs to both sides and cancel in the pairwise loss).
+
+    `tools` renders the row's tool declarations into the prompt, exactly as SFT
+    packing does. Omitting them on a function-calling corpus trains the preference
+    against a prompt the model will never be served.
+
+    ⚠ `mask_env=True` (default) additionally restricts the scored region to tokens the
+    POLICY generates, using the template's `{% generation %}` mask. This is NOT the SFT
+    masking rationale. Plain single-reply DPO needs no mask — everything after the
+    prompt is the model's own text, so masking is a no-op. But an AGENTIC preference
+    pair's completion interleaves assistant turns with `role: tool` results, and those
+    are environment output: scoring them makes the DPO log-ratio reward the model for
+    the KB text that happened to come back on the chosen side and penalize it for the
+    text on the rejected side — gradient on tokens the policy cannot emit. Where the
+    template carries no generation mask (all-zero → every arch but gemma-4 today) this
+    silently degrades to scoring the whole completion, i.e. the previous behaviour."""
     if chat_template is not None:
         kw["chat_template"] = chat_template
+    if tools:
+        kw["tools"] = tools
 
-    def _render(msgs, **extra):
+    def _render(msgs, want_mask: bool = False, **extra):
         # return_dict=True like tokenize_row — transformers 5.x returns a dict
         # (not a bare id list) from apply_chat_template.
+        if want_mask:
+            try:
+                out = tokenizer.apply_chat_template(
+                    msgs, tokenize=True, return_dict=True,
+                    return_assistant_tokens_mask=True, **kw, **extra)
+                m = out.get("assistant_masks")
+                return list(out["input_ids"]), (list(m) if m and any(m) else None)
+            except Exception:  # noqa: BLE001 — kwarg unsupported by this tokenizer version
+                pass
         out = tokenizer.apply_chat_template(msgs, tokenize=True, return_dict=True, **kw, **extra)
-        return list(out["input_ids"])
+        return list(out["input_ids"]), None
 
-    c_ids = _render(chosen_msgs)
-    r_ids = _render(rejected_msgs)
+    c_ids, c_gen = _render(chosen_msgs, want_mask=mask_env)
+    r_ids, r_gen = _render(rejected_msgs, want_mask=mask_env)
     try:
-        p_ids = _render(prompt_msgs, add_generation_prompt=True)
+        p_ids, _ = _render(prompt_msgs, add_generation_prompt=True)
     except Exception:  # noqa: BLE001 — template without generation-prompt support
         p_ids = []
     if p_ids and c_ids[:len(p_ids)] == p_ids and r_ids[:len(p_ids)] == p_ids:
@@ -644,13 +696,20 @@ def tokenize_pair(tokenizer, prompt_msgs, chosen_msgs, rejected_msgs,
     if prompt_len < 1 or len(c_ids) <= prompt_len or len(r_ids) <= prompt_len:
         return None
 
-    def _targets(ids: list) -> list:
+    def _targets(ids: list, gen: Optional[list]) -> list:
         t = [IGNORE_INDEX] * len(ids)
         for j in range(prompt_len - 1, len(ids) - 1):
-            t[j] = ids[j + 1]
+            # targets[j] predicts ids[j+1] → consult the mask at the PREDICTED position.
+            if gen is None or gen[j + 1]:
+                t[j] = ids[j + 1]
         return t
 
-    return c_ids, _targets(c_ids), r_ids, _targets(r_ids)
+    c_t, r_t = _targets(c_ids, c_gen), _targets(r_ids, r_gen)
+    # A pair whose mask left one side with nothing to score would contribute a
+    # one-sided log-ratio; drop it rather than train on half a preference.
+    if not any(t != IGNORE_INDEX for t in c_t) or not any(t != IGNORE_INDEX for t in r_t):
+        return None
+    return c_ids, c_t, r_ids, r_t
 
 
 def collate_dpo_bin(pairs: list) -> dict:
@@ -670,11 +729,13 @@ def pack_dpo_rows(
     chosen_field: str = "chosen",
     rejected_field: str = "rejected",
     prompt_field: Optional[str] = None,
+    tools_field: Optional[str] = None,
     max_seq_len: int = 131072,
     hf_token: Optional[str] = None,
     hf_endpoint: Optional[str] = None,
     all_reasoning: bool = True,
     arch: Optional[str] = None,
+    full_seq_labels: bool = False,
     progress: Optional[Callable[[int, int], None]] = None,
     progress_every: int = 100,
 ) -> dict:
@@ -683,6 +744,11 @@ def pack_dpo_rows(
     every bin holds WHOLE pairs, doc count is even, and the first half of each
     bin's docs are the chosen responses (see collate_dpo_bin). A pair whose
     chosen+rejected renders don't both fit one bin is dropped (never split).
+
+    `tools_field` names the tool-declaration column, rendered as `tools=` into BOTH
+    sides' prompt — same column and same semantics as SFT packing. `full_seq_labels`
+    scores every completion token including environment (`role: tool`) output; the
+    default masks it to policy-generated tokens (see tokenize_pair).
 
     BLOCKING (CPU-bound): call from a threadpool, not the event loop.
     """
@@ -693,7 +759,8 @@ def pack_dpo_rows(
     arch = arch or detect_arch(tokenizer_name)
     logger.info("llm_pack: DPO pack — loading tokenizer %s (arch=%s)", tokenizer_name, arch)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, token=hf_token or None)
-    chat_template = build_chat_template(tokenizer, all_reasoning, arch)
+    chat_template = build_chat_template(tokenizer, all_reasoning, arch,
+                                        assistant_mask=not full_seq_labels)
     tpl_kw: dict[str, Any] = {}
     if arch == "mistral":
         tpl_kw["reasoning_effort"] = "high" if all_reasoning else "none"
@@ -704,7 +771,7 @@ def pack_dpo_rows(
 
     total_rows = len(rows)
     n_bins = n_pairs = n_dropped_long = n_dropped_bad = 0
-    total_tokens = 0
+    total_tokens = rows_with_tools = scored_tokens = env_tokens_masked = 0
     cur_pairs: list = []
     cur_count = 0
 
@@ -721,14 +788,17 @@ def pack_dpo_rows(
     writer = ParquetWriter(out=out_dir, columns=COLUMNS, exist_ok=True)
     with writer as out:
         for i in range(total_rows):
+            row_get = _get_factory(rows[i])
             trip = extract_pair_messages(
-                _get_factory(rows[i]), chosen_field=chosen_field,
+                row_get, chosen_field=chosen_field,
                 rejected_field=rejected_field, prompt_field=prompt_field,
                 arch=arch, all_reasoning=all_reasoning)
+            tools = extract_tools(row_get(tools_field)) if tools_field else []
             pair = None
             if trip is not None:
                 try:
-                    pair = tokenize_pair(tokenizer, *trip, chat_template=chat_template, **tpl_kw)
+                    pair = tokenize_pair(tokenizer, *trip, chat_template=chat_template,
+                                         tools=tools, mask_env=not full_seq_labels, **tpl_kw)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("llm_pack: DPO row %d tokenize failed (%s); skipping", i, e)
             if pair is None:
@@ -750,6 +820,20 @@ def pack_dpo_rows(
                         cur_pairs.append(pair)
                         cur_count += length
                     n_pairs += 1
+                    if tools:
+                        rows_with_tools += 1
+                    # Scored vs masked accounting, over BOTH sides. `env_tokens_masked`
+                    # is the headline sanity number for an agentic corpus: 0 on a
+                    # single-reply dataset (nothing to mask), a large fraction when the
+                    # completions carry tool results — and 0 on a corpus that DOES carry
+                    # them means the template had no generation mask and the loss is
+                    # scoring environment output (see tokenize_pair).
+                    for ids, tgts in ((pair[0], pair[1]), (pair[2], pair[3])):
+                        scored = sum(1 for t in tgts if t != IGNORE_INDEX)
+                        scored_tokens += scored
+                        # everything after the prompt boundary that did NOT get scored
+                        first = next((j for j, t in enumerate(tgts) if t != IGNORE_INDEX), len(ids))
+                        env_tokens_masked += (len(ids) - 1 - first) - scored
 
             if progress and total_rows and (i + 1) % progress_every == 0:
                 progress(i + 1, total_rows)
@@ -778,6 +862,10 @@ def pack_dpo_rows(
         "tokenizer": tokenizer_name,
         "arch": arch,
         "objective": "dpo",
+        "rows_with_tools": rows_with_tools,
+        "scored_tokens": scored_tokens,
+        "env_tokens_masked": env_tokens_masked,
+        "full_seq_labels": full_seq_labels,
     }
 
 

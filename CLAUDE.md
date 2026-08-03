@@ -14,12 +14,13 @@ code and are pulled in automatically only when you touch that subtree:
   cu1300 / fork-install / crash-abort gotchas, the provider metrics page (NVML + `/proc`), the VM
   reverse tunnel, VM Compute sessions (uv venv + proxied JupyterLab), Activity + proxy-mode
   recording, the Label platform, the HF catalog/mirror, Quantization (llm-compressor —
-  scheme sync, calib datasets, mirror-push Xet gotcha), and Experiments (the evaluator registry,
-  the no-retry rule, and the silent Langfuse-import corruptions).
+  scheme sync, calib datasets, mirror-push Xet gotcha), Experiments (the evaluator registry,
+  the no-retry rule, and the silent Langfuse-import corruptions), and GEPA prompt optimization
+  (shared `EvaluatorStack`, the billed-call budget, the zero-cost-iteration spin).
 - **`worker-agent/worker_agent/CLAUDE.md`** — the multi-model fleet: vLLM venv self-bootstrap,
   `vllm_version` / `vllm_install_args` / git forks / `pre_script`, and serving Whisper/audio.
 - **`web/src/app/(app)/experiments/CLAUDE.md`** — the Experiments UI (agent observability): the
-  Runs/Evaluators tabs, the server-driven evaluator form, the two capture sources, the
+  Runs/Optimize/Evaluators tabs, the server-driven evaluator form, the two capture sources, the
   row-not-case vocabulary rule, and the CVD-validated tradeoff-plot palette.
 - **`web/src/app/(app)/quantization/CLAUDE.md`** — the Quantization UI: mirrors Autotrain 1:1
   (the file↔file mapping table), server-driven scheme dropdown, HF-export tab conventions.

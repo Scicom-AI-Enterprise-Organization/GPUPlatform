@@ -51,6 +51,7 @@ export function LlmPackCard({
   datasetId,
   messagesField,
   rejectedField,
+  promptField: promptField_,
   s3Storages,
   initialStatus,
   initialLog,
@@ -59,6 +60,7 @@ export function LlmPackCard({
   datasetId: string;
   messagesField: string;
   rejectedField?: string | null;
+  promptField?: string | null;
   s3Storages: StorageRecord[];
   initialStatus: string | null;
   initialLog: string | null;
@@ -83,7 +85,9 @@ export function LlmPackCard({
   const [objective, setObjective] = useState<"sft" | "dpo">(isPref ? "dpo" : "sft");
   const [chosenField, setChosenField] = useState(isPref ? messagesField : "chosen");
   const [rejectedFieldName, setRejectedFieldName] = useState((rejectedField ?? "").trim() || "rejected");
-  const [promptField, setPromptField] = useState("");
+  // Prefill from the dataset's mapped prompt column (Columns card) so a continuation-
+  // shape corpus doesn't need it re-typed on every pack.
+  const [promptField, setPromptField] = useState((promptField_ ?? "").trim());
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [status, setStatus] = useState<string | null>(initialStatus);
   const [log, setLog] = useState<string | null>(initialLog);

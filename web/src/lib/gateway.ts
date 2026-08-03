@@ -93,6 +93,10 @@ import type {
   ExperimentSampleRecord,
   ExperimentTargetsResponse,
   CreateExperimentRequest,
+  PromptOptLimits,
+  PromptOptRecord,
+  PromptOptSeedResponse,
+  CreatePromptOptRequest,
   LangfusePreviewRequest,
   LangfusePreviewResponse,
   TryItTarget,
@@ -1419,6 +1423,34 @@ export const gateway = {
     request<{ experiments: Array<{ id: string; name: string; status: string; created_at: string; summary: ExperimentSummary | null }> }>(
       `/v1/experiments/${encodeURIComponent(id)}/compare?against=${encodeURIComponent(against.join(","))}`,
     ),
+
+  // ---- Prompt optimization (GEPA) ----
+  promptOptLimits: () => request<PromptOptLimits>("/v1/prompt-optimizations/limits"),
+  /** The dataset's own most-common system message — what the search starts from. */
+  promptOptSeed: (datasetId: string) =>
+    request<PromptOptSeedResponse>(
+      `/v1/prompt-optimizations/seed?dataset_id=${encodeURIComponent(datasetId)}`,
+    ),
+  listPromptOptsPage: (p: PageQuery & { dataset_id?: string } = {}) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(p)) if (v !== undefined && v !== "") qs.set(k, String(v));
+    return request<PageResponse<PromptOptRecord>>(`/v1/prompt-optimizations/_page?${qs.toString()}`);
+  },
+  getPromptOpt: (id: string) =>
+    request<PromptOptRecord>(`/v1/prompt-optimizations/${encodeURIComponent(id)}`),
+  createPromptOpt: (body: CreatePromptOptRequest) =>
+    request<PromptOptRecord>("/v1/prompt-optimizations", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  cancelPromptOpt: (id: string) =>
+    request<PromptOptRecord>(`/v1/prompt-optimizations/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+    }),
+  deletePromptOpt: (id: string) =>
+    request<{ ok: boolean }>(`/v1/prompt-optimizations/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
 };
 
 // Per-model state reported by a multi-model worker's heartbeat.

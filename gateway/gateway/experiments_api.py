@@ -278,6 +278,10 @@ class VariantSpec(BaseModel):
     comparison matrix."""
     label: str = "baseline"
     params: dict[str, Any] = Field(default_factory=dict)
+    # REPLACES the row's system message (prefix/suffix decorate it instead).
+    # This is the axis prompt optimization writes into: a GEPA-optimized prompt
+    # is a whole system prompt, so it has to replace, not wrap.
+    system_override: str = ""
     system_prefix: str = ""
     system_suffix: str = ""
     user_suffix: str = ""
@@ -543,6 +547,16 @@ def build_request(
     params = {**(case.params or {}), **vparams}
 
     # -- prompt mutations -------------------------------------------------- #
+    # Replacement first, decoration second, so a variant can do both: swap the
+    # system prompt for an optimized one AND still pin a suffix on top of it.
+    sys_override = variant.get("system_override") or ""
+    if sys_override:
+        idx = next((i for i, m in enumerate(messages) if m.get("role") == "system"), None)
+        if idx is None:
+            messages.insert(0, {"role": "system", "content": sys_override})
+        else:
+            messages[idx] = {**messages[idx], "content": sys_override}
+
     sys_prefix = variant.get("system_prefix") or ""
     sys_suffix = variant.get("system_suffix") or ""
     if sys_prefix or sys_suffix:
@@ -813,6 +827,121 @@ async def _judge_sample(
 
 
 # --------------------------------------------------------------------------- #
+# The evaluator stack — built-ins + custom evaluators + the judge
+# --------------------------------------------------------------------------- #
+
+
+class EvaluatorStack:
+    """Everything that scores one completion, assembled once per run.
+
+    Extracted from the experiment runner so prompt optimization
+    (`prompt_opt_api.py`) grades a rollout with **exactly** the detectors an
+    experiment would — same order, same short-circuit on transport errors, same
+    one-child-process-per-run rule for python evaluators. Two scoring paths that
+    drift apart would make an optimized prompt's reported gain unreproducible in
+    the experiment that's supposed to confirm it.
+    """
+
+    def __init__(
+        self,
+        selections: list[dict[str, Any]],
+        client: httpx.AsyncClient,
+        genv: dict[str, str],
+        *,
+        default_target: Optional[dict[str, Any]] = None,
+        default_key: str = "",
+        timeout_s: float = 300.0,
+    ) -> None:
+        self.selections = selections or []
+        self.client = client
+        self.timeout_s = timeout_s
+
+        # Custom evaluators come from the run's own SNAPSHOT, never the library
+        # row — editing an entry must not change what a finished run measured.
+        self.custom_specs = [
+            ce.CustomSpec.from_dict(s["custom"]) for s in self.selections if s.get("custom")
+        ]
+        # One long-lived child per python evaluator for the whole run: a 10k-sample
+        # run would otherwise be 10k process launches.
+        self._py = {
+            spec.name: ce.PythonEvaluatorWorker(spec)
+            for spec in self.custom_specs
+            if spec.mode == "python"
+        }
+        # api mode needs no sandbox — it's an outbound call, bounded so a slow
+        # scorer can't consume the connections the replays need.
+        self._api = {
+            spec.name: ce.ApiEvaluatorClient(
+                spec, client, genv.get((spec.config.get("api_key_secret") or "").strip(), ""),
+            )
+            for spec in self.custom_specs
+            if spec.mode == "api"
+        }
+
+        judge_sel = next((s for s in self.selections if s.get("id") == "llm_judge"), None)
+        opts = (judge_sel or {}).get("options") or {}
+        self.judge: Optional[dict[str, Any]] = None
+        self.judge_key = ""
+        if judge_sel:
+            base = default_target or {}
+            self.judge = {
+                "base_url": (opts.get("base_url") or base.get("base_url") or "").rstrip("/"),
+                "model": opts.get("model") or base.get("model") or "",
+                "prompt": opts.get("prompt"),
+                "temperature": opts.get("temperature"),
+                "max_tokens": opts.get("max_tokens"),
+            }
+            ref = (opts.get("api_key_secret") or "").strip()
+            self.judge_key = genv.get(ref, "") if ref else default_key
+        # The prefilter is what keeps judging affordable: only replies that look
+        # suspicious are spent on a judge call.
+        self._prefilters = ev.as_list(opts.get("prefilter_any")) if judge_sel else []
+        self._judge_sem = asyncio.Semaphore(max(1, int(opts.get("concurrency") or 4)))
+
+    @property
+    def ids(self) -> list[str]:
+        """Result keys, in report order. Custom evaluators are keyed by NAME."""
+        return [
+            (s["custom"]["name"] if s.get("custom") else s["id"]) for s in self.selections
+        ] + list(ev.ALWAYS_ON)
+
+    async def evaluate(self, comp: ev.Completion) -> tuple[list[ev.EvalOutcome], bool]:
+        outcomes, passed = ev.run_evaluators(comp, self.selections)
+
+        # A transport error already decided the verdict; running user code
+        # against an empty string would only add noise.
+        if self.custom_specs and not comp.error:
+            for spec in self.custom_specs:
+                if spec.mode == "python":
+                    outcome = await self._py[spec.name].evaluate(comp)
+                elif spec.mode == "api":
+                    outcome = await self._api[spec.name].evaluate(comp)
+                else:
+                    outcome = ce.run_expression_evaluator(spec, comp)
+                outcomes.append(outcome)
+                passed = passed and outcome.passed
+
+        if self.judge and not comp.error:
+            text = comp.content
+            if not self._prefilters or any(
+                re.search(p, text, re.IGNORECASE) for p in self._prefilters
+            ):
+                async with self._judge_sem:
+                    verdict = await _judge_sample(
+                        self.client, self.judge, self.judge_key, text, self.timeout_s
+                    )
+                outcomes.append(verdict)
+                passed = passed and verdict.passed
+
+        return outcomes, passed
+
+    async def close(self) -> None:
+        """Never leave a child process behind, including on cancel/failure."""
+        for worker in self._py.values():
+            await worker.close()
+
+
+# --------------------------------------------------------------------------- #
 # Aggregation
 # --------------------------------------------------------------------------- #
 
@@ -978,8 +1107,6 @@ async def _run_experiment(app, experiment_id: str) -> None:
         timeout_s = float(cfg.get("timeout_s") or 300.0)
         stream = bool(cfg.get("stream", True))
         selections: list[dict[str, Any]] = cfg.get("evaluators") or []
-        judge_cfg = next((s for s in selections if s.get("id") == "llm_judge"), None)
-        judge_opts = (judge_cfg or {}).get("options") or {}
 
         keys = {t["label"]: _resolve_key(t, genv) for t in targets}
         client = _http(app)
@@ -998,47 +1125,15 @@ async def _run_experiment(app, experiment_id: str) -> None:
                 f"× {repeats} repeats). Lower repeats or trim the matrix."
             )
 
-        # Judge setup: default to the first target's endpoint/key so the common
+        # Judge setup defaults to the first target's endpoint/key, so the common
         # case ("judge with the same model") needs no extra configuration.
-        judge_client_cfg: Optional[dict[str, Any]] = None
-        judge_key = ""
-        if judge_cfg:
-            first = targets[0] if targets else {}
-            judge_client_cfg = {
-                "base_url": (judge_opts.get("base_url") or first.get("base_url") or "").rstrip("/"),
-                "model": judge_opts.get("model") or first.get("model") or "",
-                "prompt": judge_opts.get("prompt"),
-                "temperature": judge_opts.get("temperature"),
-                "max_tokens": judge_opts.get("max_tokens"),
-            }
-            ref = (judge_opts.get("api_key_secret") or "").strip()
-            judge_key = genv.get(ref, "") if ref else keys.get(first.get("label", ""), "")
-        prefilters = ev.as_list(judge_opts.get("prefilter_any")) if judge_cfg else []
-        judge_sem = asyncio.Semaphore(max(1, int(judge_opts.get("concurrency") or 4)))
-
-        # Custom evaluators, from the snapshot stored in this experiment's config.
-        # Expression mode is pure and runs inline with the built-ins; python mode
-        # gets ONE long-lived child process for the whole run (a 10k-sample run
-        # would otherwise be 10k process launches).
-        custom_specs = [
-            ce.CustomSpec.from_dict(s["custom"]) for s in selections if s.get("custom")
-        ]
-        py_workers = {
-            spec.name: ce.PythonEvaluatorWorker(spec)
-            for spec in custom_specs
-            if spec.mode == "python"
-        }
-        # api mode needs no sandbox — it's an outbound HTTP call on the shared
-        # client, with its own concurrency bound so a slow scorer can't consume
-        # every connection the replays need.
-        api_clients = {
-            spec.name: ce.ApiEvaluatorClient(
-                spec, client,
-                genv.get((spec.config.get("api_key_secret") or "").strip(), ""),
-            )
-            for spec in custom_specs
-            if spec.mode == "api"
-        }
+        first = targets[0] if targets else {}
+        stack = EvaluatorStack(
+            selections, client, genv,
+            default_target=first,
+            default_key=keys.get(first.get("label", ""), ""),
+            timeout_s=timeout_s,
+        )
 
         results: list[dict[str, Any]] = []
         pending_rows: list[ExperimentSample] = []
@@ -1088,35 +1183,7 @@ async def _run_experiment(app, experiment_id: str) -> None:
                 "_tools": case.tools or [],
             }
 
-            outcomes, passed = ev.run_evaluators(comp, selections)
-
-            # A transport error already decided the verdict; running user code
-            # against an empty string would just add noise.
-            if custom_specs and not comp.error:
-                for spec in custom_specs:
-                    if spec.mode == "python":
-                        outcome = await py_workers[spec.name].evaluate(comp)
-                    elif spec.mode == "api":
-                        outcome = await api_clients[spec.name].evaluate(comp)
-                    else:
-                        outcome = ce.run_expression_evaluator(spec, comp)
-                    outcomes.append(outcome)
-                    passed = passed and outcome.passed
-
-            if judge_cfg and judge_client_cfg and not comp.error:
-                text = comp.content
-                # The prefilter is what keeps judging affordable: only replies
-                # that look suspicious get spent on a judge call.
-                should_judge = not prefilters or any(
-                    re.search(p, text, re.IGNORECASE) for p in prefilters
-                )
-                if should_judge:
-                    async with judge_sem:
-                        verdict = await _judge_sample(
-                            client, judge_client_cfg, judge_key, text, timeout_s
-                        )
-                    outcomes.append(verdict)
-                    passed = passed and verdict.passed
+            outcomes, passed = await stack.evaluate(comp)
 
             evals = {
                 o.id: {"passed": o.passed, "score": o.score, "reason": o.reason, "flags": o.flags}
@@ -1175,16 +1242,10 @@ async def _run_experiment(app, experiment_id: str) -> None:
         try:
             await asyncio.gather(*[worker() for _ in range(min(concurrency, len(units)))])
         finally:
-            # Never leave a child process behind, including on cancel/failure.
-            for w in py_workers.values():
-                await w.close()
+            await stack.close()
         await flush(force=True)
 
-        # Custom evaluators are keyed in results by their NAME, not their id.
-        evaluator_ids = [
-            (s["custom"]["name"] if s.get("custom") else s["id"]) for s in selections
-        ] + list(ev.ALWAYS_ON)
-        summary = summarize(results, sorted(set(evaluator_ids)))
+        summary = summarize(results, sorted(set(stack.ids)))
 
         async with session_factory()() as s3:
             exp3 = await s3.get(Experiment, experiment_id)
@@ -2119,63 +2180,7 @@ async def create_experiment(
     if len(set(vlabels)) != len(vlabels):
         raise HTTPException(status_code=400, detail="variant labels must be unique")
 
-    # Custom evaluators are referenced as "custom:<ce-id>" (a library entry) or
-    # "custom" with the code inline. Either way the code is SNAPSHOTTED into this
-    # experiment's config: editing the library entry later must not retroactively
-    # change what a finished run measured.
-    stored_evaluators: list[dict[str, Any]] = []
-    for sel in req.evaluators:
-        if not sel.id.startswith("custom"):
-            if sel.id not in ev.SPECS:
-                raise HTTPException(status_code=400, detail=f"unknown evaluator: {sel.id}")
-            stored_evaluators.append(sel.model_dump())
-            continue
-
-        opts = sel.options or {}
-        _, _, ref = sel.id.partition(":")
-        if ref:
-            row = await session.get(CustomEvaluator, ref)
-            if row is None:
-                raise HTTPException(status_code=400, detail=f"no such custom evaluator: {ref}")
-            if row.owner_id != user.id and not user.is_admin:
-                raise HTTPException(status_code=403, detail=f"not your evaluator: {ref}")
-            snap = {
-                "id": row.id, "name": row.name, "mode": row.mode,
-                "code": row.code, "fail_when_true": row.fail_when_true,
-                "config": row.config or {},
-            }
-        else:
-            snap = {
-                "id": "inline",
-                "name": str(opts.get("name") or "custom").strip() or "custom",
-                "mode": str(opts.get("mode") or "expression"),
-                "code": str(opts.get("code") or ""),
-                "fail_when_true": bool(opts.get("fail_when_true", False)),
-                "config": dict(opts.get("config") or {}),
-            }
-        # Re-validate at run-create time: python mode may have been disabled, or
-        # the caller may not be an admin any more, since the entry was saved.
-        try:
-            ce.validate_spec(
-                snap["mode"], snap["code"],
-                allow_python=_allow_python(user), config=snap.get("config"),
-            )
-        except ce.CustomEvalError as exc:
-            raise HTTPException(
-                status_code=400, detail=f"custom evaluator {snap['name']!r}: {exc}"
-            )
-        if snap["name"] in ev.SPECS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"custom evaluator {snap['name']!r} collides with a built-in id",
-            )
-        stored_evaluators.append({"id": f"custom:{snap['id']}", "custom": snap})
-
-    names = [
-        (s.get("custom") or {}).get("name") for s in stored_evaluators if s.get("custom")
-    ]
-    if len(set(names)) != len(names):
-        raise HTTPException(status_code=400, detail="custom evaluator names must be unique")
+    stored_evaluators = await snapshot_evaluators(session, user, req.evaluators)
 
     # Row count is the dataset's own tally where it has one; the exact figure is
     # only known once the rows are read, so the cap below is re-checked at run time.
@@ -2227,6 +2232,75 @@ async def create_experiment(
         row.id, user.username, planned, n_rows, len(req.targets), len(variants), req.repeats,
     )
     return _experiment_record(row, user.username, ds.name)
+
+
+async def snapshot_evaluators(
+    session: AsyncSession,
+    user: User,
+    selections: list[EvaluatorSelection],
+) -> list[dict[str, Any]]:
+    """Resolve an evaluator selection into the form a runner consumes.
+
+    Custom evaluators are referenced as `custom:<ce-id>` (a library entry) or
+    bare `custom` with the definition inline. Either way the definition is
+    **snapshotted** into the caller's config: editing the library entry later
+    must not retroactively change what a finished run measured.
+
+    Shared by experiments and prompt optimization so both grade with the same
+    evaluators resolved the same way.
+    """
+    stored: list[dict[str, Any]] = []
+    for sel in selections:
+        if not sel.id.startswith("custom"):
+            if sel.id not in ev.SPECS:
+                raise HTTPException(status_code=400, detail=f"unknown evaluator: {sel.id}")
+            stored.append(sel.model_dump())
+            continue
+
+        opts = sel.options or {}
+        _, _, ref = sel.id.partition(":")
+        if ref:
+            row = await session.get(CustomEvaluator, ref)
+            if row is None:
+                raise HTTPException(status_code=400, detail=f"no such custom evaluator: {ref}")
+            if row.owner_id != user.id and not user.is_admin:
+                raise HTTPException(status_code=403, detail=f"not your evaluator: {ref}")
+            snap = {
+                "id": row.id, "name": row.name, "mode": row.mode,
+                "code": row.code, "fail_when_true": row.fail_when_true,
+                "config": row.config or {},
+            }
+        else:
+            snap = {
+                "id": "inline",
+                "name": str(opts.get("name") or "custom").strip() or "custom",
+                "mode": str(opts.get("mode") or "expression"),
+                "code": str(opts.get("code") or ""),
+                "fail_when_true": bool(opts.get("fail_when_true", False)),
+                "config": dict(opts.get("config") or {}),
+            }
+        # Re-validate at run-create time: python mode may have been disabled, or
+        # the caller may not be an admin any more, since the entry was saved.
+        try:
+            ce.validate_spec(
+                snap["mode"], snap["code"],
+                allow_python=_allow_python(user), config=snap.get("config"),
+            )
+        except ce.CustomEvalError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"custom evaluator {snap['name']!r}: {exc}"
+            )
+        if snap["name"] in ev.SPECS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"custom evaluator {snap['name']!r} collides with a built-in id",
+            )
+        stored.append({"id": f"custom:{snap['id']}", "custom": snap})
+
+    names = [(s.get("custom") or {}).get("name") for s in stored if s.get("custom")]
+    if len(set(names)) != len(names):
+        raise HTTPException(status_code=400, detail="custom evaluator names must be unique")
+    return stored
 
 
 async def _get_experiment(session: AsyncSession, exp_id: str, user: User) -> Experiment:

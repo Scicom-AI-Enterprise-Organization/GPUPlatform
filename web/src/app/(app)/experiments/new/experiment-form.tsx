@@ -87,6 +87,7 @@ const emptyVariant = (label: string, init: Partial<ExperimentVariantSpec> = {}):
   _id: nextId(),
   label,
   params: {},
+  system_override: "",
   system_prefix: "",
   system_suffix: "",
   user_suffix: "",
@@ -108,6 +109,7 @@ export function ExperimentForm({
   limits,
   initialDatasetId,
   clone,
+  optimized,
 }: {
   datasets: ExperimentDatasetOption[];
   storages: StorageRecord[];
@@ -116,6 +118,8 @@ export function ExperimentForm({
   limits: ExperimentLimits;
   initialDatasetId: string;
   clone?: ExperimentRecord;
+  /** Arrived from a GEPA run (`?prompt=opt-…`) — see the two-variant seed below. */
+  optimized?: { id: string; name: string; prompt: string; user_suffix: string; dataset_id: string };
 }) {
   const router = useRouter();
   const cfg = (clone?.config ?? {}) as Record<string, unknown>;
@@ -158,7 +162,9 @@ export function ExperimentForm({
     const qs = params.toString();
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   };
-  const [name, setName] = useState(clone ? `${clone.name}-copy` : "");
+  const [name, setName] = useState(
+    clone ? `${clone.name}-copy` : optimized ? `${optimized.name}-confirm` : "",
+  );
   const [datasetId, setDatasetId] = useState(firstDatasetId);
   const [targets, setTargets] = useState<TargetDraft[]>(() => {
     const src = (cfg.targets as ExperimentTargetSpec[] | undefined) ?? [];
@@ -173,7 +179,20 @@ export function ExperimentForm({
   });
   const [variants, setVariants] = useState<VariantDraft[]>(() => {
     const src = (cfg.variants as ExperimentVariantSpec[] | undefined) ?? [];
-    return src.length ? src.map((v) => emptyVariant(v.label, v)) : [emptyVariant("baseline")];
+    if (src.length) return src.map((v) => emptyVariant(v.label, v));
+    // A GEPA result arrives as a COMPARISON, not a single variant: the optimizer
+    // scored it on a validation slice, and the run that confirms it has to put
+    // the new prompt next to the one it replaced on the same rows.
+    if (optimized) {
+      return [
+        emptyVariant("baseline"),
+        emptyVariant("optimized", {
+          system_override: optimized.prompt,
+          user_suffix: optimized.user_suffix,
+        }),
+      ];
+    }
+    return [emptyVariant("baseline")];
   });
   const [selected, setSelected] = useState<Record<string, Record<string, unknown>>>(() => {
     const src = cfg.evaluators as Array<{ id: string; options?: Record<string, unknown> }> | undefined;
@@ -283,6 +302,7 @@ export function ExperimentForm({
         variants: variants.map((v) => ({
           label: v.label,
           params: v.params,
+          system_override: v.system_override,
           system_prefix: v.system_prefix,
           system_suffix: v.system_suffix,
           user_suffix: v.user_suffix,
@@ -318,6 +338,22 @@ export function ExperimentForm({
             JSON, and latency or cost regressions before your users do.
           </p>
         </div>
+
+        {optimized && (
+          <div className="rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2.5 text-sm">
+            Seeded from{" "}
+            <Link
+              href={`/experiments/optimize/${optimized.id}`}
+              className="font-medium underline underline-offset-2"
+            >
+              {optimized.name}
+            </Link>
+            : two variants, <span className="font-medium">baseline</span> versus{" "}
+            <span className="font-medium">optimized</span>, on the dataset it searched. The
+            optimizer scored the new prompt on a validation slice — this run confirms it on the
+            whole corpus with your full evaluator stack.
+          </div>
+        )}
 
         {/* ---------------- Dataset ---------------- */}
         <SectionCard
@@ -965,6 +1001,7 @@ function VariantEditor({
 
   const mutations = [
     Object.keys(params).length ? `${Object.keys(params).length} param` : "",
+    variant.system_override ? "system replaced" : "",
     variant.system_suffix ? "system" : "",
     variant.user_suffix ? "user" : "",
     variant.assistant_prefill ? "prefill" : "",
@@ -1067,6 +1104,19 @@ function VariantEditor({
               </div>
             </FieldWrap>
           </Grid>
+
+          <FieldWrap
+            label="Replace system prompt"
+            hint="Swaps the row's system message entirely (the append below still applies on top). This is where a GEPA-optimized prompt lands."
+          >
+            <Textarea
+              rows={variant.system_override ? 8 : 3}
+              className="font-mono text-xs"
+              value={variant.system_override ?? ""}
+              onChange={(e) => onPatch({ system_override: e.target.value })}
+              placeholder="Leave blank to keep each row's own system message."
+            />
+          </FieldWrap>
 
           <div className="grid grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-2">
             <FieldWrap
