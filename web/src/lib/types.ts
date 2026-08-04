@@ -1709,6 +1709,8 @@ export type ProxyEndpoint = {
   public?: boolean;
   max_concurrency: number;
   timeout_s: number;
+  // sub-500 statuses that fail over to the next upstream (>=500 always does). [] = off.
+  failover_status?: number[];
   upstreams: ProxyUpstream[];
   stt_callback?: ProxySttCallback | null;
   capture?: ProxyCapture | null;
@@ -1745,6 +1747,7 @@ export type CreateProxyBody = {
   name: string;
   max_concurrency?: number;
   timeout_s?: number;
+  failover_status?: number[];
   enabled?: boolean;
   public?: boolean;
   upstreams: ProxyUpstreamSpec[];

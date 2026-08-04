@@ -127,6 +127,12 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [isPublic, setIsPublic] = useState(initial?.public ?? false);
   const [maxConc, setMaxConc] = useState(String(initial?.max_concurrency ?? 0));
   const [timeoutS, setTimeoutS] = useState(String(initial?.timeout_s ?? 3600));
+  // Sub-500 statuses that fail over to the next upstream. Defaults to the three
+  // OpenRouter documents as transient — 402 out of credits, 408 timed out, 429 throttled.
+  // Blank = off (every 4xx goes straight back to the caller).
+  const [failoverStatus, setFailoverStatus] = useState((initial?.failover_status ?? [402, 408, 429]).join(", "));
+  const parsedFailover = failoverStatus.split(/[,\s]+/).map((x) => Number(x.trim()))
+    .filter((n) => Number.isFinite(n) && n >= 400 && n < 500);
   const [ups, setUps] = useState<UpstreamDraft[]>(initial ? fromEndpoint(initial) : [seededUpstream(prefill)]);
   // STT callback (CER/WER) — a whisper-compatible endpoint the TTS proxy transcribes
   // its generated audio through, async, to record CER/WER. Not a data-plane upstream.
@@ -259,6 +265,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         name: name.trim(),
         max_concurrency: Number(maxConc) || 0,
         timeout_s: Number(timeoutS) || 3600,
+        failover_status: parsedFailover,
         enabled,
         public: isPublic,
         upstreams: b.upstreams,
@@ -313,6 +320,14 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             <Label htmlFor="px-timeout" className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Timeout (s)</Label>
             <Input id="px-timeout" type="number" min={1} value={timeoutS} onChange={(e) => setTimeoutS(e.target.value)} />
           </div>
+          <div>
+            <Label htmlFor="px-failover" className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Fail over on status</Label>
+            <Input id="px-failover" value={failoverStatus} onChange={(e) => setFailoverStatus(e.target.value)} placeholder="402, 408, 429" />
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              4xx codes that try the next upstream — a backend that&apos;s up but can&apos;t serve
+              right now. 5xx and timeouts always do. Blank = off.
+            </p>
+          </div>
         </div>
         <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
           <Label className="text-xs uppercase tracking-wide text-muted-foreground">Enabled</Label>
@@ -339,6 +354,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           upstreams={ups}
           maxConcurrency={Number(maxConc) || 0}
           timeoutS={Number(timeoutS) || 0}
+          failoverStatus={parsedFailover}
           proxyId={initial?.id}
           defaultOpen={false}
           // Ties break on list position, so moving an upstream to the front is what makes

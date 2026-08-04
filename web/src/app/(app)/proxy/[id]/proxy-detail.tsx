@@ -364,6 +364,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 }))}
                 maxConcurrency={ep.max_concurrency}
                 timeoutS={ep.timeout_s}
+                failoverStatus={ep.failover_status ?? []}
                 healthRows={health}
               />
             </CardContent>

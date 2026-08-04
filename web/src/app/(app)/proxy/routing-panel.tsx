@@ -34,12 +34,14 @@ export type RoutingUpstream = {
 
 type Route = { kind: ModelKind; real: string; alias: string; chain: RoutingUpstream[]; tie: number };
 
-// What actually moves a request to the next backend. Identical in all three forwarders
-// (_do_unary, _do_unary_multipart, _stream): status >= 500, or a transport failure —
-// ConnectError / ConnectTimeout / ReadTimeout / ReadError / RemoteProtocolError. Anything
-// under 500 is handed back to the client untouched and marks the backend alive, so a 429
-// does NOT roll to the next backend even though people expect it to.
-const HOP = "5xx · timeout · dropped";
+// What actually moves a request to the next backend. Identical in all the forwarders
+// (_do_unary, _do_unary_multipart, _stream, _do_speech, _stream_speech): status >= 500, a
+// transport failure (ConnectError / ConnectTimeout / ReadTimeout / ReadError /
+// RemoteProtocolError), or one of the endpoint's `failover_status` codes — 429 by default,
+// since a rate-limited backend is up and refusing rather than down. Every other 4xx is
+// handed back to the caller untouched.
+const hopLabel = (failover: number[]) =>
+  ["5xx", ...failover.map(String), "timeout", "dropped"].join(" · ");
 
 // canvas geometry
 const PAD = 16;
@@ -81,10 +83,12 @@ const curveDown = (x: number, y1: number, y2: number, bow: number) =>
   `M ${x} ${y1} C ${x - bow} ${y1}, ${x - bow} ${y2}, ${x} ${y2}`;
 
 export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onPromote,
-                               defaultOpen = true, healthRows }: {
+                               defaultOpen = true, healthRows, failoverStatus = [] }: {
   upstreams: RoutingUpstream[];
   maxConcurrency: number;
   timeoutS: number;
+  // sub-500 statuses this endpoint fails over on, so the hop labels tell the truth
+  failoverStatus?: number[];
   proxyId?: string;   // saved endpoint → pull live upstream health
   // Move an upstream to the front of the list. Only meaningful for a tie: that is the
   // one case where list position, not the priority number, picks the winner.
@@ -189,7 +193,7 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
               <ModelFlow key={`${r.real}/${r.alias}`} route={r} down={down} health={health}
                          simDown={simDown} onToggle={toggleDown} onPromote={onPromote}
                          listOrder={upstreams} maxConcurrency={maxConcurrency} timeoutS={timeoutS}
-                         defaultOpen={defaultOpen} />
+                         defaultOpen={defaultOpen} failoverStatus={failoverStatus} />
             ))}
           </div>
         </details>
@@ -202,7 +206,15 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
         </summary>
         <ul className="space-y-1 border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
           <li><b className="text-foreground">Moves to the next backend</b> on 5xx, a connection refused/timeout, or a dropped socket.</li>
-          <li><b className="text-foreground">Does not move</b> on any 4xx — 400, 401, 404, 422 and <b className="text-foreground">429</b> all return to the client as-is, and the backend stays marked alive.</li>
+          {failoverStatus.length > 0 ? (
+            <li>
+              <b className="text-foreground">Also moves on {failoverStatus.join(", ")}</b> — a rate-limited
+              backend is up and refusing, so it stays marked alive and keeps its place in the chain.
+              Every other 4xx (400, 401, 404, 422) returns to the client as-is.
+            </li>
+          ) : (
+            <li><b className="text-foreground">Does not move on any 4xx</b> — 400, 401, 404, 422 and <b className="text-foreground">429</b> all return to the client as-is. Set a failover status to change that.</li>
+          )}
           <li>Streaming can only fail over before the first byte; after that a dropped upstream just ends the stream.</li>
           <li>Lower priority number wins. Same number is not load balancing — the tie breaks on list order, so the winner moves if you reorder or add an upstream. Distinct numbers pin it.</li>
           <li>A dead backend sinks to last, not out. A probe older than 120s counts as alive again.</li>
@@ -215,7 +227,7 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
 }
 
 function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrder,
-                     maxConcurrency, timeoutS, defaultOpen }: {
+                     maxConcurrency, timeoutS, defaultOpen, failoverStatus }: {
   route: Route;
   down: Set<string>;
   health: Record<string, ProxyUpstreamHealth>;
@@ -226,6 +238,7 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
   maxConcurrency: number;
   timeoutS: number;
   defaultOpen: boolean;
+  failoverStatus: number[];
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [avail, setAvail] = useState(0);
@@ -353,7 +366,7 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
                       transform: "translateY(-50%)",
                       color: i === chain.length - 1 ? "var(--wire)" : "var(--fall)",
                     }}>
-                {i === chain.length - 1 ? "all failed · 502" : HOP}
+                {i === chain.length - 1 ? "all failed · 502" : hopLabel(failoverStatus)}
               </span>
             ))}
 
