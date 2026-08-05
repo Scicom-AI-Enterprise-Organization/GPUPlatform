@@ -695,6 +695,66 @@ the call. LB/k8s semantics: **200** `healthy`/`degraded` (≥1 upstream not-know
 **503** `unhealthy` (all known-dead) / `disabled` / `misconfigured`, **404** unknown endpoint. Per-replica
 view (right for a per-pod probe). Excluded from the HTTP metrics (`METRICS_IGNORE_PATHS`).
 
+### ASR augmentation — the LiveKit/WebRTC transport family (`training/whisper_finetune.py`)
+
+Autotrain ASR's `augment_techniques` gained a second family (2026-08-05) that models the
+**transport a voice agent puts in front of the model**. Motivating symptom: a Whisper finetune with a
+good held-out WER was **terrible** once served as an OpenAI-compatible API behind LiveKit. That is not
+a serving bug — LiveKit never hands the model the microphone signal, only what survives a long lossy
+chain, and a finetune on clean audio has seen none of it.
+
+**The chain, read out of the LiveKit sources (not guessed) — versions current 2026-08:**
+
+| where | what | source |
+|---|---|---|
+| browser capture | `autoGainControl`, `echoCancellation`, `noiseSuppression`, **`voiceIsolation`** all default **true** | `client-sdk-js/src/room/defaults.ts` |
+| publish | Opus, `audioPreset: music` (**48 kbps**), `dtx: true`, `red: true` | same file |
+| presets | telephone 12k / speech 24k / music 48k / musicStereo 64k / …HQ 96k / …HQStereo 128k bps | `client-sdk-js/src/room/track/options.ts` |
+| agent | `rtc.AudioProcessingModule(auto_gain_control=True)` on **every inbound frame** — a SECOND AGC — then optional Krisp BVC, then `rtc.AudioResampler` (default quality MEDIUM) | `agents/.../voice/room_io/_input.py` |
+| STT plugin | `SAMPLE_RATE = 24000` → the OpenAI-compatible endpoint is fed **24 kHz** WAV, resampled at quality HIGH | `livekit-plugins-openai/.../stt.py`, `agents/.../stt/stt.py` |
+| VAD | Silero `min_speech_duration 0.05`, `min_silence_duration 0.55`, `prefix_padding_duration 0.5`, `activation_threshold 0.5`, 16 kHz | `livekit-plugins-silero/.../vad.py` |
+| SIP | trunks negotiate **PCMU/PCMA (G.711, 8 kHz)** by default and LiveKit SIP transcodes that leg to Opus → a phone caller is a **codec tandem** | LiveKit telephony docs |
+
+**Techniques:** `livekit` (the whole chain in order, per-sample randomised — *this is the one to use*),
+`livekit_sip` (the telephony variant), and the isolatable stages `opus`, `g711`, `packet_loss`, `dtx`,
+`agc`, `webrtc_ns`, `aec`, `vad_clip`, `resample_chain`.
+
+- **⚠ `layout="mono"` in `_opus_av` is load-bearing and fails SILENTLY.** A PyAV audio stream defaults
+  to **stereo**; a stereo libopus stream splits the bitrate budget across two channels, so
+  `stream.bit_rate` stops tracking and every "bitrate" produces the same distortion. Measured before
+  the fix: 48000 requested → **22.6 kbps actual**, and 12k/24k/48k all landed within 0.2 dB of each
+  other. It looks like it works. Verify a codec change by checking encoded **bytes/second**, never by
+  eyeballing the waveform.
+- **⚠ The opus round-trip is REAL, with a loud fallback.** `_opus_backend()` resolves once: PyAV
+  (in-process libopus) → ffmpeg CLI → a **DSP approximation**. `av` is in the trainer's venv `pkgs` +
+  `check_mods`, so an older venv is reconciled on the next run. The DSP path logs a WARNING because a
+  band-pass filter that is not a codec would look exactly like success in the metrics.
+- **`compression_level=5`, not ffmpeg's default 10.** Maps to `OPUS_SET_COMPLEXITY`; libwebrtc uses 9
+  desktop / 5 mobile. Measured identical distortion (−7.4 vs −7.6 dB residual, corr .908 vs .911 at
+  24 kbps) for ~30 % less encode time — and the encode is ~95 % of the chain's cost.
+- **⚠ `vad_clip` trims SILENCE only, deliberately.** Real VAD segmentation does clip words, but
+  cropping speech while keeping the full transcript is exactly how you train a model to **hallucinate
+  the missing words**. It tightens leading/trailing silence to a random 0–400 ms and leaves hard
+  (un-faded) edges. Every technique here is label-preserving; keep it that way.
+- **Cost: budget dataloader workers.** Steady-state on one core for a 7 s clip: most techniques
+  0.1–13 ms, but `opus`/`livekit`/`livekit_sip` are **~130–210 ms** (PyAV) / ~80–100 ms (ffmpeg CLI) /
+  ~25 ms (DSP). At `augment_prob=0.5` that is ~100 ms per sample amortised — raise
+  `dataloader_num_workers` or the GPU starves. `_LazyAsrDataset.__getitem__` runs in the workers, so
+  it parallelises.
+- **⚠ Four registries must stay in sync**, else a technique is silently dropped from the run config:
+  `whisper_finetune._AUG_FUNCS` (the trainer), `training_api._AUG_TECHNIQUES` (validation — request
+  values not in this set are **filtered out silently**), `training-form.tsx` `AUG_OPTIONS` +
+  `LIVEKIT_AUG_OPTIONS` (the UI), `automation/run_pipeline.py` `ALL_AUGMENTATIONS` +
+  `LIVEKIT_AUGMENTATIONS`. `gateway/tests/unit/test_audio_augment.py` pins the first three.
+- **Restart rules**: `whisper_finetune.py` is **SFTP'd per run** → trainer edits need no gateway
+  restart. `training_api.py` is imported → its `_AUG_TECHNIQUES` edit **does**.
+- **`resolve_augment` aliases** (automation YAML): `all` = the 8 classic techniques (unchanged
+  meaning), `livekit_all` = the 11 transport ones. Plain `livekit` is a real technique, not an alias.
+- Verified against a real speech clip: opus distortion falls monotonically with bitrate, G.711 leaves
+  <1 % energy above 4.2 kHz, PLC conceals instead of zeroing, AGC's 3 dB/s slew leaves the clip head
+  15 dB under the tail, and 20 random draws of both chains stay finite/unclipped on all three codec
+  backends.
+
 ### Label platform (data-labelling app)
 
 A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)

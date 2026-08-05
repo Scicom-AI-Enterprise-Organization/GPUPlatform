@@ -193,6 +193,56 @@ const AUG_OPTIONS: { id: string; label: string; desc: string }[] = [
   { id: "bandpass", label: "Band-pass", desc: "Telephone 300–3400 Hz band only" },
 ];
 
+// LiveKit / WebRTC transport augmentations — what a voice agent's audio actually
+// survives before it reaches the model (Opus, AGC, noise suppression, packet loss,
+// DTX, VAD segmentation). `livekit` runs the whole chain in order; the rest are its
+// individual stages, for isolating one. Mirrors whisper_finetune._AUG_FUNCS.
+const LIVEKIT_AUG_OPTIONS: { id: string; label: string; desc: string }[] = [
+  { id: "livekit", label: "LiveKit (full chain)", desc: "Capture APM → Opus → loss/PLC → DTX → agent AGC → 48k/24k/16k → VAD. Start here." },
+  { id: "livekit_sip", label: "LiveKit SIP (phone)", desc: "PSTN band → G.711 8 kHz trunk → tandem Opus re-encode. For agents taking calls." },
+  { id: "opus", label: "Opus codec", desc: "Real libopus round-trip at 12/24/48 kbps mono, VOIP, 20 ms frames" },
+  { id: "g711", label: "G.711", desc: "μ-law/A-law 8 kHz — a LiveKit SIP trunk leg" },
+  { id: "packet_loss", label: "Packet loss + PLC", desc: "Bursty RTP loss, Opus concealment, RED recovery" },
+  { id: "dtx", label: "DTX comfort noise", desc: "Silence replaced by synthesised hiss (LiveKit publishes dtx: true)" },
+  { id: "agc", label: "AGC", desc: "WebRTC AGC2 slew-limited gain — quiet starts arrive under-levelled" },
+  { id: "webrtc_ns", label: "Noise suppression", desc: "noiseSuppression + voiceIsolation / Krisp artefacts; eats weak fricatives" },
+  { id: "aec", label: "Echo cancel / barge-in", desc: "AEC gating during double-talk + residual echo" },
+  { id: "vad_clip", label: "VAD endpointing", desc: "Silero-style tight, hard-edged segment boundaries (trims silence only)" },
+  { id: "resample_chain", label: "Resample chain", desc: "The 48 k → 24 k → 16 k soxr path the agent + STT plugin perform" },
+];
+
+function AugPicker({
+  options, selected, onToggle,
+}: {
+  options: { id: string; label: string; desc: string }[];
+  selected: string[];
+  onToggle: (id: string) => void;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {options.map((o) => {
+        const on = selected.includes(o.id);
+        return (
+          <button
+            key={o.id}
+            type="button"
+            title={o.desc}
+            onClick={() => onToggle(o.id)}
+            className={cn(
+              "rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors",
+              on ? "border-primary/60 bg-primary/10 text-foreground"
+                 : "border-border text-muted-foreground hover:border-primary/40 hover:bg-muted/40",
+            )}
+          >
+            <span className="block font-medium">{o.label}</span>
+            <span className="block truncate text-[10px] opacity-70">{o.desc}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // TTS evaluation methods — each generates audio from the eval set, then scores
 // it. Multi-select (pick any combo), styled like the augmentation boxes.
 const TTS_EVAL_METHODS: { id: string; label: string; desc: string }[] = [
@@ -2010,30 +2060,34 @@ export function TrainingForm() {
             Select techniques to harden the model against noisy / phone audio. One enabled
             technique is applied at random to each augmented training clip; eval is never augmented.
           </p>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {AUG_OPTIONS.map((o) => {
-              const on = augmentTechniques.includes(o.id);
-              return (
-                <button
-                  key={o.id}
-                  type="button"
-                  title={o.desc}
-                  onClick={() =>
-                    setAugmentTechniques((prev) =>
-                      prev.includes(o.id) ? prev.filter((x) => x !== o.id) : [...prev, o.id],
-                    )
-                  }
-                  className={cn(
-                    "rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors",
-                    on ? "border-primary/60 bg-primary/10 text-foreground"
-                       : "border-border text-muted-foreground hover:border-primary/40 hover:bg-muted/40",
-                  )}
-                >
-                  <span className="block font-medium">{o.label}</span>
-                  <span className="block truncate text-[10px] opacity-70">{o.desc}</span>
-                </button>
-              );
-            })}
+          <AugPicker
+            options={AUG_OPTIONS}
+            selected={augmentTechniques}
+            onToggle={(id) =>
+              setAugmentTechniques((prev) =>
+                prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+              )
+            }
+          />
+          <div className="pt-3">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+              Voice-agent transport (LiveKit / WebRTC)
+            </Label>
+            <p className="pb-1.5 text-xs text-muted-foreground">
+              A model that scores well on a clean test set can still fail behind a LiveKit agent:
+              it never receives the microphone signal, only what survives Opus, AGC, noise
+              suppression, packet loss and VAD segmentation. Pick <span className="font-medium">LiveKit (full chain)</span>{" "}
+              unless you are isolating one stage.
+            </p>
+            <AugPicker
+              options={LIVEKIT_AUG_OPTIONS}
+              selected={augmentTechniques}
+              onToggle={(id) =>
+                setAugmentTechniques((prev) =>
+                  prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+                )
+              }
+            />
           </div>
           {augmentTechniques.length > 0 && (
             <div className="flex items-center gap-2 pt-1">

@@ -371,6 +371,13 @@ export type TrainingStep = {
   epoch?: number | null;
   // Sweep runs: which trial this step belongs to (for per-trial loss curves).
   trial?: number | null;
+  // training_type=dpo only — the preference signal, pooled across all ranks.
+  // reward_* are the IMPLICIT rewards β·log(π/π_ref), not a reward model's output.
+  reward_acc?: number | null;       // fraction of pairs where chosen beat rejected (0..1)
+  reward_margin?: number | null;    // mean(chosen − rejected); the quantity DPO maximizes
+  reward_chosen?: number | null;    // mean on the preferred side — should NOT dive
+  reward_rejected?: number | null;  // mean on the dispreferred side
+  pairs?: number | null;            // preference pairs in the step (accuracy's sample size)
 };
 
 export type TrainingGpuSample = { t: number; gpus: TrainingGpu[] };
