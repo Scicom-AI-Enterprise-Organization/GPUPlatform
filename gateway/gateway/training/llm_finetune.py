@@ -46,6 +46,17 @@ LLM_DIR = os.path.join(THIS_DIR, "llm")  # gemma4.py + attention.py + minimax/ +
 #   gemma4.py   "... step: 3, loss: 1.234, tokens/s: 1300.00"
 #   minimax_m2.py "epoch 0 step 3 loss 1.2340 tok/s 12400"
 _STEP_RE = re.compile(r"step:?\s*(\d+).*?loss:?\s*([0-9.eE+-]+)")
+# DPO extras on that SAME log line (training_type=dpo only; absent for SFT):
+#   "… loss: 0.693, tokens/s: 1300.00, reward_acc: 0.750, margin: 0.1234,
+#    reward_chosen: -0.0210, reward_rejected: -0.1444, pairs: 8"
+# They ride into the @@STEP payload so the live curve + result_json.steps carry them —
+# before this, reward_acc existed only in the raw log text and in wandb, so a run
+# without a wandb key had no preference signal anywhere in the platform.
+_DPO_METRIC_RE = re.compile(
+    r"\b(reward_acc|margin|reward_chosen|reward_rejected|pairs):\s*(-?[0-9.eE+-]+)")
+_DPO_METRIC_ALIAS = {"margin": "reward_margin"}
+# Counts are summed over the grad-accum window; everything else is averaged.
+_DPO_METRIC_SUMS = {"pairs"}
 _RUN_WORKDIR = None
 
 TORCH_VERSION = "2.12.0"   # MUST be 2.12.x — the FA3 prebuilt wheel ABI (+ torch._grouped_mm for MoE)
@@ -1050,15 +1061,25 @@ def run(cfg: dict) -> None:
     # window. So the loss curve gets one point per optimizer step without any per-trainer
     # logic: a new model just needs to log the standard "step: N … loss: L" the parser
     # already keys on. A step's point is emitted when the step advances (+ a final flush).
-    _acc = {"step": None, "sum": 0.0, "n": 0}
+    _acc = {"step": None, "sum": 0.0, "n": 0, "extra": {}}
 
     def _flush_step() -> None:
         nonlocal last_loss
         if _acc["step"] is not None and _acc["n"] > 0:
             last_loss = _acc["sum"] / _acc["n"]
-            emit("STEP", {"step": _acc["step"], "loss": last_loss})
+            point = {"step": _acc["step"], "loss": last_loss}
+            # DPO metrics ride the same accumulation window as loss (mean over the
+            # grad-accum microbatches) so the curve has one point per optimizer step.
+            # `pairs` is the exception: it's a COUNT, and the count behind this step's
+            # reward_acc is every pair in the window, so it sums. (Averaging it reported
+            # a fractional "20.25 pairs" — wrong number and wrong units.)
+            for k, (s, c) in _acc["extra"].items():
+                if c:
+                    point[k] = s if k in _DPO_METRIC_SUMS else s / c
+            emit("STEP", point)
         _acc["sum"] = 0.0
         _acc["n"] = 0
+        _acc["extra"] = {}
 
     for line in p.stdout:  # type: ignore[union-attr]
         print(line, end="", flush=True)
@@ -1074,6 +1095,16 @@ def run(cfg: dict) -> None:
             _acc["step"] = step_i
             _acc["sum"] += loss_f
             _acc["n"] += 1
+            # Same line carries the DPO extras when training_type=dpo (absent otherwise,
+            # so this is a no-op for SFT). Keeps the live chart in step with the loss.
+            for key, raw in _DPO_METRIC_RE.findall(line):
+                try:
+                    val = float(raw)
+                except ValueError:
+                    continue
+                name = _DPO_METRIC_ALIAS.get(key, key)
+                s, c = _acc["extra"].get(name, (0.0, 0))
+                _acc["extra"][name] = (s + val, c + 1)
     _flush_step()  # emit the final step
     p.wait()
     if p.returncode != 0:

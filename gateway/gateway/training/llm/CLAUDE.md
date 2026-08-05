@@ -324,8 +324,8 @@ only structural difference is qwen builds the custom class via `make_custom_cls(
   disabled** (`lora_disabled()` flips a module flag in `LinearLoRA.forward` — base frozen + B=0
   init ⇒ ref == initial policy, no second model copy), one extra no-grad backbone pass per
   microbatch. lm_head isn't LoRA-wrapped so one weight serves both sides. First loss ≈ **ln 2 =
-  0.693** (the policy==ref sanity). Logs `reward_acc`/`margin` after the loss (the `@@STEP` parser
-  keys on "step: N … loss: L" unchanged). Grad-accum weighting mirrors the SFT token-weighted
+  0.693** (the policy==ref sanity). Metrics are appended after the loss (the `@@STEP` parser
+  keys on "step: N … loss: L" unchanged) — see "DPO metrics" below. Grad-accum weighting mirrors the SFT token-weighted
   scheme with the **pair** as the unit (the DPO loss is a pair-mean — token-weighting would re-add
   a length bias). `lora_meta.json` gets `objective: "dpo"` + `dpo_beta`.
 - **Constraints** (validated in create-run AND llm_finetune AND the trainer): qwen or gemma-4 arch;
@@ -349,6 +349,47 @@ only structural difference is qwen builds the custom class via `make_custom_cls(
   gateway needs a gemma-authorized `HF_TOKEN` in its env to pack the gated gemma tokenizer. The
   Triton kernel `__main__` gates (`python triton_func.py` / `triton_dpo.py`) are still worth a run
   when re-syncing from small-ablation.
+
+### DPO metrics — 5 numbers, pooled across ranks, 2026-08-03
+
+Emitted per microbatch on the trainer's loss line and carried into `@@STEP` →
+`result_json.steps` → the **Preference (DPO)** card on the run page:
+
+| key | meaning |
+|---|---|
+| `reward_acc` | fraction of pairs where chosen outscored rejected ("chosen win rate") |
+| `reward_margin` | mean(chosen − rejected) — the quantity DPO maximizes |
+| `reward_chosen` | mean implicit reward β·log(π/π_ref) on the **preferred** side |
+| `reward_rejected` | same on the dispreferred side |
+| `pairs` | preference pairs in the step (reward_acc's sample size) |
+
+- **⚠ Watch `reward_chosen`, not just accuracy.** The loss only sees the DIFFERENCE, so it is
+  perfectly happy to drive BOTH rewards down — the model unlearns the preferred answers too, just
+  more slowly than the rejected ones. Win rate and margin look great throughout. A chosen line well
+  below 0 means lower the LR, raise β, or stop. This is the single most common way a "successful"
+  DPO run produces a worse model, and it was **invisible** before: only `reward_acc`/`margin`
+  existed, and only in the raw log text + wandb — nothing reached `result_json` or the UI, so a run
+  without a wandb key had no preference signal anywhere in the platform.
+- **⚠ The LOSS is pooled in the same collective (DPO only) — it has to be.** `fused_dpo_loss`
+  returns a mean over the LOCAL pairs and nothing reduces it, so `output['loss']` is rank-0-only.
+  Once the rewards went global, the two lived on different populations, and a chart pairing them
+  is apples-to-oranges: run `train-2d624e00` logged a step with loss **0.5982** while
+  `-logσ(margin)` was **0.7295** — below a floor convexity forbids for a single population, which
+  reads as a broken metric. `st[5]` carries a pair-count-weighted loss so the pooled mean is exact.
+  **Logged only** — backward still runs on the local loss, which is correct (FSDP averages grads).
+  SFT keeps the historical rank-0-local loss; only the DPO branch pools.
+- **⚠ The stats are all-reduced across ranks; the collective must run on EVERY rank.** They used to
+  be computed inside `if rank == 0`, i.e. on 1/world_size of the pairs (`DistributedSampler` shards
+  the bins) — with 4 GPUs and a couple of pairs per bin that quantized `reward_acc` to a handful of
+  values. SUMS are reduced (not means) so the pooled mean is exact under an uneven split. Moving
+  the `dist.all_reduce` under the rank-0 guard **deadlocks the job** — it is deliberately above it.
+- Both trainers must stay byte-similar here (`gemma4.py` + `qwen/qwen3_5.py`), same as the
+  `dpo_collator`. Parsed by `_DPO_METRIC_RE` in `llm_finetune.py` (`margin` → `reward_margin` via
+  `_DPO_METRIC_ALIAS`); SFT lines carry none of these, so the payload is unchanged for SFT.
+- UI: `DpoCurve` in `autotrain/[runId]/training-detail.tsx`, self-hiding when no step carries
+  `reward_acc`. **Two charts, never a dual axis** — a 0..1 rate and a signed unbounded reward share
+  no scale. Series colours are CVD/contrast-validated for BOTH themes (`dataviz` skill's
+  `validate_palette.js`); the lighter -400/-500 steps fail the dark-mode lightness band.
 
 ### Agentic DPO — tool declarations + environment masking, 2026-08-02
 

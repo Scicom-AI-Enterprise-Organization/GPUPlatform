@@ -325,6 +325,13 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           <Button type="button" variant="outline" size="xs" onClick={() => onTest(i)} disabled={u.test.status === "running" || !u.base_url.trim()}>
             {u.test.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Test
           </Button>
+          <span className="text-[11px] text-muted-foreground">
+            {u.testMode === "embedding" ? "sends a “hello” embedding"
+              : u.testMode === "rerank" ? "ranks 3 docs (incl. a hard negative) via /rerank"
+              : u.testMode === "transcription" ? "sends a short tone to /audio/transcriptions"
+              : u.testMode === "tts" ? "synthesizes “hello world” via /audio/speech"
+              : "sends a “hello” chat completion"} using the first model
+          </span>
           {u.test.status !== "idle" && u.test.status !== "running" && (
             <span className={"text-xs " + (u.test.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>{u.test.message}</span>
           )}

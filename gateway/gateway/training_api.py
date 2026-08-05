@@ -88,7 +88,13 @@ _UV_BOOTSTRAP = (
     'export PATH="$HOME/.local/bin:$PATH"\n'
 )
 # Valid training-audio augmentation techniques (mirror whisper_finetune._AUG_FUNCS).
-_AUG_TECHNIQUES = {"telephone", "noise", "dropout", "gain", "pitch", "speed", "reverb", "bandpass"}
+# The second group models the LiveKit/WebRTC transport a voice agent puts in front
+# of the model — `livekit` is the whole chain, the rest are its individual stages.
+_AUG_TECHNIQUES = {
+    "telephone", "noise", "dropout", "gain", "pitch", "speed", "reverb", "bandpass",
+    "livekit", "livekit_sip", "opus", "g711", "packet_loss", "dtx", "agc",
+    "webrtc_ns", "aec", "vad_clip", "resample_chain",
+}
 # TTS audio-eval methods (run on the test set): char-error-rate, UTMOSv2 MOS,
 # TitaNet speaker similarity. The eval runner is a follow-up; the selection +
 # config plumbing land here so runs record what to evaluate.

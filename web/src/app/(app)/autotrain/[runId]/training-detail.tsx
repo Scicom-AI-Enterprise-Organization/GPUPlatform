@@ -33,8 +33,10 @@ import {
 } from "@/components/ui/dialog";
 import {
   CartesianGrid,
+  Legend,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip as RTooltip,
   XAxis,
@@ -731,6 +733,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
       <Tabs value={tab} className="!block">
         <TabsContent value="metrics" className="!flex-none space-y-4">
           {!packOnly && <LossCurve steps={steps} epochs={epochs} live={!terminal} sweep={isSweep} trials={trials} />}
+          <DpoCurve steps={steps} live={!terminal} />
           <EvalCurve epochs={epochs} sweep={isSweep} trials={trials} />
           <GpuCard gpus={gpus} samples={run.result_json?.gpu_samples ?? []} running={!terminal} />
           {epochs.length === 0 ? (
@@ -1323,6 +1326,197 @@ function LossCurve({ steps, epochs, live, sweep, trials }: { steps: TrainingStep
               {hasEval && <> · <span className="text-amber-500">■</span> eval loss (per epoch)</>}
             </p>
           </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// DPO preference metrics (training_type=dpo only; self-hides otherwise). Two charts,
+// NOT one with two y-axes: a win RATE (0..1) and implicit REWARDS (β·log-ratio, signed,
+// unbounded) share no scale, and a dual axis would let the reader infer a crossing that
+// isn't there.
+//
+// Why reward_chosen/reward_rejected are plotted and not just the margin: DPO's loss only
+// cares about the DIFFERENCE, so it is perfectly happy to drive BOTH rewards down — the
+// model unlearns the preferred answers too, just more slowly than the rejected ones.
+// Win rate and margin both look healthy while that happens. A chosen line trending well
+// below 0 is the signal to stop, lower the LR, or raise beta.
+const DPO_CHOSEN = "#059669";    // emerald-600
+const DPO_REJECTED = "#dc2626";  // red-600
+const DPO_MARGIN = "#4f46e5";    // indigo-600
+// ^ validated for CVD + contrast on BOTH surfaces (skill `dataviz` validate_palette.js:
+// worst adjacent deutan ΔE 8.6, normal-vision ΔE 31.6, all inside the lightness band).
+// The dark-surface contrast WARN on indigo is relieved by the legend + the latest-value
+// readout below the chart, so identity never rests on colour alone. Don't swap these for
+// the lighter -400/-500 steps: they fail the dark-mode lightness band.
+
+// ⚠ These lines are `type="linear"` with visible dots, unlike LossCurve's smoothed
+// monotone. A DPO epoch is a HANDFUL of optimizer steps (grad_accum shrinks 1.3k pairs
+// to ~16), each measured on a disjoint ~81-pair sample, so the series is sparse and
+// noisy. A monotone spline through those points draws confident curves between
+// measurements that were never taken and turns a single noisy draw into an apparent
+// trend — it is what made a lone step read as "decisively turned around" during the
+// first real run. Straight segments + a dot per measurement show what was sampled.
+function fmtSigned(v: number | null | undefined, digits = 4): string {
+  return typeof v === "number" && Number.isFinite(v) ? v.toFixed(digits) : "—";
+}
+
+function DpoCurve({ steps, live }: { steps: TrainingStep[]; live: boolean }) {
+  const pts = steps.filter((s) => typeof s.reward_acc === "number");
+  if (pts.length === 0) return null; // not a DPO run (or no points yet)
+
+  const trialIdxs = [...new Set(pts.map((s) => s.trial).filter((t): t is number => t != null))].sort((a, b) => a - b);
+  const isSweep = trialIdxs.length > 0;
+
+  const liveDot = live && (
+    <span className="inline-flex items-center gap-1 text-[11px] font-normal text-muted-foreground">
+      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" /> live
+    </span>
+  );
+
+  // Sweep: one win-rate line per trial (same idiom as LossCurve). Averaging trials into
+  // a single line would invent a number no trial actually reported.
+  if (isSweep) {
+    const byStep = new Map<number, Record<string, number>>();
+    for (const s of pts) {
+      if (s.trial == null || typeof s.reward_acc !== "number") continue;
+      const row = byStep.get(s.step) ?? { step: s.step };
+      row[`t${s.trial}`] = s.reward_acc;
+      byStep.set(s.step, row);
+    }
+    const data = [...byStep.values()].sort((a, b) => a.step - b.step);
+    return (
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center gap-2 text-sm">Chosen win rate · per trial {liveDot}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="h-64 w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+                <XAxis dataKey="step" type="number" domain={["dataMin", "dataMax"]} tick={{ fontSize: 11 }}
+                  stroke="currentColor" className="text-muted-foreground"
+                  label={{ value: "step", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                  width={48} domain={[0, 1]} tickFormatter={(v: number) => v.toFixed(2)} />
+                <RTooltip contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  formatter={(v, n) => [Number(v).toFixed(3), trialLabel(Number(String(n).slice(1)), [])]}
+                  labelFormatter={(s) => `step ${s}`} />
+                <ReferenceLine y={0.5} stroke="currentColor" strokeDasharray="4 4" className="text-muted-foreground" />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                {trialIdxs.map((t, i) => (
+                  <Line key={t} type="linear" dataKey={`t${t}`} name={`trial ${t}`}
+                    stroke={TRIAL_COLORS[i % TRIAL_COLORS.length]} strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            Fraction of preference pairs where the chosen response scored above the rejected one.
+            Dashed line = 0.50 (chance).
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const data = pts
+    .map((s) => ({
+      step: s.step,
+      reward_acc: s.reward_acc ?? null,
+      reward_chosen: s.reward_chosen ?? null,
+      reward_rejected: s.reward_rejected ?? null,
+      reward_margin: s.reward_margin ?? null,
+    }))
+    .sort((a, b) => a.step - b.step);
+  const last = data[data.length - 1];
+  const lastPairs = pts[pts.length - 1]?.pairs;
+  const hasRewards = data.some((d) => typeof d.reward_chosen === "number");
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center gap-2 text-sm">Preference (DPO) {liveDot}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        {/* 1 — win rate: its own chart, because a 0..1 rate shares no axis with the rewards */}
+        <div>
+          <div className="mb-1 flex items-baseline justify-between">
+            <span className="text-xs text-muted-foreground">Chosen win rate</span>
+            <span className="font-mono text-xs tabular-nums">
+              {typeof last?.reward_acc === "number" ? `${(last.reward_acc * 100).toFixed(1)}%` : "—"}
+              {typeof lastPairs === "number" && (
+                // Rounded defensively: runs packed before pairs became a sum report a
+                // fractional mean over the grad-accum window.
+                <span className="ml-1 text-muted-foreground">· {Math.round(lastPairs)} pairs/step</span>
+              )}
+            </span>
+          </div>
+          <div className="h-48 w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+                <XAxis dataKey="step" type="number" domain={["dataMin", "dataMax"]} tick={{ fontSize: 11 }}
+                  stroke="currentColor" className="text-muted-foreground"
+                  label={{ value: "step", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                  width={48} domain={[0, 1]} tickFormatter={(v: number) => v.toFixed(2)} />
+                <RTooltip contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  formatter={(v) => [`${(Number(v) * 100).toFixed(1)}%`, "chosen win rate"]}
+                  labelFormatter={(s) => `step ${s}`} />
+                <ReferenceLine y={0.5} stroke="currentColor" strokeDasharray="4 4" className="text-muted-foreground" />
+                <Line type="linear" dataKey="reward_acc" name="chosen win rate" stroke={DPO_MARGIN}
+                  strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            Pairs where the chosen response outscored the rejected one. Dashed line = 0.50 (chance);
+            step 0 sits there by construction (policy == reference).
+          </p>
+        </div>
+
+        {/* 2 — implicit rewards: all three share the same β·log-ratio units, so one axis */}
+        {hasRewards && (
+          <div>
+            <div className="mb-1 flex items-baseline justify-between">
+              <span className="text-xs text-muted-foreground">Implicit reward β·log(π/π_ref)</span>
+              <span className="font-mono text-xs tabular-nums">
+                chosen {fmtSigned(last?.reward_chosen)} · rejected {fmtSigned(last?.reward_rejected)} ·
+                margin {fmtSigned(last?.reward_margin)}
+              </span>
+            </div>
+            <div className="h-48 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+                  <XAxis dataKey="step" type="number" domain={["dataMin", "dataMax"]} tick={{ fontSize: 11 }}
+                    stroke="currentColor" className="text-muted-foreground"
+                    label={{ value: "step", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
+                  <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                    width={56} domain={["auto", "auto"]} tickFormatter={(v: number) => v.toFixed(2)} />
+                  <RTooltip contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                    formatter={(v, n) => [Number(v).toFixed(4), String(n)]}
+                    labelFormatter={(s) => `step ${s}`} />
+                  <ReferenceLine y={0} stroke="currentColor" strokeDasharray="4 4" className="text-muted-foreground" />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Line type="linear" dataKey="reward_chosen" name="chosen" stroke={DPO_CHOSEN}
+                    strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} />
+                  <Line type="linear" dataKey="reward_rejected" name="rejected" stroke={DPO_REJECTED}
+                    strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} />
+                  <Line type="linear" dataKey="reward_margin" name="margin" stroke={DPO_MARGIN}
+                    strokeWidth={2} dot={{ r: 2 }} isAnimationActive={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              Both start at 0 (policy == reference). Healthy: rejected falls, chosen holds near 0 or rises.
+              <span className="text-foreground"> Chosen diving well below 0 means the model is unlearning the
+              preferred answers too</span> — margin can still look fine while that happens.
+            </p>
+          </div>
         )}
       </CardContent>
     </Card>

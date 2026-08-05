@@ -11,6 +11,8 @@ import { Input } from "@/components/ui/input";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
+import { CurlBlock, headerLines, shq } from "@/components/playground/curl-block";
+import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 
 export const AUDIO_MODEL_RE = /whisper|asr|transcrib|audio|speech-to-text|stt/i;
@@ -52,14 +54,30 @@ export function TranscribeTab({ app }: { app: AppRecord }) {
     <TranscribePlayground
       models={models}
       basePath={`/api/proxy/${encodeURIComponent(app.app_id)}/v1`}
+      curlBase={`${gateway.baseUrl}/${app.app_id}/v1`}
       storageKey={STORAGE_KEY(app.app_id)}
     />
   );
 }
 
 // Generic transcription playground — reused by serverless + the proxy. POSTs the
-// multipart upload to `${basePath}/audio/{transcriptions|translations}`.
-export function TranscribePlayground({ models, basePath, storageKey, extraHeaders }: { models: string[]; basePath: string; storageKey: string; extraHeaders?: Record<string, string> }) {
+// multipart upload to `${basePath}/audio/{transcriptions|translations}`. `curlBase` is
+// the same path as a caller outside the browser would spell it (the public gateway
+// URL) — only used to render the copyable curl.
+// Multipart, not JSON — audio goes up as a file part, so this is `-F` lines rather
+// than a `-d` body (and no explicit Content-Type: curl sets the boundary).
+function curlTranscribe(
+  { url, token, model, filename, language, extra }:
+  { url: string; token: string; model: string; filename: string; language: string; extra?: Record<string, string> },
+): string {
+  return `curl -X POST '${url}' \\
+  -H 'Authorization: Bearer ${token}' \\
+${headerLines(extra)}  -F 'file=@${shq(filename)}' \\
+  -F 'model=${shq(model)}' \\
+${language ? `  -F 'language=${shq(language)}' \\\n` : ""}  -F 'response_format=json'`;
+}
+
+export function TranscribePlayground({ models, basePath, curlBase, storageKey, extraHeaders }: { models: string[]; basePath: string; curlBase?: string; storageKey: string; extraHeaders?: Record<string, string> }) {
   const [model, setModel] = useState(models[0] ?? "");
   const [task, setTask] = useState<"transcriptions" | "translations">("transcriptions");
   const [language, setLanguage] = useState("");
@@ -186,6 +204,16 @@ export function TranscribePlayground({ models, basePath, storageKey, extraHeader
             </Button>
           </div>
           {err && <p className="text-sm text-destructive">{err}</p>}
+          {curlBase && model && (
+            <CurlBlock build={(tok) => curlTranscribe({
+              url: `${curlBase}/audio/${task}`, token: tok, model,
+              // The clip can't be inlined — curl reads it off disk. Name the file you
+              // picked so the command is right once you're in its directory.
+              filename: file?.name || "audio.wav",
+              language: task === "transcriptions" ? language.trim() : "",
+              extra: extraHeaders,
+            })} />
+          )}
           {text != null && (
             <div className="space-y-1.5">
               <div className="text-xs text-muted-foreground">Result</div>

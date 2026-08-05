@@ -12,6 +12,8 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { CurlBlock, curlJson } from "@/components/playground/curl-block";
+import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 
 type EmbedVec = { index: number; dim: number; preview: number[] };
@@ -43,6 +45,7 @@ export function EmbeddingTab({ app }: { app: AppRecord }) {
     <EmbeddingPlayground
       models={models}
       basePath={`/api/proxy/${encodeURIComponent(app.app_id)}/v1`}
+      curlBase={`${gateway.baseUrl}/${app.app_id}/v1`}
       storageKey={STORAGE_KEY(app.app_id)}
     />
   );
@@ -50,7 +53,9 @@ export function EmbeddingTab({ app }: { app: AppRecord }) {
 
 // Generic embedding playground — reused by serverless + the proxy. `basePath` is the
 // Next-proxy prefix fronting the OpenAI data plane (…/v1); POSTs `${basePath}/embeddings`.
-export function EmbeddingPlayground({ models, basePath, storageKey, extraHeaders }: { models: string[]; basePath: string; storageKey: string; extraHeaders?: Record<string, string> }) {
+// `curlBase` is the same path as a caller OUTSIDE the browser would spell it (the
+// public gateway URL) — only used to render the copyable curl.
+export function EmbeddingPlayground({ models, basePath, curlBase, storageKey, extraHeaders }: { models: string[]; basePath: string; curlBase?: string; storageKey: string; extraHeaders?: Record<string, string> }) {
   const [model, setModel] = useState(models[0] ?? "");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -74,9 +79,10 @@ export function EmbeddingPlayground({ models, basePath, storageKey, extraHeaders
   const removeRun = useCallback((id: string) => persist(historyRef.current.filter((r) => r.id !== id)), [persist]);
   const clearAll = useCallback(() => persist([]), [persist]);
 
+  // One input per non-blank line → an array (vLLM accepts a string or array).
+  const inputs = useMemo(() => text.split("\n").map((s) => s.trim()).filter(Boolean), [text]);
+
   async function onRun() {
-    // One input per non-blank line → an array (vLLM accepts a string or array).
-    const inputs = text.split("\n").map((s) => s.trim()).filter(Boolean);
     if (!model || inputs.length === 0) return;
     setBusy(true); setErr(null); setResult(null);
     try {
@@ -168,6 +174,9 @@ export function EmbeddingPlayground({ models, basePath, storageKey, extraHeaders
             </Button>
           </div>
           {err && <p className="text-sm text-destructive">{err}</p>}
+          {curlBase && model && inputs.length > 0 && (
+            <CurlBlock build={(tok) => curlJson(`${curlBase}/embeddings`, tok, { model, input: inputs }, extraHeaders)} />
+          )}
           {result && (
             <div className="space-y-1.5">
               <div className="text-xs text-muted-foreground">

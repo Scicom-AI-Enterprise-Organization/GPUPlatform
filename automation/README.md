@@ -52,8 +52,12 @@ cp automation/config.yaml.example automation/config.yaml   # then edit api_key e
 ### `train` block
 
 `task_type` (`asr`), `max_epochs`, `patience` (early stop), `augment_techniques`
-(`all` = the 8 techniques telephone/noise/dropout/gain/pitch/speed/reverb/bandpass,
-or a list), `augment_prob`, `warmup_steps`, `batch_size`, `grad_accum`,
+(`all` = the 8 classic techniques telephone/noise/dropout/gain/pitch/speed/reverb/
+bandpass; `livekit_all` = the WebRTC voice-agent transport family livekit/
+livekit_sip/opus/g711/packet_loss/dtx/agc/webrtc_ns/aec/vad_clip/resample_chain;
+or a list — `["livekit"]` alone runs the whole LiveKit chain and is the one to
+use when the model is served behind a LiveKit agent), `augment_prob`,
+`warmup_steps`, `batch_size`, `grad_accum`,
 `learning_rate` (omit → gateway default 1e-5), `lr_scheduler_type`, `gpu_type`,
 `gpu_count`, `secure_cloud`, `provider_id` (blank → auto-pick first enabled RunPod
 provider), `data_center_id`.

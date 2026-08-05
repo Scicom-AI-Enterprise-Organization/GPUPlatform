@@ -31,6 +31,10 @@ export function ProxyPlayground(
   // The data-plane base behind the Next proxy: /api/proxy → gateway, then
   // /proxy/{name}/v1 → the proxy router. Each mode appends its OpenAI sub-path.
   const apiBase = `/api/proxy/proxy/${encodeURIComponent(name)}/v1`;
+  // Same route as a caller outside the browser spells it — every mode renders its
+  // copyable curl against this, never against the Next-proxy path above (which only
+  // resolves from inside the console).
+  const curlBase = `${baseUrl}/proxy/${name}/v1`;
   const [mode, setMode] = useState<PlaygroundMode>("chat");
 
   // Force-provider: send X-SGPU-Upstream to pin routing to ONE upstream (no
@@ -51,7 +55,7 @@ export function ProxyPlayground(
       description={<>Routes through <code className="font-mono">POST /proxy/{name}/v1/chat/completions</code> to a live backend (priority + failover). Hit Stop mid-stream to trigger the proxy&apos;s auto-cancel.</>}
       transport={openAiTransport({
         fetchPath: `${apiBase}/chat/completions`,
-        curlUrl: `${baseUrl}/proxy/${name}/v1/chat/completions`,
+        curlUrl: `${curlBase}/chat/completions`,
         extraHeaders,
       })}
     />
@@ -92,10 +96,10 @@ export function ProxyPlayground(
         </span>
       </div>
       {mode === "chat" ? chat
-        : mode === "embedding" ? <EmbeddingPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:embed:proxy:${name}`} extraHeaders={extraHeaders} />
-        : mode === "rerank" ? <RerankPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:rerank:proxy:${name}`} extraHeaders={extraHeaders} />
-        : mode === "audio" ? <TranscribePlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:transcribe:proxy:${name}`} extraHeaders={extraHeaders} />
-        : <SpeechPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:speech:proxy:${name}`} extraHeaders={extraHeaders} />}
+        : mode === "embedding" ? <EmbeddingPlayground models={aliases} basePath={apiBase} curlBase={curlBase} storageKey={`serverless-ui:embed:proxy:${name}`} extraHeaders={extraHeaders} />
+        : mode === "rerank" ? <RerankPlayground models={aliases} basePath={apiBase} curlBase={curlBase} storageKey={`serverless-ui:rerank:proxy:${name}`} extraHeaders={extraHeaders} />
+        : mode === "audio" ? <TranscribePlayground models={aliases} basePath={apiBase} curlBase={curlBase} storageKey={`serverless-ui:transcribe:proxy:${name}`} extraHeaders={extraHeaders} />
+        : <SpeechPlayground models={aliases} basePath={apiBase} curlBase={curlBase} storageKey={`serverless-ui:speech:proxy:${name}`} extraHeaders={extraHeaders} />}
     </div>
   );
 }

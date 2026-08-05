@@ -12,6 +12,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
+import { CurlBlock, headerLines, shq } from "@/components/playground/curl-block";
 
 type SpeechRun = {
   id: string;
@@ -50,8 +51,24 @@ function fixWavSizes(buf: ArrayBuffer): ArrayBuffer {
 
 // Generic TTS playground — reused by the proxy playground (and any serverless TTS
 // endpoint). POSTs to `${basePath}/audio/speech`, plays the returned audio, and
-// pulls the speaker list from `${basePath}/audio/speaker`.
-export function SpeechPlayground({ models, basePath, storageKey, extraHeaders }: { models: string[]; basePath: string; storageKey: string; extraHeaders?: Record<string, string> }) {
+// pulls the speaker list from `${basePath}/audio/speaker`. `curlBase` is the same path
+// spelled the way a caller outside the browser would (the public gateway URL) — only
+// used to render the copyable curl.
+//
+// The response is BINARY audio, so the snippet ends in `--output` rather than piping
+// to the terminal; without it curl refuses to print the body anyway.
+function curlSpeech(
+  { url, token, body, extra }:
+  { url: string; token: string; body: unknown; extra?: Record<string, string> },
+): string {
+  return `curl -X POST '${url}' \\
+  -H 'Content-Type: application/json' \\
+  -H 'Authorization: Bearer ${token}' \\
+${headerLines(extra)}  -d '${shq(JSON.stringify(body, null, 2))}' \\
+  --output speech.wav`;
+}
+
+export function SpeechPlayground({ models, basePath, curlBase, storageKey, extraHeaders }: { models: string[]; basePath: string; curlBase?: string; storageKey: string; extraHeaders?: Record<string, string> }) {
   const [model, setModel] = useState(models[0] ?? "");
   const [text, setText] = useState("Hello, this is a test of the text to speech system.");
   const [voice, setVoice] = useState("");
@@ -97,15 +114,18 @@ export function SpeechPlayground({ models, basePath, storageKey, extraHeaders }:
     });
   }, []);
 
+  // Ask for wav so the browser can play it (the engine's default is raw PCM). Shared
+  // with the curl block so what you copy is what ran.
+  const bodyOf = () => ({ model, input: text, voice: voice || undefined, response_format: "wav" });
+
   async function onRun() {
     if (!text.trim() || !model) return;
     setBusy(true); setErr(null);
     try {
-      // Ask for wav so the browser can play it (the engine's default is raw PCM).
       const r = await fetch(`${basePath}/audio/speech`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(extraHeaders ?? {}) },
-        body: JSON.stringify({ model, input: text, voice: voice || undefined, response_format: "wav" }),
+        body: JSON.stringify(bodyOf()),
       });
       if (!r.ok) {
         const raw = await r.text();
@@ -180,6 +200,11 @@ export function SpeechPlayground({ models, basePath, storageKey, extraHeaders }:
             </Button>
           </div>
           {err && <p className="text-sm text-destructive">{err}</p>}
+          {curlBase && model && text.trim() && (
+            <CurlBlock build={(tok) => curlSpeech({
+              url: `${curlBase}/audio/speech`, token: tok, body: bodyOf(), extra: extraHeaders,
+            })} />
+          )}
         </CardContent>
       </Card>
 

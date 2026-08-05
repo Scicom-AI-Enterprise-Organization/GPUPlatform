@@ -39,6 +39,11 @@ except ImportError as e:  # pragma: no cover
     sys.exit(f"missing dependency: {e}. Run with the repo venv: .venv/bin/python {sys.argv[0]}")
 
 ALL_AUGMENTATIONS = ["telephone", "noise", "dropout", "gain", "pitch", "speed", "reverb", "bandpass"]
+# LiveKit / WebRTC transport augmentations (whisper_finetune._AUG_FUNCS). Kept OUT of
+# ALL_AUGMENTATIONS so `augment_techniques: all` keeps its old meaning; ask for them by
+# name, or use the `livekit` alias for the whole transport family.
+LIVEKIT_AUGMENTATIONS = ["livekit", "livekit_sip", "opus", "g711", "packet_loss", "dtx",
+                         "agc", "webrtc_ns", "aec", "vad_clip", "resample_chain"]
 DATASET_TERMINAL = {"done", "failed", "cancelled"}
 RUN_TERMINAL = {"done", "failed", "cancelled"}
 
@@ -94,11 +99,16 @@ def parse_cutoff(raw: Optional[str], default_offset: str) -> Optional[str]:
 
 
 def resolve_augment(v: Any) -> list[str]:
+    """'all' = the classic 8; 'livekit_all' = the whole WebRTC transport family
+    (note plain 'livekit' is a real technique — the full chain — not an alias)."""
     if v is None:
         return []
     if isinstance(v, str):
-        if v.strip().lower() == "all":
+        key = v.strip().lower()
+        if key == "all":
             return list(ALL_AUGMENTATIONS)
+        if key == "livekit_all":
+            return list(LIVEKIT_AUGMENTATIONS)
         return [t.strip() for t in v.split(",") if t.strip()]
     return [str(t).strip() for t in v if str(t).strip()]
 

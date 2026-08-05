@@ -625,22 +625,67 @@ def main(
             dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
             # seen_tokens += token_count
 
+            # DPO metrics, pooled across ALL ranks. `DistributedSampler` shards the bins,
+            # so each rank holds a DIFFERENT slice of the pairs — a rank-0-only figure is
+            # a 1/world_size sample (with 4 GPUs and a couple of pairs per bin, reward_acc
+            # was quantized to a handful of values and jumped around for no real reason).
+            # ⚠ The collective MUST run on EVERY rank — putting it under `if rank == 0`
+            # deadlocks the job. Sums are reduced (not means) so the pooled mean is exact
+            # regardless of how unevenly the pairs split.
+            # ⚠ The LOSS is pooled here too, and it must be: the fused kernel returns a
+            # mean over the LOCAL pairs and nothing reduces it, so `output['loss']` is a
+            # rank-0-only figure. Pairing a rank-0 loss with globally-pooled rewards on
+            # one chart is apples-to-oranges — it produced a step whose loss (0.5982) sat
+            # BELOW -logσ(margin) (0.7295), which convexity forbids for one population and
+            # which reads as "one of these numbers is broken". Weight by each rank's pair
+            # count so the pooled mean is exact under an uneven split. Logged only — the
+            # backward already ran on the local loss, and that is correct (FSDP averages
+            # the gradients).
+            dpo_stats = None
+            if dpo:
+                cr, rr = output["chosen_rewards"], output["rejected_rewards"]
+                n_local = float(cr.numel())
+                st = torch.stack([
+                    (cr > rr).float().sum(),        # wins: chosen beats rejected
+                    (cr - rr).sum(),                # margin
+                    cr.sum(),                       # implicit reward on chosen
+                    rr.sum(),                       # implicit reward on rejected
+                    cr.new_tensor(n_local),         # pair count
+                    output["loss"].detach().float() * n_local,  # pair-weighted loss
+                ]).float()
+                dist.all_reduce(st, op=dist.ReduceOp.SUM)
+                n_pairs = st[4].clamp(min=1)
+                dpo_stats = {
+                    "reward_acc": (st[0] / n_pairs).item(),
+                    "reward_margin": (st[1] / n_pairs).item(),
+                    "reward_chosen": (st[2] / n_pairs).item(),
+                    "reward_rejected": (st[3] / n_pairs).item(),
+                    "pairs": int(st[4].item()),
+                }
+                dpo_global_loss = (st[5] / n_pairs).item()
+
             if rank == 0:
-                loss = output['loss'].item()
+                # DPO: the globally-pooled loss (same population as the rewards above).
+                # SFT keeps the historical rank-0-local loss.
+                loss = dpo_global_loss if dpo else output['loss'].item()
                 delta_time = time.time() - start_time
                 tps = token_count.item() / delta_time
-                # DPO extras: reward accuracy (chosen > rejected) + margin. Appended AFTER
-                # loss so the orchestrator's "step: N … loss: L" parser keys on unchanged.
+                # DPO extras appended AFTER loss so the orchestrator's
+                # "step: N … loss: L" parser keys on an unchanged prefix.
+                # reward_chosen/reward_rejected are the ones worth watching: DPO can push
+                # BOTH down (the model unlearns good outputs, just slower than bad ones)
+                # while reward_acc and margin still look healthy.
                 dpo_extra = ""
-                if dpo:
-                    cr, rr = output["chosen_rewards"], output["rejected_rewards"]
-                    reward_acc = (cr > rr).float().mean().item()
-                    reward_margin = (cr - rr).mean().item()
-                    dpo_extra = f", reward_acc: {reward_acc:.3f}, margin: {reward_margin:.4f}"
+                if dpo_stats:
+                    dpo_extra = (f", reward_acc: {dpo_stats['reward_acc']:.3f}"
+                                 f", margin: {dpo_stats['reward_margin']:.4f}"
+                                 f", reward_chosen: {dpo_stats['reward_chosen']:.4f}"
+                                 f", reward_rejected: {dpo_stats['reward_rejected']:.4f}"
+                                 f", pairs: {dpo_stats['pairs']}")
                 logger.info(f"Epoch: {i}, mb: {idx}, step: {opt_step}, loss: {loss}, tokens/s: {tps:.2f}{dpo_extra}")
                 metrics = {"loss": loss, "lr": optimizer.param_groups[0]['lr'], "tps": tps, "epoch": i}
-                if dpo:
-                    metrics.update({"reward_acc": reward_acc, "reward_margin": reward_margin})
+                if dpo_stats:
+                    metrics.update(dpo_stats)
                 if wandb_run is not None and do_step:
                     try:
                         wandb_run.log(metrics, step=opt_step)

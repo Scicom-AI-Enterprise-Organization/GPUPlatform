@@ -308,8 +308,12 @@ def _ensure_venv(cfg: dict) -> str:
         # per-utterance bahasa/en language detection (zh is decided by char ratio,
         # no model). fasttext-wheel = prebuilt wheels, no C++ toolchain on the pod.
         "fasttext-wheel",
+        # PyAV bundles ffmpeg+libopus, so the livekit/opus augmentations do a REAL
+        # in-process codec round-trip instead of the DSP approximation (they log
+        # loudly when they have to fall back). Wheels only, no system ffmpeg needed.
+        "av",
     ]
-    check_mods = ["torch", "transformers", "datasets", "evaluate", "jiwer", "soundfile", "boto3", "peft", "fasttext"]
+    check_mods = ["torch", "transformers", "datasets", "evaluate", "jiwer", "soundfile", "boto3", "peft", "fasttext", "av"]
     report_to = (cfg.get("tracking") or {}).get("report_to") or cfg.get("report_to") or []
     if "wandb" in report_to:
         pkgs.append("wandb"); check_mods.append("wandb")
@@ -520,6 +524,9 @@ def load_pairs(ds: dict, work: str) -> list[dict]:
 # enable; one is picked at random per augmented sample. Hardens the model
 # against phone / noisy conditions. `telephone` is ported from the Scicom STT
 # whisper augmentation; the rest are standard ASR augmentations.
+#
+# The `livekit*` family below models the WebRTC transport a voice agent puts in
+# front of the model — see the "LiveKit / WebRTC transport chain" section.
 # ---------------------------------------------------------------------------
 def _aug_telephone(x, sr):
     """Phone-line degradation: attenuate → 300–3400 Hz band-pass → downsample to
@@ -598,6 +605,629 @@ def _aug_bandpass(x, sr):
     return lfilter(b, a, x)
 
 
+# ===========================================================================
+# LiveKit / WebRTC transport chain
+# ===========================================================================
+# Why this exists: a Whisper finetune that scores well on a clean held-out set
+# collapses once it is served behind a LiveKit voice agent, because LiveKit does
+# not hand the model the microphone signal — it hands it the output of a long
+# lossy chain. Every stage below was read out of the LiveKit sources rather than
+# guessed (versions current as of 2026-08):
+#
+#   client-sdk-js/src/room/defaults.ts
+#     audioDefaults    = autoGainControl:true, echoCancellation:true,
+#                        noiseSuppression:true, voiceIsolation:true
+#     publishDefaults  = audioPreset: AudioPresets.music, dtx:true, red:true
+#   client-sdk-js/src/room/track/options.ts
+#     AudioPresets     = telephone 12k, speech 24k, music 48k, musicStereo 64k,
+#                        musicHighQuality 96k, musicHighQualityStereo 128k (bps)
+#     audioCodecs      = ['opus', 'red']
+#   agents/livekit/agents/voice/room_io/_input.py
+#     rtc.AudioProcessingModule(auto_gain_control=True) on EVERY inbound frame,
+#     then an optional noise-cancellation FrameProcessor (Krisp BVC), then
+#     rtc.AudioResampler(48000 -> stt.sample_rate)
+#   agents/livekit/agents/stt/stt.py
+#     resamples to the plugin's sample rate at AudioResamplerQuality.HIGH
+#   livekit-plugins-openai/.../stt.py
+#     SAMPLE_RATE = 24000 -> the OpenAI-compatible endpoint is fed 24 kHz WAV
+#   livekit-plugins-silero/.../vad.py
+#     min_speech_duration 0.05, min_silence_duration 0.55,
+#     prefix_padding_duration 0.5, activation_threshold 0.5, sample_rate 16000
+#
+# so the real signal path is:
+#
+#   mic 48k -> browser APM (HPF, AEC, NS, voiceIsolation, AGC)
+#           -> Opus encode (mono, 20 ms frames, VOIP, DTX + RED)
+#           -> network loss/jitter -> Opus decode + PLC
+#           -> agent APM (AGC2, a SECOND gain stage) -> optional Krisp BVC
+#           -> soxr 48k -> 24k -> Silero VAD crop -> WAV -> this model
+#
+# Each stage is exposed on its own so a run can isolate one, and `livekit`
+# applies the whole thing in order with per-sample randomisation. `livekit_sip`
+# is the telephony variant: LiveKit SIP negotiates PCMU/PCMA (G.711, 8 kHz) by
+# default on a trunk and transcodes that leg to Opus for the SFU, so a phone
+# caller reaches the model through a TANDEM of two codecs.
+#
+# Everything here is a pure waveform transform, so the transcript stays valid:
+# no stage removes a word. In particular `vad_clip` tightens leading/trailing
+# SILENCE only and never cuts into speech — cropping real speech against an
+# unchanged label is how you train a model to hallucinate.
+# ===========================================================================
+def _resample(x, sr_in: int, sr_out: int, quality: str = "MQ"):
+    """soxr (what LiveKit's rtc.AudioResampler uses) when available, else a
+    polyphase fallback. LiveKit's inbound resampler runs at the library default
+    quality (AudioResamplerQuality.MEDIUM) — 'MQ' matches it."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    if int(sr_in) == int(sr_out) or x.size == 0:
+        return x
+    try:
+        import soxr
+        return soxr.resample(x.astype(np.float32), sr_in, sr_out, quality=quality).astype(np.float64)
+    except Exception:  # noqa: BLE001
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(int(sr_in), int(sr_out))
+        return resample_poly(x, int(sr_out) // g, int(sr_in) // g)
+
+
+def _fit(y, n: int):
+    """Trim/zero-pad to exactly n samples (codec + STFT round-trips drift a few)."""
+    import numpy as np
+    y = np.asarray(y, dtype=np.float64)
+    if len(y) >= n:
+        return y[:n]
+    return np.pad(y, (0, n - len(y)))
+
+
+# --- Opus ------------------------------------------------------------------
+_OPUS_BACKEND = None
+
+
+def _opus_backend() -> str:
+    """Resolve the codec backend ONCE: PyAV (in-process libopus, ~ms per clip) >
+    ffmpeg CLI (2 subprocesses per clip) > a DSP approximation. The fallback is
+    logged loudly — silently training on a filter that is not a codec would look
+    exactly like success."""
+    global _OPUS_BACKEND
+    if _OPUS_BACKEND is not None:
+        return _OPUS_BACKEND
+    import shutil
+    try:
+        import av  # noqa: F401
+        _OPUS_BACKEND = "av"
+    except Exception:  # noqa: BLE001
+        _OPUS_BACKEND = "ffmpeg" if shutil.which("ffmpeg") else "dsp"
+    if _OPUS_BACKEND == "dsp":
+        log("[augment] WARNING: neither PyAV nor ffmpeg is available — opus/livekit "
+            "augmentation falls back to a DSP APPROXIMATION, not a real codec "
+            "round-trip. Install `av` for parity with production.")
+    else:
+        log(f"[augment] opus codec backend: {_OPUS_BACKEND}")
+    return _OPUS_BACKEND
+
+
+def _opus_av(x48, bitrate: int, application: str):
+    import io
+
+    import av
+    import numpy as np
+
+    pcm = np.clip(np.asarray(x48, dtype=np.float64), -1.0, 1.0)
+    pcm = (pcm * 32767.0).astype(np.int16).reshape(1, -1)
+    buf = io.BytesIO()
+    # ogg is only a container to hold the packets; the encoder/decoder pair is the
+    # same libopus WebRTC uses. PyAV's AudioCodecContext FIFOs the input into the
+    # encoder's 20 ms frame size for us.
+    out = av.open(buf, mode="w", format="ogg")
+    # compression_level maps to OPUS_SET_COMPLEXITY. ffmpeg defaults to 10; libwebrtc
+    # uses 9 on desktop and 5 on mobile. 5 is ~30 % faster to encode with distortion
+    # indistinguishable from 10 (measured: -7.4 vs -7.6 dB residual, corr .908 vs .911
+    # at 24 kbps) — and the encode is by far the most expensive part of this chain.
+    opts = {"application": application, "frame_duration": "20", "vbr": "on",
+            "compression_level": "5"}
+    # ⚠ layout="mono" is load-bearing: an audio stream defaults to STEREO, and a
+    # stereo libopus stream spends the bitrate budget on two channels, so
+    # `bit_rate` stops tracking (verified: 48000 requested -> 22.6 kbps actual,
+    # and 12k/24k/48k all produced identical distortion). Mono also matches what
+    # WebRTC publishes for a microphone track.
+    try:
+        stream = out.add_stream("libopus", rate=48000, layout="mono", options=opts)
+    except TypeError:  # older PyAV: no options kwarg on add_stream
+        stream = out.add_stream("libopus", rate=48000, layout="mono")
+    stream.bit_rate = int(bitrate)
+    frame = av.AudioFrame.from_ndarray(pcm, format="s16", layout="mono")
+    frame.sample_rate = 48000
+    frame.pts = 0
+    for pkt in stream.encode(frame):
+        out.mux(pkt)
+    for pkt in stream.encode(None):
+        out.mux(pkt)
+    out.close()
+
+    buf.seek(0)
+    dec = av.open(buf, mode="r", format="ogg")
+    res = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=48000)
+    chunks = []
+    try:
+        for fr in dec.decode(audio=0):
+            for rf in res.resample(fr):
+                chunks.append(rf.to_ndarray().reshape(-1))
+        for rf in res.resample(None):  # flush
+            chunks.append(rf.to_ndarray().reshape(-1))
+    finally:
+        dec.close()
+    if not chunks:
+        raise RuntimeError("opus decode produced no audio")
+    return np.concatenate(chunks).astype(np.float64) / 32768.0
+
+
+def _opus_ffmpeg(x48, bitrate: int, application: str):
+    import numpy as np
+    raw = np.clip(np.asarray(x48, dtype=np.float64), -1.0, 1.0).astype(np.float32).tobytes()
+    enc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "pipe:0",
+         "-c:a", "libopus", "-b:a", str(int(bitrate)), "-application", application,
+         "-frame_duration", "20", "-vbr", "on", "-compression_level", "5",
+         "-ac", "1", "-f", "ogg", "pipe:1"],
+        input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+    dec = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "ogg", "-i", "pipe:0",
+         "-f", "f32le", "-ar", "48000", "-ac", "1", "pipe:1"],
+        input=enc, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+    return np.frombuffer(dec, dtype=np.float32).astype(np.float64)
+
+
+def _opus_dsp(x, sr: int, bitrate: int):
+    """Approximation used only when no real codec is available: SILK/hybrid
+    bandwidth limiting + envelope-shaped coding noise (noise-feedback coding
+    keeps a roughly constant LOCAL SNR, which is why plain additive noise is a
+    poor stand-in)."""
+    import numpy as np
+    from scipy.signal import butter, lfilter
+    x = np.asarray(x, dtype=np.float64)
+    cutoff = 6000 if bitrate <= 14000 else 8000 if bitrate <= 20000 else 12000 if bitrate <= 28000 else 16000
+    nyq = 0.5 * sr
+    if cutoff < nyq * 0.99:
+        b, a = butter(6, cutoff / nyq, btype="low")
+        x = lfilter(b, a, x)
+    snr = 12.0 + bitrate / 4000.0
+    w = max(1, int(0.01 * sr))
+    env = np.convolve(np.abs(x), np.ones(w) / w, mode="same") + 1e-6
+    return x + np.random.normal(0.0, 1.0, x.shape) * env / (10 ** (snr / 20.0))
+
+
+def _opus_roundtrip(x, sr: int, bitrate: int = 48000, application: str = "voip"):
+    """Encode/decode through libopus the way WebRTC does — mono, 48 kHz, 20 ms
+    frames, VOIP application. Returns the waveform at the original sr/length."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    backend = _opus_backend()
+    if backend == "dsp":
+        return _opus_dsp(x, sr, bitrate)
+    try:
+        x48 = _resample(x, sr, 48000, "HQ")
+        y48 = _opus_av(x48, bitrate, application) if backend == "av" else _opus_ffmpeg(x48, bitrate, application)
+        return _fit(_resample(y48, 48000, sr, "HQ"), n)
+    except Exception as e:  # noqa: BLE001
+        log(f"[augment] opus round-trip via {backend} failed ({e}); using the DSP approximation")
+        return _opus_dsp(x, sr, bitrate)
+
+
+def _g711(x, law: str = "u"):
+    """G.711 companding + 8-bit quantisation (PCMU / PCMA), the codec LiveKit SIP
+    offers by default on a trunk."""
+    import numpy as np
+    x = np.clip(np.asarray(x, dtype=np.float64), -1.0, 1.0)
+    if law == "u":
+        mu = 255.0
+        y = np.sign(x) * np.log1p(mu * np.abs(x)) / np.log1p(mu)
+        q = np.round(y * 127.0) / 127.0
+        return np.sign(q) * ((1.0 + mu) ** np.abs(q) - 1.0) / mu
+    A = 87.6
+    la = 1.0 + np.log(A)
+    ax = np.abs(x)
+    y = np.sign(x) * np.where(ax < 1.0 / A, A * ax / la, (1.0 + np.log(np.maximum(A * ax, 1e-12))) / la)
+    q = np.round(y * 127.0) / 127.0
+    aq = np.abs(q)
+    return np.sign(q) * np.where(aq < 1.0 / la, aq * la / A, np.exp(aq * la - 1.0) / A)
+
+
+# --- WebRTC audio processing module ----------------------------------------
+def _highpass(x, sr: int, fc: float = 80.0):
+    """The APM's high-pass filter — first thing WebRTC does to a capture frame."""
+    from scipy.signal import butter, lfilter
+    b, a = butter(2, max(fc, 1.0) / (0.5 * sr), btype="high")
+    return lfilter(b, a, x)
+
+
+def _agc(x, sr: int, target_dbfs: float = -3.0, max_gain_db: float = 30.0,
+         initial_gain_db: float = 8.0, rate_db_per_s: float = 3.0,
+         max_noise_dbfs: float = -50.0):
+    """WebRTC AGC2 adaptive-digital gain, on 10 ms sub-frames.
+
+    The artefact that matters for ASR is the SLEW RATE: libwebrtc caps gain
+    movement at ~3 dB/s, so the first second or two of a quiet speaker arrives
+    10–20 dB under-levelled and then swells. LiveKit applies this TWICE — once in
+    the browser (autoGainControl: true) and again agent-side
+    (AudioProcessingModule(auto_gain_control=True)) — so the chain below runs it
+    twice too. The noise-floor tracker caps the gain so the background is never
+    pushed past max_output_noise_level_dbfs, and the fixed limiter closes it out."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    hop = max(1, int(0.01 * sr))
+    nf = int(np.ceil(n / hop))
+    if nf == 0:
+        return x
+    fr = np.pad(x, (0, nf * hop - n)).reshape(nf, hop)
+    peak_db = 20.0 * np.log10(np.maximum(np.max(np.abs(fr), axis=1), 1e-9))
+    rms = np.sqrt(np.mean(fr ** 2, axis=1))
+
+    noise = np.empty(nf)                       # min-statistics floor tracker
+    cur = float(rms[0])
+    rise = 1.0 + 3.0 * hop / sr                # ~+3 %/s when no new minimum arrives
+    for i in range(nf):
+        cur = float(rms[i]) if rms[i] < cur else cur * rise
+        noise[i] = cur
+    noise_db = 20.0 * np.log10(np.maximum(noise, 1e-9))
+
+    want = np.clip(target_dbfs - peak_db, 0.0, max_gain_db)
+    want = np.minimum(want, np.maximum(max_noise_dbfs - noise_db, 0.0))
+
+    step = rate_db_per_s * hop / sr
+    g = np.empty(nf)
+    cur = float(initial_gain_db)
+    for i in range(nf):
+        cur += float(np.clip(want[i] - cur, -step, step))
+        g[i] = cur
+
+    y = x * np.repeat(10.0 ** (g / 20.0), hop)[:n]
+    lim = 10.0 ** (-1.0 / 20.0)                # AGC2's fixed limiter, soft knee
+    over = np.abs(y) > lim
+    if over.any():
+        a = np.abs(y[over])
+        y[over] = np.sign(y[over]) * (lim + (a - lim) / (1.0 + (a - lim) * 12.0))
+    return y
+
+
+def _spectral_suppress(x, sr: int, over_sub: float = 1.6, floor_db: float = -16.0,
+                       musical: float = 0.35, n_fft: int = 512):
+    """Noise suppression / voice isolation artefacts.
+
+    LiveKit's browser defaults turn on BOTH noiseSuppression and the much more
+    aggressive voiceIsolation, and agents can add Krisp BVC on top. All three are
+    spectral suppressors, and all three fail the same way on speech: weak
+    unvoiced energy (/s/ /f/ /th/, plosive bursts, the tail of a word) sits near
+    the noise floor and gets gated away, and the residual gain fluctuation leaves
+    musical noise. That is modelled as a Wiener gain raised to an over-subtraction
+    power, with per-bin gain jitter."""
+    import numpy as np
+    from scipy.signal import istft, stft
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    ov = n_fft * 3 // 4
+    _, _, Z = stft(x, fs=sr, nperseg=n_fft, noverlap=ov)
+    mag = np.abs(Z)
+    noise = np.percentile(mag, 10, axis=1, keepdims=True) + 1e-9
+    snr = np.maximum((mag / noise) ** 2 - 1.0, 1e-6)
+    gain = (snr / (1.0 + snr)) ** over_sub
+    gain = np.maximum(gain, 10.0 ** (floor_db / 20.0))
+    if musical > 0:
+        gain = np.clip(gain * np.exp(np.random.normal(0.0, musical, gain.shape)), 0.0, 1.0)
+    _, y = istft(Z * gain, fs=sr, nperseg=n_fft, noverlap=ov)
+    return _fit(y, n)
+
+
+def _aec_doubletalk(x, sr: int):
+    """Acoustic-echo-canceller behaviour during barge-in.
+
+    While the agent is speaking, its TTS comes back through the caller's mic. The
+    AEC's non-linear processor removes most of it — and takes a chunk of the
+    caller's own speech with it (that is what makes barge-in transcripts drop
+    words), leaving a low-level filtered residual behind. Modelled as: pick a few
+    'agent is talking' windows, attenuate the near-end inside them, and add a
+    scrambled, low-passed, heavily attenuated copy as residual echo (scrambled so
+    it is babble, never transcribable words the label does not contain)."""
+    import numpy as np
+    from scipy.signal import butter, lfilter
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    if n < int(0.6 * sr):
+        return x
+    blk = max(1, int(random.uniform(0.04, 0.08) * sr))
+    nb = n // blk
+    if nb < 2:
+        return x
+    order = np.random.permutation(nb)
+    residual = x[: nb * blk].reshape(nb, blk)[order].reshape(-1)
+    residual = _fit(residual, n)
+    b, a = butter(4, min(2600.0, 0.45 * sr) / (0.5 * sr), btype="low")
+    residual = lfilter(b, a, residual)
+    rms = float(np.sqrt(np.mean(x ** 2))) or 1e-9
+    rres = float(np.sqrt(np.mean(residual ** 2))) or 1e-9
+    residual *= (rms / rres) * 10 ** (random.uniform(-45.0, -30.0) / 20.0)
+
+    y = x.copy()
+    for _ in range(random.randint(1, 3)):
+        w = int(random.uniform(0.3, 1.5) * sr)
+        if w >= n:
+            continue
+        a0 = random.randint(0, n - w)
+        att = 10 ** (-random.uniform(4.0, 16.0) / 20.0)
+        ramp = min(int(0.02 * sr), w // 2)
+        env = np.full(w, att)
+        if ramp > 1:                            # the NLP opens/closes over ~20 ms
+            env[:ramp] = np.linspace(1.0, att, ramp)
+            env[-ramp:] = np.linspace(att, 1.0, ramp)
+        y[a0:a0 + w] *= env
+    return y + residual
+
+
+# --- transport -------------------------------------------------------------
+def _packet_loss(x, sr: int, loss: float = 0.03, mean_burst: float = 2.0,
+                 fec_recovery: float = 0.5, ptime: float = 0.02):
+    """RTP packet loss with Opus PLC, on the 20 ms packet grid.
+
+    Loss is bursty (Gilbert-Elliott), not independent — that is what a real
+    network does. LiveKit publishes with `red: true`, so a fraction of losses are
+    recovered from the redundant copy and never reach the decoder; the rest are
+    concealed, and Opus PLC EXTRAPOLATES the last pitch period with a decaying
+    gain rather than inserting silence. (The existing `dropout` technique zeroes
+    chunks, which is the wrong artefact — the model needs to see extrapolated
+    audio, not a hole.)
+
+    Note: this is a waveform-domain model of the decoder's output. Actually
+    dropping packets ahead of libopus would need the decoder's own PLC entry
+    point, which is not reachable through ffmpeg."""
+    import numpy as np
+    src = np.asarray(x, dtype=np.float64)
+    y = src.copy()
+    n = len(src)
+    step = max(1, int(ptime * sr))
+    q = 1.0 / max(1.0, mean_burst)                      # bad -> good
+    p = loss * q / max(1e-6, 1.0 - loss)                # good -> bad
+    bad = False
+    for i in range(int(np.ceil(n / step))):
+        bad = (np.random.rand() > q) if bad else (np.random.rand() < p)
+        if not bad or np.random.rand() < fec_recovery:
+            continue
+        a, b = i * step, min(n, (i + 1) * step)
+        m = b - a
+        if m <= 0:
+            continue
+        prev = y[max(0, a - m):a]
+        seg = (prev[-m:] * np.linspace(0.7, 0.15, m)) if len(prev) == m else np.zeros(m)
+        y[a:b] = seg
+        xf = min(int(0.003 * sr), m)                    # overlap-add back to real audio
+        if xf > 1:
+            w = np.linspace(0.0, 1.0, xf)
+            y[b - xf:b] = seg[-xf:] * (1.0 - w) + src[b - xf:b] * w
+    return y
+
+
+def _dtx(x, sr: int, min_gap_ms: float = 200.0):
+    """Opus DTX (LiveKit publishes with `dtx: true`).
+
+    During silence the encoder stops sending and the decoder synthesises comfort
+    noise, so the real room tone between words is replaced by stationary hiss at
+    a held level, with hard transitions at each end. A model trained only on
+    natural pauses has never seen that."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    step = max(1, int(0.02 * sr))
+    nf = int(np.ceil(n / step))
+    if nf < 2:
+        return x
+    fr = np.pad(x, (0, nf * step - n)).reshape(nf, step)
+    e = np.sqrt(np.mean(fr ** 2, axis=1)) + 1e-12
+    thr = max(float(np.percentile(e, 20)) * 2.0, float(np.max(e)) * 0.02)
+    speech = e > thr
+    for i in np.flatnonzero(speech):                    # hangover: DTX lags the drop
+        speech[i:i + 6] = True
+    out = np.pad(x, (0, nf * step - n))
+    quiet = ~speech
+    lvl = float(np.median(e[quiet])) if quiet.any() else 1e-4
+    min_len = int(np.ceil(min_gap_ms / 20.0))
+    i = 0
+    while i < nf:
+        if speech[i]:
+            i += 1
+            continue
+        j = i
+        while j < nf and not speech[j]:
+            j += 1
+        if j - i >= min_len:
+            out[i * step:j * step] = np.random.normal(0.0, lvl, (j - i) * step)
+        i = j
+    return out[:n]
+
+
+def _lk_resample_chain(x, sr: int):
+    """The resampling LiveKit actually performs: the track arrives at 48 kHz,
+    room_io resamples to the STT plugin's rate, and the OpenAI-compatible plugin
+    uses SAMPLE_RATE = 24000 — so the server receives 24 kHz and resamples again
+    to Whisper's 16 kHz."""
+    y = _resample(x, sr, 48000, "MQ")
+    y = _resample(y, 48000, 24000, "MQ")
+    y = _resample(y, 24000, 16000, "MQ")
+    return _fit(_resample(y, 16000, sr, "MQ"), len(x))
+
+
+def _speech_bounds(x, sr: int):
+    """(start, end) sample indices of speech, on a 20 ms energy grid. None when
+    nothing crosses the threshold."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    step = max(1, int(0.02 * sr))
+    nf = int(np.ceil(n / step))
+    if nf < 2:
+        return None
+    fr = np.pad(x, (0, nf * step - n)).reshape(nf, step)
+    e = np.sqrt(np.mean(fr ** 2, axis=1))
+    thr = max(float(np.max(e)) * 0.02, float(np.percentile(e, 10)) * 3.0)
+    idx = np.flatnonzero(e > thr)
+    if idx.size == 0:
+        return None
+    return int(idx[0]) * step, min(n, (int(idx[-1]) + 1) * step)
+
+
+def _vad_tighten(x, sr: int, max_pad_ms: float = 250.0):
+    """Silero VAD endpointing, as the StreamAdapter applies it.
+
+    The STT never sees a whole recording — it sees one VAD segment, cut close to
+    the speech with hard (un-faded) edges. Clean corpora usually carry generous
+    room tone at both ends, so the model can arrive at production having never
+    seen an utterance that starts on the first phoneme.
+
+    Deliberately conservative: it only trims SILENCE. Cutting into speech while
+    keeping the full transcript is how a finetune is taught to hallucinate the
+    missing words, so that is not done here."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    bounds = _speech_bounds(x, sr)
+    if bounds is None:
+        return x
+    s, e = bounds
+    head = int(random.uniform(0.0, max_pad_ms / 1000.0) * sr)
+    tail = int(random.uniform(0.0, max_pad_ms / 1000.0) * sr)
+    return x[max(0, s - head):min(len(x), e + tail)].copy()
+
+
+def _background(x, sr: int, snr_db: float):
+    """Pink-ish room tone at a target SNR — the noise floor the capture chain
+    then has to suppress (and the thing DTX replaces with comfort noise)."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    spec = np.fft.rfft(np.random.normal(0.0, 1.0, n))
+    f = np.arange(len(spec), dtype=np.float64)
+    f[0] = 1.0
+    noise = np.fft.irfft(spec / np.sqrt(f), n=n)
+    rms_x = float(np.sqrt(np.mean(x ** 2))) or 1e-9
+    rms_n = float(np.sqrt(np.mean(noise ** 2))) or 1e-9
+    return x + noise * (rms_x / rms_n) / (10 ** (snr_db / 20.0))
+
+
+# --- the composites --------------------------------------------------------
+def _aug_opus(x, sr):
+    """Opus round-trip at a LiveKit AudioPreset bitrate (12/24/48 kbps, mono)."""
+    return _opus_roundtrip(x, sr, random.choice([12000, 24000, 24000, 48000, 48000]), "voip")
+
+
+def _aug_g711(x, sr):
+    """G.711 μ-law/A-law at 8 kHz — a LiveKit SIP trunk leg."""
+    import numpy as np
+    n = len(x)
+    y = _resample(x, sr, 8000, "HQ")
+    y = _g711(y, random.choice(["u", "u", "a"]))
+    return _fit(_resample(y, 8000, sr, "HQ"), n)
+
+
+def _aug_packet_loss(x, sr):
+    """Bursty RTP loss + Opus PLC, 0.5–8 % with RED recovery."""
+    return _packet_loss(x, sr, loss=random.uniform(0.005, 0.08),
+                        mean_burst=random.uniform(1.0, 4.0),
+                        fec_recovery=random.uniform(0.2, 0.7))
+
+
+def _aug_dtx(x, sr):
+    """Opus DTX: comfort noise in place of the real background."""
+    return _dtx(x, sr, min_gap_ms=random.uniform(160.0, 400.0))
+
+
+def _aug_agc(x, sr):
+    """WebRTC AGC2 adaptive digital gain (slew-limited, then limited)."""
+    return _agc(x, sr, target_dbfs=random.uniform(-6.0, -2.0),
+                initial_gain_db=random.uniform(0.0, 12.0),
+                rate_db_per_s=random.uniform(2.0, 6.0))
+
+
+def _aug_webrtc_ns(x, sr):
+    """noiseSuppression + voiceIsolation / Krisp BVC artefacts."""
+    return _spectral_suppress(x, sr, over_sub=random.uniform(1.1, 2.4),
+                              floor_db=random.uniform(-24.0, -10.0),
+                              musical=random.uniform(0.15, 0.5))
+
+
+def _aug_aec(x, sr):
+    """AEC non-linear-processor gating during barge-in + residual echo."""
+    return _aec_doubletalk(x, sr)
+
+
+def _aug_vad_clip(x, sr):
+    """Silero VAD endpointing — tight, hard-edged segment boundaries."""
+    return _vad_tighten(x, sr, max_pad_ms=random.uniform(60.0, 400.0))
+
+
+def _aug_resample_chain(x, sr):
+    """The 48 k → 24 k → 16 k soxr chain the agent + STT plugin perform."""
+    return _lk_resample_chain(x, sr)
+
+
+def _aug_livekit(x, sr):
+    """THE ONE TO USE for a WebRTC voice agent: the whole LiveKit capture →
+    publish → agent → STT chain, in order, with each stage randomised per sample.
+    Roughly what a browser/mobile caller's audio survives before it reaches the
+    model."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    if random.random() < 0.7:                                   # the room
+        x = _background(x, sr, random.uniform(8.0, 32.0))
+    x = _highpass(x, sr, random.uniform(60.0, 120.0))           # APM high-pass
+    if random.random() < 0.85:                                  # NS + voiceIsolation
+        x = _aug_webrtc_ns(x, sr)
+    if random.random() < 0.25:                                  # barge-in
+        x = _aec_doubletalk(x, sr)
+    if random.random() < 0.9:                                   # browser AGC
+        x = _agc(x, sr, target_dbfs=random.uniform(-6.0, -2.0),
+                 initial_gain_db=random.uniform(0.0, 12.0))
+    x = _opus_roundtrip(x, sr, random.choice([12000, 24000, 24000, 48000, 48000]), "voip")
+    if random.random() < 0.55:                                  # loss + PLC
+        x = _packet_loss(x, sr, loss=random.uniform(0.005, 0.06),
+                         mean_burst=random.uniform(1.0, 3.5),
+                         fec_recovery=random.uniform(0.3, 0.7))
+    if random.random() < 0.5:                                   # DTX comfort noise
+        x = _dtx(x, sr, min_gap_ms=random.uniform(160.0, 400.0))
+    if random.random() < 0.9:                                   # agent-side AGC2
+        x = _agc(x, sr, target_dbfs=random.uniform(-5.0, -2.0),
+                 initial_gain_db=random.uniform(0.0, 8.0))
+    x = _lk_resample_chain(x, sr)
+    if random.random() < 0.6:                                   # VAD segment edges
+        x = _vad_tighten(x, sr, max_pad_ms=random.uniform(60.0, 400.0))
+    return x
+
+
+def _aug_livekit_sip(x, sr):
+    """LiveKit SIP (inbound phone call): the PSTN band, a G.711 8 kHz trunk leg,
+    then the TANDEM Opus re-encode LiveKit SIP performs to publish into the room.
+    Strictly worse than `livekit` — use it if the agent takes phone calls."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    if random.random() < 0.8:
+        x = _background(x, sr, random.uniform(6.0, 26.0))
+    x = _aug_bandpass(x, sr)                                    # analog line band
+    x = _aug_g711(x, sr)                                        # PCMU/PCMA trunk leg
+    if random.random() < 0.6:
+        x = _packet_loss(x, sr, loss=random.uniform(0.005, 0.06),
+                         mean_burst=random.uniform(1.0, 3.5),
+                         fec_recovery=random.uniform(0.0, 0.3))
+    # transcoded to Opus for the SFU — at the low presets, since a SIP leg carries
+    # nothing above 4 kHz worth spending bits on
+    x = _opus_roundtrip(x, sr, random.choice([12000, 24000, 24000]), "voip")
+    if random.random() < 0.9:
+        x = _agc(x, sr, target_dbfs=random.uniform(-5.0, -2.0),
+                 initial_gain_db=random.uniform(0.0, 8.0))
+    x = _lk_resample_chain(x, sr)
+    if random.random() < 0.6:
+        x = _vad_tighten(x, sr, max_pad_ms=random.uniform(60.0, 400.0))
+    return x
+
+
 _AUG_FUNCS = {
     "telephone": _aug_telephone,
     "noise": _aug_noise,
@@ -607,6 +1237,18 @@ _AUG_FUNCS = {
     "speed": _aug_speed,
     "reverb": _aug_reverb,
     "bandpass": _aug_bandpass,
+    # LiveKit / WebRTC transport (see the section above)
+    "livekit": _aug_livekit,
+    "livekit_sip": _aug_livekit_sip,
+    "opus": _aug_opus,
+    "g711": _aug_g711,
+    "packet_loss": _aug_packet_loss,
+    "dtx": _aug_dtx,
+    "agc": _aug_agc,
+    "webrtc_ns": _aug_webrtc_ns,
+    "aec": _aug_aec,
+    "vad_clip": _aug_vad_clip,
+    "resample_chain": _aug_resample_chain,
 }
 # Stable list the API/form validate against.
 AUG_TECHNIQUES = list(_AUG_FUNCS.keys())
