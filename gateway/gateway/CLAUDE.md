@@ -695,6 +695,65 @@ the call. LB/k8s semantics: **200** `healthy`/`degraded` (≥1 upstream not-know
 **503** `unhealthy` (all known-dead) / `disabled` / `misconfigured`, **404** unknown endpoint. Per-replica
 view (right for a per-pod probe). Excluded from the HTTP metrics (`METRICS_IGNORE_PATHS`).
 
+### Proxy failover — what moves a request to the next upstream
+
+`_should_failover(u, status)` is the single decision point, used by every forwarder
+(`_do_unary`, `_do_unary_multipart`, `_stream`, `_do_speech`, `_stream_speech`,
+`_stream_audio`). A request moves to the next candidate on **`status >= 500`**, on a
+transport failure (`ConnectError` / `ConnectTimeout` / `ReadTimeout` / `ReadError` /
+`RemoteProtocolError`), or on one of the endpoint's **`failover_status`** codes.
+
+- **`failover_status` defaults to `(402, 408, 429)`** — the three OpenRouter documents as
+  *transient*: out of credits, request timed out, rate limited. The 4xx blanket rule used
+  to be "never fail over", which meant a 429 went back to the caller while a healthy
+  standby sat idle. Measured before the change: a 30-request burst at a `:free` model
+  returned `{429: 28, 200: 2}` with all 30 pinned to the throttled upstream; after, `{200: 30}`.
+- ⚠️ **`403` is deliberately excluded.** OpenRouter uses it for guardrail / moderation
+  blocks — retrying that on another provider just re-triggers the block. Same for every
+  other 4xx: those are caller bugs, and failing over multiplies them across backends.
+- **A sub-500 failover does NOT mark the upstream dead** (`_mark_after_failover`). It is up
+  and refusing, so a dead-mark would sink it behind its standbys for `HEALTH_TTL_S` (120s)
+  and paint it red in the UI for something that clears in seconds. Cost: each throttled
+  request pays one wasted round-trip before rolling over.
+- **We do not honour `Retry-After`.** Trying the next upstream immediately beats sleeping
+  when a standby exists. On a single-upstream endpoint the 429 is returned as-is and the
+  hint is dropped — worth revisiting if one ever fronts OpenRouter alone.
+- `>= 500` is not configurable. Note OpenRouter classes a bare `500` as *permanent* while
+  502/503/504 are transient; we fail over on all of them, which is right here — a 500 from
+  one backend says nothing about the next.
+- Config lives on the endpoint (`failover_status` in the config JSON), is stamped onto each
+  candidate by `_route` / `_resolve_speech_route` as `_failover`, and is surfaced in the API
+  record + the "Fail over on status" field. `[]` restores the old never-fail-over-on-4xx
+  behaviour.
+
+### Rerank / score proxy (cross-encoders) — `/v1/rerank`, `/v1/score`
+
+The LLM-proxy also fronts cross-encoder rerankers. `POST /proxy/{name}/v1/rerank`
+(+ `/v2/rerank` and bare `/rerank` — the Jina/Cohere client spellings, all mapped onto the ONE
+upstream path `/rerank`, mirroring what vLLM itself serves) and `POST /proxy/{name}/v1/score`
+(+ `/score`). Both are plain unary JSON with a top-level `model`, so they ride the same buffered
+engine as embeddings (`_handle` → `_do_unary`): alias→real rewrite, priority + failover, gate,
+`X-Upstream-*` headers, request-history rows. Verified e2e against `tm-h20-reranker`
+(Qwen/Qwen3-Reranker-8B). Nothing rerank-specific in the forwarding path — the only rerank-aware
+code is the **upstream test probe** and the playground.
+
+- ⚠️ **The failure mode is a silent HTTP 200, and it's why the probe asserts the RANKING.** vLLM
+  never auto-applies a reranker's chat template, so a job started without `--chat-template` scores
+  a bare query+document concatenation and still returns 200 — with meaningless scores. Signature:
+  everything bunched in ~0.3–0.85 with no separation, often the relevant doc NOT first (a relevant
+  doc once ranked last at 0.318 under an unrelated one at 0.851). That is **not** a borderline
+  match. Real scores are calibrated hard toward 0/1 — relevant ~0.9+, irrelevant ~0.0.
+- **So `mode=rerank` on `POST /v1/proxy/test` sends THREE documents** — one relevant, one
+  same-domain-wrong-intent, one unrelated — and fails the upstream if the relevant one isn't
+  ranked #1, warning on a top-to-next gap < 0.2. A single-document smoke test passes even when the
+  template is broken, which is exactly the trap. The playground surfaces the same gap + warning.
+- **`instruction` genuinely changes the ranking**, it isn't cosmetic — the default is generic
+  web-search retrieval; override it to score for a domain task (churn intent, policy match,
+  triage). Passed through verbatim like any other body field.
+- **Serverless (`/{app_id}/v1/...`) has NO rerank** — that data plane goes through the worker
+  queue, which has no rerank job type. This is proxy-only; the playground mode lives in the proxy
+  playground, not the serverless tabs.
+
 ### ASR augmentation — the LiveKit/WebRTC transport family (`training/whisper_finetune.py`)
 
 Autotrain ASR's `augment_techniques` gained a second family (2026-08-05) that models the

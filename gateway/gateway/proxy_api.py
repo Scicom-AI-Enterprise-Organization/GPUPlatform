@@ -4,6 +4,10 @@ One stable endpoint + model name (`POST /proxy/{endpoint}/v1/chat/completions`,
 `model: "qwen"`) fans out to multiple external OpenAI-compatible backends. The
 team never changes anything; backends are added/swapped/health-routed here.
 
+Data-plane surface: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+`/v1/rerank` (+ `/v2/rerank`, `/rerank`), `/v1/score`, `/v1/audio/{transcriptions,
+translations,speech,speaker}`, `/v1/models`.
+
 - **Priority + failover** routing across the upstreams that serve a model alias,
   skipping ones a background health loop marked dead (look-ahead).
 - **Per-endpoint concurrency cap** → excess requests wait in a visible queue.
@@ -56,6 +60,17 @@ HEALTH_TTL_S = 120                 # a probe older than this is "stale/unknown"
 # PROXY_REQUEST_RETENTION_DAYS=N to prune rows older than N days.
 REQUEST_RETENTION_DAYS = int(os.environ.get("PROXY_REQUEST_RETENTION_DAYS", "0") or "0")
 DEFAULT_TIMEOUT_S = 3600.0
+# Statuses BELOW 500 that also move a request to the next upstream. (>= 500 always does.)
+# These are the three OpenRouter documents as TRANSIENT — the backend is up, it just can't
+# serve this request right now — so handing them to the caller while a standby sits idle is
+# the wrong call for a failover proxy:
+#   429 rate limited      (verified live: `{"error":{"code":429,...}}`, carries Retry-After)
+#   402 out of credits    (precisely when you want traffic on your own GPU box instead)
+#   408 request timed out
+# Deliberately NOT here: 403, which covers guardrail/moderation blocks — retrying that on
+# another provider just re-triggers the block. Nor any other 4xx, which are caller bugs.
+# Per-endpoint override: `failover_status: [...]` in config; `[]` turns it off entirely.
+DEFAULT_FAILOVER_STATUS = (402, 408, 429)
 import re as _re
 _NAME_RE = _re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -148,6 +163,9 @@ class CaptureSpec(BaseModel):
 class CreateProxyRequest(BaseModel):
     name: str
     max_concurrency: int = 0              # 0 = unlimited (no queue)
+    # Sub-500 statuses that fail over to the next upstream. None = the default (429);
+    # [] = off, i.e. every 4xx goes straight back to the caller.
+    failover_status: Optional[list[int]] = None
     # Same source as the runtime fallback (DEFAULT_TIMEOUT_S) so the per-endpoint
     # "Timeout (s)" default and the fallback can't drift — change the constant once.
     timeout_s: int = int(DEFAULT_TIMEOUT_S)
@@ -162,6 +180,7 @@ class UpdateProxyRequest(BaseModel):
     name: Optional[str] = None
     max_concurrency: Optional[int] = None
     timeout_s: Optional[int] = None
+    failover_status: Optional[list[int]] = None
     enabled: Optional[bool] = None
     public: Optional[bool] = None
     upstreams: Optional[list[UpstreamSpec]] = None
@@ -205,6 +224,7 @@ class ProxyEndpointRecord(BaseModel):
     public: bool = False
     max_concurrency: int
     timeout_s: int
+    failover_status: list[int] = []
     upstreams: list[UpstreamRecord]
     stt_callback: Optional[SttCallbackRecord] = None
     capture: Optional[CaptureRecord] = None
@@ -248,7 +268,7 @@ class TestUpstreamRequest(BaseModel):
     api_key_secret: Optional[str] = None
     api_key: Optional[str] = None
     model: Optional[str] = None   # real upstream model to end-to-end test; None = just probe /models
-    mode: str = "chat"            # chat | embedding | transcription | tts — endpoint to end-to-end test
+    mode: str = "chat"            # chat | embedding | rerank | transcription | tts — endpoint to end-to-end test
     extra_body: Optional[dict] = None  # merged into the chat test body (e.g. provider pinning)
 
 
@@ -390,6 +410,7 @@ def _endpoint_record(app, e: ProxyEndpoint, owner_username: str,
         id=e.id, name=e.name, enabled=bool(e.enabled), public=bool(getattr(e, "public", False)),
         max_concurrency=int(cfg.get("max_concurrency") or 0),
         timeout_s=int(cfg.get("timeout_s") or int(DEFAULT_TIMEOUT_S)),
+        failover_status=sorted(_failover_statuses(cfg)),
         upstreams=[_upstream_record(u) for u in cfg.get("upstreams", [])],
         stt_callback=_stt_callback_record(cfg),
         capture=_capture_record(cfg),
@@ -471,6 +492,43 @@ def _build_upstreams(specs: list[UpstreamSpec], existing: Optional[list[dict]] =
             u["api_key_secret"] = prev["api_key_secret"]
         out.append(u)
     return out
+
+
+def _failover_statuses(cfg: dict) -> frozenset[int]:
+    """Sub-500 statuses this endpoint treats as "try the next upstream". Only 4xx is
+    accepted: >= 500 already fails over unconditionally, and a 2xx/3xx isn't a failure.
+    An explicit empty list turns the behaviour off (a 429 then goes back to the caller,
+    which is what this proxy did before the setting existed)."""
+    raw = cfg.get("failover_status")
+    if raw is None:
+        return frozenset(DEFAULT_FAILOVER_STATUS)
+    out: set[int] = set()
+    for v in raw if isinstance(raw, (list, tuple)) else []:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 400 <= n < 500:
+            out.add(n)
+    return frozenset(out)
+
+
+def _should_failover(u: dict, status: int) -> bool:
+    """Whether `status` from upstream `u` should move the request to the next candidate.
+    `_failover` is stamped onto each candidate by _route, so the forwarders don't need
+    the endpoint config threaded through them."""
+    return status >= 500 or status in u.get("_failover", ())
+
+
+def _mark_after_failover(app, endpoint_id: str, u: dict, status: int, lat: Optional[int] = None) -> None:
+    """Record health after a status that triggered failover. A 5xx is a backend that's
+    down. A sub-500 trigger (429) is a backend that's UP and refusing right now — marking
+    that dead would sink it behind its standbys for HEALTH_TTL_S and paint it red in the
+    UI for something that clears itself in seconds."""
+    if status >= 500:
+        _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {status}")
+    else:
+        _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
 
 
 def _resolve_key(u: dict, genv: dict[str, str]) -> str:
@@ -641,8 +699,8 @@ async def _do_unary(app, endpoint_id: str, candidates: list[dict], alias: str,
             last_err = f"{u['name']}: {type(e).__name__}"
             continue
         lat = int((time.perf_counter() - t0) * 1000)
-        if r.status_code >= 500:
-            _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+        if _should_failover(u, r.status_code):
+            _mark_after_failover(app, endpoint_id, u, r.status_code, lat)
             last_err = f"{u['name']}: HTTP {r.status_code}"
             continue
         _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
@@ -783,8 +841,8 @@ async def _do_unary_multipart(app, endpoint_id: str, candidates: list[dict], ali
                 last_err = f"{u['name']}: {type(e).__name__}"
                 break  # → next candidate
             lat = int((time.perf_counter() - t0) * 1000)
-            if r.status_code >= 500:
-                _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+            if _should_failover(u, r.status_code):
+                _mark_after_failover(app, endpoint_id, u, r.status_code, lat)
                 last_err = f"{u['name']}: HTTP {r.status_code}"
                 break  # → next candidate (failover)
             if force_verbose and 400 <= r.status_code < 500:
@@ -938,8 +996,8 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
             try:
                 async with cli.stream("POST", url, json=body, headers=headers,
                                       timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0)) as r:
-                    if r.status_code >= 500:
-                        _mark_health(app, endpoint_id, u["id"], False, error=f"HTTP {r.status_code}")
+                    if _should_failover(u, r.status_code):
+                        _mark_after_failover(app, endpoint_id, u, r.status_code)
                         last_err = f"{u['name']}: HTTP {r.status_code}"
                         continue  # failover (nothing sent yet)
                     _mark_health(app, endpoint_id, u["id"], True, latency_ms=int((time.perf_counter() - t0) * 1000))
@@ -1048,8 +1106,10 @@ async def _route(app, endpoint_name: str, alias: str, force: Optional[str] = Non
                     f"forced upstream '{force}' not found, disabled, or does not serve model '{alias}' on endpoint '{endpoint_name}'"})
             raise HTTPException(status_code=404, detail={"error": f"model '{alias}' is not served by endpoint '{endpoint_name}'"})
         genv = await load_global_env(s)
+        failover = _failover_statuses(cfg)
         for u in candidates:
             u["_key"] = _resolve_key(u, genv)
+            u["_failover"] = failover
         max_conc = int(cfg.get("max_concurrency") or 0)
         timeout_s = float(cfg.get("timeout_s") or DEFAULT_TIMEOUT_S)
     return endpoint_id, candidates, timeout_s, max_conc
@@ -1073,8 +1133,10 @@ async def _resolve_speech_route(app, endpoint_name: str, alias: str, force: Opti
                     f"forced upstream '{force}' not found, disabled, or does not serve model '{alias}' on endpoint '{endpoint_name}'"})
             raise HTTPException(status_code=404, detail={"error": f"model '{alias}' is not served by endpoint '{endpoint_name}'"})
         genv = await load_global_env(s)
+        failover = _failover_statuses(cfg)
         for u in candidates:
             u["_key"] = _resolve_key(u, genv)
+            u["_failover"] = failover
         max_conc = int(cfg.get("max_concurrency") or 0)
         timeout_s = float(cfg.get("timeout_s") or DEFAULT_TIMEOUT_S)
         stt = None
@@ -1782,8 +1844,8 @@ async def _do_speech(app, endpoint_id: str, candidates: list[dict], alias: str,
             last_err = f"{u['name']}: {type(e).__name__}"
             continue
         lat = int((time.perf_counter() - t0) * 1000)
-        if r.status_code >= 500:
-            _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+        if _should_failover(u, r.status_code):
+            _mark_after_failover(app, endpoint_id, u, r.status_code, lat)
             last_err = f"{u['name']}: HTTP {r.status_code}"
             continue
         _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
@@ -1839,8 +1901,8 @@ async def _stream_speech(app, request_id: str, endpoint_id: str, candidates: lis
                 last_err = f"{u['name']}: {type(e).__name__}"
                 continue
             lat = int((time.perf_counter() - t0) * 1000)
-            if r.status_code >= 500:
-                _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+            if _should_failover(u, r.status_code):
+                _mark_after_failover(app, endpoint_id, u, r.status_code, lat)
                 last_err = f"{u['name']}: HTTP {r.status_code}"
                 await r.aclose()
                 continue
@@ -2054,8 +2116,8 @@ async def _stream_audio(app, request, user, endpoint_id, candidates, alias, upst
                 last_err = f"{u['name']}: {type(e).__name__}"
                 continue
             lat = int((time.perf_counter() - t0) * 1000)
-            if r.status_code >= 500:
-                _mark_health(app, endpoint_id, u["id"], False, latency_ms=lat, error=f"HTTP {r.status_code}")
+            if _should_failover(u, r.status_code):
+                _mark_after_failover(app, endpoint_id, u, r.status_code, lat)
                 last_err = f"{u['name']}: HTTP {r.status_code}"
                 await r.aclose()
                 continue
@@ -2217,6 +2279,30 @@ async def proxy_completions(endpoint: str, request: Request, user: User = Depend
 async def proxy_embeddings(endpoint: str, payload: dict, request: Request, user: User = Depends(current_user)):
     payload.pop("stream", None)  # embeddings are unary — never SSE
     return await _handle(request, user, endpoint, payload, "/embeddings")
+
+
+# Cross-encoder reranking. vLLM serves the same handler at /rerank, /v1/rerank and
+# /v2/rerank (the last two are the Jina / Cohere client shapes), so we mirror all
+# three path spellings onto the ONE upstream path `/rerank` — a client pointed at
+# `…/proxy/{name}` (Cohere SDK → /v2/rerank) and one pointed at `…/proxy/{name}/v1`
+# both work against the same upstream. Unary + non-streaming, so `_handle` (the
+# buffered engine, with failover) is all that's needed.
+@data_router.post("/proxy/{endpoint}/v1/rerank")
+@data_router.post("/proxy/{endpoint}/v2/rerank")
+@data_router.post("/proxy/{endpoint}/rerank")
+async def proxy_rerank(endpoint: str, payload: dict, request: Request, user: User = Depends(current_user)):
+    payload.pop("stream", None)  # rerank is unary — never SSE
+    return await _handle(request, user, endpoint, payload, "/rerank")
+
+
+@data_router.post("/proxy/{endpoint}/v1/score")
+@data_router.post("/proxy/{endpoint}/score")
+async def proxy_score(endpoint: str, payload: dict, request: Request, user: User = Depends(current_user)):
+    """Pairwise scoring on the same cross-encoder — `text_1` vs `text_2` (string or
+    array), unsorted, in input order. No `documents`/`query`, so it can't share the
+    rerank route."""
+    payload.pop("stream", None)
+    return await _handle(request, user, endpoint, payload, "/score")
 
 
 @data_router.post("/proxy/{endpoint}/v1/audio/transcriptions")
@@ -2486,6 +2572,8 @@ async def create_proxy(req: CreateProxyRequest, request: Request, user: User = D
         "timeout_s": max(1, int(req.timeout_s)),
         "upstreams": _build_upstreams(req.upstreams),
     }
+    if req.failover_status is not None:
+        cfg["failover_status"] = sorted(_failover_statuses({"failover_status": req.failover_status}))
     stt = _build_stt_callback(req.stt_callback)
     if stt:
         cfg["stt_callback"] = stt
@@ -2565,6 +2653,8 @@ async def update_proxy(proxy_id: str, req: UpdateProxyRequest, request: Request,
         cfg["max_concurrency"] = max(0, int(req.max_concurrency))
     if req.timeout_s is not None:
         cfg["timeout_s"] = max(1, int(req.timeout_s))
+    if req.failover_status is not None:
+        cfg["failover_status"] = sorted(_failover_statuses({"failover_status": req.failover_status}))
     if req.upstreams is not None:
         cfg["upstreams"] = _build_upstreams(req.upstreams, existing=cfg.get("upstreams"))
     if req.stt_callback is not None:
@@ -2840,6 +2930,60 @@ async def test_upstream(req: TestUpstreamRequest, request: Request,
         if dim <= 0:
             return TestUpstreamResponse(ok=False, message=f"no embedding returned — is '{model}' an embedding model?", latency_ms=lat)
         return TestUpstreamResponse(ok=True, message=f"embedding ok ({model}): dim {dim}", latency_ms=lat, models=[model])
+
+    # Reranker (cross-encoder): POST /rerank with one clearly relevant document and two
+    # negatives — one same-domain-but-wrong-intent, one unrelated. Three docs on purpose:
+    # a single-document smoke test returns HTTP 200 even when the model is misconfigured.
+    #
+    # The failure this is really looking for: vLLM never auto-applies a reranker's chat
+    # template, so a job started without `--chat-template` scores a bare query+document
+    # concatenation and returns 200 with meaningless scores. The signature is scores
+    # bunched in the middle with no separation (and often the relevant doc NOT first) —
+    # not a borderline match. So we assert the ranking, not just the response shape.
+    if model and mode == "rerank":
+        probe_docs = [
+            "To view your latest statement, log in to the billing portal and open the Billing tab.",
+            "Restart your router by holding the reset pin for ten seconds.",
+            "The Great Wall of China is over 20,000 km long.",
+        ]
+        try:
+            r = await cli.post(
+                base + "/rerank",
+                json={"model": model, "query": "How do I check my bill?", "documents": probe_docs},
+                headers=headers, timeout=httpx.Timeout(60.0),
+            )
+        except httpx.HTTPError as e:
+            return TestUpstreamResponse(ok=False, message=f"network error: {e}")
+        lat = int((time.perf_counter() - t0) * 1000)
+        if r.status_code in (401, 403):
+            return TestUpstreamResponse(ok=False, message="unauthorized — check the API key", latency_ms=lat)
+        if r.status_code != 200:
+            return TestUpstreamResponse(ok=False, message=f"HTTP {r.status_code}: {r.text[:160]}", latency_ms=lat)
+        ranked: list[tuple[int, float]] = []
+        try:
+            for it in ((r.json() or {}).get("results") or []):
+                if not isinstance(it, dict):
+                    continue
+                sc = it.get("relevance_score", it.get("score"))
+                if sc is None:
+                    continue
+                ranked.append((int(it.get("index", len(ranked))), float(sc)))
+        except Exception:
+            ranked = []
+        if not ranked:
+            return TestUpstreamResponse(ok=False, message=f"no rerank results returned — is '{model}' a reranker/cross-encoder?", latency_ms=lat)
+        ranked.sort(key=lambda x: -x[1])  # servers SHOULD sort by score desc; don't rely on it
+        top_idx, top_score = ranked[0]
+        gap = top_score - ranked[1][1] if len(ranked) > 1 else top_score
+        if top_idx != 0:
+            return TestUpstreamResponse(
+                ok=False, latency_ms=lat,
+                message=(f"ranked doc #{top_idx} (@{top_score:.3f}) above the relevant one — "
+                         f"scores look untemplated; a vLLM reranker needs --chat-template"))
+        note = "" if gap >= 0.2 else "  ⚠ weak separation — check the job's --chat-template"
+        return TestUpstreamResponse(
+            ok=True, latency_ms=lat, models=[model],
+            message=f"rerank ok ({model}): top #{top_idx} @{top_score:.3f}, gap {gap:.3f} over next of {len(ranked)}{note}")
 
     # STT: send a short synthetic tone to /audio/transcriptions — validates the endpoint
     # accepts audio + returns a transcription shape (the text may be empty for a bare tone).

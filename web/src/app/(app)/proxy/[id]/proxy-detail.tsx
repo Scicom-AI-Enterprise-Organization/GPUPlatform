@@ -14,6 +14,7 @@ import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
 import type { ProxyEndpoint, ProxyRequest, ProxyUpstreamHealth } from "@/lib/types";
 import { BaseUrlToggle, type UrlTarget } from "@/components/console/base-url-toggle";
+import { RoutingPanel } from "../routing-panel";
 import { ProxyPlayground } from "./proxy-playground";
 import { ProxyStress } from "./proxy-stress";
 import { ProxyMetricsTab } from "./proxy-metrics";
@@ -301,6 +302,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 <TabsList variant="line" className="bg-transparent">
                   <TabsTrigger value="curl">cURL</TabsTrigger>
                   <TabsTrigger value="curl-stream">cURL (stream)</TabsTrigger>
+                  <TabsTrigger value="curl-rerank">cURL (rerank)</TabsTrigger>
                   <TabsTrigger value="openai">OpenAI client</TabsTrigger>
                 </TabsList>
                 <TabsContent value="curl" className="mt-3 space-y-3">
@@ -314,6 +316,14 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                     Same endpoint with <code className="font-mono">&quot;stream&quot;: true</code> — token-by-token Server-Sent Events.
                   </p>
                   <CodeBlock display={curlChatStream(snippetBase, snippetKeyShown, model0)} copy={curlChatStream(snippetBase, snippetKeyCopy, model0)} />
+                </TabsContent>
+                <TabsContent value="curl-rerank" className="mt-3 space-y-3">
+                  <p className="text-sm text-muted-foreground">
+                    <code className="font-mono">/proxy/{ep.name}/v1/rerank</code> — cross-encoder reranking. Set <code className="font-mono">model</code> to a
+                    reranker alias; results come back sorted by <code className="font-mono">relevance_score</code>, each carrying its
+                    original <code className="font-mono">index</code>. Pairwise scoring without sorting is <code className="font-mono">/v1/score</code>.
+                  </p>
+                  <CodeBlock display={curlRerank(snippetBase, snippetKeyShown, model0)} copy={curlRerank(snippetBase, snippetKeyCopy, model0)} />
                 </TabsContent>
                 <TabsContent value="openai" className="mt-3 space-y-3">
                   <p className="text-sm text-muted-foreground">
@@ -332,6 +342,34 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
               </p>
             </CardContent>
           </Card>
+
+          {!readOnly && (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm">Routing</CardTitle>
+              <p className="text-[11px] text-muted-foreground">
+                Which backend serves each model, and where it goes when that backend fails. Expand one for the chain.
+              </p>
+            </CardHeader>
+            <CardContent>
+              {/* Open here — the overview is where you come to read the routes. The edit
+                  form folds them so they don't push the fields you came to change off
+                  screen. `health` is the page's own poll, passed in so the panel doesn't
+                  start a second timer against the same endpoint. */}
+              <RoutingPanel
+                upstreams={ep.upstreams.map((u) => ({
+                  uid: u.id, name: u.name, base_url: u.base_url,
+                  priority: u.priority, enabled: u.enabled,
+                  models: Object.entries(u.models).map(([alias, real]) => ({ alias, real })),
+                }))}
+                maxConcurrency={ep.max_concurrency}
+                timeoutS={ep.timeout_s}
+                failoverStatus={ep.failover_status ?? []}
+                healthRows={health}
+              />
+            </CardContent>
+          </Card>
+          )}
 
           {!readOnly && (
           <Card>
@@ -570,6 +608,23 @@ function curlChatStream(base: string, token: string, model: string): string {
     "messages": [{"role": "user", "content": "Hello, world"}],
     "max_tokens": 1024,
     "stream": true
+  }'`;
+}
+// Three documents, one of them a hard negative: a single-document rerank returns 200
+// even when the upstream's scoring template isn't applied, so the snippet people copy
+// should be one that would actually expose that.
+function curlRerank(base: string, token: string, model: string): string {
+  return `curl -X POST '${base}/rerank' \\
+  -H 'Content-Type: application/json' \\
+  -H 'Authorization: Bearer ${token}' \\
+  -d '{
+    "model": "${model}",
+    "query": "How do I check my bill?",
+    "documents": [
+      "Log in to the billing portal and open the Billing tab.",
+      "Restart your router by holding the reset pin.",
+      "The Great Wall of China is over 20,000 km long."
+    ]
   }'`;
 }
 function openaiSnippet(base: string, token: string, model: string): string {

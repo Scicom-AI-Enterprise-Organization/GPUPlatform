@@ -1716,6 +1716,8 @@ export type ProxyEndpoint = {
   public?: boolean;
   max_concurrency: number;
   timeout_s: number;
+  // sub-500 statuses that fail over to the next upstream (>=500 always does). [] = off.
+  failover_status?: number[];
   upstreams: ProxyUpstream[];
   stt_callback?: ProxySttCallback | null;
   capture?: ProxyCapture | null;
@@ -1752,6 +1754,7 @@ export type CreateProxyBody = {
   name: string;
   max_concurrency?: number;
   timeout_s?: number;
+  failover_status?: number[];
   enabled?: boolean;
   public?: boolean;
   upstreams: ProxyUpstreamSpec[];
@@ -1795,7 +1798,7 @@ export type TestProxyUpstreamBody = {
   api_key_secret?: string | null;
   api_key?: string | null;
   model?: string | null; // real upstream model to end-to-end test; omitted = probe /models
-  mode?: "chat" | "embedding" | "transcription" | "tts"; // which endpoint to test (default chat)
+  mode?: "chat" | "embedding" | "rerank" | "transcription" | "tts"; // which endpoint to test (default chat)
   extra_body?: Record<string, unknown> | null; // merged into the chat test body
 };
 

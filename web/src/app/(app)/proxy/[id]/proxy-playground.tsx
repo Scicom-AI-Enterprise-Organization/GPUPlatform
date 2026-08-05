@@ -1,15 +1,17 @@
 "use client";
 
-// Proxy playground with a mode DROPDOWN (chat / embeddings / audio transcription),
-// exactly like the serverless endpoint playground. The proxy is OpenAI-compatible,
-// so each mode just points the shared playground component at the matching
-// data-plane path; embeddings + audio reuse the same generic components the
-// serverless playground uses.
+// Proxy playground with a mode DROPDOWN (chat / embeddings / rerank / audio
+// transcription), exactly like the serverless endpoint playground. The proxy is
+// OpenAI-compatible, so each mode just points the shared playground component at the
+// matching data-plane path; embeddings + audio reuse the same generic components the
+// serverless playground uses. Rerank is proxy-only — the serverless data plane routes
+// through the worker queue, which has no rerank job type.
 import { useMemo, useState } from "react";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { ChatPlayground, openAiTransport } from "@/components/playground/chat-playground";
+import { RerankPlayground } from "@/components/playground/rerank-playground";
 import { EmbeddingPlayground } from "@/app/(app)/serverless/[id]/tabs/embedding";
 import { TranscribePlayground } from "@/app/(app)/serverless/[id]/tabs/transcribe";
 import { SpeechPlayground } from "@/app/(app)/serverless/[id]/tabs/speech";
@@ -17,6 +19,8 @@ import { SpeechPlayground } from "@/app/(app)/serverless/[id]/tabs/speech";
 // The upstream identity the force dropdown offers. Only enabled upstreams are
 // forceable (the backend 404s a forced disabled/absent upstream).
 export type PlaygroundUpstream = { id: string; name: string; enabled: boolean };
+
+type PlaygroundMode = "chat" | "embedding" | "rerank" | "audio" | "tts";
 
 const AUTO = "__auto";
 
@@ -27,7 +31,7 @@ export function ProxyPlayground(
   // The data-plane base behind the Next proxy: /api/proxy → gateway, then
   // /proxy/{name}/v1 → the proxy router. Each mode appends its OpenAI sub-path.
   const apiBase = `/api/proxy/proxy/${encodeURIComponent(name)}/v1`;
-  const [mode, setMode] = useState<"chat" | "embedding" | "audio" | "tts">("chat");
+  const [mode, setMode] = useState<PlaygroundMode>("chat");
 
   // Force-provider: send X-SGPU-Upstream to pin routing to ONE upstream (no
   // failover). "" / auto → normal priority+health routing across all upstreams.
@@ -57,11 +61,12 @@ export function ProxyPlayground(
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">mode</span>
-        <Select value={mode} onValueChange={(v) => setMode(v as "chat" | "embedding" | "audio" | "tts")}>
+        <Select value={mode} onValueChange={(v) => setMode(v as PlaygroundMode)}>
           <SelectTrigger className="h-8 w-[280px] text-xs"><SelectValue /></SelectTrigger>
           <SelectContent>
             <SelectItem value="chat" className="text-xs">Chat / text generation</SelectItem>
             <SelectItem value="embedding" className="text-xs">Embeddings (/v1/embeddings)</SelectItem>
+            <SelectItem value="rerank" className="text-xs">Rerank (/v1/rerank)</SelectItem>
             <SelectItem value="audio" className="text-xs">Audio transcription (Whisper)</SelectItem>
             <SelectItem value="tts" className="text-xs">Text to speech (/v1/audio/speech)</SelectItem>
           </SelectContent>
@@ -87,11 +92,10 @@ export function ProxyPlayground(
         </span>
       </div>
       {mode === "chat" ? chat
-        : mode === "embedding"
-          ? <EmbeddingPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:embed:proxy:${name}`} extraHeaders={extraHeaders} />
-          : mode === "audio"
-            ? <TranscribePlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:transcribe:proxy:${name}`} extraHeaders={extraHeaders} />
-            : <SpeechPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:speech:proxy:${name}`} extraHeaders={extraHeaders} />}
+        : mode === "embedding" ? <EmbeddingPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:embed:proxy:${name}`} extraHeaders={extraHeaders} />
+        : mode === "rerank" ? <RerankPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:rerank:proxy:${name}`} extraHeaders={extraHeaders} />
+        : mode === "audio" ? <TranscribePlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:transcribe:proxy:${name}`} extraHeaders={extraHeaders} />
+        : <SpeechPlayground models={aliases} basePath={apiBase} storageKey={`serverless-ui:speech:proxy:${name}`} extraHeaders={extraHeaders} />}
     </div>
   );
 }
