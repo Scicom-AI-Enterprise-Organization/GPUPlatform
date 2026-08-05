@@ -344,31 +344,6 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         </div>
       </section>
 
-      <section data-form-section="Routing" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
-        <h2 className="text-base font-medium">Routing</h2>
-        <p className="mb-4 mt-1 text-xs text-muted-foreground">
-          Which backend serves each model, and where it goes when that backend fails. Expand a model
-          for the full chain — take a backend down to watch the route move.
-        </p>
-        <RoutingPanel
-          upstreams={ups}
-          maxConcurrency={Number(maxConc) || 0}
-          timeoutS={Number(timeoutS) || 0}
-          failoverStatus={parsedFailover}
-          proxyId={initial?.id}
-          defaultOpen={false}
-          // Ties break on list position, so moving an upstream to the front is what makes
-          // it the primary — the only way to change the winner without editing a priority.
-          onPromote={(uid) => setUps((a) => {
-            const i = a.findIndex((u) => u.uid === uid);
-            if (i <= 0) return a;
-            const next = [...a];
-            next.unshift(next.splice(i, 1)[0]);
-            return next;
-          })}
-        />
-      </section>
-
       <section data-form-section="Upstreams" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="mb-1 flex items-center justify-between">
           <h2 className="text-base font-medium">Upstreams</h2>
@@ -495,6 +470,31 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           ))}
         </div>
         <datalist id="px-secret-keys">{secretKeys.map((k) => <option key={k} value={k} />)}</datalist>
+      </section>
+
+      <section data-form-section="Routing" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
+        <h2 className="text-base font-medium">Routing</h2>
+        <p className="mb-4 mt-1 text-xs text-muted-foreground">
+          Which backend serves each model, and where it goes when that backend fails. Expand a model
+          for the full chain — take a backend down to watch the route move.
+        </p>
+        <RoutingPanel
+          upstreams={ups}
+          maxConcurrency={Number(maxConc) || 0}
+          timeoutS={Number(timeoutS) || 0}
+          failoverStatus={parsedFailover}
+          proxyId={initial?.id}
+          defaultOpen={false}
+          // Ties break on list position, so moving an upstream to the front is what makes
+          // it the primary — the only way to change the winner without editing a priority.
+          onPromote={(uid) => setUps((a) => {
+            const i = a.findIndex((u) => u.uid === uid);
+            if (i <= 0) return a;
+            const next = [...a];
+            next.unshift(next.splice(i, 1)[0]);
+            return next;
+          })}
+        />
       </section>
 
       <section data-form-section="STT callback (CER/WER)" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">

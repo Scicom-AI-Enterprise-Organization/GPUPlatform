@@ -13,9 +13,11 @@
 // failure-only. Fanning parallel edges out of the request would draw load balancing
 // this proxy has never done.
 //
-// Models are listed by their REAL upstream name. The alias is what a client actually
-// puts in `model`, so it stays on the request node — leaving it out entirely would
-// tell you to send a name the proxy doesn't answer to.
+// Models are listed by their ALIAS — that is what a client actually puts in `model`,
+// and it is the one name that is stable across the whole chain. Each backend's own
+// spelling still shows on its node (`→ ownReal`), highlighted when it differs from
+// the serving backend's, so a mismatch is still visible without making the heading
+// change identity depending on which upstream happens to be up.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -145,8 +147,9 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
   // One route per ALIAS — the alias is the only thing that decides which upstreams match.
   // Keying on the real model name instead would split a single route in two whenever the
   // upstreams spell the model differently (a local vLLM serving "google/gemma-4-31B-it"
-  // next to OpenRouter's "google/gemma-4-31b-it" is one route, not two). The route is
-  // labelled with the real name of whichever backend is actually serving it.
+  // next to OpenRouter's "google/gemma-4-31b-it" is one route, not two). `real` is kept
+  // for kind detection + the per-backend spelling-mismatch highlight; the route is
+  // LABELLED with its alias (see the header note).
   const routes = useMemo(() => {
     const aliases = new Set<string>();
     for (const u of upstreams) for (const m of u.models) if (m.alias.trim()) aliases.add(m.alias.trim());
@@ -161,7 +164,7 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
       const tie = top ? chain.filter((c) => !down.has(c.uid) && c.priority === top.priority).length : 0;
       out.push({ kind: modelKind(real, alias), real, alias, chain, tie });
     }
-    return out.sort((a, b) => a.real.localeCompare(b.real));
+    return out.sort((a, b) => a.alias.localeCompare(b.alias));
   }, [upstreams, down]);
 
   const byKind = KIND_ORDER
@@ -282,7 +285,7 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
     <details open={defaultOpen} className="group/model rounded-md border border-border">
       <summary className="flex cursor-pointer select-none flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2">
         <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open/model:rotate-90" />
-        <code className="text-xs font-medium">{route.real}</code>
+        <code className="text-xs font-medium">{route.alias}</code>
         {chain.length === 0 ? (
           <span className="text-[11px] text-rose-600 dark:text-rose-400">no backend — returns 404</span>
         ) : (

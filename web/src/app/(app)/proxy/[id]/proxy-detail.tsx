@@ -345,34 +345,6 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
 
           {!readOnly && (
           <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm">Routing</CardTitle>
-              <p className="text-[11px] text-muted-foreground">
-                Which backend serves each model, and where it goes when that backend fails. Expand one for the chain.
-              </p>
-            </CardHeader>
-            <CardContent>
-              {/* Open here — the overview is where you come to read the routes. The edit
-                  form folds them so they don't push the fields you came to change off
-                  screen. `health` is the page's own poll, passed in so the panel doesn't
-                  start a second timer against the same endpoint. */}
-              <RoutingPanel
-                upstreams={ep.upstreams.map((u) => ({
-                  uid: u.id, name: u.name, base_url: u.base_url,
-                  priority: u.priority, enabled: u.enabled,
-                  models: Object.entries(u.models).map(([alias, real]) => ({ alias, real })),
-                }))}
-                maxConcurrency={ep.max_concurrency}
-                timeoutS={ep.timeout_s}
-                failoverStatus={ep.failover_status ?? []}
-                healthRows={health}
-              />
-            </CardContent>
-          </Card>
-          )}
-
-          {!readOnly && (
-          <Card>
             <CardHeader className="pb-2"><CardTitle className="text-sm">Upstreams <span className="text-[11px] font-normal text-muted-foreground">· live health</span></CardTitle></CardHeader>
             <CardContent className="space-y-2">
               {ep.upstreams.map((u) => {
@@ -399,6 +371,34 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                   </div>
                 );
               })}
+            </CardContent>
+          </Card>
+          )}
+
+          {!readOnly && (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm">Routing</CardTitle>
+              <p className="text-[11px] text-muted-foreground">
+                Which backend serves each model, and where it goes when that backend fails. Expand one for the chain.
+              </p>
+            </CardHeader>
+            <CardContent>
+              {/* Open here — the overview is where you come to read the routes. The edit
+                  form folds them so they don't push the fields you came to change off
+                  screen. `health` is the page's own poll, passed in so the panel doesn't
+                  start a second timer against the same endpoint. */}
+              <RoutingPanel
+                upstreams={ep.upstreams.map((u) => ({
+                  uid: u.id, name: u.name, base_url: u.base_url,
+                  priority: u.priority, enabled: u.enabled,
+                  models: Object.entries(u.models).map(([alias, real]) => ({ alias, real })),
+                }))}
+                maxConcurrency={ep.max_concurrency}
+                timeoutS={ep.timeout_s}
+                failoverStatus={ep.failover_status ?? []}
+                healthRows={health}
+              />
             </CardContent>
           </Card>
           )}

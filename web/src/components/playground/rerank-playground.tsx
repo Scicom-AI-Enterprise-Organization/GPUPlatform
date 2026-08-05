@@ -20,6 +20,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { CurlBlock, curlJson } from "@/components/playground/curl-block";
 
 type RankedDoc = { index: number; score: number; text: string };
 type RerankRun = {
@@ -43,10 +44,13 @@ const WEAK_GAP = 0.2;
 const fmtScore = (s: number) => (s >= 0.0005 || s === 0 ? s.toFixed(4) : s.toExponential(2));
 
 // Generic rerank playground — `basePath` is the Next-proxy prefix fronting the
-// OpenAI-compatible data plane (…/v1); POSTs `${basePath}/rerank`.
-export function RerankPlayground({ models, basePath, storageKey, extraHeaders }: {
+// OpenAI-compatible data plane (…/v1); POSTs `${basePath}/rerank`. `curlBase` is the
+// same path spelled the way a caller outside the browser would (the public gateway
+// URL) — only used to render the copyable curl.
+export function RerankPlayground({ models, basePath, curlBase, storageKey, extraHeaders }: {
   models: string[];
   basePath: string;
+  curlBase?: string;
   storageKey: string;
   extraHeaders?: Record<string, string>;
 }) {
@@ -81,14 +85,20 @@ export function RerankPlayground({ models, basePath, storageKey, extraHeaders }:
     [docsText],
   );
 
+  // The exact payload — shared with the curl block so what you copy is what ran.
+  const topNum = Number.parseInt(topN, 10);
+  const body = useMemo<Record<string, unknown>>(() => {
+    const b: Record<string, unknown> = { model, query: query.trim(), documents: docs };
+    if (Number.isFinite(topNum) && topNum > 0) b.top_n = topNum;
+    if (instruction.trim()) b.instruction = instruction.trim();
+    return b;
+  }, [model, query, docs, topNum, instruction]);
+
   async function onRun() {
     if (!model || !query.trim() || docs.length === 0) return;
     setBusy(true); setErr(null); setResult(null);
     try {
-      const n = Number.parseInt(topN, 10);
-      const body: Record<string, unknown> = { model, query: query.trim(), documents: docs };
-      if (Number.isFinite(n) && n > 0) body.top_n = n;
-      if (instruction.trim()) body.instruction = instruction.trim();
+      const n = topNum;
       const r = await fetch(`${basePath}/rerank`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(extraHeaders ?? {}) },
@@ -214,6 +224,9 @@ export function RerankPlayground({ models, basePath, storageKey, extraHeaders }:
             </Button>
           </div>
           {err && <p className="text-sm text-destructive">{err}</p>}
+          {curlBase && model && query.trim() && docs.length > 0 && (
+            <CurlBlock build={(tok) => curlJson(`${curlBase}/rerank`, tok, body, extraHeaders)} />
+          )}
           {result && <Results run={result} />}
         </CardContent>
       </Card>
