@@ -19,7 +19,7 @@
 // the serving backend's, so a mismatch is still visible without making the heading
 // change identity depending on which upstream happens to be up.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Server, SendHorizontal, Plus, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ProxyUpstreamHealth } from "@/lib/types";
 import { KIND_LABEL, KIND_ORDER, KIND_PATH, modelKind, type ModelKind } from "./model-kind";
@@ -42,22 +42,23 @@ type Route = { kind: ModelKind; real: string; alias: string; chain: RoutingUpstr
 // RemoteProtocolError), or one of the endpoint's `failover_status` codes — 429 by default,
 // since a rate-limited backend is up and refusing rather than down. Every other 4xx is
 // handed back to the caller untouched.
-const hopLabel = (failover: number[]) =>
-  ["5xx", ...failover.map(String), "timeout", "dropped"].join(" · ");
 
 // canvas geometry
 const PAD = 16;
-const NODE_H = 94;
+const NODE_H = 84;
 const TERM_H = 34;
 const TWO_COL_MIN = 660;
 
-// Theme-aware palette. Set as CSS variables on the canvas so the SVG strokes and the
-// card borders read from the same source in both light and dark.
+// Theme-aware node-workflow palette. These `--live/--fall/--down/--wire/--surface/--canvas/
+// --dot/--glow/--vignette` vars feed the SVG strokes, node cards and the canvas from one
+// source. Light = clean white surface on a faint grid; dark = the near-black reference look.
 const PALETTE = [
+  // light
   "[--live:#059669] [--fall:#b45309] [--down:#e11d48] [--wire:#cbd5e1]",
-  "[--dot:rgba(15,23,42,0.10)] [--surface:#ffffff] [--canvas:#f8fafc]",
-  "dark:[--live:#34d399] dark:[--fall:#f59e0b] dark:[--down:#fb7185] dark:[--wire:#2a303c]",
-  "dark:[--dot:rgba(255,255,255,0.07)] dark:[--surface:#161a22] dark:[--canvas:#0d0f14]",
+  "[--dot:rgba(15,23,42,0.07)] [--surface:#ffffff] [--canvas:#f6f8fb] [--glow:#ffffff] [--vignette:transparent]",
+  // dark (matches the reference)
+  "dark:[--live:#34d399] dark:[--fall:#f59e0b] dark:[--down:#fb7185] dark:[--wire:#3a4150]",
+  "dark:[--dot:rgba(255,255,255,0.06)] dark:[--surface:#141a24] dark:[--canvas:#0a0d13] dark:[--glow:#141d2c] dark:[--vignette:rgba(0,0,0,0.5)]",
 ].join(" ");
 
 // Mirrors _select_candidates. The final `a.idx - b.idx` is the load-bearing line: it is
@@ -85,7 +86,9 @@ const curveDown = (x: number, y1: number, y2: number, bow: number) =>
   `M ${x} ${y1} C ${x - bow} ${y1}, ${x - bow} ${y2}, ${x} ${y2}`;
 
 export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onPromote,
-                               defaultOpen = true, healthRows, failoverStatus = [] }: {
+                               defaultOpen = true, healthRows, failoverStatus = [],
+                               editable = false, selectedUid = null, onSelect,
+                               onAddUpstream, onDeleteUpstream, renderEditor }: {
   upstreams: RoutingUpstream[];
   maxConcurrency: number;
   timeoutS: number;
@@ -103,6 +106,16 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
   // Health already polled by the host page — pass it instead of proxyId so the two
   // don't poll the same endpoint on separate timers.
   healthRows?: ProxyUpstreamHealth[];
+  // ---- Editor mode (Edit page only) ---------------------------------------
+  // editable=false (Overview) is a pure read-only preview: no take-down, no clicking a
+  // node to edit, no add/delete. When true, the graph IS the upstream editor — clicking a
+  // backend node selects it and the host renders its editor below via renderEditor().
+  editable?: boolean;
+  selectedUid?: string | null;          // which upstream is open in the editor
+  onSelect?: (uid: string | null) => void;
+  onAddUpstream?: () => void;           // "+ Add backend"
+  onDeleteUpstream?: (uid: string) => void;
+  renderEditor?: (uid: string) => React.ReactNode;  // host-supplied editor for one upstream
 }) {
   const [simDown, setSimDown] = useState<Set<string>>(new Set());
   const toggleDown = (uid: string) =>
@@ -134,6 +147,16 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
     const t = setInterval(load, 15000);
     return () => { stop = true; clearInterval(t); };
   }, [proxyId, healthRows]);
+
+  // Bring the inline editor into view whenever a backend is selected — clicking a node,
+  // or "Add backend" (which selects the new one). Without this the editor renders below
+  // the fold and the click feels like nothing happened.
+  const editorRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (editable && selectedUid && editorRef.current) {
+      editorRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [editable, selectedUid]);
 
   const down = useMemo(() => {
     const s = new Set<string>();
@@ -171,16 +194,79 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
     .map((kind) => ({ kind, items: routes.filter((r) => r.kind === kind) }))
     .filter((g) => g.items.length > 0);
 
+  // Upstreams that don't appear in any route node — a disabled backend, or a brand-new
+  // one with no valid alias yet. Only relevant in editable mode, where they still need to
+  // be reachable for editing (you can't click a node that isn't drawn).
+  const shownUids = new Set<string>();
+  for (const r of routes) for (const u of r.chain) shownUids.add(u.uid);
+  const unrouted = upstreams.filter((u) => !shownUids.has(u.uid));
+
+  // The editor slot rendered below the graph for whichever upstream is selected.
+  const editorPanel = editable && selectedUid && renderEditor ? (
+    <div ref={editorRef} className="scroll-mt-4 rounded-md border border-primary/40 bg-card p-3 shadow-sm">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-xs font-medium text-muted-foreground">Editing backend</span>
+        <div className="flex items-center gap-2">
+          {onDeleteUpstream && (
+            <button type="button" onClick={() => onDeleteUpstream(selectedUid)}
+                    className="rounded border border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:text-destructive">
+              Delete backend
+            </button>
+          )}
+          <button type="button" onClick={() => onSelect?.(null)}
+                  className="rounded border border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:text-foreground">
+            Done
+          </button>
+        </div>
+      </div>
+      {renderEditor(selectedUid)}
+    </div>
+  ) : null;
+
+  // Header (editable only): add a backend. Empty-state still needs it so you can start.
+  const addBar = editable && onAddUpstream ? (
+    <div className="flex items-center justify-between">
+      <span className="text-[11px] text-muted-foreground">Click a backend to edit it. Lower priority wins; requests fail over down the chain.</span>
+      <button type="button" onClick={onAddUpstream}
+              className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs hover:bg-muted">
+        <Plus className="h-3.5 w-3.5" /> Add backend
+      </button>
+    </div>
+  ) : null;
+
+  const unroutedBar = editable && unrouted.length > 0 ? (
+    <div className="rounded-md border border-dashed border-border px-3 py-2">
+      <span className="text-[11px] text-muted-foreground">Not in any route (disabled or no model alias yet) — click to edit:</span>
+      <div className="mt-1.5 flex flex-wrap gap-1.5">
+        {unrouted.map((u) => (
+          <button key={u.uid} type="button" onClick={() => onSelect?.(u.uid)}
+                  className={cn("rounded-md border px-2 py-1 text-[11px]",
+                    selectedUid === u.uid ? "border-primary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>
+            {u.name || "unnamed"}{!u.enabled && " · off"}
+          </button>
+        ))}
+      </div>
+    </div>
+  ) : null;
+
   if (routes.length === 0) {
     return (
-      <p className="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-muted-foreground">
-        Map a model below and its route appears here.
-      </p>
+      <div className="space-y-2">
+        {addBar}
+        {unroutedBar}
+        {editorPanel}
+        {!selectedUid && (
+          <p className="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-muted-foreground">
+            {editable ? "Add a backend and map a model — its route appears here." : "Map a model below and its route appears here."}
+          </p>
+        )}
+      </div>
     );
   }
 
   return (
     <div className="space-y-2">
+      {addBar}
       {byKind.map(({ kind, items }) => (
         <details key={kind} open={defaultOpen} className="group/kind rounded-md border border-border">
           <summary className="flex cursor-pointer select-none items-center gap-2 px-3 py-2">
@@ -196,11 +282,15 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
               <ModelFlow key={`${r.real}/${r.alias}`} route={r} down={down} health={health}
                          simDown={simDown} onToggle={toggleDown} onPromote={onPromote}
                          listOrder={upstreams} maxConcurrency={maxConcurrency} timeoutS={timeoutS}
-                         defaultOpen={defaultOpen} failoverStatus={failoverStatus} />
+                         defaultOpen={defaultOpen} failoverStatus={failoverStatus}
+                         editable={editable} selectedUid={selectedUid} onSelect={onSelect} />
             ))}
           </div>
         </details>
       ))}
+
+      {unroutedBar}
+      {editorPanel}
 
       <details className="group/help rounded-md border border-border">
         <summary className="flex cursor-pointer select-none items-center gap-2 px-3 py-2 text-[11px] text-muted-foreground">
@@ -230,7 +320,8 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
 }
 
 function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrder,
-                     maxConcurrency, timeoutS, defaultOpen, failoverStatus }: {
+                     maxConcurrency, timeoutS, defaultOpen, failoverStatus,
+                     editable = false, selectedUid = null, onSelect }: {
   route: Route;
   down: Set<string>;
   health: Record<string, ProxyUpstreamHealth>;
@@ -242,6 +333,9 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
   timeoutS: number;
   defaultOpen: boolean;
   failoverStatus: number[];
+  editable?: boolean;
+  selectedUid?: string | null;
+  onSelect?: (uid: string | null) => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [avail, setAvail] = useState(0);
@@ -304,16 +398,17 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
       <div className="border-t border-border p-2">
         <div
           ref={wrapRef}
-          className={cn("relative overflow-hidden rounded-md", PALETTE)}
+          className={cn("relative overflow-hidden rounded-xl ring-1 ring-black/5 dark:ring-white/10", PALETTE)}
           style={{
-            background: "var(--canvas)",
-            backgroundImage: "radial-gradient(var(--dot) 1px, transparent 1px)",
-            backgroundSize: "16px 16px",
+            // Canvas colour + a faint top glow for depth, with the dot grid on top. All
+            // theme-aware via the palette vars, so it reads right in light and dark.
+            backgroundColor: "var(--canvas)",
+            backgroundImage:
+              "radial-gradient(var(--dot) 1px, transparent 1px), radial-gradient(120% 90% at 50% -10%, var(--glow) 0%, transparent 60%)",
+            backgroundSize: "16px 16px, 100% 100%",
+            boxShadow: "inset 0 0 80px var(--vignette)",
           }}
         >
-          <style>{`@media (prefers-reduced-motion: reduce){.pxr-crawl{animation:none!important}}
-            @keyframes pxr-dash{to{stroke-dashoffset:-26}}
-            .pxr-crawl{animation:pxr-dash 1.2s linear infinite}`}</style>
 
           <div className="relative" style={{ height }}>
             <svg className="absolute inset-0 h-full w-full" aria-hidden>
@@ -324,22 +419,28 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
                       width={nodeW + 16} height={(tie - 1) * row + NODE_H + 16}
                       fill="none" stroke="var(--fall)" strokeOpacity={0.45} strokeDasharray="4 5" />
               )}
-              <path d={entry} fill="none" strokeWidth={1.75} strokeDasharray="7 5" strokeLinecap="round"
+              {/* Active route: one soft, solid emerald curve — the request always enters
+                  at the primary backend. A dropped-socket 404 case turns rose. */}
+              <path d={entry} fill="none" strokeWidth={2} strokeLinecap="round"
                     stroke={chain.length ? "var(--live)" : "var(--down)"}
-                    className={chain.length ? "pxr-crawl" : undefined} />
+                    style={{
+                      filter: `drop-shadow(0 0 3px color-mix(in srgb, ${chain.length ? "var(--live)" : "var(--down)"} 45%, transparent))`,
+                    }} />
+              {/* Failure paths (fallback hops + the end-stop) are one quiet red-dashed
+                  curve — "where it goes when this backend fails". */}
               {chain.map((_, i) => {
                 const last = i === chain.length - 1;
                 return (
                   <path key={i} d={curveDown(chainX, rowY(i) + NODE_H / 2, last ? termMid : rowY(i + 1) + NODE_H / 2, bow)}
-                        fill="none" stroke={last ? "var(--wire)" : "var(--fall)"} strokeWidth={1.5}
-                        strokeDasharray="2 5" strokeLinecap="round" />
+                        fill="none" stroke="var(--down)" strokeWidth={1.5}
+                        strokeDasharray="1.5 7" strokeLinecap="round" strokeOpacity={0.7} />
                 );
               })}
-              <circle cx={fromPt.x} cy={fromPt.y} r={3.5} fill={chain.length ? "var(--live)" : "var(--down)"} />
+              <circle cx={fromPt.x} cy={fromPt.y} r={3} fill={chain.length ? "var(--live)" : "var(--down)"} />
               {chain.map((u, i) => (
                 <circle key={u.uid} cx={chainX} cy={rowY(i) + NODE_H / 2} r={3.5}
                         fill={i === 0 && !down.has(u.uid) ? "var(--live)" : "var(--canvas)"}
-                        stroke={down.has(u.uid) ? "var(--down)" : i === 0 ? "var(--live)" : "var(--fall)"}
+                        stroke={down.has(u.uid) ? "var(--down)" : i === 0 ? "var(--live)" : "var(--wire)"}
                         strokeWidth={1.5} />
               ))}
               <circle cx={chainX} cy={termMid} r={3.5} fill="var(--canvas)"
@@ -348,30 +449,16 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
 
             {/* request */}
             <Node x={PAD} y={reqY} w={nodeW} tone={chain.length ? "live" : "down"} glow={chain.length > 0}>
-              <div className="truncate font-mono text-[11px] text-emerald-600 dark:text-emerald-400">
-                POST {KIND_PATH[route.kind]}
-              </div>
-              <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+              <NodeHead tone={chain.length ? "live" : "down"} icon={SendHorizontal}
+                        title={`POST ${KIND_PATH[route.kind]}`} />
+              <NodeRule />
+              <div className="truncate font-mono text-[11px] text-muted-foreground">
                 &quot;model&quot;: &quot;{route.alias}&quot;
               </div>
-              <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+              <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground/70">
                 {maxConcurrency > 0 ? `${maxConcurrency} at once` : "no cap"} · {timeoutS}s
               </div>
             </Node>
-
-            {/* failure-hop labels sit in the vertical gaps, never over a card */}
-            {chain.map((_, i) => (
-              <span key={i}
-                    className="absolute z-10 whitespace-nowrap font-mono text-[10px]"
-                    style={{
-                      left: chainX + 8,
-                      top: (i === chain.length - 1 ? termY : rowY(i + 1)) - rowGap / 2,
-                      transform: "translateY(-50%)",
-                      color: i === chain.length - 1 ? "var(--wire)" : "var(--fall)",
-                    }}>
-                {i === chain.length - 1 ? "all failed · 502" : hopLabel(failoverStatus)}
-              </span>
-            ))}
 
             {/* candidates */}
             {chain.map((u, i) => {
@@ -385,51 +472,48 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
               // Inside a tie the rank comes from list position, so show that position and
               // offer the one action that changes the winner without touching a number.
               const tied = tie > 1 && i < tie;
-              const listPos = listOrder.findIndex((x) => x.uid === u.uid) + 1;
               const ownReal = u.models.find((m) => m.alias.trim() === route.alias)?.real.trim() ?? "";
+              const selected = editable && selectedUid === u.uid;
               return (
                 <Node key={u.uid} x={chainX} y={rowY(i)} w={nodeW}
-                      tone={dead ? "down" : live ? "live" : "wait"} glow={live}>
-                  <div className="flex items-center gap-1.5">
-                    <span className="font-mono text-[11px] tabular-nums text-muted-foreground">#{i + 1}</span>
-                    <span className="truncate text-xs font-medium">{u.name || "unnamed"}</span>
-                    {live && <Tag tone="live">serving</Tag>}
-                    {!live && !dead && <Tag tone="wait">standby</Tag>}
-                    {dead && <Tag tone="down">tried last</Tag>}
-                    <button type="button" onClick={(e) => { e.preventDefault(); onToggle(u.uid); }}
-                            className="ml-auto shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
-                            title={simDown.has(u.uid) ? "Bring this backend back" : "Pretend this backend is down"}>
-                      {simDown.has(u.uid) ? "bring back" : "take down"}
-                    </button>
-                  </div>
-                  <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={u.base_url}>
-                    {u.base_url || "no base URL"}
-                  </div>
-                  {/* Each backend's own name for the model. Usually identical down the
-                      chain; when it isn't (a local vLLM vs a hosted provider spelling it
-                      differently) that is worth seeing, not hiding behind the alias. */}
-                  <div className={cn("truncate font-mono text-[11px]",
-                                     ownReal && ownReal !== route.real
-                                       ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground")}
-                       title={ownReal !== route.real ? `This backend calls it "${ownReal}"` : undefined}>
-                    → {ownReal || "—"}
-                  </div>
-                  <div className="mt-1 flex items-baseline gap-2 font-mono text-[11px] text-muted-foreground">
-                    <span>prio {u.priority}</span>
-                    {tied && (
-                      <span className="shrink-0 text-amber-600 dark:text-amber-400"
-                            title="Tied on priority — the winner is whichever of these is listed first in Upstreams">
-                        listed #{listPos}{live ? " ← wins" : ""}
-                      </span>
+                      tone={dead ? "down" : live ? "live" : "wait"} glow={live}
+                      selected={selected} onClick={editable ? () => onSelect?.(u.uid) : undefined}
+                      title={editable
+                        ? `Click to edit · ${u.name || "unnamed"} · ${u.base_url || "no base URL"}`
+                        : `${u.name || "unnamed"} · ${u.base_url || "no base URL"}${ownReal ? ` · → ${ownReal}` : ""}`}>
+                  {/* Minimal pill like the reference: icon + name + tag. The base URL, mapped
+                      model and hop details live on hover; the one visible line is health.
+                      take-down (a client-only failover SIMULATION) is edit-mode only — the
+                      Overview graph is pure read/preview. */}
+                  <NodeHead tone={dead ? "down" : live ? "live" : "wait"} icon={Server}
+                            title={`#${i + 1} ${u.name || "unnamed"}`}
+                            right={
+                              <div className="flex items-center gap-1.5">
+                                {live && <Tag tone="live">serving</Tag>}
+                                {!live && !dead && <Tag tone="wait">standby</Tag>}
+                                {dead && <Tag tone="down">tried last</Tag>}
+                                {editable && (
+                                  <button type="button" onClick={(e) => { e.stopPropagation(); e.preventDefault(); onToggle(u.uid); }}
+                                          className="shrink-0 rounded px-1 py-0.5 text-[10px] text-muted-foreground/70 hover:text-foreground"
+                                          title={simDown.has(u.uid) ? "Bring this backend back" : "Simulate this backend down to preview failover"}>
+                                    {simDown.has(u.uid) ? "bring back" : "take down"}
+                                  </button>
+                                )}
+                              </div>
+                            } />
+                  <div className="mt-2 flex items-baseline gap-2 font-mono text-[10px] text-muted-foreground/70">
+                    <span className="shrink-0">prio {u.priority}</span>
+                    {ownReal && ownReal !== route.real && (
+                      <span className="shrink-0 text-amber-500" title={`This backend calls it "${ownReal}"`}>≠ model</span>
                     )}
                     {tied && !live && onPromote && (
-                      <button type="button" onClick={(e) => { e.preventDefault(); onPromote(u.uid); }}
-                              className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] hover:text-foreground"
+                      <button type="button" onClick={(e) => { e.stopPropagation(); e.preventDefault(); onPromote(u.uid); }}
+                              className="shrink-0 text-amber-500 hover:underline"
                               title="Move this upstream to the top of the list — with a tie, that alone makes it the primary">
                         make primary
                       </button>
                     )}
-                    <span className={cn("ml-auto truncate", dead && "text-rose-600 dark:text-rose-400")}>{state}</span>
+                    <span className={cn("ml-auto shrink-0", dead && "text-rose-500")}>{state}</span>
                   </div>
                 </Node>
               );
@@ -457,22 +541,58 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
   );
 }
 
-function Node({ x, y, w, h = NODE_H, tone, glow, children }: {
+function Node({ x, y, w, h = NODE_H, tone, glow, title, selected, onClick, children }: {
   x: number; y: number; w: number; h?: number;
-  tone: "live" | "wait" | "down" | "wire"; glow?: boolean; children: React.ReactNode;
+  tone: "live" | "wait" | "down" | "wire"; glow?: boolean; title?: string;
+  selected?: boolean; onClick?: () => void; children: React.ReactNode;
 }) {
   const color = `var(--${tone === "wait" ? "fall" : tone})`;
+  // A selected (open-in-editor) node gets a bold primary ring that wins over the tone ring.
+  const ring = selected
+    ? "inset 0 0 0 2px var(--primary, #6366f1), 0 0 22px -8px var(--primary, #6366f1)"
+    : glow
+      ? `inset 0 0 0 1px ${color}, 0 0 18px -10px ${color}`
+      : `inset 0 0 0 1px color-mix(in srgb, ${color} 32%, transparent)`;
   return (
     <div
-      className="absolute overflow-hidden rounded-lg px-2.5 py-2"
+      title={title}
+      onClick={onClick}
+      className={cn("absolute overflow-hidden rounded-xl px-3 py-2.5", onClick && "cursor-pointer")}
       style={{
-        left: x, top: y, width: w, height: h, background: "var(--surface)",
-        boxShadow: glow ? `inset 0 0 0 1px ${color}, 0 0 18px -8px ${color}` : `inset 0 0 0 1px ${color}`,
+        left: x, top: y, width: w, height: h,
+        background: "var(--surface)",
+        boxShadow: ring,
       }}
     >
       {children}
     </div>
   );
+}
+
+// Minimal card header — a small tinted icon badge + bold title, with an optional
+// right slot (tags / controls). Mirrors the reference's icon-and-title node style.
+function NodeHead({ tone, icon: Icon, title, right }: {
+  tone: "live" | "wait" | "down" | "wire";
+  icon: LucideIcon;
+  title: string;
+  right?: React.ReactNode;
+}) {
+  const c = `var(--${tone === "wait" ? "fall" : tone})`;
+  return (
+    <div className="flex items-center gap-2">
+      <span className="grid h-4 w-4 shrink-0 place-items-center rounded-[5px]"
+            style={{ background: `color-mix(in srgb, ${c} 16%, transparent)`, color: c }}>
+        <Icon className="h-2.5 w-2.5" strokeWidth={2.25} />
+      </span>
+      <span className="truncate text-xs font-semibold text-foreground">{title}</span>
+      {right && <div className="ml-auto shrink-0">{right}</div>}
+    </div>
+  );
+}
+
+// Hairline divider under the header, matching the reference cards.
+function NodeRule() {
+  return <div className="my-1.5 h-px" style={{ background: "color-mix(in srgb, var(--wire) 70%, transparent)" }} />;
 }
 
 function Tag({ tone, children }: { tone: "live" | "wait" | "down"; children: React.ReactNode }) {
