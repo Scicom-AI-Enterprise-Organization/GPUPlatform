@@ -134,6 +134,9 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const parsedFailover = failoverStatus.split(/[,\s]+/).map((x) => Number(x.trim()))
     .filter((n) => Number.isFinite(n) && n >= 400 && n < 500);
   const [ups, setUps] = useState<UpstreamDraft[]>(initial ? fromEndpoint(initial) : [seededUpstream(prefill)]);
+  // Which upstream is open in the graph's inline editor (edit-through-node-workflow).
+  // On the create page, auto-select the single seeded upstream so its editor is visible.
+  const [selectedUid, setSelectedUid] = useState<string | null>(initial ? null : (ups[0]?.uid ?? null));
   // STT callback (CER/WER) — a whisper-compatible endpoint the TTS proxy transcribes
   // its generated audio through, async, to record CER/WER. Not a data-plane upstream.
   const stt0 = initial?.stt_callback ?? undefined;
@@ -223,6 +226,111 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
     } catch (e) {
       setSttTest({ status: "fail", message: e instanceof Error ? e.message : String(e) });
     }
+  };
+
+  // The upstream editor, rendered inline inside the Routing node graph when a backend node
+  // is selected. Same fields as the old standalone Upstreams list — name, URL, priority,
+  // API key, model alias→name mappings, extra body, test — just reached by clicking a node.
+  const renderUpstreamEditor = (uid: string) => {
+    const i = ups.findIndex((x) => x.uid === uid);
+    if (i < 0) return null;
+    const u = ups[i];
+    return (
+      <div>
+        <div className="mb-3 flex items-center justify-end gap-2">
+          <span className="text-[11px] text-muted-foreground">enabled</span>
+          <Switch checked={u.enabled} onCheckedChange={(v) => patch(i, { enabled: v })} />
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
+          <div className="md:col-span-4">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Name</Label>
+            <Input value={u.name} onChange={(e) => patch(i, { name: e.target.value })} placeholder="openai-1" />
+          </div>
+          <div className="md:col-span-6">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Base URL</Label>
+            <Input value={u.base_url} onChange={(e) => patch(i, { base_url: e.target.value })} placeholder="https://api.openai.com/v1" className="font-mono text-xs" />
+          </div>
+          <div className="md:col-span-2">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Priority</Label>
+            <Input type="number" value={u.priority} onChange={(e) => patch(i, { priority: Number(e.target.value) })} />
+          </div>
+        </div>
+
+        {/* API key */}
+        <div className="mt-3">
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">API key</Label>
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+              {(["secret", "paste", ...(u.hadKey ? ["keep" as const] : [])] as KeyMode[]).map((m) => (
+                <button key={m} type="button" onClick={() => patch(i, { keyMode: m })}
+                        className={"rounded px-2 py-1 " + (u.keyMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                  {m === "secret" ? "Secret ref" : m === "paste" ? "Paste" : "Keep existing"}
+                </button>
+              ))}
+            </div>
+            {u.keyMode === "secret" && (
+              <Input list="px-secret-keys" value={u.api_key_secret} onChange={(e) => patch(i, { api_key_secret: e.target.value })}
+                     placeholder="SECRETS_KEY (e.g. OPENAI_KEY)" className="h-8 max-w-xs font-mono text-xs" />
+            )}
+            {u.keyMode === "paste" && (
+              <Input type="password" autoComplete="off" value={u.api_key} onChange={(e) => patch(i, { api_key: e.target.value })}
+                     placeholder="sk-… (stored encrypted)" className="h-8 max-w-xs font-mono text-xs" />
+            )}
+            {u.keyMode === "keep" && <span className="text-xs text-muted-foreground">existing key kept</span>}
+          </div>
+        </div>
+
+        {/* model alias map */}
+        <div className="mt-3">
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Models (alias → upstream model)</Label>
+          <div className="mt-1 space-y-1.5">
+            {u.models.map((m, k) => (
+              <div key={k} className="flex items-center gap-2">
+                <Input value={m.alias} onChange={(e) => patch(i, { models: u.models.map((x, j) => j === k ? { ...x, alias: e.target.value } : x) })} placeholder="qwen" className="h-8 max-w-[200px] font-mono text-xs" />
+                <span className="text-muted-foreground">→</span>
+                <Input value={m.real} onChange={(e) => patch(i, { models: u.models.map((x, j) => j === k ? { ...x, real: e.target.value } : x) })} placeholder="Qwen/Qwen2.5-72B-Instruct" className="h-8 min-w-0 flex-1 font-mono text-xs" />
+                <Button type="button" variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-destructive"
+                        onClick={() => patch(i, { models: u.models.filter((_, j) => j !== k) })} aria-label="Remove mapping">
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            ))}
+            <Button type="button" variant="ghost" size="xs" onClick={() => patch(i, { models: [...u.models, { alias: "", real: "" }] })}>
+              <Plus className="h-3 w-3" /> Add model
+            </Button>
+          </div>
+        </div>
+
+        {/* extra body — optional JSON merged into every forwarded request for this upstream */}
+        <div className="mt-3">
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Extra body (JSON)</Label>
+          <Textarea value={u.extraBody} onChange={(e) => patch(i, { extraBody: e.target.value })} rows={4} spellCheck={false}
+                    placeholder={'{\n  "provider": { "order": ["ModelRun"], "allow_fallbacks": false }\n}'}
+                    className="font-mono text-xs" />
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Optional. Merged into every forwarded body — e.g. OpenRouter <span className="font-mono">provider</span> pinning. The upstream&apos;s keys win over the caller&apos;s; <span className="font-mono">model</span> always wins.
+          </p>
+        </div>
+
+        {/* test — sends a real "hello" to the endpoint matching the chosen mode */}
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
+          <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+            {(["chat", "embedding", "rerank", "transcription", "tts"] as const).map((m) => (
+              <button key={m} type="button" onClick={() => patch(i, { testMode: m, testModeTouched: true, test: { status: "idle" } })}
+                      className={"rounded px-2 py-1 " + (u.testMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                {{ chat: "Chat", embedding: "Embedding", rerank: "Rerank", transcription: "Transcribe", tts: "TTS" }[m]}
+              </button>
+            ))}
+          </div>
+          <Button type="button" variant="outline" size="xs" onClick={() => onTest(i)} disabled={u.test.status === "running" || !u.base_url.trim()}>
+            {u.test.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Test
+          </Button>
+          {u.test.status !== "idle" && u.test.status !== "running" && (
+            <span className={"text-xs " + (u.test.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>{u.test.message}</span>
+          )}
+        </div>
+      </div>
+    );
   };
 
   const build = (): { ok: true; upstreams: ProxyUpstreamSpec[] } | { ok: false; err: string } => {
@@ -345,10 +453,10 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
       </section>
 
       <section data-form-section="Routing" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
-        <h2 className="text-base font-medium">Routing</h2>
+        <h2 className="text-base font-medium">Routing &amp; upstreams</h2>
         <p className="mb-4 mt-1 text-xs text-muted-foreground">
-          Which backend serves each model, and where it goes when that backend fails. Expand a model
-          for the full chain — take a backend down to watch the route move.
+          Which backend serves each model, and where it goes when that backend fails. Add a backend,
+          or click any node to edit its URL, priority and model mappings. Expand a model for the full chain.
         </p>
         <RoutingPanel
           upstreams={ups}
@@ -357,6 +465,23 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           failoverStatus={parsedFailover}
           proxyId={initial?.id}
           defaultOpen={false}
+          // Edit page: the graph IS the upstream editor. Clicking a node selects it; the
+          // editor for that upstream renders inline below the graph.
+          editable
+          selectedUid={selectedUid}
+          onSelect={setSelectedUid}
+          renderEditor={renderUpstreamEditor}
+          // PREPEND, not append: a new backend lands in view. Position is cosmetic — routing
+          // sorts by priority + liveness, and the save path matches kept keys by id, not order.
+          onAddUpstream={() => {
+            const u = blankUpstream();
+            setUps((a) => [u, ...a]);
+            setSelectedUid(u.uid);
+          }}
+          onDeleteUpstream={(uid) => {
+            setUps((a) => a.filter((u) => u.uid !== uid));
+            setSelectedUid((cur) => (cur === uid ? null : cur));
+          }}
           // Ties break on list position, so moving an upstream to the front is what makes
           // it the primary — the only way to change the winner without editing a priority.
           onPromote={(uid) => setUps((a) => {
@@ -367,133 +492,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             return next;
           })}
         />
-      </section>
-
-      <section data-form-section="Upstreams" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
-        <div className="mb-1 flex items-center justify-between">
-          <h2 className="text-base font-medium">Upstreams</h2>
-          {/* PREPEND, not append: a new upstream lands in view instead of below the
-              fold. Position is cosmetic — routing sorts by `priority` + liveness, and
-              the save path matches kept API keys by upstream id, not list order. */}
-          <Button type="button" variant="outline" size="sm" onClick={() => setUps((a) => [blankUpstream(), ...a])}>
-            <Plus className="h-4 w-4" /> Add upstream
-          </Button>
-        </div>
-        <p className="mb-4 text-xs text-muted-foreground">
-          OpenAI-compatible backends. Lower <span className="font-mono">priority</span> is preferred; requests fail over to the next alive one. Map your stable alias (e.g. <span className="font-mono">qwen</span>) to each backend&apos;s real model name.
-        </p>
-        <div className="space-y-4">
-          {ups.map((u, i) => (
-            <div key={u.uid} className="rounded-md border border-border p-3">
-              <div className="mb-2 flex items-center justify-between">
-                <span className="text-xs font-medium text-muted-foreground">Upstream {i + 1}</span>
-                <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-muted-foreground">enabled</span>
-                  <Switch checked={u.enabled} onCheckedChange={(v) => patch(i, { enabled: v })} />
-                  <Button type="button" variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-destructive"
-                          onClick={() => setUps((a) => a.filter((_, j) => j !== i))} aria-label="Remove">
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
-                <div className="md:col-span-4">
-                  <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Name</Label>
-                  <Input value={u.name} onChange={(e) => patch(i, { name: e.target.value })} placeholder="openai-1" />
-                </div>
-                <div className="md:col-span-6">
-                  <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Base URL</Label>
-                  <Input value={u.base_url} onChange={(e) => patch(i, { base_url: e.target.value })} placeholder="https://api.openai.com/v1" className="font-mono text-xs" />
-                </div>
-                <div className="md:col-span-2">
-                  <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Priority</Label>
-                  <Input type="number" value={u.priority} onChange={(e) => patch(i, { priority: Number(e.target.value) })} />
-                </div>
-              </div>
-
-              {/* API key */}
-              <div className="mt-3">
-                <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">API key</Label>
-                <div className="mt-1 flex flex-wrap items-center gap-2">
-                  <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
-                    {(["secret", "paste", ...(u.hadKey ? ["keep" as const] : [])] as KeyMode[]).map((m) => (
-                      <button key={m} type="button" onClick={() => patch(i, { keyMode: m })}
-                              className={"rounded px-2 py-1 " + (u.keyMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
-                        {m === "secret" ? "Secret ref" : m === "paste" ? "Paste" : "Keep existing"}
-                      </button>
-                    ))}
-                  </div>
-                  {u.keyMode === "secret" && (
-                    <Input list="px-secret-keys" value={u.api_key_secret} onChange={(e) => patch(i, { api_key_secret: e.target.value })}
-                           placeholder="SECRETS_KEY (e.g. OPENAI_KEY)" className="h-8 max-w-xs font-mono text-xs" />
-                  )}
-                  {u.keyMode === "paste" && (
-                    <Input type="password" autoComplete="off" value={u.api_key} onChange={(e) => patch(i, { api_key: e.target.value })}
-                           placeholder="sk-… (stored encrypted)" className="h-8 max-w-xs font-mono text-xs" />
-                  )}
-                  {u.keyMode === "keep" && <span className="text-xs text-muted-foreground">existing key kept</span>}
-                </div>
-              </div>
-
-              {/* model alias map */}
-              <div className="mt-3">
-                <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Models (alias → upstream model)</Label>
-                <div className="mt-1 space-y-1.5">
-                  {u.models.map((m, k) => (
-                    <div key={k} className="flex items-center gap-2">
-                      <Input value={m.alias} onChange={(e) => patch(i, { models: u.models.map((x, j) => j === k ? { ...x, alias: e.target.value } : x) })} placeholder="qwen" className="h-8 max-w-[200px] font-mono text-xs" />
-                      <span className="text-muted-foreground">→</span>
-                      <Input value={m.real} onChange={(e) => patch(i, { models: u.models.map((x, j) => j === k ? { ...x, real: e.target.value } : x) })} placeholder="Qwen/Qwen2.5-72B-Instruct" className="h-8 min-w-0 flex-1 font-mono text-xs" />
-                      <Button type="button" variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-destructive"
-                              onClick={() => patch(i, { models: u.models.filter((_, j) => j !== k) })} aria-label="Remove mapping">
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  ))}
-                  <Button type="button" variant="ghost" size="xs" onClick={() => patch(i, { models: [...u.models, { alias: "", real: "" }] })}>
-                    <Plus className="h-3 w-3" /> Add model
-                  </Button>
-                </div>
-              </div>
-
-              {/* extra body — optional JSON merged into every forwarded request for this upstream */}
-              <div className="mt-3">
-                <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Extra body (JSON)</Label>
-                <Textarea value={u.extraBody} onChange={(e) => patch(i, { extraBody: e.target.value })} rows={4} spellCheck={false}
-                          placeholder={'{\n  "provider": { "order": ["ModelRun"], "allow_fallbacks": false }\n}'}
-                          className="font-mono text-xs" />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  Optional. Merged into every forwarded body — e.g. OpenRouter <span className="font-mono">provider</span> pinning. The upstream&apos;s keys win over the caller&apos;s; <span className="font-mono">model</span> always wins.
-                </p>
-              </div>
-
-              {/* test — sends a real "hello" to the endpoint matching the chosen mode (chat or embeddings) */}
-              <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
-                <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
-                  {(["chat", "embedding", "rerank", "transcription", "tts"] as const).map((m) => (
-                    <button key={m} type="button" onClick={() => patch(i, { testMode: m, testModeTouched: true, test: { status: "idle" } })}
-                            className={"rounded px-2 py-1 " + (u.testMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
-                      {{ chat: "Chat", embedding: "Embedding", rerank: "Rerank", transcription: "Transcribe", tts: "TTS" }[m]}
-                    </button>
-                  ))}
-                </div>
-                <Button type="button" variant="outline" size="xs" onClick={() => onTest(i)} disabled={u.test.status === "running" || !u.base_url.trim()}>
-                  {u.test.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Test
-                </Button>
-                <span className="text-[11px] text-muted-foreground">
-                  {u.testMode === "embedding" ? "sends a “hello” embedding"
-                    : u.testMode === "rerank" ? "ranks 3 docs (incl. a hard negative) via /rerank"
-                    : u.testMode === "transcription" ? "sends a short tone to /audio/transcriptions"
-                    : u.testMode === "tts" ? "synthesizes “hello world” via /audio/speech"
-                    : "sends a “hello” chat completion"} using the first model
-                </span>
-                {u.test.status !== "idle" && u.test.status !== "running" && (
-                  <span className={"text-xs " + (u.test.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>{u.test.message}</span>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
+        {/* Backs the "Secret ref" key inputs in the inline upstream editor. */}
         <datalist id="px-secret-keys">{secretKeys.map((k) => <option key={k} value={k} />)}</datalist>
       </section>
 
