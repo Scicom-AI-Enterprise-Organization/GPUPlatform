@@ -41,9 +41,15 @@ except ImportError as e:  # pragma: no cover
 ALL_AUGMENTATIONS = ["telephone", "noise", "dropout", "gain", "pitch", "speed", "reverb", "bandpass"]
 # LiveKit / WebRTC transport augmentations (whisper_finetune._AUG_FUNCS). Kept OUT of
 # ALL_AUGMENTATIONS so `augment_techniques: all` keeps its old meaning; ask for them by
-# name, or use the `livekit` alias for the whole transport family.
+# name, or use the `livekit_all` alias for the whole transport family.
 LIVEKIT_AUGMENTATIONS = ["livekit", "livekit_sip", "opus", "g711", "packet_loss", "dtx",
                          "agc", "webrtc_ns", "aec", "vad_clip", "resample_chain"]
+# The streaming regime: VAD segment framing, a hesitant speaker, DNN enhancement,
+# jitter warping. Its own list (alias `stream_all`) for the same reason — one
+# technique is picked per augmented sample, so folding these into LIVEKIT_AUGMENTATIONS
+# would silently halve how often an existing YAML's transport stages fire.
+STREAM_AUGMENTATIONS = ["livekit_stream", "hesitation", "vad_pad", "rampup",
+                        "denoiser", "room_tone", "jitter"]
 DATASET_TERMINAL = {"done", "failed", "cancelled"}
 RUN_TERMINAL = {"done", "failed", "cancelled"}
 
@@ -99,8 +105,12 @@ def parse_cutoff(raw: Optional[str], default_offset: str) -> Optional[str]:
 
 
 def resolve_augment(v: Any) -> list[str]:
-    """'all' = the classic 8; 'livekit_all' = the whole WebRTC transport family
-    (note plain 'livekit' is a real technique — the full chain — not an alias)."""
+    """'all' = the classic 8; 'livekit_all' = the WebRTC transport family;
+    'stream_all' = the streaming-regime family (VAD framing, hesitation, DNN
+    enhancement, jitter); 'voice_all' = both voice-agent families.
+
+    Note plain 'livekit' and 'livekit_stream' are real techniques — whole chains —
+    not aliases."""
     if v is None:
         return []
     if isinstance(v, str):
@@ -109,6 +119,10 @@ def resolve_augment(v: Any) -> list[str]:
             return list(ALL_AUGMENTATIONS)
         if key == "livekit_all":
             return list(LIVEKIT_AUGMENTATIONS)
+        if key == "stream_all":
+            return list(STREAM_AUGMENTATIONS)
+        if key == "voice_all":
+            return LIVEKIT_AUGMENTATIONS + STREAM_AUGMENTATIONS
         return [t.strip() for t in v.split(",") if t.strip()]
     return [str(t).strip() for t in v if str(t).strip()]
 

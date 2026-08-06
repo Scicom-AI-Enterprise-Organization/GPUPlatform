@@ -15,6 +15,9 @@ const BASE = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 const PASS_HEADERS = [
   "x-upstream-url", "x-upstream-name", "x-request-id",
   "x-audio-seconds", "x-rtf", "x-rtfx",
+  // Storage file viewer: the object's true size + whether the previewed body was
+  // head-read (a 2 GB log previews as its first MB).
+  "x-object-size", "x-object-truncated",
 ];
 
 export async function GET(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {

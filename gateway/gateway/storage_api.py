@@ -12,16 +12,21 @@ Credentials are Fernet-encrypted into `config.credentials_enc` and never
 returned to the UI (the record only exposes `has_credentials`). When absent the
 runtime falls back to env (AWS_* for s3, HF_TOKEN for huggingface).
 
-Reads are org-wide (any authenticated user) so feature forms can offer the
-dropdown. Writes (create / update / delete) are admin-only — these hold shared
-credentials and platform-wide infra config, like GPU Providers.
+Reads of the RECORDS are org-wide (any authenticated user) so feature forms can
+offer the dropdown. Writes (create / update / delete) are admin-only — these hold
+shared credentials and platform-wide infra config, like GPU Providers. Reads of
+the bucket's CONTENTS (usage, cleanup, the file viewer) are admin-only too: one
+storage row backs every feature's data, so browsing it is an infra operation.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import mimetypes
 import os
+import posixpath
+import re
 import secrets
 from datetime import datetime, timezone
 from typing import Optional
@@ -29,8 +34,9 @@ from typing import Optional
 import boto3
 import httpx
 from botocore.config import Config as BotoConfig
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -945,6 +951,565 @@ async def storage_purge_delete(
                  "target_bytes": job["target_bytes"]},
     )
     return _job_public(job)
+
+
+# ---------- file browser (s3 + local) -----------------------------------
+# A read-only viewer over the backing store: one delimited LIST / one readdir per
+# directory (O(page), NOT the full-bucket walk usage/purge-scan do), plus a capped
+# read of a single object. Admin-only, like the other raw-bucket routes — a
+# storage row is shared infra and its objects are every feature's data.
+#
+# ⚠ Everything here must stay page-bounded: a single directory with a million
+# entries is normal in these buckets (per-clip audio), so no route may build a
+# whole-directory list in memory or sort one.
+
+BROWSABLE_KINDS = ("s3", "local")
+# Served THROUGH the gateway (same-origin + authed, so it works regardless of
+# bucket CORS). Anything bigger is a presigned direct-from-S3 download instead.
+MAX_INLINE_BYTES = 25 * 1024 * 1024
+# Default head-read for the text preview pane.
+DEFAULT_PREVIEW_BYTES = 1024 * 1024
+BROWSE_PAGE_MAX = 1000
+# A local directory is name-sorted only up to this many entries — above it we
+# page in readdir order instead. Sorting means materializing every name, and a
+# million-entry directory is exactly where that stops being free.
+LOCAL_SORT_MAX = 20_000
+# S3 counts every key it SCANS against MaxKeys, so a delimited page can come back
+# with zero entries (all keys collapsed into already-returned folders) while more
+# remain. Pull a few pages before handing the UI an empty one.
+S3_EMPTY_PAGE_RETRIES = 5
+
+# Extensions mimetypes doesn't know (or gets wrong) for the kinds of files this
+# platform writes.
+_EXTRA_MEDIA_TYPES = {
+    ".jsonl": "application/x-ndjson",
+    ".ndjson": "application/x-ndjson",
+    ".log": "text/plain; charset=utf-8",
+    ".yaml": "text/yaml; charset=utf-8",
+    ".yml": "text/yaml; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".tsv": "text/tab-separated-values; charset=utf-8",
+    ".py": "text/plain; charset=utf-8",
+    ".sh": "text/plain; charset=utf-8",
+    ".toml": "text/plain; charset=utf-8",
+    ".cfg": "text/plain; charset=utf-8",
+    ".ini": "text/plain; charset=utf-8",
+    ".pcm": "audio/L16",
+}
+# A filename safe to put in a Content-Disposition header (quotes/CR/LF stripped).
+_UNSAFE_FILENAME = re.compile(r'[\r\n"\\]')
+
+
+class StorageEntry(BaseModel):
+    """One row in a directory listing. `path` is relative to the storage's own
+    configured prefix — that's what every other route here takes back."""
+    name: str
+    path: str
+    kind: str  # "folder" | "file"
+    size: Optional[int] = None
+    modified: Optional[str] = None
+
+
+class StorageBrowseResponse(BaseModel):
+    storage_id: str
+    kind: str  # "s3" | "local"
+    # s3: the bucket. local: "" (the root IS the filesystem path).
+    bucket: str
+    # s3: the storage's configured prefix ("" = whole bucket).
+    # local: the absolute filesystem root.
+    root: str
+    # Directory being listed, relative to root ("" = root itself).
+    path: str
+    entries: list[StorageEntry]
+    # Opaque continuation token (S3's for s3, an offset for local) — pass back as
+    # `token` for the next page.
+    next_token: Optional[str] = None
+    # Something the user should know about THIS listing (e.g. a directory too big
+    # to sort). Rendered as a hint line, not an error.
+    note: Optional[str] = None
+
+
+class StorageObjectUrlResponse(BaseModel):
+    url: str
+    expires_in: int
+
+
+def _storage_root(s: Storage) -> str:
+    return ((s.config or {}).get("prefix") or "").strip().strip("/")
+
+
+def _safe_rel(path: Optional[str]) -> str:
+    """Normalize a browser-supplied path to a clean relative one, or 400.
+
+    Rejects `..` outright rather than resolving it: the storage's own prefix is a
+    scope boundary (a viewer must not read a sibling tenant's objects in a shared
+    bucket), so escaping it is never a legitimate request.
+    """
+    rel = (path or "").strip().lstrip("/")
+    if not rel:
+        return ""
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise HTTPException(status_code=400, detail="invalid path")
+    return "/".join(parts)
+
+
+def _abs_key(root: str, rel: str) -> str:
+    return posixpath.join(root, rel) if root else rel
+
+
+def _media_type_for(name: str) -> Optional[str]:
+    """Media type from the FILENAME, or None when the extension is unknown."""
+    ext = os.path.splitext(name.lower())[1]
+    if ext in _EXTRA_MEDIA_TYPES:
+        return _EXTRA_MEDIA_TYPES[ext]
+    guessed, _enc = mimetypes.guess_type(name)
+    if not guessed:
+        return None
+    return f"{guessed}; charset=utf-8" if guessed.startswith("text/") else guessed
+
+
+def _is_textual(media_type: str) -> bool:
+    mt = media_type.split(";", 1)[0].strip()
+    return (
+        mt.startswith("text/")
+        or mt in ("application/json", "application/x-ndjson", "application/xml",
+                  "application/javascript", "application/x-yaml")
+        or mt.endswith("+json")
+    )
+
+
+def _looks_textual(data: bytes) -> bool:
+    """Sniff a head-read for text. Extensionless files are everywhere in these
+    buckets (`.persist_marker`, `metadata`, `README`) and S3 stores them as
+    octet-stream, so without this they'd all be unpreviewable."""
+    if b"\x00" in data:
+        return False
+    try:
+        data.decode("utf-8")
+        return True
+    except UnicodeDecodeError as e:
+        # A ranged read can split a multi-byte codepoint — only the last few
+        # bytes are allowed to be an incomplete sequence.
+        return e.start >= len(data) - 4
+
+
+async def _require_browsable_storage(session: AsyncSession, storage_id: str) -> Storage:
+    s = await session.get(Storage, storage_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="storage not found")
+    if s.kind not in BROWSABLE_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"the file viewer supports s3 and local storage (this one is {s.kind})",
+        )
+    return s
+
+
+# ---------- local filesystem backing ------------------------------------
+
+
+def _local_root(s: Storage) -> str:
+    path = ((s.config or {}).get("path") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="local storage has no path configured")
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def _local_path(root: str, rel: str) -> str:
+    """Resolve a path inside a local root, or 400.
+
+    ⚠ realpath BOTH sides. `_safe_rel` already rejects `..`, but a *symlink*
+    inside the root pointing at `/etc` would sail through a string check — this
+    is what actually confines the viewer to the configured directory.
+    """
+    target = os.path.realpath(os.path.join(root, rel)) if rel else root
+    if target != root and os.path.commonpath([root, target]) != root:
+        raise HTTPException(status_code=400, detail="path escapes the storage root")
+    return target
+
+
+def _escapes_root(root: str, full_path: str) -> bool:
+    """True when `full_path` is a symlink leading OUT of the storage root.
+
+    Only symlinks pay the realpath — an ordinary child of the directory cannot
+    escape. Such entries are hidden from listings (not just refused on open) so
+    the viewer shows exactly the configured folder and nothing reachable from it.
+    """
+    if not os.path.islink(full_path):
+        return False
+    try:
+        real = os.path.realpath(full_path)
+        return real != root and os.path.commonpath([root, real]) != root
+    except ValueError:  # different drives — treat as outside
+        return True
+
+
+def _local_entry(de: os.DirEntry, rel: str) -> StorageEntry:
+    is_dir = de.is_dir(follow_symlinks=True)
+    size: Optional[int] = None
+    modified: Optional[str] = None
+    try:  # a broken symlink / racing unlink still lists, just without stats
+        st = de.stat(follow_symlinks=True)
+        size = None if is_dir else st.st_size
+        modified = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
+    except OSError:
+        pass
+    return StorageEntry(
+        name=de.name,
+        path=f"{rel}/{de.name}" if rel else de.name,
+        kind="folder" if is_dir else "file",
+        size=size,
+        modified=modified,
+    )
+
+
+def _local_browse(
+    root: str, rel: str, offset: int, limit: int, q: str,
+) -> tuple[list[StorageEntry], Optional[str], Optional[str]]:
+    """One page of a local directory → (entries, next_token, note).
+
+    ⚠ Page-bounded on purpose. Sorting a directory means materializing every
+    name, so that only happens under `LOCAL_SORT_MAX`; a bigger directory pages
+    in **readdir order** (stable for an unchanged directory) and only the page's
+    entries are stat()ed. `q` is a name-prefix filter applied during the scan —
+    same semantics as the S3 side, where a prefix is all the API can do.
+    """
+    d = _local_path(root, rel)
+    if not os.path.isdir(d):
+        raise HTTPException(
+            status_code=404,
+            detail=f"{d} is not a directory on the gateway host",
+        )
+
+    # Names only (no stat) while deciding whether the directory is small enough
+    # to sort — bounded at LOCAL_SORT_MAX + 1, so memory can't run away.
+    names: list[str] = []
+    huge = False
+    with os.scandir(d) as it:
+        for de in it:
+            if q and not de.name.startswith(q):
+                continue
+            if _escapes_root(root, de.path):
+                continue  # a symlink out of the root isn't part of this folder
+            names.append(de.name)
+            if len(names) > LOCAL_SORT_MAX:
+                huge = True
+                break
+
+    entries: list[StorageEntry] = []
+    note: Optional[str] = None
+    if not huge:
+        names.sort(key=str.lower)
+        page = names[offset : offset + limit]
+        for name in page:
+            try:
+                de_path = os.path.join(d, name)
+                st = os.stat(de_path)
+                is_dir = os.path.isdir(de_path)
+            except OSError:
+                st, is_dir = None, False
+            entries.append(StorageEntry(
+                name=name,
+                path=f"{rel}/{name}" if rel else name,
+                kind="folder" if is_dir else "file",
+                size=None if (is_dir or st is None) else st.st_size,
+                modified=(datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
+                          if st else None),
+            ))
+        next_offset = offset + len(page)
+        next_token = str(next_offset) if next_offset < len(names) else None
+    else:
+        # Stream: skip `offset`, take `limit`, stat only what we return.
+        seen = 0
+        more = False
+        with os.scandir(d) as it:
+            for de in it:
+                if q and not de.name.startswith(q):
+                    continue
+                if _escapes_root(root, de.path):
+                    continue
+                seen += 1
+                if seen <= offset:
+                    continue
+                if len(entries) >= limit:
+                    more = True
+                    break
+                entries.append(_local_entry(de, rel))
+        next_token = str(offset + len(entries)) if more else None
+        note = (
+            f"over {LOCAL_SORT_MAX:,} entries in this directory — listed in "
+            "filesystem order, not sorted"
+        )
+
+    entries.sort(key=lambda e: (e.kind != "folder", e.name.lower()))
+    return entries, next_token, note
+
+
+def _local_offset(token: Optional[str]) -> int:
+    if not token:
+        return 0
+    try:
+        return max(0, int(token))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="invalid page token") from e
+
+
+def _s3_target_checked(s: Storage):
+    target, _base = _s3_for_storage(s)
+    if not target.bucket:
+        raise HTTPException(status_code=400, detail="storage has no bucket configured")
+    return target
+
+
+def _s3_browse(target, key_prefix: str, rel: str, token: Optional[str], limit: int, q: str):
+    """One page of a bucket directory → (entries, next_token). Runs in a thread.
+
+    `q` is a name-prefix filter pushed into the S3 `Prefix` — the only filter the
+    LIST API can do without scanning, and the reason the UI's filter is
+    prefix-not-substring: on a million-object directory a client-side filter over
+    the loaded page would just be wrong.
+    """
+    from . import bench
+
+    scan_prefix = key_prefix + q
+    entries: list[StorageEntry] = []
+    next_token = token
+    for _ in range(S3_EMPTY_PAGE_RETRIES):
+        page = bench.s3_list_page(scan_prefix, target, token=next_token, limit=limit)
+        next_token = page["next_token"]
+        for folder_key in page["folders"]:
+            name = folder_key[len(key_prefix):].rstrip("/")
+            if name:
+                entries.append(StorageEntry(
+                    name=name, path=f"{rel}/{name}" if rel else name, kind="folder",
+                ))
+        for obj in page["files"]:
+            name = obj["key"][len(key_prefix):]
+            if name:
+                entries.append(StorageEntry(
+                    name=name, path=f"{rel}/{name}" if rel else name, kind="file",
+                    size=obj["size"], modified=obj["modified"],
+                ))
+        # An empty page with more to come is normal under a delimiter (every key
+        # scanned collapsed into a folder already returned) — keep pulling rather
+        # than handing the UI a blank screen with a "load more" button.
+        if entries or not next_token:
+            break
+    entries.sort(key=lambda e: (e.kind != "folder", e.name.lower()))
+    return entries, next_token
+
+
+@router.get("/{storage_id}/browse", response_model=StorageBrowseResponse)
+async def storage_browse(
+    storage_id: str,
+    path: str = "",
+    token: Optional[str] = None,
+    q: str = Query("", description="name-prefix filter within this directory"),
+    limit: int = Query(300, ge=1, le=BROWSE_PAGE_MAX),
+    user: User = Depends(require_admin),  # noqa: ARG001 — raw store access is an infra op
+    session: AsyncSession = Depends(get_session),
+):
+    """One directory: child folders + files, folders first, ALWAYS paged — a
+    directory holding a million objects returns a page and a `next_token`, never
+    the whole listing. `q` filters by name prefix on the server (see `_s3_browse`)."""
+    s = await _require_browsable_storage(session, storage_id)
+    rel = _safe_rel(path)
+    query = (q or "").strip()
+
+    if s.kind == "local":
+        root = _local_root(s)
+        entries, next_token, note = await run_in_threadpool(
+            _local_browse, root, rel, _local_offset(token), limit, query,
+        )
+        return StorageBrowseResponse(
+            storage_id=storage_id, kind="local", bucket="", root=root, path=rel,
+            entries=entries, next_token=next_token, note=note,
+        )
+
+    target = _s3_target_checked(s)
+    root = _storage_root(s)
+    key_prefix = _abs_key(root, rel)
+    if key_prefix:
+        key_prefix += "/"
+    try:
+        entries, next_token = await run_in_threadpool(
+            _s3_browse, target, key_prefix, rel, token, limit, query,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 — bad creds / missing bucket / network
+        raise HTTPException(status_code=502, detail=_s3_error_message(e)) from e
+    return StorageBrowseResponse(
+        storage_id=storage_id, kind="s3", bucket=target.bucket, root=root, path=rel,
+        entries=entries, next_token=next_token,
+    )
+
+
+def _object_head_sync(s: Storage, rel: str) -> Optional[dict]:
+    """{size, content_type} for one object on either backing store, or None."""
+    if s.kind == "local":
+        p = _local_path(_local_root(s), rel)
+        if not os.path.isfile(p):
+            return None
+        return {"size": os.path.getsize(p), "content_type": ""}
+    from . import bench
+
+    return bench.s3_head(_abs_key(_storage_root(s), rel), _s3_target_checked(s))
+
+
+def _object_read_sync(s: Storage, rel: str, max_bytes: Optional[int]) -> Optional[bytes]:
+    """The first `max_bytes` (all of it when None) of one object, or None."""
+    if s.kind == "local":
+        p = _local_path(_local_root(s), rel)
+        try:
+            with open(p, "rb") as f:
+                return f.read(max_bytes) if max_bytes else f.read()
+        except OSError:
+            return None
+    from . import bench
+
+    return bench.s3_get_head_bytes(
+        _abs_key(_storage_root(s), rel), _s3_target_checked(s), max_bytes=max_bytes,
+    )
+
+
+async def _object_download(s: Storage, rel: str, name: str):
+    """The uncapped path. Local streams off disk; S3 redirects to a presigned URL
+    so a multi-GB checkpoint never streams through the gateway."""
+    safe_name = _UNSAFE_FILENAME.sub("_", name)
+    if s.kind == "local":
+        p = _local_path(_local_root(s), rel)
+        if not os.path.isfile(p):
+            raise HTTPException(status_code=404, detail="object not found")
+        # octet-stream (not the sniffed type) so the browser saves it, and so the
+        # web proxy takes its byte-exact binary branch rather than decoding text.
+        return FileResponse(
+            p, media_type="application/octet-stream", filename=safe_name,
+        )
+    from . import bench
+
+    target = _s3_target_checked(s)
+    key = _abs_key(_storage_root(s), rel)
+    if await run_in_threadpool(bench.s3_head, key, target) is None:
+        raise HTTPException(status_code=404, detail="object not found")
+    url = await run_in_threadpool(bench.s3_presign_get, key, 3600, target)
+    return RedirectResponse(url, status_code=307)
+
+
+@router.get("/{storage_id}/object")
+async def storage_object(
+    storage_id: str,
+    path: str,
+    max_bytes: int = Query(DEFAULT_PREVIEW_BYTES, ge=1, le=MAX_INLINE_BYTES),
+    download: bool = False,
+    user: User = Depends(require_admin),  # noqa: ARG001
+    session: AsyncSession = Depends(get_session),
+):
+    """Serve one object's bytes through the gateway for the viewer (same-origin +
+    authed, so previews work without a bucket CORS policy).
+
+    Text is head-read to `max_bytes` — a truncated log still previews fine, and
+    the response says how much was cut. Binary (image/audio/…) is all-or-nothing:
+    half a WAV is not a smaller WAV, so anything over the cap is refused with a
+    413 pointing at the download instead.
+
+    `download=1` is the uncapped path: a **local** file streams off disk, an S3
+    object 307s to a presigned URL so its bytes never cross the control plane.
+    """
+    s = await _require_browsable_storage(session, storage_id)
+    rel = _safe_rel(path)
+    if not rel:
+        raise HTTPException(status_code=400, detail="path is required")
+    name = rel.rsplit("/", 1)[-1]
+
+    if download:
+        return await _object_download(s, rel, name)
+
+    head = await run_in_threadpool(_object_head_sync, s, rel)
+    if head is None:
+        raise HTTPException(status_code=404, detail="object not found")
+    # ⚠ The FILENAME decides the type, not S3's stored Content-Type — that's
+    # arbitrary caller-supplied metadata and it lies routinely (this platform's
+    # own bucket stamps .jsonl objects `application/jsonl`, which no whitelist
+    # would call text). The stored type is only the fallback for an extension we
+    # don't know, and such files are sniffed below anyway.
+    ext_type = _media_type_for(name)
+    media_type = ext_type or head["content_type"] or "application/octet-stream"
+    size = head["size"]
+    textual = _is_textual(media_type)
+    # Only an unrecognized extension may be re-typed by sniffing — a .wav whose
+    # first bytes happen to decode as utf-8 is still a .wav.
+    sniffable = ext_type is None and not textual
+    read_bytes: Optional[int] = None
+    too_large = HTTPException(
+        status_code=413,
+        detail=(
+            f"{name} is {size} bytes — too large to preview inline; "
+            "use the download link instead"
+        ),
+    )
+    if size > max_bytes:
+        if sniffable:
+            # Sniff before refusing: an extensionless multi-GB log heads fine.
+            probe = await run_in_threadpool(_object_read_sync, s, rel, 4096)
+            if probe is not None and _looks_textual(probe):
+                textual, media_type = True, "text/plain; charset=utf-8"
+        if not textual:
+            raise too_large
+        read_bytes = max_bytes
+
+    data = await run_in_threadpool(_object_read_sync, s, rel, read_bytes)
+    if data is None:
+        raise HTTPException(status_code=404, detail="object not found")
+    if sniffable and not textual and _looks_textual(data):
+        textual, media_type = True, "text/plain; charset=utf-8"
+    if textual:
+        # A head-read can land mid-codepoint; drop the partial tail rather than
+        # emitting invalid utf-8.
+        data = data.decode("utf-8", "replace").encode("utf-8")
+    safe_name = _UNSAFE_FILENAME.sub("_", name)
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{safe_name}"',
+            "X-Object-Size": str(size),
+            "X-Object-Truncated": "1" if read_bytes is not None else "0",
+            "Cache-Control": "private, max-age=60",
+        },
+    )
+
+
+@router.get("/{storage_id}/object-url", response_model=StorageObjectUrlResponse)
+async def storage_object_url(
+    storage_id: str,
+    path: str,
+    expires: int = Query(3600, ge=60, le=7 * 24 * 3600),
+    user: User = Depends(require_admin),  # noqa: ARG001
+    session: AsyncSession = Depends(get_session),
+):
+    """A presigned GET url for one S3 object — the download path, so multi-GB
+    artifacts stream from S3 directly instead of through the gateway. Local
+    storage has nothing to presign; its download is `object?download=1`."""
+    from . import bench
+
+    s = await _require_browsable_storage(session, storage_id)
+    if s.kind != "s3":
+        raise HTTPException(
+            status_code=400,
+            detail="local storage has no presigned URL — download via object?download=1",
+        )
+    target = _s3_target_checked(s)
+    rel = _safe_rel(path)
+    if not rel:
+        raise HTTPException(status_code=400, detail="path is required")
+    key = _abs_key(_storage_root(s), rel)
+    if await run_in_threadpool(bench.s3_head, key, target) is None:
+        raise HTTPException(status_code=404, detail="object not found")
+    url = await run_in_threadpool(bench.s3_presign_get, key, expires, target)
+    return StorageObjectUrlResponse(url=url, expires_in=expires)
 
 
 @router.get("/{storage_id}/purge-status")

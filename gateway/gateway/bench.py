@@ -422,6 +422,82 @@ def s3_list(prefix: str, target: Optional[S3Target] = None) -> list[dict]:
     return out
 
 
+def s3_list_page(
+    prefix: str,
+    target: Optional[S3Target] = None,
+    *,
+    token: Optional[str] = None,
+    limit: int = 500,
+    delimiter: str = "/",
+) -> dict:
+    """ONE page of a folder-style listing: the immediate child "folders"
+    (CommonPrefixes) + the files directly under `prefix`, plus a continuation
+    token. Unlike `s3_list` (which walks the whole subtree, O(objects)), this is
+    O(page) — what a file browser needs on a bucket with millions of keys.
+
+    Returns {"folders": [prefix, …], "files": [{key,size,modified}, …],
+             "next_token": str|None}. `delimiter=""` flattens (recursive listing).
+    """
+    t = target or _env_s3_target()
+    cli = _s3_client(t)
+    kwargs: dict = {
+        "Bucket": t.bucket,
+        "Prefix": prefix,
+        "MaxKeys": max(1, min(int(limit), 1000)),
+    }
+    if delimiter:
+        kwargs["Delimiter"] = delimiter
+    if token:
+        kwargs["ContinuationToken"] = token
+    r = cli.list_objects_v2(**kwargs)
+    folders = [p["Prefix"] for p in r.get("CommonPrefixes", []) if p.get("Prefix")]
+    files = []
+    for obj in r.get("Contents", []):
+        key = obj["Key"]
+        # The directory's own zero-byte placeholder key isn't a file.
+        if key == prefix or key.endswith("/"):
+            continue
+        files.append({
+            "key": key,
+            "size": obj["Size"],
+            "modified": obj["LastModified"].isoformat() if obj.get("LastModified") else "",
+        })
+    return {
+        "folders": folders,
+        "files": files,
+        "next_token": r.get("NextContinuationToken") if r.get("IsTruncated") else None,
+    }
+
+
+def s3_head(key: str, target: Optional[S3Target] = None) -> Optional[dict]:
+    """{size, content_type, modified} for one object, or None if it's missing."""
+    t = target or _env_s3_target()
+    try:
+        r = _s3_client(t).head_object(Bucket=t.bucket, Key=key)
+    except Exception:  # noqa: BLE001 — 404 / 403 / network all mean "can't read it"
+        return None
+    return {
+        "size": int(r.get("ContentLength") or 0),
+        "content_type": (r.get("ContentType") or "").strip(),
+        "modified": r["LastModified"].isoformat() if r.get("LastModified") else "",
+    }
+
+
+def s3_get_head_bytes(
+    key: str, target: Optional[S3Target] = None, *, max_bytes: Optional[int] = None
+) -> Optional[bytes]:
+    """The first `max_bytes` of an object (whole object when None), via a ranged
+    GET so a 40 GB checkpoint costs one small read. None if the key is missing."""
+    t = target or _env_s3_target()
+    params: dict = {"Bucket": t.bucket, "Key": key}
+    if max_bytes is not None and max_bytes > 0:
+        params["Range"] = f"bytes=0-{int(max_bytes) - 1}"
+    try:
+        return _s3_client(t).get_object(**params)["Body"].read()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def s3_delete_prefix(prefix: str, target: Optional[S3Target] = None,
                      on_deleted: Optional["Callable[[int], None]"] = None) -> int:
     """Delete every object under `prefix` (batched, 1000/req). Returns the count

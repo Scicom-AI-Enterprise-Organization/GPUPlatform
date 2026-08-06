@@ -1014,6 +1014,36 @@ export type StorageUsage = {
   computed_at?: string | null;
 };
 
+// ---- S3 file viewer ----
+// One row of a directory listing. `path` is relative to the storage's own
+// configured prefix — that's what every browse/object route takes back.
+export type StorageEntry = {
+  name: string;
+  path: string;
+  kind: "folder" | "file";
+  size?: number | null;
+  modified?: string | null;
+};
+
+export type StorageBrowseResponse = {
+  storage_id: string;
+  kind: "s3" | "local";
+  // s3: the bucket. local: "" (the root IS the filesystem path).
+  bucket: string;
+  // s3: the storage's configured prefix ("" = whole bucket).
+  // local: the absolute filesystem root.
+  root: string;
+  // Directory being listed, relative to root ("" = root itself).
+  path: string;
+  entries: StorageEntry[];
+  // Opaque continuation token (S3's for s3, an offset for local) — pass back as
+  // `token` for the next page.
+  next_token?: string | null;
+  // Something worth knowing about THIS listing (e.g. a directory too big to
+  // sort) — a hint, not an error.
+  note?: string | null;
+};
+
 // One owner-keyed group in a cleanup scan (a dataset/run/job/app's object subtree).
 export type PurgeGroup = {
   prefix: string;

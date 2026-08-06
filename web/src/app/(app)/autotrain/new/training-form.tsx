@@ -211,6 +211,19 @@ const LIVEKIT_AUG_OPTIONS: { id: string; label: string; desc: string }[] = [
   { id: "resample_chain", label: "Resample chain", desc: "The 48 k → 24 k → 16 k soxr path the agent + STT plugin perform" },
 ];
 
+// The streaming regime — measured on a real livekit-server + silero + WebRTC/Opus
+// pipeline (an out-of-tree STT benchmark), where the transport turned out to cost
+// ~0.35 pp and *these* things cost up to +6.75 pp. Mirrors whisper_finetune._AUG_FUNCS.
+const STREAM_AUG_OPTIONS: { id: string; label: string; desc: string }[] = [
+  { id: "livekit_stream", label: "LiveKit streaming (full)", desc: "The transport chain + hesitation, VAD framing, enhancement, jitter. Start here for a human-facing agent." },
+  { id: "hesitation", label: "Hesitation pauses", desc: "1–3 mid-turn pauses at the quietest points — costs whisper 1.31 pp in batch alone" },
+  { id: "vad_pad", label: "VAD segment framing", desc: "Prefix pad + min-silence hangover of room tone, hard-edged (a 3.95 s turn arrives as 4.92 s)" },
+  { id: "rampup", label: "Receive ramp-up", desc: "First 60–300 ms attenuated 6–24 dB — what eats the first word at session start" },
+  { id: "denoiser", label: "DNN enhancement", desc: "GTCRN / Krisp BVC artefacts: deep gating to −70 dB, speech peaks held" },
+  { id: "room_tone", label: "Room tone", desc: "Pink room/line noise at 6–30 dB SNR (speech-shaped, unlike Noise)" },
+  { id: "jitter", label: "Jitter buffer", desc: "NetEq accelerate / expand time warping, ≤2 % of the clip" },
+];
+
 function AugPicker({
   options, selected, onToggle,
 }: {
@@ -2081,6 +2094,27 @@ export function TrainingForm() {
             </p>
             <AugPicker
               options={LIVEKIT_AUG_OPTIONS}
+              selected={augmentTechniques}
+              onToggle={(id) =>
+                setAugmentTechniques((prev) =>
+                  prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+                )
+              }
+            />
+          </div>
+          <div className="pt-3">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+              Streaming regime (VAD segments + a hesitant speaker)
+            </Label>
+            <p className="pb-1.5 text-xs text-muted-foreground">
+              Benchmarked against a real LiveKit pipeline, the transport above costs ~0.35 pp — but a
+              speaker who pauses mid-turn costs <span className="font-medium">+6.75 pp</span>, and 1.31 pp of
+              that is whisper handling internal silence with no pipeline involved. Pick{" "}
+              <span className="font-medium">LiveKit streaming (full)</span> for an agent that talks to
+              people rather than to TTS clips.
+            </p>
+            <AugPicker
+              options={STREAM_AUG_OPTIONS}
               selected={augmentTechniques}
               onToggle={(id) =>
                 setAugmentTechniques((prev) =>

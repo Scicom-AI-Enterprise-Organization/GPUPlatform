@@ -1113,6 +1113,292 @@ def _background(x, sr: int, snr_db: float):
     return x + noise * (rms_x / rms_n) / (10 ** (snr_db / 20.0))
 
 
+# ===========================================================================
+# The STREAMING regime — what the VAD + a hesitant speaker do (added 2026-08-06)
+# ===========================================================================
+# Everything above models the TRANSPORT. The out-of-tree LiveKit STT benchmark
+# (a live livekit-server, real WebRTC/Opus, silero VAD, the livekit-plugins-openai
+# STT, scored by the same scorer as its batch arm; maintained separately and the
+# source of truth for these figures) then measured that transport is NOT where the
+# accuracy goes:
+#
+#   channel only (codec + noise + gain)      4.98% -> 5.33%   (+0.35 pp)
+#   + the streaming pipeline, fluent         5.33% -> 7.23%   (+1.90 pp)
+#   + the streaming pipeline, HESITANT       6.64% -> 13.39%  (+6.75 pp)
+#
+# Two findings out of that, and both are trainable properties of the MODEL
+# rather than of the pipeline:
+#
+#   1. Internal silence hurts whisper on its own. The BATCH arm degrades
+#      5.33% -> 6.64% when two 0.7 s pauses are inserted mid-utterance, with no
+#      LiveKit anywhere in the path. That 1.31 pp is ours to fix here.
+#   2. A segment is framed, not tight. Silero hands the STT the utterance plus
+#      `prefix_padding_duration` at the front and the `min_silence_duration`
+#      hangover at the back — a 3.95 s utterance arrives as a 4.92 s segment —
+#      and a DNN enhancer in front of it drives the non-speech to -70 dB. A
+#      model that only ever saw tightly-cut clips answers that quiet with
+#      phantom text (the benchmark's #2 suspicion for the production gap).
+#
+# The rest of the streaming cost is over-segmentation: silero splits the turn
+# and each fragment is transcribed with no shared context, which destroys a
+# number straddling the boundary (`charged 99, two times` -> `charged 92
+# times`). That one is NOT modelled here and cannot be, under this file's
+# label-preserving rule: cutting the audio at a segment boundary means cutting
+# the transcript too, which needs word-level alignment, i.e. a dataset
+# transform rather than a waveform augmentation. Serving-side, the fix measured
+# best anyway is the VAD's own `min_silence_duration` 0.55 -> 0.9.
+# ===========================================================================
+_WHISPER_WINDOW_S = 30.0
+
+
+def _room_left(x, sr: int) -> float:
+    """Seconds that may be ADDED before the clip passes whisper's 30 s window.
+
+    The feature extractor truncates at 30 s, so a technique that lengthens audio
+    can silently push real speech out of the window while the label still claims
+    every word — the same hallucination lesson `vad_clip` avoids, arrived at from
+    the other direction. Every stage below that inserts time asks this first."""
+    return max(0.0, _WHISPER_WINDOW_S - len(x) / float(sr))
+
+
+def _room_tone(x, sr: int, n: int, level_scale: float = 1.0):
+    """n samples of pink room tone at the clip's OWN noise floor.
+
+    Used to fill time this section inserts. Digital zeros are the wrong filler
+    for anything a microphone produced: a real pause, a real pre-roll and a real
+    hangover all carry the room, and DTX/comfort noise is the only stage that
+    ever hands the model true stationary hiss."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    step = max(1, int(0.02 * sr))
+    nf = len(x) // step
+    if nf >= 1:
+        e = np.sqrt(np.mean(x[: nf * step].reshape(nf, step) ** 2, axis=1))
+        floor = float(np.percentile(e, 10))
+    else:
+        floor = 0.0
+    floor = max(floor, 10.0 ** (-70.0 / 20.0)) * level_scale
+    if n <= 0:
+        return np.zeros(0)
+    if n < 8:
+        return np.random.normal(0.0, floor, n)
+    spec = np.fft.rfft(np.random.normal(0.0, 1.0, n))
+    f = np.arange(len(spec), dtype=np.float64)
+    f[0] = 1.0
+    tone = np.fft.irfft(spec / np.sqrt(f), n=n)
+    rms = float(np.sqrt(np.mean(tone ** 2))) or 1e-9
+    return tone * (floor / rms)
+
+
+def _insert_pauses(x, sr: int, count: int, duration: float, fill: str = "tone"):
+    """Mid-utterance hesitation: `count` pauses of `duration` s at the quietest
+    inter-word points.
+
+    Real speakers stop and restart; recorded corpora (and TTS especially) don't,
+    which is why a finetune meets its first long internal silence in production.
+    Costs whisper 1.31 pp in BATCH decoding — before any pipeline is involved —
+    and drives the streaming cost from +1.90 to +6.75 pp because a pause past
+    `min_silence_duration` makes the VAD close the turn and reopen.
+
+    Deliberately the SAME selection rule as the benchmark's own
+    `--pause-count/--pause-duration` transform (20 ms energy grid, lowest-energy
+    frames first, >=0.5 s apart, outer 15 % of the clip avoided), so the hesitant
+    arm of the benchmark measures the condition training actually saw. Randomised
+    here where the benchmark is deterministic — it needs byte-identical audio
+    across arms, this needs variety."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    if count <= 0 or duration <= 0:
+        return x
+    duration = min(duration, _room_left(x, sr))
+    if duration < 0.05:
+        return x
+    count = min(count, int(_room_left(x, sr) / duration))
+    hop = max(1, int(0.02 * sr))
+    nf = len(x) // hop
+    if count < 1 or nf < 10:
+        return x
+    energy = np.abs(x[: nf * hop].reshape(nf, hop)).mean(axis=1)
+    lo, hi = int(0.15 * nf), int(0.85 * nf)
+    if hi <= lo:
+        return x
+    min_sep = max(1, int(0.5 * sr / hop))
+    chosen: list[int] = []
+    for i in sorted(range(lo, hi), key=lambda k: energy[k]):
+        if all(abs(i - j) >= min_sep for j in chosen):
+            chosen.append(i)
+            if len(chosen) == count:
+                break
+    gap = int(sr * duration)
+    parts, prev = [], 0
+    for i in sorted(chosen):
+        pause = np.zeros(gap) if fill == "silence" else _room_tone(x, sr, gap)
+        parts += [x[prev:i * hop], pause]
+        prev = i * hop
+    parts.append(x[prev:])
+    return np.concatenate(parts)
+
+
+def _segment_frame(x, sr: int, head_s: float, tail_s: float):
+    """The VAD segment as `StreamAdapter` actually delivers it: the utterance plus
+    silero's `prefix_padding_duration` of pre-roll and its `min_silence_duration`
+    hangover, hard-edged at both ends.
+
+    This is the far end of the same axis as `vad_clip`, and it is the common case:
+    a turn silero keeps whole arrives wrapped in ~1.4 s of NON-SPEECH (measured:
+    3.95 s utterance -> 4.92 s segment), only a split one arrives cut tight. Real
+    leading/trailing audio is reused wherever the clip has some — the pre-roll a
+    microphone captured is room tone, not silence — and only the shortfall is
+    synthesised."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    bounds = _speech_bounds(x, sr)
+    if bounds is None:
+        return x
+    s, e = bounds
+    want_head = int(max(0.0, head_s) * sr)
+    want_tail = int(max(0.0, tail_s) * sr)
+    real_head = min(s, want_head)
+    real_tail = min(len(x) - e, want_tail)
+    core = x[s - real_head:e + real_tail]
+    room = max(0, int(_WHISPER_WINDOW_S * sr) - len(core))
+    add_head = min(want_head - real_head, room // 2)
+    add_tail = min(want_tail - real_tail, room - add_head)
+    return np.concatenate([_room_tone(x, sr, add_head), core,
+                           _room_tone(x, sr, add_tail)])
+
+
+def _receive_ramp(x, sr: int, ramp_s: float, depth_db: float, hard_onset: bool):
+    """WebRTC receive ramp-up over the first words of a segment.
+
+    Found in the benchmark harness the hard way: publishing a clip that starts
+    talking at t=0 lost or corrupted the FIRST WORD on 80/100 clips (`Ya saya ni`
+    -> `Saya ini`, `She's actually` -> `Actually`) — Opus/jitter-buffer priming
+    right after subscription, plus silero's prefix padding having no pre-roll to
+    prepend. The harness pads a second of silence in front precisely so it stops
+    measuring this; production still has it, at session start and after a long
+    silence, so the model should have seen it.
+
+    ATTENUATION ONLY, never deletion. A hole where the onset phoneme was, with
+    the word still in the label, is how a finetune is taught to invent it."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    if hard_onset:
+        bounds = _speech_bounds(x, sr)
+        if bounds is not None:
+            keep = int(random.uniform(0.0, 0.04) * sr)
+            x = x[max(0, bounds[0] - keep):].copy()
+    n = min(len(x), max(1, int(max(ramp_s, 0.0) * sr)))
+    if n < 2:
+        return x
+    y = x.copy()
+    y[:n] *= 10.0 ** (np.linspace(-abs(depth_db), 0.0, n) / 20.0)
+    return y
+
+
+def _deep_denoise(x, sr: int, over_sub: float = 3.5, floor_db: float = -60.0,
+                  gate_dbfs: float = -68.0):
+    """A single-channel DNN speech enhancer sitting in front of the model — GTCRN
+    (the self-hosted plugin, aimed at inbound SIP), Krisp BVC on LiveKit Cloud,
+    RNNoise. Much more aggressive than `webrtc_ns`, which models the browser's own
+    NS/voiceIsolation.
+
+    Measured on the real one: it WORKS, dropping the p25 frame level from
+    -28.9 dB to -70.9 dB while leaving speech peaks within 0.2 dB — and it lost
+    WER on every arm (7.23 -> 7.36 fluent, 13.39 -> 15.13 hesitant, 11.00 ->
+    12.52 noisy), because whisper tolerates additive noise better than
+    enhancement artefacts and answers dead-quiet non-speech with invented content
+    (`Can I talk to her later on the line?` -> `My operator was not on the
+    line.`). The serving-side conclusion is don't enable it; the TRAINING-side
+    conclusion is that a model which has to survive one should have seen its
+    artefacts. So: deep over-subtraction, a floor low enough to punch holes in weak
+    fricatives, LOW musical noise (a DNN enhancer leaves spectral holes, not the
+    musical residue a subtractive filter leaves), non-speech driven down with ~10 ms
+    ramps, and the speech peak restored.
+
+    ⚠ `gate_dbfs` is an ABSOLUTE target frame level, not another attenuation.
+    Attenuating non-speech by a further N dB stacks with the spectral floor and
+    lands 20 dB below anything real (measured -90 dB when calibrating against a
+    real segment); the enhancer's signature is a floor AT roughly -70 dBFS, ~63 dB
+    under the speech peak, so this scales the non-speech to hit that instead."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    peak0 = float(np.max(np.abs(x)))
+    y = _spectral_suppress(x, sr, over_sub=over_sub, floor_db=floor_db,
+                           musical=random.uniform(0.02, 0.18))
+    step = max(1, int(0.02 * sr))
+    nf = int(np.ceil(len(x) / step))
+    if nf >= 2:
+        fr = np.pad(x, (0, nf * step - len(x))).reshape(nf, step)
+        e = np.sqrt(np.mean(fr ** 2, axis=1)) + 1e-12
+        thr = max(float(np.percentile(e, 25)) * 3.0, float(np.max(e)) * 0.03)
+        speech = e > thr
+        for i in np.flatnonzero(speech):        # attack + hangover frames
+            speech[max(0, i - 1):i + 4] = True
+        quiet = ~speech
+        if quiet.any():
+            fy = np.pad(y, (0, nf * step - len(y)))[: nf * step].reshape(nf, step)
+            lvl = float(np.median(np.sqrt(np.mean(fy[quiet] ** 2, axis=1)))) or 1e-12
+            g = min(1.0, 10.0 ** (gate_dbfs / 20.0) / lvl)   # target, never amplify
+            env = np.repeat(np.where(speech, 1.0, g), step)[: len(y)]
+            k = max(1, int(0.01 * sr))          # the gate opens/closes over ~10 ms
+            y = y * np.convolve(env, np.ones(k) / k, mode="same")
+    peak1 = float(np.max(np.abs(y)))
+    if peak0 > 0 and peak1 > 0:
+        y = y * (peak0 / peak1)                 # enhancers hold speech peaks (0.2 dB)
+    return y
+
+
+def _neteq_warp(x, sr: int, n_ops: int, max_op_ms: float):
+    """WebRTC's jitter buffer (NetEq) absorbing network jitter: to hold the playout
+    buffer near target it ACCELERATES (overlap-add merges two windows into one) or
+    PRE-EMPTIVELY EXPANDS (plays a crossfaded duplicate) a few tens of ms at a
+    time, so the audio reaching the VAD is mildly time-warped rather than a clean
+    copy of what was captured.
+
+    ⚠ Unlike the rest of this section this one is MODELLED, not measured — the
+    benchmark runs livekit-server on localhost, where there is no jitter to
+    absorb, so it cannot see the artefact and cannot price it either.
+
+    Bounded to <=2 % of the clip (NetEq's budget is tens of ms, not seconds) and
+    applied at the lowest-energy windows, which is roughly where its correlation
+    search lands anyway — so nothing merges a phoneme away."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    win = max(1, int(min(max_op_ms, 60.0) / 1000.0 * sr))
+    budget = int(min(0.02 * n, 0.3 * sr))
+    if n < 4 * win or budget < win:
+        return x
+    nf = n // win
+    e = np.sqrt(np.mean(x[: nf * win].reshape(nf, win) ** 2, axis=1))
+    picks: list[int] = []
+    used = 0
+    for i in np.argsort(e):
+        i = int(i)
+        if i < 1 or i >= nf - 2 or any(abs(i - j) < 2 for j in picks):
+            continue
+        picks.append(i)
+        used += win
+        if len(picks) >= n_ops or used + win > budget:
+            break
+    if not picks:
+        return x
+    w = np.linspace(0.0, 1.0, win)
+    parts, prev = [], 0
+    for i in sorted(picks):
+        a, b = i * win, (i + 1) * win
+        parts.append(x[prev:a])
+        if random.random() < 0.5:                       # accelerate: merge 2 -> 1
+            parts.append(x[a:b] * (1.0 - w) + x[b:b + win] * w)
+            prev = b + win
+        else:                                           # expand: 1 -> 2
+            parts += [x[a:b], x[a:b] * (1.0 - w) + x[b:b + win] * w]
+            prev = b
+    parts.append(x[prev:])
+    return np.concatenate(parts)
+
+
 # --- the composites --------------------------------------------------------
 def _aug_opus(x, sr):
     """Opus round-trip at a LiveKit AudioPreset bitrate (12/24/48 kbps, mono)."""
@@ -1169,6 +1455,49 @@ def _aug_resample_chain(x, sr):
     return _lk_resample_chain(x, sr)
 
 
+def _aug_hesitation(x, sr):
+    """1–3 mid-utterance pauses at the quietest inter-word points (0.3–1.2 s).
+
+    The range straddles silero's `min_silence_duration` (0.55 default, 0.9 tuned)
+    on purpose: some pauses split the turn in production and some don't, and the
+    model has to read both."""
+    return _insert_pauses(x, sr, random.randint(1, 3), random.uniform(0.3, 1.2),
+                          fill=random.choice(["tone", "tone", "silence"]))
+
+
+def _aug_vad_pad(x, sr):
+    """Silero's segment framing — prefix pad (0.3–0.9 s) + min-silence hangover
+    (0.4–1.0 s) of room tone, hard-edged. The `vad_clip` counterpart."""
+    return _segment_frame(x, sr, random.uniform(0.3, 0.9), random.uniform(0.4, 1.0))
+
+
+def _aug_rampup(x, sr):
+    """WebRTC receive ramp-up: the first 60–300 ms attenuated by 6–24 dB, usually
+    with the segment starting on the first phoneme (no pre-roll to pad with)."""
+    return _receive_ramp(x, sr, random.uniform(0.06, 0.30),
+                         random.uniform(6.0, 24.0), random.random() < 0.7)
+
+
+def _aug_denoiser(x, sr):
+    """DNN speech enhancement in front of the model (GTCRN / Krisp BVC / RNNoise)."""
+    return _deep_denoise(x, sr, over_sub=random.uniform(2.5, 5.0),
+                         floor_db=random.uniform(-70.0, -45.0),
+                         gate_dbfs=random.uniform(-75.0, -55.0))
+
+
+def _aug_room_tone(x, sr):
+    """Pink room/line tone at 6–30 dB SNR — the noisy-call regime the benchmark
+    measures with `--noise-snr`. Distinct from `noise`, which is white Gaussian at
+    10–40 dB; pink has its energy where speech does, like a real room or trunk."""
+    return _background(x, sr, random.uniform(6.0, 30.0))
+
+
+def _aug_jitter(x, sr):
+    """NetEq accelerate / pre-emptive-expand time warping (<=2 % of the clip)."""
+    return _neteq_warp(x, sr, n_ops=random.randint(1, 4),
+                       max_op_ms=random.uniform(20.0, 60.0))
+
+
 def _aug_livekit(x, sr):
     """THE ONE TO USE for a WebRTC voice agent: the whole LiveKit capture →
     publish → agent → STT chain, in order, with each stage randomised per sample.
@@ -1199,6 +1528,63 @@ def _aug_livekit(x, sr):
     x = _lk_resample_chain(x, sr)
     if random.random() < 0.6:                                   # VAD segment edges
         x = _vad_tighten(x, sr, max_pad_ms=random.uniform(60.0, 400.0))
+    return x
+
+
+def _aug_livekit_stream(x, sr):
+    """`livekit` PLUS the streaming regime the benchmark measured: a speaker who
+    hesitates mid-turn, a DNN enhancer that may be in the path, NetEq warping, and
+    the VAD segment framed the way `StreamAdapter` actually delivers it.
+
+    **This is the one to use for a voice agent** whose callers are people rather
+    than TTS. `livekit` models the transport, which the benchmark priced at ~0.35 pp;
+    this models the part that costs +6.75 pp. It is left as a SEPARATE technique
+    rather than folded into `livekit` so an earlier run's augmentation is still
+    reproducible — pick both if you want the plain-transport draws too.
+
+    Order is the real signal order: the speaker hesitates before the room is
+    recorded, the room before the browser processes it, the segment is framed last,
+    and the receive ramp lands on the front of the segment that reaches the STT."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    if random.random() < 0.6:                                   # the speaker
+        x = _aug_hesitation(x, sr)
+    if random.random() < 0.7:                                   # the room
+        x = _aug_room_tone(x, sr)
+    x = _highpass(x, sr, random.uniform(60.0, 120.0))            # APM high-pass
+    r = random.random()
+    if r < 0.3:                                                 # a DNN enhancer…
+        x = _aug_denoiser(x, sr)
+    elif r < 0.9:                                               # …or browser NS
+        x = _aug_webrtc_ns(x, sr)
+    if random.random() < 0.25:                                  # barge-in
+        x = _aec_doubletalk(x, sr)
+    if random.random() < 0.9:                                   # browser AGC
+        x = _agc(x, sr, target_dbfs=random.uniform(-6.0, -2.0),
+                 initial_gain_db=random.uniform(0.0, 12.0))
+    x = _opus_roundtrip(x, sr, random.choice([12000, 24000, 24000, 48000, 48000]), "voip")
+    if random.random() < 0.55:                                  # loss + PLC
+        x = _packet_loss(x, sr, loss=random.uniform(0.005, 0.06),
+                         mean_burst=random.uniform(1.0, 3.5),
+                         fec_recovery=random.uniform(0.3, 0.7))
+    if random.random() < 0.5:                                   # DTX comfort noise
+        x = _dtx(x, sr, min_gap_ms=random.uniform(160.0, 400.0))
+    if random.random() < 0.5:                                   # jitter buffer
+        x = _aug_jitter(x, sr)
+    if random.random() < 0.9:                                   # agent-side AGC2
+        x = _agc(x, sr, target_dbfs=random.uniform(-5.0, -2.0),
+                 initial_gain_db=random.uniform(0.0, 8.0))
+    x = _lk_resample_chain(x, sr)
+    if random.random() < 0.65:      # silero kept the turn whole -> framed segment
+        x = _aug_vad_pad(x, sr)
+    else:                           # a split segment arrives cut tight
+        x = _vad_tighten(x, sr, max_pad_ms=random.uniform(60.0, 400.0))
+    # Ramp-up last: it lands on the front of the segment that reaches the STT.
+    # hard_onset is only half as likely as in `rampup` alone — the framing above
+    # usually just gave this segment its pre-roll back.
+    if random.random() < 0.45:
+        x = _receive_ramp(x, sr, random.uniform(0.06, 0.30),
+                          random.uniform(6.0, 24.0), random.random() < 0.5)
     return x
 
 
@@ -1249,6 +1635,14 @@ _AUG_FUNCS = {
     "aec": _aug_aec,
     "vad_clip": _aug_vad_clip,
     "resample_chain": _aug_resample_chain,
+    # The streaming regime — the VAD segment + a hesitant speaker
+    "livekit_stream": _aug_livekit_stream,
+    "hesitation": _aug_hesitation,
+    "vad_pad": _aug_vad_pad,
+    "rampup": _aug_rampup,
+    "denoiser": _aug_denoiser,
+    "room_tone": _aug_room_tone,
+    "jitter": _aug_jitter,
 }
 # Stable list the API/form validate against.
 AUG_TECHNIQUES = list(_AUG_FUNCS.keys())

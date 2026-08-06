@@ -94,6 +94,9 @@ _AUG_TECHNIQUES = {
     "telephone", "noise", "dropout", "gain", "pitch", "speed", "reverb", "bandpass",
     "livekit", "livekit_sip", "opus", "g711", "packet_loss", "dtx", "agc",
     "webrtc_ns", "aec", "vad_clip", "resample_chain",
+    # the streaming regime (VAD segment framing + a hesitant speaker)
+    "livekit_stream", "hesitation", "vad_pad", "rampup", "denoiser", "room_tone",
+    "jitter",
 }
 # TTS audio-eval methods (run on the test set): char-error-rate, UTMOSv2 MOS,
 # TitaNet speaker similarity. The eval runner is a follow-up; the selection +

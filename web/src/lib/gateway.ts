@@ -58,6 +58,7 @@ import type {
   SectionKey,
   StorageRecord,
   StorageUsage,
+  StorageBrowseResponse,
   PurgeScanResult,
   PurgeJobStatus,
   TestStorageRequest,
@@ -963,6 +964,43 @@ export const gateway = {
     }),
   storagePurgeStatus: (id: string) =>
     request<PurgeJobStatus>(`/v1/storage/${encodeURIComponent(id)}/purge-status`),
+
+  // ---- File viewer (admin-only, kind=s3 | local) ----
+  /** One page of a directory. `q` is a server-side name-PREFIX filter (all the
+   * S3 LIST API can do without a full scan) — never filter client-side here, a
+   * directory can hold millions of objects. */
+  storageBrowse: (
+    id: string,
+    path = "",
+    token?: string | null,
+    limit = 300,
+    q = "",
+  ) => {
+    const params = new URLSearchParams({ path, limit: String(limit) });
+    if (token) params.set("token", token);
+    if (q) params.set("q", q);
+    return request<StorageBrowseResponse>(
+      `/v1/storage/${encodeURIComponent(id)}/browse?${params.toString()}`,
+    );
+  },
+  /** Uncapped download through the Next proxy: a local file streams off the
+   * gateway's disk, an S3 object 307s to a presigned URL. */
+  storageDownloadUrl: (id: string, path: string) =>
+    `/api/proxy/v1/storage/${encodeURIComponent(id)}/object?path=${encodeURIComponent(path)}&download=1`,
+  /** Same-origin URL for an object's bytes, served through the gateway
+   * (cookie→Bearer via the Next proxy) — so previews render regardless of the
+   * bucket's CORS policy. Text is head-read to `maxBytes`. */
+  storageObjectContentUrl: (id: string, path: string, maxBytes?: number) => {
+    const q = new URLSearchParams({ path });
+    if (maxBytes) q.set("max_bytes", String(maxBytes));
+    return `/api/proxy/v1/storage/${encodeURIComponent(id)}/object?${q.toString()}`;
+  },
+  // Presigned direct-from-S3 GET — the download path, so a multi-GB artifact
+  // never streams through the gateway.
+  storageObjectUrl: (id: string, path: string, expires = 3600) =>
+    request<{ url: string; expires_in: number }>(
+      `/v1/storage/${encodeURIComponent(id)}/object-url?path=${encodeURIComponent(path)}&expires=${expires}`,
+    ),
 
   // ---- GitOps ----
   listGitopsRepos: () => request<GitopsRepo[]>("/v1/gitops"),

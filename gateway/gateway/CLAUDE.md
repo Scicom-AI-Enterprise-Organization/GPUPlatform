@@ -821,16 +821,103 @@ chain, and a finetune on clean audio has seen none of it.
 - **⚠ Four registries must stay in sync**, else a technique is silently dropped from the run config:
   `whisper_finetune._AUG_FUNCS` (the trainer), `training_api._AUG_TECHNIQUES` (validation — request
   values not in this set are **filtered out silently**), `training-form.tsx` `AUG_OPTIONS` +
-  `LIVEKIT_AUG_OPTIONS` (the UI), `automation/run_pipeline.py` `ALL_AUGMENTATIONS` +
-  `LIVEKIT_AUGMENTATIONS`. `gateway/tests/unit/test_audio_augment.py` pins the first three.
+  `LIVEKIT_AUG_OPTIONS` + `STREAM_AUG_OPTIONS` (the UI), `automation/run_pipeline.py`
+  `ALL_AUGMENTATIONS` + `LIVEKIT_AUGMENTATIONS` + `STREAM_AUGMENTATIONS`.
+  `gateway/tests/unit/test_audio_augment.py` pins **all four** (the form test scrapes the three
+  `*_OPTIONS` consts by name — a fourth UI group needs adding to that regex or its ids read as
+  missing).
 - **Restart rules**: `whisper_finetune.py` is **SFTP'd per run** → trainer edits need no gateway
   restart. `training_api.py` is imported → its `_AUG_TECHNIQUES` edit **does**.
-- **`resolve_augment` aliases** (automation YAML): `all` = the 8 classic techniques (unchanged
-  meaning), `livekit_all` = the 11 transport ones. Plain `livekit` is a real technique, not an alias.
+- **`resolve_augment` aliases** (automation YAML): `all` = the 8 classic techniques, `livekit_all`
+  = the 11 transport ones, `stream_all` = the 7 streaming-regime ones, `voice_all` = both voice-agent
+  families. Each alias keeps its meaning as techniques are added — **one technique is picked per
+  augmented sample, so growing `livekit_all` would silently halve how often an existing YAML's
+  transport stages fire**. Plain `livekit` / `livekit_stream` are real techniques, not aliases.
 - Verified against a real speech clip: opus distortion falls monotonically with bitrate, G.711 leaves
   <1 % energy above 4.2 kHz, PLC conceals instead of zeroing, AGC's 3 dB/s slew leaves the clip head
   15 dB under the tail, and 20 random draws of both chains stay finite/unclipped on all three codec
   backends.
+
+#### The streaming regime — the VAD segment + a hesitant speaker (added 2026-08-06)
+
+A second wave, driven by what the out-of-tree LiveKit STT benchmark (a live `livekit-server`, real
+WebRTC/Opus, silero VAD, the `livekit-plugins-openai` STT, graded by the same scorer as its batch
+arm — maintained separately, and the source of truth for these figures) actually **measured**:
+**the transport is not where the accuracy goes.**
+
+| what | WER |
+|---|---|
+| channel alone (codec + noise + gain) | 4.98 % → 5.33 % (**+0.35 pp**) |
+| + the streaming pipeline, fluent speech | 5.33 % → 7.23 % (+1.90 pp) |
+| + the streaming pipeline, **hesitant** speech | 6.64 % → 13.39 % (**+6.75 pp**) |
+
+Everything in the family above buys the first row. **Techniques:** `livekit_stream` (the transport
+chain plus all of the below — *the one to use for an agent that talks to people*), `hesitation`,
+`vad_pad`, `rampup`, `denoiser`, `room_tone`, `jitter`.
+
+- **`hesitation` fixes a MODEL weakness, not a pipeline one.** The benchmark's *batch* arm — no
+  LiveKit anywhere in the path — degrades 5.33 % → 6.64 % when two 0.7 s pauses are inserted
+  mid-utterance. That 1.31 pp is trainable here. It deliberately uses the **same selection rule** as
+  the benchmark's `--pause-count/--pause-duration` (20 ms energy grid, lowest-energy frames first,
+  ≥ 0.5 s apart, outer 15 % avoided), so the hesitant benchmark arm measures the condition training
+  saw; durations 0.3–1.2 s straddle silero's `min_silence_duration` (0.55 default / 0.9 tuned) so
+  some pauses split the turn and some don't.
+- **⚠ `vad_pad` is the OPPOSITE of `vad_clip`, and it is the common case.** A turn silero keeps
+  whole arrives *framed* — `prefix_padding_duration` of pre-roll + the `min_silence_duration`
+  hangover, measured as a 3.95 s utterance reaching the STT as a **4.92 s segment**. Only a *split*
+  segment arrives cut tight. Both ends of that axis are now covered; a model that has only seen
+  tightly-cut clips answers ~1.4 s of non-speech with phantom text (the benchmark's #2 suspicion for
+  the production gap). Pre-roll is filled with the clip's **own noise floor** (`_room_tone`), not
+  digital zeros — only DTX ever hands the model true stationary hiss.
+- **⚠ Anything that inserts time asks `_room_left()` first.** Whisper's feature extractor truncates
+  at **30 s**, so lengthening a clip past it pushes real speech out of the window while the label
+  still claims every word — the `vad_clip` hallucination lesson arrived at from the other direction.
+  `hesitation` shrinks/drops pauses to fit, `vad_pad` caps the synthesised padding, `livekit_stream`
+  stays under 30 s across draws (verified on a 29.2 s clip). ⚠ The **pre-existing `speed` technique
+  has no such guard** — `time_stretch(0.9)` on a > 27 s clip can overflow the window. Rare enough
+  that it was left alone; don't add a length-increasing technique without the guard.
+- **⚠ `denoiser`'s `gate_dbfs` is an ABSOLUTE target level, not another attenuation.** Attenuating
+  non-speech by a further N dB *stacks* with `_spectral_suppress`'s floor: the first calibration
+  landed the floor at **−90 dB**, ~20 dB below anything a real enhancer produces. The measured GTCRN
+  signature is a floor **at** ≈ −70 dBFS with speech peaks held within 0.2 dB, so the gate scales
+  non-speech to hit that (and never amplifies). Re-verified on a real dumped segment: −24.7 → **−71
+  to −72 dB** p25 frame level, peak delta **0.00 dB**.
+- **Why train on a denoiser that LOST at serving time.** GTCRN measurably works (floor −28.9 →
+  −70.9 dB, speech peaks within 0.2 dB) and still lost WER on **every** benchmark arm (7.23 → 7.36
+  fluent, 13.39 → 15.13 hesitant, 11.00 → 12.52 noisy) — whisper tolerates additive noise better
+  than enhancement artefacts and answers dead-quiet non-speech with invented content. The serving
+  conclusion is *don't enable it*; the training conclusion is that a model which may end up behind
+  one should have seen its artefacts. Much more aggressive than `webrtc_ns`, which stays the
+  browser's own NS/voiceIsolation.
+- **`rampup` is attenuation only, never deletion.** Found in the harness: publishing a clip that
+  starts talking at t=0 lost or corrupted the **first word on 80/100 clips** (`Ya saya ni` → `Saya
+  ini`) — Opus/jitter-buffer priming after subscription plus silero's prefix padding having no
+  pre-roll to prepend. The harness pads a second of silence in front precisely so it stops measuring
+  this; production still has it at session start. A *hole* where the onset phoneme was, with the word
+  still in the label, is the hallucination lesson again — so 6–24 dB of fade, no zeroing.
+- **⚠ `jitter` is MODELLED, not measured.** NetEq's accelerate / pre-emptive-expand is unambiguously
+  in the receive path, but the benchmark runs livekit-server on **localhost** where there is no
+  jitter to absorb, so it can neither see nor price the artefact. Bounded to ≤ 2 % of the clip and
+  applied at its lowest-energy windows (roughly where NetEq's correlation search lands), so nothing
+  merges a phoneme away.
+- **⚠ Over-segmentation is NOT modelled and cannot be here.** It is the *rest* of the streaming cost:
+  silero splits the turn, each fragment is transcribed with no shared context, and a number
+  straddling the boundary is destroyed (`charged 99, two times` → `charged 92 times`). Clips silero
+  kept whole cost 0.35 pp; the 12/100 it split were 14.5 % of the words but ~⅔ of the extra errors.
+  Modelling it means cutting the audio at a segment boundary **and cutting the transcript with it**,
+  which needs word-level alignment — a dataset transform, not a label-preserving waveform augment.
+  Serving-side the measured fix is the VAD's own `min_silence_duration` 0.55 → **0.9** (halves the
+  fluent cost, cuts the hesitant cost by two-thirds, ~0.35 s more end-of-turn latency).
+- **`livekit_stream` is a separate technique, not folded into `livekit`.** Same reason `all` never
+  grew: an earlier run's augmentation stays reproducible. Select both if you want the
+  plain-transport draws too.
+- **Cost** (real 16 kHz speech, one core): `jitter` 0.1 ms, `rampup` 0.2, `vad_pad` 0.6,
+  `hesitation` 1.2, `room_tone` 4.8, `denoiser` 10 — and `livekit_stream` **~100 ms** (vs `livekit`
+  ~81 ms), still dominated by the opus encode. Same dataloader-worker budgeting as above.
+- **Recommended**: `augment_techniques: ["livekit_stream"]` at `augment_prob` ~0.5 for a
+  human-facing voice agent (add `livekit_sip` if it takes phone calls). Verified on real segments
+  the benchmark had uploaded to the STT: 20 draws finite/bounded/under 30 s, room tone at the
+  clip's own floor, jitter warp within ±1.22 %, `room_tone` hitting its requested SNR exactly.
 
 ### Label platform (data-labelling app)
 
@@ -845,6 +932,55 @@ Dataset's import is filtered by `label_status` (review status) and `label_update
 optional ISO-8601 point-in-time cutoff → the export's `updated_until`; only tasks last updated
 at/before it are pulled). Both are forwarded on every read (`_label_export_rows`, `_label_pairs`)
 and editable post-creation via PATCH — changing either re-counts the dataset's rows.
+
+### Storage file viewer (`/storage/{id}/files` → `storage_api.py` browse/object routes)
+
+A read-only browser over a **`kind=s3` or `kind=local`** storage (`BROWSABLE_KINDS`; huggingface
+browses on the Hub, sftp would need a connection per listing): `GET /v1/storage/{id}/browse` (one
+**delimited** `list_objects_v2` / one `readdir` per directory — folders + files + a continuation
+token, O(page), NOT the full-bucket walk `usage`/`purge-scan` do), `GET /{id}/object` (bytes through
+the gateway for the preview pane, `?download=1` for the uncapped fetch) and `GET /{id}/object-url`
+(presigned, s3 only). All are **admin-only**, like usage/cleanup — one storage row backs every
+feature's data. The s3 primitives (`s3_list_page` / `s3_head` / `s3_get_head_bytes`) live in
+`bench.py` with the rest.
+
+- **Paths are relative to the storage's own scope** — the configured `prefix` (s3) or `path`
+  (local) — and that scope is a hard boundary. `_safe_rel` rejects `..` outright rather than
+  resolving it; for local, `_local_path` **realpaths both sides**, because a symlink inside the
+  root has no `..` and would otherwise walk straight to `/etc`. Escaping symlinks are also
+  **hidden from listings** (`_escapes_root`, which only pays a realpath for entries that ARE
+  symlinks), so the viewer shows the configured folder and nothing merely reachable from it.
+- **⚠ Nothing here may build or sort a whole directory** — a million objects in one prefix is
+  normal (per-clip audio). S3 pages on its continuation token; local pages on an offset token and
+  **only name-sorts under `LOCAL_SORT_MAX` (20k)** — above that it streams in readdir order,
+  stat()ing just the page, and returns a `note` saying it isn't sorted. Measured: 22 ms for a page
+  of a 25k-entry directory, 45 ms at offset 24000.
+- **The filter is a server-side name PREFIX (`q`), not a client-side substring.** Prefix is all
+  `list_objects_v2` can push down without scanning, and filtering the loaded page would answer the
+  wrong question on a directory the UI has only seen 300 of. Local applies the same rule during its
+  scan so both kinds behave identically (and a filtered local listing drops back under the sort
+  threshold, so it comes back sorted).
+- **⚠ A delimited S3 page can be EMPTY while more remain** — MaxKeys counts keys *scanned*, and a
+  page whose keys all collapse into already-returned folders returns nothing. `_s3_browse` pulls up
+  to `S3_EMPTY_PAGE_RETRIES` pages before handing the UI a blank screen with a "load more" button.
+- **Download splits by kind**: local streams off the gateway's disk (`FileResponse`, forced
+  `octet-stream` so the web proxy takes its byte-exact binary branch), s3 **307s to a presigned
+  URL** so a multi-GB checkpoint never crosses the control plane.
+
+- **⚠ S3's stored `Content-Type` LIES — the filename decides the type.** It's arbitrary
+  caller-supplied metadata: this platform's own bucket stamps `.jsonl` objects
+  **`application/jsonl`** (no whitelist calls that text) and extensionless files
+  `application/octet-stream`. Trusting it made a 21 KB JSONL un-previewable (413 "too large" on a
+  text file). `_media_type_for(name)` wins; the stored type is only the fallback for an extension
+  we don't know — and those get **sniffed** (`_looks_textual`: no NUL + valid utf-8, tolerating a
+  codepoint split at the tail of a ranged read), which is how `.persist_marker` previews. A known
+  extension is NEVER re-typed by sniffing: a `.wav` whose head happens to decode is still a `.wav`.
+- **Text is head-read, media is all-or-nothing.** Over `max_bytes` a text file serves its first
+  chunk with `X-Object-Truncated: 1`; binary is refused with 413 pointing at the download (half a
+  WAV is not a smaller WAV). `X-Object-Size`/`X-Object-Truncated` only reach the browser because
+  they're in the Next proxy's `PASS_HEADERS` — add response headers there or the UI can't see them.
+- Previews go **through the gateway** (same-origin + authed) so they work with no bucket CORS
+  policy; downloads are presigned so a multi-GB checkpoint never streams through the control plane.
 
 ### Self-hosted HuggingFace catalog (the "Models" section)
 

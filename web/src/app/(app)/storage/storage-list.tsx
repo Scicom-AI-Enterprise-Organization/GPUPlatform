@@ -1,8 +1,9 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Check, Cloud, Database, HardDrive, Inbox, KeyRound, LayoutGrid, List, Loader2, MoreHorizontal, Power, RefreshCw, Search, Sparkles, Trash2, TriangleAlert, User, X } from "lucide-react";
+import { Check, Cloud, Database, FolderOpen, HardDrive, Inbox, KeyRound, LayoutGrid, List, Loader2, MoreHorizontal, Power, RefreshCw, Search, Sparkles, Trash2, TriangleAlert, User, X } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,6 +24,9 @@ import { avatarFor } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
 import type { PurgeJobStatus, PurgeScanResult, StorageKind, StorageRecord } from "@/lib/types";
 
+// Kinds the file viewer can open — mirrors storage_api.BROWSABLE_KINDS.
+const BROWSABLE_KINDS: string[] = ["s3", "local"];
+
 const KIND_LABEL: Record<StorageKind, string> = {
   s3: "s3",
   huggingface: "huggingface",
@@ -40,10 +44,11 @@ function KindIcon({ kind }: { kind: StorageKind }) {
   return kind === "huggingface" ? <Database className="h-3 w-3" /> : <Cloud className="h-3 w-3" />;
 }
 
-/** Display the bucket scope (bucket + optional prefix), or the endpoint for
- * S3-compatible providers, or — for HF — just the kind. */
+/** Display the bucket scope (bucket + optional prefix), the directory for a
+ * local store, or the endpoint for S3-compatible providers; for HF, just the kind. */
 function scopeOf(s: StorageRecord): string | null {
   if (s.kind === "huggingface") return null;
+  if (s.kind === "local") return s.path ?? null;
   if (!s.bucket) return null;
   const prefix = s.prefix ? `/${s.prefix.replace(/^\/+|\/+$/g, "")}` : "";
   return `s3://${s.bucket}${prefix}`;
@@ -247,6 +252,14 @@ export function StorageList({
                         <Power className="h-4 w-4" />
                         {s.enabled ? "Disable" : "Enable"}
                       </DropdownMenuItem>
+                      {BROWSABLE_KINDS.includes(s.kind) && (
+                        <DropdownMenuItem asChild>
+                          <Link href={`/storage/${encodeURIComponent(s.id)}/files`}>
+                            <FolderOpen className="h-4 w-4" />
+                            Browse files
+                          </Link>
+                        </DropdownMenuItem>
+                      )}
                       {s.kind === "s3" && (
                         <DropdownMenuItem
                           onSelect={(e) => {
@@ -307,7 +320,17 @@ export function StorageList({
                 )}
               </div>
 
-              <div className="mt-3 flex items-center justify-end border-t border-border/60 pt-2 text-xs text-muted-foreground">
+              <div className="mt-3 flex items-center justify-between gap-2 border-t border-border/60 pt-2 text-xs text-muted-foreground">
+                {BROWSABLE_KINDS.includes(s.kind) && canWrite ? (
+                  <Link
+                    href={`/storage/${encodeURIComponent(s.id)}/files`}
+                    className="inline-flex items-center gap-1 hover:text-foreground"
+                  >
+                    <FolderOpen className="h-3.5 w-3.5" /> Browse files
+                  </Link>
+                ) : (
+                  <span />
+                )}
                 <span title={new Date(s.created_at).toISOString()}>
                   added {new Date(s.created_at).toLocaleString()}
                 </span>
