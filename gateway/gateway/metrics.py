@@ -382,6 +382,58 @@ PROXY_AUDIO_NLL = Histogram(
 )
 
 
+# Real-time factor for the audio proxies (STT + TTS): the wall-clock seconds the
+# upstream spent per second of audio. RTF < 1 = faster than real time; LOWER is
+# better. `kind` separates the two directions — "stt" (audio seconds transcribed)
+# from "tts" (audio seconds synthesized) — because their scales differ by ~an order
+# of magnitude and a shared series would be meaningless.
+# ⚠️ The histogram's mean is the mean of per-request RATIOS, which is NOT the fleet
+# RTF (long clips would count the same as short ones). For the aggregate, divide the
+# two counters — they are the numerator and denominator of the real thing:
+#   rate(proxy_audio_process_seconds_total[30m]) / rate(proxy_audio_seconds_total[30m])
+# Watch that ratio for a throughput regression (a slower model / a busier GPU); use
+# histogram_quantile(0.95, rate(proxy_audio_rtf_bucket[30m])) for the per-request tail.
+_RTF_BUCKETS = (
+    0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 5.0, float("inf"),
+)
+_AUDIO_RTF_LABELS = ["proxy", "model", "kind"]
+PROXY_AUDIO_RTF = Histogram(
+    "proxy_audio_rtf",
+    "Audio-proxy real-time factor (processing wall seconds / audio second; "
+    "< 1 = faster than real time, LOWER = faster), by kind (stt/tts)",
+    _AUDIO_RTF_LABELS,
+    buckets=_RTF_BUCKETS,
+    registry=_registry,
+)
+PROXY_AUDIO_SECONDS = Counter(
+    "proxy_audio_seconds_total",
+    "Audio seconds transcribed (stt) / synthesized (tts) through the proxy — the "
+    "denominator of the aggregate RTF",
+    _AUDIO_RTF_LABELS, registry=_registry,
+)
+PROXY_AUDIO_PROCESS_SECONDS = Counter(
+    "proxy_audio_process_seconds_total",
+    "Wall-clock seconds spent processing that audio (upstream forward duration) — the "
+    "numerator of the aggregate RTF",
+    _AUDIO_RTF_LABELS, registry=_registry,
+)
+
+
+def observe_audio_rtf(proxy: str, model: str, kind: str,
+                      audio_s: float, process_s: float) -> None:
+    """Record one audio request's real-time factor. `kind` is "stt" or "tts",
+    `audio_s` the measured duration of the clip (transcribed or generated) and
+    `process_s` the wall time the forward took. Ignored unless both are positive —
+    an unmeasurable duration (compressed audio, no decoder) reports no RTF rather
+    than a wrong one."""
+    if audio_s is None or process_s is None or audio_s <= 0 or process_s <= 0:
+        return
+    lbl = {"proxy": proxy, "model": model or "", "kind": kind or ""}
+    PROXY_AUDIO_RTF.labels(**lbl).observe(process_s / audio_s)
+    PROXY_AUDIO_SECONDS.labels(**lbl).inc(audio_s)
+    PROXY_AUDIO_PROCESS_SECONDS.labels(**lbl).inc(process_s)
+
+
 # TTS round-trip quality: the proxy transcribes its own generated audio through a
 # whisper STT (async, off the response path) and scores it vs the input text. CER is
 # the meaningful signal for CJK (word-based WER ≈ 1.0 there); WER for spaced scripts.
@@ -483,8 +535,9 @@ def render_proxy(proxy: str) -> bytes:
     class _ProxyFilter:
         def collect(self):
             for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION, PROXY_TTFT, PROXY_TPS,
-                           PROXY_AUDIO_NLL, PROXY_TTS_CER, PROXY_TTS_WER, PROXY_TTS_EVAL_TOTAL,
-                           PROXY_CAPTURE_TOTAL):
+                           PROXY_AUDIO_NLL, PROXY_AUDIO_RTF, PROXY_AUDIO_SECONDS,
+                           PROXY_AUDIO_PROCESS_SECONDS, PROXY_TTS_CER, PROXY_TTS_WER,
+                           PROXY_TTS_EVAL_TOTAL, PROXY_CAPTURE_TOTAL):
                 for mf in metric.collect():
                     samples = [s for s in mf.samples if s.labels.get("proxy") == proxy]
                     if not samples:

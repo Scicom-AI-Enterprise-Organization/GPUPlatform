@@ -12,6 +12,8 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { CurlBlock, headerLines, shq } from "@/components/playground/curl-block";
+import { ErrorNote } from "@/components/playground/chat-playground";
+import { readRtf, RtfNote, type Rtf } from "@/components/playground/rtf";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 
@@ -33,6 +35,7 @@ type AudioRun = {
   filename: string;
   language?: string;
   text: string;
+  rtf?: Rtf;         // only the proxy data plane reports it (absent on older entries)
 };
 
 const STORAGE_KEY = (appId: string) => `serverless-ui:transcribe:${appId}`;
@@ -84,6 +87,7 @@ export function TranscribePlayground({ models, basePath, curlBase, storageKey, e
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [text, setText] = useState<string | null>(null);
+  const [rtf, setRtf] = useState<Rtf | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   // History — tracked per browser (localStorage), like the chat playground.
@@ -105,7 +109,7 @@ export function TranscribePlayground({ models, basePath, curlBase, storageKey, e
 
   async function onRun() {
     if (!file || !model) return;
-    setBusy(true); setErr(null); setText(null);
+    setBusy(true); setErr(null); setText(null); setRtf(null);
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -129,6 +133,9 @@ export function TranscribePlayground({ models, basePath, curlBase, storageKey, e
       const out = (body as { text?: string })?.text;
       const resultText = typeof out === "string" ? out : JSON.stringify(body, null, 2);
       setText(resultText);
+      // Real-time factor, when the data plane measured one (proxy audio endpoints).
+      const runRtf = readRtf(r.headers);
+      setRtf(runRtf);
       const entry: AudioRun = {
         id: (globalThis.crypto?.randomUUID?.() ?? `r-${Date.now()}-${Math.round(Math.random() * 1e6)}`),
         at: Date.now(),
@@ -137,6 +144,7 @@ export function TranscribePlayground({ models, basePath, curlBase, storageKey, e
         filename: file.name || "audio",
         ...(task === "transcriptions" && language.trim() ? { language: language.trim() } : {}),
         text: resultText,
+        ...(runRtf ? { rtf: runRtf } : {}),
       };
       persist([entry, ...historyRef.current].slice(0, MAX_HISTORY));
     } catch (e) {
@@ -203,7 +211,7 @@ export function TranscribePlayground({ models, basePath, curlBase, storageKey, e
                 : <><AudioLines className="h-4 w-4" /> {task === "translations" ? "Translate" : "Transcribe"}</>}
             </Button>
           </div>
-          {err && <p className="text-sm text-destructive">{err}</p>}
+          {err && <ErrorNote>{err}</ErrorNote>}
           {curlBase && model && (
             <CurlBlock build={(tok) => curlTranscribe({
               url: `${curlBase}/audio/${task}`, token: tok, model,
@@ -216,8 +224,13 @@ export function TranscribePlayground({ models, basePath, curlBase, storageKey, e
           )}
           {text != null && (
             <div className="space-y-1.5">
-              <div className="text-xs text-muted-foreground">Result</div>
-              <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-3 text-sm">{text}</pre>
+              <div className="flex items-baseline gap-2">
+                <span className="text-xs text-muted-foreground">Result</span>
+                {rtf && <RtfNote rtf={rtf} className="ml-auto" />}
+              </div>
+              {/* Matches the chat playground's answer pane, so a transcript and a
+                  completion read at the same size when you flip modes. */}
+              <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed scrollbar-thin">{text}</pre>
             </div>
           )}
         </CardContent>
@@ -249,7 +262,8 @@ export function TranscribePlayground({ models, basePath, curlBase, storageKey, e
                   </span>
                   <span className="font-mono text-[11px] text-muted-foreground">{r.model}</span>
                   <span className="truncate">{r.filename}</span>
-                  <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">{new Date(r.at).toLocaleString()}</span>
+                  {r.rtf && <RtfNote rtf={r.rtf} className="ml-auto" compact />}
+                  <span className={`${r.rtf ? "" : "ml-auto "}shrink-0 text-[11px] text-muted-foreground`}>{new Date(r.at).toLocaleString()}</span>
                   <button
                     type="button"
                     onClick={(e) => { e.preventDefault(); removeRun(r.id); }}

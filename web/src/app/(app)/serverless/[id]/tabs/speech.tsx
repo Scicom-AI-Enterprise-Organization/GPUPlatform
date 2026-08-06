@@ -13,6 +13,8 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { CurlBlock, headerLines, shq } from "@/components/playground/curl-block";
+import { ErrorNote } from "@/components/playground/chat-playground";
+import { readRtf, RtfNote, type Rtf } from "@/components/playground/rtf";
 
 type SpeechRun = {
   id: string;
@@ -21,6 +23,7 @@ type SpeechRun = {
   voice: string;
   text: string;
   url: string;   // object URL (session-lived)
+  rtf?: Rtf;     // only the proxy data plane reports it
 };
 
 const MAX_HISTORY = 20;
@@ -135,11 +138,13 @@ export function SpeechPlayground({ models, basePath, curlBase, storageKey, extra
         setErr(typeof detail === "string" ? detail : JSON.stringify(detail));
         return;
       }
+      const rtf = readRtf(r.headers);   // synthesis speed, when the data plane measured it
       const buf = fixWavSizes(await r.arrayBuffer());
       const url = URL.createObjectURL(new Blob([buf], { type: r.headers.get("content-type") || "audio/wav" }));
       const entry: SpeechRun = {
         id: globalThis.crypto?.randomUUID?.() ?? `r-${Date.now()}`,
         at: Date.now(), model, voice, text: text.trim(), url,
+        ...(rtf ? { rtf } : {}),
       };
       setRuns((rs) => {
         const next = [entry, ...rs];
@@ -199,7 +204,7 @@ export function SpeechPlayground({ models, basePath, curlBase, storageKey, extra
               {busy ? <><Loader2 className="h-4 w-4 animate-spin" /> Synthesizing…</> : <><AudioLines className="h-4 w-4" /> Generate</>}
             </Button>
           </div>
-          {err && <p className="text-sm text-destructive">{err}</p>}
+          {err && <ErrorNote>{err}</ErrorNote>}
           {curlBase && model && text.trim() && (
             <CurlBlock build={(tok) => curlSpeech({
               url: `${curlBase}/audio/speech`, token: tok, body: bodyOf(), extra: extraHeaders,
@@ -232,7 +237,8 @@ export function SpeechPlayground({ models, basePath, curlBase, storageKey, extra
                 <span className="rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">{r.voice || "default"}</span>
                 <audio controls src={r.url} className="h-8 max-w-[280px]" />
                 <span className="truncate text-xs text-muted-foreground">{r.text}</span>
-                <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">{new Date(r.at).toLocaleTimeString()}</span>
+                {r.rtf && <RtfNote rtf={r.rtf} className="ml-auto" compact />}
+                <span className={`${r.rtf ? "" : "ml-auto "}shrink-0 text-[11px] text-muted-foreground`}>{new Date(r.at).toLocaleTimeString()}</span>
                 <button type="button" onClick={() => removeRun(r.id)} className="shrink-0 text-muted-foreground hover:text-destructive" aria-label="Remove">
                   <X className="h-3.5 w-3.5" />
                 </button>

@@ -245,7 +245,6 @@ export function ChatPlayground({
   const [respHeaders, setRespHeaders] = useState<Record<string, string> | null>(null);
   const [stats, setStats] = useState<Stats>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [sentParams, setSentParams] = useState<ChatParams | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   const [history, setHistory] = useState<Stored[]>([]);
@@ -272,7 +271,6 @@ export function ChatPlayground({
     if (!model) { setErr("Pick a model."); return; }
     if (useTools && !parsedTools) { setErr("Tools JSON is invalid — fix it or turn off tools."); return; }
     setErr(null); setAnswer(""); setReasoning(""); setToolCalls(""); setStats(null); setUpstream(null); setRespHeaders(null);
-    setSentParams(params);
     const id = `pg-${Date.now().toString(36)}`;
     const promptShort = prompt.slice(0, 80);
     const ctrl = new AbortController();
@@ -395,7 +393,7 @@ export function ChatPlayground({
             </div>
           )}
 
-          {err && <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive break-words">{err}</div>}
+          {err && <ErrorNote>{err}</ErrorNote>}
 
           {(busy || answer || reasoning || toolCalls) && (
             <div className="space-y-2">
@@ -423,7 +421,10 @@ export function ChatPlayground({
             </div>
           )}
 
-          {sentParams && <CurlBlock build={(tok) => transport.curl(sentParams, tok)} />}
+          {/* Live, not gated on a send — reading the request off as curl is most useful
+              BEFORE you run it, and gating it meant a freshly-opened tab showed nothing.
+              Built from the current params so it always mirrors the form above. */}
+          <CurlBlock build={(tok) => transport.curl(params, tok)} />
         </CardContent>
       </Card>
 
@@ -460,6 +461,18 @@ function UpstreamLine({ upstream }: { upstream?: Upstream | null }) {
       <span>served by</span>
       {upstream.name && <span className="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-primary">{upstream.name}</span>}
       {upstream.url && <span className="break-all font-mono">{upstream.url}</span>}
+    </div>
+  );
+}
+
+// The one error style every playground mode uses. Chat had this box while the
+// embedding/rerank/audio/TTS modes printed a bare `text-sm` line, so switching mode
+// changed the size of the same message.
+export function ErrorNote({ children }: { children: React.ReactNode }) {
+  if (!children) return null;
+  return (
+    <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive break-words">
+      {children}
     </div>
   );
 }

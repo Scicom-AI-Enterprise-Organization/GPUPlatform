@@ -8,6 +8,15 @@ import { TOKEN_COOKIE } from "@/lib/auth-cookie";
 
 const BASE = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
 
+// Response headers the gateway sets that the browser is allowed to see: which upstream
+// served a proxied request, its id, and — for the audio proxies — the measured audio
+// duration + real-time factor. Forwarded on every branch below, including the binary
+// one (a TTS response IS binary, so stripping them there would hide its RTF).
+const PASS_HEADERS = [
+  "x-upstream-url", "x-upstream-name", "x-request-id",
+  "x-audio-seconds", "x-rtf", "x-rtfx",
+];
+
 export async function GET(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   return forward(req, ctx);
 }
@@ -68,7 +77,7 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
     // Pass through the proxy router's routing-info headers so the browser
     // (e.g. the proxy Playground) can show which upstream served the request.
     const upstreamHeaders: Record<string, string> = {};
-    for (const k of ["x-upstream-url", "x-upstream-name", "x-request-id"]) {
+    for (const k of PASS_HEADERS) {
       const v = res.headers.get(k);
       if (v) upstreamHeaders[k] = v;
     }
@@ -95,7 +104,7 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
       ct.includes("+json") ||
       ct.includes("application/xml");
     if (!isText) {
-      const out = new Headers({ "Content-Type": ct });
+      const out = new Headers({ "Content-Type": ct, ...upstreamHeaders });
       for (const h of ["content-length", "accept-ranges", "content-range", "cache-control", "content-disposition"]) {
         const v = res.headers.get(h);
         if (v) out.set(h, v);

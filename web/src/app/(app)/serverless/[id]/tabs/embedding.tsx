@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { CurlBlock, curlJson } from "@/components/playground/curl-block";
+import { ErrorNote } from "@/components/playground/chat-playground";
 import { gateway } from "@/lib/gateway";
 import type { AppRecord } from "@/lib/types";
 
@@ -30,6 +31,9 @@ type EmbedRun = {
 
 const STORAGE_KEY = (appId: string) => `serverless-ui:embed:${appId}`;
 const MAX_HISTORY = 50;
+// Prefilled, not just a placeholder — the chat playground starts on "Hello, world" for
+// the same reason: an empty box means Send is dead and there's no curl to copy yet.
+const EXAMPLE_INPUT = "The quick brown fox\nhello world";
 
 // Serverless wrapper — derives the member list + data-plane base path from the app.
 export function EmbeddingTab({ app }: { app: AppRecord }) {
@@ -57,7 +61,7 @@ export function EmbeddingTab({ app }: { app: AppRecord }) {
 // public gateway URL) — only used to render the copyable curl.
 export function EmbeddingPlayground({ models, basePath, curlBase, storageKey, extraHeaders }: { models: string[]; basePath: string; curlBase?: string; storageKey: string; extraHeaders?: Record<string, string> }) {
   const [model, setModel] = useState(models[0] ?? "");
-  const [text, setText] = useState("");
+  const [text, setText] = useState(EXAMPLE_INPUT);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [result, setResult] = useState<EmbedRun | null>(null);
@@ -173,8 +177,8 @@ export function EmbeddingPlayground({ models, basePath, curlBase, storageKey, ex
                 : <><Boxes className="h-4 w-4" /> Get embeddings</>}
             </Button>
           </div>
-          {err && <p className="text-sm text-destructive">{err}</p>}
-          {curlBase && model && inputs.length > 0 && (
+          {err && <ErrorNote>{err}</ErrorNote>}
+          {curlBase && model && (
             <CurlBlock build={(tok) => curlJson(`${curlBase}/embeddings`, tok, { model, input: inputs }, extraHeaders)} />
           )}
           {result && (
@@ -183,11 +187,14 @@ export function EmbeddingPlayground({ models, basePath, curlBase, storageKey, ex
                 {result.n} embedding{result.n === 1 ? "" : "s"} · dim {result.dim}
                 {result.tokens != null ? ` · ${result.tokens} tokens` : ""}
               </div>
-              <div className="max-h-72 space-y-1.5 overflow-y-auto rounded-md border border-border bg-muted/30 p-3">
+              {/* Same weight as the chat playground's answer pane (font-mono text-xs on
+                  bg-muted/40) — this is the live result, so it shouldn't read smaller
+                  than chat's just because it's a vector. History stays at 11px. */}
+              <div className="max-h-72 space-y-1.5 overflow-y-auto rounded-md border border-border bg-muted/40 p-3">
                 {result.vecs.map((v, i) => (
                   <div key={v.index} className="text-xs">
                     <div className="truncate text-muted-foreground">[{v.index}] {result.inputs[i]}</div>
-                    <code className="block font-mono text-[11px]">dim {v.dim} · {fmtVec(v.preview)}</code>
+                    <code className="block font-mono text-xs leading-relaxed">dim {v.dim} · {fmtVec(v.preview)}</code>
                   </div>
                 ))}
               </div>

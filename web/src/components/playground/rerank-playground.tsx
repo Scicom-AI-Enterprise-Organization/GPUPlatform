@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { CurlBlock, curlJson } from "@/components/playground/curl-block";
+import { ErrorNote } from "@/components/playground/chat-playground";
 
 type RankedDoc = { index: number; score: number; text: string };
 type RerankRun = {
@@ -43,6 +44,18 @@ const WEAK_GAP = 0.2;
 
 const fmtScore = (s: number) => (s >= 0.0005 || s === 0 ? s.toFixed(4) : s.toExponential(2));
 
+// Prefilled, not just placeholders — an empty form means Rerank is dead and there's no
+// curl to copy (the chat playground starts on "Hello, world" for the same reason). The
+// third document is a deliberate hard negative: a set without one scores 200-OK even
+// when the upstream's chat template isn't applied, which is the failure this mode exists
+// to expose.
+const EXAMPLE_QUERY = "How do I check my bill?";
+const EXAMPLE_DOCS = [
+  "Log in to the billing portal and open the Billing tab.",
+  "Restart your router by holding the reset pin.",
+  "The Great Wall of China is over 20,000 km long.",
+].join("\n");
+
 // Generic rerank playground — `basePath` is the Next-proxy prefix fronting the
 // OpenAI-compatible data plane (…/v1); POSTs `${basePath}/rerank`. `curlBase` is the
 // same path spelled the way a caller outside the browser would (the public gateway
@@ -55,8 +68,8 @@ export function RerankPlayground({ models, basePath, curlBase, storageKey, extra
   extraHeaders?: Record<string, string>;
 }) {
   const [model, setModel] = useState(models[0] ?? "");
-  const [query, setQuery] = useState("");
-  const [docsText, setDocsText] = useState("");
+  const [query, setQuery] = useState(EXAMPLE_QUERY);
+  const [docsText, setDocsText] = useState(EXAMPLE_DOCS);
   const [instruction, setInstruction] = useState("");
   const [topN, setTopN] = useState("");
   const [busy, setBusy] = useState(false);
@@ -223,8 +236,8 @@ export function RerankPlayground({ models, basePath, curlBase, storageKey, extra
                 : <><ArrowDownWideNarrow className="h-4 w-4" /> Rerank</>}
             </Button>
           </div>
-          {err && <p className="text-sm text-destructive">{err}</p>}
-          {curlBase && model && query.trim() && docs.length > 0 && (
+          {err && <ErrorNote>{err}</ErrorNote>}
+          {curlBase && model && (
             <CurlBlock build={(tok) => curlJson(`${curlBase}/rerank`, tok, body, extraHeaders)} />
           )}
           {result && <Results run={result} />}
@@ -301,14 +314,17 @@ function Results({ run }: { run: RerankRun }) {
           not a borderline match.
         </p>
       )}
-      <div className="max-h-72 space-y-1.5 overflow-y-auto rounded-md border border-border bg-muted/30 p-3">
+      {/* Same weight as the chat playground's answer pane (font-mono text-xs on
+          bg-muted/40) — the ranked list IS this mode's output, so it shouldn't read a
+          size smaller than chat's just because it's a table of numbers. */}
+      <div className="max-h-72 space-y-1.5 overflow-y-auto rounded-md border border-border bg-muted/40 p-3">
         {run.results.map((d, rank) => (
-          <div key={`${d.index}-${rank}`} className="text-xs">
+          <div key={`${d.index}-${rank}`} className="text-xs leading-relaxed">
             <div className="flex items-baseline gap-2">
-              <span className="shrink-0 font-mono text-[11px] text-muted-foreground">#{rank + 1}</span>
-              <span className="shrink-0 font-mono text-[11px] text-muted-foreground">[{d.index}]</span>
+              <span className="shrink-0 font-mono text-xs text-muted-foreground">#{rank + 1}</span>
+              <span className="shrink-0 font-mono text-xs text-muted-foreground">[{d.index}]</span>
               <span className="truncate">{d.text}</span>
-              <span className="ml-auto shrink-0 font-mono text-[11px]">{fmtScore(d.score)}</span>
+              <span className="ml-auto shrink-0 font-mono text-xs">{fmtScore(d.score)}</span>
             </div>
             <div className="mt-0.5 h-1 w-full overflow-hidden rounded bg-muted">
               <div
