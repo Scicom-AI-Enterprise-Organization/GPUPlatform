@@ -267,6 +267,10 @@ async def test_python_worker_env_is_scrubbed_of_gateway_secrets():
         "    return {'passed': not leaked, 'flags': {'leaked': leaked}}\n"
     ))
     import os
+    # RESTORE the prior key afterwards, don't pop it — conftest seeds
+    # PROVIDER_SECRET_KEY for the whole run, and later tests (e.g. the red-team
+    # builder's Fernet encryption) re-read it after test_crypto clears the cache.
+    prev_key = os.environ.get("PROVIDER_SECRET_KEY")
     os.environ["DATABASE_URL"] = "postgresql://user:pw@host/db"
     os.environ["PROVIDER_SECRET_KEY"] = "super-secret"
     w = ce.PythonEvaluatorWorker(spec)
@@ -277,7 +281,10 @@ async def test_python_worker_env_is_scrubbed_of_gateway_secrets():
     finally:
         await w.close()
         os.environ.pop("DATABASE_URL", None)
-        os.environ.pop("PROVIDER_SECRET_KEY", None)
+        if prev_key is None:
+            os.environ.pop("PROVIDER_SECRET_KEY", None)
+        else:
+            os.environ["PROVIDER_SECRET_KEY"] = prev_key
 
 
 async def test_python_worker_reports_a_raising_check_without_failing_the_sample():

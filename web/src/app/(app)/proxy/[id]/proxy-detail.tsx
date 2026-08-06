@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Pagination } from "@/components/ui/pagination";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
-import type { ProxyEndpoint, ProxyRequest, ProxyUpstreamHealth } from "@/lib/types";
+import { RED_TEAM_DEFAULT_TYPES, type ProxyEndpoint, type ProxyRequest, type ProxyUpstreamHealth } from "@/lib/types";
 import { BaseUrlToggle, type UrlTarget } from "@/components/console/base-url-toggle";
 import { RoutingPanel } from "../routing-panel";
 import { ProxyPlayground } from "./proxy-playground";
@@ -27,7 +27,7 @@ const TABS = [
   { value: "queue", label: "Queue" },
   { value: "metrics", label: "Metrics" },
 ] as const;
-const BUCKETS = ["queued", "running", "completed", "cancelled", "failed"] as const;
+const BUCKETS = ["queued", "running", "completed", "cancelled", "failed", "blocked"] as const;
 type ProxyTab = (typeof TABS)[number]["value"];
 
 // Absolute timestamp for the "Requested" column — matches the serverless queue.
@@ -51,6 +51,7 @@ const STATUS_TONE: Record<string, string> = {
   completed: "bg-status-active/15 text-status-active",
   failed: "bg-status-down/15 text-status-down",
   cancelled: "bg-muted text-muted-foreground",
+  blocked: "bg-amber-500/15 text-amber-600 dark:text-amber-400", // red-team hit
 };
 
 export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: ProxyEndpoint; baseUrl: string; readOnly?: boolean }) {
@@ -402,6 +403,44 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
             </CardContent>
           </Card>
           )}
+
+          {!readOnly && ep.red_team && (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm">
+                Red teaming
+                <span className={cn("ml-2 rounded px-1.5 py-0.5 text-[10px] font-normal",
+                  ep.red_team.enabled ? "bg-status-active/15 text-status-active" : "bg-muted text-muted-foreground")}>
+                  {ep.red_team.enabled ? "on" : "off"}
+                </span>
+              </CardTitle>
+              <p className="text-[11px] text-muted-foreground">
+                Chat requests are screened inline before any upstream sees them; a hit is answered by the gateway
+                with its category in <span className="font-mono">X-SGPU-Red-Team-Type</span>.
+              </p>
+            </CardHeader>
+            <CardContent className="space-y-1.5 text-xs">
+              <div className="flex flex-wrap gap-x-6 gap-y-1">
+                <span><span className="text-muted-foreground">detector</span>{" "}
+                  {ep.red_team.mode === "llm" ? "LLM judge" : "classifier"} · <span className="font-mono">{ep.red_team.model}</span></span>
+                <span><span className="text-muted-foreground">scan</span>{" "}
+                  {{ last_user: "last user message", user: "all user messages", full: "full conversation" }[ep.red_team.scan ?? "last_user"]}</span>
+                <span><span className="text-muted-foreground">on hit</span>{" "}
+                  {ep.red_team.action === "llm_respond" ? "LLM writes the refusal"
+                    : ep.red_team.action === "error" ? `HTTP ${ep.red_team.error_status ?? 403}` : "canned reply"}</span>
+                <span><span className="text-muted-foreground">on detector failure</span>{" "}
+                  {ep.red_team.on_error === "block" ? "block (fail closed)" : "allow (fail open)"}</span>
+              </div>
+              <div className="text-muted-foreground">
+                types:{" "}
+                <span className="font-mono text-foreground">
+                  {(ep.red_team.types?.length ? ep.red_team.types : RED_TEAM_DEFAULT_TYPES).join(", ")}
+                </span>
+                {!ep.red_team.types?.length && <span> (default)</span>}
+              </div>
+            </CardContent>
+          </Card>
+          )}
         </TabsContent>
 
         {/* ---- Playground ---- */}
@@ -428,6 +467,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
             <Stat label="Completed" value={count("completed")} />
             <Stat label="Cancelled" value={count("cancelled")} />
             <Stat label="Failed" value={count("failed")} />
+            <Stat label="Blocked" value={count("blocked")} />
             <Stat label="Capacity" value={ep.max_concurrency || "∞"} />
             <div className="flex-1" />
             <div className="flex items-center gap-2">

@@ -489,6 +489,37 @@ def observe_capture(proxy: str, kind: str, result: str) -> None:
     PROXY_CAPTURE_TOTAL.labels(proxy=proxy, kind=kind or "", result=result).inc()
 
 
+PROXY_RED_TEAM_TOTAL = Counter(
+    "proxy_red_team_total",
+    "Red-team screening outcomes on the LLM-proxy chat path "
+    "(result: safe/unsafe/error/skipped)",
+    ["proxy", "model", "result"], registry=_registry,
+)
+# Flagged requests by attack category (the endpoint's `types` taxonomy — admin-
+# configured, so the label stays bounded). Separate from the outcome counter so a
+# dashboard can break blocks down by type without a per-type pass/error series.
+PROXY_RED_TEAM_HITS = Counter(
+    "proxy_red_team_hits_total",
+    "Red-team BLOCKED requests by attack category",
+    ["proxy", "type"], registry=_registry,
+)
+PROXY_RED_TEAM_SECONDS = Histogram(
+    "proxy_red_team_seconds",
+    "Red-team detector call latency (seconds), by detector mode",
+    ["proxy", "mode"], registry=_registry,
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
+)
+
+
+def observe_red_team(proxy: str, model: str, result: str, rt_type: str = "",
+                     mode: str = "", seconds: float | None = None) -> None:
+    PROXY_RED_TEAM_TOTAL.labels(proxy=proxy, model=model or "", result=result).inc()
+    if result == "unsafe" and rt_type:
+        PROXY_RED_TEAM_HITS.labels(proxy=proxy, type=rt_type).inc()
+    if seconds is not None and mode:
+        PROXY_RED_TEAM_SECONDS.labels(proxy=proxy, mode=mode).observe(seconds)
+
+
 # Depth of the shared off-path background-job queue (TTS CER/WER evals + drift-sample
 # uploads). A persistently-high value means the worker pool is saturated — raise
 # PROXY_BG_WORKERS. Process-wide (not per-proxy), so it lives on the infra /metrics.
@@ -537,7 +568,8 @@ def render_proxy(proxy: str) -> bytes:
             for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION, PROXY_TTFT, PROXY_TPS,
                            PROXY_AUDIO_NLL, PROXY_AUDIO_RTF, PROXY_AUDIO_SECONDS,
                            PROXY_AUDIO_PROCESS_SECONDS, PROXY_TTS_CER, PROXY_TTS_WER,
-                           PROXY_TTS_EVAL_TOTAL, PROXY_CAPTURE_TOTAL):
+                           PROXY_TTS_EVAL_TOTAL, PROXY_CAPTURE_TOTAL,
+                           PROXY_RED_TEAM_TOTAL, PROXY_RED_TEAM_HITS, PROXY_RED_TEAM_SECONDS):
                 for mf in metric.collect():
                     samples = [s for s in mf.samples if s.labels.get("proxy") == proxy]
                     if not samples:

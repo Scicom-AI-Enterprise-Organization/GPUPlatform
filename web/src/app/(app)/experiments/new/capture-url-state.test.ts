@@ -8,6 +8,7 @@ describe("captureStateFromParam", () => {
   it("opens on a known source and selects that tab", () => {
     expect(captureStateFromParam("platform")).toEqual({ open: true, source: "platform" });
     expect(captureStateFromParam("langfuse")).toEqual({ open: true, source: "langfuse" });
+    expect(captureStateFromParam("synthetic")).toEqual({ open: true, source: "synthetic" });
   });
 
   it("stays closed with no param", () => {

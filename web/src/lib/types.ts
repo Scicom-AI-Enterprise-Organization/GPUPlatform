@@ -1739,6 +1739,59 @@ export type ProxyCapture = {
   wer_threshold?: number | null;
 };
 
+// The gateway's built-in attack taxonomy (mirror of proxy_api.RED_TEAM_DEFAULT_TYPES —
+// keep in sync). Used when `types` is empty, and by the form's "Use defaults" button.
+export const RED_TEAM_DEFAULT_TYPES = [
+  "prompt_injection",
+  "jailbreak",
+  "system_prompt_extraction",
+  "harmful_content",
+  "pii_exfiltration",
+];
+
+// Inline LLM red-teaming screen for chat/completions: a classifier or LLM judge
+// checks every request BEFORE it reaches an upstream; a positive verdict
+// short-circuits into a canned reply, an LLM-written refusal, or an HTTP error.
+// Every block carries its attack category in the X-SGPU-Red-Team-Type header
+// (from `types`; server default taxonomy when empty).
+export type ProxyRedTeam = {
+  enabled: boolean;
+  mode: "classifier" | "llm";
+  base_url: string;
+  model: string;
+  api_key_secret?: string | null;
+  has_inline_key?: boolean;
+  types?: string[]; // attack taxonomy; [] = built-in default
+  threshold?: number; // classifier: flag when predicted prob >= this
+  flag_labels?: string[]; // classifier labels counted as a hit; [] = built-in set
+  prompt?: string | null; // llm judge system prompt override
+  no_system?: boolean; // llm judge: send scanned text only (Llama-Guard-style templates)
+  // reasoning control for the judge + responder calls: "" = model default,
+  // "disable" = chat_template_kwargs.enable_thinking=false, else reasoning_effort
+  reasoning?: "" | "disable" | "none" | "minimal" | "low" | "medium" | "high";
+  scan?: "last_user" | "user" | "full";
+  max_chars?: number;
+  timeout_s?: number;
+  on_error?: "allow" | "block"; // detector outage: fail-open or refuse
+  action?: "respond" | "llm_respond" | "error";
+  message?: string; // canned reply / error message ("" = built-in default)
+  responder_base_url?: string;
+  responder_model?: string;
+  responder_prompt?: string | null;
+  responder_api_key_secret?: string | null;
+  responder_has_inline_key?: boolean;
+  error_status?: number;
+};
+
+// Red-team spec sent on create/update (write-only pasted keys, like upstreams).
+export type ProxyRedTeamSpec = Omit<
+  ProxyRedTeam,
+  "has_inline_key" | "responder_has_inline_key"
+> & {
+  api_key?: string | null;
+  responder_api_key?: string | null;
+};
+
 export type ProxyEndpoint = {
   id: string;
   name: string;
@@ -1751,6 +1804,7 @@ export type ProxyEndpoint = {
   upstreams: ProxyUpstream[];
   stt_callback?: ProxySttCallback | null;
   capture?: ProxyCapture | null;
+  red_team?: ProxyRedTeam | null;
   inflight: number;
   queued: number;
   created_at: string;
@@ -1790,6 +1844,7 @@ export type CreateProxyBody = {
   upstreams: ProxyUpstreamSpec[];
   stt_callback?: ProxySttCallbackSpec | null;
   capture?: ProxyCapture | null;
+  red_team?: ProxyRedTeamSpec | null;
 };
 
 export type UpdateProxyBody = Partial<CreateProxyBody>;
@@ -1810,7 +1865,7 @@ export type ProxyRequest = {
   owner?: string | null;
   model?: string | null;
   upstream?: string | null;
-  status: "queued" | "running" | "completed" | "cancelled" | "failed";
+  status: "queued" | "running" | "completed" | "cancelled" | "failed" | "blocked";
   is_stream: boolean;
   status_code?: number | null;
   latency_ms?: number | null;
@@ -2097,6 +2152,54 @@ export type CapturePlatformRequest = {
   limit?: number;
   status?: string;
   search?: string;
+};
+
+// Generate an eval corpus with an OpenAI-compatible model instead of capturing
+// one — the red-teaming case, where the traffic doesn't exist yet. Rows carry
+// `expected.{attack,attack_type,expect_refusal}` so the `red_team` evaluator
+// scores attacks and benign controls by their own (opposite) rules.
+export type SynthesizeRequest = {
+  base_url: string;
+  model: string;
+  api_key?: string | null;
+  api_key_secret?: string | null;
+  mode?: "attack" | "benign" | "mixed";
+  n_rows?: number;
+  categories?: string[];
+  languages?: string[];
+  domain?: string;
+  extra_instructions?: string;
+  system_prompt?: string;
+  benign_ratio?: number;
+  temperature?: number;
+  timeout_s?: number;
+  name?: string;
+  storage_id?: string;
+};
+
+export type SynthesizeRow = {
+  name: string;
+  messages: { role: string; content: string }[];
+  expected?: { attack?: boolean; attack_type?: string; expect_refusal?: boolean };
+  source_ref?: string;
+};
+
+export type SynthesizePreview = {
+  rows: SynthesizeRow[];
+  n_attack: number;
+  n_benign: number;
+  warnings: string[];
+};
+
+// Server-driven generate-form options (taxonomy + ceilings), same convention as
+// the evaluator registry — adding a category in synthetic.py needs no UI change.
+export type SynthesizeOptions = {
+  modes: string[];
+  categories: { id: string; brief: string }[];
+  max_rows: number;
+  default_rows: number;
+  batch_size: number;
+  preview_rows: number;
 };
 
 export type ExperimentTargetSpec = {

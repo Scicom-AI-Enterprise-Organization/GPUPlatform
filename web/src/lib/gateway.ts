@@ -89,6 +89,9 @@ import type {
   CaptureResult,
   CaptureLangfuseRequest,
   CapturePlatformRequest,
+  SynthesizeRequest,
+  SynthesizePreview,
+  SynthesizeOptions,
   ExperimentRecord,
   ExperimentSummary,
   ExperimentSampleRecord,
@@ -1409,6 +1412,20 @@ export const gateway = {
     }),
   capturePlatformRequests: (body: CapturePlatformRequest) =>
     request<CaptureResult>("/v1/experiments/capture/platform", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /** Synthetic corpus generation (red teaming): options → preview → create. */
+  synthesizeOptions: () =>
+    request<SynthesizeOptions>("/v1/experiments/synthesize/options"),
+  previewSynthesizedRows: (body: SynthesizeRequest) =>
+    request<SynthesizePreview>("/v1/experiments/synthesize/preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  synthesizeDataset: (body: SynthesizeRequest) =>
+    request<CaptureResult>("/v1/experiments/synthesize", {
       method: "POST",
       body: JSON.stringify(body),
     }),

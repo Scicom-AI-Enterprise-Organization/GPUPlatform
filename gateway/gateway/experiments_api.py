@@ -78,6 +78,7 @@ from . import crypto
 from . import custom_eval as ce
 from . import evaluators as ev
 from . import langfuse_import as lf
+from . import synthetic as syn
 from .auth import require_section
 from .db import App, Base, Dataset, Request as ReqRow, Storage, User, get_session, session_factory
 from .global_env_api import load_global_env
@@ -113,6 +114,13 @@ MAX_STORED_CHARS = int(os.environ.get("EXPERIMENT_MAX_STORED_CHARS", "8000") or 
 DEFAULT_CONCURRENCY = 8
 MAX_CONCURRENCY = 64
 PROGRESS_FLUSH_S = 2.0
+# Synthetic corpus generation (see synthetic.py). Rows are capped because every
+# batch is a real billed call to the generator model, and an over-large corpus
+# then multiplies through the experiment matrix.
+SYNTH_MAX_ROWS = int(os.environ.get("EXPERIMENT_SYNTH_MAX_ROWS", "200") or "200")
+SYNTH_BATCH = int(os.environ.get("EXPERIMENT_SYNTH_BATCH", "10") or "10")
+SYNTH_CONCURRENCY = int(os.environ.get("EXPERIMENT_SYNTH_CONCURRENCY", "4") or "4")
+SYNTH_PREVIEW_ROWS = 6
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}$")
 
@@ -1881,6 +1889,37 @@ class CaptureResult(BaseModel):
     n_rows: int
 
 
+class SynthesizeRequest(BaseModel):
+    """Generate an eval corpus with an OpenAI-compatible model instead of
+    capturing one — the red-teaming case, where the traffic doesn't exist yet."""
+    # generator endpoint (any OpenAI-compatible /chat/completions)
+    base_url: str
+    model: str
+    api_key: Optional[str] = None          # inline, request-scoped (never stored)
+    api_key_secret: Optional[str] = None   # OR a global-secret name
+    # what to generate
+    mode: str = "attack"                   # attack | benign | mixed
+    n_rows: int = syn.DEFAULT_ROWS
+    categories: list[str] = []             # [] = the shared red-team taxonomy
+    languages: list[str] = []              # [] = English only
+    domain: str = ""                       # "a telco customer-service agent"
+    extra_instructions: str = ""
+    system_prompt: str = ""                # prepended to every generated row
+    benign_ratio: float = 0.3              # mixed mode only
+    temperature: float = 1.0               # high on purpose — diversity is the goal
+    timeout_s: float = 120.0
+    # persist (ignored by /preview)
+    name: str = ""
+    storage_id: str = ""
+
+
+class SynthesizePreview(BaseModel):
+    rows: list[dict[str, Any]]
+    n_attack: int
+    n_benign: int
+    warnings: list[str] = []
+
+
 def _langfuse_creds(req: LangfusePreviewRequest, genv: dict[str, str]) -> tuple[str, str, str]:
     base = (req.base_url or os.environ.get("LANGFUSE_BASE_URL", "") or "").strip().rstrip("/")
     pk = (req.public_key or "").strip()
@@ -2095,6 +2134,151 @@ async def capture_platform(
 
 
 # ---- experiments ---------------------------------------------------------- #
+
+
+# ---- synthetic corpus generation ------------------------------------------- #
+
+async def _synth_rows(app, req: SynthesizeRequest, genv: dict[str, str],
+                      n_rows: int) -> tuple[list[dict[str, Any]], list[str]]:
+    """Generate `n_rows` dataset rows with the configured model.
+
+    Batched + bounded-concurrency, deduped across batches, and **short-count
+    tolerant**: a model that returns 7 prompts when asked for 10 yields a smaller
+    corpus rather than an error, with a warning saying so. Refilling to an exact
+    count would spend unbounded billed calls chasing a number nobody asked for.
+    """
+    try:
+        spec = syn.normalize_spec(
+            {"mode": req.mode, "n_rows": n_rows, "categories": req.categories,
+             "languages": req.languages, "domain": req.domain,
+             "extra_instructions": req.extra_instructions,
+             "system_prompt": req.system_prompt, "benign_ratio": req.benign_ratio},
+            SYNTH_MAX_ROWS,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    base = (req.base_url or "").strip()
+    model = (req.model or "").strip()
+    if not base or not model:
+        raise HTTPException(status_code=400, detail="generator base_url + model are required")
+    key = (req.api_key or "").strip()
+    if req.api_key_secret:
+        key = genv.get(req.api_key_secret.strip(), "")
+
+    client = _http(app)
+    sem = asyncio.Semaphore(max(1, SYNTH_CONCURRENCY))
+    batches = syn.plan_batches(spec, SYNTH_BATCH)
+    warnings: list[str] = []
+
+    async def run_batch(i: int, kind: str, category: str, count: int):
+        body = {
+            "model": model,
+            "messages": syn.build_messages(spec, kind, category, count, variation=i),
+            "temperature": float(req.temperature),
+            "max_tokens": 2048,
+            "stream": False,
+        }
+        async with sem:
+            comp = await call_once(client, base, "/v1/chat/completions", key, body,
+                                   float(req.timeout_s))
+        if comp.error:
+            return (kind, category, [], f"{category}: {comp.error}")
+        prompts = syn.parse_prompts(comp.content)
+        if not prompts:
+            return (kind, category, [], f"{category}: generator returned nothing parseable")
+        return (kind, category, prompts[:count * 2], None)
+
+    results = await asyncio.gather(
+        *(run_batch(i, k, c, n) for i, (k, c, n) in enumerate(batches))
+    )
+
+    seen: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    want = {"attack": spec.n_attack(), "benign": spec.n_benign()}
+    got = {"attack": 0, "benign": 0}
+    for kind, category, prompts, err in results:
+        if err:
+            warnings.append(err)
+            continue
+        for p in syn.dedupe(prompts, seen):
+            if got[kind] >= want[kind]:
+                break
+            got[kind] += 1
+            rows.append(syn.to_row(p, kind, category, spec, got[kind]))
+
+    if not rows:
+        raise HTTPException(
+            status_code=502,
+            detail="the generator produced no usable prompts — "
+                   + ("; ".join(warnings[:3]) or "check the base URL, model and key"),
+        )
+    short = sum(want.values()) - len(rows)
+    if short > 0:
+        warnings.append(f"{len(rows)} of {sum(want.values())} requested rows "
+                        "(duplicates dropped or a batch failed)")
+    return rows, warnings
+
+
+@router.post("/experiments/synthesize/preview", response_model=SynthesizePreview)
+async def synthesize_preview(
+    req: SynthesizeRequest,
+    request: Request,
+    user: User = Depends(require_section(SECTION)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Generate a handful of rows WITHOUT creating a dataset — so a wrong base
+    URL, model or key costs one small call instead of a whole corpus."""
+    genv = await load_global_env(session)
+    rows, warnings = await _synth_rows(request.app, req, genv,
+                                       min(SYNTH_PREVIEW_ROWS, max(1, req.n_rows)))
+    return SynthesizePreview(
+        rows=rows,
+        n_attack=sum(1 for r in rows if (r.get("expected") or {}).get("attack")),
+        n_benign=sum(1 for r in rows if not (r.get("expected") or {}).get("attack")),
+        warnings=warnings,
+    )
+
+
+@router.post("/experiments/synthesize", response_model=CaptureResult)
+async def synthesize_dataset(
+    req: SynthesizeRequest,
+    request: Request,
+    user: User = Depends(require_section(SECTION)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Generate a synthetic eval corpus and land it as a real platform Dataset —
+    the same `kind=upload` chat dataset a capture writes, so it is browsable,
+    publishable and replayable like any other."""
+    if not (req.name or "").strip():
+        raise HTTPException(status_code=400, detail="dataset name required")
+    if not (req.storage_id or "").strip():
+        raise HTTPException(status_code=400, detail="storage_id required")
+    genv = await load_global_env(session)
+    rows, warnings = await _synth_rows(request.app, req, genv, req.n_rows)
+    n_attack = sum(1 for r in rows if (r.get("expected") or {}).get("attack"))
+    desc = (f"Synthetic {req.mode} corpus generated by {req.model} "
+            f"({n_attack} attack / {len(rows) - n_attack} benign)")
+    if warnings:
+        logger.info("synthesize %s: %s", req.name, "; ".join(warnings[:5]))
+    return await _create_case_dataset(session, user, req.name, req.storage_id, rows,
+                                      description=desc[:1000])
+
+
+@router.get("/experiments/synthesize/options")
+async def synthesize_options(user: User = Depends(require_section(SECTION))):  # noqa: ARG001
+    """Server-driven options for the generate form — the attack taxonomy (shared
+    with the proxy's red-team guard) and the ceilings. Same convention as the
+    evaluator registry: the UI renders what this returns."""
+    return {
+        "modes": list(syn.MODES),
+        "categories": [{"id": c, "brief": syn.CATEGORY_BRIEFS.get(c, "")}
+                       for c in syn.DEFAULT_CATEGORIES],
+        "max_rows": SYNTH_MAX_ROWS,
+        "default_rows": syn.DEFAULT_ROWS,
+        "batch_size": SYNTH_BATCH,
+        "preview_rows": SYNTH_PREVIEW_ROWS,
+    }
 
 
 @router.get("/experiments/_page", response_model=ExperimentPage)

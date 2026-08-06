@@ -47,10 +47,16 @@ const REQ_TOTAL = "proxy_requests_total";
 const DUR = "proxy_request_duration_seconds";
 const TTFT = "proxy_ttft_seconds";
 const TPS = "proxy_tokens_per_second";
+const RT_TOTAL = "proxy_red_team_total";       // {result: safe|unsafe|error|skipped}
+const RT_HITS = "proxy_red_team_hits_total";   // {type: attack category}
+// Unsafe/blocked shares the amber identity the Queue tab's "blocked" badge uses.
+const COLOR_UNSAFE = "#f59e0b"; // amber-500
 
 // A status counts as a success only when it completed; "cancelled" is neutral
-// (client hung up / manual flush), everything else is an error.
-const isError = (status: string) => status !== "completed" && status !== "cancelled";
+// (client hung up / manual flush), and "blocked" is the red-team guard working
+// as designed — neither is an upstream error.
+const isError = (status: string) =>
+  status !== "completed" && status !== "cancelled" && status !== "blocked";
 
 type Tally = { requests: number; completed: number; cancelled: number };
 const newTally = (): Tally => ({ requests: 0, completed: 0, cancelled: 0 });
@@ -58,10 +64,21 @@ const errorsOf = (t: Tally) => t.requests - t.completed - t.cancelled;
 
 type HistoryPoint = { t: string; requests: number; errors: number };
 
+// proxy_red_team_total/…_hits_total summarized — null until the endpoint has
+// screened at least one request (red teaming unset → the section doesn't render).
+type RedTeamSummary = {
+  safe: number;
+  unsafe: number;
+  errors: number;
+  skipped: number;
+  byType: { type: string; count: number }[];
+};
+
 type Summary = {
   total: number;
   errors: number;
   cancelled: number;
+  redTeam: RedTeamSummary | null;
   byModel: { model: string; tally: Tally; latAvg: number | null; ttftAvg: number | null; tpsAvg: number | null }[];
   byUpstream: { upstream: string; tally: Tally }[];
   byStatus: { status: string; count: number }[];
@@ -105,6 +122,27 @@ function summarize(samples: Sample[]): Summary {
   let errors = 0;
   for (const [status, count] of statuses) if (isError(status)) errors += count;
 
+  // Red-team screening outcomes + the blocked-by-attack-type breakdown.
+  const rt: RedTeamSummary = { safe: 0, unsafe: 0, errors: 0, skipped: 0, byType: [] };
+  let rtSeen = false;
+  const rtTypes = new Map<string, number>();
+  for (const s of samples) {
+    if (s.name === RT_TOTAL) {
+      rtSeen = true;
+      if (s.labels.result === "safe") rt.safe += s.value;
+      else if (s.labels.result === "unsafe") rt.unsafe += s.value;
+      else if (s.labels.result === "error") rt.errors += s.value;
+      else if (s.labels.result === "skipped") rt.skipped += s.value;
+    } else if (s.name === RT_HITS) {
+      rtSeen = true;
+      const t = s.labels.type || "(unknown)";
+      rtTypes.set(t, (rtTypes.get(t) ?? 0) + s.value);
+    }
+  }
+  rt.byType = [...rtTypes.entries()]
+    .map(([type, count]) => ({ type, count }))
+    .sort((a, b) => b.count - a.count);
+
   // Latency / ttft / tps are labelled by model only — build a per-model lookup
   // of sum/count for the table, and the proxy-wide aggregate for the cards.
   const modelDur = new Map<string, { sum: number; count: number }>();
@@ -146,6 +184,7 @@ function summarize(samples: Sample[]): Summary {
     total,
     errors,
     cancelled,
+    redTeam: rtSeen ? rt : null,
     byModel,
     byUpstream,
     byStatus,
@@ -160,6 +199,7 @@ function summarize(samples: Sample[]): Summary {
 const STATUS_TONE: Record<string, "secondary" | "outline" | "destructive"> = {
   completed: "secondary",
   cancelled: "outline",
+  blocked: "outline", // red-team hit — by design, not an upstream failure
 };
 
 export function ProxyMetricsTab({ ep }: { ep: ProxyEndpoint }) {
@@ -332,6 +372,48 @@ export function ProxyMetricsTab({ ep }: { ep: ProxyEndpoint }) {
           </ChartCard>
         </div>
       )}
+
+      {/* Red-team screening — only rendered once the endpoint has screened traffic */}
+      {summary?.redTeam && (() => {
+        const rt = summary.redTeam;
+        const screened = rt.safe + rt.unsafe;
+        const blockRate = screened > 0 ? (rt.unsafe / screened) * 100 : 0;
+        const typeBars = rt.byType.map((t) => ({
+          name: t.type.length > 28 ? `${t.type.slice(0, 27)}…` : t.type,
+          count: t.count,
+        }));
+        const typeChartHeight = Math.min(340, Math.max(120, typeBars.length * 36));
+        return (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              <SummaryCard label="Screened" value={fmtInt(screened)} />
+              <SummaryCard label="Safe" value={fmtInt(rt.safe)} />
+              <SummaryCard label="Unsafe (blocked)" value={fmtInt(rt.unsafe)} tone={rt.unsafe > 0 ? "bad" : "neutral"} />
+              <SummaryCard label="Block rate" value={`${blockRate.toFixed(blockRate < 10 ? 1 : 0)}%`} tone={blockRate > 0 ? "bad" : "neutral"} />
+              <SummaryCard label="Detector errors" value={fmtInt(rt.errors)} tone={rt.errors > 0 ? "bad" : "neutral"} />
+              <SummaryCard label="Skipped" value={fmtInt(rt.skipped)} />
+            </div>
+            <ChartCard title="Blocked by attack type" extra="(X-SGPU-Red-Team-Type)">
+              <div className="w-full" style={{ height: typeChartHeight }}>
+                {typeBars.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={typeBars} layout="vertical" margin={{ top: 4, right: 30, left: 4, bottom: 0 }} barCategoryGap="22%">
+                      <XAxis type="number" domain={[0, "dataMax"]} allowDecimals={false} tick={{ fontSize: 10, fill: "#6b7280" }} stroke="#d4d4d8" />
+                      <YAxis type="category" dataKey="name" width={170} interval={0} tickLine={false} axisLine={false} tick={{ fontSize: 10, fill: "#9ca3af" }} />
+                      <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ fill: "#000", opacity: 0.05 }} />
+                      <Bar dataKey="count" name="blocked" fill={COLOR_UNSAFE} radius={[0, 3, 3, 0]}>
+                        <LabelList dataKey="count" position="right" fontSize={10} fill="#9ca3af" />
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <Empty>No blocked requests yet — every screened request came back safe.</Empty>
+                )}
+              </div>
+            </ChartCard>
+          </div>
+        );
+      })()}
 
       {/* Status breakdown */}
       {summary && summary.total > 0 && (

@@ -12,7 +12,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { gateway } from "@/lib/gateway";
-import type { ProxyEndpoint, ProxyUpstreamSpec, StorageRecord } from "@/lib/types";
+import { RED_TEAM_DEFAULT_TYPES, type ProxyEndpoint, type ProxyUpstreamSpec, type StorageRecord } from "@/lib/types";
 import { FormFooter, FormShell } from "@/components/form-shell";
 import { RoutingPanel } from "./routing-panel";
 import { modelKind } from "./model-kind";
@@ -160,6 +160,38 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [capCer, setCapCer] = useState(numStr(cap0?.cer_threshold));
   const [capWer, setCapWer] = useState(numStr(cap0?.wer_threshold));
   const [storages, setStorages] = useState<StorageRecord[]>([]);
+  // LLM red teaming — inline screening of chat requests by a classifier or LLM judge.
+  // A positive verdict never reaches an upstream; the block carries its category in
+  // the X-SGPU-Red-Team-Type header.
+  const rt0 = initial?.red_team ?? undefined;
+  const [rtEnabled, setRtEnabled] = useState(rt0?.enabled ?? true);
+  const [rtMode, setRtMode] = useState<"classifier" | "llm">(rt0?.mode ?? "classifier");
+  const [rtBase, setRtBase] = useState(rt0?.base_url ?? "");
+  const [rtModel, setRtModel] = useState(rt0?.model ?? "");
+  const rtHadKey = !!(rt0?.has_inline_key || rt0?.api_key_secret);
+  const [rtKeyMode, setRtKeyMode] = useState<KeyMode>(
+    rt0?.has_inline_key ? "keep" : rt0?.api_key_secret ? "secret" : "paste");
+  const [rtKeySecret, setRtKeySecret] = useState(rt0?.api_key_secret ?? "");
+  const [rtKey, setRtKey] = useState("");
+  const [rtTypes, setRtTypes] = useState((rt0?.types ?? []).join(", "));
+  const [rtThreshold, setRtThreshold] = useState(String(rt0?.threshold ?? 0.5));
+  const [rtFlagLabels, setRtFlagLabels] = useState((rt0?.flag_labels ?? []).join(", "));
+  const [rtPrompt, setRtPrompt] = useState(rt0?.prompt ?? "");
+  const [rtNoSystem, setRtNoSystem] = useState(rt0?.no_system ?? false);
+  const [rtReasoning, setRtReasoning] = useState(rt0?.reasoning ?? "");
+  const [rtScan, setRtScan] = useState<"last_user" | "user" | "full">(rt0?.scan ?? "last_user");
+  const [rtOnError, setRtOnError] = useState<"allow" | "block">(rt0?.on_error ?? "allow");
+  const [rtAction, setRtAction] = useState<"respond" | "llm_respond" | "error">(rt0?.action ?? "respond");
+  const [rtMessage, setRtMessage] = useState(rt0?.message ?? "");
+  const [rtRespBase, setRtRespBase] = useState(rt0?.responder_base_url ?? "");
+  const [rtRespModel, setRtRespModel] = useState(rt0?.responder_model ?? "");
+  const [rtRespPrompt, setRtRespPrompt] = useState(rt0?.responder_prompt ?? "");
+  const rtRespHadKey = !!(rt0?.responder_has_inline_key || rt0?.responder_api_key_secret);
+  const [rtRespKeyMode, setRtRespKeyMode] = useState<KeyMode>(
+    rt0?.responder_has_inline_key ? "keep" : rt0?.responder_api_key_secret ? "secret" : "paste");
+  const [rtRespKeySecret, setRtRespKeySecret] = useState(rt0?.responder_api_key_secret ?? "");
+  const [rtRespKey, setRtRespKey] = useState("");
+  const [rtErrorStatus, setRtErrorStatus] = useState(String(rt0?.error_status ?? 403));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -374,6 +406,11 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
     setError(null);
     const b = build();
     if (!b.ok) { setError(b.err); return; }
+    if (rtBase.trim() && rtAction === "llm_respond" && rtMode === "classifier"
+        && !(rtRespBase.trim() && rtRespModel.trim())) {
+      setError("Red teaming: “LLM writes the refusal” with a classifier detector needs a responder base URL + model.");
+      return;
+    }
     setSubmitting(true);
     try {
       const body = {
@@ -402,6 +439,32 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           logprob_threshold: capLogprob.trim() === "" ? null : Number(capLogprob),
           cer_threshold: capCer.trim() === "" ? null : Number(capCer),
           wer_threshold: capWer.trim() === "" ? null : Number(capWer),
+        },
+        // Always sent: blank base_url/model clears red teaming server-side (edit) or
+        // is ignored (create). keyMode "keep" leaves stored keys untouched.
+        red_team: {
+          enabled: rtEnabled,
+          mode: rtMode,
+          base_url: rtBase.trim(),
+          model: rtModel.trim(),
+          api_key_secret: rtKeyMode === "secret" ? (rtKeySecret.trim() || null) : null,
+          api_key: rtKeyMode === "paste" ? (rtKey.trim() || null) : null,
+          types: rtTypes.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean),
+          threshold: rtThreshold.trim() === "" ? 0.5 : Number(rtThreshold),
+          flag_labels: rtFlagLabels.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean),
+          prompt: rtPrompt.trim() || null,
+          no_system: rtNoSystem,
+          reasoning: rtReasoning as NonNullable<ProxyEndpoint["red_team"]>["reasoning"],
+          scan: rtScan,
+          on_error: rtOnError,
+          action: rtAction,
+          message: rtMessage.trim(),
+          responder_base_url: rtRespBase.trim(),
+          responder_model: rtRespModel.trim(),
+          responder_prompt: rtRespPrompt.trim() || null,
+          responder_api_key_secret: rtRespKeyMode === "secret" ? (rtRespKeySecret.trim() || null) : null,
+          responder_api_key: rtRespKeyMode === "paste" ? (rtRespKey.trim() || null) : null,
+          error_status: Number(rtErrorStatus) || 403,
         },
       };
       const ep = editing
@@ -503,6 +566,255 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         <datalist id="px-secret-keys">{secretKeys.map((k) => <option key={k} value={k} />)}</datalist>
       </section>
 
+      <section data-form-section="Red teaming" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
+        <div className="mb-1 flex items-center justify-between">
+          <h2 className="text-base font-medium">Red teaming — chat guardrail</h2>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-muted-foreground">enabled</span>
+            <Switch checked={rtEnabled} onCheckedChange={setRtEnabled} />
+          </div>
+        </div>
+        <p className="mb-4 text-xs text-muted-foreground">
+          Optional — screen every <span className="font-mono">/v1/chat/completions</span> request through a detector <span className="font-medium">before</span> it
+          reaches an upstream. A hit is answered by this gateway (the model never sees the request) and carries its category in the
+          <span className="font-mono"> X-SGPU-Red-Team-Type</span> response header. Leave the URL/model blank to disable. Detector latency is paid inline by each request.
+        </p>
+        {/* Collapsed while the switch is off — the fields keep their state and
+            reappear on re-enable; the stored config is untouched until save. */}
+        {rtEnabled && (<>
+
+        {/* detector */}
+        <div className="mb-3">
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Detector</Label>
+          <div className="mt-1 inline-flex rounded-md border border-border p-0.5 text-xs">
+            {(["classifier", "llm"] as const).map((m) => (
+              <button key={m} type="button" onClick={() => setRtMode(m)}
+                      className={"rounded px-2 py-1 " + (rtMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                {m === "classifier" ? "Classifier" : "LLM as judge"}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {rtMode === "classifier"
+              ? <>a classification endpoint — vLLM <span className="font-mono">/classify</span> (server root, e.g. a prompt-injection classifier) or an OpenAI-style <span className="font-mono">/v1/moderations</span> URL pasted in full</>
+              : <>any OpenAI-compatible chat-completions endpoint — server root, <span className="font-mono">/v1</span> base, or the full <span className="font-mono">/chat/completions</span> URL. The judge answers <span className="font-mono">UNSAFE &lt;type&gt;</span> or <span className="font-mono">SAFE</span> (Llama-Guard-style models work too)</>}
+          </p>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
+          <div className="md:col-span-7">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Detector base URL</Label>
+            <Input value={rtBase} onChange={(e) => setRtBase(e.target.value)}
+                   placeholder={rtMode === "classifier" ? "http://guard-box:8000 (or …/v1/moderations)" : "https://…/proxy/guard/v1"}
+                   className="font-mono text-xs" />
+          </div>
+          <div className="md:col-span-5">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Detector model</Label>
+            <Input value={rtModel} onChange={(e) => setRtModel(e.target.value)}
+                   placeholder={rtMode === "classifier" ? "protectai/deberta-v3-base-prompt-injection-v2" : "meta-llama/Llama-Guard-4-12B"}
+                   className="font-mono text-xs" />
+          </div>
+        </div>
+        <div className="mt-3">
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Detector API key</Label>
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+              {(["secret", "paste", ...(rtHadKey ? ["keep" as const] : [])] as KeyMode[]).map((m) => (
+                <button key={m} type="button" onClick={() => setRtKeyMode(m)}
+                        className={"rounded px-2 py-1 " + (rtKeyMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                  {m === "secret" ? "Secret ref" : m === "paste" ? "Paste" : "Keep existing"}
+                </button>
+              ))}
+            </div>
+            {rtKeyMode === "secret" && (
+              <Input list="px-secret-keys" value={rtKeySecret} onChange={(e) => setRtKeySecret(e.target.value)}
+                     placeholder="SECRETS_KEY" className="h-8 max-w-xs font-mono text-xs" />
+            )}
+            {rtKeyMode === "paste" && (
+              <Input type="password" autoComplete="off" value={rtKey} onChange={(e) => setRtKey(e.target.value)}
+                     placeholder="sk-… (stored encrypted)" className="h-8 max-w-xs font-mono text-xs" />
+            )}
+            {rtKeyMode === "keep" && <span className="text-xs text-muted-foreground">existing key kept</span>}
+            <span className="text-[11px] text-muted-foreground">optional — omit for a keyless detector</span>
+          </div>
+        </div>
+
+        {/* taxonomy */}
+        <div className="mt-3">
+          <div className="mb-1.5 flex items-center justify-between">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Attack types</Label>
+            {/* Materialize the built-in taxonomy so it can be edited/extended instead of
+                retyped — blank still means "server default", so this is purely a seed. */}
+            <Button type="button" variant="ghost" size="xs"
+                    onClick={() => setRtTypes(RED_TEAM_DEFAULT_TYPES.join(", "))}
+                    disabled={rtTypes.trim() === RED_TEAM_DEFAULT_TYPES.join(", ")}>
+              <Plus className="h-3 w-3" /> Use defaults
+            </Button>
+          </div>
+          <Input value={rtTypes} onChange={(e) => setRtTypes(e.target.value)}
+                 placeholder={RED_TEAM_DEFAULT_TYPES.join(", ")}
+                 className="font-mono text-xs" />
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Comma-separated taxonomy reported in <span className="font-mono">X-SGPU-Red-Team-Type</span> — the judge picks from this list; a classifier
+            label / moderation category is matched against it. Blank = the built-in default shown above; an unmatched hit reports <span className="font-mono">unclassified</span>.
+          </p>
+        </div>
+
+        {rtMode === "classifier" ? (
+          <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-12">
+            <div className="md:col-span-3">
+              <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Threshold</Label>
+              <Input type="number" step="0.05" min={0} max={1} value={rtThreshold} onChange={(e) => setRtThreshold(e.target.value)} className="font-mono text-xs" />
+              <p className="mt-1 text-[11px] text-muted-foreground">flag if probability ≥ this</p>
+            </div>
+            <div className="md:col-span-9">
+              <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Flag labels</Label>
+              <Input value={rtFlagLabels} onChange={(e) => setRtFlagLabels(e.target.value)}
+                     placeholder="unsafe, injection, jailbreak, … (blank = built-in set)" className="font-mono text-xs" />
+              <p className="mt-1 text-[11px] text-muted-foreground">classifier labels counted as a hit (substring, case-insensitive) — e.g. <span className="font-mono">INJECTION</span>, <span className="font-mono">LABEL_1</span></p>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="mt-3">
+              <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Judge prompt</Label>
+              <Textarea value={rtPrompt} onChange={(e) => setRtPrompt(e.target.value)} rows={3} spellCheck={false}
+                        placeholder="Blank = built-in: answer 'UNSAFE <type>' (from the attack types above) or 'SAFE'."
+                        className="font-mono text-xs" />
+            </div>
+            <div className="mt-3 flex items-center justify-between border-t border-border/60 pt-3">
+              <div>
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">No system prompt</Label>
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  send only the scanned text — for guard models whose chat template bakes in the policy (e.g. Llama-Guard, which answers <span className="font-mono">unsafe + S-code</span>)
+                </p>
+              </div>
+              <Switch checked={rtNoSystem} onCheckedChange={setRtNoSystem} />
+            </div>
+          </>
+        )}
+
+        {/* scope + failure policy + reasoning control */}
+        <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Scan</Label>
+            <Select value={rtScan} onValueChange={(v) => setRtScan(v as typeof rtScan)}>
+              <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="last_user" className="text-xs">Last user message (default)</SelectItem>
+                <SelectItem value="user" className="text-xs">All user messages</SelectItem>
+                <SelectItem value="full" className="text-xs">Full conversation</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">If the detector fails</Label>
+            <Select value={rtOnError} onValueChange={(v) => setRtOnError(v as typeof rtOnError)}>
+              <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="allow" className="text-xs">Allow the request (fail open)</SelectItem>
+                <SelectItem value="block" className="text-xs">Block the request (fail closed)</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Reasoning</Label>
+            {/* Radix Select rejects value="" — "__default" stands in for model default. */}
+            <Select value={rtReasoning || "__default"} onValueChange={(v) => setRtReasoning(v === "__default" ? "" : (v as typeof rtReasoning))}>
+              <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__default" className="text-xs">Model default</SelectItem>
+                <SelectItem value="disable" className="text-xs">Disable thinking (enable_thinking=false)</SelectItem>
+                <SelectItem value="none" className="text-xs">reasoning_effort: none</SelectItem>
+                <SelectItem value="minimal" className="text-xs">reasoning_effort: minimal</SelectItem>
+                <SelectItem value="low" className="text-xs">reasoning_effort: low</SelectItem>
+                <SelectItem value="medium" className="text-xs">reasoning_effort: medium</SelectItem>
+                <SelectItem value="high" className="text-xs">reasoning_effort: high</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              applies to the judge <span className="font-italic">and</span> responder calls — a reasoning model left thinking can spend its whole token budget and return an empty verdict
+            </p>
+          </div>
+        </div>
+
+        {/* action on a hit */}
+        <div className="mt-4 border-t border-border/60 pt-3">
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">On a hit</Label>
+          <div className="mt-1 inline-flex rounded-md border border-border p-0.5 text-xs">
+            {(["respond", "llm_respond", "error"] as const).map((m) => (
+              <button key={m} type="button" onClick={() => setRtAction(m)}
+                      className={"rounded px-2 py-1 " + (rtAction === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                {{ respond: "Canned reply", llm_respond: "LLM writes the refusal", error: "HTTP error" }[m]}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {rtAction === "respond" ? <>return a normal chat completion with the message below (<span className="font-mono">finish_reason: content_filter</span>) — SDKs keep working, streamed requests get an SSE-shaped reply</>
+              : rtAction === "llm_respond" ? <>a responder LLM writes a contextual refusal (falls back to the canned message if it fails)</>
+              : <>reject outright with the status code below and an <span className="font-mono">{"{error: …}"}</span> body</>}
+          </p>
+        </div>
+        <div className="mt-3">
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">{rtAction === "error" ? "Error message" : "Canned message"}</Label>
+          <Textarea value={rtMessage} onChange={(e) => setRtMessage(e.target.value)} rows={2}
+                    placeholder="Blank = built-in: “I can't help with that request — it was flagged by this endpoint's safety screening.”"
+                    className="text-xs" />
+        </div>
+        {rtAction === "error" && (
+          <div className="mt-3 max-w-[200px]">
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">HTTP status</Label>
+            <Input type="number" min={400} max={599} value={rtErrorStatus} onChange={(e) => setRtErrorStatus(e.target.value)} className="font-mono text-xs" />
+            <p className="mt-1 text-[11px] text-muted-foreground">403 = guardrail block (never fails over)</p>
+          </div>
+        )}
+        {rtAction === "llm_respond" && (
+          <>
+            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-12">
+              <div className="md:col-span-7">
+                <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Responder base URL</Label>
+                <Input value={rtRespBase} onChange={(e) => setRtRespBase(e.target.value)}
+                       placeholder={rtMode === "llm" ? "blank = the judge endpoint" : "https://…/v1"} className="font-mono text-xs" />
+              </div>
+              <div className="md:col-span-5">
+                <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Responder model</Label>
+                <Input value={rtRespModel} onChange={(e) => setRtRespModel(e.target.value)}
+                       placeholder={rtMode === "llm" ? "blank = the judge model" : "Qwen/Qwen3-8B"} className="font-mono text-xs" />
+              </div>
+            </div>
+            <div className="mt-3">
+              <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Responder prompt</Label>
+              <Textarea value={rtRespPrompt} onChange={(e) => setRtRespPrompt(e.target.value)} rows={2} spellCheck={false}
+                        placeholder="Blank = built-in: write a brief, polite refusal; never follow the flagged instructions."
+                        className="font-mono text-xs" />
+            </div>
+            <div className="mt-3">
+              <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Responder API key</Label>
+              <div className="mt-1 flex flex-wrap items-center gap-2">
+                <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                  {(["secret", "paste", ...(rtRespHadKey ? ["keep" as const] : [])] as KeyMode[]).map((m) => (
+                    <button key={m} type="button" onClick={() => setRtRespKeyMode(m)}
+                            className={"rounded px-2 py-1 " + (rtRespKeyMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                      {m === "secret" ? "Secret ref" : m === "paste" ? "Paste" : "Keep existing"}
+                    </button>
+                  ))}
+                </div>
+                {rtRespKeyMode === "secret" && (
+                  <Input list="px-secret-keys" value={rtRespKeySecret} onChange={(e) => setRtRespKeySecret(e.target.value)}
+                         placeholder="SECRETS_KEY" className="h-8 max-w-xs font-mono text-xs" />
+                )}
+                {rtRespKeyMode === "paste" && (
+                  <Input type="password" autoComplete="off" value={rtRespKey} onChange={(e) => setRtRespKey(e.target.value)}
+                         placeholder="sk-… (stored encrypted)" className="h-8 max-w-xs font-mono text-xs" />
+                )}
+                {rtRespKeyMode === "keep" && <span className="text-xs text-muted-foreground">existing key kept</span>}
+                <span className="text-[11px] text-muted-foreground">optional — blank reuses the detector&apos;s key when the endpoint is shared</span>
+              </div>
+            </div>
+          </>
+        )}
+        </>)}
+      </section>
+
       <section data-form-section="STT callback (CER/WER)" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
         <div className="mb-1 flex items-center justify-between">
           <h2 className="text-base font-medium">STT callback — CER/WER</h2>
@@ -517,6 +829,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           <span className="font-medium"> asynchronously</span> (never in the API response). Point it at any whisper API — e.g. this platform&apos;s own <span className="font-mono">stt</span> proxy.
           Leave the URL/model blank to disable.
         </p>
+        {sttEnabled && (<>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
           <div className="md:col-span-7">
             <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">STT base URL</Label>
@@ -562,6 +875,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             <span className={"text-xs " + (sttTest.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>{sttTest.message}</span>
           )}
         </div>
+        </>)}
       </section>
 
       <section data-form-section="Capture drift samples" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
@@ -579,6 +893,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           round-trip <span className="font-mono">CER</span> or <span className="font-mono">WER</span> exceeds the ceiling (needs the STT callback above).
           Leave a threshold blank to never trigger on it.
         </p>
+        {capEnabled && (<>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
           <div className="md:col-span-7">
             <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Storage backend</Label>
@@ -615,6 +930,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             <p className="mt-1 text-[11px] text-muted-foreground">save if WER &gt; this</p>
           </div>
         </div>
+        </>)}
       </section>
 
       <FormFooter error={error}>

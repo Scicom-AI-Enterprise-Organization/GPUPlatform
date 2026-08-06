@@ -58,6 +58,16 @@ can be browsed, published, packed and reused. Consequences to preserve:
 - **Capture writes a real dataset.** `new/capture-dialog.tsx` → `/v1/experiments/capture/*`
   creates a `kind=upload` chat dataset on a chosen S3 storage and selects it. Don't reintroduce a
   private store for captured requests.
+- **The same dialog GENERATES one, on its third tab** (`?capture=synthetic` → the "Generate
+  (red team)" tab → `/v1/experiments/synthesize*`). Red teaming has nothing to capture, so a
+  generator model writes the corpus; it lands as the same `kind=upload` dataset. Two things here
+  are load-bearing: the **category chips are server-driven** (`/synthesize/options`, so adding a
+  category in `synthetic.py` needs no change here — same rule as the evaluator registry), and the
+  default corpus mode is **mixed**, i.e. attacks *plus benign controls*, because an attack-only
+  corpus can't distinguish a safe model from one that refuses everything. **Preview** costs one
+  call and creates nothing — keep it as the pre-flight for a wrong URL/model/key. Score those runs
+  with the `red_team` evaluator (its per-row direction comes from `expected.attack`, which the
+  generator writes).
 - **Defaults follow the dataset's size, and that is load-bearing.** The two uses of this feature
   want opposite settings: a captured trace (≤ `sweep_case_threshold` rows) is replayed MANY times
   to catch intermittent failures, while a corpus is swept ONCE over a sample. `defaultsFor()`
