@@ -119,6 +119,10 @@ import type {
   CreateProxyBody,
   UpdateProxyBody,
   TestProxyUpstreamBody,
+  TestProxyRedTeamBody,
+  TestProxyRedTeamResult,
+  EvalProxyRedTeamBody,
+  EvalProxyRedTeamResult,
   TestProxyUpstreamResult,
   ActivitySummary,
   ActivityLogsResponse,
@@ -1128,6 +1132,12 @@ export const gateway = {
     ),
   testProxyUpstream: (body: TestProxyUpstreamBody) =>
     request<TestProxyUpstreamResult>("/v1/proxy/test", { method: "POST", body: JSON.stringify(body) }),
+  /** Dry-run the red-teaming detector: one attack probe + one benign control. */
+  testProxyRedTeam: (body: TestProxyRedTeamBody) =>
+    request<TestProxyRedTeamResult>("/v1/proxy/red-team/test", { method: "POST", body: JSON.stringify(body) }),
+  /** Score the detector against a labelled corpus: precision / recall / F1 per type. */
+  evaluateProxyRedTeam: (body: EvalProxyRedTeamBody) =>
+    request<EvalProxyRedTeamResult>("/v1/proxy/red-team/evaluate", { method: "POST", body: JSON.stringify(body) }),
 
   // ---- Datasets (Autotrain) ----
   listDatasets: (scope: "mine" | "all" = "mine") =>

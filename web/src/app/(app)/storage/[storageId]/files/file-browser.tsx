@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ComponentProps } from "react";
 import { useRouter } from "next/navigation";
 import {
+  Check,
   ChevronRight,
   Copy,
   Download,
@@ -90,13 +91,50 @@ function absoluteUri(res: StorageBrowseResponse | null, path: string): string {
   return `s3://${res.bucket}${parts ? `/${parts}` : ""}`;
 }
 
-async function copyText(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast.success(`${label} copied`, { duration: 2000 });
-  } catch {
-    toast.error("Couldn't copy to the clipboard");
-  }
+/** `?path=…&file=…` — the browsed directory plus (optionally) the previewed file. */
+function browseQuery(dir: string, file?: string | null): string {
+  const p = new URLSearchParams();
+  if (dir) p.set("path", dir);
+  if (file) p.set("file", file);
+  const qs = p.toString();
+  return qs ? `?${qs}` : "?";
+}
+
+/** Copy-to-clipboard button that confirms inline — the icon flips to a tick for
+ * a moment instead of toasting. Failures still toast (a silent tick would lie). */
+function CopyButton({
+  value,
+  iconClass = "h-4 w-4",
+  children,
+  ...props
+}: { value: string; iconClass?: string } & Omit<ComponentProps<typeof Button>, "onClick" | "value">) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(t);
+  }, [copied]);
+  return (
+    <Button
+      {...props}
+      onClick={async (ev) => {
+        ev.stopPropagation();
+        try {
+          await navigator.clipboard.writeText(value);
+          setCopied(true);
+        } catch {
+          toast.error("Couldn't copy to the clipboard");
+        }
+      }}
+    >
+      {copied ? (
+        <Check className={cn(iconClass, "text-emerald-500 animate-in zoom-in-50 duration-200")} />
+      ) : (
+        <Copy className={iconClass} />
+      )}
+      {children}
+    </Button>
+  );
 }
 
 async function openDownload(storage: StorageRecord, path: string) {
@@ -119,7 +157,8 @@ async function openDownload(storage: StorageRecord, path: string) {
  * Read-only file viewer over a storage backend (s3 bucket or local directory):
  * one delimited LIST / readdir per directory, click a file to preview it,
  * download presigned (s3) or streamed off disk (local). The browsed path lives
- * in `?path=` so a directory is linkable and survives a refresh.
+ * in `?path=` and an open preview in `?file=` so both a directory and a file
+ * are linkable and survive a refresh.
  *
  * ⚠ Every listing is server-paged and the name filter is a SERVER-side prefix
  * query — a directory here can hold a million objects, so filtering whatever
@@ -128,9 +167,11 @@ async function openDownload(storage: StorageRecord, path: string) {
 export function FileBrowser({
   storage,
   initialPath,
+  initialFile,
 }: {
   storage: StorageRecord;
   initialPath: string;
+  initialFile?: string;
 }) {
   const router = useRouter();
   const [path, setPath] = useState(initialPath.replace(/^\/+|\/+$/g, ""));
@@ -143,6 +184,10 @@ export function FileBrowser({
   const [q, setQ] = useState("");
   const [query, setQuery] = useState(""); // debounced — what the server sees
   const [preview, setPreview] = useState<StorageEntry | null>(null);
+  // A `?file=` deep link, consumed once the first listing is in (below).
+  const [pendingFile, setPendingFile] = useState<string | null>(
+    () => initialFile?.replace(/^\/+|\/+$/g, "") || null,
+  );
 
   const load = useCallback(
     async (dir: string, prefix: string, token?: string | null) => {
@@ -180,10 +225,35 @@ export function FileBrowser({
     setQuery("");
     setNextToken(null);
     setPath(dir);
+    setPendingFile(null);
     // Keep the URL in sync so a directory is shareable (replace, not push, so
     // Back leaves the viewer instead of walking every directory visited).
-    router.replace(dir ? `?path=${encodeURIComponent(dir)}` : "?", { scroll: false });
+    router.replace(browseQuery(dir), { scroll: false });
   };
+
+  // Preview open/close rides the URL too (`?file=`), so a single object is
+  // linkable — the copied link reopens the dialog on top of its directory.
+  const openPreview = (e: StorageEntry) => {
+    setPreview(e);
+    router.replace(browseQuery(path, e.name), { scroll: false });
+  };
+  const closePreview = () => {
+    setPreview(null);
+    router.replace(browseQuery(path), { scroll: false });
+  };
+
+  // Consume the deep link: prefer the listed entry (real size/modified); a file
+  // the first page doesn't carry still opens via a minimal entry — the preview
+  // fetches by path, and the gateway is the one that knows whether it exists.
+  useEffect(() => {
+    if (!pendingFile || loading) return;
+    const found = entries.find((e) => e.kind === "file" && e.name === pendingFile);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPreview(
+      found ?? { kind: "file", name: pendingFile, path: [path, pendingFile].filter(Boolean).join("/") },
+    );
+    setPendingFile(null);
+  }, [pendingFile, loading, entries, path]);
 
   const segments = path ? path.split("/") : [];
   const folderCount = entries.filter((e) => e.kind === "folder").length;
@@ -304,7 +374,7 @@ export function FileBrowser({
                 <tr
                   key={`${e.kind}:${e.path}`}
                   className="cursor-pointer hover:bg-muted/40"
-                  onClick={() => (e.kind === "folder" ? goto(e.path) : setPreview(e))}
+                  onClick={() => (e.kind === "folder" ? goto(e.path) : openPreview(e))}
                 >
                   <td className="px-3 py-2">
                     <span className="flex min-w-0 items-center gap-2">
@@ -324,18 +394,14 @@ export function FileBrowser({
                   <td className="px-3 py-2">
                     {e.kind === "file" && (
                       <span className="flex items-center justify-end gap-1">
-                        <Button
+                        <CopyButton
                           variant="ghost"
                           size="icon-sm"
                           aria-label={`Copy ${uriLabel.toLowerCase()}`}
                           title={`Copy ${uriLabel.toLowerCase()}`}
-                          onClick={(ev) => {
-                            ev.stopPropagation();
-                            void copyText(absoluteUri(res, e.path), uriLabel);
-                          }}
-                        >
-                          <Copy className="h-3.5 w-3.5" />
-                        </Button>
+                          value={absoluteUri(res, e.path)}
+                          iconClass="h-3.5 w-3.5"
+                        />
                         <Button
                           variant="ghost"
                           size="icon-sm"
@@ -380,7 +446,7 @@ export function FileBrowser({
           entry={preview}
           uri={absoluteUri(res, preview.path)}
           uriLabel={uriLabel}
-          onClose={() => setPreview(null)}
+          onClose={closePreview}
         />
       )}
     </div>
@@ -469,7 +535,7 @@ function PreviewDialog({
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="max-w-4xl">
-        <DialogHeader>
+        <DialogHeader className="min-w-0">
           <DialogTitle className="truncate font-mono text-sm" title={entry.path}>
             {entry.name}
           </DialogTitle>
@@ -480,7 +546,21 @@ function PreviewDialog({
           </p>
         </DialogHeader>
 
-        <div className="max-h-[60vh] overflow-auto rounded-md border border-border bg-muted/20 p-3 scrollbar-thin">
+        <div className="relative">
+          {/* Floats over the pane (not inside the scroller, or it would scroll
+              away); copies the text as displayed — pretty-printed for JSON. */}
+          {text !== null && (
+            <CopyButton
+              variant="outline"
+              size="icon-sm"
+              className="absolute right-2 top-2 z-10 bg-background/80 backdrop-blur-sm"
+              aria-label="Copy contents"
+              title={truncated ? "Copy contents (preview is truncated)" : "Copy contents"}
+              value={text}
+              iconClass="h-3.5 w-3.5"
+            />
+          )}
+          <div className="max-h-[60vh] overflow-auto rounded-md border border-border bg-muted/20 p-3 scrollbar-thin">
           {error ? (
             <p className="py-8 text-center text-sm text-destructive">{error}</p>
           ) : tooBigForMedia ? (
@@ -512,16 +592,19 @@ function PreviewDialog({
               No inline preview for this file type — download it instead.
             </p>
           )}
+          </div>
         </div>
 
-        <DialogFooter>
-          <span className="mr-auto truncate font-mono text-[11px] text-muted-foreground" title={uri}>
+        {/* min-w-0: DialogContent is a grid, and a grid item's min-width:auto
+            would size this row to the URI's full nowrap width — past the card. */}
+        <DialogFooter className="min-w-0 sm:items-center">
+          <span className="mr-auto min-w-0 truncate font-mono text-[11px] text-muted-foreground" title={uri}>
             {uri}
           </span>
-          <Button variant="outline" onClick={() => copyText(uri, uriLabel)}>
-            <Copy className="h-4 w-4" /> Copy {uriLabel.toLowerCase()}
-          </Button>
-          <Button onClick={() => openDownload(storage, entry.path)}>
+          <CopyButton variant="outline" className="shrink-0" value={uri}>
+            Copy {uriLabel.toLowerCase()}
+          </CopyButton>
+          <Button className="shrink-0" onClick={() => openDownload(storage, entry.path)}>
             <Download className="h-4 w-4" /> Download
           </Button>
         </DialogFooter>

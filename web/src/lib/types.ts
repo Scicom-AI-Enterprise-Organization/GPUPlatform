@@ -1908,6 +1908,89 @@ export type TestProxyUpstreamResult = {
   models: string[];
 };
 
+// Red-team detector dry run. The detector half of the config only — action/scan don't
+// change the verdict — run through the same path the live guard uses.
+export type TestProxyRedTeamBody = {
+  mode: "classifier" | "llm";
+  base_url: string;
+  model: string;
+  api_key_secret?: string | null;
+  api_key?: string | null;
+  // Key mode "keep": send no key and let the server use the one already stored on
+  // this endpoint, so an existing guard is testable without re-pasting a secret.
+  proxy_id?: string | null;
+  types?: string[];
+  threshold?: number;
+  flag_labels?: string[];
+  prompt?: string | null;
+  no_system?: boolean;
+  reasoning?: string;
+  timeout_s?: number;
+  text?: string | null; // custom attack probe; blank = the built-in one
+};
+
+// Two probes run per test: a known attack (expect flagged) and a benign control
+// (expect passed). The control is what catches a detector that flags everything.
+export type TestProxyRedTeamProbe = {
+  label: string;
+  text: string;
+  expected: "unsafe" | "safe";
+  flagged?: boolean | null;
+  rt_type: string;
+  reason: string;
+  error: string;
+  latency_ms?: number | null;
+  ok: boolean;
+};
+
+export type TestProxyRedTeamResult = {
+  ok: boolean;
+  message: string;
+  latency_ms?: number | null;
+  probes: TestProxyRedTeamProbe[];
+};
+
+// Detector scored against a LABELLED corpus (a dataset carrying
+// expected.attack/attack_type, which the red-team generator writes) instead of two
+// probes: the precision/recall you want before enforcing on production traffic.
+export type EvalProxyRedTeamBody = TestProxyRedTeamBody & {
+  dataset_id: string;
+  limit?: number;
+  concurrency?: number;
+};
+
+export type RedTeamEvalMiss = {
+  kind: "false_negative" | "false_positive" | "error";
+  attack_type: string;
+  predicted_type: string;
+  text: string;
+  reason: string;
+};
+
+export type EvalProxyRedTeamResult = {
+  ok: boolean;
+  message: string;
+  scored: number;
+  skipped: number;   // rows with no ground truth — skipped, never guessed
+  errors: number;
+  attack_rows: number;
+  benign_rows: number;
+  true_positives: number;
+  false_negatives: number;
+  true_negatives: number;
+  false_positives: number;
+  // null when not measurable: precision needs benign rows, recall needs attacks.
+  precision?: number | null;
+  recall?: number | null;
+  f1?: number | null;
+  recall_by_type: Record<string, number>;
+  rows_by_type: Record<string, number>;
+  type_accuracy?: number | null;
+  latency_ms_p50?: number | null;
+  latency_ms_p95?: number | null;
+  misses: RedTeamEvalMiss[];
+};
+
 
 // ---- Usage activity analytics (the "Activity" dashboard) ----
 export type ActivityGranularity = "15min" | "hour" | "day";

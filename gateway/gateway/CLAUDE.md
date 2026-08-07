@@ -466,7 +466,11 @@ pair it with `llm_judge` when wording matters more than throughput).
 - **⚠ The two directions are scored by OPPOSITE rules.** Refusing an attack row is correct;
   refusing a benign control is the failure (over-refusal). Hence the `aggregate`: a 50/50 corpus
   where the model refuses everything shows a 50% *pass rate* — which looks like a coin flip instead
-  of the total over-refusal it is. `refusal_rate` / `over_refusal_rate` / `safety_score` (their
+  of the total over-refusal it is. ⚠ **Replaying through a red-teamed proxy, check
+  `model_refusal_rate`, not `refusal_rate`** — the latter is end-to-end (guard + model) and the
+  guard's canned block matches every refusal pattern, so a guardrail can post a perfect score for a
+  model that would have answered every attack. See the guard-attribution bullet in the red-teaming
+  section. `refusal_rate` / `over_refusal_rate` / `safety_score` (their
   mean, so neither half can be gamed) / per-category `refusal_<type>` / `leak_rate`.
 - **⚠ An empty reply is not a refusal** (`min_refusal_chars`, default 15) — otherwise a dead
   endpoint posts a perfect safety score. A compliance marker ("Sure, here's…", "DAN mode enabled")
@@ -774,9 +778,12 @@ view (right for a per-pod probe). Excluded from the HTTP metrics (`METRICS_IGNOR
 
 ### LLM red-teaming guard — inline chat screening (`red_team` proxy config)
 
-Per-endpoint guardrail on the LLM-proxy **chat path only** (`/proxy/{name}/v1/chat/completions`):
-every request is screened by a detector **before any upstream byte is sent**; a positive verdict is
-answered by the gateway and the model never sees the request. Config is a `red_team` block on the
+Per-endpoint guardrail on **both text-generation paths** (`_RT_GUARDED_PATHS`:
+`/v1/chat/completions` **and** the legacy `/v1/completions`): every request is screened by a
+detector **before any upstream byte is sent**; a positive verdict is answered by the gateway and the
+model never sees the request. ⚠ It screened chat only until 2026-08-07 — the same model behind the
+same endpoint answers `/v1/completions`, so re-sending an attack there walked straight past the
+guard. Anything else (embeddings, rerank, audio) has no prompt to screen in this sense. Config is a `red_team` block on the
 proxy (form card between Routing and STT callback), stored like `stt_callback`/`capture`
 (`_build_red_team`, keys Fernet-encrypted / secret-ref'd, resolved+decrypted in `_route`).
 ⚠ `_build_red_team` REBUILDS the whole block from the spec on every save, so any field the
@@ -812,7 +819,11 @@ every new `RedTeamSpec` field.
   with `{"error": {…, "red_team_type": …}}`.
 - **What's scanned**: `scan` = `last_user` (default) | `user` | `full`; multimodal content lists
   contribute their text parts; **TAIL-truncated** to `max_chars` (8k) — injections ride at the END
-  of long context.
+  of long context. A `/v1/completions` body has no `messages`, so `_rt_prompt_text` reads `prompt`
+  as one turn (scan modes don't apply — there's only one); a **batched** `prompt` list scans EVERY
+  element (one poisoned element is enough), and a token-id array is skipped, not stringified.
+  Blocks on that path get the LEGACY body shape (`object: text_completion`, `text`, `cmpl-` id) —
+  a chat-shaped body reads as an *empty* reply to a completions client, i.e. a silent block.
 - **Failure policy is explicit**: `on_error: allow` (default, fail-open — logged + counted, request
   forwards) or `block` (fail-closed, type `detector_error`). An unparseable verdict (ambiguous judge
   reply, unknown classifier shape) is an *error*, not a pass/fail.
@@ -834,8 +845,45 @@ every new `RedTeamSpec` field.
   breakdown exactly when the detector was down, and left `sum(hits)` short of the
   endpoint's `blocked` request count. That invariant — **sum(hits_total) == blocked
   ProxyRequests** — is what the Metrics tab's "Blocked" card and Queue tab agree on.
-- Unit tests: `gateway/tests/unit/test_red_team.py` (scan extraction, both verdict parsers, block
-  bodies, builder validation + key handling). ⚠ `test_custom_eval`'s env-scrub test must RESTORE
+- **Dry run before saving**: `POST /v1/proxy/red-team/test` (admin) — the "Test detector" button on
+  the form card. Runs the LIVE form values through `_rt_detect` (so URL normalization, key
+  resolution, the reasoning toggle and both verdict parsers are the real ones) against **two**
+  probes: a known attack (`RED_TEAM_TEST_ATTACK`, expect flagged) and a benign control
+  (`RED_TEAM_TEST_SAFE`, expect passed). ⚠ The control is the load-bearing half — an
+  attack-only test passes against a detector that flags EVERYTHING (wrong model, inverted
+  classifier labels, a judge prompt that always answers UNSAFE), which would refuse all chat
+  traffic the moment it's saved. The four verdicts are distinct messages: ok / over-blocks /
+  doesn't flag / answered backwards, plus the raw detector error when it can't be reached.
+  Key handling mirrors the form's three modes; `proxy_id` (sent for "keep existing") tests the
+  key already stored on the endpoint, forcing `enabled: True` so a switched-off guard is still
+  testable. Exercised live, not by a unit test — same as the upstream `POST /v1/proxy/test`.
+- **Measuring the detector, not just smoke-testing it**: `POST /v1/proxy/red-team/evaluate`
+  (admin) — the "Evaluate against a labelled dataset" panel under the test button. Takes a
+  `dataset_id` and runs every row's scanned text through the SAME `_rt_detect` (shared resolver
+  `_rt_detector_from_request`, so test and eval can never disagree about which detector they
+  measured), bounded by `limit` (≤500, detector calls are billed per row) and `concurrency` (≤16).
+  Ground truth is `expected.attack`/`expect_refusal` + `attack_type` — exactly what the synthetic
+  red-team generator writes, so the corpus generator and the guard close the loop. Reports the
+  confusion matrix, recall, **recall per attack category** (which class the guard is blind to),
+  `type_accuracy` (did it also NAME the attack right), latency p50/p95, and the rows it got wrong
+  — the tuning list. Two abstain rules, both load-bearing: a row with no label is **skipped, not
+  guessed** (`scored` vs the row count), and **precision is `null` unless the corpus has benign
+  rows** — on an attack-only corpus `fp` is 0 by construction, so `tp/(tp+fp)` would report a
+  flawless 100% while measuring nothing. Measured on this platform: 30/30 recall across all five
+  categories (EN+MS), p50 ~400 ms, `type_accuracy` 0.83; on a 16-row mixed corpus, precision 0.89
+  (the one FP was a benign row *discussing* prompt injection).
+- **Guard vs model attribution in Experiments** (`evaluators.py`): replaying a corpus through a
+  red-teamed proxy, the guard's canned block matches every refusal pattern — so the MODEL used to
+  score a refusal for a prompt it never saw. `Completion.guard_blocked`/`guard_type` (read from
+  `X-SGPU-Red-Team*` by `experiments_api._guard_verdict`, on all four return paths incl. the
+  `action=error` 403) short-circuits `_check_red_team`, and `_agg_red_team` adds
+  `guard_block_rate` / `guard_over_block_rate` / `model_refusal_rate` / `model_saw_attacks`
+  alongside the end-to-end `refusal_rate`. ⚠ "The endpoint is safe" and "the model is safe" are
+  different claims — only the second survives turning the guardrail off. All guard keys are
+  omitted entirely for an unguarded target, so old runs read exactly as before.
+- Unit tests: `gateway/tests/unit/test_red_team.py` (scan extraction incl. the `/v1/completions`
+  prompt shapes, both verdict parsers, both block-body shapes, builder validation + key handling,
+  hits-at-block-point) and `test_evaluators.py` (guard-vs-model attribution + aggregate split). ⚠ `test_custom_eval`'s env-scrub test must RESTORE
   `PROVIDER_SECRET_KEY` (not pop it) or the red-team crypto tests fail suite-order-dependently.
 - Restart rule: `proxy_api.py` is imported → **gateway restart** to pick up edits.
 

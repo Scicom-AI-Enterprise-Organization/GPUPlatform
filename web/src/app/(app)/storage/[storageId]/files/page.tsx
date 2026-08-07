@@ -17,12 +17,12 @@ export default async function StorageFilesPage({
   searchParams,
 }: {
   params: Promise<{ storageId: string }>;
-  searchParams: Promise<{ path?: string }>;
+  searchParams: Promise<{ path?: string; file?: string }>;
 }) {
   const me = await getMe();
   if (!me) redirect("/login");
   const { storageId } = await params;
-  const { path } = await searchParams;
+  const { path, file } = await searchParams;
   const username = await currentUsername();
 
   // No single-storage GET route — the list is one small query and already
@@ -70,7 +70,7 @@ export default async function StorageFilesPage({
             </Button>
           </div>
         ) : (
-          <FileBrowser storage={storage} initialPath={path ?? ""} />
+          <FileBrowser storage={storage} initialPath={path ?? ""} initialFile={file ?? ""} />
         )}
       </div>
     </div>

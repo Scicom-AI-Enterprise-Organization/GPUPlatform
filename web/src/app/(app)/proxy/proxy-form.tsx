@@ -12,7 +12,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { gateway } from "@/lib/gateway";
-import { RED_TEAM_DEFAULT_TYPES, type GlobalEnvRecord, type ProxyEndpoint, type ProxyRedTeam, type ProxyUpstreamSpec, type StorageRecord } from "@/lib/types";
+import { RED_TEAM_DEFAULT_TYPES, type DatasetRecord, type EvalProxyRedTeamResult, type GlobalEnvRecord, type ProxyEndpoint, type ProxyRedTeam, type ProxyUpstreamSpec, type StorageRecord, type TestProxyRedTeamProbe } from "@/lib/types";
 import { FormFooter, FormShell } from "@/components/form-shell";
 import { RoutingPanel } from "./routing-panel";
 import { modelKind } from "./model-kind";
@@ -196,7 +196,12 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   // STT callback (CER/WER) — a whisper-compatible endpoint the TTS proxy transcribes
   // its generated audio through, async, to record CER/WER. Not a data-plane upstream.
   const stt0 = initial?.stt_callback ?? undefined;
-  const [sttEnabled, setSttEnabled] = useState(stt0?.enabled ?? true);
+  // Default OFF when nothing is stored (same as capture below). An unconfigured block
+  // has NOWHERE to record an "off": _build_stt_callback drops the whole thing when the
+  // URL/model are blank, so a default of `true` made the switch snap back on after every
+  // save — the user turns it off, saves, reopens, and it's on again. Off IS the truth
+  // when there's no callback configured.
+  const [sttEnabled, setSttEnabled] = useState(stt0?.enabled ?? false);
   const [sttBase, setSttBase] = useState(stt0?.base_url ?? "");
   const [sttModel, setSttModel] = useState(stt0?.model ?? "");
   const sttHadKey = !!(stt0?.has_inline_key || stt0?.api_key_secret);
@@ -220,7 +225,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   // A positive verdict never reaches an upstream; the block carries its category in
   // the X-SGPU-Red-Team-Type header.
   const rt0 = initial?.red_team ?? undefined;
-  const [rtEnabled, setRtEnabled] = useState(rt0?.enabled ?? true);
+  const [rtEnabled, setRtEnabled] = useState(rt0?.enabled ?? false);  // see sttEnabled
   const [rtMode, setRtMode] = useState<"classifier" | "llm">(rt0?.mode ?? "classifier");
   const [rtBase, setRtBase] = useState(rt0?.base_url ?? "");
   const [rtModel, setRtModel] = useState(rt0?.model ?? "");
@@ -252,6 +257,22 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [rtRespKeySecret, setRtRespKeySecret] = useState(rt0?.responder_api_key_secret ?? "");
   const [rtRespKey, setRtRespKey] = useState("");
   const [rtErrorStatus, setRtErrorStatus] = useState(String(rt0?.error_status ?? 403));
+  const [rtTest, setRtTest] = useState<{
+    status: "idle" | "running" | "ok" | "fail";
+    message?: string;
+    probes?: TestProxyRedTeamProbe[];
+  }>({ status: "idle" });
+  // Corpus evaluation — the two-probe test says the detector WORKS, this says how
+  // often it is RIGHT. Datasets are fetched lazily: most edits never open this.
+  const [rtEvalOpen, setRtEvalOpen] = useState(false);
+  const [rtDatasets, setRtDatasets] = useState<DatasetRecord[]>([]);
+  const [rtDatasetId, setRtDatasetId] = useState("");
+  const [rtEvalLimit, setRtEvalLimit] = useState("100");
+  const [rtEval, setRtEval] = useState<{
+    status: "idle" | "running" | "ok" | "fail";
+    message?: string;
+    result?: EvalProxyRedTeamResult;
+  }>({ status: "idle" });
   // What the Routing graph draws as the first stage of every chat route. Built from
   // live form state (not `initial`) so the canvas answers "what will this endpoint do
   // when I save?" — and matches the server's own rule for when screening is active:
@@ -308,6 +329,80 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
       patch(i, { test: { status: r.ok ? "ok" : "fail", message: r.ok ? `${r.message} · ${r.latency_ms ?? "?"}ms` : r.message } });
     } catch (e) {
       patch(i, { test: { status: "fail", message: e instanceof Error ? e.message : String(e) } });
+    }
+  };
+
+  // Dry-run the detector against a known-bad + a known-good probe. Uses the LIVE form
+  // values, so it answers "will screening work if I save this?" — including the case a
+  // single attack probe can't see: a detector that flags everything.
+  const onTestRedTeam = async () => {
+    if (!rtBase.trim() || !rtModel.trim()) {
+      setRtTest({ status: "fail", message: "Set the detector base URL + model first" });
+      return;
+    }
+    setRtTest({ status: "running" });
+    try {
+      const r = await gateway.testProxyRedTeam({
+        mode: rtMode,
+        base_url: rtBase.trim(),
+        model: rtModel.trim(),
+        api_key_secret: rtKeyMode === "secret" ? (rtKeySecret.trim() || null) : null,
+        api_key: rtKeyMode === "paste" ? (rtKey.trim() || null) : null,
+        // "Keep existing" sends no key at all — the server tests the stored one.
+        proxy_id: rtKeyMode === "keep" ? (initial?.id ?? null) : null,
+        types: rtTypes.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean),
+        threshold: rtThreshold.trim() === "" ? 0.5 : Number(rtThreshold),
+        flag_labels: rtFlagLabels.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean),
+        prompt: rtPrompt.trim() || null,
+        no_system: rtNoSystem,
+        reasoning: rtReasoning,
+        timeout_s: Number(rtTimeoutS) || 15,
+      });
+      setRtTest({
+        status: r.ok ? "ok" : "fail",
+        message: `${r.message}${r.latency_ms != null ? ` · ${r.latency_ms}ms` : ""}`,
+        probes: r.probes ?? [],
+      });
+    } catch (e) {
+      setRtTest({ status: "fail", message: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  const openRedTeamEval = () => {
+    setRtEvalOpen(true);
+    if (rtDatasets.length) return;
+    gateway.listDatasets("all")
+      .then((rows) => setRtDatasets(Array.isArray(rows) ? rows : []))
+      .catch(() => {});
+  };
+
+  const onEvalRedTeam = async () => {
+    if (!rtDatasetId) {
+      setRtEval({ status: "fail", message: "Pick a dataset with expected.attack labels" });
+      return;
+    }
+    setRtEval({ status: "running" });
+    try {
+      const r = await gateway.evaluateProxyRedTeam({
+        mode: rtMode,
+        base_url: rtBase.trim(),
+        model: rtModel.trim(),
+        api_key_secret: rtKeyMode === "secret" ? (rtKeySecret.trim() || null) : null,
+        api_key: rtKeyMode === "paste" ? (rtKey.trim() || null) : null,
+        proxy_id: rtKeyMode === "keep" ? (initial?.id ?? null) : null,
+        types: rtTypes.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean),
+        threshold: rtThreshold.trim() === "" ? 0.5 : Number(rtThreshold),
+        flag_labels: rtFlagLabels.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean),
+        prompt: rtPrompt.trim() || null,
+        no_system: rtNoSystem,
+        reasoning: rtReasoning,
+        timeout_s: Number(rtTimeoutS) || 15,
+        dataset_id: rtDatasetId,
+        limit: Number(rtEvalLimit) || 100,
+      });
+      setRtEval({ status: r.ok ? "ok" : "fail", message: r.message, result: r });
+    } catch (e) {
+      setRtEval({ status: "fail", message: e instanceof Error ? e.message : String(e) });
     }
   };
 
@@ -828,6 +923,148 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
               read timeout on the detector call, paid inline by every chat request; a timeout follows the failure policy above. Default 15.
             </p>
           </div>
+        </div>
+
+        {/* test — runs the settings above through the SAME detector path the live gate
+            uses, on two probes. The benign control is the point: a detector that flags
+            everything passes an attack-only test and then refuses all traffic. */}
+        <div className="mt-3 border-t border-border/60 pt-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" variant="outline" size="xs" onClick={onTestRedTeam}
+                    disabled={rtTest.status === "running" || !rtBase.trim() || !rtModel.trim()}>
+              {rtTest.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Test detector
+            </Button>
+            <span className="text-[11px] text-muted-foreground">
+              screens one attack probe and one benign probe with the settings above — nothing is saved, and a
+              detector that flags <span className="font-italic">everything</span> fails this too
+              {rtKeyMode === "keep" && " (tests the key already stored on this endpoint)"}
+            </span>
+          </div>
+          {rtTest.status !== "idle" && rtTest.status !== "running" && (
+            <>
+              <p className={"mt-2 text-xs " + (rtTest.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>
+                {rtTest.message}
+              </p>
+              {!!rtTest.probes?.length && (
+                <div className="mt-1.5 space-y-1 rounded-md border border-border bg-muted/20 p-2 font-mono text-[10px] leading-relaxed">
+                  {rtTest.probes.map((p) => (
+                    <div key={p.label} className="break-words">
+                      <span className={p.ok ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}>
+                        {p.ok ? "✓" : "✗"}
+                      </span>{" "}
+                      <span className="text-muted-foreground">{p.label} (expect {p.expected}):</span>{" "}
+                      {p.error
+                        ? <span className="text-destructive">{p.error}</span>
+                        : <>{p.flagged ? `flagged${p.rt_type ? ` · ${p.rt_type}` : ""}` : "passed"}
+                            {p.latency_ms != null && ` · ${p.latency_ms}ms`}
+                            {p.reason && <span className="text-muted-foreground"> · {p.reason}</span>}</>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* corpus evaluation — two probes prove it runs; a labelled corpus proves
+              it's right. Attack-only corpora report recall and ABSTAIN on precision. */}
+          {!rtEvalOpen ? (
+            <button type="button" onClick={openRedTeamEval}
+                    className="mt-2 text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">
+              Evaluate against a labelled dataset →
+            </button>
+          ) : (
+            <div className="mt-3 rounded-md border border-border bg-muted/10 p-2.5">
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="min-w-[240px] flex-1">
+                  <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Labelled dataset</Label>
+                  <Select value={rtDatasetId} onValueChange={setRtDatasetId}>
+                    <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="pick a red-team corpus…" /></SelectTrigger>
+                    <SelectContent>
+                      {rtDatasets.map((d) => (
+                        <SelectItem key={d.id} value={d.id} className="text-xs">
+                          {d.name}{d.num_rows ? ` · ${d.num_rows} rows` : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="w-[110px]">
+                  <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Rows</Label>
+                  <Input type="number" min={1} max={500} value={rtEvalLimit}
+                         onChange={(e) => setRtEvalLimit(e.target.value)} className="h-8 font-mono text-xs" />
+                </div>
+                <Button type="button" variant="outline" size="xs" onClick={onEvalRedTeam}
+                        disabled={rtEval.status === "running" || !rtBase.trim() || !rtModel.trim()}>
+                  {rtEval.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Evaluate
+                </Button>
+              </div>
+              <p className="mt-1.5 text-[11px] text-muted-foreground">
+                Needs rows carrying <span className="font-mono">expected.attack</span> — the red-team dataset
+                generator writes them. One detector call per row (billed); rows without a label are skipped, not guessed.
+              </p>
+              {rtEval.status !== "idle" && rtEval.status !== "running" && (
+                <>
+                  <p className={"mt-2 text-xs " + (rtEval.status === "ok" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>
+                    {rtEval.message}
+                  </p>
+                  {rtEval.result && rtEval.result.scored > 0 && (() => {
+                    const r = rtEval.result;
+                    const pct = (v?: number | null) => (v == null ? "n/a" : `${(v * 100).toFixed(0)}%`);
+                    return (
+                      <div className="mt-2 space-y-2">
+                        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                          {([["Recall", pct(r.recall), "attacks caught"],
+                             ["Precision", pct(r.precision), "of blocks that were attacks"],
+                             ["F1", r.f1 == null ? "n/a" : r.f1.toFixed(2), "needs both halves"],
+                             ["Category accuracy", pct(r.type_accuracy), "named the right type"]] as const).map(([l, v, h]) => (
+                            <div key={l} className="rounded-md border border-border bg-card px-2 py-1.5">
+                              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{l}</div>
+                              <div className="font-mono text-sm">{v}</div>
+                              <div className="text-[10px] text-muted-foreground">{h}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="font-mono text-[10px] text-muted-foreground">
+                          TP {r.true_positives} · FN {r.false_negatives} · TN {r.true_negatives} · FP {r.false_positives}
+                          {" · "}{r.attack_rows} attack / {r.benign_rows} benign rows
+                          {r.skipped > 0 && ` · ${r.skipped} unlabelled skipped`}
+                          {r.errors > 0 && ` · ${r.errors} detector errors`}
+                          {r.latency_ms_p50 != null && ` · p50 ${r.latency_ms_p50}ms / p95 ${r.latency_ms_p95}ms`}
+                        </div>
+                        {Object.keys(r.recall_by_type).length > 0 && (
+                          <div className="space-y-0.5 font-mono text-[10px]">
+                            {Object.entries(r.recall_by_type).map(([t, v]) => (
+                              <div key={t} className="flex items-center gap-2">
+                                <span className="w-52 shrink-0 truncate text-muted-foreground">{t}</span>
+                                <span className={v < 1 ? "text-destructive" : "text-emerald-600 dark:text-emerald-400"}>{pct(v)}</span>
+                                <span className="text-muted-foreground">({r.rows_by_type[t]} rows)</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {r.misses.length > 0 && (
+                          <div className="space-y-1 rounded-md border border-border bg-muted/20 p-2 font-mono text-[10px] leading-relaxed">
+                            <div className="text-muted-foreground">rows it got wrong — this is the tuning list:</div>
+                            {r.misses.map((m, i) => (
+                              <div key={i} className="break-words">
+                                <span className="text-destructive">
+                                  {m.kind === "false_negative" ? "MISSED" : m.kind === "false_positive" ? "OVER-BLOCKED" : "ERROR"}
+                                </span>{" "}
+                                {(m.attack_type || m.predicted_type) && (
+                                  <span className="text-muted-foreground">[{m.attack_type || m.predicted_type}]</span>
+                                )}{" "}
+                                {m.text || m.reason}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </>
+              )}
+            </div>
+          )}
         </div>
 
         {/* action on a hit */}

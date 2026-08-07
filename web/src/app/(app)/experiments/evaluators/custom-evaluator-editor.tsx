@@ -155,7 +155,7 @@ export function CustomEvaluatorEditor({
   }
 
   return (
-    <div className="rounded-md border border-primary/40 bg-background p-3">
+    <div className="rounded-md border border-primary/40 bg-card p-3">
       <div className="mb-3 flex items-center justify-between">
         <span className="text-sm font-medium">
           {editing ? `Edit ${editing.name}` : "New custom evaluator"}

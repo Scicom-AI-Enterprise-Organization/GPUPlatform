@@ -11,6 +11,7 @@ import { gateway } from "@/lib/gateway";
 import type { ExperimentRecord } from "@/lib/types";
 import { avatarFor } from "@/lib/avatar";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -236,9 +237,9 @@ export function ExperimentsList({
         {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
       </div>
 
-      <div className="overflow-hidden rounded-md border border-border">
+      <Card className="overflow-hidden">
         <table className="w-full text-sm">
-          <thead className="bg-muted/40 text-xs text-muted-foreground">
+          <thead className="border-b border-border bg-muted/20 text-left text-xs uppercase tracking-wide text-muted-foreground">
             <tr>
               <th className="px-3 py-2 text-left font-medium">Experiment</th>
               <th className="px-3 py-2 text-left font-medium">Dataset</th>
@@ -256,7 +257,7 @@ export function ExperimentsList({
               const progress =
                 row.n_planned > 0 ? Math.round((row.n_completed / row.n_planned) * 100) : 0;
               return (
-                <tr key={row.id} className="border-t border-border hover:bg-muted/30">
+                <tr key={row.id} className="border-b border-border/60 last:border-0 hover:bg-muted/30">
                   <td className="px-3 py-2">
                     <Link
                       href={`/experiments/${row.id}`}
@@ -412,7 +413,7 @@ export function ExperimentsList({
             )}
           </div>
         )}
-      </div>
+      </Card>
 
       <Pagination
         page={page}

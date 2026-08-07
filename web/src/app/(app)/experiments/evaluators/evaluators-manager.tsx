@@ -8,7 +8,6 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
 import { BarChart3, Globe, Inbox, Lock, Pencil, Plus, Search, Sliders, Terminal, Trash2, Wand2, X } from "lucide-react";
-import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { CustomEvaluatorRecord, EvaluatorRegistry } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
@@ -116,7 +115,7 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
         )}
 
         {customs.length === 0 && !editorOpen ? (
-          <div className="flex flex-col items-center justify-center gap-2 px-6 py-14 text-center">
+          <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border bg-card px-6 py-14 text-center">
             <Inbox className="h-6 w-6 text-muted-foreground/60" />
             <p className="max-w-md text-sm text-muted-foreground">
               None yet. Write a one-line expression, point at an API you already run, or (if
@@ -134,7 +133,7 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
               return (
                 <li
                   key={c.id}
-                  className="flex items-start gap-3 rounded-md border border-border px-3 py-2.5"
+                  className="flex items-start gap-3 rounded-md border border-border bg-card px-3 py-2.5 transition-colors hover:border-foreground/25"
                 >
                   <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
                     <Icon className="h-3.5 w-3.5" />
@@ -231,7 +230,7 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
           </div>
         </div>
         {builtins.length === 0 ? (
-          <p className="px-3 py-10 text-center text-sm text-muted-foreground">
+          <p className="rounded-md border border-dashed border-border bg-card px-3 py-10 text-center text-sm text-muted-foreground">
             No built-in matches “{builtinQ}”.
           </p>
         ) : (
@@ -241,10 +240,7 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
             return (
               <li
                 key={spec.id}
-                className={cn(
-                  "rounded-md border border-border px-3 py-2.5 transition-colors hover:border-foreground/25",
-                  alwaysOn && "bg-muted/30",
-                )}
+                className="rounded-md border border-border bg-card px-3 py-2.5 transition-colors hover:border-foreground/25"
               >
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span className="text-sm font-medium">{spec.label}</span>

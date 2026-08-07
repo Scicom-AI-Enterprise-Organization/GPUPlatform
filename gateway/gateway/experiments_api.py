@@ -668,6 +668,14 @@ def _join_chat_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}{p}"
 
 
+def _guard_verdict(resp) -> tuple[bool, str]:
+    """This platform's proxy guard headers, if the target is a red-teamed proxy
+    endpoint. A block is a normal 200 carrying a refusal (or the configured error
+    status), so without these headers a guard block scores as a MODEL refusal."""
+    flagged = (resp.headers.get("x-sgpu-red-team") or "").strip().lower() == "flagged"
+    return flagged, (resp.headers.get("x-sgpu-red-team-type") or "").strip()
+
+
 async def call_once(
     client: httpx.AsyncClient,
     base_url: str,
@@ -696,16 +704,20 @@ async def call_once(
     tool_calls: list[dict[str, Any]] = []
     ttft_ms: Optional[int] = None
     status_code: Optional[int] = None
+    guard_blocked = False
+    guard_type = ""
 
     try:
         if not stream:
             resp = await client.post(url, headers=headers, json=body, timeout=timeout)
             status_code = resp.status_code
+            guard_blocked, guard_type = _guard_verdict(resp)
             if resp.status_code >= 400:
                 return ev.Completion(
                     error=f"HTTP {resp.status_code}: {resp.text[:400]}",
                     status_code=resp.status_code,
                     latency_ms=int((time.perf_counter() - t0) * 1000),
+                    guard_blocked=guard_blocked, guard_type=guard_type,
                 )
             data = resp.json()
             choice = (data.get("choices") or [{}])[0]
@@ -717,6 +729,7 @@ async def call_once(
                 usage=data.get("usage"),
                 latency_ms=int((time.perf_counter() - t0) * 1000),
                 status_code=status_code,
+                guard_blocked=guard_blocked, guard_type=guard_type,
                 expected={"_tool_calls": msg.get("tool_calls") or []},
             )
 
@@ -724,12 +737,14 @@ async def call_once(
             "POST", url, headers=headers, json=body, timeout=timeout
         ) as resp:
             status_code = resp.status_code
+            guard_blocked, guard_type = _guard_verdict(resp)
             if resp.status_code >= 400:
                 raw = (await resp.aread()).decode("utf-8", "replace")
                 return ev.Completion(
                     error=f"HTTP {resp.status_code}: {raw[:400]}",
                     status_code=resp.status_code,
                     latency_ms=int((time.perf_counter() - t0) * 1000),
+                    guard_blocked=guard_blocked, guard_type=guard_type,
                 )
             async for line in resp.aiter_lines():
                 if not line or not line.startswith("data:"):
@@ -769,6 +784,7 @@ async def call_once(
             status_code=status_code,
             latency_ms=int((time.perf_counter() - t0) * 1000),
             ttft_ms=ttft_ms,
+            guard_blocked=guard_blocked, guard_type=guard_type,
         )
 
     return ev.Completion(
@@ -779,6 +795,7 @@ async def call_once(
         latency_ms=int((time.perf_counter() - t0) * 1000),
         ttft_ms=ttft_ms,
         status_code=status_code,
+        guard_blocked=guard_blocked, guard_type=guard_type,
         expected={"_tool_calls": _merge_stream_tool_calls(tool_calls)},
     )
 
