@@ -1912,17 +1912,12 @@ def _rt_scan_text(payload: dict, scan: str, max_chars: int) -> str:
 
 
 def _rt_chat_url(base: str) -> str:
-    """The judge/responder's OpenAI-compatible chat-completions URL from a pasted
-    base. A full /chat/completions URL is used verbatim; a base ending in /v1 gets
-    /chat/completions; anything else (a bare vLLM/OpenAI server root) gets the full
-    /v1/chat/completions — so all three common paste shapes just work."""
-    b = (base or "").rstrip("/")
-    low = b.lower()
-    if low.endswith("/chat/completions"):
-        return b
-    if low.endswith("/v1"):
-        return b + "/chat/completions"
-    return b + "/v1/chat/completions"
+    """The judge/responder's chat-completions URL from a pasted base. ONE shared
+    implementation (`synthetic.chat_completions_url`) so the guard and the dataset
+    generator can't drift into disagreeing about the same pasted URL — appending
+    `/v1` to a base that already ends in it is a real, repeatedly-hit 404."""
+    from .synthetic import chat_completions_url
+    return chat_completions_url(base)
 
 
 def _rt_classifier_url(base: str) -> str:

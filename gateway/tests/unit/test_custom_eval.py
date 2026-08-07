@@ -204,8 +204,10 @@ def test_validate_spec_rejects_unknown_mode():
         ce.validate_spec("javascript", "1", allow_python=True)
 
 
-def test_python_mode_blocked_unless_enabled():
-    with pytest.raises(ce.CustomEvalError, match="disabled"):
+def test_python_mode_blocked_unless_the_caller_is_allowed():
+    # Since 2026-08-07 the env flag defaults ON, so the caller-level gate (admin
+    # role, resolved by experiments_api._allow_python) is what this asserts.
+    with pytest.raises(ce.CustomEvalError, match="admin role"):
         ce.validate_spec("python", "def check(c):\n    return True", allow_python=False)
 
 
@@ -470,3 +472,31 @@ def test_api_auth_header_uses_the_resolved_key():
 def test_api_no_key_means_no_auth_header():
     client = ce.ApiEvaluatorClient(_api_spec(), client=None)  # type: ignore[arg-type]
     assert "Authorization" not in client._headers()
+
+
+# --------------------------------------------------------------------------- #
+# The python-mode gate
+# --------------------------------------------------------------------------- #
+
+
+def test_python_mode_is_on_by_default_and_opt_out(monkeypatch):
+    """Changed 2026-08-07: python mode is ON unless explicitly disabled. The
+    remaining control is ADMIN ROLE (checked in experiments_api._allow_python),
+    so this function is only the platform-wide kill switch."""
+    monkeypatch.delenv(ce.PYTHON_MODE_ENV, raising=False)
+    assert ce.python_mode_enabled() is True          # unset = allowed
+    for off in ("0", "false", "no", "off", "FALSE"):
+        monkeypatch.setenv(ce.PYTHON_MODE_ENV, off)
+        assert ce.python_mode_enabled() is False, off
+    for on in ("1", "true", "yes", "anything-else"):
+        monkeypatch.setenv(ce.PYTHON_MODE_ENV, on)
+        assert ce.python_mode_enabled() is True, on
+
+
+def test_python_code_is_still_rejected_when_the_caller_is_not_allowed():
+    """The kill switch / non-admin path must still refuse to VALIDATE python
+    code — `allow_python` is resolved per CALLER (env AND admin role) and
+    re-checked at save and at experiment-create time, never inferred here."""
+    with pytest.raises(ce.CustomEvalError, match="admin role"):
+        ce.validate_spec("python", "def check(c):\n    return True\n", allow_python=False)
+    ce.validate_spec("python", "def check(c):\n    return True\n", allow_python=True)

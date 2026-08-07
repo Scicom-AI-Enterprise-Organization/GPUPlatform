@@ -12,7 +12,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { gateway } from "@/lib/gateway";
-import { RED_TEAM_DEFAULT_TYPES, type ProxyEndpoint, type ProxyUpstreamSpec, type StorageRecord } from "@/lib/types";
+import { RED_TEAM_DEFAULT_TYPES, type GlobalEnvRecord, type ProxyEndpoint, type ProxyUpstreamSpec, type StorageRecord } from "@/lib/types";
 import { FormFooter, FormShell } from "@/components/form-shell";
 import { RoutingPanel } from "./routing-panel";
 import { modelKind } from "./model-kind";
@@ -96,6 +96,62 @@ function seededUpstream(prefill?: ProxyPrefill): UpstreamDraft {
 
 export type ProxyPrefill = { name?: string; base?: string; model?: string };
 
+const NO_SECRET = "__none__"; // Select sentinel: clear the ref (= keyless upstream)
+
+// The "Secret ref" key picker — a dropdown of the admin-managed global secrets,
+// matching /datasets/new?source=generate. It replaced a free-text datalist input:
+// a mistyped key name resolved to "" at call time, so the upstream silently went
+// out unauthenticated instead of failing the form.
+//
+// `api_key_secret` resolves against ALL of global-env (proxy_api._resolve_key), not
+// just the is_secret rows, so this lists every key — a plaintext row is flagged so a
+// key parked in the wrong kind of row is visible rather than surprising.
+function SecretRefSelect({
+  value, onChange, rows, id,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  rows: GlobalEnvRecord[];
+  id?: string;
+}) {
+  // A ref whose secret was deleted (or that predates this dropdown) is kept as its
+  // own item — otherwise opening the edit form would blank a live, still-resolving
+  // key the moment the admin saved anything else.
+  const missing = !!value && !rows.some((r) => r.key === value);
+  if (!rows.length && !value) {
+    return (
+      <span className="text-xs text-muted-foreground">
+        No global secrets yet — add one under{" "}
+        <a href="/admin/secrets" className="underline">Secrets</a>, or switch to{" "}
+        <span className="font-medium">Paste</span>.
+      </span>
+    );
+  }
+  return (
+    <Select value={value || NO_SECRET} onValueChange={(v) => onChange(v === NO_SECRET ? "" : v)}>
+      <SelectTrigger id={id} className="h-8 max-w-xs font-mono text-xs">
+        <SelectValue placeholder="Pick a secret" />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={NO_SECRET} className="text-xs text-muted-foreground">— none —</SelectItem>
+        {missing && (
+          <SelectItem value={value} className="font-mono text-xs">
+            {value} <span className="text-destructive">— missing</span>
+          </SelectItem>
+        )}
+        {rows.map((r) => (
+          <SelectItem key={r.key} value={r.key} className="font-mono text-xs">
+            {r.key}
+            {r.is_secret
+              ? (r.value_preview ? ` — ${r.value_preview}` : "")
+              : " — plaintext"}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
 function fromEndpoint(ep: ProxyEndpoint): UpstreamDraft[] {
   return ep.upstreams.map((u) => {
     const models = Object.entries(u.models).map(([alias, real]) => ({ alias, real }));
@@ -149,7 +205,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [sttKeySecret, setSttKeySecret] = useState(stt0?.api_key_secret ?? "");
   const [sttKey, setSttKey] = useState("");
   const [sttTest, setSttTest] = useState<TestState>({ status: "idle" });
-  const [secretKeys, setSecretKeys] = useState<string[]>([]);
+  const [secrets, setSecrets] = useState<GlobalEnvRecord[]>([]);
   // Capture drift samples — save audio (+ sidecar) to storage when a threshold is crossed.
   const cap0 = initial?.capture ?? undefined;
   const [capEnabled, setCapEnabled] = useState(cap0?.enabled ?? false);
@@ -198,7 +254,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   useEffect(() => {
     fetch("/api/proxy/v1/global-env", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : []))
-      .then((rows) => { if (Array.isArray(rows)) setSecretKeys(rows.map((r: { key: string }) => r.key)); })
+      .then((rows) => { if (Array.isArray(rows)) setSecrets(rows as GlobalEnvRecord[]); })
       .catch(() => {});
     fetch("/api/proxy/v1/storage", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : []))
@@ -301,8 +357,8 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
               ))}
             </div>
             {u.keyMode === "secret" && (
-              <Input list="px-secret-keys" value={u.api_key_secret} onChange={(e) => patch(i, { api_key_secret: e.target.value })}
-                     placeholder="SECRETS_KEY (e.g. OPENAI_KEY)" className="h-8 max-w-xs font-mono text-xs" />
+              <SecretRefSelect value={u.api_key_secret} rows={secrets}
+                               onChange={(v) => patch(i, { api_key_secret: v })} />
             )}
             {u.keyMode === "paste" && (
               <Input type="password" autoComplete="off" value={u.api_key} onChange={(e) => patch(i, { api_key: e.target.value })}
@@ -562,8 +618,6 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             return next;
           })}
         />
-        {/* Backs the "Secret ref" key inputs in the inline upstream editor. */}
-        <datalist id="px-secret-keys">{secretKeys.map((k) => <option key={k} value={k} />)}</datalist>
       </section>
 
       <section data-form-section="Red teaming" className="scroll-mt-6 rounded-lg border border-border bg-card p-5">
@@ -626,8 +680,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
               ))}
             </div>
             {rtKeyMode === "secret" && (
-              <Input list="px-secret-keys" value={rtKeySecret} onChange={(e) => setRtKeySecret(e.target.value)}
-                     placeholder="SECRETS_KEY" className="h-8 max-w-xs font-mono text-xs" />
+              <SecretRefSelect value={rtKeySecret} rows={secrets} onChange={setRtKeySecret} />
             )}
             {rtKeyMode === "paste" && (
               <Input type="password" autoComplete="off" value={rtKey} onChange={(e) => setRtKey(e.target.value)}
@@ -799,8 +852,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
                   ))}
                 </div>
                 {rtRespKeyMode === "secret" && (
-                  <Input list="px-secret-keys" value={rtRespKeySecret} onChange={(e) => setRtRespKeySecret(e.target.value)}
-                         placeholder="SECRETS_KEY" className="h-8 max-w-xs font-mono text-xs" />
+                  <SecretRefSelect value={rtRespKeySecret} rows={secrets} onChange={setRtRespKeySecret} />
                 )}
                 {rtRespKeyMode === "paste" && (
                   <Input type="password" autoComplete="off" value={rtRespKey} onChange={(e) => setRtRespKey(e.target.value)}
@@ -854,8 +906,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
               ))}
             </div>
             {sttKeyMode === "secret" && (
-              <Input list="px-secret-keys" value={sttKeySecret} onChange={(e) => setSttKeySecret(e.target.value)}
-                     placeholder="SECRETS_KEY" className="h-8 max-w-xs font-mono text-xs" />
+              <SecretRefSelect value={sttKeySecret} rows={secrets} onChange={setSttKeySecret} />
             )}
             {sttKeyMode === "paste" && (
               <Input type="password" autoComplete="off" value={sttKey} onChange={(e) => setSttKey(e.target.value)}

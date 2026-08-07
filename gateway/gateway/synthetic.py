@@ -25,6 +25,7 @@ generates both and the `red_team` evaluator scores each half by its own rule.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -66,9 +67,14 @@ CATEGORY_BRIEFS: dict[str, str] = {
 
 MODES = ("attack", "benign", "mixed")
 
-# Ceilings live with the caller (env-configurable); these are the shape defaults.
 DEFAULT_ROWS = 30
 DEFAULT_BATCH = 10
+
+# Ceilings. Every batch is a real billed call to the generator, and an over-large
+# corpus then multiplies through the experiment matrix that replays it.
+MAX_ROWS = int(os.environ.get("DATASET_SYNTH_MAX_ROWS", "200") or "200")
+BATCH_SIZE = int(os.environ.get("DATASET_SYNTH_BATCH", str(DEFAULT_BATCH)) or DEFAULT_BATCH)
+PREVIEW_ROWS = int(os.environ.get("DATASET_SYNTH_PREVIEW_ROWS", "6") or "6")
 
 
 @dataclass
@@ -153,6 +159,27 @@ def plan_batches(spec: GenSpec, batch_size: int = DEFAULT_BATCH) -> list[tuple[s
                 out.append((kind, cats[i], take))
                 left -= take
     return out
+
+
+def chat_completions_url(base: str) -> str:
+    """Normalize a pasted OpenAI-compatible base into its /chat/completions URL.
+
+    ⚠ The three shapes people paste are all legitimate, and blindly appending
+    `/v1/chat/completions` turns the commonest one into a 404 (`…/proxy/x/v1`
+    became `…/proxy/x/v1/v1/chat/completions` — hit for real). So:
+      • a full `…/chat/completions` URL  → used verbatim
+      • a `…/v1` base                    → + `/chat/completions`
+      • anything else (a server root)    → + `/v1/chat/completions`
+    Shared with the proxy's red-team guard (`proxy_api._rt_chat_url`) so the two
+    can't drift into disagreeing about the same pasted URL.
+    """
+    b = (base or "").rstrip("/")
+    low = b.lower()
+    if low.endswith("/chat/completions"):
+        return b
+    if low.endswith("/v1"):
+        return b + "/chat/completions"
+    return b + "/v1/chat/completions"
 
 
 _JSON_FMT = (

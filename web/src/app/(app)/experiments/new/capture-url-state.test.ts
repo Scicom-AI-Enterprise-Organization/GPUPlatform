@@ -8,7 +8,10 @@ describe("captureStateFromParam", () => {
   it("opens on a known source and selects that tab", () => {
     expect(captureStateFromParam("platform")).toEqual({ open: true, source: "platform" });
     expect(captureStateFromParam("langfuse")).toEqual({ open: true, source: "langfuse" });
-    expect(captureStateFromParam("synthetic")).toEqual({ open: true, source: "synthetic" });
+  });
+
+  it("does not open on 'synthetic' — generating a corpus moved to /datasets/new", () => {
+    expect(captureStateFromParam("synthetic")).toEqual({ open: false, source: "platform" });
   });
 
   it("stays closed with no param", () => {

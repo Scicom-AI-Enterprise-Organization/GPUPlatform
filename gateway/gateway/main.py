@@ -630,6 +630,23 @@ async def leader_workload(app: FastAPI) -> list[asyncio.Task]:
 
     tasks.append(asyncio.create_task(_experiments_reconcile(), name="experiments_reconcile"))
 
+    async def _dataset_generate_reconcile():
+        # Synthetic-corpus generation is an in-process asyncio task, so a restart
+        # kills it silently; without this the row sits at transform_status=running
+        # forever. Rows already published stay — smaller than asked for, not broken.
+        try:
+            from . import datasets_api as datasets_module
+            g_orphaned = await datasets_module.cleanup_orphaned_generating()
+            if g_orphaned:
+                logger.warning(
+                    "datasets: failed %d interrupted generation(s) after gateway restart",
+                    g_orphaned,
+                )
+        except Exception:
+            logger.exception("datasets: generation orphan reconcile failed")
+
+    tasks.append(asyncio.create_task(_dataset_generate_reconcile(), name="dataset_generate_reconcile"))
+
     async def _prompt_opt_reconcile():
         try:
             p_orphaned = await prompt_opt_module.cleanup_orphaned_running()

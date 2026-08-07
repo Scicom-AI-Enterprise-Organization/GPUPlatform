@@ -329,6 +329,11 @@ class DatasetRecord(BaseModel):
     label_token_secret: Optional[str] = None  # global-secret key (if used instead of a stored token)
     transform_status: Optional[str] = None  # "" | running | done | failed
     transform_log: Optional[str] = None     # short tail of progress lines
+    # Set when the rows were WRITTEN BY A GENERATOR MODEL (synthetic corpora):
+    # the sanitized spec — mode, row target, categories, model, and the API-key
+    # SECRET NAME if one was used (never the key itself). Its presence is what
+    # tells the UI this dataset can be regenerated.
+    gen_spec: Optional[dict] = None
     # kind=llm: which column holds the OpenAI messages array (= chosen in DPO mode)
     messages_field: Optional[str] = None
     # kind=llm DPO (preference) mode: the rejected-response column (None → chat mode)
@@ -452,6 +457,7 @@ def _to_record(
         prompt_field=getattr(d, "prompt_field", None) or None,
         transform_status=getattr(d, "transform_status", None),
         transform_log=getattr(d, "transform_log", None),
+        gen_spec=getattr(d, "gen_spec", None) or None,
         catalog_repo_id=getattr(d, "catalog_repo_id", None),
         created_at=_iso(d.created_at) or "",
         updated_at=_iso(d.updated_at) or "",
@@ -2385,6 +2391,10 @@ async def preview_dataset(
 
         body = await _run_sync(bench.s3_get_bytes, key, t)
         if body is None:
+            # A generation in flight hasn't written its first batch yet — say so,
+            # rather than reporting the dataset as broken.
+            if getattr(d, "gen_spec", None) and d.transform_status == "running":
+                return _resp(rows=[], error="generating — rows appear as each batch completes")
             return _resp(rows=[], error="metadata file not found in storage")
         # Metadata tables are small (text + URLs) → parse all to get the true row
         # count, then slice the requested page. parse_rows_any also handles parquet.
@@ -3415,6 +3425,320 @@ async def pack_llm_dataset(
                                        "objective": req.objective})
     await session.refresh(d)
     return _to_record(d, user.username, None)
+
+
+# ---- synthetic generation (red teaming and friends) -------------------------
+# The corpus is written by a generator LLM instead of captured. The dataset row
+# is created EMPTY and returned immediately; `dataset_transform._run_generate`
+# fills it batch by batch, publishing after each one — so `num_rows` grows while
+# you watch, and the JSONL on S3 is a complete, parseable file at every moment.
+# Generation lives here (not in Experiments) because the output is an ordinary
+# platform dataset — Experiments has no dataset store.
+
+class GenerateDatasetRequest(BaseModel):
+    # Optional on the MODEL because /generate/preview creates nothing and must
+    # work before a name or bucket has been chosen; /generate validates both
+    # explicitly and 400s with a readable message.
+    name: str = ""
+    storage_id: str = ""
+    # generator endpoint — any OpenAI-compatible /chat/completions
+    base_url: str
+    model: str
+    api_key: Optional[str] = None          # request-scoped; NEVER stored on the row
+    api_key_secret: Optional[str] = None   # OR a global-secret name, resolved per call
+    mode: str = "attack"                   # attack | benign | mixed
+    n_rows: int = 30
+    categories: list[str] = []
+    languages: list[str] = []
+    domain: str = ""
+    extra_instructions: str = ""
+    system_prompt: str = ""
+    benign_ratio: float = 0.3
+    temperature: float = 1.0
+    timeout_s: float = 120.0
+    description: Optional[str] = None
+
+
+async def _resolve_generator_key(req: GenerateDatasetRequest, session: AsyncSession) -> str:
+    if req.api_key_secret:
+        from .global_env_api import load_global_env
+        genv = await load_global_env(session)
+        return genv.get(req.api_key_secret.strip(), "")
+    return (req.api_key or "").strip()
+
+
+def _generate_params(req: GenerateDatasetRequest, key: str) -> dict:
+    from . import synthetic as syn
+    return {
+        "base_url": (req.base_url or "").strip(),
+        "model": (req.model or "").strip(),
+        "api_key": key,
+        "mode": req.mode, "n_rows": req.n_rows, "categories": req.categories,
+        "languages": req.languages, "domain": req.domain,
+        "extra_instructions": req.extra_instructions, "system_prompt": req.system_prompt,
+        "benign_ratio": req.benign_ratio, "temperature": req.temperature,
+        "timeout_s": req.timeout_s,
+        "batch_size": syn.BATCH_SIZE, "max_rows": syn.MAX_ROWS,
+        "_default_rows": syn.DEFAULT_ROWS,
+    }
+
+
+def _gen_spec_of(req: GenerateDatasetRequest, spec) -> dict:
+    """The stored provenance blob. Carries the API-key SECRET NAME when one was
+    used — a reference, never the key — which is what lets `regenerate` re-run
+    with no re-auth. A pasted key is deliberately unrecoverable, so regenerating
+    that corpus asks for one."""
+    return {
+        "mode": spec.mode, "n_rows": spec.n_rows, "categories": spec.categories,
+        "languages": spec.languages, "domain": spec.domain,
+        "extra_instructions": spec.extra_instructions,
+        "system_prompt": spec.system_prompt, "benign_ratio": spec.benign_ratio,
+        "temperature": req.temperature,
+        "model": (req.model or "").strip(), "base_url": (req.base_url or "").strip(),
+        "api_key_secret": (req.api_key_secret or "").strip() or None,
+        # Distinguishes "this endpoint needs no key" from "a pasted key we didn't
+        # keep" — otherwise regenerate can't tell whether to ask for one.
+        "keyless": not ((req.api_key or "").strip() or (req.api_key_secret or "").strip()),
+    }
+
+
+class RegenerateRequest(BaseModel):
+    """Re-run generation for an existing synthetic dataset, REPLACING its rows.
+    Everything defaults to the stored `gen_spec`; only the key may need
+    re-supplying (a pasted one was never stored)."""
+    api_key: Optional[str] = None
+    api_key_secret: Optional[str] = None
+    n_rows: Optional[int] = None
+    mode: Optional[str] = None
+    temperature: Optional[float] = None
+
+
+@router.post("/{dataset_id}/regenerate", response_model=DatasetRecord)
+async def regenerate_dataset(
+    dataset_id: str,
+    req: RegenerateRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Regenerate a synthetic corpus in place — same spec, fresh rows.
+
+    ⚠ This REPLACES the corpus: the first publish overwrites `cases.jsonl` with
+    the new rows, so anything already scored against the old ones is measuring a
+    different dataset. (Clone the dataset first if you need both.)
+    """
+    from . import synthetic as syn
+
+    d = await _require_dataset(session, dataset_id, user)
+    spec_json = dict(getattr(d, "gen_spec", None) or {})
+    if not spec_json:
+        raise HTTPException(status_code=400,
+                            detail="this dataset was not generated — nothing to regenerate")
+    if d.transform_status == "running":
+        raise HTTPException(status_code=400, detail="a generation is already running")
+
+    key = (req.api_key or "").strip()
+    ref = (req.api_key_secret or "").strip() or spec_json.get("api_key_secret") or ""
+    if not key and ref:
+        from .global_env_api import load_global_env
+        key = (await load_global_env(session)).get(ref.strip(), "")
+    if not key and not spec_json.get("keyless"):
+        # The original used a pasted key (never stored) or a secret that no longer
+        # resolves. Ask, rather than silently firing an unauthenticated request
+        # that 401s deep inside the background job.
+        raise HTTPException(
+            status_code=400,
+            detail=(f"the API key secret '{ref}' is empty or missing — supply api_key "
+                    "or another api_key_secret")
+            if ref else
+            "the original run used a pasted API key, which is never stored — "
+            "supply api_key (or api_key_secret) to regenerate")
+
+    params = {
+        **spec_json,
+        "api_key": key,
+        "batch_size": syn.BATCH_SIZE, "max_rows": syn.MAX_ROWS,
+        "timeout_s": 120.0,
+    }
+    if req.n_rows is not None:
+        params["n_rows"] = req.n_rows
+    if req.mode:
+        params["mode"] = req.mode
+    if req.temperature is not None:
+        params["temperature"] = req.temperature
+    try:
+        spec = syn.normalize_spec(params, syn.MAX_ROWS)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Reset the visible state so the UI shows it refilling from zero rather than
+    # counting up from the previous corpus's total.
+    d.num_rows = 0
+    d.size_bytes = 0
+    d.gen_spec = {**spec_json, "mode": spec.mode, "n_rows": spec.n_rows,
+                  "api_key_secret": (ref or None)}
+    d.transform_status = "running"
+    await session.commit()
+    await session.refresh(d)
+
+    from . import dataset_transform
+    await dataset_transform.start_generate(d.id, params)
+    await audit_module.record(user, "dataset.regenerate", "dataset", d.id, d.name,
+                              details={"mode": spec.mode, "n_rows": spec.n_rows})
+    owner = await session.get(User, d.owner_id)
+    return _to_record(d, owner.username if owner else "", None)
+
+
+@router.get("/generate/options")
+async def generate_options(user: User = Depends(require_section("datasets"))):  # noqa: ARG001
+    """Server-driven options for the generate form — the attack taxonomy (shared
+    with the proxy's red-team guard) and the ceilings."""
+    from . import synthetic as syn
+    return {
+        "modes": list(syn.MODES),
+        "categories": [{"id": c, "brief": syn.CATEGORY_BRIEFS.get(c, "")}
+                       for c in syn.DEFAULT_CATEGORIES],
+        "max_rows": syn.MAX_ROWS,
+        "default_rows": syn.DEFAULT_ROWS,
+        "batch_size": syn.BATCH_SIZE,
+        "preview_rows": syn.PREVIEW_ROWS,
+    }
+
+
+@router.post("/generate/preview")
+async def generate_preview(
+    req: GenerateDatasetRequest,
+    user: User = Depends(require_section("datasets")),  # noqa: ARG001
+    session: AsyncSession = Depends(get_session),
+):
+    """Generate a handful of rows WITHOUT creating anything — so a wrong base
+    URL, model or key costs one small call instead of a whole dataset."""
+    import httpx
+
+    from . import synthetic as syn
+    from .experiments_api import call_once
+
+    key = await _resolve_generator_key(req, session)
+    base, model = (req.base_url or "").strip(), (req.model or "").strip()
+    if not base or not model:
+        raise HTTPException(status_code=400, detail="generator base_url + model are required")
+    try:
+        spec = syn.normalize_spec(
+            {**_generate_params(req, key),
+             "n_rows": min(syn.PREVIEW_ROWS, max(1, req.n_rows))}, syn.MAX_ROWS)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    rows: list[dict] = []
+    warnings: list[str] = []
+    seen: set[str] = set()
+    got = {"attack": 0, "benign": 0}
+    want = {"attack": spec.n_attack(), "benign": spec.n_benign()}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=15.0, read=None, write=None,
+                                                       pool=15.0)) as client:
+        for i, (kind, category, count) in enumerate(syn.plan_batches(spec, 10)):
+            body = {"model": model,
+                    "messages": syn.build_messages(spec, kind, category, count, variation=i),
+                    "temperature": float(req.temperature), "max_tokens": 2048, "stream": False}
+            comp = await call_once(client, syn.chat_completions_url(base), "", key, body,
+                                   float(req.timeout_s))
+            if comp.error:
+                warnings.append(f"{category}: {comp.error}")
+                continue
+            for p in syn.dedupe(syn.parse_prompts(comp.content), seen):
+                if got[kind] >= want[kind]:
+                    break
+                got[kind] += 1
+                rows.append(syn.to_row(p, kind, category, spec, got[kind]))
+    if not rows:
+        raise HTTPException(status_code=502, detail="the generator produced no usable prompts — "
+                            + ("; ".join(warnings[:3]) or "check the base URL, model and key"))
+    return {"rows": rows, "n_attack": got["attack"], "n_benign": got["benign"],
+            "warnings": warnings}
+
+
+@router.post("/generate", response_model=DatasetRecord)
+async def generate_dataset(
+    req: GenerateDatasetRequest,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Create an EMPTY chat dataset and fill it in the background.
+
+    Returns as soon as the row exists, so the caller lands on a real dataset
+    page; poll `GET /{id}` (`transform_status` / `transform_log` / `num_rows`)
+    to watch it grow, and `POST /{id}/cancel-transform` to stop early — the rows
+    written so far stay usable.
+    """
+    from . import synthetic as syn
+    
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="dataset name is required")
+    if not (req.base_url or "").strip() or not (req.model or "").strip():
+        raise HTTPException(status_code=400, detail="generator base_url + model are required")
+    storage = await session.get(Storage, req.storage_id) if req.storage_id else None
+    if storage is None or storage.kind != "s3":
+        raise HTTPException(status_code=400, detail="storage_id must reference a kind=s3 storage")
+    if storage.owner_id != user.id and not user.is_admin:
+        raise HTTPException(status_code=403, detail="not your storage")
+    key = await _resolve_generator_key(req, session)
+    params = _generate_params(req, key)
+    try:  # validate BEFORE creating a row nothing can fill
+        spec = syn.normalize_spec(params, syn.MAX_ROWS)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    row = Dataset(
+        id=_gen_id(), owner_id=user.id, name=name[:255],
+        description=(req.description or
+                     f"Synthetic {spec.mode} corpus generated by {req.model}")[:2000],
+        kind="upload", storage_id=req.storage_id,
+        metadata_filename="cases.jsonl", format="jsonl",
+        num_rows=0, size_bytes=0, messages_field="messages",
+        transform_status="running",
+        # Provenance + the restart-cleanup marker. NO key material here.
+        gen_spec=_gen_spec_of(req, spec),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+
+    from . import dataset_transform
+    await dataset_transform.start_generate(row.id, params)
+    await audit_module.record(user, "dataset.generate", "dataset", row.id, name,
+                              details={"mode": spec.mode, "n_rows": spec.n_rows,
+                                       "categories": spec.categories, "model": req.model})
+    return _to_record(row, user.username, None)
+
+
+async def cleanup_orphaned_generating() -> int:
+    """Fail generations left `running` by a gateway restart.
+
+    Generation is an in-process asyncio task, so a restart kills it silently and
+    the row would otherwise sit at `running` forever with no automatic
+    un-sticking. Rows already published stay — the dataset is smaller than asked
+    for, not broken — and the log says so.
+    """
+    from sqlalchemy import select as _select
+
+    from .dataset_transform import _append_log
+    from .db import session_factory
+
+    n = 0
+    async with session_factory()() as s:
+        rows = (await s.execute(
+            _select(Dataset).where(Dataset.transform_status == "running",
+                                   Dataset.gen_spec.isnot(None))
+        )).scalars().all()
+        for d in rows:
+            d.transform_status = "failed"
+            d.transform_log = _append_log(
+                d.transform_log,
+                f"generation interrupted by a gateway restart — kept {d.num_rows or 0} row(s)")
+            n += 1
+        if n:
+            await s.commit()
+    return n
 
 
 @router.post("/merge", response_model=DatasetRecord)

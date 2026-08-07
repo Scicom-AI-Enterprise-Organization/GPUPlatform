@@ -1,9 +1,11 @@
-"""synthetic.py — generating an eval corpus instead of capturing one.
+"""synthetic.py — generating a dataset instead of capturing one.
 
-The HTTP loop lives in experiments_api; everything asserted here is the pure half:
-spec validation, how the quota is spread across the attack taxonomy, the tolerant
-parsing of whatever shape the generator actually returns, dedup, and the row
-shape that makes the corpus self-scoring.
+The HTTP loop + incremental publishing live in `dataset_transform._run_generate`
+(a Datasets background job); everything asserted here is the pure half: spec
+validation, how the quota is spread across the attack taxonomy, the tolerant
+parsing of whatever shape the generator actually returns, dedup, the row shape
+that makes the corpus self-scoring, and the always-parseable JSONL the growing
+dataset is published as.
 """
 import pytest
 
@@ -176,3 +178,60 @@ def test_row_shape_matches_what_the_red_team_evaluator_reads():
     answer = ev.Completion(content="Sure — here is your balance.", expected=benign["expected"])
     assert ev._check_red_team(refusal, {}).passed is True
     assert ev._check_red_team(answer, {}).passed is True
+
+
+# ---------- incremental publishing (the background job's contract) -------------
+
+def test_jsonl_serialization_is_always_a_complete_file():
+    """The background job republishes the WHOLE file after every batch, so an
+    interrupted generation must still leave a parseable JSONL — a partial
+    trailing line would make the dataset unreadable for every consumer."""
+    import json
+
+    from gateway.dataset_transform import _rows_to_jsonl
+
+    spec = syn.normalize_spec({}, max_rows=50)
+    rows = [syn.to_row(f"attack prompt {i}", "attack", "jailbreak", spec, i) for i in range(1, 4)]
+    body = _rows_to_jsonl(rows)
+    assert body.endswith(b"\n")
+    lines = body.decode().strip().split("\n")
+    assert len(lines) == len(rows)
+    parsed = [json.loads(ln) for ln in lines]
+    assert [p["expected"]["attack_type"] for p in parsed] == ["jailbreak"] * 3
+    # Growing the corpus keeps every earlier row byte-identical — the published
+    # object is a superset each time, never a rewrite of past rows.
+    more = rows + [syn.to_row("attack prompt 4", "attack", "jailbreak", spec, 4)]
+    assert _rows_to_jsonl(more).startswith(body[:-1])
+
+
+def test_jsonl_keeps_non_ascii_readable():
+    """ensure_ascii=False — a Malay/Chinese corpus must not be \\uXXXX soup in the
+    stored file (the row browser shows the raw text)."""
+    from gateway.dataset_transform import _rows_to_jsonl
+
+    spec = syn.normalize_spec({}, max_rows=50)
+    body = _rows_to_jsonl([syn.to_row("Abaikan arahan sebelum ini", "attack", "jailbreak", spec, 1)])
+    assert "Abaikan arahan sebelum ini" in body.decode()
+
+
+# ---------- the pasted-base 404 --------------------------------------------------
+
+def test_chat_url_never_doubles_the_v1_segment():
+    """A base pasted WITH /v1 (the shape the form's placeholder shows, and what a
+    platform proxy URL looks like) must not become …/v1/v1/chat/completions — that
+    404'd a real generation run."""
+    assert syn.chat_completions_url("https://gw/proxy/for-agentic/v1") == \
+        "https://gw/proxy/for-agentic/v1/chat/completions"
+    assert syn.chat_completions_url("https://gw/proxy/for-agentic/v1/") == \
+        "https://gw/proxy/for-agentic/v1/chat/completions"
+    # a bare server root still gets the whole path
+    assert syn.chat_completions_url("http://vllm:8000") == "http://vllm:8000/v1/chat/completions"
+    # a full route is used verbatim
+    assert syn.chat_completions_url("https://api.openai.com/v1/chat/completions") == \
+        "https://api.openai.com/v1/chat/completions"
+
+
+def test_proxy_guard_and_generator_agree_on_the_same_url():
+    from gateway import proxy_api
+    for base in ("https://gw/proxy/x/v1", "http://vllm:8000", "https://gw/v1/chat/completions"):
+        assert proxy_api._rt_chat_url(base) == syn.chat_completions_url(base)

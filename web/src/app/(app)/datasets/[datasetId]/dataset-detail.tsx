@@ -11,6 +11,7 @@ import { ColumnsCard } from "./columns-card";
 import { LabelImportCard } from "./label-import-card";
 import { TransformationCard } from "./transformation-card";
 import { RowBrowser } from "./row-browser";
+import { GenerationCard } from "./generation-card";
 import { DecoderCard, type DecoderState } from "./decoder-card";
 import { UploadCard } from "./upload-card";
 import { SyncCard } from "./sync-card";
@@ -199,6 +200,9 @@ export function DatasetDetail({
               {dataset.kind === "tts_packed" && (
                 <DecoderCard datasetId={dataset.id} onState={setDecoder} />
               )}
+              {/* Synthetic corpus: status + collapsible generation log + regenerate.
+                  Rows arrive while a generation runs, so this belongs next to them. */}
+              {dataset.gen_spec && <GenerationCard dataset={dataset} />}
               <RowBrowser
                 datasetId={dataset.id}
                 initial={preview}

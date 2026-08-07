@@ -471,6 +471,32 @@ function ChatBubbles({ msgs, markScored = false }: { msgs: ChatMessage[]; markSc
   );
 }
 
+
+/** The reference block a synthetic (red-team) row carries: which attack category
+ * it is, or that it's a benign control. `expected.attack` is what the `red_team`
+ * evaluator scores against, so showing the user message alone hides half the row. */
+function ExpectedBadge({ row }: { row: DatasetPreviewRow }) {
+  const exp = row.expected as
+    | { attack?: boolean; attack_type?: string; expect_refusal?: boolean }
+    | undefined;
+  if (!exp || typeof exp !== "object" || exp.attack === undefined) return null;
+  const attack = !!exp.attack;
+  return (
+    <span
+      title={attack ? "attack row — a refusal is the correct answer"
+                    : "benign control — the model should answer normally"}
+      className={cn(
+        "shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px]",
+        attack
+          ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
+          : "bg-muted text-muted-foreground",
+      )}
+    >
+      {attack ? exp.attack_type || "attack" : "benign"}
+    </span>
+  );
+}
+
 /** One LLM / multimodal row — chat bubbles with per-role colours, reasoning traces, tool calls. */
 function LlmRowItem({
   index,
@@ -499,6 +525,7 @@ function LlmRowItem({
         <span className="mt-0.5 w-9 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
           #{index + 1}
         </span>
+        <ExpectedBadge row={row} />
         <span className="flex-1 space-y-0.5">
           {msgs == null ? (
             <span className="text-sm text-muted-foreground">(no messages)</span>
@@ -524,6 +551,14 @@ function LlmRowItem({
         <div className="space-y-3 border-t border-border p-3">
           {audio && <WaveformPlayer src={audio} />}
           {msgs && <ChatBubbles msgs={msgs} />}
+          {!!row.expected && typeof row.expected === "object" && (
+            <div className="rounded-md border border-border bg-muted/30 p-2">
+              <div className="mb-1 text-[11px] font-medium text-muted-foreground">expected</div>
+              <pre className="overflow-x-auto text-[11px] leading-relaxed scrollbar-thin">
+                {JSON.stringify(row.expected, null, 2)}
+              </pre>
+            </div>
+          )}
         </div>
       )}
     </div>

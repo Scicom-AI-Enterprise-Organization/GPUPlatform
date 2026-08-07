@@ -460,6 +460,12 @@ class Dataset(Base):
     # ([{role,content}]). Default "messages". In DPO (preference) mode this names
     # the CHOSEN column and `rejected_field` names the rejected column.
     messages_field: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Set when the rows were WRITTEN BY A GENERATOR MODEL rather than captured or
+    # uploaded (synthetic red-team corpora): the sanitized spec — mode, row target,
+    # categories, generator model/base_url. **Never the API key.** It is also the
+    # marker that identifies a generation job, so a run orphaned by a gateway
+    # restart can be reaped without string-matching the description.
+    gen_spec: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     # kind=llm preference (DPO) mode: which column holds the REJECTED response
     # (chosen = messages_field). NULL → chat/SFT mode (no preference pairing). Its
     # presence is what flips the dataset into "dpo" mode (columns card + preview).
@@ -1173,6 +1179,11 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS messages_field VARCHAR(128)"
+        ))
+        # Synthetic (generator-written) corpora: the sanitized generation spec,
+        # and the marker that lets restart-cleanup find an interrupted job.
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS gen_spec JSON"
         ))
         # Custom evaluators gained an `api` mode, whose endpoint/parsing settings
         # live in a JSON blob (expression + python modes keep using `code`).

@@ -367,11 +367,13 @@ export function ExperimentForm({
                 <Download className="h-4 w-4" />
                 Capture requests
               </Button>
-              {/* Opens the same dialog on its Generate tab — for red teaming, where
-                  the traffic to capture doesn't exist yet. */}
-              <Button type="button" variant="outline" size="sm" onClick={() => setCapture("synthetic")}>
-                <ShieldAlert className="h-4 w-4" />
-                Generate corpus
+              {/* Red teaming has nothing to capture, so the corpus is GENERATED —
+                  which is a Datasets concern, not an Experiments one. */}
+              <Button type="button" variant="outline" size="sm" asChild>
+                <Link href="/datasets/new?source=generate">
+                  <ShieldAlert className="h-4 w-4" />
+                  Generate corpus
+                </Link>
               </Button>
               <Button type="button" variant="outline" size="sm" asChild>
                 <Link href="/datasets">Datasets</Link>
@@ -390,13 +392,12 @@ export function ExperimentForm({
                 capture requests
               </button>{" "}
               from a Langfuse trace or your served traffic,{" "}
-              <button
-                type="button"
-                onClick={() => setCapture("synthetic")}
+              <Link
+                href="/datasets/new?source=generate"
                 className="font-medium text-foreground underline underline-offset-2"
               >
                 generate a red-team corpus
-              </button>
+              </Link>
               , or add one in{" "}
               <Link
                 href="/datasets"

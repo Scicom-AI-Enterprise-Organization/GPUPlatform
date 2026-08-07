@@ -18,11 +18,20 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { FormFooter, FormShell } from "@/components/form-shell";
 import { gateway } from "@/lib/gateway";
-import type { DatasetKind, GlobalEnvRecord, StorageRecord } from "@/lib/types";
+import type {
+  DatasetKind,
+  GenerateDatasetOptions,
+  GenerateDatasetRequest,
+  GenerateDatasetRow,
+  GlobalEnvRecord,
+  StorageRecord,
+} from "@/lib/types";
 
-// `upload_chat` is a UI-only pseudo-kind: it maps to kind=upload with a messages
-// column set (an uploaded chat dataset). Everything else is a real DatasetKind.
-type FormKind = DatasetKind | "upload_chat";
+// `upload_chat` and `generate` are UI-only pseudo-kinds. Both produce a
+// kind=upload chat dataset; `generate` posts to /v1/datasets/generate instead of
+// the plain create route, because its rows are WRITTEN BY A MODEL in the
+// background rather than uploaded. Everything else is a real DatasetKind.
+type FormKind = DatasetKind | "upload_chat" | "generate";
 
 const KINDS: { value: FormKind; label: string; description: string }[] = [
   { value: "upload", label: "Upload metadata", description: "Upload a CSV / JSON / JSONL with {audio, transcription} rows to an S3 storage." },
@@ -32,6 +41,7 @@ const KINDS: { value: FormKind; label: string; description: string }[] = [
   { value: "label", label: "Labeling platform", description: "Import {audio, transcription} from a labeling-platform project using its API token." },
   { value: "tts_packed", label: "TTS packed (existing S3 shards)", description: "Register ChiniDataset parquet shards (NeuCodec multipack) already in S3 by their prefix." },
   { value: "llm_packed", label: "LLM packed (existing S3 shards)", description: "Register chat-multipack ChiniDataset parquet shards already in S3 by their prefix." },
+  { value: "generate", label: "Generate (synthetic)", description: "Have an OpenAI-compatible model write the rows — e.g. a red-team corpus of attack prompts plus benign controls. The dataset is created immediately and its rows fill in the background." },
 ];
 
 // The selected source card lives in the URL (?source=…) so it's shareable +
@@ -69,6 +79,24 @@ export function DatasetForm({
   const [storageId, setStorageId] = useState("");
   const [audioPrefix, setAudioPrefix] = useState("");
   const [s3MetadataUri, setS3MetadataUri] = useState("");
+  // generate (synthetic): the generator endpoint + what to write. Options
+  // (taxonomy + ceilings) are server-driven — adding a category in synthetic.py
+  // needs no change here.
+  const [genOpts, setGenOpts] = useState<GenerateDatasetOptions | null>(null);
+  const [genBase, setGenBase] = useState("");
+  const [genModel, setGenModel] = useState("");
+  const [genKeyMode, setGenKeyMode] = useState<"secret" | "paste">("secret");
+  const [genKey, setGenKey] = useState("");
+  const [genKeySecret, setGenKeySecret] = useState("");
+  const [genMode, setGenMode] = useState<"attack" | "benign" | "mixed">("mixed");
+  const [genRows, setGenRows] = useState(30);
+  const [genCats, setGenCats] = useState<Set<string>>(new Set());
+  const [genDomain, setGenDomain] = useState("");
+  const [genLanguages, setGenLanguages] = useState("");
+  const [genSystemPrompt, setGenSystemPrompt] = useState("");
+  const [genExtra, setGenExtra] = useState("");
+  const [genPreview, setGenPreview] = useState<GenerateDatasetRow[] | null>(null);
+  const [genPreviewBusy, setGenPreviewBusy] = useState(false);
   const [hfRepo, setHfRepo] = useState("");
   const [hfRevision, setHfRevision] = useState("");
   // tts_packed: the tokenizer + multipack sequence length the shards were packed with
@@ -118,8 +146,56 @@ export function DatasetForm({
     [storages, kind],
   );
 
+  useEffect(() => {
+    if (kind !== "generate" || genOpts) return;
+    gateway
+      .generateDatasetOptions()
+      .then((o) => {
+        setGenOpts(o);
+        setGenRows(o.default_rows);
+        setGenCats(new Set(o.categories.map((c) => c.id)));   // all on by default
+      })
+      .catch(() => {});
+  }, [kind, genOpts]);
+
+  const genBody = (): GenerateDatasetRequest => ({
+    name: name.trim(),
+    storage_id: storageId,
+    description: description.trim() || null,
+    base_url: genBase.trim(),
+    model: genModel.trim(),
+    api_key: genKeyMode === "paste" ? genKey.trim() || null : null,
+    api_key_secret: genKeyMode === "secret" ? genKeySecret || null : null,
+    mode: genMode,
+    n_rows: genRows,
+    categories: [...genCats],
+    languages: genLanguages.split(/[,\n]+/).map((x) => x.trim()).filter(Boolean),
+    domain: genDomain.trim(),
+    system_prompt: genSystemPrompt.trim(),
+    extra_instructions: genExtra.trim(),
+  });
+
+  const onPreviewGenerated = async () => {
+    setGenPreviewBusy(true);
+    setError(null);
+    try {
+      const res = await gateway.previewGeneratedRows(genBody());
+      setGenPreview(res.rows);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGenPreviewBusy(false);
+    }
+  };
+
   const validate = (): string | null => {
     if (!name.trim()) return "Name is required.";
+    if (kind === "generate") {
+      if (!storageId) return "Pick an S3 storage backend.";
+      if (!genBase.trim()) return "Generator base URL is required.";
+      if (!genModel.trim()) return "Generator model is required.";
+      if (genCats.size === 0) return "Pick at least one attack category.";
+    }
     if (kind === "upload" || kind === "upload_chat" || kind === "s3" || kind === "tts_packed" || kind === "llm_packed") {
       if (!storageId) return "Pick an S3 storage backend.";
       if (kind === "s3" && !s3MetadataUri.trim()) return "S3 metadata URI is required.";
@@ -145,6 +221,14 @@ export function DatasetForm({
     setError(null);
     setSubmitting(true);
     try {
+      // Generation returns as soon as the EMPTY row exists — the rows arrive
+      // afterwards, so we navigate straight to the detail page where the
+      // transform card shows them growing.
+      if (kind === "generate") {
+        const created = await gateway.generateDataset(genBody());
+        router.push(`/datasets/${encodeURIComponent(created.id)}`);
+        return;
+      }
       const labelParsed = kind === "label" ? parseLabelProjectUrl(labelProjectUrl) : null;
       // upload_chat is a UI-only kind → a kind=upload dataset with a messages column.
       const isChatUpload = kind === "upload_chat";
@@ -557,6 +641,175 @@ export function DatasetForm({
                   ({`[{role, content}]`}). Uploaded to the selected storage on submit.
                 </p>
               </div>
+            </div>
+          )}
+
+          {kind === "generate" && (
+            <div className="space-y-4">
+              <div className="grid items-start gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label className="text-xs uppercase tracking-wide text-muted-foreground">S3 storage</Label>
+                  <Select value={storageId} onValueChange={setStorageId}>
+                    <SelectTrigger>
+                      <SelectValue placeholder={storageOptions.length ? "Choose a storage" : "No S3 storage configured"} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {storageOptions.map((st) => (
+                        <SelectItem key={st.id} value={st.id}>
+                          {st.name}
+                          {st.bucket ? ` — s3://${st.bucket}` : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    The generated rows are written here as <span className="font-mono">cases.jsonl</span>, republished after every batch.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs uppercase tracking-wide text-muted-foreground">Corpus</Label>
+                  <Select value={genMode} onValueChange={(v) => setGenMode(v as typeof genMode)}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="mixed">Attacks + benign controls</SelectItem>
+                      <SelectItem value="attack">Attacks only</SelectItem>
+                      <SelectItem value="benign">Benign controls only</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    Benign controls are harmless look-alikes the model <em>should</em> answer — without them, a model that refuses everything scores a perfect refusal rate.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid items-start gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="gen-base" className="text-xs uppercase tracking-wide text-muted-foreground">Generator base URL</Label>
+                  <Input id="gen-base" value={genBase} onChange={(e) => setGenBase(e.target.value)}
+                         placeholder="https://…/proxy/gemma/v1" className="font-mono text-xs" />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="gen-model" className="text-xs uppercase tracking-wide text-muted-foreground">Generator model</Label>
+                  <Input id="gen-model" value={genModel} onChange={(e) => setGenModel(e.target.value)}
+                         placeholder="gemma" className="font-mono text-xs" />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">Generator API key</Label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+                    {(["secret", "paste"] as const).map((m) => (
+                      <button key={m} type="button" onClick={() => setGenKeyMode(m)}
+                              className={cn("rounded px-2 py-1",
+                                genKeyMode === m ? "bg-primary text-primary-foreground"
+                                                 : "text-muted-foreground hover:text-foreground")}>
+                        {m === "secret" ? "Secret ref" : "Paste"}
+                      </button>
+                    ))}
+                  </div>
+                  {genKeyMode === "secret" ? (
+                    <Select value={genKeySecret} onValueChange={setGenKeySecret}>
+                      <SelectTrigger className="h-8 max-w-xs text-xs"><SelectValue placeholder="Pick a secret" /></SelectTrigger>
+                      <SelectContent>
+                        {secrets.map((x) => (
+                          <SelectItem key={x.key} value={x.key} className="text-xs">{x.key}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input type="password" autoComplete="off" value={genKey}
+                           onChange={(e) => setGenKey(e.target.value)}
+                           placeholder="sgpu_… (never stored)" className="h-8 max-w-xs font-mono text-xs" />
+                  )}
+                  <span className="text-xs text-muted-foreground">optional — omit for a keyless endpoint</span>
+                </div>
+              </div>
+
+              <div className="grid items-start gap-4 sm:grid-cols-3">
+                <div className="space-y-2">
+                  <Label htmlFor="gen-rows" className="text-xs uppercase tracking-wide text-muted-foreground">Rows</Label>
+                  <Input id="gen-rows" type="number" min={1} max={genOpts?.max_rows ?? 200} value={genRows}
+                         onChange={(e) => setGenRows(Number(e.target.value) || 1)} />
+                  <p className="text-xs text-muted-foreground">max {genOpts?.max_rows ?? 200}</p>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="gen-langs" className="text-xs uppercase tracking-wide text-muted-foreground">Languages</Label>
+                  <Input id="gen-langs" value={genLanguages} onChange={(e) => setGenLanguages(e.target.value)}
+                         placeholder="english, malay" />
+                  <p className="text-xs text-muted-foreground">blank = English</p>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="gen-domain" className="text-xs uppercase tracking-wide text-muted-foreground">Target the attacks at</Label>
+                  <Input id="gen-domain" value={genDomain} onChange={(e) => setGenDomain(e.target.value)}
+                         placeholder="a telco customer-service agent" />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">Attack categories</Label>
+                <div className="flex flex-wrap gap-1.5">
+                  {(genOpts?.categories ?? []).map((c) => {
+                    const on = genCats.has(c.id);
+                    return (
+                      <button key={c.id} type="button" title={c.brief}
+                              onClick={() => setGenCats((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(c.id)) next.delete(c.id);
+                                else next.add(c.id);
+                                return next;
+                              })}
+                              className={cn("rounded-md border px-2 py-1 font-mono text-[11px] transition-colors",
+                                on ? "border-primary bg-primary/10 text-foreground"
+                                   : "border-border text-muted-foreground hover:text-foreground")}>
+                        {c.id}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Rows are split evenly across the selected categories — the same taxonomy the proxy&apos;s red-team guard reports.
+                </p>
+              </div>
+
+              <div className="grid items-start gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="gen-sys" className="text-xs uppercase tracking-wide text-muted-foreground">System prompt for each row</Label>
+                  <Input id="gen-sys" value={genSystemPrompt} onChange={(e) => setGenSystemPrompt(e.target.value)}
+                         placeholder="optional — the prompt under test" />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="gen-extra" className="text-xs uppercase tracking-wide text-muted-foreground">Extra instructions to the generator</Label>
+                  <Textarea id="gen-extra" rows={2} value={genExtra} onChange={(e) => setGenExtra(e.target.value)}
+                            placeholder="optional — e.g. keep prompts under 40 words" className="text-xs" />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
+                <Button type="button" variant="outline" size="sm" onClick={() => void onPreviewGenerated()}
+                        disabled={genPreviewBusy || !genBase.trim() || !genModel.trim() || genCats.size === 0}>
+                  {genPreviewBusy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Preview {genOpts?.preview_rows ?? 6} rows
+                </Button>
+                <span className="text-xs text-muted-foreground">
+                  costs one call and creates nothing — check the endpoint before generating {genRows} rows
+                </span>
+              </div>
+
+              {genPreview && (
+                <ul className="max-h-60 space-y-1.5 overflow-y-auto rounded-md border border-border p-2">
+                  {genPreview.map((r, i) => (
+                    <li key={i} className="flex items-start gap-2 text-xs">
+                      <span className={cn("mt-0.5 shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px]",
+                        r.expected?.attack ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
+                                           : "bg-muted text-muted-foreground")}>
+                        {r.expected?.attack ? r.expected?.attack_type || "attack" : "benign"}
+                      </span>
+                      <span className="min-w-0 flex-1">{r.messages[r.messages.length - 1]?.content}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           )}
 

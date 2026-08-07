@@ -49,6 +49,9 @@ import type {
   LlmPackRequest,
   DatasetMergeRequest,
   DatasetRecord,
+  GenerateDatasetRequest,
+  GenerateDatasetPreview,
+  GenerateDatasetOptions,
   DatasetPreview,
   DatasetFile,
   SyncDatasetRequest,
@@ -89,9 +92,6 @@ import type {
   CaptureResult,
   CaptureLangfuseRequest,
   CapturePlatformRequest,
-  SynthesizeRequest,
-  SynthesizePreview,
-  SynthesizeOptions,
   ExperimentRecord,
   ExperimentSummary,
   ExperimentSampleRecord,
@@ -1142,6 +1142,32 @@ export const gateway = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  /** Synthetic corpus generation (red teaming): options → preview → create.
+   * `generateDataset` returns as soon as the (empty) dataset row exists — the
+   * rows are then filled by a background job, so poll GET /{id} for
+   * transform_status / transform_log / num_rows. */
+  generateDatasetOptions: () =>
+    request<GenerateDatasetOptions>("/v1/datasets/generate/options"),
+  previewGeneratedRows: (body: GenerateDatasetRequest) =>
+    request<GenerateDatasetPreview>("/v1/datasets/generate/preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  generateDataset: (body: GenerateDatasetRequest) =>
+    request<DatasetRecord>("/v1/datasets/generate", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Re-run generation for an existing synthetic dataset, REPLACING its rows.
+   * Defaults come from the stored gen_spec; only a pasted key needs re-supplying. */
+  regenerateDataset: (
+    id: string,
+    body: { api_key?: string | null; api_key_secret?: string | null; n_rows?: number; mode?: string } = {},
+  ) =>
+    request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}/regenerate`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   updateDataset: (id: string, body: UpdateDatasetRequest) =>
     request<DatasetRecord>(`/v1/datasets/${encodeURIComponent(id)}`, {
       method: "PATCH",
@@ -1412,20 +1438,6 @@ export const gateway = {
     }),
   capturePlatformRequests: (body: CapturePlatformRequest) =>
     request<CaptureResult>("/v1/experiments/capture/platform", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-
-  /** Synthetic corpus generation (red teaming): options → preview → create. */
-  synthesizeOptions: () =>
-    request<SynthesizeOptions>("/v1/experiments/synthesize/options"),
-  previewSynthesizedRows: (body: SynthesizeRequest) =>
-    request<SynthesizePreview>("/v1/experiments/synthesize/preview", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  synthesizeDataset: (body: SynthesizeRequest) =>
-    request<CaptureResult>("/v1/experiments/synthesize", {
       method: "POST",
       body: JSON.stringify(body),
     }),

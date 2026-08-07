@@ -20,18 +20,21 @@ the right answer whenever the logic already lives somewhere else. URLs go throug
 `netsafe.assert_safe_fetch_url`, which permits internal hosts (an in-cluster
 scorer is a legitimate target) but blocks link-local / cloud-metadata addresses.
 
-**`python`** (opt-in, off by default). A real `def check(c)`. This one executes
-arbitrary user code, so it is gated twice — `EXPERIMENT_ALLOW_PYTHON_EVALUATORS=1`
-AND admin role — and runs in a separate process with a scrubbed environment
-(none of the gateway's DB / Fernet / cloud credentials), CPU + address-space +
-file-descriptor rlimits, and a wall-clock kill.
+**`python`** (**admin-only, on by default**). A real `def check(c)`. This one
+executes arbitrary user code, so it is restricted to **admin role** (re-checked at
+save AND at experiment-create time) and runs in a separate process with a scrubbed
+environment (none of the gateway's DB / Fernet / cloud credentials), CPU +
+address-space + file-descriptor rlimits, and a wall-clock kill. Set
+`EXPERIMENT_ALLOW_PYTHON_EVALUATORS=0` to disable the mode outright.
 
 ⚠️ **Be honest about what the `python` sandbox is and isn't.** It removes the
 credentials from the environment, bounds CPU and memory, and keeps user code out
 of the gateway's own process — a real reduction in blast radius. It does NOT
 prevent a determined author from reading the filesystem the gateway user can read
-or opening a socket. Treat enabling it as granting code execution on the gateway
-host to whoever can reach the endpoint. The expression mode has no such caveat.
+or opening a socket. With the mode on by default, **admin role is the whole
+control**: anyone who is an admin (or who can reach an endpoint authenticated as
+one) has code execution on the gateway host. Deployments where that is not
+acceptable must set the env var to 0. The expression mode has no such caveat.
 """
 from __future__ import annotations
 
@@ -65,7 +68,21 @@ PY_MEM_BYTES = int(os.environ.get("EXPERIMENT_PY_EVAL_MEM_MB", "512") or "512") 
 
 
 def python_mode_enabled() -> bool:
-    return (os.environ.get(PYTHON_MODE_ENV, "") or "").strip().lower() in ("1", "true", "yes")
+    """Whether python-mode evaluators may be authored/run at all.
+
+    ⚠ **Default ON (opt-OUT)** since 2026-08-07, by explicit product decision.
+    The other half of the gate — **admin role** — still applies and is checked
+    separately at both save and experiment-create time, so this is not
+    "anyone can run code": it is "an admin can, without an env flag first".
+
+    Set `EXPERIMENT_ALLOW_PYTHON_EVALUATORS=0` (or false/no/off) to restore the
+    old refuse-by-default behaviour on a deployment where even admin-authored
+    code execution on the gateway host is unacceptable.
+    """
+    raw = (os.environ.get(PYTHON_MODE_ENV, "") or "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
 
 
 class CustomEvalError(ValueError):
@@ -817,8 +834,9 @@ def validate_spec(
         return
     if not allow_python:
         raise CustomEvalError(
-            "python-mode evaluators are disabled. They execute arbitrary code on the "
-            f"gateway host, so they require admin role and {PYTHON_MODE_ENV}=1."
+            "python-mode evaluators are not available to you. They execute arbitrary "
+            "code on the gateway host, so they require admin role"
+            f" (and are blocked entirely when {PYTHON_MODE_ENV}=0)."
         )
     if len(code) > 20000:
         raise CustomEvalError("python evaluator too long (20000 char limit)")

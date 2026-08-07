@@ -235,9 +235,10 @@ export function CustomEvaluatorEditor({
         <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>
-            Python evaluators execute arbitrary code on the gateway host, so they need admin
-            role and <code className="font-mono">{context.python_env_var}=1</code> in the
-            gateway environment. Expression mode needs neither.
+            Python evaluators execute arbitrary code on the gateway host, so they require admin
+            role — and are unavailable entirely when{" "}
+            <code className="font-mono">{context.python_env_var}=0</code> is set in the gateway
+            environment. Expression mode needs neither.
           </span>
         </div>
       )}

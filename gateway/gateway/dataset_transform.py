@@ -161,6 +161,171 @@ async def start_llm_pack(
     task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
 
 
+async def start_generate(dataset_id: str, gen: dict) -> None:
+    """Kick off synthetic row generation for an already-created (empty) dataset.
+
+    The row is created up front by the API and returned immediately — same shape
+    as `merge_datasets` — so the UI navigates to a real dataset whose rows then
+    GROW in the background. `gen` carries the generator endpoint + key **in
+    memory only**: it is never written to the Dataset row, so an inline key
+    cannot be read back out of the API later.
+    """
+    async with session_factory()() as s:
+        d = await s.get(Dataset, dataset_id)
+        if d is None:
+            return
+        d.transform_status = "running"
+        d.transform_log = _append_log(
+            None, f"generation queued ({gen.get('n_rows')} rows, mode={gen.get('mode')}, "
+                  f"model={gen.get('model')})")
+        await s.commit()
+    task = asyncio.create_task(_run_generate(dataset_id, gen))
+    _active[dataset_id] = task
+    task.add_done_callback(lambda t: _active.pop(dataset_id, None))
+
+
+def _rows_to_jsonl(rows: list[dict]) -> bytes:
+    import json as _json
+    return ("\n".join(_json.dumps(r, ensure_ascii=False) for r in rows) + "\n").encode()
+
+
+async def _run_generate(dataset_id: str, gen: dict) -> None:
+    """Generate rows batch by batch, publishing after EVERY batch.
+
+    ⚠ The publish rewrites the whole JSONL each time rather than appending. S3
+    has no append, and the corpus is bounded (`EXPERIMENT_SYNTH_MAX_ROWS`, 200 —
+    tens of KB), so a full rewrite is both simpler and safe to interrupt: the
+    object is always a complete, parseable file matching `num_rows`. A partial
+    trailing line would make the dataset unreadable for every consumer, which is
+    the whole risk of "rows grow in the background".
+    """
+    from fastapi.concurrency import run_in_threadpool
+
+    import httpx
+
+    from . import synthetic as syn
+    from .datasets_api import _metadata_key, _s3_target_and_prefix
+    from .experiments_api import call_once
+    from .bench import s3_put_file
+
+    cancel_event = threading.Event()
+    _cancel_events[dataset_id] = cancel_event
+    rows: list[dict] = []
+    try:
+        spec = syn.normalize_spec(gen, gen.get("max_rows") or 200)
+        async with session_factory()() as s:
+            d = await s.get(Dataset, dataset_id)
+            if d is None:
+                return
+            storage = await s.get(Storage, d.storage_id) if d.storage_id else None
+            filename = d.metadata_filename or "cases.jsonl"
+        if storage is None or storage.kind != "s3":
+            await _finish(dataset_id, "failed", "generation needs a kind=s3 storage")
+            return
+        target, _prefix = _s3_target_and_prefix(storage)
+        key = _metadata_key(storage, dataset_id, filename)
+
+        async def publish() -> None:
+            """Write the corpus so far + advance the row count."""
+            body = _rows_to_jsonl(rows)
+            import tempfile
+            with tempfile.NamedTemporaryFile() as tmp:
+                tmp.write(body)
+                tmp.flush()
+                await run_in_threadpool(s3_put_file, key, tmp.name, target)
+            async with session_factory()() as s2:
+                d2 = await s2.get(Dataset, dataset_id)
+                if d2 is not None:
+                    d2.num_rows = len(rows)
+                    d2.size_bytes = len(body)
+                    await s2.commit()
+
+        # Publish an EMPTY file before the first batch. Between row-create and the
+        # first publish the dataset otherwise points at an object that doesn't
+        # exist yet, and every reader reports "metadata file not found in storage"
+        # — which reads as a broken dataset rather than one that is still filling.
+        await publish()
+
+        batches = syn.plan_batches(spec, int(gen.get("batch_size") or syn.DEFAULT_BATCH))
+        want = {"attack": spec.n_attack(), "benign": spec.n_benign()}
+        got = {"attack": 0, "benign": 0}
+        total = sum(want.values())
+        seen: set[str] = set()
+        chat_url = syn.chat_completions_url(gen.get("base_url") or "")
+        model = gen.get("model") or ""
+        key_hdr = gen.get("api_key") or ""
+        timeout = float(gen.get("timeout_s") or 120.0)
+        failures = 0
+
+        await _log(dataset_id, f"generating {total} rows in {len(batches)} batch(es) via {model}")
+        # Its own client, closed with the job: a dataset-section background task
+        # must not consume the experiment runner's connection pool.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=15.0, read=None, write=None, pool=15.0),
+            follow_redirects=True,
+        ) as client:
+            for i, (kind, category, count) in enumerate(batches):
+                if cancel_event.is_set():
+                    break
+                body_req = {
+                    "model": model,
+                    "messages": syn.build_messages(spec, kind, category, count, variation=i),
+                    "temperature": float(gen.get("temperature") or 1.0),
+                    "max_tokens": 2048,
+                    "stream": False,
+                }
+                # `base` is already normalized to the full chat-completions URL —
+                # pass an EMPTY path so call_once can't append /v1 a second time.
+                comp = await call_once(client, chat_url, "", key_hdr, body_req, timeout)
+                if comp.error:
+                    failures += 1
+                    await _log(dataset_id, f"batch {i + 1}/{len(batches)} ({category}) failed: {comp.error}")
+                    continue
+                fresh = syn.dedupe(syn.parse_prompts(comp.content), seen)
+                added = 0
+                for p in fresh:
+                    if got[kind] >= want[kind]:
+                        break
+                    got[kind] += 1
+                    added += 1
+                    rows.append(syn.to_row(p, kind, category, spec, got[kind]))
+                if not added:
+                    failures += 1
+                    await _log(dataset_id, f"batch {i + 1}/{len(batches)} ({category}) added nothing "
+                                           "(unparseable or all duplicates)")
+                    continue
+                # Publish after every batch — this is what "rows grow" means.
+                await publish()
+                pct = (len(rows) / total * 100.0) if total else 0.0
+                await _log(dataset_id,
+                           f"[AUTOTRAIN_PROGRESS] step=generate processed={len(rows)} "
+                           f"total={total} percent={pct:.1f}")
+
+        if cancel_event.is_set():
+            if rows:
+                await publish()
+            await _finish(dataset_id, "cancelled",
+                          f"generation cancelled — kept {len(rows)} row(s)")
+            return
+        if not rows:
+            await _finish(dataset_id, "failed",
+                          "the generator produced no usable rows — check the base URL, model and key")
+            return
+        await publish()
+        note = f" ({failures} batch(es) produced nothing)" if failures else ""
+        await _finish(dataset_id, "done",
+                      f"generated {len(rows)} row(s): {got['attack']} attack / {got['benign']} benign{note}")
+    except asyncio.CancelledError:
+        # Keep whatever was already published — a cancelled generation leaves a
+        # smaller but perfectly usable dataset, not a broken one.
+        raise
+    except Exception as exc:  # noqa: BLE001 — surface to the row, never kill the loop
+        logger.exception("generation failed for %s", dataset_id)
+        await _finish(dataset_id, "failed", f"generation failed: {type(exc).__name__}: {exc}")
+    finally:
+        _cancel_events.pop(dataset_id, None)
+
+
 async def cancel_transform(dataset_id: str) -> bool:
     """Abort an in-flight audio-extraction OR LLM-pack transform for this dataset.
     Returns True if one was running. (Pack-only TTS runs are training runs —

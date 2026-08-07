@@ -1145,6 +1145,20 @@ export type DatasetRecord = {
   label_token_secret?: string | null; // global-secret key (if used instead of a stored token)
   transform_status?: string | null; // "" | running | done | failed
   transform_log?: string | null;
+  /** Present when the rows were WRITTEN BY A GENERATOR MODEL (synthetic corpus).
+   * Carries mode/rows/categories/model and the API-key SECRET NAME if one was
+   * used — never the key. Its presence is what enables Regenerate. */
+  gen_spec?: {
+    mode?: string;
+    n_rows?: number;
+    categories?: string[];
+    languages?: string[];
+    domain?: string;
+    model?: string;
+    base_url?: string;
+    api_key_secret?: string | null;
+    keyless?: boolean;
+  } | null;
   catalog_repo_id?: string | null; // hosted HF-mirror dataset repo (if published)
   created_at: string;
   updated_at: string;
@@ -2154,11 +2168,13 @@ export type CapturePlatformRequest = {
   search?: string;
 };
 
-// Generate an eval corpus with an OpenAI-compatible model instead of capturing
-// one — the red-teaming case, where the traffic doesn't exist yet. Rows carry
+// Generate a dataset with an OpenAI-compatible model instead of capturing one —
+// the red-teaming case, where the traffic doesn't exist yet. Rows carry
 // `expected.{attack,attack_type,expect_refusal}` so the `red_team` evaluator
 // scores attacks and benign controls by their own (opposite) rules.
-export type SynthesizeRequest = {
+// POST /v1/datasets/generate returns immediately with an EMPTY dataset; the rows
+// are filled by a background job (poll transform_status / num_rows).
+export type GenerateDatasetRequest = {
   base_url: string;
   model: string;
   api_key?: string | null;
@@ -2175,17 +2191,18 @@ export type SynthesizeRequest = {
   timeout_s?: number;
   name?: string;
   storage_id?: string;
+  description?: string | null;
 };
 
-export type SynthesizeRow = {
+export type GenerateDatasetRow = {
   name: string;
   messages: { role: string; content: string }[];
   expected?: { attack?: boolean; attack_type?: string; expect_refusal?: boolean };
   source_ref?: string;
 };
 
-export type SynthesizePreview = {
-  rows: SynthesizeRow[];
+export type GenerateDatasetPreview = {
+  rows: GenerateDatasetRow[];
   n_attack: number;
   n_benign: number;
   warnings: string[];
@@ -2193,7 +2210,7 @@ export type SynthesizePreview = {
 
 // Server-driven generate-form options (taxonomy + ceilings), same convention as
 // the evaluator registry — adding a category in synthetic.py needs no UI change.
-export type SynthesizeOptions = {
+export type GenerateDatasetOptions = {
   modes: string[];
   categories: { id: string; brief: string }[];
   max_rows: number;

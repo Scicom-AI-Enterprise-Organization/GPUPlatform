@@ -58,14 +58,10 @@ can be browsed, published, packed and reused. Consequences to preserve:
 - **Capture writes a real dataset.** `new/capture-dialog.tsx` → `/v1/experiments/capture/*`
   creates a `kind=upload` chat dataset on a chosen S3 storage and selects it. Don't reintroduce a
   private store for captured requests.
-- **The same dialog GENERATES one, on its third tab** (`?capture=synthetic` → the "Generate
-  (red team)" tab → `/v1/experiments/synthesize*`). Red teaming has nothing to capture, so a
-  generator model writes the corpus; it lands as the same `kind=upload` dataset. Two things here
-  are load-bearing: the **category chips are server-driven** (`/synthesize/options`, so adding a
-  category in `synthetic.py` needs no change here — same rule as the evaluator registry), and the
-  default corpus mode is **mixed**, i.e. attacks *plus benign controls*, because an attack-only
-  corpus can't distinguish a safe model from one that refuses everything. **Preview** costs one
-  call and creates nothing — keep it as the pre-flight for a wrong URL/model/key. Score those runs
+- **Generating a corpus is a DATASETS feature, not an Experiments one** — red teaming has nothing
+  to capture, so `/datasets/new` → source "Generate (synthetic)" has a model write the rows
+  (`/v1/datasets/generate`), and the dataset then appears in this form's picker like any other. The
+  form links out to it; do NOT reintroduce a generate tab in `capture-dialog.tsx`. Score those runs
   with the `red_team` evaluator (its per-row direction comes from `expected.attack`, which the
   generator writes).
 - **Defaults follow the dataset's size, and that is load-bearing.** The two uses of this feature
@@ -115,7 +111,8 @@ rows without a usable messages cell are dropped. That distinction is why the foo
   not decoration — `fail_when_true` silently inverts every result if chosen wrong.
   Three modes in the editor: **expression** (textarea), **api** (the `API_FIELDS` grid — URL plus
   dotted response paths), **python** (greyed out unless `custom_context.python_allowed`, with the
-  reason inline). api mode stores its settings in `config`, not `code`, so `codeReady` gates the
+  reason inline — that flag is now `admin role` alone, since python mode is on by default;
+  `EXPERIMENT_ALLOW_PYTHON_EVALUATORS=0` still turns it off platform-wide). api mode stores its settings in `config`, not `code`, so `codeReady` gates the
   Test/Save buttons on the URL instead.
 - Target suggestions come from `GET /v1/experiments/targets` (this platform's apps + proxy
   endpoints) but they only *prefill* the form — an experiment always stores plain

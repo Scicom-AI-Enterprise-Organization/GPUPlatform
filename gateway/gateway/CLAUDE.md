@@ -421,29 +421,44 @@ pools tp/fp/fn across every reply, and per-language accuracy pools per class. So
 reading first). Averaging the per-sample rates instead would NOT reproduce the benchmark's tables.
 The per-sample `flags` that feed it are pooled and discarded — never stored on the cell.
 
-**Synthetic corpus generation** (`synthetic.py` + `/v1/experiments/synthesize*`). Red teaming is the
-case where there is nothing to capture — nobody has a log of the attacks nobody has tried yet — so a
-generator LLM (any OpenAI-compatible endpoint) WRITES the corpus and it lands as a real `kind=upload`
-chat Dataset through the same `_create_case_dataset` a capture uses. UI = a third tab on the capture
-dialog (`?capture=synthetic`).
+**Synthetic corpus generation** (`synthetic.py` + `dataset_transform._run_generate` +
+`/v1/datasets/generate*`). Red teaming is the case where there is nothing to capture — nobody has a
+log of the attacks nobody has tried yet — so a generator LLM (any OpenAI-compatible endpoint) WRITES
+the corpus. It lives in the **Datasets** section (`/datasets/new` → source "Generate (synthetic)"),
+NOT Experiments: the output is an ordinary `kind=upload` chat dataset, and Experiments has no
+dataset store.
+- **⚠ The dataset row is created EMPTY and returned immediately; rows grow in the background.**
+  `POST /datasets/generate` returns a real dataset id at once (mirrors `merge_datasets`), then the
+  job publishes after EVERY batch — `num_rows`/`size_bytes` advance while you watch it. Progress
+  rides the EXISTING transform plumbing (`transform_status`/`transform_log`, `_active`,
+  `POST /{id}/cancel-transform`), so the datasets UI polls and cancels it with no new machinery.
+- **⚠ Each publish rewrites the WHOLE JSONL rather than appending.** S3 has no append, and the
+  corpus is bounded (`DATASET_SYNTH_MAX_ROWS`, 200 → tens of KB). The point is that the object is a
+  complete, parseable file matching `num_rows` at every instant — a partial trailing line would make
+  the dataset unreadable for every consumer, which is the whole risk of "rows grow in the background".
+  Cancel keeps what was published (smaller, not broken).
+- **`Dataset.gen_spec` (JSON, idempotent ALTER) is provenance AND the restart marker** — mode, row
+  target, categories, generator model/base_url; **never the API key** (that is passed in memory to
+  the task and nowhere else). `datasets_api.cleanup_orphaned_generating()` (wired into
+  `main.lifespan`) fails rows left `running` by a restart, since an in-process asyncio task dies
+  silently and the row would otherwise sit at `running` forever.
 - **The taxonomy is shared with the proxy's red-team guard** (`proxy_api.RED_TEAM_DEFAULT_TYPES`),
   so "which attacks got through the model" reads against "which attacks the guard blocked"
-  (`X-SGPU-Red-Team-Type`) in one vocabulary. Served to the form by
-  `GET /experiments/synthesize/options` — server-driven, same convention as the evaluator registry.
+  (`X-SGPU-Red-Team-Type`) in one vocabulary. Served by `GET /datasets/generate/options` —
+  server-driven, same convention as the evaluator registry.
 - **⚠ Benign controls are not filler.** `mode=mixed` generates harmless look-alikes of each attack
   category; without them a model that refuses EVERYTHING scores a perfect refusal rate. `n_benign()`
   guarantees ≥1 of each half so a "mixed" corpus is never silently single-mode.
 - **`plan_batches` splits the quota per CATEGORY first, then chunks.** Round-robining batch-by-batch
   (30 rows / 5 categories / batch 10) emits 3 batches and silently tests 3 of the 5 categories.
 - **Short counts are tolerated, not chased.** A model returning 7 of 10 prompts yields a smaller
-  corpus + a warning; refilling to an exact number spends unbounded billed calls. Parsing accepts a
+  corpus + a log line; refilling to an exact number spends unbounded billed calls. Parsing accepts a
   bare array, a fenced array, an object wrapper, `{prompt:…}` items, or a numbered list — re-asking
   costs a call and the failure is trivially recoverable. Dedup is case/punctuation-insensitive
   (the same attack 30 times measures one attack).
 - Rows carry `expected.{attack,attack_type,expect_refusal}` — that's what makes the corpus
-  self-scoring for the `red_team` evaluator below. Caps: `EXPERIMENT_SYNTH_MAX_ROWS` (200),
-  `EXPERIMENT_SYNTH_BATCH` (10), `EXPERIMENT_SYNTH_CONCURRENCY` (4). `POST …/synthesize/preview`
-  generates ~6 rows and persists nothing, so a wrong URL/model/key costs one small call.
+  self-scoring for the `red_team` evaluator below. `POST /datasets/generate/preview` generates ~6
+  rows and persists nothing, so a wrong URL/model/key costs one small call.
 
 **`red_team` evaluator** (`evaluators.py`) — scores the MODEL UNDER TEST's reply, not the guard's
 verdict: a lexical refusal / compliance / leak classifier (deterministic, no second billed call;
@@ -491,9 +506,12 @@ is rejected. **Three modes:**
    ⚠️ **`api_config()` treats only `None` as "unset", NOT `""`** — empty string is a *meaningful*
    value for `passed_field` (whole response) and `auth_prefix` (no `Bearer `). An earlier version
    skipped `""` and silently reinstated the defaults for both; two unit tests pin it.
-3. **`python`** (opt-in, OFF by default) — a real `def check(c)`. Gated **twice**:
-   `EXPERIMENT_ALLOW_PYTHON_EVALUATORS=1` **and** admin role, re-checked at experiment-create time
-   (not just at save). Runs in a child process with the gateway's env **scrubbed** to
+3. **`python`** (**admin-only, ON by default** since 2026-08-07 — was opt-in) — a real
+   `def check(c)`. The remaining gate is **admin role**, re-checked at experiment-create time
+   (not just at save); `EXPERIMENT_ALLOW_PYTHON_EVALUATORS=0` disables the mode outright for a
+   deployment that can't accept it. ⚠ With the env flag gone from the default path, **admin role
+   is the whole control** — an admin (or anything authenticated as one) has code execution on the
+   gateway host. Runs in a child process with the gateway's env **scrubbed** to
    `PATH/LANG/LC_ALL/SYSTEMROOT/TMPDIR` (no `DATABASE_URL`, no `PROVIDER_SECRET_KEY`, no cloud
    keys — a unit test asserts this), CPU/address-space/NOFILE rlimits the child sets on itself
    (`preexec_fn` is unsafe from a threaded parent), and a wall-clock kill.
