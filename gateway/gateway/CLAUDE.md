@@ -1093,6 +1093,74 @@ chain plus all of the below — *the one to use for an agent that talks to peopl
   the benchmark had uploaded to the STT: 20 draws finite/bounded/under 30 s, room tone at the
   clip's own floor, jitter warp within ±1.22 %, `room_tone` hitting its requested SNR exactly.
 
+### kind=hf audio import — subset scoping + embedded (`Audio`) clips (`dataset_transform.py`)
+
+The HF→S3 transform originally assumed one repo shape: audio files in archives, referenced by a
+**path column** in a metadata table. Two additions (2026-08-07) cover the other common shape and
+stop a whole-repo pull:
+
+- **Subset scoping.** `TransformRequest.hf_subsets` (or, persisted, `Dataset.hf_subsets` — an
+  idempotent-ALTER JSON column set by `/datasets/new?source=hf`) restricts the run to some of the repo's
+  **declared** configs/splits. `_declared_entries` parses the README `configs:` front-matter into
+  `{label, config, split, glob}` — `label` being the SAME config-vs-split name `_hf_split_ident`
+  gives the row browser, so a name picked in the UI resolves here. `_resolve_hf_subsets` matches by
+  label, by bare config (= all its splits), or `config/split`, and returns the globs → the README is
+  fetched **first** (`_fetch_declared_entries`, one `hf_hub_download`) so they become
+  `snapshot_download(allow_patterns=…)`. ⚠ **An unmatched name RAISES**, listing the available
+  labels: selecting nothing would materialise an empty dataset and selecting everything would pull
+  the configs the caller was excluding. The `repo_info` byte total is filtered by the same patterns
+  or the download % stalls partway.
+- **Embedded audio.** An HF `Audio` feature stores the clip INLINE (`struct<bytes, path>`), so the
+  old path — `isinstance(ref, str)` → join to a file on disk — skipped every row and the transform
+  died with "no metadata rows matched an extracted audio file". `_table_with_embedded_audio` detects
+  the struct via the arrow schema and writes each clip under `work/_embedded/{label}/`, replacing the
+  column with that path so everything downstream is unchanged. Extension comes from the struct's own
+  `path` when it's a known audio suffix, else sniffed from the container magic (`_audio_ext`).
+  - ⚠ **Streamed in `_EMBED_BATCH_ROWS` (64) batches, not `_load_table`.** A shard of 24 kHz speech
+    is ~0.5 MB/row, so reading one 500 MB parquet into pandas would put half a gigabyte of audio in
+    the gateway heap — per file.
+  - ⚠ **The subset label MUST be in the clip filename.** `_materialise_s3` keys S3 objects by
+    BASENAME, and this shape repeats both the shard stem (`train-00000-of-00005`) and the inner
+    `path` (`gen00047.wav`) across configs — so two configs' clips would silently collapse onto one
+    object. Names are `{label}_{shard}_{row}{ext}`; a unit test pins the uniqueness.
+  - `_read_metadata` resolves each table's split label BEFORE loading it, so an unselected (or
+    undeclared) multi-GB shard is never read.
+
+**⚠ A stored scope has to be honoured by the READ paths too, not just the transform.** The row
+browser and the `/splits` picker enumerate the repo live off the datasets-server and used to
+default to **`splits[0]`** — so a dataset scoped to `synthetic` opened on `default/train`, a
+text-only chat config whose every audio/transcription cell is null, which reads as "the subset
+setting did nothing" (reported from the UI). `_dataset_scope` + `_hf_resolve_scope` now filter
+`GET /{id}/splits` and supply the preview's default selection; both share
+`dataset_transform.subset_matches` with the transform, so label / bare-config / `config/split`
+mean the same thing in all three. A scope matching nothing (free text, and the repo can change
+under it) is an **error naming the available subsets**, never a silent widening back to the whole
+repo. ⚠ `GET /{id}/splits?all=1` is the escape hatch the scope EDITOR uses: every subset with
+`in_scope` flags, and no error on an unmatched scope — a filtered listing can only narrow a scope,
+and erroring would lock the user out of the control that fixes it. The preview clamps an explicit
+`?split=` to the scope too (a URL or a remembered selection outlives a narrowing). Note the preview's `_stamp_detected_fields` self-heal still picks the column mapping from the
+rows it sees — on a TTS corpus that lands on `transcription` (the readback), so set
+`transcription_field` by hand if the script column is the label.
+
+**⚠ `_materialise_s3` drops carried-through columns that collide with the three it owns**
+(`audio` / `<transcription_field>` / `split`). Emitting both put a DUPLICATE header in the metadata
+CSV and every reader (csv.DictReader, pandas) keeps the LAST — silently replacing the real label
+with the passenger value. Live case: a source labelled by `text` that also carries an ASR-readback
+`transcription` column, merged into an output whose transcription column IS `transcription` — which
+would have blanked every *other* source's transcript too (they have no such extra).
+
+**⚠ A subset's split label is `config/split`, so a HF `test` subset is NOT eval.** The trainer's
+`EVAL_SPLITS` is `{test, validation, valid, eval, dev}` and `synthetic/test` matches none of them —
+it trains. Carve eval with `test_split_pct`/`test_split_count` instead.
+
+**Verified e2e locally** (2026-08-07) against `Scicom-intl/Synthetic-User-Turn-TTS` (audio inline,
+5 configs): `synthetic/test` alone selected → only that config downloaded, 100 clips materialised to
+S3 with the right split label and `text` (the TTS script) as the transcript, not `transcription` (a
+Whisper readback of the same clip); then merged with a 188-row label-derived dataset → 288 rows, one
+`transcription` column, neither half blanked. Unit tests: `gateway/tests/unit/test_dataset_transform_hf.py`.
+Automation side: `automation/run_pipeline.py` grew an `hf_repo` dataset entry (see its README) and
+`automation/config-v4.yaml.prod`.
+
 ### Label platform (data-labelling app)
 
 A separate Next.js app (source: `/home/husein/ssd3/Label`, dev host `http://localhost:3002`)

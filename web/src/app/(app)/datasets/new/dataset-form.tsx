@@ -51,6 +51,16 @@ function normSource(s: string | undefined): FormKind {
   return SOURCE_VALUES.includes(s ?? "") ? (s as FormKind) : "upload";
 }
 
+// "synthetic/train, synthetic_podcast/train" (or one per line) → the array the
+// gateway stores as the dataset's subset scope. Blank → null (the whole repo).
+function parseSubsets(raw: string): string[] | null {
+  const out = raw
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return out.length ? Array.from(new Set(out)) : null;
+}
+
 // Pull the base URL + project id out of a pasted project URL like
 // http://localhost:3002/dashboard/projects/<uuid>.
 function parseLabelProjectUrl(raw: string): { base: string; id: string } | null {
@@ -99,6 +109,9 @@ export function DatasetForm({
   const [genPreviewBusy, setGenPreviewBusy] = useState(false);
   const [hfRepo, setHfRepo] = useState("");
   const [hfRevision, setHfRevision] = useState("");
+  // hf: scope the dataset to some of the repo's declared configs/splits. Comma-
+  // or newline-separated; blank = the whole repo.
+  const [hfSubsets, setHfSubsets] = useState("");
   // tts_packed: the tokenizer + multipack sequence length the shards were packed with
   const [packTokenizer, setPackTokenizer] = useState("Scicom-intl/Multilingual-Expressive-TTS-1.7B");
   const [packSeqLen, setPackSeqLen] = useState(4096);
@@ -251,6 +264,7 @@ export function DatasetForm({
         subset: kind === "llm_packed" ? llmPackSubset.trim() || null : null,
         hf_repo: kind === "hf" ? hfRepo.trim() : null,
         hf_revision: kind === "hf" ? hfRevision.trim() || null : null,
+        hf_subsets: kind === "hf" ? parseSubsets(hfSubsets) : null,
         messages_field:
           isChatUpload || kind === "llm_packed"
             ? messagesField.trim() || "messages"
@@ -590,6 +604,21 @@ export function DatasetForm({
                 />
                 <p className="text-xs text-muted-foreground">
                   Git branch, tag, or commit hash to pin. Blank → the repo&apos;s default branch.
+                </p>
+              </div>
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="ds-hf-subsets" className="text-xs uppercase tracking-wide text-muted-foreground">Subsets <span className="normal-case text-muted-foreground">(optional)</span></Label>
+                <Input
+                  id="ds-hf-subsets"
+                  value={hfSubsets}
+                  onChange={(e) => setHfSubsets(e.target.value)}
+                  placeholder="synthetic/train, synthetic_podcast/train"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Scope this dataset to some of the repo&apos;s declared configs/splits — comma-separated,
+                  named as the row browser shows them (<span className="font-mono">config/split</span>), or a bare
+                  config name to take all of its splits. Blank → the whole repo. Transforms only download the
+                  selected ones, so an unused multi-GB config costs nothing.
                 </p>
               </div>
             </div>

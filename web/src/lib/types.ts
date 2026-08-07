@@ -1131,6 +1131,9 @@ export type DatasetRecord = {
   source_hf_repo?: string | null;
   hf_repo?: string | null;
   hf_revision?: string | null;
+  // kind=hf — the repo's declared configs/splits this dataset is scoped to
+  // (["synthetic/train", …]); null/empty → the whole repo.
+  hf_subsets?: string[] | null;
   hf_synced_at?: string | null;
   messages_field?: string | null; // kind=llm: column holding the messages array (= chosen in DPO mode)
   rejected_field?: string | null; // kind=llm DPO (preference) mode: rejected-response column (null → chat mode)
@@ -1178,6 +1181,7 @@ export type CreateDatasetRequest = {
   subset?: string | null; // kind=llm_packed — source subset that was packed (metadata)
   hf_repo?: string | null;
   hf_revision?: string | null; // kind=hf/llm — commit/branch/tag to pin
+  hf_subsets?: string[] | null; // kind=hf — declared configs/splits to scope to (null → whole repo)
   messages_field?: string | null; // kind=llm / llm_packed — column holding the messages array (= chosen in DPO mode)
   rejected_field?: string | null; // kind=llm DPO mode — rejected-response column
   prompt_field?: string | null; // kind=llm DPO continuation shape — shared-prompt column
@@ -1204,6 +1208,8 @@ export type UpdateDatasetRequest = {
   rejected_field?: string | null;
   // DPO continuation shape — the shared-prompt column ("" → infer from the common prefix).
   prompt_field?: string | null;
+  // kind=hf — declared configs/splits to scope to; [] clears (→ whole repo), null → unchanged.
+  hf_subsets?: string[] | null;
   // kind=label import filters (null → unchanged; pass "" for label_updated_until to clear the cutoff)
   label_status?: string | null;
   label_updated_until?: string | null;

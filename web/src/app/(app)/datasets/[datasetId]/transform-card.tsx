@@ -36,6 +36,7 @@ export function TransformCard({
   datasetId,
   kind,
   hfRepo,
+  hfSubsets,
   speakerField,
   s3Storages,
   initialStatus,
@@ -45,6 +46,7 @@ export function TransformCard({
   datasetId: string;
   kind: DatasetKind;
   hfRepo: string | null;
+  hfSubsets?: string[] | null;
   speakerField?: string | null;
   s3Storages: StorageRecord[];
   initialStatus: string | null;
@@ -240,9 +242,16 @@ export function TransformCard({
         </>
       ) : (
         <>
-          This repo stores audio in archives, so there&apos;s no audio column to preview. Unzip it and rebuild a
-          dataset with a real audio column (joined on the <span className="font-mono">audio</span> column you set
-          above). Runs on the gateway; watch progress below.
+          This repo stores audio in archives (or inline, as a HuggingFace <span className="font-mono">Audio</span>{" "}
+          column), so there&apos;s no audio column to preview. Unpack it and rebuild a dataset with a real audio
+          column (joined on the <span className="font-mono">audio</span> column you set above). Runs on the
+          gateway; watch progress below.
+          {hfSubsets && hfSubsets.length > 0 && (
+            <>
+              {" "}Scoped to <span className="font-mono">{hfSubsets.join(", ")}</span> — the repo&apos;s other
+              configs are not downloaded.
+            </>
+          )}
         </>
       )}
     </span>

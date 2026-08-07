@@ -2,7 +2,8 @@
 
 Config-driven, API-only pipeline that:
 
-1. **imports** each Label-platform project → a `kind=label` dataset
+1. **imports** each source — a Label-platform project (`kind=label`) or a HuggingFace
+   audio repo (`kind=hf`)
 2. **transforms** each to S3 (with a per-dataset held-out test split) → a `kind=s3` audio dataset
 3. **merges** all transformed datasets into ONE combined audio dataset
 4. **fine-tunes** each model on the merged dataset (RunPod Secure H100 SXM)
@@ -39,15 +40,51 @@ cp automation/config.yaml.example automation/config.yaml   # then edit api_key e
 |-----|---------|
 | `gateway_url` / `api_key` | gateway to hit (overridable via `--gateway-url` / `--api-key` / `AUTOTRAIN_API_KEY`) |
 | `storage_id` | kind=s3 storage for the audio datasets; blank → auto-pick first enabled S3 |
-| `label_base_url` | Label platform host (e.g. `https://….aies.scicom.dev`) |
+| `hf_storage_id` | kind=huggingface storage a `hf_repo` source reads through (token + Hub endpoint). Blank → auto-pick the first enabled one **with no custom endpoint** |
+| `label_base_url` | Label platform host (e.g. `https://….aies.scicom.dev`) — only required when the config has a Label dataset |
 | `label_token_secret` | gateway global-secret key holding the `lpat_` token (e.g. `LABEL_PROD`) |
 | `label_status` | `approved` (default) / `rejected` / `not_reviewed` / `all` |
 | `cutoff` | default import cutoff; naive times use `timezone_offset` |
 | `timezone_offset` | offset applied to a cutoff with no zone (e.g. `+08:00`) |
-| `datasets[]` | `name`, `project_id`, and `test_split_pct` **or** `test_split_count` (omit both = no test set); `test_exclude_regex` (transcripts matching the regex are kept out of test, e.g. `'^\s*\[.*\]\s*$'` for `[silent]`/`[unintelligible]`) and/or `test_min_chars` (min transcription length for test eligibility); optional per-dataset `cutoff`, `label_status` |
+| `datasets[]` | `name` + one source (see below), and `test_split_pct` **or** `test_split_count` (omit both = no test set); `test_exclude_regex` (transcripts matching the regex are kept out of test, e.g. `'^\s*\[.*\]\s*$'` for `[silent]`/`[unintelligible]`) and/or `test_min_chars` (min transcription length for test eligibility) |
 | `merge` | `enabled`, `name` |
 | `train` | shared hyperparameters (see below) |
 | `models[]` | `base_model` + any per-model overrides of the `train` block |
+
+### `datasets[]` sources
+
+Each entry is **either** a Label project or a HuggingFace repo — the presence of
+`hf_repo` is what picks the branch.
+
+| source | keys |
+|--------|------|
+| Label project | `project_id` (+ optional per-dataset `cutoff`, `label_status`) |
+| HuggingFace | `hf_repo` (`owner/name`), optional `hf_revision` (commit/branch/tag — pin it), optional `hf_subsets`, `audio_field` (default `audio`), `transcription_field` (default `transcription`), optional `hf_storage_id` |
+
+`hf_subsets` scopes the import to some of the repo's declared configs/splits,
+named as the row browser shows them (`synthetic/train`) or by bare config name
+(`synthetic` = all its splits). **Unselected configs are never downloaded**, so
+pulling two configs out of a repo that also holds three others costs only the two.
+An unrecognised name fails the transform with the list of available ones rather
+than silently selecting nothing (or everything).
+
+Audio may be stored either way: files in archives referenced by a path column, or
+inline as a HuggingFace `Audio` column (the clip bytes in the parquet) — the
+transform materialises the inline case to real files on its way to S3.
+
+⚠️ **Check which column is the label.** A synthesised (TTS) corpus usually carries
+both the script it was told to say *and* an ASR readback of what came out; set
+`transcription_field` to the script. Training on the readback is self-distillation
+on ASR errors.
+
+⚠️ **Merge order decides the transcription column name.** The merged output takes
+it from the FIRST source, and each source is read through its own — so put the
+sources whose column is `transcription` ahead of one using `text`.
+
+⚠️ **A subset's split label is `config/split`, not `split`.** The trainer's eval
+set is any row whose split is `test`/`validation`/`valid`/`eval`/`dev` — a row
+labelled `synthetic/test` is **train**. Carve eval with `test_split_pct` /
+`test_split_count` instead of relying on a HF `test` subset.
 
 ### `train` block
 

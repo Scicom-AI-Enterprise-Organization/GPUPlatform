@@ -235,6 +235,7 @@ export function DatasetDetail({
               messagesField={dataset.messages_field}
               rejectedField={dataset.rejected_field}
               promptField={dataset.prompt_field}
+              hfSubsets={dataset.hf_subsets ?? null}
             />
           </TabsContent>
 
@@ -250,6 +251,7 @@ export function DatasetDetail({
                 datasetId={dataset.id}
                 kind={dataset.kind}
                 hfRepo={dataset.hf_repo ?? null}
+                hfSubsets={dataset.hf_subsets ?? null}
                 messagesField={dataset.messages_field ?? null}
                 rejectedField={dataset.rejected_field ?? null}
                 promptField={dataset.prompt_field ?? null}

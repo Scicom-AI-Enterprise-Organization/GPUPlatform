@@ -4,7 +4,9 @@
 Reads a YAML config (see config.yaml) and drives the whole flow through the
 gateway HTTP API:
 
-  1. import each Label-platform project        -> a kind=label dataset
+  1. import each source: a Label-platform project (`project_id` -> kind=label) or
+     a HuggingFace audio repo (`hf_repo` -> kind=hf, optionally scoped to some of
+     its declared configs/splits with `hf_subsets`)
   2. transform each to S3 (per-dataset test split) -> a kind=s3 "-audio" dataset
   3. merge all transformed datasets into ONE combined audio dataset
   4. fine-tune each model on the merged dataset (RunPod secure H100 SXM)
@@ -266,6 +268,35 @@ def resolve_storage(gw: Gateway, cfg: dict) -> str:
     return s3s[0]["id"]
 
 
+def resolve_hf_storage(gw: Gateway, cfg: dict, want: Optional[str] = None) -> Optional[str]:
+    """A kind=huggingface storage for a `hf_repo` source, used by the gateway to
+    resolve the HF token + Hub endpoint.
+
+    ⚠ Setting this explicitly is load-bearing, not cosmetic. With no storage on
+    the dataset the gateway falls back to *any* huggingface storage — and this
+    platform's own mirror is one, carrying endpoint=<gateway>/hf, which 404s a
+    repo that really lives on huggingface.co. So auto-pick prefers a storage with
+    NO custom endpoint (plain public Hub)."""
+    sid = (want or cfg.get("hf_storage_id") or "").strip()
+    storages = gw.get("/v1/storage")
+    if sid:
+        s = next((x for x in storages if x["id"] == sid), None)
+        if not s:
+            die(f"hf_storage_id {sid!r} not found on the gateway")
+        if s["kind"] != "huggingface":
+            die(f"hf_storage_id {sid!r} is kind={s['kind']} — must be kind=huggingface")
+        return sid
+    hfs = [s for s in storages if s["kind"] == "huggingface" and s.get("enabled", True)]
+    public = [s for s in hfs if not (s.get("endpoint") or "").strip()]
+    if not public:
+        if hfs:
+            die("every kind=huggingface storage on the gateway has a custom endpoint (a mirror); "
+                "set hf_storage_id to the one pointing at huggingface.co")
+        die("no kind=huggingface storage on the gateway — set hf_storage_id in the config")
+    log(f"auto-picked HF storage {public[0]['id']} ({public[0].get('name')})")
+    return public[0]["id"]
+
+
 def resolve_provider(gw: Gateway, want: Optional[str]) -> Optional[str]:
     if want and want.strip():
         return want.strip()
@@ -277,38 +308,12 @@ def resolve_provider(gw: Gateway, want: Optional[str]) -> Optional[str]:
     return runpods[0]["id"]
 
 
-def dataset_signature(ds: dict, cutoff: Optional[str], status: str,
-                      min_chars: Any, exclude_regex: Any, ref_id: Any = None) -> dict:
-    sig = {
-        "project_id": ds.get("project_id"),
-        "cutoff": cutoff,
-        "status": status,
-        "test_split_pct": ds.get("test_split_pct"),
-        "test_split_count": ds.get("test_split_count"),
-    }
-    # Only record these when set, so datasets created before the option existed
-    # (and those not using it) still match their stored signature.
-    if min_chars:
-        sig["test_min_chars"] = int(min_chars)
-    if exclude_regex:
-        sig["test_exclude_regex"] = str(exclude_regex)
-    if ref_id:
-        sig["test_split_ref_dataset_id"] = str(ref_id)
-    return sig
-
-
-def ensure_dataset(
-    gw: Gateway, cfg: dict, ds: dict, state: State, storage_id: str,
-    *, cli_cutoff: Optional[str], dry_run: bool, poll_timeout: float,
-) -> str:
-    """Import + transform one dataset. Returns the transformed (kind=s3) id."""
-    name = ds.get("name") or die("every dataset needs a `name`")
-    project_id = ds.get("project_id") or die(f"dataset {name!r} needs a `project_id`")
-
-    # cutoff precedence: per-dataset > CLI --cutoff > config default
-    raw_cutoff = ds.get("cutoff") or cli_cutoff or cfg.get("cutoff")
-    cutoff = parse_cutoff(raw_cutoff, cfg.get("timezone_offset", "+00:00"))
-    status = (ds.get("label_status") or cfg.get("label_status") or "approved").strip()
+def resolve_test_split(cfg: dict, ds: dict, name: str) -> dict:
+    """Resolve one dataset entry's held-out-test settings into the three things
+    the caller needs: the transform-request fields (`body`), the idempotency
+    signature fragment (`sig`), and a one-line description for the log (`desc`).
+    Shared by both source kinds so a label project and a HF repo carve their test
+    split by exactly the same rules."""
     pct = ds.get("test_split_pct")
     cnt = ds.get("test_split_count")
     # Reuse ANOTHER dataset's exact test set instead of carving a random one: the
@@ -341,16 +346,28 @@ def ensure_dataset(
     # min_chars / exclude_regex are eligibility filters for the RANDOM split only —
     # a reused test set is taken verbatim, so they don't apply in ref mode.
     eligibility = has_test and not ref_id
-    sig = dataset_signature(
-        ds, cutoff, status,
-        min_chars if eligibility else None, exclude_regex if eligibility else None,
-        ref_id=ref_id,
-    )
 
-    entry = state.data["datasets"].get(name) or {}
-    if entry.get("transformed_id") and entry.get("signature") == sig:
-        log(f"[{name}] up-to-date (transformed={entry['transformed_id']}) — skipping")
-        return entry["transformed_id"]
+    body: dict[str, Any] = {}
+    if ref_id:
+        body["test_split_ref_dataset_id"] = ref_id
+    elif pct not in (None, 0):
+        body["test_split_pct"] = float(pct)
+    elif cnt not in (None, 0):
+        body["test_split_count"] = int(cnt)
+    if eligibility and min_chars not in (None, 0):
+        body["test_min_chars"] = int(min_chars)
+    if eligibility and exclude_regex:
+        body["test_exclude_regex"] = exclude_regex
+
+    sig: dict[str, Any] = {"test_split_pct": pct, "test_split_count": cnt}
+    # Only record these when set, so datasets created before the option existed
+    # (and those not using it) still match their stored signature.
+    if eligibility and min_chars:
+        sig["test_min_chars"] = int(min_chars)
+    if eligibility and exclude_regex:
+        sig["test_exclude_regex"] = str(exclude_regex)
+    if ref_id:
+        sig["test_split_ref_dataset_id"] = str(ref_id)
 
     _notes = []
     if eligibility and min_chars:
@@ -358,12 +375,43 @@ def ensure_dataset(
     if eligibility and exclude_regex:
         _notes.append(f"excl /{exclude_regex}/")
     _n = (", " + ", ".join(_notes)) if _notes else ""
-    test_desc = (
+    desc = (
         f"reuse test set of {ref_id}" if ref_id else
         f"{pct}% test{_n}" if pct not in (None, 0) else
         f"{cnt} test rows{_n}" if cnt not in (None, 0) else "no test set"
     )
-    log(f"[{name}] import project {project_id} (status={status}, cutoff={cutoff}) + transform to S3 [{test_desc}]")
+    return {"body": body, "sig": sig, "desc": desc}
+
+
+def ensure_dataset(
+    gw: Gateway, cfg: dict, ds: dict, state: State, storage_id: str,
+    *, cli_cutoff: Optional[str], dry_run: bool, poll_timeout: float,
+    hf_storage_id: Optional[str] = None,
+) -> str:
+    """Import + transform one dataset. Returns the transformed (kind=s3) id.
+    Dispatches on the entry's source: `hf_repo` → a HuggingFace repo, otherwise
+    `project_id` → a Label-platform project."""
+    name = ds.get("name") or die("every dataset needs a `name`")
+    if (ds.get("hf_repo") or "").strip():
+        return ensure_hf_dataset(
+            gw, cfg, ds, state, storage_id,
+            dry_run=dry_run, poll_timeout=poll_timeout, hf_storage_id=hf_storage_id,
+        )
+    project_id = ds.get("project_id") or die(f"dataset {name!r} needs a `project_id` or an `hf_repo`")
+
+    # cutoff precedence: per-dataset > CLI --cutoff > config default
+    raw_cutoff = ds.get("cutoff") or cli_cutoff or cfg.get("cutoff")
+    cutoff = parse_cutoff(raw_cutoff, cfg.get("timezone_offset", "+00:00"))
+    status = (ds.get("label_status") or cfg.get("label_status") or "approved").strip()
+    split = resolve_test_split(cfg, ds, name)
+    sig = {"project_id": project_id, "cutoff": cutoff, "status": status, **split["sig"]}
+
+    entry = state.data["datasets"].get(name) or {}
+    if entry.get("transformed_id") and entry.get("signature") == sig:
+        log(f"[{name}] up-to-date (transformed={entry['transformed_id']}) — skipping")
+        return entry["transformed_id"]
+
+    log(f"[{name}] import project {project_id} (status={status}, cutoff={cutoff}) + transform to S3 [{split['desc']}]")
 
     if dry_run:
         log(f"[{name}] DRY-RUN: would create kind=label dataset + transform")
@@ -385,17 +433,7 @@ def ensure_dataset(
         log(f"[{name}] created label dataset {label_id} (num_rows={created.get('num_rows')})")
 
     # 2. transform to S3 with the requested test split
-    body: dict[str, Any] = {"target": "s3", "storage_id": storage_id}
-    if ref_id:
-        body["test_split_ref_dataset_id"] = ref_id
-    elif pct not in (None, 0):
-        body["test_split_pct"] = float(pct)
-    elif cnt not in (None, 0):
-        body["test_split_count"] = int(cnt)
-    if eligibility and min_chars not in (None, 0):
-        body["test_min_chars"] = int(min_chars)
-    if eligibility and exclude_regex:
-        body["test_exclude_regex"] = exclude_regex
+    body: dict[str, Any] = {"target": "s3", "storage_id": storage_id, **split["body"]}
     gw.post(f"/v1/datasets/{label_id}/transform", body)
     log(f"[{name}] transform started; waiting…")
     rec = wait_dataset(gw, label_id, timeout=poll_timeout, label=name)
@@ -408,6 +446,93 @@ def ensure_dataset(
 
     state.data["datasets"][name] = {
         "label_id": label_id, "transformed_id": transformed_id, "signature": sig,
+    }
+    state.save()
+    return transformed_id
+
+
+def ensure_hf_dataset(
+    gw: Gateway, cfg: dict, ds: dict, state: State, storage_id: str,
+    *, dry_run: bool, poll_timeout: float, hf_storage_id: Optional[str] = None,
+) -> str:
+    """Register a HuggingFace audio repo as a kind=hf dataset and transform it to
+    S3. Returns the transformed (kind=s3) id — the same shape a label project
+    yields, so both feed the merge identically.
+
+    `hf_subsets` restricts the run to some of the repo's declared configs/splits
+    (as the row browser names them, e.g. "synthetic/train"); everything else is
+    never downloaded. Omit it to take the whole repo."""
+    name = ds["name"]
+    repo = (ds.get("hf_repo") or "").strip()
+    if "/" not in repo:
+        die(f"[{name}] hf_repo must be owner/name")
+    revision = (str(ds.get("hf_revision") or "").strip()) or None
+    subsets = [str(s).strip() for s in (ds.get("hf_subsets") or []) if str(s).strip()]
+    audio_field = (str(ds.get("audio_field") or "audio").strip())
+    # ⚠ Which column is the LABEL matters on a synthesised corpus: a TTS dataset
+    # typically carries both the script it was told to say and an ASR readback of
+    # what came out. Training on the readback is self-distillation, not supervision.
+    transcription_field = (str(ds.get("transcription_field") or "transcription").strip())
+    split = resolve_test_split(cfg, ds, name)
+
+    sig = {
+        "hf_repo": repo,
+        "hf_revision": revision,
+        "hf_subsets": subsets or None,
+        "audio_field": audio_field,
+        "transcription_field": transcription_field,
+        **split["sig"],
+    }
+    entry = state.data["datasets"].get(name) or {}
+    if entry.get("transformed_id") and entry.get("signature") == sig:
+        log(f"[{name}] up-to-date (transformed={entry['transformed_id']}) — skipping")
+        return entry["transformed_id"]
+
+    _rev = f" @ {revision}" if revision else " @ default branch"
+    _sub = f", subsets={subsets}" if subsets else ", whole repo"
+    log(f"[{name}] import HF {repo}{_rev}{_sub} "
+        f"(audio={audio_field}, text={transcription_field}) + transform to S3 [{split['desc']}]")
+
+    if dry_run:
+        log(f"[{name}] DRY-RUN: would create kind=hf dataset + transform")
+        return f"<dry-run:{name}>"
+
+    # 1. register the repo as a kind=hf dataset. storage_id is the HF storage (the
+    #    gateway resolves the token + Hub endpoint from it) — NOT the S3 target.
+    src_id = entry.get("source_id")
+    if not src_id or entry.get("signature") != sig:
+        created = gw.post("/v1/datasets", {
+            "name": f"{name}-hf",
+            "kind": "hf",
+            "hf_repo": repo,
+            "hf_revision": revision,
+            "hf_subsets": subsets,   # stored on the row: the UI shows the scope,
+            "storage_id": hf_storage_id,  # and a manual re-transform inherits it
+        })
+        src_id = created["id"]
+        log(f"[{name}] created hf dataset {src_id}")
+        # kind=hf carries no column hints at create time — map them before transforming.
+        gw.request("PATCH", f"/v1/datasets/{src_id}", json={
+            "audio_field": audio_field,
+            "transcription_field": transcription_field,
+        })
+
+    # 2. transform to S3 (subset-restricted) with the requested test split
+    body: dict[str, Any] = {"target": "s3", "storage_id": storage_id, **split["body"]}
+    if subsets:
+        body["hf_subsets"] = subsets
+    gw.post(f"/v1/datasets/{src_id}/transform", body)
+    log(f"[{name}] transform started; waiting…")
+    rec = wait_dataset(gw, src_id, timeout=poll_timeout, label=name)
+    if rec.get("transform_status") != "done":
+        die(f"[{name}] transform ended as {rec.get('transform_status')!r}: {(rec.get('transform_log') or '')[-400:]}")
+    transformed_id = rec.get("audio_dataset_id")
+    if not transformed_id:
+        die(f"[{name}] transform done but no audio_dataset_id on the source record")
+    log(f"[{name}] transformed -> {transformed_id}")
+
+    state.data["datasets"][name] = {
+        "source_id": src_id, "transformed_id": transformed_id, "signature": sig,
     }
     state.save()
     return transformed_id
@@ -553,9 +678,12 @@ def main() -> None:
     api_key = args.api_key or os.environ.get("AUTOTRAIN_API_KEY") or cfg.get("api_key")
     if not api_key:
         die("no api_key (config.api_key, --api-key, or AUTOTRAIN_API_KEY)")
-    for req in ("label_base_url", "label_token_secret"):
-        if not cfg.get(req):
-            die(f"config is missing `{req}`")
+    # Only needed when the config actually imports a Label project — an all-HF
+    # config has no labelling platform to talk to.
+    if any(not (d.get("hf_repo") or "").strip() for d in (cfg.get("datasets") or [])):
+        for req in ("label_base_url", "label_token_secret"):
+            if not cfg.get(req):
+                die(f"config is missing `{req}` (needed by its Label-platform datasets)")
 
     state_path = Path(args.state) if args.state else (here / "state" / f"{Path(args.config).stem}.json")
     if args.fresh and state_path.exists() and not args.dry_run:
@@ -584,12 +712,21 @@ def main() -> None:
     if not datasets:
         die("config has no `datasets`")
 
+    # HF sources need a kind=huggingface storage for token/endpoint resolution.
+    hf_storage_id: Optional[str] = None
+    if any((d.get("hf_repo") or "").strip() for d in datasets):
+        hf_storage_id = resolve_hf_storage(gw, cfg) if not args.dry_run \
+            else (cfg.get("hf_storage_id") or "<auto>")
+        log(f"hf source = {hf_storage_id}")
+
     # Preflight: make sure the running gateway supports every transform field the
     # config uses. Older gateways silently drop unknown request fields (pydantic
     # extra=ignore), which would quietly put junk transcripts back in the test set —
     # fail loudly instead of misbehaving silently.
     def _needed_fields(d: dict) -> set:
         out: set = set()
+        if [s for s in (d.get("hf_subsets") or []) if str(s).strip()]:
+            out.add("hf_subsets")
         if (d.get("test_split_ref_dataset_id") or "").strip():
             out.add("test_split_ref_dataset_id")
         has_test = d.get("test_split_pct") not in (None, 0) or d.get("test_split_count") not in (None, 0)
@@ -612,8 +749,9 @@ def main() -> None:
             die(f"could not read the gateway OpenAPI to verify transform support: {e}")
         missing = sorted(f for f in needed if f not in props)
         if missing:
-            die(f"the running gateway doesn't support {', '.join(missing)} yet — restart it "
-                "(.venv/bin/gateway) to pick up the new code, then re-run")
+            die(f"the running gateway at {gateway_url} doesn't support {', '.join(missing)} yet — "
+                "it would silently DROP those fields (pydantic extra=ignore) and transform the "
+                "wrong thing. Deploy/restart the gateway on the new code, then re-run")
 
     # 1 + 2. import + transform each dataset
     log("=" * 70)
@@ -623,6 +761,7 @@ def main() -> None:
         tid = ensure_dataset(
             gw, cfg, ds, state, storage_id,
             cli_cutoff=args.cutoff, dry_run=args.dry_run, poll_timeout=args.transform_timeout,
+            hf_storage_id=hf_storage_id,
         )
         transformed_ids.append(tid)
 

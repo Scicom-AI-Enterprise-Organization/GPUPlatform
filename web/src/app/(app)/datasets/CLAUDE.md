@@ -55,7 +55,8 @@ still *packs* (`llm_pack` accepts it per-request) but previews wrong — set it 
   the project URL, a token (pasted `lpat_…` or a global secret), the review-status filter, and the
   **timestamp cutoff** (see below).
 - `[datasetId]/dataset-detail.tsx` — tabbed detail. Editable cards PATCH then `router.refresh()`:
-  - `columns-card.tsx` — audio/transcription/speaker/messages column mapping. For a chat-only
+  - `columns-card.tsx` — audio/transcription/speaker/messages column mapping, plus (kind=hf) the
+    **Subsets** scope (see below). For a chat-only
     dataset it also has a **Chat (SFT) / Preference (DPO)** mode toggle: DPO mode maps a **chosen**
     (= `messages_field`) + **rejected** (`rejected_field`) column, plus an optional **prompt**
     (`prompt_field`) column for the continuation shape above; saving `rejected_field` flips the
@@ -70,6 +71,29 @@ still *packs* (`llm_pack` accepts it per-request) but previews wrong — set it 
   - `row-browser.tsx` — paged preview; include/exclude rows from training.
   - `hf-mirror-card.tsx` — publish an S3 dataset to the self-hosted HF mirror.
 - `merge/` — merge ≥2 `label` datasets into one audio dataset.
+
+## `kind=hf` subset scope (`hf_subsets`)
+
+A HF repo can hold several configs, and a dataset usually wants only some of them (e.g. the two
+audio configs of a repo that also ships text-only chat ones). `Dataset.hf_subsets` is that scope —
+set on `/datasets/new?source=hf` (comma-separated free text, before the repo has been introspected)
+and edited afterwards on the **columns card** as a checkbox multiselect. It bounds the row browser,
+the per-split column pickers, and which files a transform downloads.
+
+- **`GET /{id}/splits` is filtered to the scope; the editor needs `?all=1`.** Filtered output can
+  only narrow a scope, never widen it back, so the picker fetches `?all=1` (every subset, each
+  flagged `in_scope`) and derives BOTH lists from that one call. `?all=1` also still answers when
+  the scope matches nothing — that's precisely the state the editor exists to fix, so it must not
+  inherit the default listing's error.
+- **Selection is by canonical label, never typed here.** The stored value may be a bare config name
+  (`synthetic`) that expands to several labels, so "did the user change it" compares against the
+  RESOLVED baseline captured at load — comparing against the raw stored value would rewrite
+  `["synthetic"]` into explicit labels just for opening the card.
+- **Ticking every subset saves `[]` (no scope), not the full list**, so a config added upstream
+  later is picked up rather than silently excluded.
+- **Saving a changed scope clears `split_fields`.** The per-split transcription picks were seeded
+  from the outgoing split list; keeping them would write a mapping keyed by labels the dataset no
+  longer has. The card says so before you save.
 
 ## Transcription normalization (`kind=s3` → new `kind=s3`, LLM respelling)
 

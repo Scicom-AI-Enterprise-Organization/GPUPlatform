@@ -70,6 +70,11 @@ class CreateDatasetRequest(BaseModel):
     # kind=hf / kind=llm — git revision to pin: a commit SHA (full/short), branch
     # ("main", "dev"), or tag ("v1.0.0"). Blank → the repo's default branch.
     hf_revision: Optional[str] = None
+    # kind=hf — scope the dataset to some of the repo's declared configs/splits,
+    # named as the row browser shows them ("synthetic/train") or by bare config
+    # name ("synthetic", = all its splits). Empty/None → the whole repo. The
+    # transform only downloads the selected ones.
+    hf_subsets: Optional[list[str]] = None
     # kind=llm / kind=llm_packed — which column holds the OpenAI messages array ([{role,content}]).
     # In DPO (preference) mode this is the CHOSEN column; rejected_field names the rejected one.
     messages_field: Optional[str] = None
@@ -104,6 +109,9 @@ class UpdateDatasetRequest(BaseModel):
     # Per-split transcription column overrides, e.g. {"train": "text", "test": "after"}.
     # Pass {} to clear. Splits not listed fall back to transcription_field.
     split_fields: Optional[dict[str, str]] = None
+    # kind=hf — the declared configs/splits this dataset is scoped to. Pass [] to
+    # clear (→ the whole repo). None → leave unchanged.
+    hf_subsets: Optional[list[str]] = None
     # kind=llm — which column holds the messages array (= chosen in DPO mode). Pass "" to reset.
     messages_field: Optional[str] = None
     # kind=llm DPO mode — the rejected-response column. Pass "" to clear (→ chat mode),
@@ -140,6 +148,11 @@ class TransformRequest(BaseModel):
     target: str  # "hf" | "s3"
     hf_repo: Optional[str] = None     # required for target=hf (owner/name)
     storage_id: Optional[str] = None  # required for target=s3 (a kind=s3 storage)
+    # kind=hf source only — restrict the transform to these declared subsets of the
+    # SOURCE repo, named as the row browser shows them ("synthetic/train") or by
+    # bare config name ("synthetic", = all its splits). Unselected configs are
+    # never downloaded, let alone materialised. None/empty → the whole repo.
+    hf_subsets: Optional[list[str]] = None
     # target=s3: destination folder within the storage (under its configured
     # prefix). Blank → datasets/{id}/transformed.
     s3_folder: Optional[str] = None
@@ -320,6 +333,7 @@ class DatasetRecord(BaseModel):
     source_hf_repo: Optional[str] = None
     hf_repo: Optional[str] = None
     hf_revision: Optional[str] = None
+    hf_subsets: Optional[list[str]] = None  # kind=hf: declared configs/splits in scope (None → all)
     hf_synced_at: Optional[str] = None
     label_base_url: Optional[str] = None     # kind=label source (token never returned)
     label_project_id: Optional[str] = None
@@ -377,6 +391,10 @@ class SplitInfo(BaseModel):
     split: str
     columns: list[str]
     num_rows: Optional[int] = None
+    # kind=hf: is this subset inside the dataset's stored `hf_subsets` scope?
+    # Always True in the default (filtered) listing; only meaningful with `?all=1`,
+    # which returns every subset so a scope PICKER can widen as well as narrow.
+    in_scope: Optional[bool] = None
 
 
 class SplitsResponse(BaseModel):
@@ -445,6 +463,7 @@ def _to_record(
         source_hf_repo=source_hf_repo,
         hf_repo=d.hf_repo,
         hf_revision=d.hf_revision,
+        hf_subsets=list(getattr(d, "hf_subsets", None) or []) or None,
         hf_synced_at=_iso(d.hf_synced_at),
         label_base_url=getattr(d, "label_base_url", None),
         label_project_id=getattr(d, "label_project_id", None),
@@ -820,6 +839,10 @@ async def create_dataset(
         s3_metadata_uri=(req.s3_metadata_uri or "").strip() or None,
         hf_repo=(req.hf_repo or "").strip() or None,
         hf_revision=(req.hf_revision or "").strip() or None if req.kind in ("hf", "llm") else None,
+        hf_subsets=(
+            [s.strip() for s in (req.hf_subsets or []) if s and s.strip()] or None
+            if req.kind == "hf" else None
+        ),
         label_base_url=label_base_url,
         label_project_id=label_project_id,
         label_token_enc=label_token_enc,
@@ -1097,6 +1120,9 @@ async def update_dataset(
             if str(k).strip() and str(v).strip()
         }
         d.split_fields = cleaned or None
+    if req.hf_subsets is not None:
+        # [] clears the scope → the whole repo.
+        d.hf_subsets = [s.strip() for s in req.hf_subsets if s and s.strip()] or None
     if req.messages_field is not None:
         d.messages_field = req.messages_field.strip() or None
     if req.rejected_field is not None:
@@ -1735,6 +1761,47 @@ def _hf_split_columns(hf_repo: str, token: Optional[str], revision: Optional[str
     return out
 
 
+def _dataset_scope(d: Dataset) -> list[str]:
+    """The subset names a kind=hf dataset is scoped to (its stored `hf_subsets`),
+    or [] for the whole repo."""
+    return [str(s).strip() for s in (getattr(d, "hf_subsets", None) or []) if str(s).strip()]
+
+
+def _hf_resolve_scope(
+    hf_repo: str, token: Optional[str], wanted: list[str], revision: Optional[str] = None,
+) -> tuple[list[str], Optional[str]]:
+    """Resolve a dataset's stored subset scope against the repo's LIVE split list
+    → (labels in scope, error). The scope is stored as free text (it's set before
+    the repo is introspected), and the repo can change under it, so a scope that
+    now matches nothing is reported as an error rather than silently widening to
+    the whole repo — which is what would put a text-only config's rows in front
+    of someone who asked for audio."""
+    from .dataset_transform import subset_matches
+
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    rev = {"revision": revision} if revision else {}
+    with httpx.Client(timeout=20.0) as cli:
+        sp = cli.get(
+            "https://datasets-server.huggingface.co/splits",
+            params={"dataset": hf_repo, **rev}, headers=headers,
+        )
+        sp.raise_for_status()
+        splits = sp.json().get("splits", [])
+    if not splits:
+        return [], f"{hf_repo} exposes no splits on the HF datasets-server"
+    ident = _hf_split_ident(splits)
+    keep = [
+        ident(s) for s in splits
+        if any(subset_matches(w, ident(s), s["config"], s["split"]) for w in wanted)
+    ]
+    if not keep:
+        return [], (
+            f"this dataset is scoped to {', '.join(wanted)}, which matches none of "
+            f"{hf_repo}'s subsets. Available: {', '.join(ident(s) for s in splits)}"
+        )
+    return keep, None
+
+
 def _resolve_hf_subset(
     hf_repo: str, token: Optional[str], subset: Optional[str], revision: Optional[str] = None,
 ) -> tuple[str, str, str]:
@@ -2327,6 +2394,28 @@ async def preview_dataset(
             # `split` may be a comma-separated list (the row browser's multiselect):
             # >1 → read all of them merged into one paged list with a combined total.
             sel = [s.strip() for s in (split or "").split(",") if s.strip()]
+            # The dataset's stored subset scope, resolved to live labels. It bounds
+            # BOTH what's read and what the row browser's subset picker offers —
+            # `splits=names` below is that picker's whole source, so leaving it
+            # unfiltered is what let every config stay selectable on a scoped set.
+            scoped: Optional[list[str]] = None
+            scope = _dataset_scope(d)
+            if scope:
+                scoped, scope_err = await _run_sync(
+                    _hf_resolve_scope, d.hf_repo, tok, scope, d.hf_revision,
+                )
+                if scope_err:
+                    return _resp(rows=[], error=scope_err)
+            if not sel:
+                # Nothing picked → the scope, NOT the repo's first split. On a
+                # multi-config repo those differ wildly: scoping to `synthetic` and
+                # then being shown `default/train` (a text-only chat config, every
+                # audio/transcription cell null) reads as "the setting did nothing".
+                sel = list(scoped or [])
+            elif scoped:
+                # An explicit pick can't escape the scope — a URL or a remembered
+                # selection can outlive a narrowing of it.
+                sel = [s for s in sel if s in set(scoped)] or list(scoped)
             if len(sel) > 1:
                 raw, total, used_split, names = await _run_sync(
                     _hf_preview_rows_multi, d.hf_repo, tok, limit, offset, sel, d.hf_revision,
@@ -2368,6 +2457,8 @@ async def preview_dataset(
                 if mf:
                     row["messages"] = _parse_messages(r.get(mf))
                 rows.append(row)
+            if scoped:
+                names = [n for n in names if n in set(scoped)]
             return _resp(rows=rows, total=total, split=used_split, splits=names)
 
         # upload / s3 → read the metadata file from S3
@@ -2934,11 +3025,21 @@ async def dataset_audio_peaks(
 @router.get("/{dataset_id}/splits", response_model=SplitsResponse)
 async def dataset_splits(
     dataset_id: str,
+    include_all: bool = Query(
+        False, alias="all",
+        description="return every subset (with in_scope flags) instead of only the dataset's scope",
+    ),
     user: User = Depends(require_section("datasets")),
     session: AsyncSession = Depends(get_session),
 ):
     """Per-split column names for an HF source, so the UI can offer a
-    transcription-column picker per split (splits can differ in schema)."""
+    transcription-column picker per split (splits can differ in schema).
+
+    Filtered to the dataset's `hf_subsets` scope by default — the picker drives
+    the row browser and the column mapping, so leaving the excluded configs in it
+    invites mapping a column this dataset will never read. `?all=1` returns
+    everything with `in_scope` set, which is what a scope EDITOR needs: filtered
+    output can only ever narrow a scope, never widen it back."""
     d = await _require_dataset(session, dataset_id, user)
     if d.kind not in ("hf", "llm") or not d.hf_repo:
         return SplitsResponse(splits=[])
@@ -2946,7 +3047,24 @@ async def dataset_splits(
         storage = await session.get(Storage, d.storage_id) if d.storage_id else None
         token = await _hf_token(storage, session)
         splits = await _run_sync(_hf_split_columns, d.hf_repo, token, d.hf_revision)
-        return SplitsResponse(splits=[SplitInfo(**s) for s in splits])
+        scope = _dataset_scope(d)
+        keep: Optional[set[str]] = None
+        if scope:
+            labels, scope_err = await _run_sync(
+                _hf_resolve_scope, d.hf_repo, token, scope, d.hf_revision,
+            )
+            # A scope that matches nothing is an error in the default listing, but
+            # NOT with ?all=1 — that's exactly the state the editor exists to fix,
+            # so it still needs the choices.
+            if scope_err and not include_all:
+                return SplitsResponse(splits=[], error=scope_err)
+            keep = set(labels)
+        out = [
+            SplitInfo(**s, in_scope=(keep is None or s.get("split") in keep))
+            for s in splits
+            if include_all or keep is None or s.get("split") in keep
+        ]
+        return SplitsResponse(splits=out)
     except Exception as e:  # noqa: BLE001
         logger.warning("splits lookup failed for %s: %s", dataset_id, e)
         return SplitsResponse(splits=[], error=str(e))
@@ -3145,6 +3263,9 @@ async def transform_dataset(
         st = await session.get(Storage, req.storage_id)
         if st is None or st.kind != "s3":
             raise HTTPException(status_code=400, detail="storage_id must reference a kind=s3 storage")
+    subsets = [s.strip() for s in (req.hf_subsets or []) if s and s.strip()]
+    if subsets and d.kind == "label":
+        raise HTTPException(status_code=400, detail="hf_subsets applies to a HuggingFace source, not a label dataset")
     if req.test_split_pct is not None and req.test_split_count is not None:
         raise HTTPException(status_code=400, detail="set a test split by percentage OR by count, not both")
     if req.test_split_pct is not None and not (0 <= req.test_split_pct < 100):
@@ -3186,6 +3307,7 @@ async def transform_dataset(
         test_exclude_regex=(req.test_exclude_regex or "").strip() or None,
         test_split_ref_keys=ref_keys,
         test_split_per_speaker=req.test_split_per_speaker,
+        hf_subsets=subsets or None,
     )
     await audit_module.record(user, "dataset.transform", "dataset", dataset_id, d.name, details={"target": req.target})
     await session.refresh(d)

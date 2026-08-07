@@ -19,6 +19,7 @@ export function TransformationCard({
   datasetId,
   kind,
   hfRepo,
+  hfSubsets,
   messagesField,
   rejectedField,
   promptField,
@@ -31,6 +32,7 @@ export function TransformationCard({
   datasetId: string;
   kind: DatasetKind;
   hfRepo: string | null;
+  hfSubsets?: string[] | null;
   messagesField?: string | null;
   rejectedField?: string | null;
   promptField?: string | null;
@@ -69,6 +71,7 @@ export function TransformationCard({
         datasetId={datasetId}
         kind={kind}
         hfRepo={hfRepo}
+        hfSubsets={hfSubsets}
         speakerField={speakerField}
         s3Storages={s3Storages}
         initialStatus={initialStatus}

@@ -427,6 +427,12 @@ class Dataset(Base):
     audio_dataset_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     hf_repo: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     hf_revision: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # kind=hf: which of the repo's declared configs/splits this dataset is scoped
+    # to, named as the row browser shows them (["synthetic/train", …]). NULL/[] =
+    # the whole repo. The transform reads it to build `allow_patterns`, so an
+    # unselected config is never downloaded — the difference between fetching two
+    # configs and fetching a repo that also holds three others.
+    hf_subsets: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     hf_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # Audio-zip → audio-column transform job: "" (idle) | running | done | failed.
     # `transform_log` holds a short tail of progress lines for the UI to poll.
@@ -1184,6 +1190,11 @@ async def init_db() -> None:
         # and the marker that lets restart-cleanup find an interrupted job.
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS gen_spec JSON"
+        ))
+        # kind=hf: the declared configs/splits the dataset is scoped to (the
+        # transform turns them into HF allow_patterns).
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS hf_subsets JSON"
         ))
         # Custom evaluators gained an `api` mode, whose endpoint/parsing settings
         # live in a JSON blob (expression + python modes keep using `code`).

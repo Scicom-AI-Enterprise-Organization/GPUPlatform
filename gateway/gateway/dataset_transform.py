@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import tarfile
 import threading
@@ -43,6 +44,19 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 _AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac")
 _META_NAMES = ("metadata", "train", "data")
 _META_EXTS = (".csv", ".tsv", ".parquet", ".jsonl", ".json")
+
+# Rows per batch when streaming a parquet whose audio column holds EMBEDDED clip
+# bytes (the HF `Audio` feature). Deliberately small: a shard of 24 kHz speech is
+# ~0.5 MB/row, so reading one whole 500 MB shard into pandas — which is what the
+# plain `_load_table` path does — would put half a gigabyte of audio in the
+# gateway's heap per file. 64 rows caps that at tens of MB.
+_EMBED_BATCH_ROWS = max(1, int(os.environ.get("HF_EMBEDDED_AUDIO_BATCH_ROWS") or 64))
+
+# Container sniffing for embedded audio whose struct carries no usable filename.
+_AUDIO_MAGIC = (
+    (b"RIFF", ".wav"), (b"fLaC", ".flac"), (b"OggS", ".ogg"),
+    (b"ID3", ".mp3"), (b"\xff\xfb", ".mp3"), (b"\xff\xf3", ".mp3"), (b"\xff\xf2", ".mp3"),
+)
 
 # ---- label-project audio download (used by _label_pairs) --------------------
 # The per-clip audio fetch is the slow, failure-prone part of a label transform:
@@ -98,6 +112,7 @@ async def start_transform(
     test_exclude_regex: Optional[str] = None,
     test_split_ref_keys: Optional[list[str]] = None,
     test_split_per_speaker: bool = False,
+    hf_subsets: Optional[list[str]] = None,
 ) -> None:
     """Mark the dataset running and kick off the background job."""
     async with session_factory()() as s:
@@ -113,6 +128,7 @@ async def start_transform(
         test_min_chars=test_min_chars, test_exclude_regex=test_exclude_regex,
         test_split_ref_keys=test_split_ref_keys,
         test_split_per_speaker=test_split_per_speaker,
+        hf_subsets=hf_subsets,
     ))
     _active[dataset_id] = task
     task.add_done_callback(lambda _t: _active.pop(dataset_id, None))
@@ -431,6 +447,7 @@ async def _run(
     test_exclude_regex: Optional[str] = None,
     test_split_ref_keys: Optional[list[str]] = None,
     test_split_per_speaker: bool = False,
+    hf_subsets: Optional[list[str]] = None,
 ) -> None:
     from fastapi.concurrency import run_in_threadpool
     from sqlalchemy import select
@@ -457,6 +474,12 @@ async def _run(
             audio_field, transcription_field = d.audio_field, d.transcription_field
             speaker_field = d.speaker_field  # TTS speaker column (for per-speaker test splits)
             split_fields = dict(d.split_fields or {})  # {split: transcription_column}
+            # Subset scope: an explicit request wins, else the scope stored on the
+            # dataset (what the create form / row browser selected) — so a repo
+            # registered as "just these two configs" transforms as that everywhere,
+            # not only when the caller remembers to repeat the list.
+            if not hf_subsets:
+                hf_subsets = [s for s in (getattr(d, "hf_subsets", None) or []) if str(s).strip()]
             # HF token + endpoint: prefer the dataset's OWN storage when it's a
             # huggingface backend, else fall back to any configured huggingface
             # storage (mirrors _run_llm_pack). Using the dataset's own storage is
@@ -513,9 +536,35 @@ async def _run(
                 await _finish(dataset_id, "failed", "no tasks with downloadable audio in the label export (check the status filter / token)")
                 return
         else:
+            # Subset selection: resolve the requested config/split labels against
+            # the repo's declared configs FIRST, so only their files are fetched.
+            keep_splits: Optional[set[str]] = None
+            allow_patterns: Optional[list[str]] = None
+            if hf_subsets:
+                entries = await run_in_threadpool(
+                    _fetch_declared_entries, src_repo, token, work, src_revision, hf_endpoint,
+                )
+                if not entries:
+                    await _finish(
+                        dataset_id, "failed",
+                        f"{src_repo} declares no configs in its README, so subsets "
+                        f"{list(hf_subsets)} can't be resolved — clear the subset selection to "
+                        "transform the whole repo",
+                    )
+                    return
+                try:
+                    keep_splits, globs = _resolve_hf_subsets(entries, list(hf_subsets))
+                except ValueError as e:
+                    await _finish(dataset_id, "failed", str(e))
+                    return
+                allow_patterns = [*globs, "README.md"]
+                await _log(dataset_id, f"subsets: {', '.join(sorted(keep_splits))} (files: {', '.join(globs)})")
+
             rev_note = f" @ {src_revision}" if src_revision else ""
             await _log(dataset_id, f"downloading {src_repo}{rev_note} … (reuses cached files on re-run)")
-            await run_in_threadpool(_download, src_repo, token, work, progress, src_revision, hf_endpoint)
+            await run_in_threadpool(
+                _download, src_repo, token, work, progress, src_revision, hf_endpoint, allow_patterns,
+            )
 
             await _log(dataset_id, "extracting audio archives …")
             n_audio = await run_in_threadpool(_extract_archives, work)
@@ -523,7 +572,9 @@ async def _run(
 
             if split_fields:
                 await _log(dataset_id, f"per-split transcription columns: {split_fields}")
-            pairs = await run_in_threadpool(_build_pairs, work, audio_field, transcription_field, split_fields)
+            pairs = await run_in_threadpool(
+                _build_pairs, work, audio_field, transcription_field, split_fields, keep_splits,
+            )
             if not pairs:
                 await _finish(dataset_id, "failed", "no metadata rows matched an extracted audio file — check the audio column")
                 return
@@ -849,7 +900,11 @@ def _write_normalized_metadata(
     expires = 7 * 24 * 3600
     unique_keys = sorted({audio_key for _split, audio_key, _text, _extra in rows})
     urls = bench.s3_presign_many(unique_keys, expires, target)
-    extra_cols = sorted({k for *_rest, extra in rows for k in extra})
+    # Same reserved-name guard as `_materialise_s3`: a carried-through column named
+    # like one of the three this writer owns would emit a duplicate header, and
+    # every reader keeps the LAST. Reachable here when the source's audio column
+    # isn't literally `audio` but the row also has an `audio` column.
+    extra_cols = sorted({k for *_rest, extra in rows for k in extra} - {"audio", transcription_field, "split"})
     buf = _io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["audio", transcription_field, "split"] + extra_cols)
@@ -1482,6 +1537,31 @@ def _work_dir(dataset_id: str) -> str:
     return os.path.join(tempfile.gettempdir(), "sgpu-transform", dataset_id)
 
 
+def _fetch_declared_entries(
+    repo: str,
+    token: Optional[str],
+    dest: str,
+    revision: Optional[str] = None,
+    endpoint: Optional[str] = None,
+) -> Optional[list[dict]]:
+    """Pull ONLY the repo README into `dest` and parse its declared configs.
+    Runs before the snapshot download so a subset selection can be turned into
+    `allow_patterns` — i.e. so the configs the caller didn't ask for are never
+    fetched at all."""
+    from huggingface_hub import hf_hub_download
+
+    os.makedirs(dest, exist_ok=True)
+    try:
+        hf_hub_download(
+            repo_id=repo, repo_type="dataset", filename="README.md",
+            local_dir=dest, token=token, revision=revision, endpoint=endpoint or None,
+        )
+    except Exception as e:  # noqa: BLE001 — no README → no declared configs
+        logger.warning("could not fetch README for %s: %s", repo, e)
+        return None
+    return _declared_entries(dest)
+
+
 def _download(
     repo: str,
     token: Optional[str],
@@ -1489,13 +1569,17 @@ def _download(
     progress: Optional[Callable[[str, int, int], None]] = None,
     revision: Optional[str] = None,
     endpoint: Optional[str] = None,
+    allow_patterns: Optional[list[str]] = None,
 ) -> str:
     """snapshot_download the dataset repo into the STABLE `dest` — re-runs skip
     files already present (no network re-fetch). Emits a byte-based `download`
     progress marker (snapshot_download itself is opaque, so the UI otherwise
     shows no %) by polling the on-disk size against the repo's total size.
-    `revision` (commit/branch/tag) pins which ref to fetch (None → default)."""
+    `revision` (commit/branch/tag) pins which ref to fetch (None → default);
+    `allow_patterns` limits it to the selected subsets' files."""
+    import fnmatch
     import threading
+
     from huggingface_hub import HfApi, snapshot_download
 
     # Belt-and-suspenders to the import-time env set above: if hf_hub was already
@@ -1516,7 +1600,15 @@ def _download(
     total_bytes = 0
     try:
         info = HfApi(token=token, endpoint=endpoint or None).repo_info(repo, repo_type="dataset", revision=revision, files_metadata=True)
-        total_bytes = sum(int(getattr(s, "size", 0) or 0) for s in (info.siblings or []))
+        sibs = info.siblings or []
+        # Count only what will actually be fetched, else the % stalls partway on a
+        # subset selection.
+        if allow_patterns:
+            sibs = [
+                s for s in sibs
+                if any(fnmatch.fnmatch(getattr(s, "rfilename", ""), p) for p in allow_patterns)
+            ]
+        total_bytes = sum(int(getattr(s, "size", 0) or 0) for s in sibs)
     except Exception:  # noqa: BLE001 — size lookup is best-effort (just disables %)
         logger.warning("repo_info size lookup failed for %s; download %% unavailable", repo)
 
@@ -1552,7 +1644,11 @@ def _download(
     poller = threading.Thread(target=_poll, daemon=True)
     poller.start()
     try:
-        snapshot_download(repo_id=repo, repo_type="dataset", local_dir=dest, token=token, revision=revision, endpoint=endpoint or None)
+        snapshot_download(
+            repo_id=repo, repo_type="dataset", local_dir=dest, token=token,
+            revision=revision, endpoint=endpoint or None,
+            allow_patterns=allow_patterns or None,
+        )
     finally:
         stop.set()
         poller.join(timeout=3.0)
@@ -1954,15 +2050,15 @@ def _split_of(meta: Path, root: Path) -> str:
     return rel.parts[0] if len(rel.parts) > 1 else meta.stem
 
 
-def _declared_splits(work: str) -> Optional[list[tuple[str, str]]]:
-    """Parse the repo README's `configs:` front-matter → [(split_label, path_glob)],
-    so a metadata file maps to the dataset's DECLARED split (the same train/test
-    HF shows) instead of being guessed from its filename. Files matching no
-    declared pattern aren't part of the dataset and are dropped by the caller.
-    Returns None when no configs are declared (caller falls back to filename
-    inference). Labels mirror the row preview's config-vs-split naming."""
-    import re
+def _declared_entries(work: str) -> Optional[list[dict]]:
+    """Parse the repo README's `configs:` front-matter → one entry per declared
+    (config, split, path glob): `{"label", "config", "split", "glob"}`. `label` is
+    the UI-facing subset name (the same config-vs-split naming `_hf_split_ident`
+    produces for the row preview), so a subset picked in the browser or named in
+    a YAML config resolves to the same tables here.
 
+    Returns None when no configs are declared (callers fall back to filename
+    inference)."""
     import yaml
 
     readme = Path(work) / "README.md"
@@ -1995,7 +2091,131 @@ def _declared_splits(work: str) -> Optional[list[tuple[str, str]]]:
         ident = lambda c, s: s  # noqa: E731
     else:
         ident = lambda c, s: f"{c}/{s}"  # noqa: E731
-    return [(ident(c, s), g) for c, s, g in triples]
+    return [{"label": ident(c, s), "config": c, "split": s, "glob": g} for c, s, g in triples]
+
+
+def _declared_splits(work: str) -> Optional[list[tuple[str, str]]]:
+    """`_declared_entries` reduced to the [(split_label, path_glob)] pairs
+    `_read_metadata` maps a metadata file through. Files matching no declared
+    pattern aren't part of the dataset and are dropped by the caller."""
+    entries = _declared_entries(work)
+    return None if entries is None else [(e["label"], e["glob"]) for e in entries]
+
+
+def subset_matches(wanted: str, label: str, config: str, split: str) -> bool:
+    """Does a requested subset name select this config/split?
+
+    Accepts the row browser's label ("synthetic/train"), a bare config name
+    ("synthetic", = every split of it), or the explicit "config/split" spelling.
+    Shared with `datasets_api` so the transform, the /splits picker and the row
+    preview can never disagree about what a stored scope means."""
+    q = str(wanted).strip()
+    return bool(q) and q in (label, config, f"{config}/{split}")
+
+
+def _resolve_hf_subsets(entries: list[dict], wanted: list[str]) -> tuple[set[str], list[str]]:
+    """Resolve the requested subset names against a repo's declared configs →
+    (labels to keep, path globs to fetch).
+
+    A request matches an entry by its `label` (`synthetic/train`), by its bare
+    `config` name (`synthetic` — selects every split of it), or by the explicit
+    `config/split` spelling. Anything unmatched RAISES with the available labels:
+    a typo that silently selected nothing would materialise an empty dataset, and
+    one that silently selected everything would quietly pull the configs the
+    caller was trying to exclude."""
+    keep_labels: set[str] = set()
+    globs: list[str] = []
+    available = sorted({e["label"] for e in entries})
+    for raw in wanted:
+        q = str(raw).strip()
+        if not q:
+            continue
+        hits = [e for e in entries if subset_matches(q, e["label"], e["config"], e["split"])]
+        if not hits:
+            raise ValueError(
+                f"subset {q!r} is not declared by this repo. Available: {', '.join(available)}"
+            )
+        for e in hits:
+            keep_labels.add(e["label"])
+            if e["glob"] not in globs:
+                globs.append(e["glob"])
+    if not keep_labels:
+        raise ValueError("hf_subsets resolved to nothing — name at least one config or config/split")
+    return keep_labels, globs
+
+
+def _safe_name(s: str) -> str:
+    """Filesystem- and S3-safe token for a subset label / file stem."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)).strip("_") or "x"
+
+
+def _audio_ext(data: bytes, hint: Optional[str]) -> str:
+    """Extension for an embedded clip: the struct's own filename when it has a
+    known audio suffix, else sniffed from the container magic."""
+    ext = Path(hint or "").suffix.lower()
+    if ext in _AUDIO_EXTS:
+        return ext
+    for magic, e in _AUDIO_MAGIC:
+        if data.startswith(magic):
+            return e
+    if data[4:8] == b"ftyp":
+        return ".m4a"
+    return ".wav"
+
+
+def _table_with_embedded_audio(meta: Path, audio_field: str, work: str, label: str):
+    """Load a parquet whose audio column is an HF `Audio` feature (a
+    `struct<bytes, path>` of the clip itself, not a path to a file in the repo),
+    writing each clip under `work/_embedded/{label}/` and replacing the column
+    with that relative path — so the rest of the pipeline sees the same
+    file-reference shape a plain audio-archive repo produces.
+
+    Returns a DataFrame, or None when this isn't an embedded-audio parquet (the
+    caller falls back to `_load_table`).
+
+    Streamed in `_EMBED_BATCH_ROWS` batches: the whole point is to never hold a
+    shard's worth of audio bytes in memory. Clip names are
+    `{label}_{shard}_{row}` — the label is load-bearing, because the struct's own
+    `path` (e.g. `gen00047.wav`) repeats across configs and `_materialise_s3`
+    keys S3 objects by BASENAME, so two configs' clips would silently collapse
+    onto one object."""
+    if meta.suffix.lower() != ".parquet":
+        return None
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(meta)
+    schema = pf.schema_arrow
+    if audio_field not in schema.names:
+        return None
+    ftype = schema.field(audio_field).type
+    if not (pa.types.is_struct(ftype) and any(f.name == "bytes" for f in ftype)):
+        return None
+
+    out_dir = Path(work) / "_embedded" / _safe_name(label)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{_safe_name(label)}_{_safe_name(meta.stem)}"
+    frames = []
+    idx = 0
+    for batch in pf.iter_batches(batch_size=_EMBED_BATCH_ROWS):
+        df = batch.to_pandas()
+        refs: list[Optional[str]] = []
+        for cell in df[audio_field]:
+            data = cell.get("bytes") if isinstance(cell, dict) else None
+            if not data:
+                refs.append(None)
+                idx += 1
+                continue
+            dest = out_dir / f"{prefix}_{idx:06d}{_audio_ext(data, (cell or {}).get('path'))}"
+            # Idempotent: a resumed transform reuses clips already written.
+            if not (dest.is_file() and dest.stat().st_size == len(data)):
+                dest.write_bytes(data)
+            refs.append(str(dest.relative_to(work)))
+            idx += 1
+        df[audio_field] = refs
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else None
 
 
 def _scalar(v) -> Optional[str]:
@@ -2022,6 +2242,7 @@ def _read_metadata(
     audio_field: str,
     transcription_field: str,
     split_fields: Optional[dict] = None,
+    keep_splits: Optional[set[str]] = None,
 ) -> list[dict]:
     """Load + concatenate every metadata table (csv/tsv/parquet/jsonl) that has
     the audio column — so train/test split parquets are all included. Each split
@@ -2029,7 +2250,11 @@ def _read_metadata(
     {"train": "text", "test": "after"}); the chosen column is normalised into a
     single `__text__` column so the output is unified. All other columns (e.g.
     `speaker`) are preserved so the output dataset keeps them. Raises with the
-    columns it *did* find when nothing matches (usually a wrong column mapping)."""
+    columns it *did* find when nothing matches (usually a wrong column mapping).
+
+    `keep_splits` restricts the run to those declared subset labels (see
+    `_resolve_hf_subsets`); tables belonging to any other config/split are
+    skipped WITHOUT being read, so an unselected multi-GB config costs nothing."""
     import pandas as pd
 
     split_fields = split_fields or {}
@@ -2049,14 +2274,11 @@ def _read_metadata(
     frames = []
     seen_cols: set[str] = set()
     skipped_undeclared = 0
+    skipped_unselected = 0
     for meta in candidates:
-        try:
-            df = _load_table(meta)
-        except Exception:
-            continue
-        seen_cols.update(map(str, df.columns))
-        if audio_field not in df.columns:
-            continue
+        # The split label is resolved BEFORE the table is loaded so a filtered-out
+        # (or undeclared) file is never read — with embedded audio a single parquet
+        # shard is hundreds of MB.
         if declared is not None:
             try:
                 rel = str(meta.relative_to(root)).replace(os.sep, "/")
@@ -2069,6 +2291,24 @@ def _read_metadata(
                 continue
         else:
             split = _split_of(meta, root)
+        if keep_splits is not None and split not in keep_splits:
+            skipped_unselected += 1
+            continue
+        # An HF `Audio` column stores the clip inline; materialise it to disk and
+        # carry a path, so the join below is the same for both repo shapes.
+        try:
+            df = _table_with_embedded_audio(meta, audio_field, work, split)
+        except Exception:
+            logger.exception("embedded-audio read failed for %s; falling back to a plain read", meta)
+            df = None
+        if df is None:
+            try:
+                df = _load_table(meta)
+            except Exception:
+                continue
+        seen_cols.update(map(str, df.columns))
+        if audio_field not in df.columns:
+            continue
         tcol = split_fields.get(split) or transcription_field
         out = df.copy()  # keep every column (speaker, etc.); audio col is replaced later
         # Missing column for this split → blank, not a hard failure (the split may
@@ -2081,6 +2321,8 @@ def _read_metadata(
             "transform: kept %d declared-split tables, dropped %d not referenced by the "
             "source's configs (e.g. loose root parquets)", len(frames), skipped_undeclared,
         )
+    if skipped_unselected:
+        logger.info("transform: skipped %d table(s) outside the selected subsets", skipped_unselected)
     if not frames:
         raise RuntimeError(
             f"no metadata table has the audio column '{audio_field}'. "
@@ -2094,16 +2336,19 @@ def _build_pairs(
     audio_field: str,
     transcription_field: str,
     split_fields: Optional[dict] = None,
+    keep_splits: Optional[set[str]] = None,
 ) -> list[tuple[str, str, str, dict]]:
     """Join each metadata row's audio reference to an extracted file on disk.
     Returns [(split, abs_audio_path, transcription, extra)] so the output keeps
     splits; `extra` carries the row's other simple columns (e.g. speaker)."""
     root = Path(work)
+    rows = _read_metadata(work, audio_field, transcription_field, split_fields, keep_splits)
+    # basename → path, for repos whose metadata references a clip by name only.
+    # Built AFTER the metadata read so embedded audio materialised by it is seen.
     by_name: dict[str, str] = {}
     for f in root.rglob("*"):
         if f.suffix.lower() in _AUDIO_EXTS:
-            by_name.setdefault(f.name, str(f))  # basename → path
-    rows = _read_metadata(work, audio_field, transcription_field, split_fields)
+            by_name.setdefault(f.name, str(f))
     # Don't carry the audio col (it's replaced by the URL), the chosen
     # transcription col (it becomes `transcription_field`), or the markers.
     skip = {audio_field, transcription_field, "__text__", "__split__"}
@@ -2332,7 +2577,14 @@ def _materialise_s3(
     # Presign every unique key (local signing, one client), then write the CSV
     # with the carried-through columns (e.g. speaker) after audio/text/split.
     urls = bench.s3_presign_many(list(key_of.values()), expires, s3_target)
-    extra_cols = sorted({k for *_rest, extra in pairs for k in extra})
+    # ⚠ A carried-through column may share a name with one of the three columns
+    # this writer owns. Emitting both would put TWO same-named columns in the CSV
+    # and every reader (csv.DictReader, pandas) keeps the LAST — silently
+    # replacing the real label with the passenger value. Seen for real merging a
+    # source labelled by `text` that also carries an ASR-readback `transcription`
+    # column into an output whose transcription column IS `transcription`.
+    reserved = {"audio", transcription_field, "split"}
+    extra_cols = sorted({k for *_rest, extra in pairs for k in extra} - reserved)
     buf = _io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["audio", transcription_field, "split"] + extra_cols)

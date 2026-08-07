@@ -2,9 +2,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Check, Loader2, Pencil } from "lucide-react";
+import { Check, ChevronDown, Loader2, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -16,7 +22,13 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 
-type SplitInfo = { split: string; columns: string[]; num_rows?: number | null };
+type SplitInfo = {
+  split: string;
+  columns: string[];
+  num_rows?: number | null;
+  // Only set by `?all=1`: whether the subset is inside the dataset's stored scope.
+  in_scope?: boolean | null;
+};
 
 /** Pull a readable message out of the gateway's {detail} / {detail:{error}} shape. */
 function errText(body: unknown, fallback: string): string {
@@ -35,6 +47,9 @@ function errText(body: unknown, fallback: string): string {
 // column" with a sentinel that maps back to "" on save.
 const NO_SPEAKER = "__none__";
 
+const sameScope = (a: string[], b: string[]) =>
+  a.length === b.length && a.every((x, i) => x === b[i]);
+
 export function ColumnsCard({
   datasetId,
   kind,
@@ -45,6 +60,7 @@ export function ColumnsCard({
   messagesField,
   rejectedField,
   promptField,
+  hfSubsets,
 }: {
   datasetId: string;
   kind: string;
@@ -55,6 +71,7 @@ export function ColumnsCard({
   messagesField?: string | null;
   rejectedField?: string | null;
   promptField?: string | null;
+  hfSubsets?: string[] | null;
 }) {
   const router = useRouter();
   const isHfLike = kind === "hf" || kind === "llm"; // column list comes from HF splits API
@@ -91,9 +108,23 @@ export function ColumnsCard({
   const [prompt, setPrompt] = useState(promptField ?? "");
   // TTS-only speaker column (one global column, like audio). "" → one voice.
   const [speaker, setSpeaker] = useState(speakerField ?? "");
+  // kind=hf source scope — which of the repo's configs/splits this dataset covers.
+  // Editable here (not only at create) because it's the setting you most want to
+  // fix after seeing the rows: it drives the row browser, the split pickers below
+  // AND which files a transform downloads. Held as canonical labels, ticked off the
+  // repo's real subset list rather than typed — a typo here empties the dataset.
+  const [subsets, setSubsets] = useState<string[]>([]);
+  // What the scope resolved to when the splits loaded. The stored scope may be a
+  // bare config name ("synthetic") that expands to several labels, so "did the user
+  // change it" compares against this, not against the raw stored value — otherwise
+  // merely opening the editor would rewrite the scope.
+  const [scopeBaseline, setScopeBaseline] = useState<string[]>([]);
   // Per-split transcription column choices (only when the HF source exposes splits).
   const [perSplit, setPerSplit] = useState<Record<string, string>>({});
   const [splits, setSplits] = useState<SplitInfo[] | null>(null);
+  // Every subset the repo exposes (from ?all=1) — the pool the picker offers, so
+  // the scope can be widened again and not just narrowed.
+  const [allSubsets, setAllSubsets] = useState<SplitInfo[]>([]);
   const [loadingSplits, setLoadingSplits] = useState(false);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -133,10 +164,23 @@ export function ColumnsCard({
     }
     setLoadingSplits(true);
     try {
-      const r = await fetch(`/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/splits`, { cache: "no-store" });
+      // ?all=1 in ONE call: everything the repo has, each flagged in_scope — the
+      // pool for the scope picker, and (filtered) the splits this dataset reads.
+      const r = await fetch(
+        `/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/splits?all=1`,
+        { cache: "no-store" },
+      );
       const data = (await r.json()) as { splits?: SplitInfo[] };
-      const info = data.splits ?? [];
+      const every = data.splits ?? [];
+      const inScope = every.filter((s) => s.in_scope !== false);
+      setAllSubsets(every);
+      // A scope resolving to nothing leaves the mapping section on the full list
+      // rather than on an empty one; the picker is right there to fix it.
+      const info = inScope.length ? inScope : every;
       setSplits(info);
+      const scoped = inScope.map((s) => s.split);
+      setSubsets(scoped);
+      setScopeBaseline(scoped);
       seedPerSplit(info);
     } catch {
       setSplits([]);
@@ -158,12 +202,16 @@ export function ColumnsCard({
     setRejected(rejectedField ?? "");
     setPrompt(promptField ?? "");
     setSpeaker(speakerField ?? "");
+    setSubsets(scopeBaseline);
     setErr(null);
     setEditing(true);
     if (splits) seedPerSplit(splits);
     else void loadSplits();
   }
 
+  // Live view of the same check `save()` makes, so the warning about the per-split
+  // mapping shows while the picker is open.
+  const scopeChangedNow = isHf && !sameScope(subsets, scopeBaseline);
   const multiSplit = showTts && (splits?.length ?? 0) > 1;
   // Union of all known columns from the HF splits API, used for all dropdowns.
   const allColumns = Array.from(new Set((splits ?? []).flatMap((s) => s.columns)));
@@ -223,7 +271,20 @@ export function ColumnsCard({
     // Scope the PATCH to the visible modality so switching LLM↔TTS never clobbers
     // the other side's mapping (a kind=hf dataset can carry both).
     let body: Record<string, unknown>;
-    if (showMessages && !showTts) {
+    if (scopeChangedNow) {
+      // Changing the scope changes which splits EXIST, so the per-split picks
+      // below were derived from a list that's about to be replaced — saving them
+      // would write a mapping keyed by labels this dataset no longer has. Save the
+      // scope, clear the overrides, and let the reloaded splits be re-mapped.
+      // Ticking every subset means "the whole repo" → store no scope at all, so a
+      // config added upstream later is picked up instead of being silently excluded.
+      const everything = subsets.length === allSubsets.length;
+      body = {
+        hf_subsets: everything ? [] : subsets,
+        split_fields: {},
+        audio_field: audio.trim(),
+      };
+    } else if (showMessages && !showTts) {
       // hf · LLM mode: messages + audio only (leave the TTS mapping untouched).
       if (!messages.trim()) {
         setErr("Messages column is required.");
@@ -323,6 +384,18 @@ export function ColumnsCard({
       <CardContent>
         {!editing ? (
           <div className="divide-y divide-border/60">
+            {isHf && (
+              <div className="flex items-baseline justify-between gap-4 py-1.5">
+                <span className="text-xs text-muted-foreground">Subsets</span>
+                <span className="text-right font-mono text-xs">
+                  {(hfSubsets ?? []).length ? (
+                    (hfSubsets ?? []).join(", ")
+                  ) : (
+                    <span className="text-muted-foreground/50">whole repo</span>
+                  )}
+                </span>
+              </div>
+            )}
             {showAudio && (
               <div className="flex items-baseline justify-between gap-4 py-1.5">
                 <span className="text-xs text-muted-foreground">Audio column</span>
@@ -516,6 +589,70 @@ export function ColumnsCard({
           </div>
         ) : (
           <div className="space-y-3">
+            {isHf && (
+              <div className="space-y-1 sm:max-w-md">
+                <Label className="text-xs">Subsets</Label>
+                {loadingSplits ? (
+                  <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Loader2 className="h-3 w-3 animate-spin" /> reading subsets…
+                  </p>
+                ) : (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={saving || allSubsets.length === 0}
+                        className="h-8 w-56 justify-between text-xs font-normal"
+                      >
+                        <span className="truncate">
+                          {subsets.length === 0 || subsets.length === allSubsets.length
+                            ? "whole repo"
+                            : subsets.length === 1
+                              ? subsets[0]
+                              : `${subsets.length} subsets`}
+                        </span>
+                        <ChevronDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-60" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="start" className="max-h-72 overflow-y-auto">
+                      {allSubsets.map((s) => (
+                        <DropdownMenuCheckboxItem
+                          key={s.split}
+                          checked={subsets.includes(s.split)}
+                          // keep the menu open so several can be ticked in one go
+                          onSelect={(e) => e.preventDefault()}
+                          onCheckedChange={(c) =>
+                            setSubsets((prev) => {
+                              const next = c ? [...prev, s.split] : prev.filter((x) => x !== s.split);
+                              // keep the repo's own order, so the saved scope is stable
+                              return allSubsets.map((x) => x.split).filter((x) => next.includes(x));
+                            })
+                          }
+                          className="text-xs"
+                        >
+                          <span className="font-mono">{s.split}</span>
+                          {typeof s.num_rows === "number" && (
+                            <span className="ml-1.5 text-[10px] opacity-60">({s.num_rows.toLocaleString()})</span>
+                          )}
+                        </DropdownMenuCheckboxItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
+                <p className="text-[11px] text-muted-foreground">
+                  Which of the repo&apos;s configs/splits this dataset covers. Bounds the row browser, the
+                  split pickers below, and which files a transform downloads. Tick everything for the whole
+                  repo.
+                  {scopeChangedNow && (
+                    <span className="block pt-1 text-foreground">
+                      Changing this replaces the split list, so saving clears the per-split transcription
+                      mapping — re-pick it once the new subsets load.
+                    </span>
+                  )}
+                </p>
+              </div>
+            )}
             <div className="space-y-1 sm:max-w-xs">
               <Label htmlFor="ds-audio" className="text-xs">Audio column</Label>
               {isHfLike && allColumns.length > 0 ? (
@@ -549,7 +686,18 @@ export function ColumnsCard({
                 <div className="space-y-2">
                   {(splits ?? []).map((s) => (
                     <div key={s.split} className="flex items-center gap-3">
-                      <span className="w-24 shrink-0 font-mono text-xs text-muted-foreground">
+                      {/* A subset label is `config/split` and can be long
+                          (synthetic_podcast/train). The old fixed w-24 didn't clip,
+                          so the text ran straight over the dropdown next to it —
+                          hence the width bump + truncate + a title for the full name. */}
+                      <span
+                        className="w-44 shrink-0 truncate font-mono text-xs text-muted-foreground"
+                        title={
+                          typeof s.num_rows === "number"
+                            ? `${s.split} — ${s.num_rows.toLocaleString()} rows`
+                            : s.split
+                        }
+                      >
                         {s.split}
                         {typeof s.num_rows === "number" && (
                           <span className="ml-1 text-[10px] opacity-60">({s.num_rows})</span>
@@ -560,7 +708,7 @@ export function ColumnsCard({
                         onValueChange={(v) => setPerSplit((p) => ({ ...p, [s.split]: v }))}
                         disabled={saving}
                       >
-                        <SelectTrigger className="text-xs">
+                        <SelectTrigger className="w-56 shrink-0 text-xs">
                           <SelectValue placeholder="Choose a column" />
                         </SelectTrigger>
                         <SelectContent>
