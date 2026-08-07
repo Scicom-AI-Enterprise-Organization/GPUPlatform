@@ -11,6 +11,10 @@ export type ProgressMarker = {
   processed: number | null;
   total: number | null;
   percent: number | null;
+  // What processed/total COUNT — "MB" for the HF snapshot download, "clips" /
+  // "files" / "rows" elsewhere. Absent on older logs (and on emitters that don't
+  // send it), in which case the counts are shown bare.
+  unit: string | null;
 };
 
 const MARKER_RE = /\[AUTOTRAIN_PROGRESS\]([^\n]*)/g;
@@ -37,7 +41,7 @@ export function parseAutotrainProgress(log: string | null | undefined): Progress
   let percent = num(kv.percent);
   if (percent === null && processed !== null && total) percent = (processed / total) * 100;
   if (processed === null && total === null && percent === null) return null;
-  return { step: kv.step ?? null, processed, total, percent };
+  return { step: kv.step ?? null, processed, total, percent, unit: kv.unit ?? null };
 }
 
 const WINDOW_MS = 90_000; // smoothing window for the rate estimate

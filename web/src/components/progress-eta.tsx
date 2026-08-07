@@ -20,12 +20,20 @@ export function ProgressEta({
   const pct = marker?.percent ?? null;
   const etaStr = formatEta(eta);
   const step = prettyStep(marker?.step);
+  // "2,337/4,609 MB" — WITH the unit. The counts mean different things per step
+  // (megabytes while fetching the source, clips while uploading), and an unlabelled
+  // one reads as a row count, i.e. as if most of the dataset had gone missing.
+  const counts =
+    marker?.processed !== null && marker?.processed !== undefined && marker?.total
+      ? `${marker.processed.toLocaleString()}/${marker.total.toLocaleString()}${marker.unit ? ` ${marker.unit}` : ""}`
+      : null;
   if (pct === null && etaStr === null && !step) return null;
 
   return (
     <span className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-muted/40 px-2 py-0.5 text-[10px] font-medium tabular-nums text-foreground/80">
       {step && <span className="text-muted-foreground">{step}</span>}
       {pct !== null && <span>{Math.round(pct)}%</span>}
+      {counts && <span className="text-muted-foreground">{counts}</span>}
       <span className="text-muted-foreground">{etaStr ? `ETA ${etaStr}` : "estimating…"}</span>
     </span>
   );

@@ -371,10 +371,20 @@ def _make_progress(dataset_id: str, loop: asyncio.AbstractEventLoop) -> Callable
     threadpool). Appends an `[AUTOTRAIN_PROGRESS]` marker to transform_log so the
     UI can show a percentage + ETA — the same marker format the TTS pack emits.
     `rate`, when given, is appended as `rate=<MB/s>` (the download step's transfer
-    speed); the UI marker parser ignores unknown keys, so it's purely additive."""
-    def progress(step: str, processed: int, total: int, rate: Optional[float] = None) -> None:
+    speed); the UI marker parser ignores unknown keys, so it's purely additive.
+
+    ⚠ `unit` is not decoration. `processed`/`total` count different things per step
+    — MEGABYTES for the HF snapshot download, clips for the per-file steps, rows
+    for normalize/pack — and `step=download` is used by both the byte-based and the
+    clip-based downloaders. A reader with no unit naturally reads the number as
+    rows, which on a 4,609 MB / 13,460-row transform looks like two thirds of the
+    dataset silently going missing (reported for real)."""
+    def progress(step: str, processed: int, total: int, rate: Optional[float] = None,
+                 unit: Optional[str] = None) -> None:
         pct = (processed / total * 100.0) if total else 0.0
         line = f"[AUTOTRAIN_PROGRESS] step={step} processed={processed} total={total} percent={pct:.1f}"
+        if unit:
+            line += f" unit={unit}"
         if rate is not None:
             # Trailing unit reads cleanly in the log; the marker parser tokenises on
             # whitespace and ignores the unit-only `MB/s` token (and the `rate` key).
@@ -869,7 +879,7 @@ def _normalize_rows(
                 stats["unchanged"] += 1
             done += 1
             if progress and (done % every == 0 or done == total):
-                progress("normalize", done, total)
+                progress("normalize", done, total, unit="rows")
     # Rows never processed (cancelled before completion) keep their original tuple.
     for i, r in enumerate(rows):
         if new_rows[i] is None:
@@ -1238,7 +1248,7 @@ def _upload_chinidataset_dir(out_dir: str, target, key_prefix: str,
 
     def _on_done(done: int) -> None:
         if progress and (done % every == 0 or done == total):
-            progress("upload_s3", done, total)
+            progress("upload_s3", done, total, unit="clips")
 
     # max_workers was 16 — high thread-count concurrent HTTPS/TLS handshakes hit a
     # genuine SIGSEGV in this Python build's bundled OpenSSL (X509_verify_cert on a
@@ -1415,7 +1425,7 @@ async def _run_llm_pack(
         out_dir = os.path.join(work, "packed")
 
         def _pack_progress(p: int, t: int) -> None:
-            progress("pack", p, t)
+            progress("pack", p, t, unit="rows")
 
         if objective == "dpo":
             stats = await run_in_threadpool(
@@ -1523,7 +1533,7 @@ def _download_parquet_urls(
                         f.write(chunk)
             paths.append(local)
             if progress:
-                progress("download", i + 1, total)
+                progress("download", i + 1, total, unit="files")
     return paths
 
 
@@ -1639,7 +1649,7 @@ def _download(
             # grow, e.g. a cached re-run where snapshot_download fetches nothing).
             rate = max(0.0, (cur_bytes - prev_bytes) / dt / mb) if dt > 0 else 0.0
             prev_bytes, prev_t = cur_bytes, now
-            progress("download", min(cur_bytes, total_bytes) // mb, total_bytes // mb, rate)
+            progress("download", min(cur_bytes, total_bytes) // mb, total_bytes // mb, rate, unit="MB")
 
     poller = threading.Thread(target=_poll, daemon=True)
     poller.start()
@@ -1653,7 +1663,7 @@ def _download(
         stop.set()
         poller.join(timeout=3.0)
     if progress and total_bytes:
-        progress("download", total_bytes // mb, total_bytes // mb)
+        progress("download", total_bytes // mb, total_bytes // mb, unit="MB")
     return dest
 
 
@@ -1853,7 +1863,7 @@ def _label_pairs(
                     done = n_done
                 if progress is not None and (done % 50 == 0 or done == n_total):
                     try:
-                        progress("download", done, n_total)
+                        progress("download", done, n_total, unit="clips")
                     except Exception:  # noqa: BLE001 — progress is best-effort
                         pass
     return pairs, {"total": n_total, "downloaded": len(pairs), "failed": n_fail}
@@ -1999,7 +2009,7 @@ def _s3_pairs(
         extra = {k: v for k, v in r.items() if k not in skip and isinstance(v, str) and v != ""}
         pairs.append((split, str(dest), str(text_val), extra))
         if progress and (i % every == 0 or i == total - 1):
-            progress("download_s3", i + 1, total)
+            progress("download_s3", i + 1, total, unit="clips")
     return pairs
 
 
@@ -2565,7 +2575,7 @@ def _materialise_s3(
 
     def _tick(done: int) -> None:
         if progress and (done % every == 0 or done == total):
-            progress("upload_s3", done, total)
+            progress("upload_s3", done, total, unit="clips")
 
     # Server-side copies first (fast metadata ops), then local uploads.
     if to_copy:
