@@ -136,6 +136,9 @@ class TrainingRun(Base):
     name: Mapped[str] = mapped_column(String(128))
     dataset_id: Mapped[str] = mapped_column(String(64), index=True)
     test_dataset_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # ASR: several named test sets, each scored on its own (see db.py's ALTER for
+    # why a single blended set is not enough). Supersedes test_dataset_id when set.
+    test_dataset_ids: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     base_model: Mapped[str] = mapped_column(String(255))
     # "asr" (Whisper finetune) | "tts" (Qwen3 + NeuCodec finetune).
     task_type: Mapped[str] = mapped_column(String(16), default="asr", server_default="asr", nullable=False)
@@ -543,31 +546,15 @@ def _ssh_put(cli, local: str, remote: str) -> None:
     doesn't expose the SFTP subsystem, so `cli.open_sftp()` dies with
     "EOF during negotiation". exec is the only channel type these proxies allow;
     base64 keeps the payload to a single safe argv (no quoting/heredoc issues).
-    Mirrors pyremote_shim's config upload. Files shipped here (trainer scripts,
-    config json) are tens of KB — well under ARG_MAX for a printf argv."""
-    import base64 as _b64
-    import shlex as _shlex
 
+    ⚠ This used to write the whole payload as ONE `printf %s <b64>` argv, on the
+    assumption that trainer scripts stay "tens of KB". `whisper_finetune.py` grew
+    past it (105 KB → 140,508 b64 bytes vs Linux's 131,072-byte MAX_ARG_STRLEN)
+    and EVERY asr run died with `/bin/bash: Argument list too long`. It delegates
+    to `_ssh_put_bytes` now, which chunks + verifies the landed size — so the next
+    script to cross the line just works."""
     with open(local, "rb") as f:
-        b64 = _b64.b64encode(f.read()).decode("ascii")
-    write_cmd = (
-        f"mkdir -p \"$(dirname {_shlex.quote(remote)})\" && "
-        f"printf %s {_shlex.quote(b64)} | base64 -d > {_shlex.quote(remote)}"
-    )
-    chan = cli.get_transport().open_session()
-    chan.set_combine_stderr(True)
-    chan.exec_command(f"bash -c {_shlex.quote(write_cmd)}")
-    out = b""
-    while not chan.exit_status_ready() or chan.recv_ready():
-        if chan.recv_ready():
-            out += chan.recv(8192)
-        else:
-            time.sleep(0.05)
-    rc = chan.recv_exit_status()
-    if rc != 0:
-        raise RuntimeError(
-            f"remote write of {remote} failed (rc={rc}): {out.decode('utf-8', 'replace').strip()}"
-        )
+        _ssh_put_bytes(cli, f.read(), remote)
 
 
 def _ssh_put_bytes(cli, data: bytes, remote: str) -> None:
@@ -1869,6 +1856,7 @@ async def run_training(redis, run_id: str) -> None:
         storage_id = row.storage_id
         dataset_id = row.dataset_id
         test_dataset_id = row.test_dataset_id
+        test_dataset_ids = list(row.test_dataset_ids or [])
         s3_prefix = row.s3_prefix
         gpu_type = row.gpu_type or "NVIDIA L40S"
         gpu_count = row.gpu_count or 1
@@ -1907,6 +1895,26 @@ async def run_training(redis, run_id: str) -> None:
             # "No test set" — train on everything, no eval. Never resolve a test
             # dataset or set test_from_split (the trainers force eval off).
             await _push_log(redis, run_id, "[gateway] no_eval: training with no test set / no eval")
+        elif test_dataset_ids:
+            # Several named test sets, each scored on its own. The trainer tags every
+            # eval row with its set name and reports per-set + macro metrics.
+            named = []
+            async with session_factory()() as _s:
+                for tid in test_dataset_ids:
+                    _d = await _s.get(Dataset, tid)
+                    named.append({
+                        "name": (_d.name if _d is not None else tid),
+                        "dataset": await _resolve_dataset_spec(tid, _ds_hf_token),
+                        # A test set that IS the training dataset contributes only its
+                        # own test/validation split, never the rows being trained on.
+                        "from_split": bool(tid == dataset_id),
+                    })
+            cfg["test_datasets"] = named
+            await _push_log(
+                redis, run_id,
+                f"[gateway] {len(named)} test set(s), scored separately: "
+                + ", ".join(n["name"] for n in named),
+            )
         elif test_dataset_id and test_dataset_id != dataset_id:
             cfg["test_dataset"] = await _resolve_dataset_spec(test_dataset_id, _ds_hf_token)
         elif test_dataset_id and test_dataset_id == dataset_id:
@@ -2935,6 +2943,12 @@ class CreateTrainingRunRequest(BaseModel):
     base_model: str
     task_type: str = "asr"             # "asr" | "tts" | "llm"
     test_dataset_id: Optional[str] = None
+    # ASR: evaluate against SEVERAL named test sets, each scored separately (the
+    # form's multi-select). Wins over test_dataset_id when non-empty. The run
+    # reports wer/cer per set plus a MACRO average (equal weight per set, not per
+    # row) — which is what best-checkpoint selection should use, so a large
+    # augmented set can't outvote a small clean one.
+    test_dataset_ids: list[str] = []
     # ---- TTS-only (Qwen3 + NeuCodec) ----
     tokenizer: Optional[str] = None    # pack tokenizer (speech tokens); default set in runner
     block_size: int = 10240            # training context length
@@ -3185,6 +3199,7 @@ class TrainingRunRecord(BaseModel):
     status: str
     dataset_id: str
     test_dataset_id: Optional[str] = None
+    test_dataset_ids: Optional[list[str]] = None
     base_model: str
     task_type: str = "asr"
     s3_prefix: str
@@ -3270,7 +3285,9 @@ def _to_record(
             result_json = {**result_json, "best": corrected}
     return TrainingRunRecord(
         id=row.id, name=row.name, status=row.status, dataset_id=row.dataset_id,
-        test_dataset_id=row.test_dataset_id, base_model=row.base_model,
+        test_dataset_id=row.test_dataset_id,
+        test_dataset_ids=list(row.test_dataset_ids or []) or None,
+        base_model=row.base_model,
         task_type=row.task_type,
         s3_prefix=row.s3_prefix, config_json=row.config_json or {},
         exit_code=row.exit_code, error_text=row.error_text, result_json=result_json,
@@ -3666,7 +3683,9 @@ async def _create_and_launch_run(
     }
     row = TrainingRun(
         id=run_id, name=body.name.strip() or run_id, dataset_id=body.dataset_id,
-        test_dataset_id=body.test_dataset_id, base_model=body.base_model,
+        test_dataset_id=body.test_dataset_id,
+        test_dataset_ids=[t for t in (body.test_dataset_ids or []) if t and t.strip()] or None,
+        base_model=body.base_model,
         task_type=body.task_type,
         config_json=config, status="queued", s3_prefix=s3_prefix, owner_id=user.id,
         provider_id=body.provider_id, storage_id=body.storage_id,

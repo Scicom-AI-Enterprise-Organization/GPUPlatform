@@ -1725,6 +1725,21 @@ class _LazyAsrDataset:
 EVAL_SPLITS = {"test", "validation", "valid", "eval", "dev"}
 
 
+def _slug(name: str) -> str:
+    """Dataset name → a metric-key-safe token. HF builds keys as
+    `eval_<key>_wer`, and `metric_for_best_model` matches them literally, so the
+    key can't carry spaces or dots."""
+    import re as _re
+    out = _re.sub(r"[^0-9a-zA-Z]+", "_", str(name or "test")).strip("_").lower()
+    return out or "test"
+
+
+def _mean(vals):
+    """Average of the non-None values, or None when there are none."""
+    xs = [float(v) for v in (vals or []) if v is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
 def split_pairs(pairs: list[dict], cfg: dict) -> tuple[list[dict], list[dict]]:
     labelled = [p for p in pairs if p.get("split")]
     if labelled and any(p["split"].lower() in EVAL_SPLITS for p in labelled):
@@ -1798,12 +1813,36 @@ def run(cfg: dict) -> None:
         f"max_epochs={cfg['max_epochs']} patience={cfg.get('patience', 0)}")
 
     no_eval = bool(cfg.get("no_eval"))
+    eval_groups: list = []          # [(set name, pairs)] when several test sets are configured
     pairs = load_pairs(cfg["dataset"], work)
     if no_eval:
         # "No test set" — train on everything, no held-out eval (no WER/CER, no
         # best-checkpoint selection, no early stop). The final/last model is saved.
         train_pairs, eval_pairs = pairs, []
         log(f"[split] no_eval: training on all {len(train_pairs)} rows — evaluation disabled")
+    elif cfg.get("test_datasets"):
+        # Several named test sets, each kept SEPARATE so it is scored on its own.
+        # A single blended eval set hides per-set regression: 200 rows of
+        # transport-augmented audio next to a 50-row clean corpus put 80% of the
+        # weight on the former, and best-checkpoint selection would follow it.
+        train_pairs = pairs
+        eval_groups = []
+        for spec in cfg["test_datasets"]:
+            nm = str(spec.get("name") or "test")
+            if spec.get("from_split"):
+                # This test set IS the training dataset — split it ONCE and use both
+                # halves: its test rows here, and the train half as the training set.
+                # Without reassigning train_pairs the model would train on the very
+                # rows it is scored on.
+                train_pairs, ev = split_pairs(pairs, cfg)
+            else:
+                ev = load_pairs(spec["dataset"], work)
+            if ev:
+                eval_groups.append((nm, ev))
+            log(f"[split] test set '{nm}': {len(ev)} rows")
+        eval_pairs = [p for _, g in eval_groups for p in g]
+        log(f"[split] {len(eval_groups)} separate test set(s): "
+            f"{len(train_pairs)} train / {len(eval_pairs)} eval total")
     elif cfg.get("test_dataset"):
         train_pairs = pairs
         eval_pairs = load_pairs(cfg["test_dataset"], work)
@@ -1890,10 +1929,33 @@ def run(cfg: dict) -> None:
     aug_prob = float(cfg.get("augment_prob", 0.5))
     train_ds = _LazyAsrDataset(train_pairs, processor, work,
                                augment_techniques=aug_techs, augment_prob=aug_prob)
-    eval_ds = None if no_eval else _LazyAsrDataset(eval_pairs, processor, work)  # never augment eval
+    # A dict eval_dataset makes HF run evaluation once PER SET, prefixing every
+    # metric with the set name — so per-set loss comes for free alongside per-set
+    # WER/CER. Single set (or none) keeps the plain dataset.
+    if no_eval:
+        eval_ds = None
+    elif eval_groups:
+        eval_ds = {_slug(nm): _LazyAsrDataset(g, processor, work) for nm, g in eval_groups}
+    else:
+        eval_ds = _LazyAsrDataset(eval_pairs, processor, work)  # never augment eval
     log(f"[trainer] {len(train_ds)} train / {0 if no_eval else len(eval_ds)} eval examples "
         f"— audio fetched + decoded lazily per item during training"
         + (f"; augment p={aug_prob}: {', '.join(aug_techs)}" if aug_techs else ""))
+
+    # {metric-key slug: display name} for the configured test sets — empty unless
+    # several were selected, which keeps the single-set path byte-for-byte the same.
+    _eval_set_keys = {_slug(nm): nm for nm, _ in eval_groups} if eval_groups else {}
+    # Per-round scratch shared by MacroMetric (fills it) and MetricEmitter (drains it).
+    _set_acc: dict = {}
+
+    # What shift_tokens_right prepends to build the decoder input — the token the
+    # labels must NOT also start with (see the strip in Collator below).
+    _decoder_start_id = (
+        getattr(model.config, "decoder_start_token_id", None)
+        or processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+    )
+    log(f"[trainer] decoder_start_token_id={_decoder_start_id} "
+        f"(bos_token_id={processor.tokenizer.bos_token_id}) — labels stripped of the leading SOT")
 
     class Collator:
         def __call__(self, features):
@@ -1914,7 +1976,20 @@ def run(cfg: dict) -> None:
                 [{"input_ids": f["labels"]} for f in features], return_tensors="pt"
             )
             lab = labels["input_ids"].masked_fill(labels.attention_mask.ne(1), -100)
-            if (lab[:, 0] == processor.tokenizer.bos_token_id).all().cpu().item():
+            # ⚠ Strip the leading <|startoftranscript|>: the model's own
+            # shift_tokens_right prepends decoder_start_token_id, so leaving it in
+            # the labels trains the model to EMIT <|startoftranscript|> as its first
+            # generated token — while generate() has already consumed it and expects
+            # a language token next. The result is a train/generate mismatch that
+            # eval_loss cannot see (it scores the self-consistent shifted sequence)
+            # and that compute_metrics hides too (skip_special_tokens=True), so it
+            # surfaces only as WER collapsing after the first eval.
+            # This compared against tokenizer.bos_token_id, which for Whisper is
+            # <|endoftext|> (50257), NOT <|startoftranscript|> (50258) — so the strip
+            # NEVER fired. Every whisper run peaked at its first eval and then
+            # degenerated to 80-95 WER. Compare against decoder_start_token_id, which
+            # is what shift_tokens_right actually prepends (the canonical HF collator).
+            if (lab[:, 0] == _decoder_start_id).all().cpu().item():
                 lab = lab[:, 1:]
             batch["labels"] = lab
             return batch
@@ -2045,7 +2120,11 @@ def run(cfg: dict) -> None:
         # No eval → no "best" to load (load_best needs eval==save strategy); keep
         # the last checkpoint instead.
         load_best_model_at_end=(not no_eval),
-        metric_for_best_model=(None if no_eval else metric_name),
+        # Several test sets -> select on the MACRO average so a large augmented set
+        # cannot outvote a small clean one (per-row weighting would let it).
+        metric_for_best_model=(
+            None if no_eval else (f"{metric_name}_macro" if _eval_set_keys else metric_name)
+        ),
         greater_is_better=(None if no_eval else False),
         save_total_limit=1,
         logging_steps=eff_logging_steps,
@@ -2077,13 +2156,55 @@ def run(cfg: dict) -> None:
                 if "loss" in h:
                     train_loss = h["loss"]
                     break
-            emit("METRIC", {
+            point = {
                 "epoch": round(float(state.epoch or 0), 3),
                 "wer": m.get("eval_wer"),
                 "cer": m.get("eval_cer"),
                 "eval_loss": m.get("eval_loss"),
                 "train_loss": train_loss,
-            })
+            }
+            if _eval_set_keys:
+                # One point per ROUND, not per set: MacroMetric marks the round ready
+                # once every set has reported (see its docstring).
+                if not _set_acc.pop("__ready__", False):
+                    return
+                sets = {nm: dict(v) for nm, v in _set_acc.items()}
+                _set_acc.clear()
+                point["sets"] = sets
+                point["wer"] = m.get("eval_wer_macro")
+                point["cer"] = m.get("eval_cer_macro")
+                point["eval_loss"] = _mean([v.get("eval_loss") for v in sets.values()])
+            emit("METRIC", point)
+
+    class MacroMetric(TrainerCallback):
+        """A dict eval_dataset makes HF evaluate each set with its OWN call to
+        `evaluate()`, so `on_evaluate` fires once PER SET and each call sees only
+        that set's metrics — there is no moment where all of them are in one dict.
+
+        Accumulate them, and once the last set has reported, compute the MACRO
+        average (equal weight per set) and inject it into the metrics dict of that
+        final call. That dict is the object `evaluate()` returns and the trainer
+        merges into the combined metrics, so `eval_wer_macro` reaches
+        `load_best_model_at_end` / EarlyStoppingCallback — which is the whole point:
+        a big augmented set must not outvote a small clean one.
+        """
+        def on_evaluate(self, a, state, control, metrics=None, **kw):
+            if metrics is None or not _eval_set_keys:
+                return
+            for key, nm in _eval_set_keys.items():
+                if f"eval_{key}_wer" in metrics or f"eval_{key}_loss" in metrics:
+                    _set_acc[nm] = {
+                        "wer": metrics.get(f"eval_{key}_wer"),
+                        "cer": metrics.get(f"eval_{key}_cer"),
+                        "eval_loss": metrics.get(f"eval_{key}_loss"),
+                    }
+            if len(_set_acc) < len(_eval_set_keys):
+                return  # more sets still to evaluate this round
+            for metric in ("wer", "cer"):
+                avg = _mean([v.get(metric) for v in _set_acc.values()])
+                if avg is not None:
+                    metrics[f"eval_{metric}_macro"] = avg
+            _set_acc["__ready__"] = True
 
     # Graceful early-stop: the gateway's /stop-early `touch`es $SGPU_STOP_FLAG; we
     # poll it each step and stop cleanly so the partial model is still saved+uploaded.
@@ -2097,7 +2218,10 @@ def run(cfg: dict) -> None:
                     print("[trainer] early-stop flag seen → stopping after this step; saving model", flush=True)
             return control
 
-    callbacks: list = [MetricEmitter(), StopFlag()]
+    # MacroMetric FIRST: it injects eval_wer_macro / eval_cer_macro, which
+    # MetricEmitter reports and EarlyStoppingCallback / load_best_model_at_end
+    # select on. Callbacks fire in list order, so it has to run before both.
+    callbacks: list = [MacroMetric(), MetricEmitter(), StopFlag()]
     patience = int(cfg.get("patience", 0) or 0)
     if patience > 0 and not no_eval:  # early stopping needs eval metrics
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience))

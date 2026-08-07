@@ -2162,6 +2162,24 @@ def _declared_entries(work: str) -> Optional[list[dict]]:
             for p in ([path] if isinstance(path, str) else path):
                 triples.append((cfg, str(sp), str(p)))
     if not triples:
+        # `dataset_info:`-only repos declare config_name + splits but no `data_files`
+        # globs (HF writes this block itself; the `configs:` one is hand-authored and
+        # often absent). Without a fallback every subset selection on such a repo
+        # raises "declares no configs", and the only escape is transforming the WHOLE
+        # repo — which for an audio corpus means pulling the multi-GB train shards to
+        # get at a 100-row test split. Synthesize the globs from HF's own layout
+        # convention: `{config}/{split}-*`, with the `default` config living in
+        # `data/`. Narrower than the alternative and still exact — `test-*` does not
+        # match `test_livekit-…`, so sibling splits stay distinct.
+        di = meta.get("dataset_info")
+        for c in (di if isinstance(di, list) else [di] if isinstance(di, dict) else []):
+            cfg = str((c or {}).get("config_name") or "default")
+            folder = "data" if cfg == "default" else cfg
+            for sp in ((c or {}).get("splits") or []):
+                name = str((sp or {}).get("name") or "").strip()
+                if name:
+                    triples.append((cfg, name, f"{folder}/{name}-*"))
+    if not triples:
         return None
     # Label by whichever of config/split is distinct (matches _hf_split_ident).
     pairs = sorted({(c, s) for c, s, _ in triples})

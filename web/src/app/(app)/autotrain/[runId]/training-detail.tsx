@@ -1258,17 +1258,26 @@ function LossCurve({ steps, epochs, live, sweep, trials }: { steps: TrainingStep
   }
   const data = [...byStep.values()]
     .sort((a, b) => a.step - b.step)
-    .map((r) => ({ step: r.step, loss: r.sum / r.n, eval_loss: null as number | null, epoch: r.epoch }));
+    .map((r) => ({ step: r.step, loss: r.sum / r.n, eval_loss: null as number | null, epoch: r.epoch })) as
+      (Record<string, number | null | undefined> & { step: number; loss: number; eval_loss: number | null })[];
+  // Several test sets → one eval-loss line PER SET (plus the macro in `eval_loss`),
+  // so a set whose loss diverges is visible instead of averaged away.
+  const lossSetNames = [...new Set(epochs.flatMap((e) => Object.keys(e.sets || {})))];
   // Per-epoch eval_loss is sparse; pin each to the last (collapsed) training point
   // within that epoch so it overlays the per-step train loss on the same step axis.
   for (const e of epochs) {
-    if (typeof e.eval_loss !== "number") continue;
+    const perSet = lossSetNames
+      .map((nm) => [nm, e.sets?.[nm]?.eval_loss] as const)
+      .filter(([, v]) => typeof v === "number");
+    if (typeof e.eval_loss !== "number" && perSet.length === 0) continue;
     let idx = -1;
     for (let i = 0; i < data.length; i++) {
       if ((data[i].epoch ?? 0) <= (e.epoch ?? 0) + 1e-6) idx = i;
     }
     if (idx < 0) idx = data.length - 1;
-    if (data[idx]) data[idx].eval_loss = e.eval_loss;
+    if (!data[idx]) continue;
+    if (typeof e.eval_loss === "number") data[idx].eval_loss = e.eval_loss;
+    for (const [nm, v] of perSet) data[idx][`${nm} · loss`] = v as number;
   }
   const hasEval = data.some((d) => d.eval_loss != null);
 
@@ -1311,13 +1320,23 @@ function LossCurve({ steps, epochs, live, sweep, trials }: { steps: TrainingStep
                   />
                   <RTooltip
                     contentStyle={{ fontSize: 12, borderRadius: 8 }}
-                    formatter={(v, n) => [Number(v).toFixed(4), n === "eval_loss" ? "eval loss" : "train loss"]}
+                    formatter={(v, n) => [Number(v).toFixed(4),
+                      n === "eval_loss" ? "eval loss" : n === "loss" ? "train loss" : String(n)]}
                     labelFormatter={(s) => `step ${s}`}
                   />
+                  {lossSetNames.length > 1 && <Legend wrapperStyle={{ fontSize: 11 }} />}
                   <Line type="monotone" dataKey="loss" name="train loss" stroke="#6366f1" strokeWidth={2}
                     dot={false} isAnimationActive={false} />
-                  <Line type="monotone" dataKey="eval_loss" name="eval loss" stroke="#f59e0b" strokeWidth={2}
+                  <Line type="monotone" dataKey="eval_loss"
+                    name={lossSetNames.length > 1 ? "eval loss (macro)" : "eval loss"}
+                    stroke="#f59e0b" strokeWidth={2}
                     connectNulls dot={{ r: 3 }} isAnimationActive={false} />
+                  {/* One eval-loss line per test set, same hue as its WER/CER lines above. */}
+                  {lossSetNames.length > 1 && lossSetNames.map((nm, i) => (
+                    <Line key={nm} type="monotone" dataKey={`${nm} · loss`} name={`${nm} · loss`}
+                      stroke={TRIAL_COLORS[i % TRIAL_COLORS.length]} strokeWidth={1.5}
+                      strokeDasharray="4 3" connectNulls dot={{ r: 2 }} isAnimationActive={false} />
+                  ))}
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -1601,6 +1620,68 @@ function EvalCurve({ epochs, sweep, trials }: { epochs: TrainingEpoch[]; sweep: 
               </span>
             ))}
           </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // Several test sets → ONE chart carrying 2 x N lines (WER + CER per set) with a
+  // legend, rather than N separate graphs: the sets are directly comparable and a
+  // single set regressing is visible against the others. The headline wer/cer are
+  // the macro average (equal weight per set).
+  const setNames = [...new Set(epochs.flatMap((e) => Object.keys(e.sets || {})))];
+  if (setNames.length > 1) {
+    const rows = epochs
+      .filter((e) => e.sets && Object.keys(e.sets).length > 0)
+      .map((e) => {
+        const r: Record<string, number | null> = { epoch: e.epoch };
+        for (const nm of setNames) {
+          r[`${nm} · WER`] = e.sets?.[nm]?.wer ?? null;
+          r[`${nm} · CER`] = e.sets?.[nm]?.cer ?? null;
+        }
+        return r;
+      });
+    return (
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm">
+            Eval metrics · WER / CER per test set{" "}
+            <span className="text-[11px] font-normal text-muted-foreground">
+              ({setNames.length} sets · {2 * setNames.length} lines, lower is better · headline = macro average)
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="h-80 w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={rows} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-border" />
+                <XAxis dataKey="epoch" type="number" domain={["dataMin", "dataMax"]} allowDecimals={false}
+                  ticks={uniqTicks(rows.map((d) => Number(d.epoch)))}
+                  tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                  label={{ value: "epoch", position: "insideBottomRight", offset: -4, fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} stroke="currentColor" className="text-muted-foreground"
+                  width={44} domain={["auto", "auto"]} tickFormatter={(v: number) => `${v.toFixed(0)}%`} />
+                <RTooltip contentStyle={{ fontSize: 12, borderRadius: 8 }}
+                  formatter={(v, n) => [`${Number(v).toFixed(2)}%`, String(n)]}
+                  labelFormatter={(e) => `epoch ${e}`} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                {setNames.map((nm, i) => [
+                  // One hue per test set; WER solid, CER dashed — so a set reads as a
+                  // colour and the metric as a line style.
+                  <Line key={`${nm}-wer`} type="monotone" dataKey={`${nm} · WER`}
+                    stroke={TRIAL_COLORS[i % TRIAL_COLORS.length]} strokeWidth={2}
+                    dot={{ r: 2 }} connectNulls isAnimationActive={false} />,
+                  <Line key={`${nm}-cer`} type="monotone" dataKey={`${nm} · CER`}
+                    stroke={TRIAL_COLORS[i % TRIAL_COLORS.length]} strokeWidth={2}
+                    strokeDasharray="4 3" dot={{ r: 2 }} connectNulls isAnimationActive={false} />,
+                ])}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            Solid = WER · dashed = CER · one colour per test set
+          </p>
         </CardContent>
       </Card>
     );

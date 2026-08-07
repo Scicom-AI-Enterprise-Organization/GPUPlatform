@@ -376,6 +376,9 @@ export function TrainingForm() {
   const [customModel, setCustomModel] = useState("");
   const [datasetId, setDatasetId] = useState("");
   const [testDatasetId, setTestDatasetId] = useState(AUTO_SPLIT);
+  // ASR: extra test sets, each scored SEPARATELY (per-set WER/CER + a macro
+  // average that drives best-checkpoint selection). Empty = the single set above.
+  const [extraTestIds, setExtraTestIds] = useState<string[]>([]);
   const [evalSplitPct, setEvalSplitPct] = useState(10);
   // TTS trains on a pre-packed dataset: block size follows the dataset's
   // sequence_length and the tokenizer is the base model's — neither is asked here.
@@ -610,6 +613,7 @@ export function TrainingForm() {
         setName(r.name || (tt === "tts" ? "tts-finetune" : tt === "llm" ? "gemma4-finetune" : "whisper-finetune"));
         setDatasetId(r.dataset_id || "");
         setTestDatasetId(c.no_eval ? NO_TEST : (r.test_dataset_id || AUTO_SPLIT));
+        setExtraTestIds((r.test_dataset_ids || []).filter((x: string) => x !== r.test_dataset_id));
         if (c.eval_split_pct != null) setEvalSplitPct(num(c.eval_split_pct, 10));
         // training
         if (c.grad_accum != null) setGradAccum(num(c.grad_accum, 4));
@@ -1070,6 +1074,10 @@ export function TrainingForm() {
       base_model: baseModel,
       task_type: taskType,
       test_dataset_id: testDatasetId === AUTO_SPLIT || testDatasetId === NO_TEST ? null : testDatasetId,
+      // Several test sets → the primary one leads, then the extras. The backend
+      // scores each on its own and selects on the macro average.
+      test_dataset_ids: extraTestIds.length && testDatasetId !== AUTO_SPLIT && testDatasetId !== NO_TEST
+        ? [testDatasetId, ...extraTestIds] : [],
       no_eval: testDatasetId === NO_TEST,
       eval_metric: evalMetric,
       normalize_text: normalizeText,
@@ -1350,6 +1358,33 @@ export function TrainingForm() {
               ]}
               searchPlaceholder="Search datasets by name…"
             />
+            {!isTts && !isLlm && testDatasetId !== AUTO_SPLIT && testDatasetId !== NO_TEST && (
+              <div className="mt-3">
+                <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                  Additional test sets
+                </Label>
+                <div className="mt-1">
+                  <TestSetMultiSelect
+                    selected={extraTestIds}
+                    onChange={setExtraTestIds}
+                    options={pickDatasets
+                      .filter((d) => d.id !== testDatasetId)
+                      .map((d) => ({
+                        value: d.id,
+                        label: d.name,
+                        hint: `${d.num_rows != null ? `${d.num_rows} rows · ` : ""}${d.kind}`,
+                      }))}
+                  />
+                </div>
+                <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+                  Each test set is scored <span className="font-medium">separately</span> — its own
+                  WER/CER and loss curve on the run page. Best-checkpoint selection uses the{" "}
+                  <span className="font-medium">macro average</span> (equal weight per set), so a
+                  large augmented set can&apos;t outvote a small clean one the way a single merged
+                  set would.
+                </p>
+              </div>
+            )}
             {testDatasetId === AUTO_SPLIT && (
               <div className="mt-2 flex items-center gap-2">
                 <Label className="text-xs uppercase tracking-wide text-muted-foreground">Hold-out %</Label>
@@ -2677,6 +2712,45 @@ function FieldWrap({ label, hint, extra, children }: {
 
 // Multi-select dropdown over the precision combos (sweep mode). Stays open on
 // toggle so several can be picked.
+function TestSetMultiSelect({ selected, onChange, options }: {
+  selected: string[];
+  onChange: (v: string[]) => void;
+  options: { value: string; label: string; hint?: string }[];
+}) {
+  const toggle = (v: string) =>
+    onChange(selected.includes(v) ? selected.filter((x) => x !== v) : [...selected, v]);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button type="button" variant="outline" className="w-full justify-between font-normal">
+          <span className="truncate">
+            {selected.length ? `${selected.length} more test set(s)` : "Add more test sets…"}
+          </span>
+          <ChevronDown className="h-4 w-4 opacity-50" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent className="max-h-80 w-80 overflow-y-auto">
+        {options.length === 0 && (
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">No other datasets</div>
+        )}
+        {options.map((o) => (
+          <DropdownMenuCheckboxItem
+            key={o.value}
+            checked={selected.includes(o.value)}
+            onCheckedChange={() => toggle(o.value)}
+            onSelect={(e) => e.preventDefault()}
+          >
+            <span className="truncate">{o.label}</span>
+            {o.hint && (
+              <span className="ml-2 shrink-0 text-[10px] text-muted-foreground">{o.hint}</span>
+            )}
+          </DropdownMenuCheckboxItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 function PrecisionMultiSelect({ selected, onChange }: {
   selected: string[]; onChange: (v: string[]) => void;
 }) {

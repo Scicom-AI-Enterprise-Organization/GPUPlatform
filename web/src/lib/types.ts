@@ -349,6 +349,9 @@ export type TrainingEpoch = {
   train_loss?: number | null;
   // Sweep runs: which trial this eval belongs to (for per-trial eval curves/table).
   trial?: number | null;
+  /** Several test sets: per-set scores, keyed by the test set's name. `wer`/`cer`
+   *  above are then the MACRO average across sets (equal weight per set). */
+  sets?: Record<string, { wer?: number | null; cer?: number | null; eval_loss?: number | null }> | null;
 };
 
 export type TrainingTrial = {
@@ -475,6 +478,8 @@ export type TrainingRunRecord = {
   status: "queued" | "running" | "done" | "failed" | "cancelled";
   dataset_id: string;
   test_dataset_id?: string | null;
+  /** ASR: several test sets, each scored separately (per-set WER/CER + macro). */
+  test_dataset_ids?: string[] | null;
   base_model: string;
   task_type?: "asr" | "tts" | "llm";
   s3_prefix: string;
@@ -579,6 +584,8 @@ export type CreateTrainingRunRequest = {
   base_model: string;
   task_type?: "asr" | "tts" | "llm";
   test_dataset_id?: string | null;
+  /** ASR: several test sets, each scored separately (per-set WER/CER + macro). */
+  test_dataset_ids?: string[] | null;
   // TTS-only (Qwen3 + NeuCodec)
   tokenizer?: string | null;
   block_size?: number;

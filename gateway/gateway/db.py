@@ -1196,6 +1196,13 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS hf_subsets JSON"
         ))
+        # Multiple named test sets for one run, each scored SEPARATELY (ASR). A
+        # single blended eval set hides per-set regression: merging a 50-row clean
+        # corpus with 200 rows of transport-augmented audio puts 80% of the weight
+        # on the latter, so a model can look good while degrading on the clean one.
+        await conn.execute(text(
+            "ALTER TABLE training_runs ADD COLUMN IF NOT EXISTS test_dataset_ids JSON"
+        ))
         # Custom evaluators gained an `api` mode, whose endpoint/parsing settings
         # live in a JSON blob (expression + python modes keep using `code`).
         await conn.execute(text(
