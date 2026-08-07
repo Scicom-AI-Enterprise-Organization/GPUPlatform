@@ -511,13 +511,24 @@ PROXY_RED_TEAM_SECONDS = Histogram(
 )
 
 
-def observe_red_team(proxy: str, model: str, result: str, rt_type: str = "",
+def observe_red_team(proxy: str, model: str, result: str,
                      mode: str = "", seconds: float | None = None) -> None:
+    """One screening OUTCOME (the detector's verdict axis). The block breakdown is
+    a separate call — see observe_red_team_hit."""
     PROXY_RED_TEAM_TOTAL.labels(proxy=proxy, model=model or "", result=result).inc()
-    if result == "unsafe" and rt_type:
-        PROXY_RED_TEAM_HITS.labels(proxy=proxy, type=rt_type).inc()
     if seconds is not None and mode:
         PROXY_RED_TEAM_SECONDS.labels(proxy=proxy, mode=mode).observe(seconds)
+
+
+def observe_red_team_hit(proxy: str, rt_type: str) -> None:
+    """One BLOCKED request, by category. Counted at the block point rather than off
+    the verdict, because the two don't coincide: a fail-closed `on_error=block`
+    blocks with result="error" and type `detector_error`. Deriving hits from
+    result="unsafe" made those blocks invisible in the by-type breakdown — exactly
+    when the detector is down and the operator most needs to see it — and left
+    sum(hits) short of the endpoint's `blocked` request count."""
+    if rt_type:
+        PROXY_RED_TEAM_HITS.labels(proxy=proxy, type=rt_type).inc()
 
 
 # Depth of the shared off-path background-job queue (TTS CER/WER evals + drift-sample

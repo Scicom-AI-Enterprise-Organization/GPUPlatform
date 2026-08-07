@@ -11,7 +11,7 @@ Server pages fetch via `gateway.*` (`web/src/lib/gateway.ts`); client components
 |---|---|---|
 | `/experiments` | `page.tsx` + `experiments-list.tsx` | run list (status pills, search/filter/sort, `_page` pagination, 4s poll while any run is active) |
 | `/experiments/new` | `new/experiment-form.tsx` | **mirrors `/benchmark/new`** — see below |
-| `/experiments/[id]` | `[id]/experiment-detail.tsx` | header KPIs + `?tab=`-less Tabs: Overview / Tradeoff / Samples / Config |
+| `/experiments/[id]` | `[id]/experiment-detail.tsx` | header KPIs + **`?tab=`-driven** Tabs (Overview / Tradeoff / Samples / Config), real `<Link>` triggers like the proxy detail page — linkable, ⌘-clickable |
 | `/experiments/evaluators` | `evaluators/*` | your reusable evaluator library (author/test/edit) + the built-ins for reference |
 | `/experiments/optimize` | `optimize/*` | GEPA prompt optimization — see below |
 | — | `tradeoff-plot.tsx` | the parallel-coordinates chart, shared by the detail tabs |
@@ -182,6 +182,12 @@ Parallel coordinates, hand-rolled SVG (recharts has no such chart, and the highl
 interaction needs direct control). One polyline per `(target, variant)` cell; axes are built from
 the summary — categorical `target`/`variant` first, then pass rate, each evaluator's pass rate,
 error rate, p95 latency, p95 TTFT, output tokens, cost.
+
+**⚠ Rate axes are FIXED to 0–100%, not scaled to the data** (`RATE` domain in
+`buildAxes`). Deriving a rate axis from its own values made a single 100% cell hit the flat-axis
+branch and render an axis labelled **0%…200%** — a rate that cannot exist — and, with several cells,
+blew a 1pp gap up into a full-height swing while making two runs incomparable. Latency/token/cost
+axes stay data-scaled; they have no natural ceiling.
 
 **⚠ The colours are validated, not chosen by eye — don't "tidy" them.** `SERIES_CLASS` holds the
 app's existing categorical hues **re-ordered** so every adjacent pair separates under simulated

@@ -8,7 +8,7 @@
 // can supply its own transport with the same shape.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Loader2, Play, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Loader2, Play, ShieldAlert, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { NumberField } from "@/components/ui/number-field";
@@ -414,6 +414,7 @@ export function ChatPlayground({
                   <div className="flex items-center gap-2">{busy && <Loader2 className="h-3 w-3 animate-spin" />}<span>Answer</span></div>
                   {stats && <span className="font-mono tabular-nums">{stats.tps.toFixed(1)} tok/s · {stats.tokens} tok{stats.ttftMs > 0 ? ` · TTFT ${stats.ttftMs} ms` : ""}</span>}
                 </div>
+                <RedTeamNote headers={respHeaders} />
                 <UpstreamLine upstream={upstream} />
                 <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground scrollbar-thin">{answer || (busy ? "…" : "")}</pre>
                 <HeadersPanel headers={respHeaders} />
@@ -477,6 +478,23 @@ export function ErrorNote({ children }: { children: React.ReactNode }) {
   );
 }
 
+// The red-team guard's verdict, called out instead of left buried in the header list.
+// A blocked request is a normal 200 carrying a refusal (finish_reason: content_filter,
+// or the same text over SSE), so without this the answer reads as the model's own —
+// when in fact no upstream was called at all.
+export function RedTeamNote({ headers }: { headers?: Record<string, string> | null }) {
+  if (headers?.["x-sgpu-red-team"] !== "flagged") return null;
+  const type = headers["x-sgpu-red-team-type"] || "unclassified";
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+      <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+      <span className="font-medium">Blocked by the red-team screen</span>
+      <span className="opacity-80">no upstream was called — the reply below is the gateway&apos;s</span>
+      <code className="ml-auto shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px]">{type}</code>
+    </div>
+  );
+}
+
 export function HeadersPanel({ headers }: { headers?: Record<string, string> | null }) {
   const [open, setOpen] = useState(false);
   if (!headers || Object.keys(headers).length === 0) return null;
@@ -520,6 +538,7 @@ function HistoryRow({ h }: { h: Stored }) {
       </button>
       {open && (
         <div className="space-y-2 px-4 pb-3 pl-9">
+          <RedTeamNote headers={h.headers} />
           <UpstreamLine upstream={h.upstream} />
           <HeadersPanel headers={h.headers} />
           {h.reasoning && <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-dashed border-border bg-muted/20 p-2 font-mono text-[11px] italic text-muted-foreground scrollbar-thin">{h.reasoning}</pre>}

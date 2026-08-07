@@ -4,10 +4,10 @@
 // below for reference. Built-ins are configured per-experiment (their options
 // depend on the run), so they're read-only here.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { Globe, Inbox, Lock, Pencil, Plus, Terminal, Trash2, Wand2 } from "lucide-react";
+import { BarChart3, Globe, Inbox, Lock, Pencil, Plus, Search, Sliders, Terminal, Trash2, Wand2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { CustomEvaluatorRecord, EvaluatorRegistry } from "@/lib/types";
@@ -35,7 +35,19 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
   const [editing, setEditing] = useState<CustomEvaluatorRecord | null>(null);
   const [pending, setPending] = useState<CustomEvaluatorRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [builtinQ, setBuiltinQ] = useState("");
   const context = registry.custom_context;
+
+  // Filter is over label/id/description — NEVER a hardcoded id list. The registry
+  // is server-driven, so adding a detector in evaluators.py must need no change here.
+  const builtins = useMemo(() => {
+    const needle = builtinQ.trim().toLowerCase();
+    const all = registry.evaluators;
+    if (!needle) return all;
+    return all.filter((sp) =>
+      `${sp.label} ${sp.id} ${sp.description}`.toLowerCase().includes(needle),
+    );
+  }, [registry.evaluators, builtinQ]);
 
   async function onDelete() {
     if (!pending) return;
@@ -58,7 +70,14 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
       <section>
         <div className="mb-3 flex items-start justify-between gap-4 border-b border-border pb-2">
           <div>
-            <h2 className="text-base font-medium">Your evaluators</h2>
+            <h2 className="flex items-center gap-2 text-base font-medium">
+              Your evaluators
+              {customs.length > 0 && (
+                <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-normal tabular-nums text-muted-foreground">
+                  {customs.length}
+                </span>
+              )}
+            </h2>
             <p className="mt-0.5 text-xs text-muted-foreground">
               Reusable across every experiment. A run <span className="font-medium">snapshots</span>{" "}
               the definition, so editing one here never changes what a finished run measured.
@@ -169,8 +188,14 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
 
       {/* ---------------- built-ins ---------------- */}
       <section>
-        <div className="mb-3 border-b border-border pb-2">
-          <h2 className="text-base font-medium">Built-in</h2>
+        <div className="mb-3 flex flex-wrap items-end justify-between gap-3 border-b border-border pb-2">
+          <div>
+          <h2 className="flex items-center gap-2 text-base font-medium">
+            Built-in
+            <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-normal tabular-nums text-muted-foreground">
+              {registry.evaluators.length}
+            </span>
+          </h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
             Ship with the platform. Their options depend on the run, so you configure them when
             you{" "}
@@ -182,15 +207,42 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
             </Link>
             .
           </p>
+          </div>
+          {/* The list grows with every detector added in evaluators.py, so it needs
+              a way in that isn't "read all of them". */}
+          <div className="relative w-full max-w-[220px]">
+            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              value={builtinQ}
+              onChange={(e) => setBuiltinQ(e.target.value)}
+              placeholder="Filter built-ins…"
+              className="h-8 w-full rounded-md border border-input bg-background pl-8 pr-7 text-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            />
+            {builtinQ && (
+              <button
+                type="button"
+                onClick={() => setBuiltinQ("")}
+                aria-label="Clear filter"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
         </div>
+        {builtins.length === 0 ? (
+          <p className="px-3 py-10 text-center text-sm text-muted-foreground">
+            No built-in matches “{builtinQ}”.
+          </p>
+        ) : (
         <ul className="grid gap-2 sm:grid-cols-2">
-          {registry.evaluators.map((spec) => {
+          {builtins.map((spec) => {
             const alwaysOn = registry.always_on.includes(spec.id);
             return (
               <li
                 key={spec.id}
                 className={cn(
-                  "rounded-md border border-border px-3 py-2.5",
+                  "rounded-md border border-border px-3 py-2.5 transition-colors hover:border-foreground/25",
                   alwaysOn && "bg-muted/30",
                 )}
               >
@@ -208,19 +260,38 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
                       after the replay
                     </Badge>
                   )}
-                  {spec.options.length > 0 && (
-                    <span className="text-[10px] text-muted-foreground">
-                      {spec.options.length} options
-                    </span>
-                  )}
                 </div>
                 <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
                   {spec.description}
                 </p>
+                {/* Both facts are server-driven: `headline` marks a detector that
+                    reports CORPUS-level metrics (an F1 or per-class accuracy that
+                    can't be averaged from per-sample rates), `options` how much
+                    there is to configure at run time. */}
+                {(spec.options.length > 0 || (spec.headline?.length ?? 0) > 0) && (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
+                    {(spec.headline?.length ?? 0) > 0 && (
+                      <span
+                        className="inline-flex items-center gap-1"
+                        title={`Corpus-level metrics: ${spec.headline?.join(", ")}`}
+                      >
+                        <BarChart3 className="h-3 w-3" />
+                        corpus metrics
+                      </span>
+                    )}
+                    {spec.options.length > 0 && (
+                      <span className="inline-flex items-center gap-1">
+                        <Sliders className="h-3 w-3" />
+                        {spec.options.length} option{spec.options.length === 1 ? "" : "s"}
+                      </span>
+                    )}
+                  </div>
+                )}
               </li>
             );
           })}
         </ul>
+        )}
       </section>
 
       <Dialog open={!!pending} onOpenChange={(o) => !o && setPending(null)}>

@@ -2114,7 +2114,7 @@ async def _red_team_gate(app, endpoint_name: str, endpoint_id: str, request_id: 
     try:
         flagged, rt_type, reason = await _rt_detect(app, rt, text)
         _metrics.observe_red_team(endpoint_id, alias, "unsafe" if flagged else "safe",
-                                  rt_type=rt_type, mode=mode, seconds=time.perf_counter() - t0)
+                                  mode=mode, seconds=time.perf_counter() - t0)
     except (httpx.HTTPError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as e:
         _metrics.observe_red_team(endpoint_id, alias, "error", mode=mode,
                                   seconds=time.perf_counter() - t0)
@@ -2127,6 +2127,10 @@ async def _red_team_gate(app, endpoint_name: str, endpoint_id: str, request_id: 
     if not flagged:
         return None
     rt_type = rt_type or RED_TEAM_UNCLASSIFIED
+    # Counted HERE, not off the verdict: a fail-closed detector error blocks with
+    # result="error", and the by-type breakdown must still show it (and stay equal
+    # to the endpoint's `blocked` request count).
+    _metrics.observe_red_team_hit(endpoint_id, rt_type)
     lat = int((time.perf_counter() - t0) * 1000)
     action = rt.get("action") or "respond"
     message = rt.get("message") or RED_TEAM_BLOCK_MESSAGE

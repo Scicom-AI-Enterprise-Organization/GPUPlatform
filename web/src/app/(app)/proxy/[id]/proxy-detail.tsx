@@ -399,6 +399,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 timeoutS={ep.timeout_s}
                 failoverStatus={ep.failover_status ?? []}
                 healthRows={health}
+                redTeam={ep.red_team}
               />
             </CardContent>
           </Card>

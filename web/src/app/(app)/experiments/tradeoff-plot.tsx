@@ -50,7 +50,19 @@ type Axis = {
   categories?: string[];
 };
 
-const PAD = { top: 42, right: 28, bottom: 34, left: 150 };
+// The top band is laid out in three FIXED rows so nothing has to fight for space:
+//   y=16          band headers ("N inputs" / "N outputs")
+//   AXIS_TITLE_Y  axis names
+//   PAD.top-10    hover value-labels for points at the very top of an axis
+//   PAD.top       the plot itself starts
+// A point at 100% (a value lines actually land on now that rate axes are fixed
+// 0–100%) sits exactly on the plot's top edge, so its label lands in that
+// reserved row — above the title band, and above every line, since nothing is
+// ever drawn above PAD.top. Earlier attempts moved the label INTO the title row
+// (overlapped the axis name) and then BELOW the point (overlapped the line
+// descending to the next axis); a reserved row is what actually has room.
+const AXIS_TITLE_Y = 32;
+const PAD = { top: 56, right: 28, bottom: 34, left: 150 };
 const HEIGHT = 340;
 
 function pct(v: number) {
@@ -102,6 +114,8 @@ function buildAxes(cells: ExperimentCell[], evaluatorIds: string[]): Axis[] {
     pick: (c: ExperimentCell) => number | null | undefined,
     format: (v: number) => string,
     higherBetter: boolean,
+    /** Fixed axis range. Rates pass [0, 1] — see below. */
+    domain?: [number, number],
   ): Axis | null => {
     const vals = cells.map((c) => {
       const v = pick(c);
@@ -109,21 +123,36 @@ function buildAxes(cells: ExperimentCell[], evaluatorIds: string[]): Axis[] {
     });
     if (vals.every((v) => Number.isNaN(v))) return null;
     const real = vals.filter((v) => !Number.isNaN(v));
-    let min = Math.min(...real);
-    let max = Math.max(...real);
-    if (min === max) {
-      // A flat axis still deserves to render — centre the line on it.
-      min = min - 1;
-      max = max + 1;
+    let min: number;
+    let max: number;
+    if (domain) {
+      // ⚠ A rate axis is 0–100%, NOT the data's own range. Deriving it from the
+      // data made a single 100% cell hit the flat-axis branch below and render an
+      // axis labelled 0%…200% — a rate that cannot exist. It also exaggerated
+      // tiny gaps into full-height swings and made two runs incomparable.
+      // Math.max keeps an out-of-range value visible rather than clipped.
+      min = Math.min(domain[0], ...real);
+      max = Math.max(domain[1], ...real);
+    } else {
+      min = Math.min(...real);
+      max = Math.max(...real);
+      if (min === max) {
+        // A flat axis still deserves to render — centre the line on it.
+        min = min - 1;
+        max = max + 1;
+      }
     }
     return { key, label, group: "output", higherBetter, values: vals, min, max, format };
   };
+
+  /** Every 0..1 rate shares this domain so the axes read as percentages. */
+  const RATE: [number, number] = [0, 1];
 
   const push = (a: Axis | null) => {
     if (a) axes.push(a);
   };
 
-  push(numeric("pass_rate", "pass rate", (c) => c.pass_rate, pct, true));
+  push(numeric("pass_rate", "pass rate", (c) => c.pass_rate, pct, true, RATE));
   for (const eid of evaluatorIds) {
     if (eid === "request_error") continue; // shown as error rate below
     push(
@@ -133,10 +162,11 @@ function buildAxes(cells: ExperimentCell[], evaluatorIds: string[]): Axis[] {
         (c) => c.evals[eid]?.pass_rate ?? null,
         pct,
         true,
+        RATE,
       ),
     );
   }
-  push(numeric("error_rate", "error rate", (c) => c.error_rate, pct, false));
+  push(numeric("error_rate", "error rate", (c) => c.error_rate, pct, false, RATE));
   push(numeric("p95", "p95 latency", (c) => c.latency_ms.p95, ms, false));
   push(numeric("ttft", "p95 ttft", (c) => c.ttft_ms.p95, ms, false));
   push(
@@ -240,7 +270,9 @@ export function TradeoffPlot({
                 />
                 <text
                   x={x}
-                  y={PAD.top - 10}
+                  // Fixed row, NOT relative to PAD.top — the row just above the
+                  // plot is reserved for top-of-axis value labels.
+                  y={AXIS_TITLE_Y}
                   textAnchor={i === axes.length - 1 ? "end" : "middle"}
                   className="fill-foreground text-[10px] font-medium"
                 >
@@ -329,9 +361,16 @@ export function TradeoffPlot({
                     <text
                       key={`v${i}`}
                       x={x}
-                      y={y - 10}
+                      // Always ABOVE the point, and never higher than the reserved
+                      // row — a top-of-axis label lands there instead of on the
+                      // axis title. The stroke-background halo (paint-order:
+                      // stroke) keeps mid-plot labels legible where a steep
+                      // segment from the neighbouring axis crosses them.
+                      y={Math.max(y - 10, PAD.top - 10)}
                       textAnchor="middle"
-                      className="fill-foreground text-[10px] font-medium tabular-nums"
+                      paintOrder="stroke"
+                      strokeWidth={3}
+                      className="fill-foreground stroke-background text-[10px] font-medium tabular-nums"
                     >
                       {axes[i].format(axes[i].values[ci])}
                     </text>

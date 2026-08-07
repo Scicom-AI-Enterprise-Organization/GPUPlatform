@@ -779,6 +779,10 @@ every request is screened by a detector **before any upstream byte is sent**; a 
 answered by the gateway and the model never sees the request. Config is a `red_team` block on the
 proxy (form card between Routing and STT callback), stored like `stt_callback`/`capture`
 (`_build_red_team`, keys Fernet-encrypted / secret-ref'd, resolved+decrypted in `_route`).
+⚠ `_build_red_team` REBUILDS the whole block from the spec on every save, so any field the
+edit form doesn't send snaps back to its Pydantic default — `max_chars`/`timeout_s` were
+silently reset to 8000/15 by a UI save until the form carried them. Add a form input with
+every new `RedTeamSpec` field.
 
 - **Two detector modes.** `classifier` → POST `{model, input}` to the classify route; the URL rule
   is `_rt_classifier_url`: a full `/classify` or `/moderations` URL is used verbatim, otherwise
@@ -820,8 +824,16 @@ proxy (form card between Routing and STT callback), stored like `stt_callback`/`
   `proxy_red_team_hits_total{proxy,type}` (attack-type breakdown),
   `proxy_red_team_seconds{proxy,mode}` — all three included in the per-proxy
   `/proxy/{name}/metrics` exposition and rendered on the web Metrics tab
-  (safe/unsafe cards + a blocked-by-type bar chart). ⚠ `blocked` is NOT an error
-  in the tab's error rate — the guard working as designed isn't an upstream failure.
+  (screened/safe/blocked cards + a blocked-by-type bar chart). ⚠ `blocked` is NOT an
+  error in the tab's error rate — the guard working as designed isn't an upstream
+  failure. ⚠ **The two counters measure different axes**: `_total` is the detector's
+  VERDICT, `_hits_total` is the BLOCK. They diverge under `on_error: block`, where a
+  fail-closed request counts `result=error` *and* `type=detector_error`. `_hits_total`
+  is therefore bumped at the block point in `_red_team_gate` (`observe_red_team_hit`),
+  not derived from `result="unsafe"` — deriving it hid fail-closed blocks from the
+  breakdown exactly when the detector was down, and left `sum(hits)` short of the
+  endpoint's `blocked` request count. That invariant — **sum(hits_total) == blocked
+  ProxyRequests** — is what the Metrics tab's "Blocked" card and Queue tab agree on.
 - Unit tests: `gateway/tests/unit/test_red_team.py` (scan extraction, both verdict parsers, block
   bodies, builder validation + key handling). ⚠ `test_custom_eval`'s env-scrub test must RESTORE
   `PROVIDER_SECRET_KEY` (not pop it) or the red-team crypto tests fail suite-order-dependently.

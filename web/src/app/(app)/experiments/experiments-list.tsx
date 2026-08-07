@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { useListUrlState, readParam } from "@/lib/list-url-state";
-import { Loader2, MoreHorizontal, Search, Square, Trash2, X } from "lucide-react";
+import { CheckCircle2, FlaskConical, Loader2, MoreHorizontal, Search, Square, Trash2, X, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type { ExperimentRecord } from "@/lib/types";
@@ -46,11 +46,50 @@ const STATUS_PILL: Record<string, string> = {
 const STATUS_OPTIONS = ["all", "queued", "running", "completed", "failed", "cancelled"] as const;
 type StatusFilter = (typeof STATUS_OPTIONS)[number];
 
+/** Relative age — a run list without recency is unscannable. Mirrors the
+ * implementation in admin/secrets so the two read identically. */
+function relTime(iso: string): string {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return "";
+  const sec = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+/** How the matrix was shaped — `2 targets · 3 variants` — read off the stored
+ * config. It's the difference between two runs with the same name. */
+function shapeOf(config: Record<string, unknown>): string {
+  const n = (k: string) => (Array.isArray(config[k]) ? (config[k] as unknown[]).length : 0);
+  const parts: string[] = [];
+  const t = n("targets");
+  const v = n("variants");
+  if (t) parts.push(`${t} target${t === 1 ? "" : "s"}`);
+  if (v) parts.push(`${v} variant${v === 1 ? "" : "s"}`);
+  return parts.join(" · ");
+}
+
+const STATUS_ICON: Record<string, typeof CheckCircle2> = {
+  completed: CheckCircle2,
+  failed: XCircle,
+  cancelled: Square,
+};
+
 /** Pass rate reads as the headline number, so colour it by health. */
 function rateTone(rate: number) {
   if (rate >= 0.95) return "text-emerald-600 dark:text-emerald-400";
   if (rate >= 0.8) return "text-amber-600 dark:text-amber-400";
   return "text-red-600 dark:text-red-400";
+}
+
+/** Bar fill matching rateTone — the meter and the number must never disagree. */
+function rateBar(rate: number) {
+  if (rate >= 0.95) return "bg-emerald-500";
+  if (rate >= 0.8) return "bg-amber-500";
+  return "bg-red-500";
 }
 
 export function ExperimentsList({
@@ -205,7 +244,8 @@ export function ExperimentsList({
               <th className="px-3 py-2 text-left font-medium">Dataset</th>
               <th className="px-3 py-2 text-left font-medium">Status</th>
               <th className="px-3 py-2 text-right font-medium">Samples</th>
-              <th className="px-3 py-2 text-right font-medium">Pass rate</th>
+              <th className="px-3 py-2 text-left font-medium">Pass rate</th>
+              <th className="px-3 py-2 text-left font-medium">When</th>
               <th className="px-3 py-2 text-left font-medium">By</th>
               <th className="w-10 px-3 py-2" />
             </tr>
@@ -224,7 +264,10 @@ export function ExperimentsList({
                     >
                       {row.name}
                     </Link>
-                    <div className="font-mono text-[11px] text-muted-foreground">{row.id}</div>
+                    <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-muted-foreground">
+                      <span className="font-mono">{row.id}</span>
+                      {shapeOf(row.config) && <span>· {shapeOf(row.config)}</span>}
+                    </div>
                   </td>
                   <td className="px-3 py-2">
                     <Link
@@ -241,30 +284,63 @@ export function ExperimentsList({
                         STATUS_PILL[row.status] ?? STATUS_PILL.queued,
                       )}
                     >
-                      {row.status === "running" && (
+                      {row.status === "running" ? (
                         <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                      ) : (
+                        (() => {
+                          // Status is an icon + colour, never colour alone.
+                          const Icon = STATUS_ICON[row.status];
+                          return Icon ? <Icon className="mr-1 h-3 w-3" /> : null;
+                        })()
                       )}
                       {row.status}
-                      {row.status === "running" && ` ${progress}%`}
                     </span>
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
-                    {row.n_completed}
-                    <span className="text-muted-foreground/60">/{row.n_planned}</span>
-                    {row.n_failed > 0 && (
-                      <span className="ml-1 text-red-600 dark:text-red-400">
-                        ({row.n_failed} err)
-                      </span>
+                    <div>
+                      {row.n_completed}
+                      <span className="text-muted-foreground/60">/{row.n_planned}</span>
+                      {row.n_failed > 0 && (
+                        <span className="ml-1 text-red-600 dark:text-red-400">
+                          ({row.n_failed} err)
+                        </span>
+                      )}
+                    </div>
+                    {/* Progress belongs here, next to the counts it describes —
+                        as a bar rather than a percentage buried in the pill. */}
+                    {row.status === "running" && (
+                      <div className="mt-1 h-1 w-full overflow-hidden rounded-full bg-muted">
+                        <div
+                          className="h-full rounded-full bg-amber-500 transition-all"
+                          style={{ width: `${progress}%` }}
+                        />
+                      </div>
                     )}
                   </td>
-                  <td className="px-3 py-2 text-right tabular-nums">
+                  <td className="px-3 py-2">
                     {rate === undefined ? (
                       <span className="text-muted-foreground">—</span>
                     ) : (
-                      <span className={cn("font-medium", rateTone(rate))}>
-                        {Math.round(rate * 100)}%
-                      </span>
+                      // Number + meter: the number is the value, the bar makes the
+                      // column scannable. Both are 0–100%, so rows compare directly.
+                      <div className="flex items-center gap-2">
+                        <span className={cn("w-9 text-right font-medium tabular-nums", rateTone(rate))}>
+                          {Math.round(rate * 100)}%
+                        </span>
+                        <span className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+                          <span
+                            className={cn("block h-full rounded-full", rateBar(rate))}
+                            style={{ width: `${Math.round(rate * 100)}%` }}
+                          />
+                        </span>
+                      </div>
                     )}
+                  </td>
+                  <td
+                    className="px-3 py-2 text-xs text-muted-foreground"
+                    title={new Date(row.created_at).toLocaleString()}
+                  >
+                    {relTime(row.created_at)}
                   </td>
                   <td className="px-3 py-2">
                     <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -310,6 +386,32 @@ export function ExperimentsList({
             })}
           </tbody>
         </table>
+        {/* An empty result set used to render as a header row with nothing under
+            it, which reads as a broken page rather than an empty one. */}
+        {items.length === 0 && !loading && (
+          <div className="border-t border-border px-3 py-12 text-center">
+            <FlaskConical className="mx-auto mb-2 h-6 w-6 text-muted-foreground" />
+            {q || status !== "all" ? (
+              <>
+                <p className="text-sm font-medium">No experiments match</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  Clear the search or status filter to see the rest.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm font-medium">No experiments yet</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  Replay a dataset against an endpoint and score every reply —{" "}
+                  <Link href="/experiments/new" className="font-medium text-foreground underline underline-offset-2">
+                    start a run
+                  </Link>
+                  .
+                </p>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       <Pagination

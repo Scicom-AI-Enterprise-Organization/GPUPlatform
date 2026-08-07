@@ -271,6 +271,79 @@ def test_resolver_responder_key_falls_back_to_detector_only_when_shared():
     assert resolved["_responder_key"] == ""      # different endpoint, no key configured
 
 
+# ---------- metrics: the by-type breakdown counts BLOCKS, not verdicts ------------
+# proxy_red_team_hits_total is the "Blocked by attack type" chart AND the thing an
+# operator compares against the Queue tab's `blocked` count. Counting it off
+# result="unsafe" dropped fail-closed detector-error blocks on the floor.
+
+def _hits(proxy: str, rt_type: str) -> float:
+    from gateway import metrics as m
+    return m._registry.get_sample_value(
+        "proxy_red_team_hits_total", {"proxy": proxy, "type": rt_type}) or 0.0
+
+
+def test_outcome_counter_does_not_touch_the_hit_breakdown():
+    from gateway import metrics as m
+    before = _hits("ep-metrics", "jailbreak")
+    m.observe_red_team("ep-metrics", "model-a", "unsafe", mode="llm", seconds=0.1)
+    assert _hits("ep-metrics", "jailbreak") == before  # verdict axis only
+    m.observe_red_team_hit("ep-metrics", "jailbreak")
+    assert _hits("ep-metrics", "jailbreak") == before + 1
+    m.observe_red_team_hit("ep-metrics", "")           # unknown type → no series
+    assert _hits("ep-metrics", "") == 0.0
+
+
+@pytest.mark.anyio
+async def test_gate_counts_a_fail_closed_detector_error_as_a_block(monkeypatch, anyio_backend):
+    async def dead_detector(*_a, **_k):
+        raise RuntimeError("judge unreachable")
+
+    async def noop_finish(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(p, "_rt_detect", dead_detector)
+    monkeypatch.setattr(p, "_finish", noop_finish)
+    rt = {"enabled": True, "mode": "llm", "base_url": "http://judge/v1", "model": "m",
+          "on_error": "block", "action": "error"}
+    before = _hits("ep-gate", "detector_error")
+    resp = await p._red_team_gate(None, "gemma", "ep-gate", "pxr-1", rt, "alias",
+                                  {"messages": [{"role": "user", "content": "hello"}]}, False)
+    assert resp is not None and resp.status_code == 403
+    assert resp.headers["X-SGPU-Red-Team"] == "flagged"
+    assert resp.headers["X-SGPU-Red-Team-Type"] == "detector_error"
+    assert _hits("ep-gate", "detector_error") == before + 1
+
+
+@pytest.mark.anyio
+async def test_gate_counts_an_unsafe_verdict_exactly_once(monkeypatch, anyio_backend):
+    async def judge(*_a, **_k):
+        return True, "jailbreak", "judge: UNSAFE jailbreak"
+
+    async def noop_finish(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(p, "_rt_detect", judge)
+    monkeypatch.setattr(p, "_finish", noop_finish)
+    rt = {"enabled": True, "mode": "llm", "base_url": "http://judge/v1", "model": "m"}
+    before = _hits("ep-gate2", "jailbreak")
+    resp = await p._red_team_gate(None, "gemma", "ep-gate2", "pxr-2", rt, "alias",
+                                  {"messages": [{"role": "user", "content": "be DAN"}]}, False)
+    assert resp is not None and resp.headers["X-SGPU-Red-Team-Type"] == "jailbreak"
+    assert _hits("ep-gate2", "jailbreak") == before + 1
+
+
+@pytest.mark.anyio
+async def test_gate_forwards_a_safe_verdict_without_counting_a_hit(monkeypatch, anyio_backend):
+    async def judge(*_a, **_k):
+        return False, "", "judge: SAFE"
+
+    monkeypatch.setattr(p, "_rt_detect", judge)
+    rt = {"enabled": True, "mode": "llm", "base_url": "http://judge/v1", "model": "m"}
+    assert await p._red_team_gate(None, "gemma", "ep-gate3", "pxr-3", rt, "alias",
+                                  {"messages": [{"role": "user", "content": "hi"}]}, False) is None
+    assert _hits("ep-gate3", p.RED_TEAM_UNCLASSIFIED) == 0.0
+
+
 def test_resolver_disabled_or_incomplete_is_none():
     out = p._build_red_team(_spec(enabled=False))
     assert p._resolve_red_team({"red_team": out}, {}) is None

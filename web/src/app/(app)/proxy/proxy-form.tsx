@@ -12,7 +12,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { gateway } from "@/lib/gateway";
-import { RED_TEAM_DEFAULT_TYPES, type GlobalEnvRecord, type ProxyEndpoint, type ProxyUpstreamSpec, type StorageRecord } from "@/lib/types";
+import { RED_TEAM_DEFAULT_TYPES, type GlobalEnvRecord, type ProxyEndpoint, type ProxyRedTeam, type ProxyUpstreamSpec, type StorageRecord } from "@/lib/types";
 import { FormFooter, FormShell } from "@/components/form-shell";
 import { RoutingPanel } from "./routing-panel";
 import { modelKind } from "./model-kind";
@@ -236,6 +236,10 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [rtNoSystem, setRtNoSystem] = useState(rt0?.no_system ?? false);
   const [rtReasoning, setRtReasoning] = useState(rt0?.reasoning ?? "");
   const [rtScan, setRtScan] = useState<"last_user" | "user" | "full">(rt0?.scan ?? "last_user");
+  // Both are rebuilt from the spec on every save, so the form has to carry them or a
+  // value set elsewhere (API/automation) silently snaps back to the default.
+  const [rtMaxChars, setRtMaxChars] = useState(String(rt0?.max_chars ?? 8000));
+  const [rtTimeoutS, setRtTimeoutS] = useState(String(rt0?.timeout_s ?? 15));
   const [rtOnError, setRtOnError] = useState<"allow" | "block">(rt0?.on_error ?? "allow");
   const [rtAction, setRtAction] = useState<"respond" | "llm_respond" | "error">(rt0?.action ?? "respond");
   const [rtMessage, setRtMessage] = useState(rt0?.message ?? "");
@@ -248,6 +252,17 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [rtRespKeySecret, setRtRespKeySecret] = useState(rt0?.responder_api_key_secret ?? "");
   const [rtRespKey, setRtRespKey] = useState("");
   const [rtErrorStatus, setRtErrorStatus] = useState(String(rt0?.error_status ?? 403));
+  // What the Routing graph draws as the first stage of every chat route. Built from
+  // live form state (not `initial`) so the canvas answers "what will this endpoint do
+  // when I save?" — and matches the server's own rule for when screening is active:
+  // enabled + a detector URL + a detector model (_resolve_red_team / _build_red_team).
+  const rtPreview: ProxyRedTeam | null = rtEnabled && rtBase.trim() && rtModel.trim()
+    ? {
+        enabled: true, mode: rtMode, base_url: rtBase.trim(), model: rtModel.trim(),
+        scan: rtScan, action: rtAction, on_error: rtOnError,
+        error_status: Number(rtErrorStatus) || 403,
+      }
+    : null;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -512,6 +527,8 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           no_system: rtNoSystem,
           reasoning: rtReasoning as NonNullable<ProxyEndpoint["red_team"]>["reasoning"],
           scan: rtScan,
+          max_chars: Number(rtMaxChars) || 8000,
+          timeout_s: Number(rtTimeoutS) || 15,
           on_error: rtOnError,
           action: rtAction,
           message: rtMessage.trim(),
@@ -590,6 +607,9 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           timeoutS={Number(timeoutS) || 0}
           failoverStatus={parsedFailover}
           proxyId={initial?.id}
+          // Live, unsaved guard state — edit the Red teaming card below and the chat
+          // routes above redraw immediately, same as editing an upstream does.
+          redTeam={rtPreview}
           defaultOpen={false}
           // Edit page: the graph IS the upstream editor. Clicking a node selects it; the
           // editor for that upstream renders inline below the graph.
@@ -790,6 +810,26 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           </div>
         </div>
 
+        {/* how much text the detector sees, and how long the request waits for it */}
+        <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Max scanned chars</Label>
+            <Input type="number" min={200} step={100} value={rtMaxChars}
+                   onChange={(e) => setRtMaxChars(e.target.value)} className="font-mono text-xs" />
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              the scanned text is truncated from the <span className="font-italic">head</span> to this length — injections ride at the END of long context. Default 8000, floor 200.
+            </p>
+          </div>
+          <div>
+            <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Detector timeout (s)</Label>
+            <Input type="number" min={1} step={1} value={rtTimeoutS}
+                   onChange={(e) => setRtTimeoutS(e.target.value)} className="font-mono text-xs" />
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              read timeout on the detector call, paid inline by every chat request; a timeout follows the failure policy above. Default 15.
+            </p>
+          </div>
+        </div>
+
         {/* action on a hit */}
         <div className="mt-4 border-t border-border/60 pt-3">
           <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">On a hit</Label>
@@ -808,10 +848,23 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           </p>
         </div>
         <div className="mt-3">
-          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">{rtAction === "error" ? "Error message" : "Canned message"}</Label>
+          <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">
+            {rtAction === "error" ? "Error message"
+              : rtAction === "llm_respond" ? "Fallback message"
+              : "Canned message"}
+          </Label>
           <Textarea value={rtMessage} onChange={(e) => setRtMessage(e.target.value)} rows={2}
                     placeholder="Blank = built-in: “I can't help with that request — it was flagged by this endpoint's safety screening.”"
                     className="text-xs" />
+          {rtAction === "llm_respond" && (
+            /* Not leftover from the canned-reply action: `_rt_llm_respond` returns None on
+               ANY responder failure and the gate falls back to this text, so a dead
+               responder can't turn a block into a 502. */
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Still used: this is the fallback whenever the responder LLM fails — non-2xx, timeout, or an
+              empty reply — so a broken responder can never turn a block into a 502. Blank = the built-in wording.
+            </p>
+          )}
         </div>
         {rtAction === "error" && (
           <div className="mt-3 max-w-[200px]">

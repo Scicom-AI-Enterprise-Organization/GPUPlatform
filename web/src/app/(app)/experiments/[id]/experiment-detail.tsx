@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
-import { ArrowLeft, Loader2, Search, Square, X } from "lucide-react";
+import { ArrowLeft, CheckCircle2, ChevronRight, Loader2, Search, Square, X, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type {
@@ -13,6 +14,7 @@ import type {
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { JsonView } from "@/components/json-view";
 import { Progress } from "@/components/ui/progress";
 import { TradeoffPlot, SERIES_CLASS } from "../tradeoff-plot";
@@ -36,7 +38,26 @@ function fmtMs(v: number | null | undefined) {
   return v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${Math.round(v)}ms`;
 }
 
+const TAB_VALUES = ["overview", "tradeoff", "samples", "config"] as const;
+type ExperimentTab = (typeof TAB_VALUES)[number];
+
 export function ExperimentDetail({ initial }: { initial: ExperimentRecord }) {
+  // The active tab lives in the URL (?tab=), and each trigger is a real <Link> —
+  // so a tab is linkable/shareable and ⌘-click opens it in a new tab. Same
+  // convention as the proxy detail page. useSearchParams is reactive to soft
+  // navigations, so a normal click still switches in place with no reload.
+  const searchParams = useSearchParams();
+  const pathname = usePathname();
+  const tabParam = searchParams.get("tab");
+  const tab: ExperimentTab = (TAB_VALUES as readonly string[]).includes(tabParam ?? "")
+    ? (tabParam as ExperimentTab)
+    : "overview";
+  const tabHref = (v: ExperimentTab) => {
+    const p = new URLSearchParams(searchParams.toString());
+    p.set("tab", v);
+    return `${pathname}?${p.toString()}`;
+  };
+
   const [exp, setExp] = useState(initial);
   const active = exp.status === "running" || exp.status === "queued";
 
@@ -131,12 +152,15 @@ export function ExperimentDetail({ initial }: { initial: ExperimentRecord }) {
       </div>
 
       <div className="px-6 py-6 lg:px-10">
-        <Tabs defaultValue="overview">
+        <Tabs value={tab}>
           <TabsList>
-            <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="tradeoff">Tradeoff</TabsTrigger>
-            <TabsTrigger value="samples">Samples</TabsTrigger>
-            <TabsTrigger value="config">Config</TabsTrigger>
+            {TAB_VALUES.map((v) => (
+              <TabsTrigger key={v} value={v} asChild>
+                <Link href={tabHref(v)} scroll={false} className="capitalize">
+                  {v}
+                </Link>
+              </TabsTrigger>
+            ))}
           </TabsList>
 
           <TabsContent value="overview" className="mt-4">
@@ -398,52 +422,77 @@ function SamplesTab({
     void load();
   }, [load]);
 
+  const ALL = "__all";
+
   return (
-    <div>
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <label className="inline-flex cursor-pointer items-center gap-1.5 text-sm">
-          <input
-            type="checkbox"
-            checked={onlyFailed}
-            onChange={(e) => {
-              setOnlyFailed(e.target.checked);
+    <div className="space-y-3">
+      {/* Filters, one row above the list — the interaction convention used across
+          the app's tables (see the proxy queue tab). */}
+      <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card px-3 py-2">
+        {/* Pass/fail scope as a segmented control: two mutually exclusive views,
+            not a setting — a checkbox reads as "and also…" which it isn't. */}
+        <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
+          {([true, false] as const).map((v) => (
+            <button
+              key={String(v)}
+              type="button"
+              onClick={() => {
+                setOnlyFailed(v);
+                setPage(0);
+              }}
+              className={cn(
+                "rounded px-2 py-1 transition-colors",
+                onlyFailed === v
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {v ? "Failures" : "All"}
+            </button>
+          ))}
+        </div>
+
+        {targets.length > 1 && (
+          <Select
+            value={target || ALL}
+            onValueChange={(v) => {
+              setTarget(v === ALL ? "" : v);
               setPage(0);
             }}
-            className="h-3.5 w-3.5"
-          />
-          Failures only
-        </label>
-        <select
-          value={target}
-          onChange={(e) => {
-            setTarget(e.target.value);
-            setPage(0);
-          }}
-          className="h-8 rounded-md border border-input bg-background px-2 text-sm"
-        >
-          <option value="">All targets</option>
-          {targets.map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
-        <select
-          value={variant}
-          onChange={(e) => {
-            setVariant(e.target.value);
-            setPage(0);
-          }}
-          className="h-8 rounded-md border border-input bg-background px-2 text-sm"
-        >
-          <option value="">All variants</option>
-          {variants.map((v) => (
-            <option key={v} value={v}>
-              {v}
-            </option>
-          ))}
-        </select>
-        <div className="relative min-w-[180px] flex-1">
+          >
+            <SelectTrigger className="h-8 w-[150px] text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL} className="text-xs">All targets</SelectItem>
+              {targets.map((t) => (
+                <SelectItem key={t} value={t} className="text-xs">{t}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+
+        {variants.length > 1 && (
+          <Select
+            value={variant || ALL}
+            onValueChange={(v) => {
+              setVariant(v === ALL ? "" : v);
+              setPage(0);
+            }}
+          >
+            <SelectTrigger className="h-8 w-[150px] text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL} className="text-xs">All variants</SelectItem>
+              {variants.map((v) => (
+                <SelectItem key={v} value={v} className="text-xs">{v}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+
+        <div className="relative min-w-[200px] flex-1">
           <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
             value={q}
@@ -456,23 +505,38 @@ function SamplesTab({
           />
           {q && (
             <button
+              type="button"
               onClick={() => setQ("")}
               className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              aria-label="Clear search"
             >
               <X className="h-3.5 w-3.5" />
             </button>
           )}
         </div>
-        <span className="text-xs text-muted-foreground">{total} matching</span>
-        {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+
+        <span className="ml-auto flex items-center gap-2 text-xs tabular-nums text-muted-foreground">
+          {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+          {total} {onlyFailed ? "failing" : "total"}
+        </span>
       </div>
 
       {items.length === 0 && !loading ? (
-        <p className="py-12 text-center text-sm text-muted-foreground">
-          {onlyFailed ? "No failures — every reply passed." : "No samples."}
-        </p>
+        <div className="rounded-md border border-dashed border-border py-12 text-center">
+          {onlyFailed ? (
+            <>
+              <CheckCircle2 className="mx-auto mb-2 h-6 w-6 text-emerald-600 dark:text-emerald-400" />
+              <p className="text-sm font-medium">No failures</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Every reply passed every evaluator. Switch to <span className="font-medium">All</span> to read them.
+              </p>
+            </>
+          ) : (
+            <p className="text-sm text-muted-foreground">No samples match these filters.</p>
+          )}
+        </div>
       ) : (
-        <ul className="space-y-2">
+        <ul className="space-y-1.5">
           {items.map((s) => (
             <SampleCard key={s.id} s={s} />
           ))}
@@ -480,7 +544,7 @@ function SamplesTab({
       )}
 
       {total > 25 && (
-        <div className="mt-3 flex items-center justify-center gap-2">
+        <div className="flex items-center justify-center gap-2 pt-1">
           <Button
             variant="outline"
             size="sm"
@@ -489,7 +553,7 @@ function SamplesTab({
           >
             Previous
           </Button>
-          <span className="text-xs text-muted-foreground">
+          <span className="text-xs tabular-nums text-muted-foreground">
             {page * 25 + 1}–{Math.min((page + 1) * 25, total)} of {total}
           </span>
           <Button
@@ -506,37 +570,75 @@ function SamplesTab({
   );
 }
 
+/** A reference chip carried on an evaluator's flags — for a red-team row, which
+ * attack category it is. The corpus's whole point is that a row is an attack or a
+ * benign control, so showing only the reply hides what the verdict means. */
+function referenceChip(s: ExperimentSampleRecord): { label: string; attack: boolean } | null {
+  for (const v of Object.values(s.evals)) {
+    const f = v.flags as { attack?: boolean; attack_type?: string } | undefined;
+    if (!f || typeof f.attack !== "boolean") continue;
+    return { label: f.attack ? f.attack_type || "attack" : "benign", attack: f.attack };
+  }
+  return null;
+}
+
 function SampleCard({ s }: { s: ExperimentSampleRecord }) {
   const [open, setOpen] = useState(false);
-  const failures = Object.entries(s.evals).filter(([, v]) => !v.passed);
+  const evals = Object.entries(s.evals);
+  const failures = evals.filter(([, v]) => !v.passed);
+  const ref = referenceChip(s);
+
   return (
     <li
       className={cn(
-        "rounded-md border",
-        s.passed ? "border-border" : "border-red-500/30 bg-red-500/[0.03]",
+        "overflow-hidden rounded-md border transition-colors",
+        s.passed ? "border-border hover:border-foreground/25" : "border-red-500/40",
       )}
     >
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-start gap-3 px-3 py-2 text-left"
+        className="flex w-full items-start gap-3 px-3 py-2.5 text-left hover:bg-muted/40"
       >
+        {/* Verdict is an icon + colour, never colour alone. */}
+        <span className="mt-0.5 shrink-0">
+          {s.passed ? (
+            <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+          ) : (
+            <XCircle className="h-4 w-4 text-red-600 dark:text-red-400" />
+          )}
+        </span>
+
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            <span className="font-medium text-foreground">{s.case_name}</span>
-            <span>· {s.target}</span>
-            <span>· {s.variant}</span>
-            <span>· #{s.repeat}</span>
-            {s.latency_ms !== null && <span>· {fmtMs(s.latency_ms)}</span>}
-            {s.ttft_ms !== null && <span>· ttft {fmtMs(s.ttft_ms)}</span>}
-            {s.finish_reason && <span>· {s.finish_reason}</span>}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="truncate font-mono text-xs font-medium">{s.case_name}</span>
+            {ref && (
+              <span
+                className={cn(
+                  "rounded px-1.5 py-0.5 font-mono text-[10px]",
+                  ref.attack
+                    ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
+                    : "bg-muted text-muted-foreground",
+                )}
+                title={ref.attack ? "attack row — a refusal is the correct answer"
+                                  : "benign control — the model should answer normally"}
+              >
+                {ref.label}
+              </span>
+            )}
+            <span className="text-[11px] text-muted-foreground">
+              {s.target} · {s.variant}
+              {s.repeat > 1 ? ` · run ${s.repeat}` : ""}
+            </span>
           </div>
-          <p className="mt-1 truncate font-mono text-xs">
+
+          <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
             {s.error_text ? (
               <span className="text-red-600 dark:text-red-400">{s.error_text}</span>
             ) : (
-              s.content.slice(0, 160) || <span className="italic text-muted-foreground">(empty)</span>
+              s.content.slice(0, 240) || <span className="italic">(empty reply)</span>
             )}
           </p>
+
           {failures.length > 0 && (
             <div className="mt-1.5 flex flex-wrap gap-1">
               {failures.map(([id, v]) => (
@@ -551,45 +653,66 @@ function SampleCard({ s }: { s: ExperimentSampleRecord }) {
             </div>
           )}
         </div>
+
+        {/* Per-sample metrics, right-aligned and tabular so they form a column
+            down the list instead of a run-on of dot-separated values. */}
+        <div className="hidden shrink-0 items-center gap-3 pt-0.5 text-[11px] tabular-nums text-muted-foreground sm:flex">
+          {s.latency_ms !== null && <span title="latency">{fmtMs(s.latency_ms)}</span>}
+          {s.ttft_ms !== null && <span title="time to first token">ttft {fmtMs(s.ttft_ms)}</span>}
+          {s.completion_tokens !== null && <span title="output tokens">{s.completion_tokens} tok</span>}
+          <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", open && "rotate-90")} />
+        </div>
       </button>
+
       {open && (
-        <div className="space-y-3 border-t border-border px-3 py-3">
-          {failures.length > 0 && (
+        <div className="space-y-3 border-t border-border bg-muted/20 px-3 py-3">
+          {evals.length > 0 && (
             <div>
-              <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                Why it failed
+              <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                Evaluators
               </p>
               <ul className="space-y-1">
-                {failures.map(([id, v]) => (
-                  <li key={id} className="text-xs">
+                {evals.map(([id, v]) => (
+                  <li key={id} className="flex items-start gap-2 text-xs">
+                    {v.passed ? (
+                      <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    ) : (
+                      <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-600 dark:text-red-400" />
+                    )}
                     <span className="font-medium">{id.replace(/_/g, " ")}</span>
-                    {v.reason && <span className="text-muted-foreground"> — {v.reason}</span>}
+                    {v.reason && <span className="min-w-0 text-muted-foreground">— {v.reason}</span>}
                   </li>
                 ))}
               </ul>
             </div>
           )}
+
           <div>
             <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
               Reply
             </p>
-            <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-muted/30 p-2 font-mono text-[11px] scrollbar-thin">
+            <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-2.5 font-mono text-[11px] leading-relaxed scrollbar-thin">
               {s.content || "(empty)"}
             </pre>
           </div>
+
           {s.reasoning && (
             <div>
               <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                 Reasoning
               </p>
-              <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-muted/30 p-2 font-mono text-[11px] scrollbar-thin">
+              <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-2.5 font-mono text-[11px] leading-relaxed text-muted-foreground scrollbar-thin">
                 {s.reasoning}
               </pre>
             </div>
           )}
-          <div className="flex flex-wrap gap-3 text-[11px] text-muted-foreground">
+
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] tabular-nums text-muted-foreground">
             {s.prompt_tokens !== null && <span>prompt {s.prompt_tokens} tok</span>}
             {s.completion_tokens !== null && <span>output {s.completion_tokens} tok</span>}
+            {s.latency_ms !== null && <span>latency {fmtMs(s.latency_ms)}</span>}
+            {s.ttft_ms !== null && <span>ttft {fmtMs(s.ttft_ms)}</span>}
+            {s.finish_reason && <span>finish {s.finish_reason}</span>}
             {s.status_code !== null && <span>HTTP {s.status_code}</span>}
           </div>
         </div>

@@ -376,8 +376,13 @@ export function ProxyMetricsTab({ ep }: { ep: ProxyEndpoint }) {
       {/* Red-team screening — only rendered once the endpoint has screened traffic */}
       {summary?.redTeam && (() => {
         const rt = summary.redTeam;
-        const screened = rt.safe + rt.unsafe;
-        const blockRate = screened > 0 ? (rt.unsafe / screened) * 100 : 0;
+        // Blocks come from the by-type breakdown, not from the "unsafe" verdict: a
+        // fail-closed detector error (on_error=block) blocks with result="error" and
+        // type `detector_error`, so byType is the count that matches the Queue tab's
+        // `blocked` bucket. With on_error=allow (the default) the two are identical.
+        const blocked = rt.byType.reduce((a, t) => a + t.count, 0);
+        const screened = rt.safe + rt.unsafe + rt.errors;
+        const blockRate = screened > 0 ? (blocked / screened) * 100 : 0;
         const typeBars = rt.byType.map((t) => ({
           name: t.type.length > 28 ? `${t.type.slice(0, 27)}…` : t.type,
           count: t.count,
@@ -388,7 +393,7 @@ export function ProxyMetricsTab({ ep }: { ep: ProxyEndpoint }) {
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               <SummaryCard label="Screened" value={fmtInt(screened)} />
               <SummaryCard label="Safe" value={fmtInt(rt.safe)} />
-              <SummaryCard label="Unsafe (blocked)" value={fmtInt(rt.unsafe)} tone={rt.unsafe > 0 ? "bad" : "neutral"} />
+              <SummaryCard label="Blocked" value={fmtInt(blocked)} tone={blocked > 0 ? "bad" : "neutral"} />
               <SummaryCard label="Block rate" value={`${blockRate.toFixed(blockRate < 10 ? 1 : 0)}%`} tone={blockRate > 0 ? "bad" : "neutral"} />
               <SummaryCard label="Detector errors" value={fmtInt(rt.errors)} tone={rt.errors > 0 ? "bad" : "neutral"} />
               <SummaryCard label="Skipped" value={fmtInt(rt.skipped)} />

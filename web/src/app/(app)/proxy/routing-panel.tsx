@@ -18,10 +18,14 @@
 // spelling still shows on its node (`→ ownReal`), highlighted when it differs from
 // the serving backend's, so a mismatch is still visible without making the heading
 // change identity depending on which upstream happens to be up.
+//
+// One stage sits BEFORE the chain: the red-team guard. It is drawn only on chat
+// routes, because that is the only path `_red_team_gate` runs on — a hit is answered
+// by the gateway itself, so the request never reaches a backend and never fails over.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronRight, Server, SendHorizontal, Plus, type LucideIcon } from "lucide-react";
+import { ChevronRight, Server, SendHorizontal, ShieldAlert, Plus, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { ProxyUpstreamHealth } from "@/lib/types";
+import type { ProxyRedTeam, ProxyUpstreamHealth } from "@/lib/types";
 import { KIND_LABEL, KIND_ORDER, KIND_PATH, modelKind, type ModelKind } from "./model-kind";
 
 // Structural subset of the form's UpstreamDraft — also satisfied by a saved endpoint.
@@ -78,6 +82,23 @@ function selectCandidates(ups: RoutingUpstream[], alias: string, down: Set<strin
     .map(({ u }) => u);
 }
 
+// The guard is live for a route only under the same conditions `_resolve_red_team`
+// uses (enabled + a detector configured), and only on the chat path.
+const guardFor = (rt: ProxyRedTeam | null | undefined, kind: ModelKind) =>
+  kind === "chat" && rt && rt.enabled && rt.base_url?.trim() && rt.model?.trim() ? rt : null;
+
+const SCAN_LABEL: Record<string, string> = {
+  last_user: "last user message",
+  user: "all user messages",
+  full: "full conversation",
+};
+// What a hit produces. `error` is the only one that isn't a 200 — the other two are
+// ordinary completions carrying a refusal (finish_reason: content_filter).
+const hitLabel = (rt: ProxyRedTeam) =>
+  rt.action === "error" ? `HTTP ${rt.error_status ?? 403}`
+    : rt.action === "llm_respond" ? "LLM-written refusal"
+    : "canned reply";
+
 const curveLR = (x1: number, y1: number, x2: number, y2: number) => {
   const dx = Math.max(36, (x2 - x1) * 0.55);
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
@@ -86,7 +107,7 @@ const curveDown = (x: number, y1: number, y2: number, bow: number) =>
   `M ${x} ${y1} C ${x - bow} ${y1}, ${x - bow} ${y2}, ${x} ${y2}`;
 
 export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onPromote,
-                               defaultOpen = true, healthRows, failoverStatus = [],
+                               defaultOpen = true, healthRows, failoverStatus = [], redTeam,
                                editable = false, selectedUid = null, onSelect,
                                onAddUpstream, onDeleteUpstream, renderEditor }: {
   upstreams: RoutingUpstream[];
@@ -94,6 +115,9 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
   timeoutS: number;
   // sub-500 statuses this endpoint fails over on, so the hop labels tell the truth
   failoverStatus?: number[];
+  // The endpoint's chat guardrail, drawn as the first stage of every chat route.
+  // On the edit page this is the LIVE form state, so the graph tracks what you type.
+  redTeam?: ProxyRedTeam | null;
   proxyId?: string;   // saved endpoint → pull live upstream health
   // Move an upstream to the front of the list. Only meaningful for a tie: that is the
   // one case where list position, not the priority number, picks the winner.
@@ -194,6 +218,10 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
     .map((kind) => ({ kind, items: routes.filter((r) => r.kind === kind) }))
     .filter((g) => g.items.length > 0);
 
+  // Chat is the only screened path, so this doubles as "does this endpoint guard
+  // anything at all" for the help text below.
+  const chatGuard = guardFor(redTeam, "chat");
+
   // Upstreams that don't appear in any route node — a disabled backend, or a brand-new
   // one with no valid alias yet. Only relevant in editable mode, where they still need to
   // be reachable for editing (you can't click a node that isn't drawn).
@@ -273,6 +301,12 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
             <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open/kind:rotate-90" />
             <span className="text-sm font-medium">{KIND_LABEL[kind]}</span>
             <code className="truncate text-[11px] text-muted-foreground">POST {KIND_PATH[kind]}</code>
+            {guardFor(redTeam, kind) && (
+              <span className="inline-flex shrink-0 items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-600 dark:text-amber-400"
+                    title="Every request on this path is screened by the red-team guard before any backend is called">
+                <ShieldAlert className="h-2.5 w-2.5" /> screened
+              </span>
+            )}
             <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">
               {items.length} model{items.length === 1 ? "" : "s"}
             </span>
@@ -283,6 +317,7 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
                          simDown={simDown} onToggle={toggleDown} onPromote={onPromote}
                          listOrder={upstreams} maxConcurrency={maxConcurrency} timeoutS={timeoutS}
                          defaultOpen={defaultOpen} failoverStatus={failoverStatus}
+                         guard={guardFor(redTeam, r.kind)}
                          editable={editable} selectedUid={selectedUid} onSelect={onSelect} />
             ))}
           </div>
@@ -298,6 +333,14 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
           How failover works
         </summary>
         <ul className="space-y-1 border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
+          {chatGuard && (
+            <li>
+              <b className="text-foreground">Chat is screened first.</b> The red-team guard runs before any
+              backend is chosen — a hit is answered by the gateway ({hitLabel(chatGuard)}), so it never reaches
+              an upstream and never fails over. A detector outage{" "}
+              {chatGuard.on_error === "block" ? "blocks the request (fail closed)" : "lets it through (fail open)"}.
+            </li>
+          )}
           <li><b className="text-foreground">Moves to the next backend</b> on 5xx, a connection refused/timeout, or a dropped socket.</li>
           {failoverStatus.length > 0 ? (
             <li>
@@ -320,7 +363,7 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
 }
 
 function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrder,
-                     maxConcurrency, timeoutS, defaultOpen, failoverStatus,
+                     maxConcurrency, timeoutS, defaultOpen, failoverStatus, guard = null,
                      editable = false, selectedUid = null, onSelect }: {
   route: Route;
   down: Set<string>;
@@ -333,6 +376,8 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
   timeoutS: number;
   defaultOpen: boolean;
   failoverStatus: number[];
+  // Already resolved by the caller (active + chat-only) — null means no screen here.
+  guard?: ProxyRedTeam | null;
   editable?: boolean;
   selectedUid?: string | null;
   onSelect?: (uid: string | null) => void;
@@ -360,16 +405,35 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
   const row = NODE_H + rowGap;
   const rows = chain.length + 1;
   const chainH = rows * row - rowGap - (NODE_H - TERM_H);
-  const reqY = twoCol ? PAD + Math.max(0, (chainH - NODE_H) / 2) : PAD;
-  const firstRowY = twoCol ? PAD : reqY + row;
+  // The guard is a STAGE of the request column (request → screen → chain), not a
+  // candidate: it can end the request, but it never serves it. Both columns centre
+  // against the taller one so the canvas stays balanced with or without a screen.
+  const reqColH = guard ? NODE_H + row : NODE_H;
+  const colH = Math.max(reqColH, chainH);
+  const reqY = twoCol ? PAD + Math.max(0, (colH - reqColH) / 2) : PAD;
+  const guardY = reqY + row;
+  const firstRowY = twoCol
+    ? PAD + Math.max(0, (colH - chainH) / 2)
+    : (guard ? guardY + row : reqY + row);
   const rowY = (i: number) => firstRowY + i * row;
   const termY = rowY(chain.length);
   const termMid = termY + TERM_H / 2;
-  const height = Math.max(reqY + NODE_H, termY + TERM_H) + PAD;
+  const height = Math.max(reqY + reqColH, termY + TERM_H) + PAD;
   const bow = twoCol ? 48 : 26;
-  const fromPt = twoCol
-    ? { x: PAD + nodeW, y: reqY + NODE_H / 2 }
-    : { x: chainX, y: reqY + NODE_H + 6 };
+  const guardX = twoCol ? PAD : chainX;
+  const guardMid = guardY + NODE_H / 2;
+  // Everything downstream leaves the SCREEN when there is one — the request node no
+  // longer touches the chain, which is the whole point of an inline guardrail.
+  const fromPt = guard
+    ? { x: twoCol ? PAD + nodeW : chainX, y: guardMid }
+    : twoCol
+      ? { x: PAD + nodeW, y: reqY + NODE_H / 2 }
+      : { x: chainX, y: reqY + NODE_H + 6 };
+  // request → screen. In two-column the hop runs down the right edge of the request
+  // column and bows AWAY from the cards (negative bow) into the gutter.
+  const toGuard = !guard ? null
+    : twoCol ? curveDown(PAD + nodeW, reqY + NODE_H / 2, guardMid, -28)
+             : curveDown(chainX, reqY + NODE_H + 6, guardMid, bow);
   const entry = chain.length === 0
     ? (twoCol ? curveLR(fromPt.x, fromPt.y, chainX, termMid) : curveDown(chainX, fromPt.y, termMid, bow))
     : (twoCol ? curveLR(fromPt.x, fromPt.y, chainX, rowY(0) + NODE_H / 2)
@@ -419,6 +483,13 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
                       width={nodeW + 16} height={(tie - 1) * row + NODE_H + 16}
                       fill="none" stroke="var(--fall)" strokeOpacity={0.45} strokeDasharray="4 5" />
               )}
+              {/* request → red-team screen. Solid: every chat request really does go
+                  through it, and pays its latency, before a backend is picked. */}
+              {toGuard && (
+                <path d={toGuard} fill="none" strokeWidth={2} strokeLinecap="round"
+                      stroke="var(--fall)"
+                      style={{ filter: "drop-shadow(0 0 3px color-mix(in srgb, var(--fall) 45%, transparent))" }} />
+              )}
               {/* Active route: one soft, solid emerald curve — the request always enters
                   at the primary backend. A dropped-socket 404 case turns rose. */}
               <path d={entry} fill="none" strokeWidth={2} strokeLinecap="round"
@@ -436,6 +507,14 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
                         strokeDasharray="1.5 7" strokeLinecap="round" strokeOpacity={0.7} />
                 );
               })}
+              {guard && (
+                <>
+                  <circle cx={twoCol ? PAD + nodeW : chainX} cy={reqY + (twoCol ? NODE_H / 2 : NODE_H + 6)}
+                          r={3} fill="var(--fall)" />
+                  <circle cx={twoCol ? PAD + nodeW : chainX} cy={guardMid} r={3.5}
+                          fill="var(--canvas)" stroke="var(--fall)" strokeWidth={1.5} />
+                </>
+              )}
               <circle cx={fromPt.x} cy={fromPt.y} r={3} fill={chain.length ? "var(--live)" : "var(--down)"} />
               {chain.map((u, i) => (
                 <circle key={u.uid} cx={chainX} cy={rowY(i) + NODE_H / 2} r={3.5}
@@ -459,6 +538,30 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
                 {maxConcurrency > 0 ? `${maxConcurrency} at once` : "no cap"} · {timeoutS}s
               </div>
             </Node>
+
+            {/* red-team screen — chat only. Drawn between the request and the chain
+                because that is where `_red_team_gate` runs: a hit is answered from
+                here, so nothing below it is reached and no failover happens. */}
+            {guard && (
+              <Node x={guardX} y={guardY} w={nodeW} tone="wait" glow
+                    title={`${guard.mode === "llm" ? "LLM judge" : "classifier"} · ${guard.base_url || "no detector URL"}`
+                           + ` · scans the ${SCAN_LABEL[guard.scan ?? "last_user"]}`
+                           + ` · a hit is answered with a ${hitLabel(guard)} and carries X-SGPU-Red-Team-Type`}>
+                <NodeHead tone="wait" icon={ShieldAlert} title="Red-team screen"
+                          right={
+                            <Tag tone={guard.on_error === "block" ? "down" : "wait"}>
+                              {guard.on_error === "block" ? "fail closed" : "fail open"}
+                            </Tag>
+                          } />
+                <NodeRule />
+                <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  {guard.mode === "llm" ? "LLM judge" : "classifier"} · {guard.model}
+                </div>
+                <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground/70">
+                  scans {SCAN_LABEL[guard.scan ?? "last_user"]} · hit → {hitLabel(guard)}
+                </div>
+              </Node>
+            )}
 
             {/* candidates */}
             {chain.map((u, i) => {

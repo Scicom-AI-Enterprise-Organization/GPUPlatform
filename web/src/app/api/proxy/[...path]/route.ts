@@ -19,6 +19,20 @@ const PASS_HEADERS = [
   // head-read (a 2 GB log previews as its first MB).
   "x-object-size", "x-object-truncated",
 ];
+// …plus every `x-sgpu-*` the gateway sets, by prefix rather than by name — the same
+// rule the REQUEST direction already uses below. A named allowlist silently swallowed
+// X-SGPU-Red-Team / -Type, so a request the guard BLOCKED looked, in the Playground,
+// exactly like one the model answered. New gateway signals shouldn't need this file
+// edited to become visible.
+const isPassHeader = (k: string) => k.startsWith("x-sgpu-") || PASS_HEADERS.includes(k);
+
+function passThrough(res: Response): Record<string, string> {
+  const out: Record<string, string> = {};
+  res.headers.forEach((v, k) => {
+    if (isPassHeader(k.toLowerCase())) out[k.toLowerCase()] = v;
+  });
+  return out;
+}
 
 export async function GET(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   return forward(req, ctx);
@@ -77,13 +91,10 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
   try {
     const res = await fetch(target, init);
     const ct = res.headers.get("content-type") ?? "application/json";
-    // Pass through the proxy router's routing-info headers so the browser
-    // (e.g. the proxy Playground) can show which upstream served the request.
-    const upstreamHeaders: Record<string, string> = {};
-    for (const k of PASS_HEADERS) {
-      const v = res.headers.get(k);
-      if (v) upstreamHeaders[k] = v;
-    }
+    // Pass through the proxy router's routing-info + guardrail headers so the browser
+    // (e.g. the proxy Playground) can show which upstream served the request, or that
+    // the red-team screen answered it instead.
+    const upstreamHeaders = passThrough(res);
     // SSE / chunked: pipe the body through instead of buffering — buffering
     // would break long-running streams (e.g. benchmark log tails).
     if (ct.includes("text/event-stream") || ct.includes("application/x-ndjson")) {
