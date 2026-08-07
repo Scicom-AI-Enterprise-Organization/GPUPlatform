@@ -647,6 +647,27 @@ def _reasoning_of(obj: Any) -> str:
 # --------------------------------------------------------------------------- #
 
 
+DEFAULT_CHAT_PATH = "/v1/chat/completions"
+
+
+def _join_chat_url(base_url: str, path: str) -> str:
+    """Target base + path → the URL to POST.
+
+    ⚠ A base pasted WITH its `/v1` (what every platform proxy URL looks like:
+    `…/proxy/for-agentic/v1`) plus the DEFAULT path produced
+    `…/v1/v1/chat/completions` → 404. Since the default path is the only one 99%
+    of targets use, normalize that case through the one shared helper; a target
+    that sets a CUSTOM path means it deliberately, so join it verbatim.
+    """
+    p = (path or "").strip()
+    if not p:
+        return base_url.rstrip("/")
+    if p == DEFAULT_CHAT_PATH:
+        from .synthetic import chat_completions_url
+        return chat_completions_url(base_url)
+    return f"{base_url.rstrip('/')}{p}"
+
+
 async def call_once(
     client: httpx.AsyncClient,
     base_url: str,
@@ -661,7 +682,7 @@ async def call_once(
     *iterating* the stream, long after the request future resolved, and letting
     it escape kills the whole run rather than one unit.
     """
-    url = f"{base_url.rstrip('/')}{path}"
+    url = _join_chat_url(base_url, path)
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"

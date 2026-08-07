@@ -20,7 +20,6 @@ import {
   Plus,
   Server,
   Shuffle,
-  ShieldAlert,
   Sparkles,
   Trash2,
 } from "lucide-react";
@@ -367,14 +366,6 @@ export function ExperimentForm({
                 <Download className="h-4 w-4" />
                 Capture requests
               </Button>
-              {/* Red teaming has nothing to capture, so the corpus is GENERATED —
-                  which is a Datasets concern, not an Experiments one. */}
-              <Button type="button" variant="outline" size="sm" asChild>
-                <Link href="/datasets/new?source=generate">
-                  <ShieldAlert className="h-4 w-4" />
-                  Generate corpus
-                </Link>
-              </Button>
               <Button type="button" variant="outline" size="sm" asChild>
                 <Link href="/datasets">Datasets</Link>
               </Button>
@@ -391,14 +382,7 @@ export function ExperimentForm({
               >
                 capture requests
               </button>{" "}
-              from a Langfuse trace or your served traffic,{" "}
-              <Link
-                href="/datasets/new?source=generate"
-                className="font-medium text-foreground underline underline-offset-2"
-              >
-                generate a red-team corpus
-              </Link>
-              , or add one in{" "}
+              from a Langfuse trace or your served traffic, or add one in{" "}
               <Link
                 href="/datasets"
                 className="font-medium text-foreground underline underline-offset-2"

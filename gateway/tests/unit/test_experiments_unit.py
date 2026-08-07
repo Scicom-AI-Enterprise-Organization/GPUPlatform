@@ -444,3 +444,30 @@ def test_row_to_case_keeps_tool_message_fields():
     assert case.messages[0]["tool_calls"] == [{"id": "1"}]
     assert "junk" not in case.messages[0]
     assert case.messages[1]["tool_call_id"] == "1"
+
+
+# --------------------------------------------------------------------------- #
+# Target URL joining — the /v1/v1 404
+# --------------------------------------------------------------------------- #
+
+
+def test_default_path_normalizes_a_base_that_already_has_v1():
+    """A platform proxy base is `…/proxy/x/v1`; joined naively with the default
+    path it became `…/v1/v1/chat/completions` and 404'd every replay."""
+    from gateway.experiments_api import DEFAULT_CHAT_PATH, _join_chat_url
+
+    assert _join_chat_url("https://gw/proxy/x/v1", DEFAULT_CHAT_PATH) == \
+        "https://gw/proxy/x/v1/chat/completions"
+    assert _join_chat_url("http://vllm:8000", DEFAULT_CHAT_PATH) == \
+        "http://vllm:8000/v1/chat/completions"
+    assert _join_chat_url("https://gw/v1/chat/completions", DEFAULT_CHAT_PATH) == \
+        "https://gw/v1/chat/completions"
+
+
+def test_a_custom_path_is_joined_verbatim():
+    """Setting a non-default path is deliberate — don't second-guess it."""
+    from gateway.experiments_api import _join_chat_url
+
+    assert _join_chat_url("https://gw/api", "/v2/generate") == "https://gw/api/v2/generate"
+    # An empty path means the caller already resolved the full URL.
+    assert _join_chat_url("https://gw/v1/chat/completions", "") == "https://gw/v1/chat/completions"
