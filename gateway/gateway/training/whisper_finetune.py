@@ -1947,6 +1947,10 @@ def run(cfg: dict) -> None:
     _eval_set_keys = {_slug(nm): nm for nm, _ in eval_groups} if eval_groups else {}
     # Per-round scratch shared by MacroMetric (fills it) and MetricEmitter (drains it).
     _set_acc: dict = {}
+    # Every emitted eval round. With a dict eval_dataset the macro never reaches
+    # trainer.state.log_history (HF logs each sub-dataset's metrics before the macro
+    # is injected), so `best` below is read from here instead.
+    _metric_points: list = []
 
     # What shift_tokens_right prepends to build the decoder input — the token the
     # labels must NOT also start with (see the strip in Collator below).
@@ -2174,6 +2178,7 @@ def run(cfg: dict) -> None:
                 point["wer"] = m.get("eval_wer_macro")
                 point["cer"] = m.get("eval_cer_macro")
                 point["eval_loss"] = _mean([v.get("eval_loss") for v in sets.values()])
+            _metric_points.append(point)
             emit("METRIC", point)
 
     class MacroMetric(TrainerCallback):
@@ -2255,7 +2260,16 @@ def run(cfg: dict) -> None:
         # exactly how a finished run's "Best WER" ended up above an epoch it had passed.
         # log_history is identical across DDP ranks, so this needs no collective op.
         mkey = f"eval_{metric_name}"
-        evals = [h for h in trainer.state.log_history if isinstance(h.get(mkey), (int, float))]
+        if _eval_set_keys:
+            # Multi test set: rank the rounds by the MACRO metric we emitted.
+            evals = [
+                {"epoch": p.get("epoch"), mkey: p.get(metric_name),
+                 "eval_wer": p.get("wer"), "eval_cer": p.get("cer"),
+                 "eval_loss": p.get("eval_loss"), "sets": p.get("sets")}
+                for p in _metric_points if isinstance(p.get(metric_name), (int, float))
+            ]
+        else:
+            evals = [h for h in trainer.state.log_history if isinstance(h.get(mkey), (int, float))]
         if evals:
             b = min(evals, key=lambda h: h[mkey])
             best = {
