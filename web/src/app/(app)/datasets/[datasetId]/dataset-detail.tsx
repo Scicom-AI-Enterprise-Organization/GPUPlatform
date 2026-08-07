@@ -2,6 +2,9 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { Copy } from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { DatasetPreview, DatasetRecord, StorageRecord } from "@/lib/types";
@@ -37,6 +40,31 @@ function Kpi({ label, value }: { label: string; value: React.ReactNode }) {
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="mt-0.5 truncate text-lg font-semibold tabular-nums">{value}</div>
     </div>
+  );
+}
+
+/** An S3 URI with a copy button. It's long, wraps across lines and is the thing
+ *  you paste into a merge / a `kind=s3` registration, so selecting it by hand is
+ *  the fiddliest interaction on this page. */
+function CopyableUri({ uri }: { uri: string | null }) {
+  if (!uri) return <span className="font-mono text-xs">—</span>;
+  return (
+    <span className="inline-flex items-start gap-1.5">
+      <span className="font-mono text-xs break-all">{uri}</span>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        aria-label="Copy S3 URI"
+        title="Copy"
+        className="mt-[-2px] shrink-0 text-muted-foreground hover:text-foreground"
+        onClick={() => {
+          navigator.clipboard.writeText(uri);
+          toast.success("S3 URI copied", { duration: 3000 });
+        }}
+      >
+        <Copy className="h-3.5 w-3.5" />
+      </Button>
+    </span>
   );
 }
 
@@ -286,7 +314,7 @@ export function DatasetDetail({
                 {(dataset.kind === "s3" || dataset.kind === "tts_packed") && (
                   <Row
                     label={dataset.kind === "tts_packed" ? "Packed shards (S3)" : "S3 metadata URI"}
-                    value={<span className="font-mono text-xs break-all">{dataset.s3_metadata_uri ?? "—"}</span>}
+                    value={<CopyableUri uri={dataset.s3_metadata_uri ?? null} />}
                   />
                 )}
                 {dataset.kind === "label" && (

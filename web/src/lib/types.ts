@@ -1025,6 +1025,12 @@ export type StorageEntry = {
   modified?: string | null;
 };
 
+// `name`/`asc` is both backends' native order and stays strictly page-bounded.
+// Any other ordering is computed by the gateway over a capped scan of the
+// directory — see the browse route's `note`.
+export type StorageSortField = "name" | "size" | "modified";
+export type StorageSortOrder = "asc" | "desc";
+
 export type StorageBrowseResponse = {
   storage_id: string;
   kind: "s3" | "local";
@@ -1036,8 +1042,8 @@ export type StorageBrowseResponse = {
   // Directory being listed, relative to root ("" = root itself).
   path: string;
   entries: StorageEntry[];
-  // Opaque continuation token (S3's for s3, an offset for local) — pass back as
-  // `token` for the next page.
+  // Opaque continuation token (S3's for s3, an offset for local — and an offset
+  // for both under a non-native sort) — pass back as `token` for the next page.
   next_token?: string | null;
   // Something worth knowing about THIS listing (e.g. a directory too big to
   // sort) — a hint, not an error.

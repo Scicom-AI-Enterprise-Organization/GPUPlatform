@@ -1097,17 +1097,19 @@ async def _run_merge(
                                   f"source '{src['name']}' is an s3 dataset without storage / a metadata file")
                     return
                 # Fast path: when the source and destination S3 are the same account
-                # (same creds/region/endpoint) and we're writing to S3, copy the audio
-                # objects server-side (S3→S3) instead of pulling every clip down through
-                # the gateway and re-uploading. Falls back to download for target=hf or
-                # a cross-account source.
+                # (same creds/region/endpoint) and we're writing to S3, don't move the
+                # audio at all — the merged metadata REFERENCES the objects where they
+                # already are. Merging two exports of the same corpus used to duplicate
+                # every clip (26k objects for a 13k+13k merge) to produce a file whose
+                # only real content is the row list. Falls back to download for
+                # target=hf or a cross-account source.
                 if target == "s3" and _same_account(src["s3_target"], s3_target):
                     await _log(output_id,
-                               f"[{idx + 1}/{len(sources)}] copying s3 dataset '{src['name']}' "
-                               f"server-side ({src['s3_metadata_uri']}) …")
+                               f"[{idx + 1}/{len(sources)}] referencing s3 dataset '{src['name']}' "
+                               f"in place ({src['s3_metadata_uri']}) …")
                     pairs = await run_in_threadpool(
                         _s3_copy_pairs, src["s3_target"], src["s3_metadata_uri"],
-                        src["audio_field"], src["transcription_field"], f"s{idx}-",
+                        src["audio_field"], src["transcription_field"], f"s{idx}-", True,
                     )
                 else:
                     await _log(output_id,
@@ -1133,6 +1135,32 @@ async def _run_merge(
                           "no tasks with downloadable audio across the selected sources "
                           "(check each project's status filter / token)")
             return
+
+        # ⚠ A referenced clip is NOT renamed (it isn't moved), so two sources holding
+        # different clips under the same basename would both land in the metadata as
+        # that one name. Nothing downstream keys on the URL alone — the whisper
+        # trainer caches each download by BASENAME, so the second row would train on
+        # the first row's audio. A copy is what makes names unique (the `s{idx}-`
+        # prefix), so on any collision the whole merge falls back to copying rather
+        # than silently mixing the two schemes.
+        _names: dict[str, set] = {}
+        for _split, s, _t, _e in all_pairs:
+            _names.setdefault(_pair_stem(s), set()).add(s)
+        _clashes = {n: v for n, v in _names.items() if len(v) > 1}
+        if _clashes:
+            n_ref = sum(
+                1 for _s, s, _t, _e in all_pairs
+                if isinstance(s, tuple) and s and s[0] == "s3ref"
+            )
+            if n_ref:
+                await _log(output_id,
+                           f"⚠ {len(_clashes)} clip name(s) appear in more than one source "
+                           f"(e.g. {sorted(_clashes)[0]}) — copying instead of referencing so "
+                           f"every clip keeps a distinct name")
+                all_pairs = [
+                    (sp, (("s3cp",) + tuple(s[1:])) if (isinstance(s, tuple) and s and s[0] == "s3ref") else s, t, e)
+                    for sp, s, t, e in all_pairs
+                ]
         await _log(output_id,
                    f"merged {len(all_pairs)} rows from {len(sources)} sources; building output …")
 
@@ -1882,18 +1910,57 @@ def _same_account(a, b) -> bool:
     )
 
 
+def _s3_key_from_ref(ref: str, bucket: str, base: str, index: int) -> str:
+    """The bucket key an audio cell points at.
+
+    ⚠ The cell is normally a presigned https URL whose PATH **is** the key, and
+    that is the authoritative answer. Reconstructing `{metadata_dir}/audio/{name}`
+    instead only works when the metadata sits next to its audio — which a
+    NORMALIZED dataset deliberately doesn't do: its CSV lives in a
+    `normalized-<hex>/` sub-folder and references the PARENT's `audio/`. Merging
+    one of those guessed a key one directory too deep and died with
+    `NoSuchKey` on CopyObject — after copying the other source's 13k objects.
+
+    Falls back to the reconstructed key for a bare filename or relative path
+    (a hand-written metadata file)."""
+    from urllib.parse import unquote, urlparse
+
+    u = urlparse(ref or "")
+    path = unquote(u.path or "").lstrip("/")
+    if u.scheme == "s3":
+        return path  # s3://bucket/key
+    if u.scheme in ("http", "https") and path:
+        # Virtual-host style (bucket in the host) → the path is already the key.
+        # Path style (https://host/bucket/key) → strip the leading bucket segment.
+        host = (u.netloc or "").lower()
+        if bucket and not host.startswith(bucket.lower() + "."):
+            if path == bucket or path.startswith(bucket + "/"):
+                path = path[len(bucket):].lstrip("/")
+        return path
+    name = unquote(os.path.basename(u.path or ref)) or f"row-{index}.wav"
+    return f"{base}/audio/{name}" if base else f"audio/{name}"
+
+
 def _s3_copy_pairs(
     s3_target,
     s3_metadata_uri: str,
     audio_field: str,
     transcription_field: str,
     name_prefix: str = "",
+    reference: bool = False,
 ) -> list[tuple[str, tuple, str, dict]]:
-    """Like `_s3_pairs`, but does NOT download: read the source metadata CSV and
-    return copy-markers so `_materialise_s3` server-side copies each clip S3→S3.
-    Each pair's audio element is an ("s3cp", src_bucket, src_key, dest_basename)
-    tuple. `name_prefix` keeps dest basenames unique across merged sources — the
-    SAME contract as `_s3_pairs`, so the two can be mixed in one merge."""
+    """Like `_s3_pairs`, but moves no bytes: read the source metadata CSV and
+    return markers describing where each clip already lives.
+
+    `reference=False` → ("s3cp", src_bucket, src_key, dest_basename): the clip is
+    server-side COPIED into the output folder. `reference=True` → ("s3ref",
+    src_bucket, src_key, dest_basename): the output metadata just points at the
+    existing object and nothing is copied at all. The 4th element is the name the
+    copy WOULD get, so a reference can be downgraded to a copy by swapping the
+    tag (see the basename-collision guard in `_run_merge`).
+
+    `name_prefix` keeps dest basenames unique across merged sources — the SAME
+    contract as `_s3_pairs`, so the two can be mixed in one merge."""
     import csv
     import io as _io
     from urllib.parse import unquote, urlparse
@@ -1919,14 +1986,15 @@ def _s3_copy_pairs(
     if not a_col:
         raise RuntimeError(f"audio column '{audio_field}' not found in {meta_key} (have {cols})")
     skip = {a_col, t_col, "split"}
+    tag = "s3ref" if reference else "s3cp"
     pairs: list[tuple[str, tuple, str, dict]] = []
     for i, r in enumerate(reader):
         ref = (r.get(a_col) or "").strip()
         if not ref:
             continue
+        src_key = _s3_key_from_ref(ref, src_bucket, base, i)
         basename = unquote(os.path.basename(urlparse(ref).path)) or f"row-{i}.wav"
-        src_key = f"{base}/audio/{basename}" if base else f"audio/{basename}"
-        marker = ("s3cp", src_bucket, src_key, f"{name_prefix}{basename}")
+        marker = (tag, src_bucket, src_key, f"{name_prefix}{basename}")
         text_val = (r.get(t_col) or "") if t_col else ""
         split = (r.get("split") or "train").strip() or "train"
         extra = {k: v for k, v in r.items() if k not in skip and isinstance(v, str) and v != ""}
@@ -1988,9 +2056,11 @@ def _s3_pairs(
         if not ref:
             continue
         basename = unquote(os.path.basename(urlparse(ref).path)) or f"row-{i}.wav"
-        # Prefer the {base}/audio/{basename} key (re-signed by our own client, so
-        # an expired URL in the CSV doesn't bite); fall back to the raw URL.
-        key = f"{base}/audio/{basename}" if base else f"audio/{basename}"
+        # Read by KEY (re-signed by our own client, so an expired URL in the CSV
+        # doesn't bite), taking the key from the cell's own URL — see
+        # `_s3_key_from_ref` for why reconstructing it from the metadata folder is
+        # wrong for a normalized dataset. Falls back to the raw URL.
+        key = _s3_key_from_ref(ref, getattr(s3_target, "bucket", ""), base, i)
         data = bench.s3_get_bytes(key, s3_target)
         if data is None and ref.lower().startswith(("http://", "https://")):
             try:
@@ -2463,12 +2533,18 @@ def _apply_test_split(
 
 def _pair_stem(src) -> str:
     """The audio-basename stem a clip carries across exports — the join key for
-    reusing another dataset's test set. `src` is either a local/absolute path or
-    an ("s3cp", bucket, key, dest_basename) copy-marker; both resolve to the same
-    dest basename `_materialise_s3` would write (label clips → `task-<uuid>`).
+    reusing another dataset's test set. `src` is a local/absolute path, an
+    ("s3cp", …) copy-marker or an ("s3ref", …) reference; each resolves to the
+    basename `_materialise_s3` actually writes into the metadata (a reference
+    keeps the object's OWN name — it isn't renamed, because it isn't moved).
     Extension-stripped so a re-export as a different container still matches."""
-    if isinstance(src, tuple) and src and src[0] == "s3cp":
-        base = src[3]
+    if isinstance(src, tuple) and src:
+        if src[0] == "s3ref":
+            base = os.path.basename(src[2])
+        elif src[0] == "s3cp":
+            base = src[3]
+        else:
+            base = os.path.basename(str(src[-1]))
     else:
         base = os.path.basename(src)
     return os.path.splitext(base)[0]
@@ -2545,24 +2621,35 @@ def _materialise_s3(
     except Exception:  # noqa: BLE001 — best-effort; fall back to always uploading
         pass
     expires = 7 * 24 * 3600
-    # Each unique audio source (same clip can repeat across splits) → its S3 dest key.
-    # A source is either a local file path (str, uploaded) or an
-    # ("s3cp", src_bucket, src_key, dest_basename) marker (server-side copied S3→S3,
-    # no bytes through the gateway — emitted by _s3_copy_pairs for a same-account merge).
+    # Each unique audio source (same clip can repeat across splits) → the S3 key the
+    # metadata will point at. A source is one of:
+    #   * a local file path (str)                              → uploaded
+    #   * ("s3cp",  bucket, key, dest_basename)                → server-side copied
+    #   * ("s3ref", bucket, key, dest_basename)                → NOT moved at all;
+    #     the metadata references the object where it already lives (a same-account
+    #     s3→s3 merge). Its key is therefore OUTSIDE this dataset's folder.
     def _dest_key(src) -> str:
-        if isinstance(src, tuple) and src and src[0] == "s3cp":
-            return f"{base}/audio/{src[3]}"
+        if isinstance(src, tuple) and src:
+            if src[0] == "s3ref":
+                return src[2]
+            if src[0] == "s3cp":
+                return f"{base}/audio/{src[3]}"
         return f"{base}/audio/{os.path.basename(src)}"
 
     key_of: dict = {}
+    ref_bucket: dict[str, str] = {}  # dest key → its bucket, for keys we don't own
     for _split, src, _text, _extra in pairs:
-        key_of.setdefault(src, _dest_key(src))
+        k = key_of.setdefault(src, _dest_key(src))
+        if isinstance(src, tuple) and src and src[0] == "s3ref" and src[1]:
+            ref_bucket[k] = src[1]
 
     # Re-runs skip clips already in the bucket. Split the rest into local uploads
-    # and server-side copies.
+    # and server-side copies; references move nothing.
     to_upload: list[tuple[str, str]] = []      # (dest_key, local_path)
     to_copy: list[tuple[str, str, str]] = []   # (dest_key, src_bucket, src_key)
     for src, dest_key in key_of.items():
+        if isinstance(src, tuple) and src and src[0] == "s3ref":
+            continue
         if dest_key in existing:
             continue
         if isinstance(src, tuple) and src and src[0] == "s3cp":
@@ -2586,7 +2673,18 @@ def _materialise_s3(
 
     # Presign every unique key (local signing, one client), then write the CSV
     # with the carried-through columns (e.g. speaker) after audio/text/split.
-    urls = bench.s3_presign_many(list(key_of.values()), expires, s3_target)
+    # Referenced keys can live in another bucket of the same account, so sign each
+    # bucket's keys against a target pinned to it.
+    by_bucket: dict[Optional[str], list[str]] = {}
+    for k in key_of.values():
+        by_bucket.setdefault(ref_bucket.get(k), []).append(k)
+    urls: dict[str, str] = {}
+    for bucket, keys in by_bucket.items():
+        t = s3_target
+        if bucket and bucket != getattr(s3_target, "bucket", None):
+            import dataclasses as _dc
+            t = _dc.replace(s3_target, bucket=bucket)
+        urls.update(bench.s3_presign_many(keys, expires, t))
     # ⚠ A carried-through column may share a name with one of the three columns
     # this writer owns. Emitting both would put TWO same-named columns in the CSV
     # and every reader (csv.DictReader, pandas) keeps the LAST — silently

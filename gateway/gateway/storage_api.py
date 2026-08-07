@@ -974,6 +974,14 @@ BROWSE_PAGE_MAX = 1000
 # page in readdir order instead. Sorting means materializing every name, and a
 # million-entry directory is exactly where that stops being free.
 LOCAL_SORT_MAX = 20_000
+# Sorting by size/modified (or by name DESCENDING) can't be pushed down to either
+# backend: S3 LIST only ever returns keys in ascending lexicographic order, and a
+# local readdir has no order at all. So those orderings are computed here, over a
+# scan of the directory capped at this many entries — above it the ranking is over
+# what was scanned, not the whole directory, and the listing says so.
+BROWSE_SORT_SCAN_MAX = 20_000
+BROWSE_SORT_FIELDS = ("name", "size", "modified")
+BROWSE_SORT_ORDERS = ("asc", "desc")
 # S3 counts every key it SCANS against MaxKeys, so a delimited page can come back
 # with zero entries (all keys collapsed into already-returned folders) while more
 # remain. Pull a few pages before handing the UI an empty one.
@@ -1248,6 +1256,9 @@ def _local_browse(
 
 
 def _local_offset(token: Optional[str]) -> int:
+    """Parse an offset-style page token. Used by the local backend's paging AND —
+    for both kinds — by the sorted path, whose token is an offset into the sorted
+    listing rather than S3's own opaque continuation token."""
     if not token:
         return 0
     try:
@@ -1256,11 +1267,119 @@ def _local_offset(token: Optional[str]) -> int:
         raise HTTPException(status_code=400, detail="invalid page token") from e
 
 
+def _local_scan_dir(
+    root: str, rel: str, q: str, cap: int,
+) -> tuple[list[StorageEntry], bool]:
+    """A local directory materialized (stat and all) → (entries, truncated).
+
+    Only the sorted path calls this: ranking by size/mtime needs every entry's
+    stat, not just the page's — which is exactly why it is capped.
+    """
+    d = _local_path(root, rel)
+    if not os.path.isdir(d):
+        raise HTTPException(
+            status_code=404,
+            detail=f"{d} is not a directory on the gateway host",
+        )
+    entries: list[StorageEntry] = []
+    truncated = False
+    with os.scandir(d) as it:
+        for de in it:
+            if q and not de.name.startswith(q):
+                continue
+            if _escapes_root(root, de.path):
+                continue  # a symlink out of the root isn't part of this folder
+            if len(entries) >= cap:
+                truncated = True
+                break
+            entries.append(_local_entry(de, rel))
+    return entries, truncated
+
+
+def _sort_entries(entries: list[StorageEntry], sort: str, order: str) -> list[StorageEntry]:
+    """Order a MATERIALIZED listing by name / size / modified.
+
+    ⚠ Folders always come first and are always name-ordered. An S3 "folder" is a
+    CommonPrefix — it carries neither a size nor a last-modified time, so ranking
+    one by either is meaningless; a local directory does have an mtime, but
+    letting it participate would make the two kinds behave differently for the
+    same click.
+
+    Entries whose value is missing sort LAST in both directions — unranked, not
+    "the smallest". `modified` compares as a string because both producers emit
+    UTC ISO-8601 (`…+00:00`), for which lexicographic order IS chronological.
+
+    Note folders lead the WHOLE listing here, where the page-bounded native path
+    can only put them first within each page (it has not seen the folders it
+    hasn't scanned). That's the native path's limit, not a rule this one breaks.
+    """
+    desc = order == "desc"
+    folders = [e for e in entries if e.kind == "folder"]
+    files = [e for e in entries if e.kind != "folder"]
+    folders.sort(key=lambda e: e.name.lower(), reverse=desc and sort == "name")
+    if sort == "name":
+        files.sort(key=lambda e: e.name.lower(), reverse=desc)
+        return folders + files
+
+    def value(e: StorageEntry):
+        return e.size if sort == "size" else e.modified
+
+    ranked = [e for e in files if value(e) is not None]
+    unranked = [e for e in files if value(e) is None]
+    # Name first, then a stable sort on the field — so ties read alphabetically.
+    ranked.sort(key=lambda e: e.name.lower())
+    ranked.sort(key=value, reverse=desc)
+    unranked.sort(key=lambda e: e.name.lower())
+    return folders + ranked + unranked
+
+
+def _sorted_page(
+    entries: list[StorageEntry], truncated: bool, sort: str, order: str,
+    offset: int, limit: int,
+) -> tuple[list[StorageEntry], Optional[str], Optional[str]]:
+    """Sort a scanned directory and cut one page out of it → (page, token, note).
+
+    The token is an offset into the sorted list, so a later page re-scans and
+    re-sorts. That's the same trade `_local_browse` already makes for its name
+    sort, and it keeps the server holding no per-client state.
+    """
+    ordered = _sort_entries(entries, sort, order)
+    page = ordered[offset : offset + limit]
+    next_offset = offset + len(page)
+    next_token = str(next_offset) if next_offset < len(ordered) else None
+    note = None
+    if truncated:
+        note = (
+            f"sorted the first {len(ordered):,} entries scanned — this directory "
+            "holds more, so this ranking is not the whole folder's"
+        )
+    return page, next_token, note
+
+
 def _s3_target_checked(s: Storage):
     target, _base = _s3_for_storage(s)
     if not target.bucket:
         raise HTTPException(status_code=400, detail="storage has no bucket configured")
     return target
+
+
+def _s3_page_entries(page: dict, key_prefix: str, rel: str) -> list[StorageEntry]:
+    """One `s3_list_page` result → StorageEntry rows for this directory."""
+    entries: list[StorageEntry] = []
+    for folder_key in page["folders"]:
+        name = folder_key[len(key_prefix):].rstrip("/")
+        if name:
+            entries.append(StorageEntry(
+                name=name, path=f"{rel}/{name}" if rel else name, kind="folder",
+            ))
+    for obj in page["files"]:
+        name = obj["key"][len(key_prefix):]
+        if name:
+            entries.append(StorageEntry(
+                name=name, path=f"{rel}/{name}" if rel else name, kind="file",
+                size=obj["size"], modified=obj["modified"],
+            ))
+    return entries
 
 
 def _s3_browse(target, key_prefix: str, rel: str, token: Optional[str], limit: int, q: str):
@@ -1279,19 +1398,7 @@ def _s3_browse(target, key_prefix: str, rel: str, token: Optional[str], limit: i
     for _ in range(S3_EMPTY_PAGE_RETRIES):
         page = bench.s3_list_page(scan_prefix, target, token=next_token, limit=limit)
         next_token = page["next_token"]
-        for folder_key in page["folders"]:
-            name = folder_key[len(key_prefix):].rstrip("/")
-            if name:
-                entries.append(StorageEntry(
-                    name=name, path=f"{rel}/{name}" if rel else name, kind="folder",
-                ))
-        for obj in page["files"]:
-            name = obj["key"][len(key_prefix):]
-            if name:
-                entries.append(StorageEntry(
-                    name=name, path=f"{rel}/{name}" if rel else name, kind="file",
-                    size=obj["size"], modified=obj["modified"],
-                ))
+        entries.extend(_s3_page_entries(page, key_prefix, rel))
         # An empty page with more to come is normal under a delimiter (every key
         # scanned collapsed into a folder already returned) — keep pulling rather
         # than handing the UI a blank screen with a "load more" button.
@@ -1301,6 +1408,31 @@ def _s3_browse(target, key_prefix: str, rel: str, token: Optional[str], limit: i
     return entries, next_token
 
 
+def _s3_scan_dir(
+    target, key_prefix: str, rel: str, q: str, cap: int,
+) -> tuple[list[StorageEntry], bool]:
+    """A whole bucket directory, up to `cap` entries → (entries, truncated).
+
+    ⚠ Only the sorted path calls this. S3 LIST returns keys in ascending
+    lexicographic order and nothing else, so "biggest file" / "newest file" is
+    unanswerable without reading the directory — hence the cap, and hence the
+    `note` the caller attaches when it bites.
+    """
+    from . import bench
+
+    scan_prefix = key_prefix + q
+    entries: list[StorageEntry] = []
+    token: Optional[str] = None
+    while True:
+        page = bench.s3_list_page(scan_prefix, target, token=token, limit=1000)
+        token = page["next_token"]
+        entries.extend(_s3_page_entries(page, key_prefix, rel))
+        if len(entries) >= cap:
+            return entries[:cap], bool(token) or len(entries) > cap
+        if not token:
+            return entries, False
+
+
 @router.get("/{storage_id}/browse", response_model=StorageBrowseResponse)
 async def storage_browse(
     storage_id: str,
@@ -1308,21 +1440,45 @@ async def storage_browse(
     token: Optional[str] = None,
     q: str = Query("", description="name-prefix filter within this directory"),
     limit: int = Query(300, ge=1, le=BROWSE_PAGE_MAX),
+    sort: str = Query("name", description="name | size | modified"),
+    order: str = Query("asc", description="asc | desc"),
     user: User = Depends(require_admin),  # noqa: ARG001 — raw store access is an infra op
     session: AsyncSession = Depends(get_session),
 ):
     """One directory: child folders + files, folders first, ALWAYS paged — a
     directory holding a million objects returns a page and a `next_token`, never
-    the whole listing. `q` filters by name prefix on the server (see `_s3_browse`)."""
+    the whole listing. `q` filters by name prefix on the server (see `_s3_browse`).
+
+    `sort=name&order=asc` is the native order of both backends and stays strictly
+    page-bounded. Any other ordering has to be computed over the directory (see
+    `_s3_scan_dir`), so it scans up to `BROWSE_SORT_SCAN_MAX` entries and says so
+    in `note` when the directory is bigger than that.
+    """
     s = await _require_browsable_storage(session, storage_id)
     rel = _safe_rel(path)
     query = (q or "").strip()
+    sort = (sort or "name").strip().lower()
+    order = (order or "asc").strip().lower()
+    if sort not in BROWSE_SORT_FIELDS:
+        raise HTTPException(status_code=400, detail=f"sort must be one of {BROWSE_SORT_FIELDS}")
+    if order not in BROWSE_SORT_ORDERS:
+        raise HTTPException(status_code=400, detail=f"order must be one of {BROWSE_SORT_ORDERS}")
+    # The backends' own order. Everything else is ranked here, over a scan.
+    native = sort == "name" and order == "asc"
 
     if s.kind == "local":
         root = _local_root(s)
-        entries, next_token, note = await run_in_threadpool(
-            _local_browse, root, rel, _local_offset(token), limit, query,
-        )
+        if native:
+            entries, next_token, note = await run_in_threadpool(
+                _local_browse, root, rel, _local_offset(token), limit, query,
+            )
+        else:
+            scanned, truncated = await run_in_threadpool(
+                _local_scan_dir, root, rel, query, BROWSE_SORT_SCAN_MAX,
+            )
+            entries, next_token, note = _sorted_page(
+                scanned, truncated, sort, order, _local_offset(token), limit,
+            )
         return StorageBrowseResponse(
             storage_id=storage_id, kind="local", bucket="", root=root, path=rel,
             entries=entries, next_token=next_token, note=note,
@@ -1333,17 +1489,26 @@ async def storage_browse(
     key_prefix = _abs_key(root, rel)
     if key_prefix:
         key_prefix += "/"
+    note = None
     try:
-        entries, next_token = await run_in_threadpool(
-            _s3_browse, target, key_prefix, rel, token, limit, query,
-        )
+        if native:
+            entries, next_token = await run_in_threadpool(
+                _s3_browse, target, key_prefix, rel, token, limit, query,
+            )
+        else:
+            scanned, truncated = await run_in_threadpool(
+                _s3_scan_dir, target, key_prefix, rel, query, BROWSE_SORT_SCAN_MAX,
+            )
+            entries, next_token, note = _sorted_page(
+                scanned, truncated, sort, order, _local_offset(token), limit,
+            )
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 — bad creds / missing bucket / network
         raise HTTPException(status_code=502, detail=_s3_error_message(e)) from e
     return StorageBrowseResponse(
         storage_id=storage_id, kind="s3", bucket=target.bucket, root=root, path=rel,
-        entries=entries, next_token=next_token,
+        entries=entries, next_token=next_token, note=note,
     )
 
 

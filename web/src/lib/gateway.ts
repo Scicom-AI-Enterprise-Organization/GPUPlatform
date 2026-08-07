@@ -62,6 +62,8 @@ import type {
   StorageRecord,
   StorageUsage,
   StorageBrowseResponse,
+  StorageSortField,
+  StorageSortOrder,
   PurgeScanResult,
   PurgeJobStatus,
   TestStorageRequest,
@@ -982,10 +984,18 @@ export const gateway = {
     token?: string | null,
     limit = 300,
     q = "",
+    sort: StorageSortField = "name",
+    order: StorageSortOrder = "asc",
   ) => {
     const params = new URLSearchParams({ path, limit: String(limit) });
     if (token) params.set("token", token);
     if (q) params.set("q", q);
+    // name/asc is both backends' native order; anything else makes the gateway
+    // rank a (capped) scan of the directory, so only ask when it differs.
+    if (sort !== "name" || order !== "asc") {
+      params.set("sort", sort);
+      params.set("order", order);
+    }
     return request<StorageBrowseResponse>(
       `/v1/storage/${encodeURIComponent(id)}/browse?${params.toString()}`,
     );

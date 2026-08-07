@@ -3,8 +3,11 @@
 import { useCallback, useEffect, useState, type ComponentProps } from "react";
 import { useRouter } from "next/navigation";
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
   ChevronRight,
+  ChevronsUpDown,
   Copy,
   Download,
   File as FileIcon,
@@ -29,7 +32,13 @@ import {
 } from "@/components/ui/dialog";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
-import type { StorageBrowseResponse, StorageEntry, StorageRecord } from "@/lib/types";
+import type {
+  StorageBrowseResponse,
+  StorageEntry,
+  StorageRecord,
+  StorageSortField,
+  StorageSortOrder,
+} from "@/lib/types";
 
 // Mirrors the gateway's caps (storage_api.MAX_INLINE_BYTES / DEFAULT_PREVIEW_BYTES).
 // Media is all-or-nothing — half a WAV is not a smaller WAV — so anything over
@@ -91,13 +100,66 @@ function absoluteUri(res: StorageBrowseResponse | null, path: string): string {
   return `s3://${res.bucket}${parts ? `/${parts}` : ""}`;
 }
 
-/** `?path=…&file=…` — the browsed directory plus (optionally) the previewed file. */
-function browseQuery(dir: string, file?: string | null): string {
+/** `?path=…&file=…&sort=…&order=…` — the browsed directory, (optionally) the
+ * previewed file, and the ordering, so a sorted view is linkable too. The
+ * default ordering is left out of the URL rather than spelled out. */
+function browseQuery(
+  dir: string,
+  file?: string | null,
+  sort: StorageSortField = "name",
+  order: StorageSortOrder = "asc",
+): string {
   const p = new URLSearchParams();
   if (dir) p.set("path", dir);
   if (file) p.set("file", file);
+  if (sort !== "name" || order !== "asc") {
+    p.set("sort", sort);
+    p.set("order", order);
+  }
   const qs = p.toString();
   return qs ? `?${qs}` : "?";
+}
+
+/** A clickable column heading. First click sorts by that column in its natural
+ * direction (names A→Z, but biggest/newest first — nobody opens a folder looking
+ * for its smallest file); clicking the active one flips it. */
+function SortHeader({
+  field,
+  label,
+  sort,
+  order,
+  onSort,
+  className,
+  align = "left",
+}: {
+  field: StorageSortField;
+  label: string;
+  sort: StorageSortField;
+  order: StorageSortOrder;
+  onSort: (f: StorageSortField) => void;
+  className?: string;
+  align?: "left" | "right";
+}) {
+  const active = sort === field;
+  const Icon = !active ? ChevronsUpDown : order === "asc" ? ArrowUp : ArrowDown;
+  return (
+    <th className={cn("px-3 py-2 font-medium", className)}>
+      <button
+        type="button"
+        onClick={() => onSort(field)}
+        aria-label={`Sort by ${label.toLowerCase()}`}
+        title={`Sort by ${label.toLowerCase()}`}
+        className={cn(
+          "-mx-1 inline-flex items-center gap-1 rounded px-1 py-0.5 uppercase tracking-wide hover:text-foreground",
+          align === "right" && "flex-row-reverse",
+          active ? "text-foreground" : "text-muted-foreground",
+        )}
+      >
+        {label}
+        <Icon className={cn("h-3 w-3", !active && "opacity-40")} />
+      </button>
+    </th>
+  );
 }
 
 /** Copy-to-clipboard button that confirms inline — the icon flips to a tick for
@@ -168,13 +230,19 @@ export function FileBrowser({
   storage,
   initialPath,
   initialFile,
+  initialSort = "name",
+  initialOrder = "asc",
 }: {
   storage: StorageRecord;
   initialPath: string;
   initialFile?: string;
+  initialSort?: StorageSortField;
+  initialOrder?: StorageSortOrder;
 }) {
   const router = useRouter();
   const [path, setPath] = useState(initialPath.replace(/^\/+|\/+$/g, ""));
+  const [sort, setSort] = useState<StorageSortField>(initialSort);
+  const [order, setOrder] = useState<StorageSortOrder>(initialOrder);
   const [res, setRes] = useState<StorageBrowseResponse | null>(null);
   const [entries, setEntries] = useState<StorageEntry[]>([]);
   const [nextToken, setNextToken] = useState<string | null>(null);
@@ -189,13 +257,17 @@ export function FileBrowser({
     () => initialFile?.replace(/^\/+|\/+$/g, "") || null,
   );
 
+  // Sorting is a SERVER concern (`sort`/`order` in the deps, so changing either
+  // refetches): a page holds 300 of a directory that may hold a million, so
+  // re-ordering what happens to be loaded would rank the wrong set — the same
+  // reason the name filter is a server-side prefix query.
   const load = useCallback(
     async (dir: string, prefix: string, token?: string | null) => {
       if (token) setLoadingMore(true);
       else setLoading(true);
       setError(null);
       try {
-        const r = await gateway.storageBrowse(storage.id, dir, token, 300, prefix);
+        const r = await gateway.storageBrowse(storage.id, dir, token, 300, prefix, sort, order);
         setRes(r);
         setEntries((prev) => (token ? [...prev, ...r.entries] : r.entries));
         setNextToken(r.next_token ?? null);
@@ -207,7 +279,7 @@ export function FileBrowser({
         setLoadingMore(false);
       }
     },
-    [storage.id],
+    [storage.id, sort, order],
   );
 
   useEffect(() => {
@@ -227,19 +299,31 @@ export function FileBrowser({
     setPath(dir);
     setPendingFile(null);
     // Keep the URL in sync so a directory is shareable (replace, not push, so
-    // Back leaves the viewer instead of walking every directory visited).
-    router.replace(browseQuery(dir), { scroll: false });
+    // Back leaves the viewer instead of walking every directory visited). The
+    // ordering rides along — it's a view preference that outlives the folder.
+    router.replace(browseQuery(dir, null, sort, order), { scroll: false });
+  };
+
+  // Click a column: sort by it, or flip the direction if it's already active.
+  // Size and modified open biggest/newest first — that's what you came for.
+  const sortBy = (field: StorageSortField) => {
+    const next: StorageSortOrder =
+      sort === field ? (order === "asc" ? "desc" : "asc") : field === "name" ? "asc" : "desc";
+    setSort(field);
+    setOrder(next);
+    setNextToken(null);
+    router.replace(browseQuery(path, null, field, next), { scroll: false });
   };
 
   // Preview open/close rides the URL too (`?file=`), so a single object is
   // linkable — the copied link reopens the dialog on top of its directory.
   const openPreview = (e: StorageEntry) => {
     setPreview(e);
-    router.replace(browseQuery(path, e.name), { scroll: false });
+    router.replace(browseQuery(path, e.name, sort, order), { scroll: false });
   };
   const closePreview = () => {
     setPreview(null);
-    router.replace(browseQuery(path), { scroll: false });
+    router.replace(browseQuery(path, null, sort, order), { scroll: false });
   };
 
   // Consume the deep link: prefer the listed entry (real size/modified); a file
@@ -335,9 +419,18 @@ export function FileBrowser({
         <table className="w-full text-sm">
           <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
             <tr>
-              <th className="px-3 py-2 text-left font-medium">Name</th>
-              <th className="w-28 px-3 py-2 text-right font-medium">Size</th>
-              <th className="w-52 px-3 py-2 text-left font-medium">Modified</th>
+              <SortHeader
+                field="name" label="Name" sort={sort} order={order} onSort={sortBy}
+                className="text-left"
+              />
+              <SortHeader
+                field="size" label="Size" sort={sort} order={order} onSort={sortBy}
+                className="w-28 text-right" align="right"
+              />
+              <SortHeader
+                field="modified" label="Modified" sort={sort} order={order} onSort={sortBy}
+                className="w-52 text-left"
+              />
               <th className="w-24 px-3 py-2"></th>
             </tr>
           </thead>

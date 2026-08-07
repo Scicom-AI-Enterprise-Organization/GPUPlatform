@@ -1149,6 +1149,37 @@ with the passenger value. Live case: a source labelled by `text` that also carri
 `transcription` column, merged into an output whose transcription column IS `transcription` — which
 would have blanked every *other* source's transcript too (they have no such extra).
 
+### Merging s3 sources — REFERENCE in place, and where the key comes from
+
+A same-account s3→s3 merge (`_run_merge` → `_s3_copy_pairs(reference=True)` → `("s3ref", …)`
+markers) writes a metadata CSV pointing at the source objects **where they already are**. It used
+to server-side copy every clip: merging two 13k-row exports duplicated 26,283 objects to produce a
+file whose only real content is the row list. Now nothing is moved and the merge takes seconds.
+Consequences to keep in mind:
+
+- **The merged dataset owns only its `metadata.csv`.** `DELETE ?purge=true` on it therefore
+  deletes just that (verified: 1 object) — but purging a SOURCE now breaks the merge. Same tradeoff
+  the normalize output already carries.
+- **⚠ A referenced clip is NOT renamed, so basenames must stay unique across sources.** The
+  `s{idx}-` prefix that guaranteed that is a property of the COPY. Nothing downstream keys on the
+  URL alone — `whisper_finetune` caches each download by basename — so two sources holding
+  different clips under one name would train the second row on the first row's audio. `_run_merge`
+  therefore checks `_pair_stem` uniqueness across all pairs and, on any clash, **downgrades the
+  whole merge back to copying** (the marker tags swap; the 4th element is the copy name, which is
+  why references carry one). Verified both ways: distinct names → 0 copies, 1 file in the output
+  folder; same names → the `s0-`/`s1-` copy path and 200 unique basenames.
+- References may span buckets in one account, so `_materialise_s3` presigns **grouped by bucket**.
+
+**⚠ The audio key comes from the CSV cell's own URL (`_s3_key_from_ref`), never from the metadata's
+folder.** `{metadata_dir}/audio/{basename}` only holds when metadata sits next to its audio, and a
+**normalized** dataset deliberately breaks that: its CSV lives in `normalized-<hex>/` and references
+the PARENT's `audio/`. Merging one guessed a key one directory too deep and died with
+`NoSuchKey` on CopyObject — after copying the other source's 13k objects (hit in prod on
+`asr-merged-v3-normalized`). The URL's path IS the key; virtual-host vs path-style is
+disambiguated by the host, and the reconstructed key survives only as the fallback for a bare
+filename. `_s3_pairs` (the download path) reads the key the same way; it had been surviving on its
+"fall back to fetching the raw URL" branch, which `_s3_copy_pairs` has no equivalent of.
+
 **⚠ A subset's split label is `config/split`, so a HF `test` subset is NOT eval.** The trainer's
 `EVAL_SPLITS` is `{test, validation, valid, eval, dev}` and `synthetic/test` matches none of them —
 it trains. Carve eval with `test_split_pct`/`test_split_count` instead.
@@ -1202,6 +1233,25 @@ feature's data. The s3 primitives (`s3_list_page` / `s3_head` / `s3_get_head_byt
   wrong question on a directory the UI has only seen 300 of. Local applies the same rule during its
   scan so both kinds behave identically (and a filtered local listing drops back under the sort
   threshold, so it comes back sorted).
+- **Sorting by size / modified is SERVER-side too, over a capped scan** (`sort=name|size|modified`
+  + `order=asc|desc`, added 2026-08-07; sortable column headers in the UI, state in `?sort=`/
+  `?order=` so a sorted view is linkable). Same reasoning as the filter — re-ordering the 300 rows
+  the browser happens to hold would rank the wrong set — but neither backend can push it down:
+  **S3 LIST only ever returns keys in ascending lexicographic order**, and readdir has no order at
+  all. So `sort=name&order=asc` is the native path (unchanged, strictly page-bounded) and
+  *everything else* reads the directory via `_s3_scan_dir` / `_local_scan_dir`, capped at
+  `BROWSE_SORT_SCAN_MAX` (20k), sorts in `_sort_entries`, and pages by an **offset** token (so a
+  later page re-scans — the same trade `_local_browse` already makes, and the server keeps no
+  per-client state). Measured: 0.1 s on a ~250-object day directory, 1.3 s on a few-thousand-object
+  prefix. Three rules the tests pin:
+  - **Over the cap, `note` says the ranking is partial** — "biggest file" over the first 20k keys of
+    a million-key directory is not the biggest file, and a silently-truncated ranking reads as an
+    answer.
+  - **Folders lead and are always name-ordered.** An S3 "folder" is a CommonPrefix — no size, no
+    LastModified. A local directory *does* have an mtime, but letting it rank would make the two
+    kinds behave differently for the same click.
+  - **A missing value sorts LAST in both directions** (unranked, not "the smallest"). `modified`
+    compares as a string: both producers emit UTC ISO-8601, so lexicographic *is* chronological.
 - **⚠ A delimited S3 page can be EMPTY while more remain** — MaxKeys counts keys *scanned*, and a
   page whose keys all collapse into already-returned folders returns nothing. `_s3_browse` pulls up
   to `S3_EMPTY_PAGE_RETRIES` pages before handing the UI a blank screen with a "load more" button.

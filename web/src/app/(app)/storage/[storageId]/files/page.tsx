@@ -6,23 +6,29 @@ import { gateway } from "@/lib/gateway";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
 import { FileBrowser } from "./file-browser";
+import type { StorageSortField, StorageSortOrder } from "@/lib/types";
 
 // Kinds with something to browse — mirrors storage_api.BROWSABLE_KINDS.
 // huggingface/sftp have no viewer (a HF repo browses on the Hub; sftp would need
 // its own connection per listing).
 const BROWSABLE = ["s3", "local"];
 
+// Mirrors storage_api.BROWSE_SORT_FIELDS / BROWSE_SORT_ORDERS — a hand-edited
+// URL falls back to the default rather than 400ing the listing.
+const SORT_FIELDS: StorageSortField[] = ["name", "size", "modified"];
+const SORT_ORDERS: StorageSortOrder[] = ["asc", "desc"];
+
 export default async function StorageFilesPage({
   params,
   searchParams,
 }: {
   params: Promise<{ storageId: string }>;
-  searchParams: Promise<{ path?: string; file?: string }>;
+  searchParams: Promise<{ path?: string; file?: string; sort?: string; order?: string }>;
 }) {
   const me = await getMe();
   if (!me) redirect("/login");
   const { storageId } = await params;
-  const { path, file } = await searchParams;
+  const { path, file, sort, order } = await searchParams;
   const username = await currentUsername();
 
   // No single-storage GET route — the list is one small query and already
@@ -70,7 +76,13 @@ export default async function StorageFilesPage({
             </Button>
           </div>
         ) : (
-          <FileBrowser storage={storage} initialPath={path ?? ""} initialFile={file ?? ""} />
+          <FileBrowser
+            storage={storage}
+            initialPath={path ?? ""}
+            initialFile={file ?? ""}
+            initialSort={SORT_FIELDS.find((f) => f === sort) ?? "name"}
+            initialOrder={SORT_ORDERS.find((o) => o === order) ?? "asc"}
+          />
         )}
       </div>
     </div>

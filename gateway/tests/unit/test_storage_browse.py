@@ -17,14 +17,18 @@ from fastapi import HTTPException
 
 from gateway import storage_api
 from gateway.storage_api import (
+    StorageEntry,
     _abs_key,
     _is_textual,
     _local_browse,
     _local_offset,
     _local_path,
+    _local_scan_dir,
     _looks_textual,
     _media_type_for,
     _safe_rel,
+    _sort_entries,
+    _sorted_page,
 )
 
 
@@ -162,6 +166,100 @@ def test_local_offset_rejects_a_junk_token():
     with pytest.raises(HTTPException) as e:
         _local_offset("not-a-number")
     assert e.value.status_code == 400
+
+
+# ---------- sorting by size / modified ------------------------------------
+# Neither backend can push these down (S3 LIST is lexicographic-only, readdir is
+# unordered), so they are computed over a capped scan. What must hold: folders
+# stay first and name-ordered (an S3 CommonPrefix has neither field), a missing
+# value is unranked rather than "smallest", and a scan that hit the cap says so.
+
+
+def _e(name, kind="file", size=None, modified=None):
+    return StorageEntry(name=name, path=name, kind=kind, size=size, modified=modified)
+
+
+@pytest.fixture()
+def mixed():
+    return [
+        _e("zed", kind="folder"),
+        _e("alpha", kind="folder"),
+        _e("big.bin", size=900, modified="2026-08-01T00:00:00+00:00"),
+        _e("small.txt", size=12, modified="2026-08-07T00:00:00+00:00"),
+        _e("mid.wav", size=300, modified="2026-08-05T00:00:00+00:00"),
+    ]
+
+
+def test_sort_by_size(mixed):
+    desc = _sort_entries(mixed, "size", "desc")
+    assert [e.name for e in desc] == ["alpha", "zed", "big.bin", "mid.wav", "small.txt"]
+    asc = _sort_entries(mixed, "size", "asc")
+    assert [e.name for e in asc] == ["alpha", "zed", "small.txt", "mid.wav", "big.bin"]
+
+
+def test_sort_by_modified(mixed):
+    desc = _sort_entries(mixed, "modified", "desc")
+    assert [e.name for e in desc] == ["alpha", "zed", "small.txt", "mid.wav", "big.bin"]
+
+
+def test_folders_lead_and_never_rank_by_size_or_time(mixed):
+    """An S3 folder is a CommonPrefix — no size, no LastModified. Letting one
+    participate would also make local (which has an mtime) behave differently
+    for the same click."""
+    for order in ("asc", "desc"):
+        for field in ("size", "modified"):
+            out = _sort_entries(mixed, field, order)
+            assert [e.name for e in out[:2]] == ["alpha", "zed"]
+
+
+def test_sort_by_name_both_ways(mixed):
+    assert [e.name for e in _sort_entries(mixed, "name", "asc")] == [
+        "alpha", "zed", "big.bin", "mid.wav", "small.txt",
+    ]
+    assert [e.name for e in _sort_entries(mixed, "name", "desc")] == [
+        "zed", "alpha", "small.txt", "mid.wav", "big.bin",
+    ]
+
+
+def test_a_file_with_no_value_is_unranked_not_smallest():
+    entries = [_e("known", size=5), _e("unknown"), _e("bigger", size=50)]
+    for order in ("asc", "desc"):
+        out = _sort_entries(entries, "size", order)
+        assert out[-1].name == "unknown", order
+
+
+def test_equal_values_tie_break_alphabetically():
+    entries = [_e("c.txt", size=7), _e("a.txt", size=7), _e("b.txt", size=7)]
+    assert [e.name for e in _sort_entries(entries, "size", "desc")] == [
+        "a.txt", "b.txt", "c.txt",
+    ]
+
+
+def test_sorted_page_cuts_pages_and_ends_the_walk(mixed):
+    first, token, note = _sorted_page(mixed, False, "size", "desc", 0, 3)
+    assert [e.name for e in first] == ["alpha", "zed", "big.bin"]
+    assert token == "3" and note is None
+    second, token2, _ = _sorted_page(mixed, False, "size", "desc", _local_offset(token), 3)
+    assert [e.name for e in second] == ["mid.wav", "small.txt"]
+    assert token2 is None
+
+
+def test_a_truncated_scan_says_the_ranking_is_partial(mixed):
+    """The trap this note exists for: "biggest file" over the first 20k keys of a
+    million-key directory is not the biggest file."""
+    _, _, note = _sorted_page(mixed, True, "size", "desc", 0, 3)
+    assert note and "not the whole folder" in note
+
+
+def test_local_scan_dir_materializes_stats_and_caps(local_root):
+    entries, truncated = _local_scan_dir(local_root, "", "", 100)
+    assert not truncated
+    # The escaping symlinks stay hidden here too, and every file carries the
+    # stat that a size/mtime ranking needs.
+    assert {e.name for e in entries} == {"sub", "a.txt", "b.txt", "c.log"}
+    assert all(e.size is not None for e in entries if e.kind == "file")
+    capped, truncated = _local_scan_dir(local_root, "", "", 2)
+    assert len(capped) == 2 and truncated
 
 
 def test_looks_textual_sniff():

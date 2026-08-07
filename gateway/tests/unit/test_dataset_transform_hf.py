@@ -226,6 +226,119 @@ def test_audio_ext_sniffs_when_the_name_is_useless():
 # ------------------------------------------------ metadata column collision ---
 
 
+# ------------------------------------------------------ s3 key resolution ----
+
+
+class TestS3KeyFromRef:
+    """The audio cell's URL is the authority on where the object lives. The old
+    `{metadata_dir}/audio/{basename}` guess is only a fallback."""
+
+    BASE = "datasets/ds-src/transformed/normalized-1b8fd6"
+
+    def test_virtual_host_url_path_is_the_key(self):
+        ref = ("https://my-bucket.s3.ap-southeast-5.amazonaws.com/"
+               "datasets/ds-src/transformed/audio/clip.mp3?X-Amz-Signature=abc")
+        # NOT …/normalized-1b8fd6/audio/clip.mp3 — that object doesn't exist.
+        assert dt._s3_key_from_ref(ref, "my-bucket", self.BASE, 0) == \
+            "datasets/ds-src/transformed/audio/clip.mp3"
+
+    def test_path_style_url_drops_the_bucket_segment(self):
+        ref = "https://minio.internal/my-bucket/datasets/x/audio/clip.wav?sig=1"
+        assert dt._s3_key_from_ref(ref, "my-bucket", self.BASE, 0) == "datasets/x/audio/clip.wav"
+
+    def test_virtual_host_key_starting_with_the_bucket_name_is_not_mangled(self):
+        ref = "https://my-bucket.s3.amazonaws.com/my-bucket/clip.wav"
+        assert dt._s3_key_from_ref(ref, "my-bucket", self.BASE, 0) == "my-bucket/clip.wav"
+
+    def test_s3_uri(self):
+        assert dt._s3_key_from_ref("s3://my-bucket/a/b/clip.flac", "my-bucket", self.BASE, 0) == \
+            "a/b/clip.flac"
+
+    def test_percent_encoding_is_decoded(self):
+        ref = "https://my-bucket.s3.amazonaws.com/datasets/x/audio/a%20b.wav"
+        assert dt._s3_key_from_ref(ref, "my-bucket", self.BASE, 0) == "datasets/x/audio/a b.wav"
+
+    def test_bare_name_falls_back_to_the_metadata_folder(self):
+        assert dt._s3_key_from_ref("clip.wav", "my-bucket", self.BASE, 0) == \
+            f"{self.BASE}/audio/clip.wav"
+        assert dt._s3_key_from_ref("", "my-bucket", self.BASE, 7) == f"{self.BASE}/audio/row-7.wav"
+
+
+def test_pair_stem_reads_a_reference_by_its_own_name():
+    """A referenced object is never renamed, so its metadata basename is the
+    object's — not the `s{idx}-` name a copy would have got."""
+    assert dt._pair_stem(("s3ref", "b", "datasets/x/audio/task-9.mp3", "s1-task-9.mp3")) == "task-9"
+    assert dt._pair_stem(("s3cp", "b", "datasets/x/audio/task-9.mp3", "s1-task-9.mp3")) == "s1-task-9"
+    assert dt._pair_stem("/tmp/work/audio/task-9.mp3") == "task-9"
+
+
+def test_materialise_s3_references_without_copying(monkeypatch, tmp_path):
+    """An ("s3ref", …) source must be presigned WHERE IT IS — no copy, no upload,
+    and the metadata points outside this dataset's own folder."""
+    copied: list = []
+    uploaded: list = []
+    signed: list = []
+    written: dict[str, bytes] = {}
+
+    class _FakeBench:
+        @staticmethod
+        def s3_list(prefix, target):
+            return []
+
+        @staticmethod
+        def s3_copy_many(items, target, max_workers=16, on_done=None):
+            copied.extend(items)
+
+        @staticmethod
+        def s3_put_files(items, target, max_workers=16, on_done=None):
+            uploaded.extend(items)
+
+        @staticmethod
+        def s3_presign_many(keys, expires, target):
+            signed.append((getattr(target, "bucket", None), sorted(keys)))
+            return {k: f"https://{getattr(target, 'bucket', 'b')}.s3.test/{k}" for k in keys}
+
+        @staticmethod
+        def s3_put_text(key, text, target):
+            written[key] = text.encode("utf-8")
+
+    import sys
+
+    import gateway as gateway_pkg
+
+    monkeypatch.setattr(gateway_pkg, "bench", _FakeBench, raising=False)
+    monkeypatch.setitem(sys.modules, "gateway.bench", _FakeBench)
+
+    import dataclasses
+
+    @dataclasses.dataclass
+    class _T:
+        bucket: str = "out-bucket"
+
+    pairs = [
+        ("train", ("s3ref", "out-bucket", "datasets/ds-a/transformed/audio/one.wav", "s0-one.wav"),
+         "hello", {}),
+        # a reference from ANOTHER bucket of the same account
+        ("train", ("s3ref", "other-bucket", "datasets/ds-b/transformed/audio/two.wav", "s1-two.wav"),
+         "world", {}),
+    ]
+    dt._materialise_s3(pairs, "transcription", _T(), "", "ds-out")
+
+    assert copied == [] and uploaded == []
+    import csv
+    import io
+
+    body = next(v for k, v in written.items() if k.endswith("metadata.csv")).decode()
+    rows = list(csv.DictReader(io.StringIO(body)))
+    assert [r["transcription"] for r in rows] == ["hello", "world"]
+    # Points at the ORIGINAL locations, each signed against its own bucket.
+    assert rows[0]["audio"].endswith("datasets/ds-a/transformed/audio/one.wav")
+    assert "out-bucket" in rows[0]["audio"]
+    assert rows[1]["audio"].endswith("datasets/ds-b/transformed/audio/two.wav")
+    assert "other-bucket" in rows[1]["audio"]
+    assert {b for b, _ in signed} == {"out-bucket", "other-bucket"}
+
+
 def test_materialise_s3_drops_extras_that_collide_with_its_own_columns(monkeypatch, tmp_path):
     """A carried-through column named like one of the three the writer owns would
     emit a DUPLICATE header; every CSV reader keeps the last, so the passenger
