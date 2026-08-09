@@ -397,3 +397,71 @@ def test_materialise_s3_drops_extras_that_collide_with_its_own_columns(monkeypat
     assert rows[0]["transcription"] == "the real label"
     assert rows[0]["split"] == "train"
     assert rows[0]["speaker"] == "spk"          # a non-colliding extra survives
+
+
+# --- source-storage pick: never the self-hosted mirror -----------------------
+# A `kind=hf` dataset with no storage of its own borrows a huggingface Storage
+# for the token/endpoint. Borrowing the MIRROR (endpoint=<gw>/hf) sends a public
+# huggingface.co repo at the wrong Hub: every file 404s, the README parse then
+# reports "declares no configs", and the transform blames the repo. Real case:
+# Scicom-intl/Synthetic-User-Turn-TTS, whose README declares 18 configs.
+
+class _FakeStore:
+    kind = "huggingface"
+
+    def __init__(self, sid, config):
+        self.id, self.config = sid, config
+
+
+class _FakeSession:
+    """Just enough of AsyncSession for `_hf_source_store`."""
+
+    def __init__(self, rows, by_id=None):
+        self._rows, self._by_id = rows, by_id or {}
+
+    async def get(self, _model, sid):
+        return self._by_id.get(sid)
+
+    async def execute(self, _stmt):
+        rows = self._rows
+
+        class _R:
+            def scalars(self):
+                class _S:
+                    def all(self_inner):
+                        return rows
+                return _S()
+        return _R()
+
+
+class _FakeDataset:
+    def __init__(self, storage_id=None):
+        self.storage_id = storage_id
+
+
+@pytest.mark.asyncio
+async def test_hf_source_store_skips_the_mirror():
+    mirror = _FakeStore("store-mirror", {"endpoint": "http://localhost:8080/hf"})
+    public = _FakeStore("store-public", {"credentials_enc": "…"})
+    # Mirror listed FIRST — the old `.limit(1)` picked exactly this one.
+    s = _FakeSession([mirror, public])
+    got = await dt._hf_source_store(s, _FakeDataset())
+    assert got is public
+
+
+@pytest.mark.asyncio
+async def test_hf_source_store_prefers_the_datasets_own_storage():
+    # An own huggingface storage wins even WITH an endpoint — that's a repo that
+    # genuinely lives on the mirror.
+    own = _FakeStore("store-own", {"endpoint": "http://localhost:8080/hf"})
+    public = _FakeStore("store-public", {})
+    s = _FakeSession([public], {"store-own": own})
+    assert await dt._hf_source_store(s, _FakeDataset("store-own")) is own
+
+
+@pytest.mark.asyncio
+async def test_hf_source_store_returns_none_when_only_a_mirror_exists():
+    # No storage at all → public HF + the HF_TOKEN env var, which is exactly how
+    # the row browser reads the same repo.
+    mirror = _FakeStore("store-mirror", {"endpoint": "http://localhost:8080/hf"})
+    assert await dt._hf_source_store(_FakeSession([mirror]), _FakeDataset()) is None

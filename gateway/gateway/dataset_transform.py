@@ -490,16 +490,9 @@ async def _run(
             # not only when the caller remembers to repeat the list.
             if not hf_subsets:
                 hf_subsets = [s for s in (getattr(d, "hf_subsets", None) or []) if str(s).strip()]
-            # HF token + endpoint: prefer the dataset's OWN storage when it's a
-            # huggingface backend, else fall back to any configured huggingface
-            # storage (mirrors _run_llm_pack). Using the dataset's own storage is
-            # load-bearing: the mirror storage carries endpoint=<gw>/hf, which 404s
-            # a repo that actually lives on public huggingface.co (the source repo's
-            # storage has no endpoint → public HF).
-            own = await s.get(Storage, d.storage_id) if d.storage_id else None
-            hf_store = own if (own and own.kind == "huggingface") else (
-                await s.execute(select(Storage).where(Storage.kind == "huggingface").limit(1))
-            ).scalars().first()
+            # HF token + endpoint for the SOURCE repo — see `_hf_source_store`
+            # (the fallback must never land on the mirror storage).
+            hf_store = await _hf_source_store(s, d)
             token = await _hf_token(hf_store, s)
             hf_endpoint = await _hf_endpoint(hf_store, s)  # custom Hub endpoint, or None
             out_storage = await s.get(Storage, storage_id) if (target == "s3" and storage_id) else None
@@ -551,9 +544,14 @@ async def _run(
             keep_splits: Optional[set[str]] = None
             allow_patterns: Optional[list[str]] = None
             if hf_subsets:
-                entries = await run_in_threadpool(
-                    _fetch_declared_entries, src_repo, token, work, src_revision, hf_endpoint,
-                )
+                try:
+                    entries = await run_in_threadpool(
+                        _fetch_declared_entries, src_repo, token, work, src_revision, hf_endpoint,
+                    )
+                except ReadmeUnavailable as e:
+                    # NOT "the repo declares no configs" — we never got to read it.
+                    await _finish(dataset_id, "failed", str(e))
+                    return
                 if not entries:
                     await _finish(
                         dataset_id, "failed",
@@ -1024,9 +1022,10 @@ async def _run_merge(
             if out is None:
                 return
             transcription_field = out.transcription_field or "transcription"
-            hf_store = (
-                await s.execute(select(Storage).where(Storage.kind == "huggingface").limit(1))
-            ).scalars().first()
+            # Sources are read from public HF here, so borrow a token only from a
+            # storage that points there (`_hf_source_store` with no own storage) —
+            # the mirror's `sgpu_` key is not an HF credential.
+            hf_store = await _hf_source_store(s, out)
             token = await _hf_token(hf_store, s)
             _hf_endpoint_unused = await _hf_endpoint(hf_store, s)  # noqa: F841 — parity with _run
             out_storage = await s.get(Storage, storage_id) if (target == "s3" and storage_id) else None
@@ -1331,13 +1330,8 @@ async def _run_llm_pack(
             src_name = d.name
             src_metadata_filename = d.metadata_filename
             messages_field = (getattr(d, "messages_field", None) or "messages")
-            # HF token + endpoint: prefer the dataset's OWN storage when it's a
-            # huggingface backend (carries the token for a gated repo), else fall
-            # back to any configured huggingface storage (mirrors _run).
-            own = await s.get(Storage, d.storage_id) if d.storage_id else None
-            hf_store = own if (own and own.kind == "huggingface") else (
-                await s.execute(select(Storage).where(Storage.kind == "huggingface").limit(1))
-            ).scalars().first()
+            # HF token + endpoint for the SOURCE repo — see `_hf_source_store`.
+            hf_store = await _hf_source_store(s, d)
             token = await _hf_token(hf_store, s)
             hf_endpoint = await _hf_endpoint(hf_store, s)
             out_storage = await s.get(Storage, storage_id)
@@ -1575,6 +1569,41 @@ def _work_dir(dataset_id: str) -> str:
     return os.path.join(tempfile.gettempdir(), "sgpu-transform", dataset_id)
 
 
+async def _hf_source_store(s, d) -> Optional[Storage]:
+    """Which huggingface Storage supplies the token/endpoint for READING a
+    `kind=hf` source repo.
+
+    The dataset's OWN storage wins when it is a huggingface backend — that's the
+    one that knows where the repo actually lives (and holds the token for a gated
+    one). ⚠ Otherwise the fallback must skip any storage carrying a custom
+    `endpoint`: that's the **self-hosted mirror**, and pointing a public
+    huggingface.co repo at it 404s every file. That misfire is silent and
+    misattributed — the README fetch fails, the parse returns "no configs", and
+    the transform tells the user their repo declares none (hit for real on
+    `Scicom-intl/Synthetic-User-Turn-TTS`, whose README declares 18). A
+    storage-less `kind=hf` dataset is a PUBLIC-HF dataset — the row browser has
+    always read it that way (`datasets_api` passes no storage at all), so the
+    transform agreeing with it is the fix.
+    """
+    from sqlalchemy import select  # local, like every other db use in this module
+
+    own = await s.get(Storage, d.storage_id) if getattr(d, "storage_id", None) else None
+    if own is not None and own.kind == "huggingface":
+        return own
+    rows = (await s.execute(select(Storage).where(Storage.kind == "huggingface"))).scalars().all()
+    for st in rows:
+        if not str((st.config or {}).get("endpoint") or "").strip():
+            return st  # public HF — safe to borrow its token
+    return None
+
+
+class ReadmeUnavailable(RuntimeError):
+    """The repo's README could not be FETCHED (wrong Hub endpoint, bad token,
+    network) — as opposed to a README that simply declares no configs. The two
+    look identical downstream and read very differently to the user: one blames
+    the repo, the other is ours to fix."""
+
+
 def _fetch_declared_entries(
     repo: str,
     token: Optional[str],
@@ -1585,7 +1614,10 @@ def _fetch_declared_entries(
     """Pull ONLY the repo README into `dest` and parse its declared configs.
     Runs before the snapshot download so a subset selection can be turned into
     `allow_patterns` — i.e. so the configs the caller didn't ask for are never
-    fetched at all."""
+    fetched at all.
+
+    Returns None when the README carries no configs; raises `ReadmeUnavailable`
+    when it couldn't be read at all."""
     from huggingface_hub import hf_hub_download
 
     os.makedirs(dest, exist_ok=True)
@@ -1594,9 +1626,11 @@ def _fetch_declared_entries(
             repo_id=repo, repo_type="dataset", filename="README.md",
             local_dir=dest, token=token, revision=revision, endpoint=endpoint or None,
         )
-    except Exception as e:  # noqa: BLE001 — no README → no declared configs
-        logger.warning("could not fetch README for %s: %s", repo, e)
-        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not fetch README for %s (endpoint=%s): %s", repo, endpoint or "huggingface.co", e)
+        raise ReadmeUnavailable(
+            f"could not read {repo}'s README from {endpoint or 'huggingface.co'}: {e}"
+        ) from e
     return _declared_entries(dest)
 
 

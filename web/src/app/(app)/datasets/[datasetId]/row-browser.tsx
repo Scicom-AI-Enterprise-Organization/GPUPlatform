@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Bot, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2, Mic, Play, ShieldCheck, Terminal, TriangleAlert, User, Volume2, Wrench } from "lucide-react";
+import { Bot, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Download, Loader2, Mic, Play, ShieldCheck, Terminal, TriangleAlert, User, Volume2, Wrench } from "lucide-react";
 import type { DecoderState } from "./decoder-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -1222,6 +1222,21 @@ export function RowBrowser({
   const hasNext = total != null ? offset + limit < total : rows.length === limit;
   const lastOffset = total != null ? Math.max(0, Math.floor((total - 1) / limit) * limit) : offset;
 
+  // Download = the zip of what this browser is currently scoped to (audio/ + a
+  // metadata.json referencing them by relative path). Only the S3/upload audio
+  // kinds — an HF source is already downloadable as its repo, and a packed one
+  // holds token shards, not files.
+  const canDownload = (kind === "s3" || kind === "upload") && !isLlm && !isDpo;
+  // Mirror the preview's default: with a split column and nothing ticked, the
+  // browser is showing splits[0], so that's what "download" must mean.
+  const downloadSplit = splits.length > 0 ? (selected[0] ?? splits[0]) : null;
+  const downloadHref = (() => {
+    const q = new URLSearchParams();
+    if (downloadSplit) q.set("split", downloadSplit);
+    if (speaker) q.set("speaker", speaker);
+    return `/api/proxy/v1/datasets/${encodeURIComponent(datasetId)}/download?${q.toString()}`;
+  })();
+
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">
@@ -1301,6 +1316,34 @@ export function RowBrowser({
                 ))}
               </SelectContent>
             </Select>
+          )}
+          {canDownload && (
+            <Button
+              asChild={!multiSubset}
+              variant="outline"
+              size="sm"
+              className="h-8 text-xs font-normal"
+              disabled={multiSubset}
+              title={
+                multiSubset
+                  ? "Pick a single subset to download"
+                  : `Download ${downloadSplit ? `subset ${downloadSplit}` : "every row"}${
+                      speaker ? ` · speaker ${speaker}` : ""
+                    } as a zip of audio files + metadata.json`
+              }
+            >
+              {multiSubset ? (
+                <>
+                  <Download className="mr-1 h-3.5 w-3.5" />
+                  Download
+                </>
+              ) : (
+                <a href={downloadHref} download>
+                  <Download className="mr-1 h-3.5 w-3.5" />
+                  Download
+                </a>
+              )}
+            </Button>
           )}
           {isPackedLlm && (
             <Button

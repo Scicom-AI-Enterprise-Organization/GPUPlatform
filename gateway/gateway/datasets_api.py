@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import dataclasses
 import io
+import itertools
 import json
 import logging
 import os
 import secrets
 import tempfile
-from collections import OrderedDict
+import zipfile
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Optional
 import posixpath
@@ -32,6 +35,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 from .pathsafe import validate_path_field, is_safe_path
 from .netsafe import assert_safe_fetch_url
@@ -1480,9 +1484,13 @@ def _proxy_audio_url(dataset_id: str, presigned: Optional[str]) -> Optional[str]
     return f"/v1/datasets/{dataset_id}/audio?src={quote(presigned, safe='')}"
 
 
-def _fetch_url_bytes(url: str) -> tuple[bytes, str]:
-    """GET a URL server-side (no browser CORS) and return (bytes, content_type)."""
-    with httpx.Client(timeout=30.0, follow_redirects=True) as cli:
+def _fetch_url_bytes(url: str, client: Optional[httpx.Client] = None) -> tuple[bytes, str]:
+    """GET a URL server-side (no browser CORS) and return (bytes, content_type).
+
+    Pass `client` to reuse a pooled connection — a fresh `httpx.Client` per call
+    means a fresh TLS handshake per object, which dominates when fetching
+    thousands of small clips (see the download route)."""
+    def _read(cli: httpx.Client) -> tuple[bytes, str]:
         r = cli.get(url)
         r.raise_for_status()
         ext_ct = _AUDIO_CT.get(posixpath.splitext(urlparse(url).path)[1].lower())
@@ -1491,6 +1499,11 @@ def _fetch_url_bytes(url: str) -> tuple[bytes, str]:
         # type inferred from the extension so the browser/<audio> handles it.
         ct = ext_ct if (ext_ct and upstream in ("", "binary/octet-stream", "application/octet-stream")) else (upstream or ext_ct or "application/octet-stream")
         return r.content, ct
+
+    if client is not None:
+        return _read(client)
+    with httpx.Client(timeout=30.0, follow_redirects=True) as cli:
+        return _read(cli)
 
 
 def _byte_range_response(data: bytes, ctype: str, range_header: Optional[str]) -> Response:
@@ -2447,10 +2460,15 @@ async def preview_dataset(
             rows = []
             for r in raw:
                 tcol = sfmap.get(r.get("__split") or used_split or "") or tf
+                # ⚠ Spread `**r` FIRST, then the computed keys. A row can carry its
+                # OWN `transcription`/`audio_url` column (e.g. an ASR readback that
+                # rides along as a passenger while the real label lives in `text`);
+                # spreading last let that empty passenger overwrite the value we
+                # just resolved, blanking every transcript in the row browser.
                 row: dict[str, Any] = {
+                    **r,
                     "audio_url": resolver(r.get(af)) if resolver else _audio_str(r.get(af)),
                     "transcription": r.get(tcol),
-                    **r,
                 }
                 # If messages_field is configured, parse + surface it so the chat
                 # viewer always gets a list regardless of how HF stored it.
@@ -2555,6 +2573,12 @@ async def preview_dataset(
         else:
             rows = [
                 {
+                    # ⚠ `**r` FIRST, computed keys after — a metadata file can carry
+                    # a passenger column named `transcription` (an empty ASR readback
+                    # carried through a transform whose real label column is `text`),
+                    # and spreading it last overwrote the resolved transcript with the
+                    # blank passenger for every row. Same for `audio_url`/`row_index`.
+                    **r,
                     # Proxy the presigned URL through the gateway (avoids S3 CORS in
                     # the browser). _audio_str drops bare filenames first.
                     "audio_url": _proxy_audio_url(
@@ -2563,7 +2587,6 @@ async def preview_dataset(
                     "transcription": r.get(tf),
                     "row_index": gi,
                     "included": gi not in excluded,
-                    **r,
                 }
                 for gi, r in page
             ]
@@ -3020,6 +3043,197 @@ async def dataset_audio_peaks(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"peaks failed: {e}") from e
     return {"peaks": peaks, "duration": duration}
+
+
+# Parallelism for the download route. Fetching one small clip at a time is
+# latency-bound (~12k round-trips), so the fetches run in a thread pool while the
+# zip is still written serially in file order. The window bounds how many clips
+# are buffered ahead of the writer — memory, not throughput, is what caps it.
+_DOWNLOAD_WORKERS = max(1, int(os.environ.get("DATASET_DOWNLOAD_WORKERS", "16")))
+_DOWNLOAD_WINDOW = max(_DOWNLOAD_WORKERS, int(os.environ.get("DATASET_DOWNLOAD_WINDOW", "64")))
+
+
+class _ZipSink:
+    """Unseekable sink for `zipfile.ZipFile` — buffers what the writer emits so a
+    generator can hand it straight to the client. zipfile detects the missing
+    `seek`/`tell` and falls back to data descriptors, so nothing needs rewriting
+    after the fact and the archive never has to exist on disk."""
+
+    def __init__(self) -> None:
+        self._parts: list[bytes] = []
+
+    def write(self, data: bytes) -> int:
+        self._parts.append(bytes(data))
+        return len(data)
+
+    def flush(self) -> None:  # pragma: no cover — zipfile calls it on close
+        pass
+
+    def drain(self) -> bytes:
+        out = b"".join(self._parts)
+        self._parts.clear()
+        return out
+
+
+def _zip_member_name(value: Any, index: int, used: set[str]) -> str:
+    """`audio/<basename>` for a row's audio reference, de-duplicated. Two rows can
+    legitimately point at the same object (or at files that share a basename
+    across folders); silently collapsing them would drop rows from the archive,
+    so a collision gets the row index appended."""
+    raw = os.path.basename(urlparse(_audio_str(value) or str(value or "")).path) or f"row{index}"
+    raw = raw.split("?")[0] or f"row{index}"
+    stem, ext = os.path.splitext(raw)
+    name = raw
+    if name in used:
+        name = f"{stem}-{index}{ext}"
+    used.add(name)
+    return name
+
+
+@router.get("/{dataset_id}/download")
+async def download_dataset(
+    dataset_id: str,
+    split: Optional[str] = Query(None, description="only rows of this subset (default: every row)"),
+    speaker: Optional[str] = Query(None, description="only rows of this speaker"),
+    included_only: bool = Query(True, description="skip rows un-ticked in the row browser"),
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stream the dataset as a zip: `audio/…` files plus a `metadata.json` whose
+    rows reference them by that relative path (so the folder is self-contained
+    offline — no presigned URL to expire).
+
+    S3/upload audio sources only; HF and packed datasets already have their own
+    download paths (the HF repo itself / the pack shards)."""
+    d = await _require_dataset(session, dataset_id, user)
+    if d.kind not in ("s3", "upload"):
+        raise HTTPException(status_code=400, detail=f"download is not supported for kind={d.kind}")
+    if not d.storage_id:
+        raise HTTPException(status_code=400, detail="no storage attached")
+    storage = await _load_storage(session, d.storage_id)
+    target, base = _s3_target_and_prefix(storage)
+    if d.kind == "s3":
+        if not d.s3_metadata_uri:
+            raise HTTPException(status_code=400, detail="no s3_metadata_uri")
+        u = urlparse(d.s3_metadata_uri)
+        t = dataclasses.replace(target, bucket=u.netloc) if u.scheme == "s3" else target
+        key = u.path.lstrip("/") if u.scheme == "s3" else d.s3_metadata_uri
+        mdname = os.path.basename(key)
+    else:
+        if not d.metadata_filename:
+            raise HTTPException(status_code=400, detail="no metadata uploaded yet")
+        t = target
+        key = _metadata_key(storage, dataset_id, d.metadata_filename)
+        mdname = d.metadata_filename
+
+    body = await _run_sync(bench.s3_get_bytes, key, t)
+    if body is None:
+        raise HTTPException(status_code=404, detail="metadata file not found in storage")
+    try:
+        all_rows = dataset_metadata.parse_rows_any(mdname, body, 10**9)
+    except dataset_metadata.DatasetParseError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    af = d.audio_field
+    excluded = {int(x) for x in (d.excluded_rows or [])}
+    # Same filtering order as the preview so "what I'm looking at" is "what I get":
+    # global index first (that's the identity the trainers and the row browser use),
+    # then split, then speaker.
+    indexed = list(enumerate(all_rows))
+    if split:
+        indexed = [(gi, r) for gi, r in indexed if str(r.get("split") or "") == split]
+        if not indexed:
+            raise HTTPException(status_code=404, detail=f"no rows in subset {split!r}")
+    if speaker:
+        spk_col = getattr(d, "speaker_field", None) or "speaker"
+        indexed = [(gi, r) for gi, r in indexed if str(r.get(spk_col) or "") == speaker]
+    if included_only:
+        indexed = [(gi, r) for gi, r in indexed if gi not in excluded]
+
+    allowed = await _allowed_audio_hosts(session, d)
+
+    def _generate():
+        sink = _ZipSink()
+        zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True)
+        used: set[str] = set()
+        meta_rows: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+
+        def _fetch(item, cli: httpx.Client):
+            """Resolve + download ONE row. Runs in a worker thread; returns data
+            or the error to record — it never touches the zip, which stays
+            single-threaded and in file order."""
+            gi, r = item
+            src = _audio_str(_resolve_audio_url(target, base, d.audio_prefix, r.get(af)))
+            if not src:
+                return gi, r, None, None
+            pu = urlparse(src)
+            if pu.scheme != "https" or pu.netloc not in allowed:
+                return gi, r, None, "audio host not allowed for this dataset"
+            try:
+                data, _ct = _fetch_url_bytes(src, client=cli)
+                return gi, r, data, None
+            except Exception as e:  # noqa: BLE001 — one bad object shouldn't abort a
+                # multi-GB download; it's recorded in metadata.json instead.
+                return gi, r, None, str(e)
+
+        # Fetch in parallel, write in order. The window is what keeps memory flat:
+        # only ~DOWNLOAD_WINDOW clips are ever in flight/buffered, so a 12k-row
+        # subset streams in the same footprint as a 50-row one. It has to stay a
+        # sliding window (submit one more as each completes) rather than a
+        # `map` over everything, which would materialise the whole dataset in RAM.
+        with httpx.Client(
+            timeout=30.0, follow_redirects=True,
+            limits=httpx.Limits(max_connections=_DOWNLOAD_WORKERS,
+                                max_keepalive_connections=_DOWNLOAD_WORKERS),
+        ) as cli, ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as pool:
+            pending: deque = deque()
+            it = iter(indexed)
+            for item in itertools.islice(it, _DOWNLOAD_WINDOW):
+                pending.append(pool.submit(_fetch, item, cli))
+            while pending:
+                gi, r, data, err = pending.popleft().result()
+                nxt = next(it, None)
+                if nxt is not None:
+                    pending.append(pool.submit(_fetch, nxt, cli))
+                member: Optional[str] = None
+                if err:
+                    errors.append({"row_index": gi, "error": err})
+                elif data is not None:
+                    member = f"audio/{_zip_member_name(r.get(af), gi, used)}"
+                    zf.writestr(member, data)
+                # The row keeps every original column, with `audio` rewritten to the
+                # in-zip relative path (null when the fetch failed / there was no audio).
+                meta_rows.append({**r, af: member, "row_index": gi, "included": gi not in excluded})
+                chunk = sink.drain()
+                if chunk:
+                    yield chunk
+        zf.writestr("metadata.json", json.dumps({
+            "dataset_id": d.id,
+            "name": d.name,
+            "kind": d.kind,
+            "split": split,
+            "speaker": speaker,
+            "audio_field": af,
+            "transcription_field": d.transcription_field,
+            "speaker_field": d.speaker_field,
+            "num_rows": len(meta_rows),
+            "errors": errors,
+            "rows": meta_rows,
+        }, ensure_ascii=False, indent=2).encode("utf-8"))
+        zf.close()
+        yield sink.drain()
+
+    stem = _sanitize_repo_part(d.name or dataset_id) or dataset_id
+    fname = f"{stem}-{split}.zip" if split else f"{stem}.zip"
+    return StreamingResponse(
+        _generate(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{dataset_id}/splits", response_model=SplitsResponse)

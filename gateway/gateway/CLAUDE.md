@@ -1126,6 +1126,21 @@ stop a whole-repo pull:
   - `_read_metadata` resolves each table's split label BEFORE loading it, so an unselected (or
     undeclared) multi-GB shard is never read.
 
+**⚠ The source repo's token/endpoint must never come from the MIRROR storage** (`_hf_source_store`,
+fixed 2026-08-09). A `kind=hf` dataset usually has `storage_id=None`, and the transform borrowed
+"any huggingface Storage" — `.limit(1)`, which on this deployment is the self-hosted mirror
+(`endpoint=http://localhost:8080/hf` + an `sgpu_` key). Every file of a public huggingface.co repo
+then 404s, and the first casualty is the README: `_fetch_declared_entries` returned None, which the
+caller reported as **"<repo> declares no configs in its README"** — for a repo whose README declares
+18. The row browser was unaffected the whole time because `datasets_api` passes **no storage** for a
+storage-less dataset, which is why the same subsets picked fine and only the transform failed. The
+fallback now skips any storage carrying a custom `endpoint` (the dataset's OWN huggingface storage
+still wins, endpoint and all — that's a repo genuinely hosted on the mirror), and no huggingface
+storage at all is a valid answer: public HF + `HF_TOKEN`. Same helper on the merge + llm-pack paths.
+`ReadmeUnavailable` now separates **"couldn't read the README"** (names the endpoint + the real
+error) from **"the README declares nothing"** — conflating them is what sent the last debug at the
+repo instead of at us. Unit tests in `test_dataset_transform_hf.py`.
+
 **⚠ A stored scope has to be honoured by the READ paths too, not just the transform.** The row
 browser and the `/splits` picker enumerate the repo live off the datasets-server and used to
 default to **`splits[0]`** — so a dataset scoped to `synthetic` opened on `default/train`, a
@@ -1148,6 +1163,15 @@ CSV and every reader (csv.DictReader, pandas) keeps the LAST — silently replac
 with the passenger value. Live case: a source labelled by `text` that also carries an ASR-readback
 `transcription` column, merged into an output whose transcription column IS `transcription` — which
 would have blanked every *other* source's transcript too (they have no such extra).
+
+**⚠ The same collision bit the READ path, in the opposite direction** (fixed 2026-08-09). When the
+output's transcription column is `text`, a passenger column literally named `transcription` is
+legitimately written — and `preview_dataset` built each row as `{"transcription": r.get(tf), **r}`,
+so the `**r` spread (last) let that empty passenger overwrite the value just resolved from `text`.
+Every transcript in the row browser read blank while the CSV was perfectly fine (hit on
+`synthetic-tts-user-v2-audio`, transformed out of `Scicom-intl/Synthetic-User-Turn-TTS`). Both
+branches now spread `**r` FIRST and assign the computed `audio_url`/`transcription`/`row_index`
+after — the rule the chat (`messages_field`) branch already followed for the same reason.
 
 ### Merging s3 sources — REFERENCE in place, and where the key comes from
 

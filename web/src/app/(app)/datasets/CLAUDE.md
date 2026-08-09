@@ -68,9 +68,36 @@ still *packs* (`llm_pack` accepts it per-request) but previews wrong — set it 
     HF repo or S3 (the **export** path; honours the cutoff). For a `kind=s3` audio dataset the
     Transform tab adds a **Normalize transcription** mode (see below).
   - `normalize-card.tsx` — **`kind=s3` only**: LLM-normalize the transcription column (see below).
-  - `row-browser.tsx` — paged preview; include/exclude rows from training.
+  - `row-browser.tsx` — paged preview; include/exclude rows from training; **Download** button
+    (see below).
   - `hf-mirror-card.tsx` — publish an S3 dataset to the self-hosted HF mirror.
 - `merge/` — merge ≥2 `label` datasets into one audio dataset.
+
+## Download (`GET /v1/datasets/{id}/download` → zip)
+
+The row browser's **Download** button streams a zip of `audio/…` + `metadata.json`, scoped to
+**exactly what the browser is showing**: `?split=` (subset) + `?speaker=`, `included_only=1` by
+default (un-ticked rows are skipped). `kind=s3|upload` audio datasets only — an HF source is
+already downloadable as its repo and a packed one holds token shards, not files.
+
+- **The zip is self-contained.** Each metadata row keeps its original columns but the audio column
+  is rewritten to the in-zip relative path (`audio/<basename>`), never the presigned URL — those
+  expire, and a downloaded folder must still work offline.
+- **The default with a `split` column is `splits[0]`, not "everything"** — that's what the preview
+  shows when nothing is ticked, so the button must mean the same. Multi-subset selection disables
+  the button rather than silently downloading one of them.
+- **Streamed, never staged on disk**: `_ZipSink` is an unseekable sink, so `zipfile` falls back to
+  data descriptors and each member is yielded as it's fetched. A member whose fetch fails is
+  recorded in `metadata.json`'s `errors[]` (row's audio → `null`) instead of aborting a multi-GB
+  download. Basename collisions get the row index appended — collapsing them would drop rows.
+- **Fetch in parallel, write in order.** A 12k-row subset is 12k small round-trips — latency-bound,
+  not bandwidth-bound. Downloads run on a `ThreadPoolExecutor` over ONE pooled `httpx.Client`
+  (`_fetch_url_bytes(url, client=…)`; a client per call was a TLS handshake per clip) while the zip
+  writer stays single-threaded and in file order, so the archive is byte-identical to the serial
+  one. ⚠ It must stay a **sliding window** (`_DOWNLOAD_WINDOW`, submit one more per completion) —
+  mapping the pool over every row would buffer the whole dataset in the gateway's heap. Tune with
+  `DATASET_DOWNLOAD_WORKERS` (16) / `DATASET_DOWNLOAD_WINDOW` (64). Measured: ~9.7 MB/s sustained
+  on the train split, ~2.3× the serial path on a 50-row one.
 
 ## `kind=hf` subset scope (`hf_subsets`)
 
