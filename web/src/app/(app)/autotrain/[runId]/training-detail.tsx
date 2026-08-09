@@ -43,7 +43,7 @@ import {
   YAxis,
 } from "recharts";
 import { gateway } from "@/lib/gateway";
-import { formatCostUSD, formatRateUSD, useLiveCost } from "@/lib/cost";
+import { formatCostUSD, formatGpuHours, formatRateUSD, useLiveCost, useLiveGpuHours } from "@/lib/cost";
 import { BurnFlame } from "@/components/burn-flame";
 import { JsonView } from "@/components/json-view";
 import { cn } from "@/lib/utils";
@@ -286,6 +286,14 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
     .map((e) => e.eval_loss)
     .filter((n): n is number => typeof n === "number");
   const bestEvalLoss = evalLosses.length ? Math.min(...evalLosses) : (best?.eval_loss ?? null);
+  // ⚠ `result_json.best` has TWO shapes. A single run's best is a checkpoint
+  // ({epoch, wer, cer, eval_loss}); a SWEEP's best is the winning trial
+  // ({trial, params, metric}) — `metric` being whatever `sweep_metric` ranked by,
+  // i.e. the same eval_metric this KPI is labelled with. Reading `wer` alone left
+  // the KPI blank on every sweep (and on LLM runs, whose metric is loss), while the
+  // number sat one key over. eval_loss is the last resort for a run that reported
+  // neither (LLM/pack-only), matching what `metricLabel` says for those task types.
+  const bestMetric = (best?.wer ?? best?.metric ?? (isTts ? null : bestEvalLoss)) ?? null;
   const sortedTrials = [...trials].sort((a, b) => {
     if (a.metric == null) return 1;
     if (b.metric == null) return -1;
@@ -564,7 +572,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
           <CostKpi run={run} />
           <Kpi
             label={isTts ? "Best eval loss" : `Best ${metricLabel}`}
-            value={isTts ? fmt(bestEvalLoss, 4) : fmt(best?.wer ?? null)}
+            value={isTts ? fmt(bestEvalLoss, 4) : fmt(bestMetric, metricLabel === "loss" ? 4 : 2)}
           />
           {isSweep && <Kpi label="Trials" value={String(trials.length)} />}
         </div>
@@ -1036,23 +1044,38 @@ function Kpi({ label, value }: { label: string; value: string }) {
 }
 
 // Live-ticking spend while running; final total once the run ends.
+// Spend KPI. ⚠ A bare-metal (kind=vm) run rents nothing, so `cost_per_hr` is null
+// by design and every dollar figure is "—" — which read as "this run cost nothing
+// to measure". GPU-hours (wall time × gpu_count) is the unit those runs DO have,
+// and it's also what makes a 1-GPU run comparable to an 8-GPU one. So: cloud runs
+// lead with the dollar figure and carry GPU-hours + the rate underneath; runs with
+// no rate lead with GPU-hours outright.
 function CostKpi({ run }: { run: TrainingRunRecord }) {
   const live = useLiveCost(run.started_at, run.ended_at, run.cost_per_hr);
-  const isBurning = run.status === "running" && run.cost_per_hr != null && run.ended_at == null;
+  const gpuHours = useLiveGpuHours(run.started_at, run.ended_at, run.gpu_count);
+  const billed = run.cost_per_hr != null;
+  const isBurning = run.status === "running" && run.ended_at == null;
+  const gpuLabel = formatGpuHours(gpuHours);
   return (
     <div>
-      <div className="text-xs text-muted-foreground">Cost {isBurning ? "(live)" : ""}</div>
+      <div className="text-xs text-muted-foreground">
+        {billed ? "Cost" : "GPU hours"} {isBurning ? "(live)" : ""}
+      </div>
       <div
         className={cn(
           "mt-0.5 flex items-center gap-1.5 text-lg font-semibold tabular-nums",
-          isBurning && "text-amber-600 dark:text-amber-400",
+          isBurning && billed && "text-amber-600 dark:text-amber-400",
         )}
       >
-        {isBurning && <BurnFlame size="h-4 w-4" />}
-        {formatCostUSD(live)}
+        {isBurning && billed && <BurnFlame size="h-4 w-4" />}
+        {billed ? formatCostUSD(live) : gpuLabel}
       </div>
       <div className="text-[10px] text-muted-foreground">
-        {run.cost_per_hr != null ? `at ${formatRateUSD(run.cost_per_hr)}` : "—"}
+        {billed
+          ? `${gpuLabel} · at ${formatRateUSD(run.cost_per_hr)}`
+          : run.gpu_count > 1
+            ? `${run.gpu_count} GPUs · no rented cost`
+            : "no rented cost"}
       </div>
     </div>
   );
