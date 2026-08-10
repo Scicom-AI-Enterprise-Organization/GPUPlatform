@@ -77,6 +77,13 @@ DEFAULT_TIMEOUT_S = 3600.0
 DEFAULT_FAILOVER_STATUS = (402, 408, 429)
 import re as _re
 _NAME_RE = _re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+# <|im_end|> for Qwen-family LiveKit turn detectors — the token whose logprob IS the
+# end-of-utterance prediction. Only used by the `turn` upstream probe.
+_EOU_TOKEN_ID = 151645
+
+
+class _ProbeError(Exception):
+    """An upstream probe failed with a message meant for the user (not a traceback)."""
 
 
 # ---------- DB models (registered via init_db side-effect import) -----------
@@ -352,7 +359,7 @@ class TestUpstreamRequest(BaseModel):
     api_key_secret: Optional[str] = None
     api_key: Optional[str] = None
     model: Optional[str] = None   # real upstream model to end-to-end test; None = just probe /models
-    mode: str = "chat"            # chat | embedding | rerank | transcription | tts — endpoint to end-to-end test
+    mode: str = "chat"            # chat | turn | embedding | rerank | transcription | tts — endpoint to end-to-end test
     extra_body: Optional[dict] = None  # merged into the chat test body (e.g. provider pinning)
 
 
@@ -4131,6 +4138,82 @@ async def test_upstream(req: TestUpstreamRequest, request: Request,
         return TestUpstreamResponse(
             ok=True, latency_ms=lat, models=[model],
             message=f"rerank ok ({model}): top #{top_idx} @{top_score:.3f}, gap {gap:.3f} over next of {len(ranked)}{note}")
+
+    # Turn detector (LiveKit end-of-utterance): the ONLY probe on raw /completions. It
+    # sends the request shape a voice agent sends — max_tokens 1 + logprobs 1 +
+    # allowed_token_ids=[<|im_end|>] — and reads choices[0].logprobs.token_logprobs[0],
+    # which the client turns into p(end-of-turn) with exp().
+    #
+    # Like the rerank probe, this asserts MEANING rather than HTTP 200, because the
+    # failure is silent: a client that cannot parse the response falls back to p=1.0
+    # ("user finished talking"), so a broken pipeline doesn't error — it makes the agent
+    # talk over people. Two utterances are sent (an unfinished prefix and its finished
+    # form) so all three real failures are caught:
+    #   * logprobs missing            -> nothing to read; the 1.0 fallback
+    #   * allowed_token_ids stripped  -> a proxy that drops it scores the WRONG token
+    #                                    (the model's own next word), which still 200s
+    #   * no separation               -> not predicting; usually a prompt-template mismatch
+    if model and mode == "turn":
+        async def _eou(text: str) -> tuple[Optional[float], Optional[str], Optional[str]]:
+            """(logprob, sampled token, model's own argmax) for one utterance."""
+            r = await cli.post(
+                base + "/completions",
+                json={"model": model, "prompt": f"<|im_start|>user\n{text}",
+                      "max_tokens": 1, "logprobs": 1, "allowed_token_ids": [_EOU_TOKEN_ID]},
+                headers=headers, timeout=httpx.Timeout(60.0),
+            )
+            if r.status_code in (401, 403):
+                raise _ProbeError("unauthorized — check the API key")
+            if r.status_code != 200:
+                # _EOU_TOKEN_ID is Qwen's <|im_end|>. A detector on another base has a
+                # different end-of-turn id, and the only symptom is vLLM's out-of-vocab
+                # complaint — which reads like a proxy bug unless we name the cause.
+                if "allowed_token_ids" in r.text:
+                    raise _ProbeError(
+                        f"upstream rejected allowed_token_ids=[{_EOU_TOKEN_ID}] — that is Qwen's "
+                        f"<|im_end|>; this detector likely uses a different end-of-turn token id. "
+                        f"Use the playground's EOU mode to set it. ({r.text[:100]})")
+                raise _ProbeError(f"HTTP {r.status_code}: {r.text[:160]}")
+            ch = ((r.json() or {}).get("choices") or [{}])[0]
+            lp = ch.get("logprobs") or {}
+            vals, toks = lp.get("token_logprobs") or [], lp.get("tokens") or []
+            top = (lp.get("top_logprobs") or [{}])[0] or {}
+            argmax = max(top, key=top.get) if top else None
+            return (vals[0] if vals and vals[0] is not None else None,
+                    toks[0] if toks else None, argmax)
+
+        try:
+            lp_open, tok_open, want_open = await _eou("hello how are")
+            lp_done, _, _ = await _eou("hello how are you")
+        except _ProbeError as e:
+            return TestUpstreamResponse(ok=False, message=str(e), latency_ms=int((time.perf_counter() - t0) * 1000))
+        except httpx.HTTPError as e:
+            return TestUpstreamResponse(ok=False, message=f"network error: {e}")
+        lat = int((time.perf_counter() - t0) * 1000)
+        if lp_open is None or lp_done is None:
+            return TestUpstreamResponse(
+                ok=False, latency_ms=lat,
+                message=(f"no logprobs returned — is '{model}' served by vLLM with logprobs enabled? "
+                         f"A LiveKit client would silently fall back to p=1.0 here"))
+        # The constraint proves itself only when it had to OVERRIDE the model: mid-phrase
+        # the model wants the next word, so getting <|im_end|> back means the field
+        # survived the hop. Same token as the argmax proves nothing either way.
+        if tok_open is not None and want_open is not None and tok_open == want_open:
+            return TestUpstreamResponse(
+                ok=False, latency_ms=lat,
+                message=(f"sampled {tok_open!r} was also the model's own top token — "
+                         f"cannot confirm allowed_token_ids was applied upstream"))
+        spread = lp_done - lp_open
+        p_open, p_done = math.exp(lp_open), math.exp(lp_done)
+        if spread < 2.3:  # ~10x; below this nothing is being discriminated
+            return TestUpstreamResponse(
+                ok=False, latency_ms=lat,
+                message=(f"p(EOU) barely moves between an unfinished and a finished utterance "
+                         f"({p_open:.2e} → {p_done:.2e}) — prompt template likely doesn't match the detector"))
+        return TestUpstreamResponse(
+            ok=True, latency_ms=lat, models=[model],
+            message=(f"turn ok ({model}): p(EOU) {p_open:.2e} → {p_done:.2e} "
+                     f"({math.exp(spread):,.0f}x), forced {tok_open!r} over {want_open!r}"))
 
     # STT: send a short synthetic tone to /audio/transcriptions — validates the endpoint
     # accepts audio + returns a transcription shape (the text may be empty for a bare tone).

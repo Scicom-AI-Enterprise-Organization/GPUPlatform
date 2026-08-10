@@ -35,7 +35,7 @@ type UpstreamDraft = {
   enabled: boolean;
   hadKey: boolean;
   extraBody: string; // raw JSON text; parsed + validated on submit
-  testMode: "chat" | "embedding" | "rerank" | "transcription" | "tts";
+  testMode: "chat" | "turn" | "embedding" | "rerank" | "transcription" | "tts";
   // true once the admin picks a mode by hand — stops guessTestMode from overriding it
   testModeTouched: boolean;
   test: { status: "idle" | "running" | "ok" | "fail"; message?: string };
@@ -513,10 +513,10 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         {/* test — sends a real "hello" to the endpoint matching the chosen mode */}
         <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
           <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
-            {(["chat", "embedding", "rerank", "transcription", "tts"] as const).map((m) => (
+            {(["chat", "turn", "embedding", "rerank", "transcription", "tts"] as const).map((m) => (
               <button key={m} type="button" onClick={() => patch(i, { testMode: m, testModeTouched: true, test: { status: "idle" } })}
                       className={"rounded px-2 py-1 " + (u.testMode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
-                {{ chat: "Chat", embedding: "Embedding", rerank: "Rerank", transcription: "Transcribe", tts: "TTS" }[m]}
+                {{ chat: "Chat", turn: "Turn", embedding: "Embedding", rerank: "Rerank", transcription: "Transcribe", tts: "TTS" }[m]}
               </button>
             ))}
           </div>
@@ -524,7 +524,8 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             {u.test.status === "running" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />} Test
           </Button>
           <span className="text-[11px] text-muted-foreground">
-            {u.testMode === "embedding" ? "sends a “hello” embedding"
+            {u.testMode === "turn" ? "scores an unfinished vs finished utterance via /completions"
+              : u.testMode === "embedding" ? "sends a “hello” embedding"
               : u.testMode === "rerank" ? "ranks 3 docs (incl. a hard negative) via /rerank"
               : u.testMode === "transcription" ? "sends a short tone to /audio/transcriptions"
               : u.testMode === "tts" ? "synthesizes “hello world” via /audio/speech"
