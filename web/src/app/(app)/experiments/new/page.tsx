@@ -21,11 +21,13 @@ export default async function NewExperimentPage({
   // Only used when the gateway is unreachable — the real ceilings come from
   // GET /v1/experiments/limits so the form can't drift from what the runner enforces.
   const FALLBACK_LIMITS: ExperimentLimits = {
-    max_units: 20000, max_rows: 2000, max_concurrency: 64, default_concurrency: 8,
+    max_units: 20000, max_calls: 60000, max_tool_rounds_cap: 20, default_max_tool_rounds: 6,
+    max_rows: 2000, max_concurrency: 64, default_concurrency: 8,
     sweep_row_threshold: 20, sweep_sample_rows: 200,
   };
-  const [datasets, storages, registry, targets, limits] = noAccess
-    ? [[], [], { evaluators: [], always_on: [] }, { targets: [], gateway_url: "" }, FALLBACK_LIMITS]
+  const [datasets, storages, registry, targets, limits, sandboxes] = noAccess
+    ? [[], [], { evaluators: [], always_on: [] }, { targets: [], gateway_url: "" },
+       FALLBACK_LIMITS, []]
     : await Promise.all([
         // Datasets come from the platform's own section — Experiments keeps no
         // parallel store; this is /datasets filtered to chat-shaped kinds.
@@ -34,6 +36,7 @@ export default async function NewExperimentPage({
         gateway.listEvaluators().catch(() => ({ evaluators: [], always_on: [] })),
         gateway.listExperimentTargets().catch(() => ({ targets: [], gateway_url: "" })),
         gateway.experimentLimits().catch(() => FALLBACK_LIMITS),
+        gateway.listCustomSandboxes().catch(() => []),
       ]);
 
   // "Run it again" — clone an earlier experiment's whole matrix.
@@ -88,6 +91,7 @@ export default async function NewExperimentPage({
             datasets={datasets}
             storages={storages.filter((s) => s.kind === "s3")}
             registry={registry}
+            sandboxes={sandboxes}
             suggestions={targets}
             limits={limits}
             initialDatasetId={sp.dataset ?? optimized?.dataset_id ?? ""}

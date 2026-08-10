@@ -32,7 +32,7 @@ export default function middleware(req: NextRequest) {
   // Already signed in but visiting /login or /register → bounce to home.
   if (hasSession && isAuthPage) {
     const url = req.nextUrl.clone();
-    url.pathname = "/serverless";
+    url.pathname = "/inference";
     url.searchParams.delete("next");
     return NextResponse.redirect(url);
   }

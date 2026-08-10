@@ -166,6 +166,7 @@ export function ExperimentDetail({ initial }: { initial: ExperimentRecord }) {
           <TabsContent value="overview" className="mt-4">
             {summary ? (
               <>
+                <SandboxHealth summary={summary} />
                 <CellsTable summary={summary} />
                 <BenchmarkMetrics summary={summary} />
               </>
@@ -211,6 +212,98 @@ export function ExperimentDetail({ initial }: { initial: ExperimentRecord }) {
           </TabsContent>
         </Tabs>
       </div>
+    </div>
+  );
+}
+
+/** Sandbox health per cell — load-bearing, not decoration.
+ *
+ * A broken sandbox still produces trajectories, and the detectors will happily
+ * score them: a run can come back green having measured an environment that
+ * never worked. These three numbers are the ones that say so, and they're the
+ * same shape of warning the Optimize page shows for `unscored_rollouts`. */
+function SandboxHealth({ summary }: { summary: NonNullable<ExperimentRecord["summary"]> }) {
+  const cells = summary.cells.filter((c) => c.sandbox);
+  if (!cells.length) return null;
+
+  return (
+    <div className="mb-4 rounded-lg border border-border bg-card p-4">
+      <h2 className="text-sm font-medium">Sandbox</h2>
+      <p className="mb-2 text-xs text-muted-foreground">
+        Each row was replayed as a conversation. These numbers say whether the environment
+        actually worked — a green pass rate over a sandbox that answered nothing is not a result.
+      </p>
+      <div className="overflow-x-auto scrollbar-thin">
+        <table className="w-full min-w-[640px] text-sm">
+          <thead>
+            <tr className="border-b border-border text-left text-xs text-muted-foreground">
+              <th className="py-1.5 pr-3 font-medium">Target · variant</th>
+              <th className="py-1.5 pr-3 text-right font-medium">Rounds (mean/max)</th>
+              <th className="py-1.5 pr-3 text-right font-medium">Tool calls</th>
+              <th className="py-1.5 pr-3 text-right font-medium">Unanswered</th>
+              <th className="py-1.5 pr-3 text-right font-medium">Forced final</th>
+              <th className="py-1.5 pr-3 text-right font-medium">Aborted</th>
+              <th className="py-1.5 font-medium">Answers came from</th>
+            </tr>
+          </thead>
+          <tbody>
+            {cells.map((c) => {
+              const sb = c.sandbox!;
+              return (
+                <tr key={`${c.target}/${c.variant}`} className="border-b border-border/60">
+                  <td className="py-1.5 pr-3 font-mono text-xs">
+                    {c.target} · {c.variant}
+                  </td>
+                  <td className="py-1.5 pr-3 text-right tabular-nums">
+                    {sb.rounds_mean} / {sb.rounds_max}
+                  </td>
+                  <td className="py-1.5 pr-3 text-right tabular-nums">{sb.tool_calls}</td>
+                  <td
+                    className={cn(
+                      "py-1.5 pr-3 text-right tabular-nums",
+                      sb.novel_call_rate >= 0.25 && "text-amber-600 dark:text-amber-400",
+                    )}
+                    title="Calls the sandbox had no answer for. High = the run measured seed coverage, not the model."
+                  >
+                    {(sb.novel_call_rate * 100).toFixed(0)}%
+                  </td>
+                  <td
+                    className={cn(
+                      "py-1.5 pr-3 text-right tabular-nums",
+                      sb.forced_final_rate >= 0.25 && "text-amber-600 dark:text-amber-400",
+                    )}
+                    title="Rows that hit the tool-round limit. High = the run measured the limit, not the model."
+                  >
+                    {(sb.forced_final_rate * 100).toFixed(0)}%
+                  </td>
+                  <td className="py-1.5 pr-3 text-right tabular-nums">{sb.aborted}</td>
+                  <td className="py-1.5">
+                    <div className="flex flex-wrap gap-1">
+                      {Object.entries(sb.provenance).map(([k, n]) => (
+                        <span
+                          key={k}
+                          className={cn(
+                            "rounded px-1.5 py-0.5 font-mono text-[10px]",
+                            PROVENANCE_TONE[k] ?? "bg-muted text-muted-foreground",
+                          )}
+                        >
+                          {k} {n}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {cells.some((c) => c.sandbox!.all_errors) && (
+        <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] leading-snug text-red-700 dark:text-red-400">
+          Every tool call in at least one cell came back as an error — the model was never given
+          a working environment, so those verdicts measure nothing. Treat this as a failed run.
+        </p>
+      )}
     </div>
   );
 }
@@ -687,9 +780,11 @@ function SampleCard({ s }: { s: ExperimentSampleRecord }) {
             </div>
           )}
 
+          {s.trajectory && <TrajectoryView t={s.trajectory} />}
+
           <div>
             <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-              Reply
+              {s.trajectory ? "Final reply" : "Reply"}
             </p>
             <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-2.5 font-mono text-[11px] leading-relaxed scrollbar-thin">
               {s.content || "(empty)"}
@@ -718,5 +813,100 @@ function SampleCard({ s }: { s: ExperimentSampleRecord }) {
         </div>
       )}
     </li>
+  );
+}
+
+/** Where a tool result came from. A trajectory mostly answered by simulation
+ * supports a weaker claim than one replayed from reference data, so provenance
+ * is rendered per message rather than rolled into a single badge. */
+const PROVENANCE_TONE: Record<string, string> = {
+  seed: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
+  cache: "bg-sky-500/15 text-sky-700 dark:text-sky-400",
+  api: "bg-violet-500/15 text-violet-700 dark:text-violet-400",
+  llm: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+  python: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+  error: "bg-red-500/15 text-red-700 dark:text-red-400",
+};
+
+function TrajectoryView({ t }: { t: NonNullable<ExperimentSampleRecord["trajectory"]> }) {
+  return (
+    <div>
+      <div className="mb-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+        <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          Trajectory
+        </p>
+        <span className="text-[11px] tabular-nums text-muted-foreground">
+          {t.turns} turn{t.turns === 1 ? "" : "s"} · {t.rounds} tool round
+          {t.rounds === 1 ? "" : "s"} · {t.tool_calls_total} call
+          {t.tool_calls_total === 1 ? "" : "s"}
+        </span>
+        {t.forced_final && (
+          <span
+            className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-400"
+            title="Hit the tool-round limit and was re-asked without tools — this row measured the limit as much as the model."
+          >
+            forced final
+          </span>
+        )}
+        {t.error && (
+          <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] text-red-700 dark:text-red-400">
+            aborted at turn {t.error_round ?? "?"}
+          </span>
+        )}
+      </div>
+
+      <ol className="space-y-1.5">
+        {t.messages.map((m, i) => (
+          <li
+            key={i}
+            className={cn(
+              "rounded-md border p-2",
+              m.role === "tool" ? "border-border bg-background/60" : "border-border bg-background",
+            )}
+          >
+            <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="font-mono text-[10px] font-medium uppercase text-muted-foreground">
+                {m.role}
+              </span>
+              {m.name && <span className="font-mono text-[10px]">{m.name}</span>}
+              {m._provenance && (
+                <span
+                  className={cn(
+                    "rounded px-1.5 py-0.5 font-mono text-[10px]",
+                    PROVENANCE_TONE[m._provenance] ?? "bg-muted text-muted-foreground",
+                  )}
+                  title={`This tool result came from: ${m._provenance}`}
+                >
+                  {m._provenance}
+                </span>
+              )}
+              {m.truncated && (
+                <span
+                  className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                  title="Stored transcript was capped — the model saw the full text."
+                >
+                  truncated
+                </span>
+              )}
+            </div>
+
+            {(m.tool_calls ?? []).map((c) => (
+              <pre
+                key={c.id}
+                className="mb-1 overflow-x-auto rounded border border-border bg-muted/40 px-2 py-1 font-mono text-[11px] scrollbar-thin"
+              >
+                {c.function.name}({c.function.arguments})
+              </pre>
+            ))}
+
+            {m.content && (
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed scrollbar-thin">
+                {m.content}
+              </pre>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }

@@ -2440,9 +2440,7 @@ async def list_compute(
     # and the list gets noisy. Detail page (`/compute/{id}`) still resolves
     # for terminated rows so links from audit / direct URLs keep working.
     #
-    # Admins default to their own pods; pass ?scope=all to see everyone's.
-    # Non-admins are always scoped to own regardless of the param.
-    show_all = user.is_admin and scope == "all"
+    # Everyone with the section sees every pod — see main.list_apps.
     # Hide MANUAL terminations (the user did it, knows it's gone) but keep
     # auto_terminated pods visible — the system killed them, so they're worth
     # reviewing (and it's why the status is distinct in the first place).
@@ -2451,8 +2449,6 @@ async def list_compute(
         .where(ComputePod.status != "terminated")
         .order_by(ComputePod.created_at.desc())
     )
-    if not show_all:
-        stmt = stmt.where(ComputePod.owner_id == user.id)
     rows = await session.execute(stmt)
     out: list[ComputeRecord] = []
     for p in rows.scalars().all():

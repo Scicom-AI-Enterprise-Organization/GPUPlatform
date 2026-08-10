@@ -1330,6 +1330,10 @@ async def _run_llm_pack(
             src_name = d.name
             src_metadata_filename = d.metadata_filename
             messages_field = (getattr(d, "messages_field", None) or "messages")
+            # The dataset's OWN storage — where an uploaded chat/preference file lives
+            # (the kind=upload path below reads it straight from S3). Distinct from
+            # `hf_store`, which only supplies the token/endpoint for an HF source.
+            own = await s.get(Storage, d.storage_id) if getattr(d, "storage_id", None) else None
             # HF token + endpoint for the SOURCE repo — see `_hf_source_store`.
             hf_store = await _hf_source_store(s, d)
             token = await _hf_token(hf_store, s)

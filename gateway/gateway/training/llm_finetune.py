@@ -1117,6 +1117,16 @@ def run(cfg: dict) -> None:
     if art.get("bucket"):
         s3_uri = _upload_s3_dir(art, ckpt_dir, art["prefix"].rstrip("/") + "/checkpoint")
         log(f"[upload] LoRA checkpoint → {s3_uri}")
+    else:
+        # ⚠ Nowhere to upload — say so LOUDLY. This branch used to be a silent
+        # skip, so a run with no storage_id (and no $BENCHMARK_S3_BUCKET) trained
+        # to completion, reported exit 0, and lost the adapter when the work dir
+        # was cleaned moments later. create_training_run now auto-picks a storage,
+        # but a direct/legacy invocation can still land here.
+        log("[upload] WARNING: no artifact bucket configured (no storage_id / "
+            "BENCHMARK_S3_BUCKET) — the LoRA checkpoint in "
+            f"{ckpt_dir} will be LOST when the work dir is cleaned. "
+            "Re-run with a storage attached, or set hf_push_repo.")
 
     hf_repo = None
     if cfg.get("hf_push_repo") and hf_token:

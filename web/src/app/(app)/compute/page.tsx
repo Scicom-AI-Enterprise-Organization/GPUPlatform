@@ -3,7 +3,6 @@ import { Inbox, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
-import { ScopeToggle } from "@/components/scope-toggle";
 import { gateway } from "@/lib/gateway";
 import type { ComputePod } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
@@ -11,30 +10,22 @@ import { getMe } from "@/lib/me";
 import { ComputeList } from "./compute-list";
 
 async function loadCompute(
-  scope: "mine" | "all",
 ): Promise<{ items: ComputePod[]; error: string | null }> {
   try {
-    const items = await gateway.listCompute(scope);
+    const items = await gateway.listCompute();
     return { items, error: null };
   } catch (e) {
     return { items: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-export default async function ComputePage({
-  searchParams,
-}: {
-  searchParams: Promise<{ scope?: string }>;
-}) {
+export default async function ComputePage() {
   const me = await getMe();
   const sections = me?.sections as Record<string, boolean> | undefined;
   const noAccess = me ? !(me.is_admin || sections?.compute) : false;
-  const sp = await searchParams;
-  const scope: "mine" | "all" =
-    me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   const [{ items, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ items: [], error: null }) : loadCompute(scope),
+    noAccess ? Promise.resolve({ items: [], error: null }) : loadCompute(),
     currentUsername(),
   ]);
 
@@ -55,7 +46,6 @@ export default async function ComputePage({
               an SSH command and a JupyterLab URL.
             </p>
           </div>
-          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -73,7 +63,6 @@ export default async function ComputePage({
                 <h2 className="text-base font-medium">Pods</h2>
                 <span className="text-xs text-muted-foreground">
                   {items.length} total · {active} active
-                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <Button asChild size="sm">

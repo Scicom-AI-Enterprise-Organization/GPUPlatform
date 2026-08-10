@@ -25,7 +25,7 @@ async function loadJson<T>(token: string, path: string): Promise<T | null> {
 export default async function OrganizationPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const jar = await cookies();
   const token = jar.get(TOKEN_COOKIE)?.value ?? "";

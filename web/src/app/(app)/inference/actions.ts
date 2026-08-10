@@ -22,7 +22,7 @@ export type DeployResult =
 export async function deployEndpoint(input: CreateAppRequest): Promise<DeployResult> {
   try {
     const res = await gateway.createApp(input);
-    revalidatePath("/serverless");
+    revalidatePath("/inference");
     return { ok: true, app_id: res.app_id };
   } catch (e) {
     if (e instanceof GatewayError && e.status === 503 && e.parsed) {
@@ -54,8 +54,8 @@ export async function updateAutoscaler(
 ): Promise<DeployResult> {
   try {
     await gateway.updateAutoscaler(appId, patch);
-    revalidatePath(`/serverless/${appId}`);
-    revalidatePath("/serverless");
+    revalidatePath(`/inference/${appId}`);
+    revalidatePath("/inference");
     return { ok: true, app_id: appId };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -67,7 +67,7 @@ export async function restartEndpoint(
 ): Promise<{ ok: true; drained: number } | { ok: false; error: string }> {
   try {
     const res = await gateway.restartApp(appId);
-    revalidatePath(`/serverless/${appId}`);
+    revalidatePath(`/inference/${appId}`);
     return { ok: true, drained: res.drained_workers };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -79,7 +79,7 @@ export async function purgeWorkers(
 ): Promise<{ ok: true; terminated: number; purged: number } | { ok: false; error: string }> {
   try {
     const res = await gateway.purgeApp(appId);
-    revalidatePath(`/serverless/${appId}`);
+    revalidatePath(`/inference/${appId}`);
     return { ok: true, terminated: res.terminated, purged: res.purged };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -89,7 +89,7 @@ export async function purgeWorkers(
 export async function deleteEndpoint(appId: string): Promise<DeployResult> {
   try {
     await gateway.deleteApp(appId);
-    revalidatePath("/serverless");
+    revalidatePath("/inference");
     return { ok: true, app_id: appId };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -104,8 +104,8 @@ export async function setEndpointVisibility(
 ): Promise<DeployResult> {
   try {
     await gateway.setAppVisibility(appId, isPublic);
-    revalidatePath(`/serverless/${appId}`);
-    revalidatePath("/serverless");
+    revalidatePath(`/inference/${appId}`);
+    revalidatePath("/inference");
     return { ok: true, app_id: appId };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };

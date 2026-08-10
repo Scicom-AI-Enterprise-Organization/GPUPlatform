@@ -44,7 +44,7 @@ export function ProviderForm() {
   const [password, setPassword] = useState("");
 
   // Optional jump host (ProxyJump) — for VMs not directly reachable (e.g. the
-  // TM Huawei NPU boxes behind ssh.tma01.gpu.tm.com.my).
+  // Huawei NPU boxes reached through a jump host).
   const [useJump, setUseJump] = useState(false);
   const [jumpHost, setJumpHost] = useState("");
   const [jumpPort, setJumpPort] = useState("22");
@@ -389,7 +389,7 @@ export function ProviderForm() {
                         setJumpHost(e.target.value);
                         invalidateTest();
                       }}
-                      placeholder="ssh.tma01.gpu.tm.com.my"
+                      placeholder="ssh.jump.example.com"
                       className="mt-1.5"
                     />
                   </div>

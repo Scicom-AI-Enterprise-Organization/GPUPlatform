@@ -61,7 +61,7 @@ export function RegisterForm() {
         setErr(msg ?? `Failed (${res.status})`);
         return;
       }
-      router.replace("/serverless");
+      router.replace("/inference");
       router.refresh();
     });
   }

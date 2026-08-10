@@ -481,6 +481,74 @@ pair it with `llm_judge` when wording matters more than throughput).
   is **skipped, not guessed**; force `mode=attack` for a hand-built all-attack corpus and check
   `scored` against the row count.
 
+**Sandboxes — multi-turn tool replay** (`sandbox.py` + the `CustomSandbox` table +
+`experiments_api.run_trajectory`; design + the unbuilt stages in `docs/EXPERIMENTS_SANDBOX.md`).
+A sandbox is the thing that ANSWERS a model's tool call during a replay, which is what turns
+"one request per row" into a conversation. It's `CustomEvaluator`'s twin: same trust ladder
+(`replay` | `api` implemented; `llm` | `python` declared but rejected at save), same
+snapshot-at-create rule, `POST /v1/custom-sandboxes/test` to dry-run ONE row,
+`GET /v1/experiments/sandboxes` for the server-driven mode descriptors.
+**`sandbox=None` is the default and that path is unchanged** — `EvaluatorStack.evaluate()` and
+GEPA never see any of this.
+
+- **`mode=api` is what makes it general**: `POST {conversation, tool_call, call}` → the result read
+  out of the response by a dotted `response_field`, so any mock service / staging API / simulated
+  environment becomes a sandbox with zero gateway code. Nothing runs on the gateway, so the only
+  guard is `netsafe.assert_safe_fetch_url` (re-checked on first use — a saved hostname can be
+  re-pointed) + `follow_redirects=False`. ⚠ **`send_expected` is OFF by default and that is a
+  CORRECTNESS setting**, not privacy: `row.expected` holds the gold reference the evaluators grade
+  against, so a simulator that can read it can return exactly the reference result and inflate the
+  score with nothing in the trajectory showing why. ⚠ `api_config()` treats only `None` as unset —
+  `""` is meaningful for `response_field` (whole response) and `auth_prefix` (no `Bearer `), the
+  same bug `custom_eval.api_config` already carries a warning about; two unit tests pin it.
+
+- **⚠ `wants` is why this isn't a one-line adapter.** The model's parsed tool calls are NOT a
+  `Completion` field — the runner side-channels them as `expected["_tool_calls"]` (`_tools` for
+  the schemas). A trajectory's FINAL turn is the text answer, so projecting to it hands
+  `function_call_units` an empty call list against a non-empty reference on every row and collapses
+  `tool_call_f1` to 0 — which reads as a model regression, not a bug. Hence
+  `EvaluatorSpec.wants ∈ {completion, turn, trajectory}`: `"turn"` scores each assistant turn and
+  folds any-fail, with every turn's flags pooled into the `aggregate` (which is what the
+  out-of-tree benchmark does over a conversation). Set on `function_call_units`,
+  `control_token_leak`, `degeneration` — and **only** those, because a `"turn"` detector must be
+  meaningful on a turn whose content is empty because the model only called tools. That
+  disqualifies `empty_response` (every tool turn would flag empty), `json_output`/`structure_tags`/
+  `regex` (patterns can't match `""`), and `multilingual_units`/`red_team` (their subject is the
+  final reply). `test_sandbox.py::test_final_turn_projection_would_zero_tool_call_f1` pins it.
+- **⚠ A row's reference describes ONE turn.** `ev.turn_expected()` gives turn 0 the row's
+  `expected`, and later turns get the reference keys (`TURN_REFERENCE_KEYS`) STRIPPED unless the row
+  carries `expected.turns[i]` — else round 2 is graded against round 1's gold answer and the
+  detector invents failures. The fold publishes no "turns scored" count on purpose: abstention
+  vocabulary is per-detector, so the authoritative number stays `metrics.scored` from the
+  aggregate, pooled out of `flags.turn_flags` by `summarize()`.
+- **⚠ `EXPERIMENT_MAX_CALLS` (60k), not `MAX_UNITS`, is what bounds spend now.** A sandboxed unit is
+  up to `max_tool_rounds + 1` billed calls, so the 20k unit cap alone would permit ~140k. Checked at
+  create AND re-checked at run time, same discipline as GEPA's billed-call budget. `GET
+  /v1/experiments/limits` serves it — **the form must price a sandboxed run in calls**, and that
+  arithmetic has to match the server (the existing rule for the GEPA budget card).
+- **⚠ `replay` matches seed entries by NAME, not by exact arguments** (`match: "exact"` opts in).
+  Requiring identical args sounds stricter and is useless: a model under test rarely reproduces the
+  reference call's arguments, so nearly every call would be `no_fixture`, the trajectory dies at
+  round 1, and a seed-coverage problem gets reported as a catastrophic model score. Scoring the
+  ARGUMENTS is the evaluator's job (`function_call_units`), not the environment's. Repeated calls
+  walk the seed in order, then reuse the last entry rather than erroring.
+- **The response cache is a contract with a DIRECTION.** Same `(name, canonical_args)` → same
+  content for the whole run (else two variants face different worlds), which means the **first cell
+  to make a novel call defines it for everyone** — `seeded_by` records which. Errors are cached too,
+  or a retry makes the comparison luck. For an exact A/B, freeze a cache from a reference pass.
+- **A tool failure does NOT abort; a transport failure does.** The model gets a structured error as
+  a `role=tool` message and may react to it (realistic, worth scoring); a dead endpoint aborts the
+  trajectory and `run_evaluators_trajectory` force-fails the sample, so partial trajectories are
+  never partial credit. Per-cell `summary.cells[].sandbox` carries the anti-silent-no-op numbers:
+  `provenance` histogram, `novel_call_rate` (high in replay = you measured seed coverage),
+  `forced_final_rate` (high = you measured the round limit), `aborted`, and `all_errors`.
+- Storage: `experiment_samples.trajectory_json` (idempotent ALTER; NULL for non-sandboxed samples),
+  capped at `EXPERIMENT_MAX_TRAJECTORY_CHARS` (32k) with **tool results truncated before model
+  turns** — the model's output is what's under test, a fixture's payload isn't.
+- ⚠ Summed `usage` means `prompt_tokens` DOUBLE-COUNTS context (turn N's prompt contains turn N−1's).
+  Right for cost, wrong for comparing a sandboxed cell's prompt-token mean to a single-turn run's.
+- Restart rule: `sandbox.py` / `experiments_api.py` are imported → **gateway restart** for edits.
+
 **Custom evaluators** (`custom_eval.py` + the `CustomEvaluator` table). The escape hatch for a
 check the built-ins don't cover, authored on the **Evaluators tab** (`/experiments/evaluators`)
 rather than in the run form — they're a reusable resource, not a per-run setting. Saved entries

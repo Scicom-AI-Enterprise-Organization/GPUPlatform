@@ -2204,24 +2204,16 @@ async def create_app(
 
 @app.get("/apps", response_model=list[AppRecord])
 async def list_apps(
-    scope: str = "mine",
     user: User = Depends(require_section("inference")),
     session: AsyncSession = Depends(get_session),
 ):
-    # Admins default to their own apps; pass ?scope=all to see everyone's.
-    # Non-admins are always scoped to own regardless of the param.
+    # Everyone with the section sees every endpoint. Section access IS the
+    # boundary on this platform — ownership is a label on a shared resource, not
+    # a privacy control — so there's no mine-vs-all split to make here. Editing
+    # and deleting are still owner-gated below.
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
-    show_all = user.is_admin and scope == "all"
     stmt = select(App).options(selectinload(App.owner))
-    if show_all:
-        pass  # admin + ?scope=all → every endpoint
-    elif user.is_admin:
-        stmt = stmt.where(App.owner_id == user.id)  # admin "mine" stays strictly own
-    else:
-        # Non-admins see their own endpoints plus any public ones (read-only),
-        # mirroring the benchmark list. Edit/delete is still owner-gated server-side.
-        stmt = stmt.where((App.owner_id == user.id) | (App.is_public.is_(True)))
     result = await session.execute(stmt)
     apps = result.scalars().all()
     return [_to_app_record(a, redacted=not _viewer_is_owner(a, user)) for a in apps]

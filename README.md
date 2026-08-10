@@ -565,6 +565,7 @@ A finished run reports `status: done`, `exit_code: 0`, and writes an aggregate `
 | [docs/DEPLOY.md](docs/DEPLOY.md) | Local-fake / local-real / k8s+helm deploy paths |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Auth, health probes, timeouts, observability, tear-down |
 | [docs/API_LATENCY_REPORT.md](docs/API_LATENCY_REPORT.md) | Measured gateway latency per endpoint (p50–p99, concurrency), findings + fixes |
+| [docs/EXPERIMENTS_SANDBOX.md](docs/EXPERIMENTS_SANDBOX.md) | **Proposal** — Sandboxes for Experiments: multi-turn tool replay (the documented one-request-per-row gap), `CustomSandbox` as `CustomEvaluator`'s twin, the `Trajectory` contract |
 | [deploy/monitoring/README.md](deploy/monitoring/README.md) | Local Prometheus + Alertmanager + Loki + Grafana stack, incl. the gateway alert rules |
 | [deploy/helm/serverlessgpu/README.md](deploy/helm/serverlessgpu/README.md) | k8s chart values + production wiring |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Local dev, tests, code layout |

@@ -63,7 +63,7 @@ describe("benchmark Form<->YAML round-trip", () => {
 // form fills from YAML and flipping Form<->YAML<->Form doesn't drift/reset.
 describe("benchmark VM Form<->YAML round-trip (DE-53)", () => {
   const vmExtras = {
-    providerName: "TM-H20",
+    providerName: "gpu-h20",
     cleanupModel: true,
     visibleDevices: "0,1",
     envText: "export HF_HOME=/share/huggingface\nexport TRITON_CACHE_DIR=/share/triton",
@@ -71,7 +71,7 @@ describe("benchmark VM Form<->YAML round-trip (DE-53)", () => {
 
   it("emits provider / workdir / cleanup_model / env in the VM remote block", () => {
     const out = renderYaml(DEFAULTS, "vm", "s3", vmExtras);
-    expect(out).toMatch(/^ {2}provider: "TM-H20"$/m);
+    expect(out).toMatch(/^ {2}provider: "gpu-h20"$/m);
     expect(out).toMatch(/^ {2}workdir: "~"$/m);
     expect(out).toMatch(/^ {2}cleanup_model: true$/m);
     expect(out).toMatch(/^ {4}CUDA_VISIBLE_DEVICES: "0,1"$/m);
@@ -82,7 +82,7 @@ describe("benchmark VM Form<->YAML round-trip (DE-53)", () => {
   it("parses every VM remote.* section back out (YAML -> Form)", () => {
     const parsed = parseYamlToForm(renderYaml(DEFAULTS, "vm", "s3", vmExtras), DEFAULTS);
     expect(parsed.parseError).toBeNull();
-    expect(parsed.providerRef).toBe("TM-H20");
+    expect(parsed.providerRef).toBe("gpu-h20");
     expect(parsed.cleanupModel).toBe(true);
     expect(parsed.visibleDevices).toBe("0,1");
     expect(parsed.state.vm_base_dir).toBe("~");
@@ -157,7 +157,7 @@ describe("benchmark VM Form<->YAML round-trip (DE-53)", () => {
 describe("benchmark ingress GPU Form<->YAML round-trip (DE-59)", () => {
   const ingress = {
     ...DEFAULTS,
-    ingress_base_url: "https://tm-h20-llm-1.aies.scicom.dev",
+    ingress_base_url: "https://llm-1.example.internal",
     ingress_gpu_type: "NVIDIA H20",
     ingress_gpu_count: 4,
   };

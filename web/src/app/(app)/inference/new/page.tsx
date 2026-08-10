@@ -11,7 +11,7 @@ export default async function NewEndpointPage() {
     <div className="flex h-full flex-col">
       <ConsoleTopbar
         crumbs={[
-          { label: "Serverless Inference", href: "/serverless" },
+          { label: "Inference", href: "/inference" },
           { label: "New endpoint" },
         ]}
         username={username}

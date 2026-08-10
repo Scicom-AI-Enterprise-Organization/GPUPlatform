@@ -33,7 +33,7 @@ async function load(token: string): Promise<{
 export default async function ProvisionedPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const jar = await cookies();
   const token = jar.get(TOKEN_COOKIE)?.value ?? "";

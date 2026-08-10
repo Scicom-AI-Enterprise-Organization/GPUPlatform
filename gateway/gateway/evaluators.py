@@ -70,6 +70,119 @@ class Completion:
         return (self.usage or {}).get("prompt_tokens")
 
 
+# Keys on a row's `expected` block that are REFERENCE DATA — the gold answer for
+# ONE turn, namely the turn the row is about (the first one). A multi-turn replay
+# must not re-use them for turn 2: comparing the model's second round against the
+# first round's reference would invent failures. A row that genuinely carries
+# per-turn references puts them in `expected.turns[i]`; otherwise later turns
+# abstain, which is the platform's standing rule (skip, never guess).
+TURN_REFERENCE_KEYS = (
+    "tool_calls", "reference_tool_calls", "tool_results", "available_ids",
+    "out_of_context", "json_keys", "language", "attack", "attack_type",
+    "expect_refusal",
+)
+
+
+def turn_expected(
+    row_expected: Optional[dict[str, Any]],
+    index: int,
+    *,
+    tool_calls: Optional[list[dict[str, Any]]] = None,
+    tools: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """The `expected` block one assistant turn of a trajectory should be scored
+    against.
+
+    `_tool_calls` (what the model actually called) and `_tools` (the schemas it
+    saw) are runner side-channels the detectors read; everything else is the
+    row's own reference data, narrowed per the rule above.
+    """
+    base = dict(row_expected or {})
+    per_turn = base.get("turns")
+    has_own = (
+        isinstance(per_turn, list) and 0 <= index < len(per_turn)
+        and isinstance(per_turn[index], dict)
+    )
+    if has_own:
+        out = {k: v for k, v in base.items()
+               if k != "turns" and k not in TURN_REFERENCE_KEYS}
+        out.update(per_turn[index])
+    elif index > 0:
+        out = {k: v for k, v in base.items()
+               if k != "turns" and k not in TURN_REFERENCE_KEYS}
+    else:
+        out = {k: v for k, v in base.items() if k != "turns"}
+    out["_tool_calls"] = list(tool_calls or [])
+    out["_tools"] = list(tools or [])
+    return out
+
+
+@dataclass
+class Trajectory:
+    """One sandboxed replay: the model's turns plus the tool results it was given.
+
+    `messages` is the OpenAI-shaped transcript (assistant turns with `tool_calls`,
+    interleaved `role=tool` results) — what the drill-down renders. `turns` is the
+    same assistant turns as `Completion`s, each already carrying its OWN
+    `expected._tool_calls` / `_tools`, which is what makes per-turn scoring
+    possible at all.
+
+    ⚠ `usage` is SUMMED across turns. Cost is right to sum (it is the real bill),
+    but `prompt_tokens` double-counts context — turn N's prompt contains turn
+    N−1's — so a sandboxed cell's prompt-token mean is not comparable to a
+    single-turn run's. `rounds` is stored so the UI can say so.
+    """
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    turns: list["Completion"] = field(default_factory=list)
+    # One entry per tool response: seed | cache | api | llm | python | error.
+    provenance: list[str] = field(default_factory=list)
+    rounds: int = 0
+    forced_final: bool = False      # hit max_tool_rounds and was re-asked without tools
+    tool_calls_total: int = 0
+    novel_calls: int = 0            # calls answered from neither seed nor cache
+    error: Optional[str] = None
+    error_round: Optional[int] = None
+    latency_ms: Optional[int] = None    # wall-clock for the WHOLE trajectory
+    ttft_ms: Optional[int] = None       # first turn only
+    usage: Optional[dict[str, Any]] = None
+    expected: dict[str, Any] = field(default_factory=dict)
+
+    def as_completion(self) -> "Completion":
+        """Project to the FINAL assistant turn, with trajectory-level latency and
+        usage. This is what `wants="completion"` evaluators see, so a detector
+        whose author never thought about multi-turn keeps its single-turn meaning.
+
+        ⚠ It is NOT a safe default for anything turn-sensitive: the final turn of
+        a trajectory is the text answer, so it carries no tool calls at all.
+        Scoring `function_call_units` here compares an empty call list against a
+        non-empty reference on every row and collapses tool-call F1 to zero —
+        which reads exactly like a model regression. That detector declares
+        `wants="turn"` for this reason.
+        """
+        last = self.turns[-1] if self.turns else Completion()
+        return Completion(
+            content=last.content,
+            reasoning=last.reasoning,
+            finish_reason=last.finish_reason,
+            usage=self.usage if self.usage is not None else last.usage,
+            latency_ms=self.latency_ms if self.latency_ms is not None else last.latency_ms,
+            ttft_ms=self.ttft_ms if self.ttft_ms is not None else last.ttft_ms,
+            error=self.error,
+            status_code=last.status_code,
+            guard_blocked=last.guard_blocked,
+            guard_type=last.guard_type,
+            expected=dict(last.expected or self.expected or {}),
+        )
+
+    def provenance_counts(self) -> dict[str, int]:
+        """Histogram feeding the anti-silent-no-op check: a trajectory whose every
+        tool response errored is a FAILED run, not a 100% pass."""
+        out: dict[str, int] = {}
+        for p in self.provenance:
+            out[p] = out.get(p, 0) + 1
+        return out
+
+
 @dataclass
 class EvalOutcome:
     """One evaluator's verdict on one completion.
@@ -1280,6 +1393,18 @@ class EvaluatorSpec:
     aggregate: Optional[AggregateFn] = None
     # Metrics worth plotting as tradeoff axes, best-first.
     headline: tuple[str, ...] = ()
+    # What this detector is handed when the run has a SANDBOX (multi-turn replay):
+    #   "completion" — the final assistant turn (default; today's meaning exactly)
+    #   "turn"       — called once per assistant turn, folded any-fail, and every
+    #                  turn's flags feed `aggregate` (which is what corpus-level
+    #                  F1 needs, and what the out-of-tree benchmark actually does)
+    # ⚠ A detector may only declare "turn" if it is MEANINGFUL on an assistant
+    # turn whose content is empty because the model only called tools. That rules
+    # out `empty_response` (every tool turn would flag empty), `json_output`,
+    # `structure_tags` and `regex` (their require-patterns can't match ""), and
+    # `multilingual_units` / `red_team`, whose subject is the final reply to the
+    # user. Without a sandbox this field is never consulted.
+    wants: str = "completion"
 
 
 def _num(name: str, label: str, default: Any, help_: str = "") -> dict[str, Any]:
@@ -1317,6 +1442,8 @@ SPECS: dict[str, EvaluatorSpec] = {
             _list("extra_patterns", "Extra regex patterns", "One per line."),
         ],
         fn=_check_control_token_leak,
+        # A leak in round 2 is a leak even if round 5 came back clean.
+        wants="turn",
     ),
     "empty_response": EvaluatorSpec(
         id="empty_response",
@@ -1344,6 +1471,9 @@ SPECS: dict[str, EvaluatorSpec] = {
             _bool("check_reasoning", "Also check reasoning", True),
         ],
         fn=_check_degeneration,
+        # Safe per-turn: `min_tokens` already refuses to judge a short reply, so a
+        # tool-call turn with empty content is never flagged.
+        wants="turn",
     ),
     "json_output": EvaluatorSpec(
         id="json_output",
@@ -1440,6 +1570,11 @@ SPECS: dict[str, EvaluatorSpec] = {
         fn=_check_function_call_units,
         aggregate=_agg_function_call_units,
         headline=("tool_call_f1", "name_set_f1", "hallucination_rate"),
+        # THE reason `wants` exists. Under a sandbox this scores every assistant
+        # turn and pools tp/fp/fn across them — which is what the out-of-tree
+        # benchmark does. Scored on the final turn instead it would compare an
+        # empty call list against a non-empty reference on every row.
+        wants="turn",
     ),
     "multilingual_units": EvaluatorSpec(
         id="multilingual_units",
@@ -1526,6 +1661,7 @@ def specs_payload() -> dict[str, Any]:
                 "options": s.options,
                 "deferred": s.deferred,
                 "headline": list(s.headline),
+                "wants": s.wants,
             }
             for s in SPECS.values()
         ],
@@ -1575,5 +1711,113 @@ def run_evaluators(
     # A request error short-circuits the verdict: the content checks ran against
     # an empty string and their "passes" are meaningless.
     if completion.error:
+        return outcomes, False
+    return outcomes, all(o.passed for o in outcomes)
+
+
+def _fold_turns(
+    spec: EvaluatorSpec,
+    eid: str,
+    traj: Trajectory,
+    options: dict[str, Any],
+) -> EvalOutcome:
+    """Run a `wants="turn"` detector over every assistant turn and fold.
+
+    Fold rules, each chosen because the alternative hides a real failure:
+      * **passed = every turn passed.** A model that degenerated in round 2 and
+        recovered in round 5 did degenerate.
+      * **score = the worst turn's.** Averaging would let a long clean tail bury
+        one broken round.
+      * **flags carry `turn_flags`, one entry per turn.** `summarize()` expands
+        that into the corpus-level rollup, so an F1 pools tp/fp/fn across turns
+        the way the benchmark does rather than across samples only.
+      * **abstention propagates.** If every turn abstained (no reference data for
+        any of them) the sample is `skipped`, not a pass — the standing rule that
+        stops a dataset with no `expected` block reporting a clean 100%.
+
+    ⚠ The fold deliberately does NOT publish a "turns scored" count. Abstention
+    vocabulary is per-detector: `multilingual_units` and `red_team` say so with
+    `flags.skipped`, while `function_call_units` abstains implicitly (a turn with
+    neither a reference nor a model call). A generic count would have read 2-of-2
+    scored for a trajectory the function-call detector actually scored once. The
+    authoritative number stays the one the detector's own `aggregate` reports
+    (`metrics.scored`), which `summarize()` pools from `turn_flags`.
+    """
+    per = [spec.fn(c, options) for c in traj.turns] if spec.fn else []
+    if not per:
+        return EvalOutcome(id=eid, passed=True, score=None, flags={"skipped": True, "turns": 0})
+
+    flags_list = [dict(o.flags or {}) for o in per]
+    skipped = [i for i, f in enumerate(flags_list) if f.get("skipped")]
+    failed = [i for i, o in enumerate(per) if not o.passed]
+    scores = [o.score for o in per if o.score is not None]
+
+    flags: dict[str, Any] = {
+        "turn_flags": flags_list,
+        "turns": len(per),
+    }
+    if failed:
+        flags["failed_turn"] = failed[0] + 1
+    if len(skipped) == len(per):
+        # No turn had reference data — abstain rather than invent a verdict.
+        flags["skipped"] = True
+    if any(f.get("evaluator_error") for f in flags_list):
+        flags["evaluator_error"] = True
+
+    reason = next((f"turn {i + 1}: {per[i].reason}" for i in failed if per[i].reason), None)
+    return EvalOutcome(
+        id=eid,
+        passed=not failed,
+        score=min(scores) if scores else None,
+        reason=reason,
+        flags=flags,
+    )
+
+
+def run_evaluators_trajectory(
+    traj: Trajectory,
+    selected: list[dict[str, Any]],
+) -> tuple[list[EvalOutcome], bool]:
+    """`run_evaluators`, but for a sandboxed multi-turn replay.
+
+    Same contract, same ordering, same short-circuit — the only difference is
+    that a detector declaring `wants="turn"` is scored per assistant turn and
+    folded (`_fold_turns`) instead of being handed the final reply. Everything
+    else, including every custom evaluator and the judge, sees
+    `traj.as_completion()` and behaves exactly as it does today.
+    """
+    final = traj.as_completion()
+    outcomes: list[EvalOutcome] = []
+    seen: set[str] = set()
+
+    for item in selected:
+        eid = (item or {}).get("id")
+        spec = SPECS.get(eid or "")
+        if spec is None or spec.deferred or spec.fn is None or eid in seen:
+            continue
+        seen.add(eid)
+        options = (item or {}).get("options") or {}
+        try:
+            if spec.wants == "turn" and traj.turns:
+                outcomes.append(_fold_turns(spec, eid, traj, options))
+            else:
+                outcomes.append(spec.fn(final, options))
+        except Exception as exc:  # noqa: BLE001 - one bad detector must not kill the sample
+            outcomes.append(EvalOutcome(
+                id=eid, passed=True, score=None,
+                reason=f"evaluator error: {exc.__class__.__name__}: {exc}",
+                flags={"evaluator_error": True},
+            ))
+
+    for eid in ALWAYS_ON:
+        if eid in seen:
+            continue
+        spec = SPECS[eid]
+        if spec.fn is not None:
+            outcomes.append(spec.fn(final, {}))
+
+    # An aborted trajectory is a failure, not partial credit: the rounds that DID
+    # succeed were scored against a conversation that never reached its answer.
+    if traj.error:
         return outcomes, False
     return outcomes, all(o.passed for o in outcomes)

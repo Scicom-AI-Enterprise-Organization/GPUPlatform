@@ -839,7 +839,6 @@ async def seed_prompt(
 
 @router.get("/prompt-optimizations/_page", response_model=OptimizationPage)
 async def list_optimizations_page(
-    scope: str = "mine",
     q: str = "",
     status: str = "",
     dataset_id: str = "",
@@ -849,8 +848,8 @@ async def list_optimizations_page(
     session: AsyncSession = Depends(get_session),
 ):
     stmt = select(PromptOptimization)
-    if not (scope == "all" and user.is_admin):
-        stmt = stmt.where(PromptOptimization.owner_id == user.id)
+        # Everyone with the section sees every row — section access IS the
+        # boundary here, so there is no mine-vs-all split (see main.list_apps).
     if status:
         stmt = stmt.where(PromptOptimization.status == status)
     if dataset_id:

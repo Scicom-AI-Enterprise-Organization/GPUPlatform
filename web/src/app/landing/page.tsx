@@ -26,7 +26,7 @@ export default async function Landing() {
             <span>GPU Platform</span>
           </Link>
           <Button asChild size="sm">
-            <Link href={signedIn ? "/serverless" : "/login"}>
+            <Link href={signedIn ? "/inference" : "/login"}>
               {signedIn ? "Console" : "Sign in"} <ArrowRight className="h-4 w-4" />
             </Link>
           </Button>
@@ -47,7 +47,7 @@ export default async function Landing() {
             <HeroCycler />
             <div className="mt-10">
               <Button asChild size="lg">
-                <Link href={signedIn ? "/serverless" : "/login"}>
+                <Link href={signedIn ? "/inference" : "/login"}>
                   {signedIn ? "Open console" : "Get me in"}
                   <ArrowRight className="h-4 w-4" />
                 </Link>
@@ -113,18 +113,18 @@ export default async function Landing() {
             </div>
             <pre className="overflow-x-auto rounded-xl border border-border/60 bg-zinc-950/80 p-6 text-xs leading-relaxed text-zinc-100 shadow-2xl shadow-violet-500/10 sm:text-sm">
 {`# 1. Login (returns a token)
-curl -X POST https://serverlessgpu.aies.scicom.dev/auth/login \\
+curl -X POST https://inferencegpu.aies.scicom.dev/auth/login \\
   -H 'Content-Type: application/json' \\
   -d '{"username":"you","password":"..."}'
 
 # 2. Create an endpoint
-curl -X POST https://serverlessgpu.aies.scicom.dev/apps \\
+curl -X POST https://inferencegpu.aies.scicom.dev/apps \\
   -H 'Authorization: Bearer <token>' \\
   -H 'Content-Type: application/json' \\
   -d '{"name":"qwen","model":"Qwen/Qwen1.5-0.5B","gpu":"rtx3090"}'
 
 # 3. Run inference (OpenAI-compatible)
-curl -X POST https://serverlessgpu.aies.scicom.dev/v1/chat/completions \\
+curl -X POST https://inferencegpu.aies.scicom.dev/v1/chat/completions \\
   -H 'Authorization: Bearer <token>' \\
   -H 'Content-Type: application/json' \\
   -d '{"model":"qwen","messages":[{"role":"user","content":"yo"}]}'`}
@@ -149,7 +149,7 @@ curl -X POST https://serverlessgpu.aies.scicom.dev/v1/chat/completions \\
             <p className="mt-3 text-muted-foreground">First endpoint takes a minute. Then it&apos;s your problem only when somebody actually uses it.</p>
             <div className="mt-8 flex justify-center">
               <Button asChild size="lg">
-                <Link href={signedIn ? "/serverless" : "/login"}>
+                <Link href={signedIn ? "/inference" : "/login"}>
                   {signedIn ? "Open console" : "Sign in"}
                   <ArrowRight className="h-4 w-4" />
                 </Link>

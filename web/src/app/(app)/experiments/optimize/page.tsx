@@ -7,16 +7,14 @@ import { gateway } from "@/lib/gateway";
 import type { PromptOptRecord, PageResponse } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
-import { ScopeToggle } from "@/components/scope-toggle";
 import { SectionTabs } from "../section-tabs";
 import { OptimizeList } from "./optimize-list";
 
 async function loadOptimizations(
-  scope: "mine" | "all",
 ): Promise<{ page: PageResponse<PromptOptRecord>; error: string | null }> {
   try {
     return {
-      page: await gateway.listPromptOptsPage({ scope, limit: 12, offset: 0 }),
+      page: await gateway.listPromptOptsPage({ limit: 12, offset: 0 }),
       error: null,
     };
   } catch (e) {
@@ -24,21 +22,15 @@ async function loadOptimizations(
   }
 }
 
-export default async function OptimizePage({
-  searchParams,
-}: {
-  searchParams: Promise<{ scope?: string }>;
-}) {
+export default async function OptimizePage() {
   const me = await getMe();
   const sections = me?.sections as Record<string, boolean> | undefined;
   const noAccess = me ? !(me.is_admin || sections?.experiments) : false;
-  const sp = await searchParams;
-  const scope: "mine" | "all" = me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   const [{ page, error }, username] = await Promise.all([
     noAccess
       ? Promise.resolve({ page: { total: 0, items: [] }, error: null })
-      : loadOptimizations(scope),
+      : loadOptimizations(),
     currentUsername(),
   ]);
 
@@ -59,7 +51,6 @@ export default async function OptimizePage({
               The winner drops straight into an experiment as a variant.
             </p>
           </div>
-          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         <SectionTabs />
@@ -79,7 +70,6 @@ export default async function OptimizePage({
                 <h2 className="text-base font-medium">Runs</h2>
                 <span className="text-xs text-muted-foreground">
                   {page.total} {page.total === 1 ? "run" : "runs"}
-                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <Button asChild size="sm">
@@ -113,10 +103,8 @@ export default async function OptimizePage({
               </div>
             ) : (
               <OptimizeList
-                key={scope}
                 initialItems={page.items}
                 initialTotal={page.total}
-                scope={scope}
               />
             )}
           </section>

@@ -25,7 +25,7 @@ async function loadRoles(token: string): Promise<PolicyRole[]> {
 export default async function RolesPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const jar = await cookies();
   const token = jar.get(TOKEN_COOKIE)?.value ?? "";

@@ -318,7 +318,7 @@ function invalidNumTokens(s: string, kind: "num" | "int" | "nonneg"): string[] {
     });
 }
 
-// Rough capacity estimate (mirrors the benchmark/serverless forms).
+// Rough capacity estimate (mirrors the benchmark/inference forms).
 function capacityHint(vramGb: number, count: number): string {
   const total = vramGb * count;
   const weights = total * 0.55;
@@ -565,7 +565,7 @@ export function TrainingForm() {
 
   useEffect(() => {
     gateway.listDatasets().then(setDatasets).catch(() => {});
-    gateway.listCatalog("mine", "dataset").then(setCatalogDatasets).catch(() => {});
+    gateway.listCatalog("dataset").then(setCatalogDatasets).catch(() => {});
     gateway.listStorage().then(setStorages).catch(() => {});
     gateway
       .listProviders()
@@ -2053,7 +2053,7 @@ export function TrainingForm() {
                     <label className="flex cursor-pointer items-center gap-2 text-sm sm:col-span-2">
                       <input type="checkbox" checked={labelSpeakerPrefix} onChange={(e) => setLabelSpeakerPrefix(e.target.checked)}
                         className="h-4 w-4 accent-primary" />
-                      <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
+                      <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “Speaker_Mandarin: …”)</span></span>
                     </label>
                   </>
                 ) : (

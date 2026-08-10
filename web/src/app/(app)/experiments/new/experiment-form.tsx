@@ -10,6 +10,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
+  Boxes,
   ChevronDown,
   ChevronRight,
   Database,
@@ -27,6 +28,7 @@ import { cn } from "@/lib/utils";
 import { gateway } from "@/lib/gateway";
 import type {
   CustomEvaluatorRecord,
+  CustomSandboxRecord,
   GlobalEnvRecord,
   ExperimentDatasetOption,
   ExperimentLimits,
@@ -105,6 +107,7 @@ export function ExperimentForm({
   datasets: initialDatasets,
   storages,
   registry,
+  sandboxes,
   suggestions,
   limits,
   initialDatasetId,
@@ -114,6 +117,7 @@ export function ExperimentForm({
   datasets: ExperimentDatasetOption[];
   storages: StorageRecord[];
   registry: EvaluatorRegistry;
+  sandboxes: CustomSandboxRecord[];
   suggestions: ExperimentTargetsResponse;
   limits: ExperimentLimits;
   initialDatasetId: string;
@@ -228,12 +232,35 @@ export function ExperimentForm({
   // later edit can't change what a finished experiment measured.
   const customs = registry.custom ?? [];
 
+  // Sandboxes are authored on their own tab for the same reason. "" = none,
+  // which is the default and the single-request path.
+  const [sandboxId, setSandboxId] = useState(
+    typeof (cfg.sandbox as Record<string, unknown> | undefined)?.id === "string"
+      ? String((cfg.sandbox as Record<string, unknown>).id)
+      : "",
+  );
+
   const dataset = datasets.find((d) => d.id === datasetId);
   // A dataset reports its row count; the exact case count is only known once the
   // rows are read, so the footer labels the unit total as an estimate.
   const rowCount = dataset?.num_rows ?? 0;
   const nRows = maxRows > 0 ? Math.min(rowCount, maxRows) : rowCount;
   const units = nRows * targets.length * variants.length * Math.max(1, repeats);
+
+  // ⚠ With a sandbox a unit stops being one request: the row becomes a
+  // conversation of up to (max_tool_rounds + 1) billed calls. The rounds come
+  // from the sandbox DEFINITION, not a per-run override — it's part of the
+  // environment the run is snapshotting, so overriding it here would make two
+  // runs of "the same sandbox" incomparable. This arithmetic must match
+  // EXPERIMENT_MAX_CALLS on the server; change the Python, change this.
+  const sandbox = sandboxes.find((s) => s.id === sandboxId);
+  const rounds = sandbox
+    ? Number(
+        (sandbox.config?.loop as Record<string, unknown> | undefined)?.max_tool_rounds ??
+          limits.default_max_tool_rounds,
+      )
+    : 0;
+  const calls = units * (1 + rounds);
 
   const evaluatorList = useMemo(
     () => registry.evaluators.filter((e) => !registry.always_on.includes(e.id)),
@@ -265,20 +292,25 @@ export function ExperimentForm({
           ? "no-name"
           : units > limits.max_units
             ? "over-cap"
-            : null;
+            : calls > limits.max_calls
+              ? "over-call-cap"
+              : null;
 
   /** Trim the matrix to the cap: drop repeats to 1 first (a sweep rarely needs
    * them), then sample rows. Leaves targets and variants alone — those are the
    * comparison you came for. */
   function fitToCap() {
+    // A sandboxed row costs (1 + rounds) calls, so the row budget is whichever
+    // of the two ceilings binds first.
+    const unitCap = Math.min(limits.max_units, Math.floor(limits.max_calls / (1 + rounds)));
     const perRow = targets.length * variants.length;
-    if (repeats > 1 && rowCount * perRow <= limits.max_units) {
+    if (repeats > 1 && rowCount * perRow <= unitCap) {
       setRepeats(1);
       setMaxRows(0);
       return;
     }
     setRepeats(1);
-    setMaxRows(Math.max(1, Math.floor(limits.max_units / Math.max(1, perRow))));
+    setMaxRows(Math.max(1, Math.floor(unitCap / Math.max(1, perRow))));
   }
 
   async function onSubmit(e: React.FormEvent) {
@@ -312,6 +344,8 @@ export function ExperimentForm({
           extra_body: v.extra_body,
         })),
         evaluators: Object.entries(selected).map(([id, options]) => ({ id, options })),
+        // Omitted entirely when none is picked — that's the single-request path.
+        sandbox: sandboxId ? { id: sandboxId } : undefined,
         repeats,
         concurrency,
         retries,
@@ -539,7 +573,7 @@ export function ExperimentForm({
                     wide
                   >
                     <div className="space-y-2">
-                      {/* Same segmented toggle as the HF-token field on /serverless/new. */}
+                      {/* Same segmented toggle as the HF-token field on /inference/new. */}
                       <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
                         {(["secret", "paste"] as const).map((src) => (
                           <button
@@ -725,6 +759,63 @@ export function ExperimentForm({
           </div>
         </SectionCard>
 
+        {/* ---------------- Sandbox ----------------
+            Optional, and off by default. `data-form-section` is all the scrollspy
+            rail needs — FormShell rescans the DOM on mutation, so a conditional
+            card needs no registry entry. */}
+        <SectionCard
+          icon={<Boxes className="h-4 w-4" />}
+          title="Sandbox"
+          description="Answer the model's tool calls so each row becomes a conversation instead of a single request. Off = one request per row."
+        >
+          <Grid>
+            <FieldWrap
+              label="Sandbox"
+              hint="Authored on the Sandboxes tab; the run snapshots the definition."
+              wide
+            >
+              <Select value={sandboxId || "none"} onValueChange={(v) => setSandboxId(v === "none" ? "" : v)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">None — one request per row</SelectItem>
+                  {sandboxes.map((s) => (
+                    <SelectItem key={s.id} value={s.id}>
+                      {s.name} ({s.mode})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </FieldWrap>
+            {sandbox && (
+              <FieldWrap
+                label="Tool rounds"
+                hint="From the sandbox definition — part of what the run snapshots."
+              >
+                <div className="flex h-9 items-center text-sm tabular-nums">≤ {rounds}</div>
+              </FieldWrap>
+            )}
+          </Grid>
+          {sandboxes.length === 0 ? (
+            <p className="mt-3 text-xs text-muted-foreground">
+              None yet — add one on the{" "}
+              <Link
+                href="/experiments/sandboxes"
+                className="font-medium text-foreground underline underline-offset-2"
+              >
+                Sandboxes tab
+              </Link>{" "}
+              and it&apos;ll appear here for every experiment.
+            </p>
+          ) : sandbox ? (
+            <p className="mt-3 text-[11px] leading-snug text-amber-600 dark:text-amber-400">
+              Each row becomes up to {1 + rounds} billed calls, and the tool results are part of
+              the measurement — two runs whose sandbox differs are not comparable.
+            </p>
+          ) : null}
+        </SectionCard>
+
         {/* ---------------- Run ---------------- */}
         <SectionCard
           icon={<Gauge className="h-4 w-4" />}
@@ -763,21 +854,26 @@ export function ExperimentForm({
           <div className="mt-6 border-t border-border pt-4">
             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-sm">
               <span className="text-2xl font-semibold tabular-nums">
-                {units.toLocaleString()}
+                {calls.toLocaleString()}
               </span>
               <span className="text-muted-foreground">
-                request{units === 1 ? "" : "s"} will be sent —{" "}
+                {sandbox ? "billed calls at most" : "requests"} will be sent —{" "}
                 <span className="font-mono text-xs">
                   {nRows.toLocaleString()} dataset row{nRows === 1 ? "" : "s"} × {targets.length} target
                   {targets.length === 1 ? "" : "s"} × {variants.length} variant
                   {variants.length === 1 ? "" : "s"} × {repeats} repeat
                   {repeats === 1 ? "" : "s"}
+                  {sandbox ? ` × up to ${1 + rounds} turns` : ""}
                 </span>
               </span>
             </div>
-            {units > limits.max_units ? (
+            {units > limits.max_units || calls > limits.max_calls ? (
               <p className="mt-1.5 text-[11px] leading-snug text-red-600 dark:text-red-400">
-                Over the {limits.max_units.toLocaleString()}-request cap.{" "}
+                Over the{" "}
+                {units > limits.max_units
+                  ? `${limits.max_units.toLocaleString()}-unit`
+                  : `${limits.max_calls.toLocaleString()}-call`}{" "}
+                cap.{" "}
                 <button
                   type="button"
                   onClick={fitToCap}
@@ -787,7 +883,7 @@ export function ExperimentForm({
                 </button>{" "}
                 — sets repeats to 1 and samples the dataset, keeping every target and variant.
               </p>
-            ) : units > 2000 ? (
+            ) : calls > 2000 ? (
               <p className="mt-1.5 text-[11px] leading-snug text-amber-600 dark:text-amber-400">
                 That&apos;s a lot of billed inference against a real endpoint.
               </p>
@@ -818,10 +914,12 @@ export function ExperimentForm({
               "Every target needs a base URL and a model."
             ) : blocked === "no-name" ? (
               "Give the experiment a name."
-            ) : blocked === "over-cap" ? (
+            ) : blocked === "over-cap" || blocked === "over-call-cap" ? (
               <>
-                {units.toLocaleString()} requests is over the{" "}
-                {limits.max_units.toLocaleString()} cap —{" "}
+                {blocked === "over-cap"
+                  ? `${units.toLocaleString()} units is over the ${limits.max_units.toLocaleString()} cap`
+                  : `${calls.toLocaleString()} billed calls is over the ${limits.max_calls.toLocaleString()} cap`}{" "}
+                —{" "}
                 <button
                   type="button"
                   onClick={fitToCap}

@@ -63,8 +63,17 @@ const STATUS_PILL: Record<string, string> = {
 const STATUS_OPTIONS = ["all", "queued", "running", "done", "failed", "cancelled"] as const;
 type StatusFilter = (typeof STATUS_OPTIONS)[number];
 
+const TASK_OPTIONS = ["all", "asr", "tts", "llm"] as const;
+type TaskFilter = (typeof TASK_OPTIONS)[number];
+
+// task_type is "asr" | "tts" | "llm" (see CreateTrainingRunRequest). This used to
+// be a tts-or-else binary from before LLM training existed, which labelled every
+// gemma/qwen finetune "ASR". An unknown value falls back to ASR only because that
+// was the original default — add new task types here, don't rely on the fallback.
+const TASK_LABELS: Record<string, string> = { tts: "TTS", llm: "LLM", asr: "ASR" };
+
 function taskLabel(r: TrainingRunRecord): string {
-  return r.task_type === "tts" ? "TTS" : "ASR";
+  return TASK_LABELS[r.task_type ?? ""] ?? "ASR";
 }
 
 function isSweepRun(r: TrainingRunRecord): boolean {
@@ -85,11 +94,9 @@ function primaryMetric(r: TrainingRunRecord): { label: string; value: string } |
 export function AutotrainList({
   initialItems,
   initialTotal,
-  scope,
 }: {
   initialItems: TrainingRunRecord[];
   initialTotal: number;
-  scope: "mine" | "all";
 }) {
   const router = useRouter();
   const sp = useSearchParams();
@@ -97,6 +104,7 @@ export function AutotrainList({
   const [q, setQ] = useState(() => sp.get("q") ?? "");
   const [qDebounced, setQDebounced] = useState(q);
   const [status, setStatus] = useState<StatusFilter>(() => readParam(sp, "status", STATUS_OPTIONS, "all"));
+  const [task, setTask] = useState<TaskFilter>(() => readParam(sp, "task", TASK_OPTIONS, "all"));
   const [sort, setSort] = useState<SortDir>(() => readParam(sp, "sort", ["newest", "oldest"] as const, "newest"));
   const [view, setView] = useState<"rows" | "grid">(() => readParam(sp, "view", ["rows", "grid"] as const, "grid"));
   const [selectMode, setSelectMode] = useState(() => sp.get("select") === "1");
@@ -130,7 +138,13 @@ export function AutotrainList({
     setView(v);
     window.localStorage.setItem("sgpu_autotrain_view", v);
   };
-  useListUrlState({ q, status, sort, view, select: selectMode });
+  // `task` rides in `extra` — the hook's designed slot for a page-specific filter
+  // (same shape datasets uses for its source filter), so the shared ListFilters
+  // type stays about the filters every list page has.
+  useListUrlState({
+    q, status, sort, view, select: selectMode,
+    extra: { task: { value: task, def: "all" } },
+  });
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -199,7 +213,7 @@ export function AutotrainList({
     return () => clearTimeout(t);
   }, [q]);
 
-  const hasFilter = q.trim().length > 0 || status !== "all";
+  const hasFilter = q.trim().length > 0 || status !== "all" || task !== "all";
 
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   // Clamp in render so a shrinking result set never strands an empty page; the
@@ -214,9 +228,9 @@ export function AutotrainList({
     setLoading(true);
     try {
       const res = await gateway.listTrainingRunsPage({
-        scope,
         q: qDebounced,
         status: status === "all" ? "" : status,
+        task_type: task === "all" ? "" : task,
         sort,
         limit: pageSize,
         offset: (currentPage - 1) * pageSize,
@@ -230,7 +244,7 @@ export function AutotrainList({
     } finally {
       if (seq === seqRef.current) setLoading(false);
     }
-  }, [scope, qDebounced, status, sort, pageSize, currentPage]);
+  }, [qDebounced, status, task, sort, pageSize, currentPage]);
 
   // Refetch on any query change — except the very first run while state still
   // equals the SSR defaults (the server already rendered that exact page). A
@@ -240,11 +254,12 @@ export function AutotrainList({
     if (!bootedRef.current) {
       bootedRef.current = true;
       const ssrDefaults =
-        qDebounced === "" && status === "all" && sort === "newest" && page === 1 && pageSize === 12;
+        qDebounced === "" && status === "all" && task === "all" && sort === "newest" &&
+        page === 1 && pageSize === 12;
       if (ssrDefaults) return;
     }
     void load();
-  }, [load, qDebounced, status, sort, page, pageSize]);
+  }, [load, qDebounced, status, task, sort, page, pageSize]);
 
   const onRename = async () => {
     if (!renameTarget) return;
@@ -330,6 +345,24 @@ export function AutotrainList({
             {STATUS_OPTIONS.map((s) => (
               <SelectItem key={s} value={s}>
                 {s === "all" ? "All statuses" : s.charAt(0).toUpperCase() + s.slice(1)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select
+          value={task}
+          onValueChange={(v) => {
+            setTask(v as TaskFilter);
+            setPage(1);
+          }}
+        >
+          <SelectTrigger className="h-10! w-[130px]" title="Filter by training type">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {TASK_OPTIONS.map((t) => (
+              <SelectItem key={t} value={t}>
+                {t === "all" ? "All types" : (TASK_LABELS[t] ?? t.toUpperCase())}
               </SelectItem>
             ))}
           </SelectContent>
@@ -451,6 +484,12 @@ export function AutotrainList({
           {status !== "all" && (
             <>
               {" "}· status <span className="font-mono text-foreground">{status}</span>
+            </>
+          )}
+          {task !== "all" && (
+            <>
+              {" "}· type{" "}
+              <span className="font-mono text-foreground">{TASK_LABELS[task] ?? task}</span>
             </>
           )}
         </div>

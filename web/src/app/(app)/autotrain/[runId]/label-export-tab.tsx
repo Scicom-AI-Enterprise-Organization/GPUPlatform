@@ -104,7 +104,7 @@ export function LabelExportTab({
     // Eval-dataset picker source (LLM export): registered kind=hf datasets +
     // standalone catalog repos pushed via the hf CLI. Mirrors autotrain/new.
     gateway.listDatasets().then(setDatasets).catch(() => {});
-    gateway.listCatalog("mine", "dataset").then(setCatalogDatasets).catch(() => {});
+    gateway.listCatalog("dataset").then(setCatalogDatasets).catch(() => {});
   }, []);
 
   // Eval-dataset options for the LLM label export (search-select): registered
@@ -426,7 +426,7 @@ export function LabelExportTab({
             </label>
             <label className="flex cursor-pointer items-center gap-2 text-sm">
               <input type="checkbox" checked={speakerPrefix} onChange={(e) => setSpeakerPrefix(e.target.checked)} className="h-4 w-4 accent-primary" />
-              <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “TM_Mandarin: …”)</span></span>
+              <span>Prefix transcription with speaker name <span className="text-muted-foreground">(e.g. “Speaker_Mandarin: …”)</span></span>
             </label>
           </>
         )}

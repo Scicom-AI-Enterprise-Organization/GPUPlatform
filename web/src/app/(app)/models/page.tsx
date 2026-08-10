@@ -3,7 +3,6 @@ import { Inbox, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
-import { ScopeToggle } from "@/components/scope-toggle";
 import { gateway } from "@/lib/gateway";
 import type { CatalogRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
@@ -12,29 +11,21 @@ import { CatalogList } from "@/components/catalog/catalog-list";
 import { PushHint } from "@/components/catalog/push-hint";
 
 async function loadRepos(
-  scope: "mine" | "all",
 ): Promise<{ items: CatalogRecord[]; error: string | null }> {
   try {
-    const items = await gateway.listCatalog(scope, "model");
+    const items = await gateway.listCatalog("model");
     return { items, error: null };
   } catch (e) {
     return { items: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-export default async function ModelsPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ scope?: string }>;
-}) {
+export default async function ModelsPage() {
   const me = await getMe();
   const noAccess = !me?.sections?.catalog;
-  const sp = await searchParams;
-  const scope: "mine" | "all" =
-    me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   const [{ items, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ items: [], error: null }) : loadRepos(scope),
+    noAccess ? Promise.resolve({ items: [], error: null }) : loadRepos(),
     currentUsername(),
   ]);
   const gatewayUrl = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:8080";
@@ -53,7 +44,6 @@ export default async function ModelsPage({
               <span className="font-mono text-xs">HF_ENDPOINT</span> at this gateway.
             </p>
           </div>
-          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -73,7 +63,6 @@ export default async function ModelsPage({
                 <h2 className="text-base font-medium">Models</h2>
                 <span className="text-xs text-muted-foreground">
                   {items.length} {items.length === 1 ? "model" : "models"}
-                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <Button asChild size="sm">

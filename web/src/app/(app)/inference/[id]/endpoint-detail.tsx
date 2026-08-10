@@ -109,7 +109,7 @@ export function EndpointDetail({ app, readOnly = false, isAdmin = false }: { app
         setDeleteError(res.error);
         return;
       }
-      router.push("/serverless");
+      router.push("/inference");
     });
   }
 

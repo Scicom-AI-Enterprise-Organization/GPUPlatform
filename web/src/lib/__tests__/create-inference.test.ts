@@ -54,7 +54,7 @@ const BATTLE_MODELS: MultiModelMember[] = [
 ];
 
 const BATTLE_REQUEST: CreateAppRequest = {
-  name: "tm-fleet",
+  name: "demo-fleet",
   gpu: "VM",
   gpu_count: 4,
   mode: "multi",
@@ -96,11 +96,11 @@ afterEach(() => {
 describe("gateway.createApp — multi-model SSH serverless via the JS API", () => {
   it("POSTs /apps with method, JSON content-type and bearer auth", async () => {
     const fetchMock = stubFetch(async () =>
-      jsonResponse({ app_id: "tm-fleet", url: "/run/tm-fleet" }),
+      jsonResponse({ app_id: "demo-fleet", url: "/run/demo-fleet" }),
     );
 
     const res = await gateway.createApp(BATTLE_REQUEST);
-    expect(res).toEqual({ app_id: "tm-fleet", url: "/run/tm-fleet" });
+    expect(res).toEqual({ app_id: "demo-fleet", url: "/run/demo-fleet" });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -113,7 +113,7 @@ describe("gateway.createApp — multi-model SSH serverless via the JS API", () =
 
   it("serializes the VM multi-model envelope (mode, pin, venv, version, sleep)", async () => {
     const fetchMock = stubFetch(async () =>
-      jsonResponse({ app_id: "tm-fleet", url: "/run/tm-fleet" }),
+      jsonResponse({ app_id: "demo-fleet", url: "/run/demo-fleet" }),
     );
     await gateway.createApp(BATTLE_REQUEST);
 
@@ -130,7 +130,7 @@ describe("gateway.createApp — multi-model SSH serverless via the JS API", () =
 
   it("preserves each member's tp + per-model vLLM args verbatim", async () => {
     const fetchMock = stubFetch(async () =>
-      jsonResponse({ app_id: "tm-fleet", url: "/run/tm-fleet" }),
+      jsonResponse({ app_id: "demo-fleet", url: "/run/demo-fleet" }),
     );
     await gateway.createApp(BATTLE_REQUEST);
 
@@ -155,7 +155,7 @@ describe("gateway.createApp — multi-model SSH serverless via the JS API", () =
 
   it("sends all 10 cache/HOME env vars unchanged", async () => {
     const fetchMock = stubFetch(async () =>
-      jsonResponse({ app_id: "tm-fleet", url: "/run/tm-fleet" }),
+      jsonResponse({ app_id: "demo-fleet", url: "/run/demo-fleet" }),
     );
     await gateway.createApp(BATTLE_REQUEST);
 
@@ -170,7 +170,7 @@ describe("gateway.createApp — multi-model SSH serverless via the JS API", () =
 
   it("round-trips the request unchanged (no field dropped or mutated)", async () => {
     const fetchMock = stubFetch(async () =>
-      jsonResponse({ app_id: "tm-fleet", url: "/run/tm-fleet" }),
+      jsonResponse({ app_id: "demo-fleet", url: "/run/demo-fleet" }),
     );
     await gateway.createApp(BATTLE_REQUEST);
     expect(sentBody(fetchMock)).toEqual(BATTLE_REQUEST);
@@ -179,7 +179,7 @@ describe("gateway.createApp — multi-model SSH serverless via the JS API", () =
   it("omits the Authorization header when there is no session cookie", async () => {
     mockToken = undefined;
     const fetchMock = stubFetch(async () =>
-      jsonResponse({ app_id: "tm-fleet", url: "/run/tm-fleet" }),
+      jsonResponse({ app_id: "demo-fleet", url: "/run/demo-fleet" }),
     );
     await gateway.createApp(BATTLE_REQUEST);
     const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>;

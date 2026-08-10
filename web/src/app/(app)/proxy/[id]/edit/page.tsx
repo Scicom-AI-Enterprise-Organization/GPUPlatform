@@ -9,7 +9,7 @@ import { ProxyForm } from "../../proxy-form";
 export default async function EditProxyPage({ params }: { params: Promise<{ id: string }> }) {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
   const { id } = await params;
   let ep: ProxyEndpoint;
   try {

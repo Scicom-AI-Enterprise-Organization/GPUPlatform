@@ -24,7 +24,7 @@ async function loadAudit(token: string): Promise<AuditLogRecord[]> {
 export default async function AuditPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const jar = await cookies();
   const token = jar.get(TOKEN_COOKIE)?.value ?? "";

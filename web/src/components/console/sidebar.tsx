@@ -20,7 +20,7 @@ type Item = {
 };
 
 const RESOURCES: Item[] = [
-  { label: "Serverless Inference", href: "/serverless", icon: Boxes, section: "inference" },
+  { label: "Inference", href: "/inference", icon: Boxes, section: "inference" },
   { label: "Benchmark", href: "/benchmark", icon: FlaskConical, section: "benchmark" },
   { label: "Storage", href: "/storage", icon: Database },
   { label: "Models", href: "/models", icon: Package, section: "catalog" },
@@ -98,8 +98,8 @@ export function ConsoleSidebar({
   }, [measure, collapsed]);
 
   const isActive = (href: string) => {
-    if (href === "/serverless") {
-      return pathname === "/serverless" || pathname.startsWith("/serverless/");
+    if (href === "/inference") {
+      return pathname === "/inference" || pathname.startsWith("/inference/");
     }
     if (href === "/benchmark") {
       return pathname === "/benchmark" || pathname.startsWith("/benchmark/");

@@ -13,7 +13,7 @@ export default async function ProviderMetricsPage({
 }) {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const { id } = await params;
   const username = await currentUsername();

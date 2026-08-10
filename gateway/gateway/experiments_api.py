@@ -78,6 +78,7 @@ from . import crypto
 from . import custom_eval as ce
 from . import evaluators as ev
 from . import langfuse_import as lf
+from . import sandbox as sb
 from .auth import require_section
 from .db import App, Base, Dataset, Request as ReqRow, Storage, User, get_session, session_factory
 from .global_env_api import load_global_env
@@ -107,9 +108,23 @@ SECTION = "experiments"
 # calls — enough to bill real money and saturate an endpoint, so it needs an
 # explicit ceiling rather than discovering it in production.
 MAX_UNITS = int(os.environ.get("EXPERIMENT_MAX_UNITS", "20000") or "20000")
+# ⚠ MAX_UNITS counts UNITS, and a unit stopped meaning "one billed call" the
+# moment sandboxes landed: a sandboxed row is up to `max_tool_rounds + 1` model
+# calls, so the 20k cap alone would permit ~140k. This is the ceiling that
+# actually bounds spend — denominated in real billed calls, checked at create AND
+# re-checked at run time, the same discipline `PROMPT_OPT_MAX_METRIC_CALLS`
+# applies to GEPA. Without a sandbox calls == units, so it can never bind a run
+# that would pass MAX_UNITS today.
+MAX_CALLS = int(os.environ.get("EXPERIMENT_MAX_CALLS", "60000") or "60000")
 # Stored per-sample text is capped: a 200-repeat run of 8k-char replies is
 # ~1.6MB of JSONB per cell otherwise.
 MAX_STORED_CHARS = int(os.environ.get("EXPERIMENT_MAX_STORED_CHARS", "8000") or "8000")
+# The stored trajectory has its own, larger cap — a 6-round transcript with tool
+# results is ~10x a completion, and ExperimentSample exists to keep a 20k-unit
+# run at a few hundred MB rather than multiple GB.
+MAX_TRAJECTORY_CHARS = int(
+    os.environ.get("EXPERIMENT_MAX_TRAJECTORY_CHARS", "32000") or "32000"
+)
 DEFAULT_CONCURRENCY = 8
 MAX_CONCURRENCY = 64
 PROGRESS_FLUSH_S = 2.0
@@ -196,6 +211,35 @@ class CustomEvaluator(Base):
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class CustomSandbox(Base):
+    """A user-defined tool-response provider, reusable across experiments.
+
+    The twin of `CustomEvaluator`, down to the invariant that matters most: an
+    experiment **snapshots** the definition into its own config at create time,
+    so editing the library entry later can never change what a finished run
+    meant. That is not just tidiness here — a sandbox's seed field or mock URL is
+    part of the ENVIRONMENT the model was measured in, so changing it makes old
+    numbers incomparable, exactly like swapping the fastText detector.
+    """
+    __tablename__ = "custom_sandboxes"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # sb-<hex8>
+    name: Mapped[str] = mapped_column(String(64), index=True)
+    description: Mapped[str] = mapped_column(Text, default="", server_default="", nullable=False)
+    # replay | api | llm | python  (see sandbox.MODES — only replay runs today)
+    mode: Mapped[str] = mapped_column(String(16), default="replay",
+                                      server_default="replay", nullable=False)
+    # python mode only: `def respond(convo, call) -> str`.
+    code: Mapped[str] = mapped_column(Text, default="", server_default="", nullable=False)
+    # Mode config + loop policy. No secret is stored — `api_key_secret` NAMES a
+    # global secret, same convention as custom_evaluators.config.
+    config: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ExperimentSample(Base):
     """One replay. High volume — deliberately narrow columns plus a capped text
     body, so a 20k-unit run stays a few hundred MB rather than multiple GB."""
@@ -221,6 +265,11 @@ class ExperimentSample(Base):
     error_text: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     # {evaluator_id: {passed, score, reason, flags}}
     evals_json: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
+    # The multi-turn transcript + its counters, NULL for every non-sandboxed
+    # sample (which is the default). Capped at MAX_TRAJECTORY_CHARS — tool results
+    # are truncated before model turns, because the model's own output is the
+    # thing under test and a fixture's 40 KB payload is not.
+    trajectory_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -298,12 +347,29 @@ class EvaluatorSelection(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class SandboxSelection(BaseModel):
+    """Which sandbox answers this run's tool calls.
+
+    `id` is a library entry (`sb-…`); a bare definition can be sent inline the
+    way an inline custom evaluator can. Either way it is SNAPSHOTTED into the
+    experiment config at create time. `None` — the default — is exactly today's
+    behaviour: one request per row, no trajectory.
+    """
+    id: Optional[str] = None
+    name: Optional[str] = None
+    mode: Optional[str] = None
+    code: Optional[str] = None
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class CreateExperimentRequest(BaseModel):
     name: str
     dataset_id: str
     targets: list[TargetSpec]
     variants: list[VariantSpec] = Field(default_factory=lambda: [VariantSpec()])
     evaluators: list[EvaluatorSelection] = Field(default_factory=list)
+    # None = one request per row (today's behaviour, and the default forever).
+    sandbox: Optional[SandboxSelection] = None
     repeats: int = 1
     concurrency: int = DEFAULT_CONCURRENCY
     # 1 = no retry. Retrying masks the failure being measured.
@@ -355,6 +421,8 @@ class SampleRecord(BaseModel):
     status_code: Optional[int]
     error_text: Optional[str]
     evals: dict[str, Any]
+    # Present only for a sandboxed replay; the Samples drill-down renders it.
+    trajectory: Optional[dict[str, Any]] = None
 
 
 class SamplePage(BaseModel):
@@ -371,6 +439,50 @@ class LangfusePreviewRequest(BaseModel):
     secret_key_secret: Optional[str] = None
 
 
+
+
+class CustomSandboxSpec(BaseModel):
+    name: str
+    description: str = ""
+    mode: str = "replay"
+    code: str = ""
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class CustomSandboxUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    mode: Optional[str] = None
+    code: Optional[str] = None
+    config: Optional[dict[str, Any]] = None
+
+
+class CustomSandboxRecord(BaseModel):
+    id: str
+    name: str
+    description: str
+    mode: str
+    code: str
+    config: dict[str, Any]
+    owner: str
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+
+class TestCustomSandboxRequest(BaseModel):
+    """Dry-run a sandbox against ONE dataset row.
+
+    The cost guard: you validate a sandbox on one row before spending a full
+    matrix of rollouts on it. `tool_call` is the call to resolve; `expected` is
+    the row's own block (which carries the seed).
+    """
+    mode: str = "replay"
+    code: str = ""
+    config: dict[str, Any] = Field(default_factory=dict)
+    tool_call: dict[str, Any] = Field(default_factory=dict)
+    expected: dict[str, Any] = Field(default_factory=dict)
+    dataset_id: Optional[str] = None
+    row_index: Optional[int] = None
 
 
 class CustomEvaluatorSpec(BaseModel):
@@ -818,6 +930,247 @@ def _merge_stream_tool_calls(fragments: list[dict[str, Any]]) -> list[dict[str, 
 
 
 # --------------------------------------------------------------------------- #
+# Sandboxed multi-turn replay
+# --------------------------------------------------------------------------- #
+
+
+def _normalize_calls(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Give every tool call an id and the OpenAI shape.
+
+    A streamed reply can omit the id on the fragment we reassembled from, and a
+    `role=tool` message without a matching `tool_call_id` is rejected by the very
+    server we are about to send it back to.
+    """
+    out: list[dict[str, Any]] = []
+    for i, call in enumerate(raw or []):
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        out.append({
+            "id": str(call.get("id") or f"sgpu-call-{i}"),
+            "type": "function",
+            "function": {
+                "name": str(fn.get("name") or call.get("name") or ""),
+                "arguments": fn.get("arguments", call.get("arguments", "")) or "",
+            },
+        })
+    return out
+
+
+def _sum_usage(total: Optional[dict[str, Any]], add: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Accumulate token usage across a trajectory's turns.
+
+    ⚠ Summing is right for spend and wrong for context: turn N's `prompt_tokens`
+    already contains turn N−1's, so the total double-counts. It is still the
+    number that was billed, which is what `cost` needs — the UI labels the column
+    accordingly and `rounds` is stored so it can be normalized.
+    """
+    if not add:
+        return total
+    merged = dict(total or {})
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        val = add.get(key)
+        if isinstance(val, (int, float)):
+            merged[key] = (merged.get(key) or 0) + val
+    return merged or None
+
+
+async def run_trajectory(
+    client: httpx.AsyncClient,
+    case: Case,
+    target: dict[str, Any],
+    variant: dict[str, Any],
+    stream: bool,
+    api_key: str,
+    timeout_s: float,
+    runtime: sb.SandboxRuntime,
+    *,
+    retries: int = 1,
+    cell: str = "",
+) -> ev.Trajectory:
+    """Replay one row as a CONVERSATION: call, answer the tool calls, continue.
+
+    The loop deliberately reuses `build_request` + `call_once` per turn, so
+    streaming, the `reasoning`/`reasoning_content` normalization, guard detection
+    and latency/usage accounting all keep working exactly as they do for a
+    single-shot replay — there is one dispatch path, not two.
+
+    Never raises: a transport failure aborts the trajectory and lands on
+    `Trajectory.error`, mirroring the single-turn rule where `comp.error` decides
+    the verdict. A *tool* failure does NOT abort — the model is handed a
+    structured error and gets to react to it, which is realistic and worth
+    scoring.
+    """
+    body = build_request(case, target, variant, stream)
+    messages: list[dict[str, Any]] = body["messages"]
+    path = target.get("path") or DEFAULT_CHAT_PATH
+
+    traj = ev.Trajectory(expected=dict(case.expected or {}))
+    t0 = time.perf_counter()
+    deadline = t0 + runtime.trajectory_timeout_s
+    # Seed entries are consumed in order, so a conversation that calls the same
+    # tool twice gets two different reference results.
+    used_seed: set[int] = set()
+
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            traj.error = "trajectory_timeout"
+            traj.error_round = len(traj.turns) + 1
+            break
+
+        comp = ev.Completion()
+        for attempt in range(max(1, retries)):
+            comp = await call_once(
+                client, target["base_url"], path, api_key, body,
+                min(timeout_s, remaining),
+            )
+            if not comp.error or attempt == retries - 1:
+                break
+            await asyncio.sleep(min(2 ** attempt, 15))
+
+        raw_calls = _normalize_calls((comp.expected or {}).get("_tool_calls") or [])
+        # Each turn is scored against its OWN reference: the row's `expected`
+        # block describes the turn the row is about (the first), so later turns
+        # abstain unless the row carries `expected.turns[i]`.
+        comp.expected = ev.turn_expected(
+            case.expected, len(traj.turns), tool_calls=raw_calls, tools=case.tools,
+        )
+        traj.turns.append(comp)
+        if traj.ttft_ms is None and comp.ttft_ms is not None:
+            traj.ttft_ms = comp.ttft_ms
+        traj.usage = _sum_usage(traj.usage, comp.usage)
+
+        if comp.error:
+            traj.error = comp.error
+            traj.error_round = len(traj.turns)
+            break
+
+        assistant: dict[str, Any] = {"role": "assistant", "content": comp.content or ""}
+        if raw_calls:
+            assistant["tool_calls"] = raw_calls
+        messages.append(assistant)
+        traj.messages.append(dict(assistant))
+
+        if not raw_calls:
+            break
+
+        traj.tool_calls_total += len(raw_calls)
+        for call in raw_calls:
+            resp = await runtime.respond(
+                call, case.expected, cell=cell, used=used_seed,
+                # api mode gets the conversation SO FAR — everything the model
+                # saw before making this call, which is what a stateful simulator
+                # needs to answer it.
+                conversation=messages,
+            )
+            traj.provenance.append(resp.provenance)
+            if resp.novel:
+                traj.novel_calls += 1
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "name": call["function"]["name"],
+                "content": resp.content,
+            }
+            messages.append(tool_msg)
+            traj.messages.append({**tool_msg, "_provenance": resp.provenance})
+
+        traj.rounds += 1
+        if traj.rounds > runtime.max_tool_rounds:
+            # Out of rounds. Re-ask ONCE with the tools removed so the trajectory
+            # ends in an answer a content detector can read, rather than in a
+            # dangling tool call. `forced_final` is reported because a corpus
+            # where most rows hit this is measuring the round limit, not the model.
+            if runtime.force_final and body.get("tools"):
+                body.pop("tools", None)
+                body.pop("tool_choice", None)
+                traj.forced_final = True
+                continue
+            break
+
+    traj.latency_ms = int((time.perf_counter() - t0) * 1000)
+    return traj
+
+
+def _trajectory_payload(traj: ev.Trajectory) -> dict[str, Any]:
+    """The stored form of a trajectory, capped.
+
+    ⚠ Tool results are truncated BEFORE model turns: the model's own output is
+    the thing under test, a fixture's payload is not. Anything trimmed is marked
+    so the viewer says "truncated" instead of implying the model saw less than it
+    did — and the counters below survive truncation, because the
+    anti-silent-no-op checks are computed from them.
+    """
+    budget = MAX_TRAJECTORY_CHARS
+    spent = sum(len(str(m.get("content") or "")) for m in traj.messages
+                if m.get("role") == "assistant")
+    messages: list[dict[str, Any]] = []
+    for msg in traj.messages:
+        out = dict(msg)
+        content = str(out.get("content") or "")
+        if out.get("role") == "tool":
+            room = max(0, budget - spent)
+            if len(content) > room:
+                out["content"] = content[:room]
+                out["truncated"] = True
+            spent += len(out.get("content") or "")
+        elif len(content) > MAX_STORED_CHARS:
+            out["content"] = content[:MAX_STORED_CHARS]
+            out["truncated"] = True
+        messages.append(out)
+    return {
+        "messages": messages,
+        "rounds": traj.rounds,
+        "forced_final": traj.forced_final,
+        "tool_calls_total": traj.tool_calls_total,
+        "novel_calls": traj.novel_calls,
+        "provenance": traj.provenance_counts(),
+        "turns": len(traj.turns),
+        "error": traj.error,
+        "error_round": traj.error_round,
+    }
+
+
+def _sandbox_rollup(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    """Corpus-level sandbox health for one cell.
+
+    Exists because a broken sandbox still produces trajectories and the detectors
+    will happily score them: a run whose every tool call errored can otherwise
+    post a clean pass rate. Three numbers carry that:
+      * `provenance` — all-`error` means the environment never worked.
+      * `novel_call_rate` — high in replay mode means the model called tools the
+        seed doesn't cover, so the run measured seed coverage, not the model.
+      * `forced_final_rate` — high means the round limit is what was measured.
+    """
+    if not payloads:
+        return {}
+    rounds = [int(p.get("rounds") or 0) for p in payloads]
+    calls = sum(int(p.get("tool_calls_total") or 0) for p in payloads)
+    novel = sum(int(p.get("novel_calls") or 0) for p in payloads)
+    provenance: dict[str, int] = {}
+    for p in payloads:
+        for key, val in (p.get("provenance") or {}).items():
+            provenance[key] = provenance.get(key, 0) + int(val or 0)
+    n = len(payloads)
+    return {
+        "trajectories": n,
+        "rounds_mean": round(statistics.fmean(rounds), 2) if rounds else 0.0,
+        "rounds_max": max(rounds) if rounds else 0,
+        "tool_calls": calls,
+        "novel_calls": novel,
+        "novel_call_rate": round(novel / calls, 4) if calls else 0.0,
+        "forced_final": sum(1 for p in payloads if p.get("forced_final")),
+        "forced_final_rate": round(
+            sum(1 for p in payloads if p.get("forced_final")) / n, 4),
+        "aborted": sum(1 for p in payloads if p.get("error")),
+        "provenance": provenance,
+        # The loud one: every tool response failed, so nothing was really tested.
+        "all_errors": bool(calls) and provenance.get("error", 0) >= calls,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # LLM judge
 # --------------------------------------------------------------------------- #
 
@@ -945,7 +1298,32 @@ class EvaluatorStack:
 
     async def evaluate(self, comp: ev.Completion) -> tuple[list[ev.EvalOutcome], bool]:
         outcomes, passed = ev.run_evaluators(comp, self.selections)
+        return await self._extras(comp, outcomes, passed)
 
+    async def evaluate_trajectory(
+        self, traj: ev.Trajectory
+    ) -> tuple[list[ev.EvalOutcome], bool]:
+        """Score a sandboxed multi-turn replay.
+
+        Deliberately a SEPARATE entry point rather than a branch inside
+        `evaluate()`: this class is shared with prompt optimization, whose
+        rollouts are single-shot completions, and the whole reason it was
+        extracted is that two scoring paths which drift apart make an optimized
+        prompt's reported gain unreproducible in the experiment meant to confirm
+        it. GEPA keeps calling `evaluate()` and is bit-for-bit unaffected.
+
+        Custom evaluators and the judge see the FINAL reply (`as_completion()`) —
+        they are authored against `Completion` and know nothing about turns.
+        """
+        outcomes, passed = ev.run_evaluators_trajectory(traj, self.selections)
+        return await self._extras(traj.as_completion(), outcomes, passed)
+
+    async def _extras(
+        self,
+        comp: ev.Completion,
+        outcomes: list[ev.EvalOutcome],
+        passed: bool,
+    ) -> tuple[list[ev.EvalOutcome], bool]:
         # A transport error already decided the verdict; running user code
         # against an empty string would only add noise.
         if self.custom_specs and not comp.error:
@@ -1009,9 +1387,11 @@ def summarize(samples: list[dict[str, Any]], evaluator_ids: list[str]) -> dict[s
             "target": s["target"], "variant": s["variant"],
             "n": 0, "n_error": 0, "n_passed": 0,
             "latencies": [], "ttfts": [], "prompt_tokens": [], "completion_tokens": [],
-            "costs": [], "evals": {},
+            "costs": [], "evals": {}, "trajectories": [],
         })
         cell["n"] += 1
+        if isinstance(s.get("trajectory"), dict):
+            cell["trajectories"].append(s["trajectory"])
         if s.get("error_text"):
             cell["n_error"] += 1
         if s.get("passed"):
@@ -1035,7 +1415,15 @@ def summarize(samples: list[dict[str, Any]], evaluator_ids: list[str]) -> dict[s
                 slot["scores"].append(float(res["score"]))
             # Kept only long enough for the corpus-level rollup below; never stored.
             if eid in _AGGREGATING and isinstance(res.get("flags"), dict):
-                slot["flags"].append(res["flags"])
+                # A sandboxed sample folds N assistant turns into one verdict but
+                # keeps each turn's flags. Pool the TURNS, not the fold: an F1
+                # pools tp/fp/fn across every scored turn, which is exactly what
+                # the out-of-tree benchmark does over a conversation.
+                turn_flags = res["flags"].get("turn_flags")
+                if isinstance(turn_flags, list) and turn_flags:
+                    slot["flags"].extend(f for f in turn_flags if isinstance(f, dict))
+                else:
+                    slot["flags"].append(res["flags"])
             if eid == "cost":
                 c = (res.get("flags") or {}).get("cost_usd")
                 if c is not None:
@@ -1066,7 +1454,9 @@ def summarize(samples: list[dict[str, Any]], evaluator_ids: list[str]) -> dict[s
                 except Exception:  # noqa: BLE001 — a bad rollup must not void the run
                     logger.exception("aggregate failed for evaluator %s", eid)
             evals_out[eid] = entry
+        sandbox_stats = _sandbox_rollup(cell["trajectories"])
         out_cells.append({
+            **({"sandbox": sandbox_stats} if sandbox_stats else {}),
             "target": cell["target"],
             "variant": cell["variant"],
             "n": n,
@@ -1163,6 +1553,23 @@ async def _run_experiment(app, experiment_id: str) -> None:
                 f"× {repeats} repeats). Lower repeats or trim the matrix."
             )
 
+        # Sandbox: None (the default) keeps the single-request path byte for byte.
+        runtime: Optional[sb.SandboxRuntime] = None
+        snap = cfg.get("sandbox") or None
+        if snap:
+            sspec = sb.SandboxSpec.from_dict(snap)
+            ref = str((sspec.config.get("api") or {}).get("api_key_secret") or "").strip()
+            runtime = sb.SandboxRuntime(
+                sspec, client=client, api_key=genv.get(ref, "") if ref else "",
+            )
+        calls = len(units) * (1 + (runtime.max_tool_rounds if runtime else 0))
+        if calls > MAX_CALLS:
+            raise RuntimeError(
+                f"{calls} billed calls exceeds the {MAX_CALLS} cap "
+                f"({len(units)} units × up to {1 + runtime.max_tool_rounds} calls each). "
+                f"Lower the tool-round limit or trim the matrix."
+            )
+
         # Judge setup defaults to the first target's endpoint/key, so the common
         # case ("judge with the same model") needs no extra configuration.
         first = targets[0] if targets else {}
@@ -1201,27 +1608,40 @@ async def _run_experiment(app, experiment_id: str) -> None:
             case, target, variant, repeat = unit
             if experiment_id in _CANCELLED:
                 return
-            body = build_request(case, target, variant, stream)
-            comp = ev.Completion()
-            for attempt in range(retries):
-                comp = await call_once(
-                    client, target["base_url"], target.get("path") or "/v1/chat/completions",
-                    keys.get(target["label"], ""), body, timeout_s,
+            vlabel = variant.get("label") or "baseline"
+            traj_payload: Optional[dict[str, Any]] = None
+
+            if runtime is not None:
+                traj = await run_trajectory(
+                    client, case, target, variant, stream,
+                    keys.get(target["label"], ""), timeout_s, runtime,
+                    retries=retries, cell=f"{target['label']}/{vlabel}",
                 )
-                if not comp.error or attempt == retries - 1:
-                    break
-                await asyncio.sleep(min(2 ** attempt, 15))
+                comp = traj.as_completion()
+                traj_payload = _trajectory_payload(traj)
+                outcomes, passed = await stack.evaluate_trajectory(traj)
+            else:
+                body = build_request(case, target, variant, stream)
+                comp = ev.Completion()
+                for attempt in range(retries):
+                    comp = await call_once(
+                        client, target["base_url"], target.get("path") or "/v1/chat/completions",
+                        keys.get(target["label"], ""), body, timeout_s,
+                    )
+                    if not comp.error or attempt == retries - 1:
+                        break
+                    await asyncio.sleep(min(2 ** attempt, 15))
 
-            tool_calls = (comp.expected or {}).get("_tool_calls") or []
-            # `_tools` lets the function-call detector resolve each call against
-            # the schema the model actually saw (hallucination + param checks).
-            comp.expected = {
-                **(case.expected or {}),
-                "_tool_calls": tool_calls,
-                "_tools": case.tools or [],
-            }
+                tool_calls = (comp.expected or {}).get("_tool_calls") or []
+                # `_tools` lets the function-call detector resolve each call against
+                # the schema the model actually saw (hallucination + param checks).
+                comp.expected = {
+                    **(case.expected or {}),
+                    "_tool_calls": tool_calls,
+                    "_tools": case.tools or [],
+                }
 
-            outcomes, passed = await stack.evaluate(comp)
+                outcomes, passed = await stack.evaluate(comp)
 
             evals = {
                 o.id: {"passed": o.passed, "score": o.score, "reason": o.reason, "flags": o.flags}
@@ -1229,22 +1649,23 @@ async def _run_experiment(app, experiment_id: str) -> None:
             }
             record = {
                 "case_id": case.id, "case_name": case.name or case.id,
-                "target": target["label"], "variant": variant.get("label") or "baseline",
+                "target": target["label"], "variant": vlabel,
                 "repeat": repeat, "passed": passed,
                 "latency_ms": comp.latency_ms, "ttft_ms": comp.ttft_ms,
                 "prompt_tokens": comp.prompt_tokens, "completion_tokens": comp.completion_tokens,
                 "error_text": comp.error, "evals": evals,
+                "trajectory": traj_payload,
             }
             row = ExperimentSample(
                 id=_new_id("exs"), experiment_id=experiment_id, case_id=case.id,
                 case_name=(case.name or case.id)[:255], target=target["label"][:128],
-                variant=(variant.get("label") or "baseline")[:128], repeat=repeat,
+                variant=vlabel[:128], repeat=repeat,
                 passed=passed, content=_clip(comp.content), reasoning=_clip(comp.reasoning),
                 finish_reason=comp.finish_reason, prompt_tokens=comp.prompt_tokens,
                 completion_tokens=comp.completion_tokens, latency_ms=comp.latency_ms,
                 ttft_ms=comp.ttft_ms, status_code=comp.status_code,
                 error_text=(comp.error or None) and str(comp.error)[:2048],
-                evals_json=evals,
+                evals_json=evals, trajectory_json=traj_payload,
             )
             async with lock:
                 results.append(record)
@@ -1398,15 +1819,16 @@ async def list_evaluators(
 ):
     """The evaluator registry — the web form renders its options from this, so
     the UI can never drift from what the runner actually supports. Also carries
-    the caller's custom evaluators and the authoring context, so the form needs
+    every custom evaluator on the platform and the authoring context, so the form needs
     a single fetch."""
     payload = ev.specs_payload()
     rows = (await session.execute(
-        select(CustomEvaluator)
-        .where(CustomEvaluator.owner_id == user.id)
-        .order_by(CustomEvaluator.created_at.desc())
+        select(CustomEvaluator).order_by(CustomEvaluator.created_at.desc())
     )).scalars().all()
-    payload["custom"] = [_custom_record(r, user.username).model_dump() for r in rows]
+    names = await _owner_names(session, {r.owner_id for r in rows})
+    payload["custom"] = [
+        _custom_record(r, names.get(r.owner_id, "?")).model_dump() for r in rows
+    ]
     payload["custom_context"] = ce.describe_context()
     payload["custom_context"]["python_allowed"] = _allow_python(user)
     return payload
@@ -1418,11 +1840,10 @@ async def list_custom_evaluators(
     session: AsyncSession = Depends(get_session),
 ):
     rows = (await session.execute(
-        select(CustomEvaluator)
-        .where(CustomEvaluator.owner_id == user.id)
-        .order_by(CustomEvaluator.created_at.desc())
+        select(CustomEvaluator).order_by(CustomEvaluator.created_at.desc())
     )).scalars().all()
-    return [_custom_record(r, user.username) for r in rows]
+    names = await _owner_names(session, {r.owner_id for r in rows})
+    return [_custom_record(r, names.get(r.owner_id, "?")) for r in rows]
 
 
 def _public_api_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1598,12 +2019,223 @@ async def test_custom_evaluator(
     }
 
 
+# ---- sandboxes ------------------------------------------------------------ #
+
+
+def _sandbox_record(row: CustomSandbox, owner: str) -> CustomSandboxRecord:
+    return CustomSandboxRecord(
+        id=row.id, name=row.name, description=row.description, mode=row.mode,
+        code=row.code, config=_public_api_config(row.config or {}), owner=owner,
+        created_at=row.created_at, updated_at=row.updated_at,
+    )
+
+
+def _validate_sandbox(
+    name: str, mode: str, code: str, user: User, config: Optional[dict[str, Any]] = None
+) -> str:
+    name = (name or "").strip()
+    if not re.match(r"^[a-z0-9][a-z0-9 _-]{1,47}$", name, re.IGNORECASE):
+        raise HTTPException(
+            status_code=400,
+            detail="name must be 2–48 chars: letters, digits, spaces, - or _",
+        )
+    try:
+        sb.validate_spec(mode, code, config, allow_python=_allow_python(user))
+    except sb.SandboxError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return name
+
+
+@router.get("/experiments/sandboxes")
+async def list_sandbox_registry(
+    user: User = Depends(require_section(SECTION)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Mode descriptors + the platform's sandbox library, in one fetch.
+
+    Server-driven like the evaluator registry: adding a mode in `sandbox.py`
+    needs no change in the web directory.
+    """
+    payload = sb.specs_payload()
+    rows = (await session.execute(
+        select(CustomSandbox).order_by(CustomSandbox.created_at.desc())
+    )).scalars().all()
+    names = await _owner_names(session, {r.owner_id for r in rows})
+    payload["sandboxes"] = [
+        _sandbox_record(r, names.get(r.owner_id, "?")).model_dump() for r in rows
+    ]
+    payload["python_allowed"] = _allow_python(user)
+    return payload
+
+
+@router.get("/custom-sandboxes", response_model=list[CustomSandboxRecord])
+async def list_custom_sandboxes(
+    user: User = Depends(require_section(SECTION)),
+    session: AsyncSession = Depends(get_session),
+):
+    rows = (await session.execute(
+        select(CustomSandbox).order_by(CustomSandbox.created_at.desc())
+    )).scalars().all()
+    names = await _owner_names(session, {r.owner_id for r in rows})
+    return [_sandbox_record(r, names.get(r.owner_id, "?")) for r in rows]
+
+
+@router.post("/custom-sandboxes", response_model=CustomSandboxRecord)
+async def create_custom_sandbox(
+    req: CustomSandboxSpec,
+    user: User = Depends(require_section(SECTION)),
+    session: AsyncSession = Depends(get_session),
+):
+    name = _validate_sandbox(req.name, req.mode, req.code, user, req.config)
+    dupe = (await session.execute(
+        select(CustomSandbox).where(
+            CustomSandbox.owner_id == user.id, CustomSandbox.name == name
+        )
+    )).scalar_one_or_none()
+    if dupe is not None:
+        raise HTTPException(status_code=400, detail=f"you already have a sandbox named {name!r}")
+    row = CustomSandbox(
+        id=_new_id("sb"), name=name, description=(req.description or "").strip(),
+        mode=req.mode, code=req.code, config=req.config or {}, owner_id=user.id,
+    )
+    session.add(row)
+    await session.commit()
+    logger.info("custom sandbox %s (%s) created by %s", row.id, row.mode, user.username)
+    return _sandbox_record(row, user.username)
+
+
+async def _get_sandbox(session: AsyncSession, sb_id: str, user: User) -> CustomSandbox:
+    row = await session.get(CustomSandbox, sb_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such sandbox")
+    if row.owner_id != user.id and not user.is_admin:
+        raise HTTPException(status_code=403, detail="not your sandbox")
+    return row
+
+
+@router.patch("/custom-sandboxes/{sb_id}", response_model=CustomSandboxRecord)
+async def update_custom_sandbox(
+    sb_id: str,
+    req: CustomSandboxUpdate,
+    user: User = Depends(require_section(SECTION)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Edit a library entry. Finished experiments are untouched — they carry
+    their own snapshot, which is the whole point."""
+    row = await _get_sandbox(session, sb_id, user)
+    name = req.name if req.name is not None else row.name
+    mode = req.mode if req.mode is not None else row.mode
+    code = req.code if req.code is not None else row.code
+    config = req.config if req.config is not None else (row.config or {})
+    row.name = _validate_sandbox(name, mode, code, user, config)
+    row.mode, row.code, row.config = mode, code, config
+    if req.description is not None:
+        row.description = req.description.strip()
+    row.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    return _sandbox_record(row, user.username)
+
+
+@router.delete("/custom-sandboxes/{sb_id}")
+async def delete_custom_sandbox(
+    sb_id: str,
+    user: User = Depends(require_section(SECTION)),
+    session: AsyncSession = Depends(get_session),
+):
+    row = await _get_sandbox(session, sb_id, user)
+    await session.delete(row)
+    await session.commit()
+    return {"ok": True}
+
+
+@router.post("/custom-sandboxes/test")
+async def test_custom_sandbox(
+    req: TestCustomSandboxRequest,
+    request: Request,
+    user: User = Depends(require_section(SECTION)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Resolve ONE tool call against ONE row and show what the model would get.
+
+    The cost guard: a sandbox that answers nothing still produces trajectories
+    the detectors will happily score, so validating it on one row before spending
+    a whole matrix is the difference between a finding and a wasted sweep.
+    """
+    try:
+        sb.validate_spec(req.mode, req.code, req.config, allow_python=_allow_python(user))
+    except sb.SandboxError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    expected = dict(req.expected or {})
+    row_name = None
+    # Prefer a REAL row over a paste — that's where a missing seed column shows up.
+    if req.dataset_id:
+        ds = await _require_source_dataset(session, req.dataset_id, user)
+        idx = max(0, int(req.row_index or 0))
+        cases = await resolve_cases(session, ds, limit=idx + 1)
+        if not cases:
+            return {"ok": False, "error": "that dataset has no replayable rows"}
+        case = cases[min(idx, len(cases) - 1)]
+        expected = dict(case.expected or {})
+        row_name = case.name or case.id
+
+    spec = sb.SandboxSpec(
+        id="preview", name="preview", mode=req.mode, code=req.code, config=req.config or {},
+    )
+    genv = await load_global_env(session)
+    ref = str((spec.config.get("api") or {}).get("api_key_secret") or "").strip()
+    runtime = sb.SandboxRuntime(
+        spec, client=_http(request.app), api_key=genv.get(ref, "") if ref else "",
+    )
+    call = req.tool_call or {}
+    if not sb.call_name(call) and spec.mode == "replay":
+        # No call given: report what the row's seed offers, which answers the
+        # question people actually have ("is my seed column wired up?").
+        seed = sb.ReplayProvider(spec).seed_for(expected)
+        return {
+            "ok": bool(seed),
+            "row": row_name,
+            "seed_entries": len(seed),
+            "seed_names": sorted({e["name"] for e in seed}),
+            "error": None if seed else
+                     f"no {sb.replay_config(spec.config)['seed_field']!r} on this row — "
+                     f"every tool call would come back as no_fixture",
+            "loop": runtime.loop,
+        }
+    if not sb.call_name(call):
+        # api mode has no seed to introspect, so probe it with a real call rather
+        # than reporting nothing — a wrong URL or result path shows up here.
+        call = {"id": "probe", "type": "function",
+                "function": {"name": "ping", "arguments": "{}"}}
+
+    resp = await runtime.respond(
+        call, expected, cell="preview", used=set(),
+        conversation=[{"role": "user", "content": "sandbox test"}],
+    )
+    return {
+        "ok": not resp.error,
+        "row": row_name,
+        "content": resp.content[:4000],
+        "provenance": resp.provenance,
+        "matched": resp.detail,
+        "novel": resp.novel,
+        "error": resp.content if resp.error else None,
+        "loop": runtime.loop,
+    }
+
+
 @router.get("/experiments/limits")
 async def experiment_limits(user: User = Depends(require_section(SECTION))):
     """The run-size ceilings, so the form can enforce them BEFORE submit rather
     than letting the user compose a matrix the gateway will reject."""
     return {
         "max_units": MAX_UNITS,
+        # ⚠ The form must price a sandboxed run in CALLS, not units: one row is up
+        # to (max_tool_rounds + 1) billed calls. Same rule as the GEPA budget card
+        # — this arithmetic exists on both sides and they must agree.
+        "max_calls": MAX_CALLS,
+        "max_tool_rounds_cap": sb.MAX_TOOL_ROUNDS_CAP,
+        "default_max_tool_rounds": sb.DEFAULT_MAX_TOOL_ROUNDS,
         "max_rows": MAX_ROWS_PER_RUN,
         "max_concurrency": MAX_CONCURRENCY,
         "default_concurrency": DEFAULT_CONCURRENCY,
@@ -2137,7 +2769,6 @@ async def capture_platform(
 
 @router.get("/experiments/_page", response_model=ExperimentPage)
 async def list_experiments_page(
-    scope: str = "mine",
     q: str = "",
     status: str = "",
     dataset_id: str = "",
@@ -2147,8 +2778,8 @@ async def list_experiments_page(
     session: AsyncSession = Depends(get_session),
 ):
     stmt = select(Experiment)
-    if not (scope == "all" and user.is_admin):
-        stmt = stmt.where(Experiment.owner_id == user.id)
+        # Everyone with the section sees every row — section access IS the
+        # boundary here, so there is no mine-vs-all split (see main.list_apps).
     if status:
         stmt = stmt.where(Experiment.status == status)
     if dataset_id:
@@ -2219,6 +2850,7 @@ async def create_experiment(
         raise HTTPException(status_code=400, detail="variant labels must be unique")
 
     stored_evaluators = await snapshot_evaluators(session, user, req.evaluators)
+    stored_sandbox = await snapshot_sandbox(session, user, req.sandbox)
 
     # Row count is the dataset's own tally where it has one; the exact figure is
     # only known once the rows are read, so the cap below is re-checked at run time.
@@ -2232,6 +2864,19 @@ async def create_experiment(
             detail=f"{planned} units exceeds the {MAX_UNITS} cap "
                    f"({n_rows} rows × {len(req.targets)} targets × {len(variants)} variants "
                    f"× {req.repeats} repeats)",
+        )
+
+    # A sandboxed unit is a CONVERSATION, so the unit cap alone no longer bounds
+    # spend — this is the ceiling denominated in what actually gets billed.
+    rounds = (sb.loop_config(stored_sandbox.get("config"))["max_tool_rounds"]
+              if stored_sandbox else 0)
+    planned_calls = planned * (1 + rounds)
+    if planned_calls > MAX_CALLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{planned_calls} billed calls exceeds the {MAX_CALLS} cap "
+                   f"({planned} units × up to {1 + rounds} calls each — every tool round is "
+                   f"another model call). Lower the tool-round limit or trim the matrix.",
         )
 
     judge = next((s for s in stored_evaluators if s.get("id") == "llm_judge"), None)
@@ -2248,6 +2893,7 @@ async def create_experiment(
         "targets": _store_targets(req.targets),
         "variants": [v.model_dump() for v in variants],
         "evaluators": stored_evaluators,
+        **({"sandbox": stored_sandbox} if stored_sandbox else {}),
         "repeats": max(1, req.repeats),
         "concurrency": max(1, min(MAX_CONCURRENCY, req.concurrency)),
         "retries": max(1, req.retries),
@@ -2270,6 +2916,54 @@ async def create_experiment(
         row.id, user.username, planned, n_rows, len(req.targets), len(variants), req.repeats,
     )
     return _experiment_record(row, user.username, ds.name)
+
+
+async def snapshot_sandbox(
+    session: AsyncSession,
+    user: User,
+    selection: Optional[SandboxSelection],
+) -> Optional[dict[str, Any]]:
+    """Resolve a sandbox selection into the definition the runner consumes.
+
+    Same rule as `snapshot_evaluators`: a library entry is **copied** into the
+    experiment's config, so editing it later can never retroactively change what
+    a finished run meant. Here it matters more than usual — the sandbox is the
+    environment the model was measured in, so an edited seed field silently makes
+    two runs incomparable rather than merely differently-scored.
+
+    Returns None for the default (no sandbox), which is the single-request path.
+    """
+    if selection is None:
+        return None
+    ref = (selection.id or "").strip()
+    if ref:
+        row = await session.get(CustomSandbox, ref)
+        if row is None:
+            raise HTTPException(status_code=400, detail=f"no such sandbox: {ref}")
+        if row.owner_id != user.id and not user.is_admin:
+            raise HTTPException(status_code=403, detail=f"not your sandbox: {ref}")
+        snap = {
+            "id": row.id, "name": row.name, "mode": row.mode,
+            "code": row.code, "config": row.config or {},
+        }
+    else:
+        snap = {
+            "id": "inline",
+            "name": (selection.name or "sandbox").strip() or "sandbox",
+            "mode": (selection.mode or "replay").strip() or "replay",
+            "code": selection.code or "",
+            "config": dict(selection.config or {}),
+        }
+    # Re-validate at create time: a mode can be unimplemented-but-saved, or the
+    # caller may have lost admin since the entry was written.
+    try:
+        sb.validate_spec(
+            snap["mode"], snap["code"], snap.get("config"),
+            allow_python=_allow_python(user),
+        )
+    except sb.SandboxError as exc:
+        raise HTTPException(status_code=400, detail=f"sandbox {snap['name']!r}: {exc}")
+    return snap
 
 
 async def snapshot_evaluators(
@@ -2408,6 +3102,7 @@ async def list_samples(
                 prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens,
                 latency_ms=r.latency_ms, ttft_ms=r.ttft_ms, status_code=r.status_code,
                 error_text=r.error_text, evals=r.evals_json or {},
+                trajectory=r.trajectory_json,
             )
             for r in rows
         ],

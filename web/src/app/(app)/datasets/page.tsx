@@ -3,7 +3,6 @@ import { GitMerge, Inbox, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConsoleTopbar } from "@/components/console/topbar";
 import { NoAccessAlert } from "@/components/no-access-alert";
-import { ScopeToggle } from "@/components/scope-toggle";
 import { gateway } from "@/lib/gateway";
 import type { CatalogRecord, DatasetRecord, PageResponse } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
@@ -15,19 +14,18 @@ import { PushHint } from "@/components/catalog/push-hint";
 const PAGE_SIZE = 12;
 
 async function loadDatasetsPage(
-  scope: "mine" | "all",
 ): Promise<{ page: PageResponse<DatasetRecord>; error: string | null }> {
   try {
-    const page = await gateway.listDatasetsPage({ scope, limit: PAGE_SIZE, offset: 0 });
+    const page = await gateway.listDatasetsPage({ limit: PAGE_SIZE, offset: 0 });
     return { page, error: null };
   } catch (e) {
     return { page: { total: 0, items: [] }, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-async function loadHosted(scope: "mine" | "all"): Promise<CatalogRecord[]> {
+async function loadHosted(): Promise<CatalogRecord[]> {
   try {
-    return await gateway.listCatalog(scope, "dataset");
+    return await gateway.listCatalog("dataset");
   } catch {
     return [];
   }
@@ -54,23 +52,16 @@ function hostedToDataset(r: CatalogRecord): DatasetRecord {
   };
 }
 
-export default async function DatasetsPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ scope?: string }>;
-}) {
+export default async function DatasetsPage() {
   const me = await getMe();
   const noAccess = !me?.sections?.datasets;
-  const sp = await searchParams;
-  const scope: "mine" | "all" =
-    me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   const hasCatalog = !!me?.sections?.catalog;
   const [{ page, error }, hostedAll, username] = await Promise.all([
     noAccess
       ? Promise.resolve({ page: { total: 0, items: [] as DatasetRecord[] }, error: null })
-      : loadDatasetsPage(scope),
-    !noAccess && hasCatalog ? loadHosted(scope) : Promise.resolve<CatalogRecord[]>([]),
+      : loadDatasetsPage(),
+    !noAccess && hasCatalog ? loadHosted() : Promise.resolve<CatalogRecord[]>([]),
     currentUsername(),
   ]);
   // Merge HF-mirror dataset repos into the one list, EXCLUDING those already
@@ -94,7 +85,6 @@ export default async function DatasetsPage({
               datasets for Autotrain — upload metadata to storage, preview rows with inline audio, sync to HuggingFace.
             </p>
           </div>
-          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -114,7 +104,6 @@ export default async function DatasetsPage({
                 <h2 className="text-base font-medium">Datasets</h2>
                 <span className="text-xs text-muted-foreground">
                   {totalCount} {totalCount === 1 ? "dataset" : "datasets"}
-                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <div className="flex items-center gap-2">
@@ -124,7 +113,7 @@ export default async function DatasetsPage({
                     Merge label datasets
                   </Link>
                 </Button>
-                <PurgeEmptyButton scope={scope} />
+                <PurgeEmptyButton />
                 <Button asChild size="sm">
                   <Link href="/datasets/new">
                     <Plus className="h-4 w-4" />
@@ -148,7 +137,6 @@ export default async function DatasetsPage({
                 initialItems={page.items}
                 initialTotal={page.total}
                 hosted={standaloneHosted}
-                scope={scope}
               />
             )}
           </section>

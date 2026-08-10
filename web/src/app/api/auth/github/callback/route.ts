@@ -46,7 +46,7 @@ export async function GET(req: NextRequest) {
   if (stored.state !== state) {
     return failRedirect(req, "OAuth state mismatch");
   }
-  const next = stored.next || "/serverless";
+  const next = stored.next || "/inference";
 
   // Exchange code for access token.
   const tokenRes = await fetch("https://github.com/login/oauth/access_token", {

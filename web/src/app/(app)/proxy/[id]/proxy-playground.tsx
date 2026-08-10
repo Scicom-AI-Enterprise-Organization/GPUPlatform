@@ -12,9 +12,9 @@ import {
 } from "@/components/ui/select";
 import { ChatPlayground, openAiTransport } from "@/components/playground/chat-playground";
 import { RerankPlayground } from "@/components/playground/rerank-playground";
-import { EmbeddingPlayground } from "@/app/(app)/serverless/[id]/tabs/embedding";
-import { TranscribePlayground } from "@/app/(app)/serverless/[id]/tabs/transcribe";
-import { SpeechPlayground } from "@/app/(app)/serverless/[id]/tabs/speech";
+import { EmbeddingPlayground } from "@/app/(app)/inference/[id]/tabs/embedding";
+import { TranscribePlayground } from "@/app/(app)/inference/[id]/tabs/transcribe";
+import { SpeechPlayground } from "@/app/(app)/inference/[id]/tabs/speech";
 
 // The upstream identity the force dropdown offers. Only enabled upstreams are
 // forceable (the backend 404s a forced disabled/absent upstream).

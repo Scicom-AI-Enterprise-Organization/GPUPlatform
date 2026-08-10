@@ -130,7 +130,7 @@ describe("gateway.listModels — model discovery", () => {
     stubFetch(async () =>
       jsonResponse({
         object: "list",
-        data: FLEET.map((id) => ({ id, object: "model", created: 0, owned_by: "tm-fleet" })),
+        data: FLEET.map((id) => ({ id, object: "model", created: 0, owned_by: "demo-fleet" })),
       }),
     );
     const res = await gateway.listModels();

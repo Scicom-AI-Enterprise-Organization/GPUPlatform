@@ -22,7 +22,7 @@ export default async function MergeDatasetsPage({
   let datasets: DatasetRecord[] = [];
   let storages: StorageRecord[] = [];
   try {
-    [datasets, storages] = await Promise.all([gateway.listDatasets("mine"), gateway.listStorage()]);
+    [datasets, storages] = await Promise.all([gateway.listDatasets(), gateway.listStorage()]);
   } catch {
     /* render with whatever loaded; the form surfaces gateway errors on submit */
   }

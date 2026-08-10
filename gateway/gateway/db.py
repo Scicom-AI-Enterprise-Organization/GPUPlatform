@@ -1209,6 +1209,13 @@ async def init_db() -> None:
             "ALTER TABLE custom_evaluators ADD COLUMN IF NOT EXISTS "
             "config JSON NOT NULL DEFAULT '{}'"
         ))
+        # Sandboxes: multi-turn tool replay. The `custom_sandboxes` table itself is
+        # created by create_all above — only this column, added to a table that
+        # already shipped, needs a statement. NULL for every non-sandboxed sample
+        # (the default), so existing rows are valid unchanged.
+        await conn.execute(text(
+            "ALTER TABLE experiment_samples ADD COLUMN IF NOT EXISTS trajectory_json JSON"
+        ))
         # Worker lifecycle timeline: the calendar/analytics query is always
         # "events for app X between t0 and t1", so a composite (app_id,
         # created_at) index serves it without scanning the whole table.

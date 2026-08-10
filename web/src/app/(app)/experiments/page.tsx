@@ -7,16 +7,14 @@ import { gateway } from "@/lib/gateway";
 import type { ExperimentRecord, PageResponse } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
-import { ScopeToggle } from "@/components/scope-toggle";
 import { SectionTabs } from "./section-tabs";
 import { ExperimentsList } from "./experiments-list";
 
 async function loadExperiments(
-  scope: "mine" | "all",
 ): Promise<{ page: PageResponse<ExperimentRecord>; error: string | null }> {
   try {
     return {
-      page: await gateway.listExperimentsPage({ scope, limit: 12, offset: 0 }),
+      page: await gateway.listExperimentsPage({ limit: 12, offset: 0 }),
       error: null,
     };
   } catch (e) {
@@ -24,19 +22,13 @@ async function loadExperiments(
   }
 }
 
-export default async function ExperimentsPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ scope?: string }>;
-}) {
+export default async function ExperimentsPage() {
   const me = await getMe();
   const sections = me?.sections as Record<string, boolean> | undefined;
   const noAccess = me ? !(me.is_admin || sections?.experiments) : false;
-  const sp = await searchParams;
-  const scope: "mine" | "all" = me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   const [{ page, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ page: { total: 0, items: [] }, error: null }) : loadExperiments(scope),
+    noAccess ? Promise.resolve({ page: { total: 0, items: [] }, error: null }) : loadExperiments(),
     currentUsername(),
   ]);
 
@@ -55,7 +47,6 @@ export default async function ExperimentsPage({
               regressions.
             </p>
           </div>
-          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         <SectionTabs />
@@ -75,7 +66,6 @@ export default async function ExperimentsPage({
                 <h2 className="text-base font-medium">Runs</h2>
                 <span className="text-xs text-muted-foreground">
                   {page.total} {page.total === 1 ? "run" : "runs"}
-                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <Button asChild size="sm">
@@ -99,10 +89,8 @@ export default async function ExperimentsPage({
               </div>
             ) : (
               <ExperimentsList
-                key={scope}
                 initialItems={page.items}
                 initialTotal={page.total}
-                scope={scope}
               />
             )}
           </section>

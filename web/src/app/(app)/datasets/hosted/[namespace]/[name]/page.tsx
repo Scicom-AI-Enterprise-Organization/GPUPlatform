@@ -31,7 +31,7 @@ export default async function HostedDatasetDetailPage({
   // (redirect() must be OUTSIDE the try — it throws NEXT_REDIRECT.)
   let linkedDatasetId: string | null = null;
   try {
-    const datasets = await gateway.listDatasets(me.is_admin ? "all" : "mine");
+    const datasets = await gateway.listDatasets();
     linkedDatasetId = datasets.find((d) => d.catalog_repo_id === repo.id)?.id ?? null;
   } catch {
     /* if the lookup fails, just show the hosted repo page */

@@ -23,7 +23,7 @@ function errText(body: unknown, fallback: string): string {
   return fallback;
 }
 
-const DEFAULT_BASE_URL = "https://serverlessgpu.aies.scicom.dev/proxy/for-agentic/v1";
+const DEFAULT_BASE_URL = "https://inferencegpu.aies.scicom.dev/proxy/for-agentic/v1";
 const DEFAULT_MODEL = "google/gemma-4-31b-it";
 
 /**

@@ -410,11 +410,11 @@ function recHref(kind: string, j: HistoryJob): string | null {
       return `/compute/${j.id}`;
     case "endpoint": {
       const appId = str(detail.app_id);
-      return detail.still_exists && appId ? `/serverless/${appId}` : null;
+      return detail.still_exists && appId ? `/inference/${appId}` : null;
     }
     case "inference": {
       const appId = str(detail.app_id);
-      return appId ? `/serverless/${appId}` : null;
+      return appId ? `/inference/${appId}` : null;
     }
     default:
       return null;
@@ -2941,7 +2941,7 @@ export function AnalyticsView() {
                   />
                   <Input
                     value={a.label}
-                    placeholder="TM-VM1"
+                    placeholder="gpu-vm1"
                     className="h-8 text-xs"
                     onChange={(e) =>
                       setDraftAliases(

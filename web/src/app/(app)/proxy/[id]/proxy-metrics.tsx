@@ -41,7 +41,7 @@ import {
   REFRESH_MS,
   type Sample,
   type Bucket,
-} from "@/app/(app)/serverless/[id]/tabs/metrics";
+} from "@/app/(app)/inference/[id]/tabs/metrics";
 
 const REQ_TOTAL = "proxy_requests_total";
 const DUR = "proxy_request_duration_seconds";

@@ -71,12 +71,10 @@ export function DatasetsList({
   initialItems,
   initialTotal,
   hosted,
-  scope,
 }: {
   initialItems: DatasetRecord[];
   initialTotal: number;
   hosted: DatasetRecord[];
-  scope: "mine" | "all";
 }) {
   const router = useRouter();
   const sp = useSearchParams();
@@ -269,7 +267,6 @@ export function DatasetsList({
     setLoading(true);
     try {
       const res = await gateway.listDatasetsPage({
-        scope,
         q: qDebounced,
         kind: source === "all" || source === "hosted" ? "" : source,
         sort,
@@ -285,7 +282,7 @@ export function DatasetsList({
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
-  }, [scope, qDebounced, source, sort, currentPage, pageSize]);
+  }, [qDebounced, source, sort, currentPage, pageSize]);
 
   // Refetch when a filter/sort/page changes. The SSR payload already covers the
   // default first page, so the very first run is skipped when state matches the

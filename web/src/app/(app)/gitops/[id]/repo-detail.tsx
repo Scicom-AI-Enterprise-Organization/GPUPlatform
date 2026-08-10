@@ -18,7 +18,7 @@ import { SyncStatusPill, fmtWhen } from "../gitops-shared";
 function hrefFor(kind: string, id: string | null): string | null {
   if (!id) return null;
   switch (kind) {
-    case "app": return `/serverless/${encodeURIComponent(id)}`;
+    case "app": return `/inference/${encodeURIComponent(id)}`;
     case "dataset": return `/datasets/${encodeURIComponent(id)}`;
     case "benchmark": return `/benchmark/${encodeURIComponent(id)}`;
     case "training_run": return `/autotrain/${encodeURIComponent(id)}`;

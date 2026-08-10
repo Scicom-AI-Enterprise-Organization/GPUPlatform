@@ -26,7 +26,7 @@ async function loadJson<T>(path: string, token: string, fallback: T): Promise<T>
 export default async function SecretsPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const jar = await cookies();
   const token = jar.get(TOKEN_COOKIE)?.value ?? "";

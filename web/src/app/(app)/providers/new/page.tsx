@@ -7,7 +7,7 @@ import { ProviderForm } from "./provider-form";
 export default async function NewProviderPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
   const username = await currentUsername();
   return (
     <div className="flex h-full flex-col">

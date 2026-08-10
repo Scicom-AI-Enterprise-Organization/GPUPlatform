@@ -88,6 +88,11 @@ import type {
   CustomEvaluatorSpec,
   CustomEvaluatorTestRequest,
   CustomEvaluatorTestResponse,
+  CustomSandboxRecord,
+  CustomSandboxSpec,
+  CustomSandboxTestRequest,
+  CustomSandboxTestResponse,
+  SandboxRegistry,
   ExperimentLimits,
   ExperimentDatasetOption,
   ExperimentRowPreview,
@@ -248,8 +253,8 @@ function pageQs(p: PageQuery): string {
 
 export const gateway = {
   baseUrl: PUBLIC_BASE,
-  listApps: (scope: "mine" | "all" = "mine") =>
-    request<AppRecord[]>(`/apps?scope=${scope}`),
+  listApps: () =>
+    request<AppRecord[]>(`/apps`),
   getApp: (id: string) => request<AppRecord>(`/apps/${encodeURIComponent(id)}`),
   createApp: (body: CreateAppRequest) =>
     request<CreateAppResponse>("/apps", {
@@ -366,14 +371,14 @@ export const gateway = {
     }),
 
   // ---- Benchmarks ----
-  listBenchmarks: (scope: "mine" | "all" = "mine") =>
-    request<BenchmarkRecord[]>(`/benchmarks?scope=${scope}`),
+  listBenchmarks: () =>
+    request<BenchmarkRecord[]>(`/benchmarks`),
   /** Server-paginated list — fetch page-by-page instead of every record. */
   listBenchmarksPage: (p: PageQuery = {}) =>
     request<PageResponse<BenchmarkRecord>>(`/benchmarks/_page?${pageQs(p)}`),
   /** Slim per-run stats for the dashboard KPI row (all runs, tiny payload). */
-  benchmarkStats: (scope: "mine" | "all" = "mine") =>
-    request<BenchStat[]>(`/benchmarks/_stats?scope=${scope}`),
+  benchmarkStats: () =>
+    request<BenchStat[]>(`/benchmarks/_stats`),
   getBenchmark: (id: string) =>
     request<BenchmarkRecord>(`/benchmarks/${encodeURIComponent(id)}`),
   renameBenchmark: (id: string, name: string) =>
@@ -447,8 +452,8 @@ export const gateway = {
     `/api/proxy/benchmarks/${encodeURIComponent(id)}/files/content?path=${encodeURIComponent(name)}`,
 
   // ---- Autotrain runs ----
-  listTrainingRuns: (scope: "mine" | "all" = "mine") =>
-    request<TrainingRunRecord[]>(`/v1/training-runs?scope=${scope}`),
+  listTrainingRuns: () =>
+    request<TrainingRunRecord[]>(`/v1/training-runs`),
   /** Server-paginated list — result_json slimmed to `best` per run. */
   listTrainingRunsPage: (p: PageQuery = {}) =>
     request<PageResponse<TrainingRunRecord>>(`/v1/training-runs/_page?${pageQs(p)}`),
@@ -662,8 +667,8 @@ export const gateway = {
   // ---- Quantization jobs (llm-compressor) ----
   listQuantizationSchemes: () =>
     request<QuantizationSchemesResponse>("/v1/quantization-jobs/schemes"),
-  listQuantizationJobs: (scope: "mine" | "all" = "mine") =>
-    request<QuantizationJobRecord[]>(`/v1/quantization-jobs?scope=${scope}`),
+  listQuantizationJobs: () =>
+    request<QuantizationJobRecord[]>(`/v1/quantization-jobs`),
   listQuantizationJobsPage: (p: PageQuery = {}) =>
     request<PageResponse<QuantizationJobRecord>>(`/v1/quantization-jobs/_page?${pageQs(p)}`),
   getQuantizationJob: (id: string) =>
@@ -817,8 +822,8 @@ export const gateway = {
     ),
 
   // ---- Cross-benchmark aggregate (one point per result.json across all benches) ----
-  aggregateBenchmarks: (scope: "mine" | "all" = "mine") =>
-    request<AggregatePoint[]>(`/benchmarks/_aggregate?scope=${scope}`),
+  aggregateBenchmarks: () =>
+    request<AggregatePoint[]>(`/benchmarks/_aggregate`),
 
   // ---- Benchmark templates ----
   listBenchmarkTemplates: () =>
@@ -835,8 +840,8 @@ export const gateway = {
     ),
 
   // ---- Compute ----
-  listCompute: (scope: "mine" | "all" = "mine") =>
-    request<ComputePod[]>(`/compute?scope=${scope}`),
+  listCompute: () =>
+    request<ComputePod[]>(`/compute`),
   getCompute: (id: string) =>
     request<ComputePod>(`/compute/${encodeURIComponent(id)}`),
   createCompute: (body: CreateComputeRequest) =>
@@ -1150,8 +1155,8 @@ export const gateway = {
     request<EvalProxyRedTeamResult>("/v1/proxy/red-team/evaluate", { method: "POST", body: JSON.stringify(body) }),
 
   // ---- Datasets (Autotrain) ----
-  listDatasets: (scope: "mine" | "all" = "mine") =>
-    request<DatasetRecord[]>(`/v1/datasets?scope=${scope}`),
+  listDatasets: () =>
+    request<DatasetRecord[]>(`/v1/datasets`),
   /** Server-paginated list — `kind` filters the dataset source. */
   listDatasetsPage: (p: PageQuery = {}) =>
     request<PageResponse<DatasetRecord>>(`/v1/datasets/_page?${pageQs(p)}`),
@@ -1215,10 +1220,11 @@ export const gateway = {
     ),
 
   // ---- Model/Dataset catalog (self-hosted HuggingFace mirror) ----
-  listCatalog: (scope: "mine" | "all" = "mine", repoType?: CatalogRepoType) => {
-    const q = new URLSearchParams({ scope });
+  listCatalog: (repoType?: CatalogRepoType) => {
+    const q = new URLSearchParams();
     if (repoType) q.set("repo_type", repoType);
-    return request<CatalogRecord[]>(`/v1/catalog?${q.toString()}`);
+    const qs = q.toString();
+    return request<CatalogRecord[]>(`/v1/catalog${qs ? `?${qs}` : ""}`);
   },
   getCatalogRepo: (id: string, revision?: string) => {
     const q = revision ? `?revision=${encodeURIComponent(revision)}` : "";
@@ -1430,6 +1436,33 @@ export const gateway = {
   /** Dry-run an evaluator against one sample reply before committing to a run. */
   testCustomEvaluator: (body: CustomEvaluatorTestRequest) =>
     request<CustomEvaluatorTestResponse>("/v1/custom-evaluators/test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // ---- Sandboxes (multi-turn tool replay) ----
+  /** Mode descriptors + the caller's library. Server-driven like the evaluator
+   * registry: a new mode in sandbox.py needs no change in the web app. */
+  listSandboxes: () => request<SandboxRegistry>("/v1/experiments/sandboxes"),
+  listCustomSandboxes: () => request<CustomSandboxRecord[]>("/v1/custom-sandboxes"),
+  createCustomSandbox: (body: CustomSandboxSpec) =>
+    request<CustomSandboxRecord>("/v1/custom-sandboxes", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateCustomSandbox: (id: string, body: Partial<CustomSandboxSpec>) =>
+    request<CustomSandboxRecord>(`/v1/custom-sandboxes/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteCustomSandbox: (id: string) =>
+    request<{ ok: boolean }>(`/v1/custom-sandboxes/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  /** Resolve ONE tool call against ONE row. The cost guard: a sandbox that
+   * answers nothing still produces trajectories the detectors will score. */
+  testCustomSandbox: (body: CustomSandboxTestRequest) =>
+    request<CustomSandboxTestResponse>("/v1/custom-sandboxes/test", {
       method: "POST",
       body: JSON.stringify(body),
     }),

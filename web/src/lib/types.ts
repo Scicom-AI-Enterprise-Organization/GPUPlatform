@@ -256,6 +256,7 @@ export type PageQuery = {
   scope?: "mine" | "all";
   q?: string;
   status?: string; // benchmarks + training runs (datasets use `kind`)
+  task_type?: string; // training runs: asr | tts | llm
   kind?: string; // datasets source filter
   sort?: "newest" | "oldest";
   limit?: number;
@@ -2218,9 +2219,94 @@ export type EvaluatorRegistry = {
   custom_context?: CustomEvaluatorContext;
 };
 
+// ---- Sandboxes (multi-turn tool replay) ---------------------------------
+// Mirrors gateway/gateway/sandbox.py + the CustomSandbox model. A sandbox is the
+// thing that ANSWERS a model's tool call during a replay, turning "one request
+// per row" into a conversation. Like a custom evaluator, an experiment snapshots
+// the definition at create time — so editing one here never changes what a
+// finished run meant.
+
+export type CustomSandboxRecord = {
+  id: string;
+  name: string;
+  description: string;
+  mode: "replay" | "api" | "llm" | "python" | string;
+  code: string;
+  /** {replay: {...}} / {api: {...}} / {loop: {...}} — never holds a secret. */
+  config: Record<string, unknown>;
+  owner: string;
+  created_at: string;
+  updated_at: string | null;
+};
+
+export type CustomSandboxSpec = {
+  name: string;
+  description?: string;
+  mode: string;
+  code?: string;
+  config?: Record<string, unknown>;
+};
+
+/** Server-driven mode descriptors + the caller's library, in one fetch. Adding a
+ * mode in sandbox.py must need no change in the web directory. */
+export type SandboxRegistry = {
+  modes: Array<{
+    id: string;
+    label: string;
+    description: string;
+    implemented: boolean;
+    options: EvaluatorOption[];
+  }>;
+  loop_options: EvaluatorOption[];
+  implemented_modes: string[];
+  max_tool_rounds_cap: number;
+  sandboxes: CustomSandboxRecord[];
+  python_allowed: boolean;
+};
+
+export type CustomSandboxTestRequest = {
+  mode: string;
+  code?: string;
+  config?: Record<string, unknown>;
+  tool_call?: Record<string, unknown>;
+  expected?: Record<string, unknown>;
+  dataset_id?: string;
+  row_index?: number;
+};
+
+export type CustomSandboxTestResponse = {
+  ok: boolean;
+  row?: string | null;
+  /** replay probe (no tool call given): what the row's seed offers. */
+  seed_entries?: number;
+  seed_names?: string[];
+  /** resolved-call shape. */
+  content?: string;
+  provenance?: string;
+  matched?: string;
+  novel?: boolean;
+  error?: string | null;
+  loop?: Record<string, unknown>;
+};
+
+/** What a run sends: a library entry by id, or an inline definition. */
+export type SandboxSelection = {
+  id?: string | null;
+  name?: string | null;
+  mode?: string | null;
+  code?: string | null;
+  config?: Record<string, unknown>;
+};
+
 /** Run-size ceilings, so the form can enforce them before submit. */
 export type ExperimentLimits = {
   max_units: number;
+  /** ⚠ The cap that actually bounds spend once a sandbox is set: one row is up
+   * to (max_tool_rounds + 1) billed calls. The form must price a sandboxed run
+   * in CALLS, and that arithmetic has to match the server. */
+  max_calls: number;
+  max_tool_rounds_cap: number;
+  default_max_tool_rounds: number;
   max_rows: number;
   max_concurrency: number;
   default_concurrency: number;
@@ -2357,6 +2443,8 @@ export type CreateExperimentRequest = {
   targets: ExperimentTargetSpec[];
   variants?: ExperimentVariantSpec[];
   evaluators?: EvaluatorSelection[];
+  /** Omitted = one request per row, which is the default and today's behaviour. */
+  sandbox?: SandboxSelection;
   repeats?: number;
   concurrency?: number;
   retries?: number;
@@ -2395,6 +2483,24 @@ export type ExperimentCell = {
   cost_usd_total: number | null;
   cost_usd_mean: number | null;
   evals: Record<string, ExperimentEvalStat>;
+  /** Only for a sandboxed run. These are the anti-silent-no-op numbers: a broken
+   * sandbox still produces trajectories the detectors will happily score. */
+  sandbox?: {
+    trajectories: number;
+    rounds_mean: number;
+    rounds_max: number;
+    tool_calls: number;
+    novel_calls: number;
+    /** High in replay mode = the run measured seed coverage, not the model. */
+    novel_call_rate: number;
+    forced_final: number;
+    /** High = the run measured the round limit, not the model. */
+    forced_final_rate: number;
+    aborted: number;
+    provenance: Record<string, number>;
+    /** Every tool response failed — a failed run, not a 100% pass. */
+    all_errors: boolean;
+  };
 };
 
 export type ExperimentSummary = {
@@ -2446,6 +2552,32 @@ export type ExperimentSampleRecord = {
   status_code: number | null;
   error_text: string | null;
   evals: Record<string, ExperimentSampleEval>;
+  /** The multi-turn transcript, present only for a sandboxed replay. Tool
+   * results are truncated before model turns, and anything trimmed is marked. */
+  trajectory?: ExperimentTrajectory | null;
+};
+
+export type ExperimentTrajectoryMessage = {
+  role: "assistant" | "tool" | string;
+  content: string;
+  tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
+  tool_call_id?: string;
+  name?: string;
+  /** seed | cache | api | llm | python | error — how this tool result was answered. */
+  _provenance?: string;
+  truncated?: boolean;
+};
+
+export type ExperimentTrajectory = {
+  messages: ExperimentTrajectoryMessage[];
+  rounds: number;
+  forced_final: boolean;
+  tool_calls_total: number;
+  novel_calls: number;
+  provenance: Record<string, number>;
+  turns: number;
+  error: string | null;
+  error_round: number | null;
 };
 
 // ---- Prompt optimization (GEPA) -----------------------------------------

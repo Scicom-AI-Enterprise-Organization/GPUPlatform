@@ -50,9 +50,9 @@ export async function GET(req: NextRequest) {
 }
 
 function sanitizeNext(raw: string | null): string {
-  // Only allow same-origin paths; otherwise default to /serverless. Stops
+  // Only allow same-origin paths; otherwise default to /inference. Stops
   // an attacker turning the SSO flow into an open redirect.
-  if (!raw) return "/serverless";
-  if (!raw.startsWith("/") || raw.startsWith("//")) return "/serverless";
+  if (!raw) return "/inference";
+  if (!raw.startsWith("/") || raw.startsWith("//")) return "/inference";
   return raw;
 }

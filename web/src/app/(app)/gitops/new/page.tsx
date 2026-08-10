@@ -7,7 +7,7 @@ import { RepoForm } from "./repo-form";
 export default async function NewGitopsRepoPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
   const username = await currentUsername();
   return (
     <div className="flex h-full flex-col">

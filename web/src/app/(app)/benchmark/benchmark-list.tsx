@@ -41,12 +41,10 @@ type StatusFilter = (typeof STATUS_OPTIONS)[number];
 export function BenchmarkList({
   initialItems,
   initialTotal,
-  scope,
   isAdmin = false,
 }: {
   initialItems: BenchmarkRecord[];
   initialTotal: number;
-  scope: "mine" | "all";
   isAdmin?: boolean;
 }) {
   const router = useRouter();
@@ -113,7 +111,6 @@ export function BenchmarkList({
       setLoading(true);
       try {
         const res = await gateway.listBenchmarksPage({
-          scope,
           q: qDebounced,
           status: status === "all" ? "" : status,
           sort,
@@ -131,7 +128,7 @@ export function BenchmarkList({
         if (!signal?.cancelled) setLoading(false);
       }
     },
-    [scope, qDebounced, status, sort, pageSize, currentPage],
+    [qDebounced, status, sort, pageSize, currentPage],
   );
 
   // Refetch whenever a server-side input changes. The ref skips the very first

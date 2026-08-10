@@ -771,13 +771,12 @@ async def create_quantization_job(
 
 @router.get("", response_model=list[QuantizationJobRecord])
 async def list_quantization_jobs(
-    scope: str = "mine",
     user: User = Depends(require_section("quantization")),
     session: AsyncSession = Depends(get_session),
 ):
     q = select(QuantizationJob).order_by(QuantizationJob.created_at.desc())
-    if not (scope == "all" and user.is_admin):
-        q = q.where(QuantizationJob.owner_id == user.id)
+        # Everyone with the section sees every row — section access IS the
+        # boundary here, so there is no mine-vs-all split (see main.list_apps).
     rows = (await session.execute(q)).scalars().all()
     names: dict[int, str] = {}
     for row in rows:
@@ -789,7 +788,6 @@ async def list_quantization_jobs(
 
 @router.get("/_page", response_model=QuantizationJobPageResponse)
 async def list_quantization_jobs_page(
-    scope: str = "mine",
     q: str = "",
     status: str = "",
     sort: str = "newest",
@@ -799,8 +797,8 @@ async def list_quantization_jobs_page(
     session: AsyncSession = Depends(get_session),
 ):
     stmt = select(QuantizationJob)
-    if not (scope == "all" and user.is_admin):
-        stmt = stmt.where(QuantizationJob.owner_id == user.id)
+        # Everyone with the section sees every row — section access IS the
+        # boundary here, so there is no mine-vs-all split (see main.list_apps).
     if status:
         stmt = stmt.where(QuantizationJob.status == status)
     for tok in (q or "").lower().split():

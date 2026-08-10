@@ -23,7 +23,7 @@ const PAGE = 100;
  * exactly 0 (empty/broken registrations — NOT null, which just means the count
  * is unknown) and delete their records. S3 files are left in place (purge=false)
  * since a 0-row dataset has nothing meaningful stored. */
-export function PurgeEmptyButton({ scope }: { scope: "mine" | "all" }) {
+export function PurgeEmptyButton() {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -39,7 +39,7 @@ export function PurgeEmptyButton({ scope }: { scope: "mine" | "all" }) {
       const found: DatasetRecord[] = [];
       let offset = 0;
       for (;;) {
-        const res = await gateway.listDatasetsPage({ scope, limit: PAGE, offset });
+        const res = await gateway.listDatasetsPage({ limit: PAGE, offset });
         found.push(...res.items.filter((d) => d.num_rows === 0));
         offset += res.items.length;
         if (res.items.length < PAGE || offset >= res.total) break;
@@ -50,7 +50,7 @@ export function PurgeEmptyButton({ scope }: { scope: "mine" | "all" }) {
     } finally {
       setScanning(false);
     }
-  }, [scope]);
+  }, []);
 
   const openDialog = () => {
     setOpen(true);
@@ -105,7 +105,7 @@ export function PurgeEmptyButton({ scope }: { scope: "mine" | "all" }) {
             <DialogTitle>Purge empty datasets</DialogTitle>
             <DialogDescription>
               Deletes the records of datasets with <span className="font-medium text-foreground">0 rows</span>
-              {scope === "all" ? " across all users" : ""}. Files in storage are left in place.
+              . Files in storage are left in place.
             </DialogDescription>
           </DialogHeader>
 

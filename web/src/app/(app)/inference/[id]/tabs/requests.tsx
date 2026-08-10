@@ -136,7 +136,7 @@ export function RequestsTab({ app, appId }: { app?: AppRecord; appId?: string } 
 }
 
 function useAppIdFromPath(): string {
-  // Avoids next/navigation params plumbing — the URL is /serverless/<id>.
+  // Avoids next/navigation params plumbing — the URL is /inference/<id>.
   const [id, setId] = useState<string>("");
   useEffect(() => {
     const seg = window.location.pathname.split("/").filter(Boolean);

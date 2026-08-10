@@ -195,9 +195,10 @@ async def list_catalog(
     user: User = Depends(_catalog),
     session: AsyncSession = Depends(get_session),
 ):
+    # Everyone with the section sees every repo — see main.list_apps. (A repo's
+    # own `private` flag still governs the HF-mirror read path, which is a
+    # different question from what this catalog list shows.)
     q = select(CatalogRepo).order_by(CatalogRepo.updated_at.desc())
-    if scope != "all":
-        q = q.where(CatalogRepo.owner_id == user.id)
     if repo_type in ("model", "dataset"):
         q = q.where(CatalogRepo.repo_type == repo_type)
     rows = list((await session.execute(q)).scalars().all())

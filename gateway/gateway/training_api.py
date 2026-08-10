@@ -3466,6 +3466,32 @@ async def _create_and_launch_run(
         st = await session.get(Storage, body.storage_id)
         if st is None or st.kind != "s3" or not st.enabled:
             raise HTTPException(status_code=400, detail="storage must be an enabled s3 backend")
+    elif not body.pack_only:
+        # ⚠ NO STORAGE = THE TRAINED MODEL IS SILENTLY THROWN AWAY. The trainer
+        # uploads only `if art.get("bucket")`; with no storage_id the bucket falls
+        # back to $BENCHMARK_S3_BUCKET, and when that is unset too the upload is
+        # skipped with no warning — then the work dir is cleaned and the weights
+        # are gone. That cost a full 3-epoch 8xH20 DPO run (train-fdf7cd97, 4h41m,
+        # exit 0, "Saved LoRA (460 tensors)", @@ARTIFACT s3_uri=null, nothing in S3).
+        # Auto-pick the first enabled S3 storage instead, matching the datasets
+        # convention ("leave blank to auto-pick"), and only fail when there is
+        # genuinely nowhere to put a checkpoint.
+        picked = (await session.execute(
+            select(Storage).where(Storage.kind == "s3", Storage.enabled.is_(True))
+            .order_by(Storage.created_at).limit(1)
+        )).scalars().first()
+        if picked is not None:
+            body.storage_id = picked.id
+            logger.info("training run: no storage_id given — auto-picked %s (%s) so the "
+                        "checkpoint has somewhere to land", picked.id, picked.name)
+        elif not os.environ.get("BENCHMARK_S3_BUCKET", "").strip() and not body.hf_push_repo:
+            raise HTTPException(
+                status_code=400,
+                detail=("no storage to save the trained model to: pass storage_id (an enabled "
+                        "kind=s3 storage), set hf_push_repo, or configure BENCHMARK_S3_BUCKET. "
+                        "Without one the run would train to completion and discard the "
+                        "checkpoint."),
+            )
     # On a VM the hardware is fixed by the box, so the RunPod-pod knobs
     # (gpu_type / secure_cloud / disk_gb / volume_gb) don't apply — reflect the
     # VM's actual GPU and drop the cloud-only fields so the config tab isn't
@@ -4088,7 +4114,6 @@ async def reconnect_training_run(
 
 @router.get("", response_model=list[TrainingRunRecord])
 async def list_training_runs(
-    scope: str = "mine",
     user: User = Depends(require_section("autotrain")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -4097,9 +4122,9 @@ async def list_training_runs(
     shipping them for EVERY run made this the slowest list endpoint in the API,
     ~146ms p50 at 60 runs and growing linearly). The full record still comes
     from GET /{run_id}."""
+    # Everyone with the section sees every run — see list_apps for why there's no
+    # mine-vs-all split anywhere on this platform.
     q = select(TrainingRun).order_by(TrainingRun.created_at.desc())
-    if not (scope == "all" and user.is_admin):
-        q = q.where(TrainingRun.owner_id == user.id)
     rows = (await session.execute(q)).scalars().all()
     # owner username map — one IN query, not one session.get per owner
     names: dict[int, str] = {}
@@ -4123,9 +4148,9 @@ class TrainingRunPageResponse(BaseModel):
 
 @router.get("/_page", response_model=TrainingRunPageResponse)
 async def list_training_runs_page(
-    scope: str = "mine",
     q: str = "",
     status: str = "",
+    task_type: str = "",
     sort: str = "newest",
     limit: int = Query(12, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -4140,10 +4165,15 @@ async def list_training_runs_page(
     comes from GET /{run_id}. Declared before /{run_id} (declaration-order
     matching); the plain list endpoint above stays for back-compat."""
     stmt = select(TrainingRun)
-    if not (scope == "all" and user.is_admin):
-        stmt = stmt.where(TrainingRun.owner_id == user.id)
+        # Everyone with the section sees every row — section access IS the
+        # boundary here, so there is no mine-vs-all split (see main.list_apps).
     if status:
         stmt = stmt.where(TrainingRun.status == status)
+    if task_type:
+        # Server-side like `status`, so the filter covers EVERY run rather than
+        # whichever page happens to be loaded. Case-insensitive because task_type
+        # is free-form text on the row, not an enum.
+        stmt = stmt.where(func.lower(TrainingRun.task_type) == task_type.strip().lower())
     if not include_children:
         # Hide multi-node sweep child trials by default — they're real TrainingRun
         # rows (so logs/hf-export/etc. work unmodified) but only the parent sweep

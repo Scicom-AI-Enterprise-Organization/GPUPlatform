@@ -20,7 +20,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { CustomEvaluatorEditor } from "./custom-evaluator-editor";
 
 const MODE_ICON: Record<string, React.ElementType> = {
   expression: Wand2,
@@ -30,12 +29,9 @@ const MODE_ICON: Record<string, React.ElementType> = {
 
 export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry }) {
   const [customs, setCustoms] = useState<CustomEvaluatorRecord[]>(registry.custom ?? []);
-  const [editorOpen, setEditorOpen] = useState(false);
-  const [editing, setEditing] = useState<CustomEvaluatorRecord | null>(null);
   const [pending, setPending] = useState<CustomEvaluatorRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [builtinQ, setBuiltinQ] = useState("");
-  const context = registry.custom_context;
 
   // Filter is over label/id/description — NEVER a hardcoded id list. The registry
   // is server-driven, so adding a detector in evaluators.py must need no change here.
@@ -82,39 +78,16 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
               the definition, so editing one here never changes what a finished run measured.
             </p>
           </div>
-          {!editorOpen && (
-            <Button
-              size="sm"
-              onClick={() => {
-                setEditing(null);
-                setEditorOpen(true);
-              }}
-            >
+          <Button asChild size="sm">
+            <Link href="/experiments/evaluators/new">
               <Plus className="h-4 w-4" />
               New evaluator
-            </Button>
-          )}
+            </Link>
+          </Button>
         </div>
 
-        {editorOpen && context && (
-          <div className="mb-3">
-            <CustomEvaluatorEditor
-              context={context}
-              editing={editing}
-              onCancel={() => {
-                setEditorOpen(false);
-                setEditing(null);
-              }}
-              onSaved={(row) => {
-                setCustoms((xs) => [row, ...xs.filter((x) => x.id !== row.id)]);
-                setEditorOpen(false);
-                setEditing(null);
-              }}
-            />
-          </div>
-        )}
 
-        {customs.length === 0 && !editorOpen ? (
+        {customs.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border bg-card px-6 py-14 text-center">
             <Inbox className="h-6 w-6 text-muted-foreground/60" />
             <p className="max-w-md text-sm text-muted-foreground">
@@ -160,16 +133,13 @@ export function EvaluatorsManager({ registry }: { registry: EvaluatorRegistry })
                     </pre>
                   </div>
                   <div className="flex shrink-0 items-center gap-1">
-                    <button
-                      onClick={() => {
-                        setEditing(c);
-                        setEditorOpen(true);
-                      }}
+                    <Link
+                      href={`/experiments/evaluators/new?id=${c.id}`}
                       title="Edit"
                       className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                     >
                       <Pencil className="h-3.5 w-3.5" />
-                    </button>
+                    </Link>
                     <button
                       onClick={() => setPending(c)}
                       title="Delete"

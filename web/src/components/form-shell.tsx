@@ -1,6 +1,6 @@
 "use client";
 
-// Shared shell for the long "create X" forms (/autotrain/new, /serverless/new,
+// Shared shell for the long "create X" forms (/autotrain/new, /inference/new,
 // /benchmark/new). Three problems it solves, uniformly:
 //
 //   1. Width — the forms used to sprawl the full content area; the shell caps the

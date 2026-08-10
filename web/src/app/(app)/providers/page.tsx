@@ -21,7 +21,7 @@ async function loadProviders(): Promise<{ items: ProviderRecord[]; error: string
 export default async function ProvidersPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const [{ items, error }, username] = await Promise.all([
     loadProviders(),

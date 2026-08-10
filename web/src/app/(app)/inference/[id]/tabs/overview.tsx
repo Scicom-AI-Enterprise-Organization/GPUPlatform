@@ -1000,7 +1000,7 @@ function RequestPanel({ app }: { app: AppRecord }) {
                 </Link>
               )
             ) : (
-              <Link href="/login?next=/serverless" className="text-xs text-primary hover:underline">
+              <Link href="/login?next=/inference" className="text-xs text-primary hover:underline">
                 Sign in to use your key
               </Link>
             )

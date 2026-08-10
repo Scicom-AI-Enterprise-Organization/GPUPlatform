@@ -96,11 +96,9 @@ function rateBar(rate: number) {
 export function ExperimentsList({
   initialItems,
   initialTotal,
-  scope,
 }: {
   initialItems: ExperimentRecord[];
   initialTotal: number;
-  scope: "mine" | "all";
 }) {
   const sp = useSearchParams();
   const [q, setQ] = useState(() => sp.get("q") ?? "");
@@ -131,7 +129,6 @@ export function ExperimentsList({
     setLoading(true);
     try {
       const res = await gateway.listExperimentsPage({
-        scope,
         q: qDebounced,
         status: status === "all" ? "" : status,
         sort,
@@ -145,7 +142,7 @@ export function ExperimentsList({
     } finally {
       setLoading(false);
     }
-  }, [scope, qDebounced, status, sort, page, pageSize]);
+  }, [qDebounced, status, sort, page, pageSize]);
 
   // Skip the first run: the server component already rendered this exact page.
   const bootedRef = useRef(false);

@@ -682,10 +682,8 @@ async def list_datasets(
     user: User = Depends(require_section("datasets")),
     session: AsyncSession = Depends(get_session),
 ):
-    show_all = user.is_admin and scope == "all"
+    # Everyone with the section sees every dataset — see main.list_apps.
     stmt = select(Dataset).order_by(Dataset.created_at.desc())
-    if not show_all:
-        stmt = select(Dataset).where(Dataset.owner_id == user.id).order_by(Dataset.created_at.desc())
     rows = list((await session.execute(stmt)).scalars().all())
     owners = await _owner_map(session, rows)
     storages = await _storage_name_map(session, rows)
@@ -714,8 +712,6 @@ async def list_datasets_page(
     (declaration-order matching); the plain list endpoint above stays for
     back-compat."""
     stmt = select(Dataset)
-    if not (user.is_admin and scope == "all"):
-        stmt = stmt.where(Dataset.owner_id == user.id)
     if kind:
         stmt = stmt.where(Dataset.kind == kind)
     # Multi-token search (every token must match), mirroring the old client-side

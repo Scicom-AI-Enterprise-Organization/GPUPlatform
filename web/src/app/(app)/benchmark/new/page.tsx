@@ -39,7 +39,7 @@ export default async function NewBenchmarkPage({
         username={username}
       />
       {/* Inner scroller with symmetric vertical padding (mirrors
-          /serverless/new) so the action bar keeps bottom breathing room.
+          /inference/new) so the action bar keeps bottom breathing room.
           `relative` makes this the containing block for any out-of-flow
           descendant — notably Radix <Switch>'s hidden form-bubble <input>
           (position:absolute, no positioned ancestor of its own). Without it

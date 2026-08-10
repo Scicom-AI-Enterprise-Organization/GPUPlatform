@@ -519,7 +519,7 @@ function EndpointCard({
 
   return (
     <Link
-      href={`/serverless/${encodeURIComponent(app.app_id)}`}
+      href={`/inference/${encodeURIComponent(app.app_id)}`}
       className={cn(base, "hover:border-primary/40 hover:bg-card/80 hover:shadow-md")}
     >
       {inner}

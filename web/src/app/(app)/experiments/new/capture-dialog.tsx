@@ -362,7 +362,7 @@ function LangfuseCapture({
       <div className="space-y-2">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <Label>API keys</Label>
-          {/* Same segmented toggle as the HF-token field on /serverless/new. */}
+          {/* Same segmented toggle as the HF-token field on /inference/new. */}
           <div className="inline-flex rounded-md border border-border p-0.5 text-xs">
             {(["secret", "paste"] as const).map((src) => (
               <button

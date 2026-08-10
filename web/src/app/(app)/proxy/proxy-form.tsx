@@ -371,7 +371,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const openRedTeamEval = () => {
     setRtEvalOpen(true);
     if (rtDatasets.length) return;
-    gateway.listDatasets("all")
+    gateway.listDatasets()
       .then((rows) => setRtDatasets(Array.isArray(rows) ? rows : []))
       .catch(() => {});
   };
@@ -1176,7 +1176,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           <div className="md:col-span-7">
             <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">STT base URL</Label>
             <Input value={sttBase} onChange={(e) => setSttBase(e.target.value)}
-                   placeholder="https://serverlessgpu.aies.scicom.dev/proxy/stt/v1" className="font-mono text-xs" />
+                   placeholder="https://inferencegpu.aies.scicom.dev/proxy/stt/v1" className="font-mono text-xs" />
           </div>
           <div className="md:col-span-5">
             <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">STT model</Label>

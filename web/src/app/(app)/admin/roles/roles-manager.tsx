@@ -20,7 +20,7 @@ import { cn } from "@/lib/utils";
 
 const SECTIONS: SectionKey[] = ["inference", "benchmark", "compute", "datasets", "quantization", "catalog", "experiments"];
 const SECTION_LABEL: Record<SectionKey, string> = {
-  inference: "Serverless Inference",
+  inference: "Inference",
   benchmark: "Benchmark",
   compute: "Compute",
   datasets: "Datasets",

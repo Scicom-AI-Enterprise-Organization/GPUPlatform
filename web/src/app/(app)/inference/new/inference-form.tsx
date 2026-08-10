@@ -88,13 +88,13 @@ const VLLM_NIGHTLY_ARGS =
   "-U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly/cu130 --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match";
 // Default vLLM version installed into the VM/pod venv when none is pinned.
 const DEFAULT_VLLM_VERSION = "0.23.0";
-// Huawei Ascend NPU (vllm-ascend) — matched pair verified on CANN 8.5.2 (the TM
+// Huawei Ascend NPU (vllm-ascend) — matched pair verified on CANN 8.5.2 (the
 // 910B3 box). One uv command: vLLM (its python layer; the NPU platform plugin
 // comes from vllm-ascend) + vllm-ascend from the Huawei wheel index. The worker
 // detects Ascend itself (venv python 3.11, CANN env, ASCEND_RT_VISIBLE_DEVICES).
 // Three sequential installs (one per line — the worker runs each line as its own
 // `uv pip install`): vllm and vllm-ascend pin conflicting torch versions so they
-// can't co-resolve; the trailing pins fix runtime imports on the TM box —
+// can't co-resolve; the trailing pins fix runtime imports on the NPU box —
 // setuptools<81 restores pkg_resources (torchair needs it) and the older
 // z3-solver is a manylinux2014 build (newer wheels need GLIBCXX_3.4.29, which
 // EulerOS hosts don't have). v0.18.0 is the newest STABLE pair for CANN 8.5.x —
@@ -107,7 +107,7 @@ const ASCEND_INSTALL_ARGS = [
     "--index-strategy unsafe-best-match",
   "setuptools<81 z3-solver==4.12.2.0",
 ].join("\n");
-// Big-disk default on the TM NPU box; editable like any venv path.
+// Big-disk default on the NPU box; editable like any venv path.
 const ASCEND_VENV_PATH = "/data/nvme0/sgpu/vllm-ascend-venv";
 // Custom vllm-ascend fork (git) — installed from SOURCE on the box: uv's isolated
 // build env supplies cmake/torch-npu (pyproject build requires), SOC_VERSION
@@ -565,7 +565,7 @@ export function InferenceForm() {
       return;
     }
     toast.success(`Endpoint ${res.app_id} created`, { duration: 4000 });
-    router.push(`/serverless/${encodeURIComponent(res.app_id)}`);
+    router.push(`/inference/${encodeURIComponent(res.app_id)}`);
   }
 
   function submit() {
@@ -2054,7 +2054,7 @@ export function InferenceForm() {
           : `${isVm ? "Bare metal" : "Cloud"} · ${mode === "single" ? "single model" : mode}`
         }
       >
-        <Button variant="ghost" onClick={() => router.push("/serverless")} disabled={pending}>
+        <Button variant="ghost" onClick={() => router.push("/inference")} disabled={pending}>
           Cancel
         </Button>
         <Button

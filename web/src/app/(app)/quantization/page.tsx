@@ -7,15 +7,13 @@ import { gateway } from "@/lib/gateway";
 import type { PageResponse, QuantizationJobRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
-import { ScopeToggle } from "@/components/scope-toggle";
 import { QuantizationList } from "./quantization-list";
 
 async function loadJobs(
-  scope: "mine" | "all",
 ): Promise<{ page: PageResponse<QuantizationJobRecord>; error: string | null }> {
   try {
     return {
-      page: await gateway.listQuantizationJobsPage({ scope, limit: 12, offset: 0 }),
+      page: await gateway.listQuantizationJobsPage({ limit: 12, offset: 0 }),
       error: null,
     };
   } catch (e) {
@@ -23,19 +21,13 @@ async function loadJobs(
   }
 }
 
-export default async function QuantizationPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ scope?: string }>;
-}) {
+export default async function QuantizationPage() {
   const me = await getMe();
   const sections = me?.sections as Record<string, boolean> | undefined;
   const noAccess = me ? !(me.is_admin || sections?.quantization) : false;
-  const sp = await searchParams;
-  const scope: "mine" | "all" = me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   const [{ page, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ page: { total: 0, items: [] }, error: null }) : loadJobs(scope),
+    noAccess ? Promise.resolve({ page: { total: 0, items: [] }, error: null }) : loadJobs(),
     currentUsername(),
   ]);
 
@@ -51,7 +43,6 @@ export default async function QuantizationPage({
               (data-free or calibrated on a dataset), and push the compressed model back.
             </p>
           </div>
-          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -69,7 +60,6 @@ export default async function QuantizationPage({
                 <h2 className="text-base font-medium">Quantization jobs</h2>
                 <span className="text-xs text-muted-foreground">
                   {page.total} {page.total === 1 ? "job" : "jobs"}
-                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <Button asChild size="sm">
@@ -90,10 +80,8 @@ export default async function QuantizationPage({
               </div>
             ) : (
               <QuantizationList
-                key={scope}
                 initialItems={page.items}
                 initialTotal={page.total}
-                scope={scope}
               />
             )}
           </section>

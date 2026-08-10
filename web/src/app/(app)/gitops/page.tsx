@@ -20,7 +20,7 @@ async function loadRepos(): Promise<{ items: GitopsRepo[]; error: string | null 
 export default async function GitopsPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const [{ items, error }, username] = await Promise.all([loadRepos(), currentUsername()]);
 

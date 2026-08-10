@@ -11,7 +11,7 @@ import { ActivityDashboard } from "./activity-dashboard";
 export default async function ActivityPage() {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
   return (
     <div className="flex h-full flex-col">
       <ConsoleTopbar crumbs={[{ label: "Activity" }]} username={me.username} />

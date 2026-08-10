@@ -94,7 +94,7 @@ export function ProvisionedList({
       status: "running",
       created_at: a.created_at,
       ready_at: a.created_at,
-      detail_href: `/serverless/${a.app_id}`,
+      detail_href: `/inference/${a.app_id}`,
       raw: a,
     }));
     return [...computeRows, ...appRows].sort((a, b) =>

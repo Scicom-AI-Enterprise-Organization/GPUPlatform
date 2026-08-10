@@ -6,7 +6,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { FlaskConical, Microscope, Wand2 } from "lucide-react";
+import { Boxes, FlaskConical, Microscope, Wand2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Datasets deliberately absent: experiments read from the platform's own
@@ -14,10 +14,14 @@ import { cn } from "@/lib/utils";
 // Optimize is a peer, not a sub-page of Runs: a GEPA search *uses* the same
 // datasets and evaluators, and its output is a prompt you then run an
 // experiment with — the two are siblings in the same loop.
+// Sandboxes is a peer for the same reason: it's a reusable resource (the thing
+// that ANSWERS a model's tool calls during a replay), not a per-run setting —
+// and like an evaluator, a run snapshots it rather than referencing it live.
 const TABS = [
   { label: "Runs", href: "/experiments", icon: Microscope },
   { label: "Optimize", href: "/experiments/optimize", icon: Wand2 },
   { label: "Evaluators", href: "/experiments/evaluators", icon: FlaskConical },
+  { label: "Sandboxes", href: "/experiments/sandboxes", icon: Boxes },
 ];
 
 export function SectionTabs() {

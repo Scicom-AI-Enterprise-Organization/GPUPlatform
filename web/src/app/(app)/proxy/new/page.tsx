@@ -11,7 +11,7 @@ export default async function NewProxyPage({
 }) {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
   const username = await currentUsername();
   // Optional prefill from the serverless "Proxy" tab: pre-point an upstream at a
   // specific endpoint's serving URL + model.

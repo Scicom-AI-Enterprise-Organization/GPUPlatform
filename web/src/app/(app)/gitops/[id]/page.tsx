@@ -9,7 +9,7 @@ import { RepoDetail } from "./repo-detail";
 export default async function GitopsRepoPage({ params }: { params: Promise<{ id: string }> }) {
   const me = await getMe();
   if (!me) redirect("/login");
-  if (me.role !== "admin") redirect("/serverless");
+  if (me.role !== "admin") redirect("/inference");
 
   const { id } = await params;
   let repo: GitopsRepo;

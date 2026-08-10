@@ -10,7 +10,7 @@ export default async function LoginPage({
   const { next, sso_error: ssoError } = await searchParams;
   const githubEnabled = !!process.env.GITHUB_CLIENT_ID;
   const registrationDisabled = process.env.REGISTRATION_DISABLED === "1";
-  const target = next ?? "/serverless";
+  const target = next ?? "/inference";
   return (
     <div className="space-y-6">
       <div className="space-y-1">

@@ -67,11 +67,9 @@ export function deltaTone(delta: number) {
 export function OptimizeList({
   initialItems,
   initialTotal,
-  scope,
 }: {
   initialItems: PromptOptRecord[];
   initialTotal: number;
-  scope: "mine" | "all";
 }) {
   const sp = useSearchParams();
   const [q, setQ] = useState(() => sp.get("q") ?? "");
@@ -102,7 +100,6 @@ export function OptimizeList({
     setLoading(true);
     try {
       const res = await gateway.listPromptOptsPage({
-        scope,
         q: qDebounced,
         status: status === "all" ? "" : status,
         sort,
@@ -116,7 +113,7 @@ export function OptimizeList({
     } finally {
       setLoading(false);
     }
-  }, [scope, qDebounced, status, sort, page, pageSize]);
+  }, [qDebounced, status, sort, page, pageSize]);
 
   // Skip the first run: the server component already rendered this exact page.
   const bootedRef = useRef(false);

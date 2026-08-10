@@ -2427,17 +2427,8 @@ async def list_benchmarks(
     user: User = Depends(require_section("benchmark")),
     session: AsyncSession = Depends(get_session),
 ):
-    # Admins default to their own runs; pass ?scope=all to see everyone's.
-    # Everyone (incl. non-admins) additionally sees public runs shared by others.
-    show_all = user.is_admin and scope == "all"
-    if show_all:
-        rows = await session.execute(select(Benchmark).order_by(Benchmark.created_at.desc()))
-    else:
-        rows = await session.execute(
-            select(Benchmark)
-            .where((Benchmark.owner_id == user.id) | (Benchmark.is_public.is_(True)))
-            .order_by(Benchmark.created_at.desc())
-        )
+    # Everyone with the section sees every run — see main.list_apps.
+    rows = await session.execute(select(Benchmark).order_by(Benchmark.created_at.desc()))
     benches = rows.scalars().all()
     # Resolve all owner usernames in ONE query (was a session.get per row → an N+1
     # that made the list scale linearly in DB round-trips).
@@ -2472,11 +2463,13 @@ class BenchmarkPageResponse(BaseModel):
     items: list[BenchmarkRecord]
 
 
-def _bench_scope_stmt(user: User, scope: str):
-    stmt = select(Benchmark)
-    if not (user.is_admin and scope == "all"):
-        stmt = stmt.where((Benchmark.owner_id == user.id) | (Benchmark.is_public.is_(True)))
-    return stmt
+def _bench_scope_stmt(user: User, scope: str = ""):
+    """Every benchmark, for anyone with the section. `is_public` still means
+    something — it's what `public-compare` serves to UNauthenticated callers —
+    but it no longer narrows an authenticated list, because section access is the
+    boundary here (see main.list_apps). `scope` is accepted and ignored so an old
+    bookmarked `?scope=all` URL keeps working."""
+    return select(Benchmark)
 
 
 @router.get("/_page", response_model=BenchmarkPageResponse)
@@ -2896,9 +2889,11 @@ async def aggregate(
     user: User = Depends(require_section("benchmark")),
     session: AsyncSession = Depends(get_session),
 ):
-    show_all = user.is_admin and scope == "all"
-    cache_key = "admin-all" if show_all else f"u{user.id}"
-    owner_id = None if show_all else user.id
+    # One shared aggregate for everyone — the per-user cache split existed only to
+    # serve the mine-vs-all scoping that no longer exists.
+    cache_key = "all"
+    owner_id = None
+    show_all = True
     # Register this key so the background warmer keeps its cache entry hot.
     _AGG_WARM[cache_key] = (show_all, owner_id)
     redis = getattr(request.app.state, "redis", None)

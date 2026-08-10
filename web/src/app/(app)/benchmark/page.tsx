@@ -10,16 +10,14 @@ import { getMe } from "@/lib/me";
 import { BenchmarkList } from "./benchmark-list";
 import { BenchmarkDashboard } from "./dashboard";
 import { ExplorerCollapsible } from "./explorer-collapsible";
-import { ScopeToggle } from "@/components/scope-toggle";
 
 // First page rendered server-side; BenchmarkList fetches the rest on demand.
 const PAGE_SIZE = 12;
 
 async function loadFirstPage(
-  scope: "mine" | "all",
 ): Promise<{ page: PageResponse<BenchmarkRecord>; error: string | null }> {
   try {
-    const page = await gateway.listBenchmarksPage({ scope, limit: PAGE_SIZE, offset: 0 });
+    const page = await gateway.listBenchmarksPage({ limit: PAGE_SIZE, offset: 0 });
     return { page, error: null };
   } catch (e) {
     return { page: { total: 0, items: [] }, error: e instanceof Error ? e.message : String(e) };
@@ -27,26 +25,18 @@ async function loadFirstPage(
 }
 
 async function loadStats(
-  scope: "mine" | "all",
 ): Promise<{ stats: BenchStat[]; error: string | null }> {
   try {
-    const stats = await gateway.benchmarkStats(scope);
+    const stats = await gateway.benchmarkStats();
     return { stats, error: null };
   } catch (e) {
     return { stats: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-export default async function BenchmarkPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ scope?: string }>;
-}) {
+export default async function BenchmarkPage() {
   const me = await getMe();
   const noAccess = !me?.sections?.benchmark;
-  const sp = await searchParams;
-  const scope: "mine" | "all" =
-    me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   // Fetch the first page and the dashboard stats in parallel; each guards its
   // own error so one failing endpoint doesn't blank the other.
@@ -56,10 +46,10 @@ export default async function BenchmarkPage({
           page: { total: 0, items: [] },
           error: null,
         })
-      : loadFirstPage(scope),
+      : loadFirstPage(),
     noAccess
       ? Promise.resolve<{ stats: BenchStat[]; error: string | null }>({ stats: [], error: null })
-      : loadStats(scope),
+      : loadStats(),
     currentUsername(),
   ]);
   const error = pageError ?? statsError;
@@ -76,7 +66,6 @@ export default async function BenchmarkPage({
               Results land in S3; metrics and files surface in the detail view.
             </p>
           </div>
-          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -88,7 +77,7 @@ export default async function BenchmarkPage({
         )}
 
         {!noAccess && stats.length > 0 && <BenchmarkDashboard stats={stats} />}
-        {!noAccess && page.total > 0 && <ExplorerCollapsible scope={scope} />}
+        {!noAccess && page.total > 0 && <ExplorerCollapsible />}
 
         {!noAccess && (
           <section>
@@ -97,7 +86,6 @@ export default async function BenchmarkPage({
                 <h2 className="text-base font-medium">Benchmarks</h2>
                 <span className="text-xs text-muted-foreground">
                   {page.total} {page.total === 1 ? "run" : "runs"}
-                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <div className="flex items-center gap-2">
@@ -123,7 +111,7 @@ export default async function BenchmarkPage({
                 </p>
               </div>
             ) : (
-              <BenchmarkList initialItems={page.items} initialTotal={page.total} scope={scope} isAdmin={!!me?.is_admin} />
+              <BenchmarkList initialItems={page.items} initialTotal={page.total} isAdmin={!!me?.is_admin} />
             )}
           </section>
         )}

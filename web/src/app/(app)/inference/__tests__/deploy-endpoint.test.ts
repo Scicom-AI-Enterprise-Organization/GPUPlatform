@@ -13,10 +13,10 @@ vi.mock("next/headers", () => ({
 const revalidatePath = vi.fn();
 vi.mock("next/cache", () => ({ revalidatePath: (p: string) => revalidatePath(p) }));
 
-const { deployEndpoint } = await import("@/app/(app)/serverless/actions");
+const { deployEndpoint } = await import("@/app/(app)/inference/actions");
 
 const REQUEST: CreateAppRequest = {
-  name: "tm-fleet",
+  name: "demo-fleet",
   gpu: "VM",
   gpu_count: 4,
   mode: "multi",
@@ -52,13 +52,13 @@ afterEach(() => {
 describe("deployEndpoint — create multi-model inference action", () => {
   it("returns { ok, app_id } and revalidates on success", async () => {
     const fetchMock = stubFetch(async () =>
-      jsonResponse({ app_id: "tm-fleet", url: "/run/tm-fleet" }),
+      jsonResponse({ app_id: "demo-fleet", url: "/run/demo-fleet" }),
     );
 
     const res = await deployEndpoint(REQUEST);
 
-    expect(res).toEqual({ ok: true, app_id: "tm-fleet" });
-    expect(revalidatePath).toHaveBeenCalledWith("/serverless");
+    expect(res).toEqual({ ok: true, app_id: "demo-fleet" });
+    expect(revalidatePath).toHaveBeenCalledWith("/inference");
     // It forwarded the multi-model body to POST /apps.
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(body.mode).toBe("multi");

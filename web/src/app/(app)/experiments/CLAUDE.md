@@ -13,9 +13,10 @@ Server pages fetch via `gateway.*` (`web/src/lib/gateway.ts`); client components
 | `/experiments/new` | `new/experiment-form.tsx` | **mirrors `/benchmark/new`** — see below |
 | `/experiments/[id]` | `[id]/experiment-detail.tsx` | header KPIs + **`?tab=`-driven** Tabs (Overview / Tradeoff / Samples / Config), real `<Link>` triggers like the proxy detail page — linkable, ⌘-clickable |
 | `/experiments/evaluators` | `evaluators/*` | your reusable evaluator library (author/test/edit) + the built-ins for reference |
+| `/experiments/sandboxes` | `sandboxes/*` | your reusable sandbox library — see below |
 | `/experiments/optimize` | `optimize/*` | GEPA prompt optimization — see below |
 | — | `tradeoff-plot.tsx` | the parallel-coordinates chart, shared by the detail tabs |
-| — | `section-tabs.tsx` | Runs · Optimize · Evaluators. **No Datasets tab on purpose** — see below |
+| — | `section-tabs.tsx` | Runs · Optimize · Evaluators · Sandboxes. **No Datasets tab on purpose** — see below |
 | — | `new/capture-dialog.tsx` | capture requests (Langfuse / served traffic) into a NEW platform dataset |
 
 ## The one rule for `new/`: mirror `/benchmark/new`
@@ -158,6 +159,39 @@ diff `optimize-list.tsx` against `experiments-list.tsx` and `optimize-form.tsx` 
   prompt lands, but it's useful on its own.
 - `react-hooks/set-state-in-effect` fires on `optimize-form.tsx`'s seed-prompt fetch, same as the
   ~44 pre-existing instances noted below. The build does not gate on it.
+
+## Sandboxes (`sandboxes/`) — multi-turn tool replay
+
+A sandbox ANSWERS the model's tool calls during a replay, so a row becomes a conversation instead
+of one request. It's the `evaluators/` tab's twin — diff `sandboxes-manager.tsx` against
+`evaluators-manager.tsx` and `custom-sandbox-editor.tsx` against `custom-evaluator-editor.tsx`
+before changing structure. Backend + the gotchas are in **`gateway/gateway/CLAUDE.md` →
+"Sandboxes"** and the design doc `docs/EXPERIMENTS_SANDBOX.md`. What's UI-specific:
+
+- **A peer tab, not a per-run setting**, for the same reason evaluators are: it's reusable, and a
+  run **snapshots** the definition. That matters more here — a sandbox is the *environment* the
+  model was measured in, so editing one would make old numbers incomparable rather than merely
+  different. The manager copy says so; keep it.
+- **Everything in the editor is server-driven** (`registry.modes[].options` + `loop_options`,
+  rendered by `OptionGrid` with the same five field types the evaluator form uses). Adding a mode
+  or an option in `sandbox.py` needs **no change in this directory**. Don't hardcode mode ids.
+- **⚠ The run form prices a sandboxed run in CALLS, not units, and that arithmetic must match the
+  server.** One row becomes up to `max_tool_rounds + 1` billed calls, so the footer, the
+  `over-call-cap` block and `fitToCap()` all read `limits.max_calls` alongside `max_units` — the
+  same rule the GEPA budget card already follows. **Change `EXPERIMENT_MAX_CALLS`, change this.**
+- **Rounds come from the sandbox definition, not a per-run override.** The form displays them
+  read-only. An override would put a number in the run config that the snapshot contradicts, and
+  "the same sandbox" would stop meaning one thing.
+- **The Test panel is load-bearing.** A sandbox that answers NOTHING still produces trajectories
+  and the detectors score them, so a run can come back green having measured a broken environment.
+  With no tool name, replay mode reports what the row's seed offers ("is my seed column wired
+  up?"); with one, it shows exactly what the model would receive.
+- **Two detail-page surfaces, both warnings rather than decoration** (same class as Optimize's
+  `unscored_rollouts`): `SandboxHealth` on Overview — `novel_call_rate` ≥25% means the run measured
+  seed coverage, `forced_final_rate` ≥25% means it measured the round limit, and `all_errors` is
+  called out as a failed run — and `TrajectoryView` in Samples, which badges **every tool result
+  with its provenance** (seed / cache / api / llm / error) because a trajectory mostly answered by
+  simulation supports a weaker claim than one replayed from reference data.
 
 ## The two benchmark unit tests
 

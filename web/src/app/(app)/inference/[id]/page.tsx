@@ -21,7 +21,7 @@ export default async function EndpointPage({
     return (
       <div className="flex h-full flex-col">
         <ConsoleTopbar
-          crumbs={[{ label: "Serverless Inference", href: "/serverless" }, { label: id }]}
+          crumbs={[{ label: "Inference", href: "/inference" }, { label: id }]}
           username={username}
         />
         <div className="flex-1 px-6 py-8">
@@ -41,7 +41,7 @@ export default async function EndpointPage({
   return (
     <div className="flex h-full flex-col">
       <ConsoleTopbar
-        crumbs={[{ label: "Serverless Inference", href: "/serverless" }, { label: app.name }]}
+        crumbs={[{ label: "Inference", href: "/inference" }, { label: app.name }]}
         username={username}
       />
       <EndpointDetail app={app} readOnly={readOnly} isAdmin={me?.is_admin ?? false} />

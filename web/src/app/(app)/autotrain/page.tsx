@@ -7,15 +7,13 @@ import { gateway } from "@/lib/gateway";
 import type { PageResponse, TrainingRunRecord } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
-import { ScopeToggle } from "@/components/scope-toggle";
 import { AutotrainList } from "./autotrain-list";
 
 async function loadRuns(
-  scope: "mine" | "all",
 ): Promise<{ page: PageResponse<TrainingRunRecord>; error: string | null }> {
   try {
     return {
-      page: await gateway.listTrainingRunsPage({ scope, limit: 12, offset: 0 }),
+      page: await gateway.listTrainingRunsPage({ limit: 12, offset: 0 }),
       error: null,
     };
   } catch (e) {
@@ -23,19 +21,13 @@ async function loadRuns(
   }
 }
 
-export default async function AutotrainPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ scope?: string }>;
-}) {
+export default async function AutotrainPage() {
   const me = await getMe();
   const sections = me?.sections as Record<string, boolean> | undefined;
   const noAccess = me ? !(me.is_admin || sections?.autotrain) : false;
-  const sp = await searchParams;
-  const scope: "mine" | "all" = me?.is_admin && sp.scope === "all" ? "all" : "mine";
 
   const [{ page, error }, username] = await Promise.all([
-    noAccess ? Promise.resolve({ page: { total: 0, items: [] }, error: null }) : loadRuns(scope),
+    noAccess ? Promise.resolve({ page: { total: 0, items: [] }, error: null }) : loadRuns(),
     currentUsername(),
   ]);
 
@@ -51,7 +43,6 @@ export default async function AutotrainPage({
               evaluated every epoch and stop at the max-epoch cap or early on patience.
             </p>
           </div>
-          {!noAccess && me?.is_admin && <ScopeToggle scope={scope} />}
         </div>
 
         {noAccess && <NoAccessAlert />}
@@ -69,7 +60,6 @@ export default async function AutotrainPage({
                 <h2 className="text-base font-medium">Training runs</h2>
                 <span className="text-xs text-muted-foreground">
                   {page.total} {page.total === 1 ? "run" : "runs"}
-                  {me?.is_admin && scope === "all" && " · all users"}
                 </span>
               </div>
               <div className="flex items-center gap-2">
@@ -100,10 +90,8 @@ export default async function AutotrainPage({
               // key remounts the client list on scope toggle so its state
               // resets to the freshly SSR'd first page of the new scope.
               <AutotrainList
-                key={scope}
                 initialItems={page.items}
                 initialTotal={page.total}
-                scope={scope}
               />
             )}
           </section>

@@ -259,10 +259,13 @@ describe("benchmark API routes", () => {
     expect(init.method ?? "GET").toBe("GET");
   });
 
-  it("listBenchmarks → GET /benchmarks?scope=all", async () => {
+  // No `?scope=` any more: section access is the boundary on this platform, so
+  // every list returns everything the caller's section grants. Ownership is a
+  // label on a shared resource, not a filter.
+  it("listBenchmarks → GET /benchmarks (unscoped)", async () => {
     const fetchMock = stubFetch(async () => jsonResponse([]));
-    await gateway.listBenchmarks("all");
-    expect(call(fetchMock).url).toBe("http://localhost:8080/benchmarks?scope=all");
+    await gateway.listBenchmarks();
+    expect(call(fetchMock).url).toBe("http://localhost:8080/benchmarks");
   });
 
   it("renameBenchmark → PATCH /benchmarks/{id} {name}", async () => {

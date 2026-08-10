@@ -50,11 +50,9 @@ type StatusFilter = (typeof STATUS_OPTIONS)[number];
 export function QuantizationList({
   initialItems,
   initialTotal,
-  scope,
 }: {
   initialItems: QuantizationJobRecord[];
   initialTotal: number;
-  scope: "mine" | "all";
 }) {
   const sp = useSearchParams();
   const [q, setQ] = useState(() => sp.get("q") ?? "");
@@ -89,7 +87,6 @@ export function QuantizationList({
     setLoading(true);
     try {
       const res = await gateway.listQuantizationJobsPage({
-        scope,
         q: qDebounced,
         status: status === "all" ? "" : status,
         sort,
@@ -104,7 +101,7 @@ export function QuantizationList({
     } finally {
       if (seq === seqRef.current) setLoading(false);
     }
-  }, [scope, qDebounced, status, sort, pageSize, currentPage]);
+  }, [qDebounced, status, sort, pageSize, currentPage]);
 
   const bootedRef = useRef(false);
   useEffect(() => {
