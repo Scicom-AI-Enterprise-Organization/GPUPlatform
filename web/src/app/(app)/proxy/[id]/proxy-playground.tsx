@@ -1,17 +1,20 @@
 "use client";
 
-// Proxy playground with a mode DROPDOWN (chat / embeddings / rerank / audio
+// Proxy playground with a mode DROPDOWN (chat / EOU / embeddings / rerank / audio
 // transcription), exactly like the serverless endpoint playground. The proxy is
 // OpenAI-compatible, so each mode just points the shared playground component at the
 // matching data-plane path; embeddings + audio reuse the same generic components the
 // serverless playground uses. Rerank is proxy-only — the serverless data plane routes
-// through the worker queue, which has no rerank job type.
+// through the worker queue, which has no rerank job type. EOU (turn detector) is the
+// only mode on the RAW /v1/completions path: it's the one caller that needs
+// allowed_token_ids + logprobs, which no other mode sends.
 import { useMemo, useState } from "react";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { ChatPlayground, openAiTransport } from "@/components/playground/chat-playground";
 import { RerankPlayground } from "@/components/playground/rerank-playground";
+import { EouPlayground } from "@/components/playground/eou-playground";
 import { EmbeddingPlayground } from "@/app/(app)/inference/[id]/tabs/embedding";
 import { TranscribePlayground } from "@/app/(app)/inference/[id]/tabs/transcribe";
 import { SpeechPlayground } from "@/app/(app)/inference/[id]/tabs/speech";
@@ -20,7 +23,18 @@ import { SpeechPlayground } from "@/app/(app)/inference/[id]/tabs/speech";
 // forceable (the backend 404s a forced disabled/absent upstream).
 export type PlaygroundUpstream = { id: string; name: string; enabled: boolean };
 
-type PlaygroundMode = "chat" | "embedding" | "rerank" | "audio" | "tts";
+type PlaygroundMode = "chat" | "completions-eou" | "embedding" | "rerank" | "audio" | "tts";
+
+// Short labels for the segmented selector; the full endpoint lives in the tooltip so the
+// row stays readable at narrow widths.
+const MODES: { id: PlaygroundMode; label: string; title: string }[] = [
+  { id: "chat", label: "Chat", title: "Chat / text generation (/v1/chat/completions)" },
+  { id: "completions-eou", label: "Turn detector", title: "End of utterance (/v1/completions)" },
+  { id: "embedding", label: "Embeddings", title: "Embeddings (/v1/embeddings)" },
+  { id: "rerank", label: "Rerank", title: "Rerank (/v1/rerank)" },
+  { id: "audio", label: "Transcribe", title: "Audio transcription (Whisper)" },
+  { id: "tts", label: "TTS", title: "Text to speech (/v1/audio/speech)" },
+];
 
 const AUTO = "__auto";
 
@@ -65,16 +79,24 @@ export function ProxyPlayground(
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">mode</span>
-        <Select value={mode} onValueChange={(v) => setMode(v as PlaygroundMode)}>
-          <SelectTrigger className="h-8 w-[280px] text-xs"><SelectValue /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="chat" className="text-xs">Chat / text generation</SelectItem>
-            <SelectItem value="embedding" className="text-xs">Embeddings (/v1/embeddings)</SelectItem>
-            <SelectItem value="rerank" className="text-xs">Rerank (/v1/rerank)</SelectItem>
-            <SelectItem value="audio" className="text-xs">Audio transcription (Whisper)</SelectItem>
-            <SelectItem value="tts" className="text-xs">Text to speech (/v1/audio/speech)</SelectItem>
-          </SelectContent>
-        </Select>
+        {/* Segmented row rather than a dropdown: every mode stays visible, so which one
+            you're in — and what else exists — reads at a glance and is one click away.
+            Same control the upstream editor's Test row uses. */}
+        <div className="inline-flex flex-wrap rounded-md border border-border p-0.5 text-xs">
+          {MODES.map(({ id, label, title }) => (
+            <button
+              key={id}
+              type="button"
+              title={title}
+              onClick={() => setMode(id)}
+              className={"rounded px-2 py-1 " + (mode === id
+                ? "bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:text-foreground")}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         {forceable.length > 1 && (
           <>
             <span className="text-xs text-muted-foreground">provider</span>
@@ -96,6 +118,7 @@ export function ProxyPlayground(
         </span>
       </div>
       {mode === "chat" ? chat
+        : mode === "completions-eou" ? <EouPlayground models={aliases} basePath={apiBase} curlBase={curlBase} storageKey={`serverless-ui:eou:proxy:${name}`} extraHeaders={extraHeaders} />
         : mode === "embedding" ? <EmbeddingPlayground models={aliases} basePath={apiBase} curlBase={curlBase} storageKey={`serverless-ui:embed:proxy:${name}`} extraHeaders={extraHeaders} />
         : mode === "rerank" ? <RerankPlayground models={aliases} basePath={apiBase} curlBase={curlBase} storageKey={`serverless-ui:rerank:proxy:${name}`} extraHeaders={extraHeaders} />
         : mode === "audio" ? <TranscribePlayground models={aliases} basePath={apiBase} curlBase={curlBase} storageKey={`serverless-ui:transcribe:proxy:${name}`} extraHeaders={extraHeaders} />
