@@ -7,7 +7,6 @@ import { gateway } from "@/lib/gateway";
 import type { PromptOptRecord, PageResponse } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
-import { SectionTabs } from "../section-tabs";
 import { OptimizeList } from "./optimize-list";
 
 async function loadOptimizations(
@@ -52,8 +51,6 @@ export default async function OptimizePage() {
             </p>
           </div>
         </div>
-
-        <SectionTabs />
 
         {noAccess && <NoAccessAlert />}
 

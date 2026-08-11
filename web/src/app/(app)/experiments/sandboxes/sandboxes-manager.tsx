@@ -64,22 +64,14 @@ export function SandboxesManager({ registry }: { registry: SandboxRegistry }) {
     <div className="space-y-8">
       {/* ---------------- your library ---------------- */}
       <section>
-        <div className="mb-3 flex items-start justify-between gap-4 border-b border-border pb-2">
-          <div>
-            <h2 className="flex items-center gap-2 text-base font-medium">
-              Your sandboxes
-              {rows.length > 0 && (
-                <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-normal tabular-nums text-muted-foreground">
-                  {rows.length}
-                </span>
-              )}
-            </h2>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              Reusable across every experiment. A run{" "}
-              <span className="font-medium">snapshots</span> the definition — which matters more
-              here than for an evaluator: a sandbox is the environment the model was measured in,
-              so editing one would make old numbers incomparable rather than merely different.
-            </p>
+        {/* Same list header as /experiments and /experiments/optimize — heading
+            plus a plain count. Keep the three in step. */}
+        <div className="mb-3 flex items-center justify-between border-b border-border pb-2">
+          <div className="flex items-baseline gap-3">
+            <h2 className="text-base font-medium">Sandboxes</h2>
+            <span className="text-xs text-muted-foreground">
+              {rows.length} {rows.length === 1 ? "sandbox" : "sandboxes"}
+            </span>
           </div>
           <Button asChild size="sm">
             <Link href="/experiments/sandboxes/new">
@@ -88,7 +80,6 @@ export function SandboxesManager({ registry }: { registry: SandboxRegistry }) {
             </Link>
           </Button>
         </div>
-
 
         {rows.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border bg-card px-6 py-14 text-center">

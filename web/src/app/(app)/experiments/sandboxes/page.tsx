@@ -3,7 +3,6 @@ import { NoAccessAlert } from "@/components/no-access-alert";
 import { gateway } from "@/lib/gateway";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
-import { SectionTabs } from "../section-tabs";
 import { SandboxesManager } from "./sandboxes-manager";
 
 export default async function SandboxesPage() {
@@ -34,8 +33,6 @@ export default async function SandboxesPage() {
             what the model does across several turns, not just its first.
           </p>
         </div>
-
-        <SectionTabs />
 
         {noAccess && <NoAccessAlert />}
 

@@ -3,7 +3,6 @@ import { NoAccessAlert } from "@/components/no-access-alert";
 import { gateway } from "@/lib/gateway";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
-import { SectionTabs } from "../section-tabs";
 import { EvaluatorsManager } from "./evaluators-manager";
 
 export default async function EvaluatorsPage() {
@@ -33,8 +32,6 @@ export default async function EvaluatorsPage() {
             write here are saved to your library and can be reused across any experiment.
           </p>
         </div>
-
-        <SectionTabs />
 
         {noAccess && <NoAccessAlert />}
 

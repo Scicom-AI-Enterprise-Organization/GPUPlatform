@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { Activity, BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, Lock, Microscope, Network, Package, ScrollText, Server, Settings, Shield, Shrink, Sparkles, Users } from "lucide-react";
+import { Activity, BarChart3, BookOpen, Box, Boxes, CheckSquare, Cloud, Database, FlaskConical, GitBranch, KeyRound, Library, ListChecks, Lock, Microscope, Network, Package, ScrollText, Server, Settings, Shield, Shrink, Sparkles, ToyBrick, Users, Wand2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ScicomLogo } from "@/components/scicom-logo";
 import { useSidebarState } from "./sidebar-state";
@@ -16,21 +16,36 @@ type Item = {
   locked?: boolean;
   // If set, this item is dropped from the nav when the section is turned off
   // platform-wide via DISABLED_SECTIONS.
-  section?: "inference" | "benchmark" | "compute" | "datasets" | "catalog" | "experiments";
+  // The DISABLED_SECTIONS key that switches this item off. Every nav entry that
+  // has a matching route guard carries one, so the rail and the routes can never
+  // disagree about what exists.
+  section?:
+    | "inference" | "benchmark" | "compute" | "datasets" | "catalog"
+    | "experiments" | "gitops" | "autotrain" | "quantization" | "providers"
+    | "storage" | "proxy" | "manage";
 };
 
 const RESOURCES: Item[] = [
   { label: "Inference", href: "/inference", icon: Boxes, section: "inference" },
   { label: "Benchmark", href: "/benchmark", icon: FlaskConical, section: "benchmark" },
-  { label: "Storage", href: "/storage", icon: Database },
+  { label: "Storage", href: "/storage", icon: Database, section: "storage" },
   { label: "Models", href: "/models", icon: Package, section: "catalog" },
   { label: "Datasets", href: "/datasets", icon: Library, section: "datasets" },
-  { label: "Autotrain", href: "/autotrain", icon: Sparkles },
-  { label: "Quantization", href: "/quantization", icon: Shrink },
-  { label: "Experiments", href: "/experiments", icon: Microscope, section: "experiments" },
+  { label: "Autotrain", href: "/autotrain", icon: Sparkles, section: "autotrain" },
+  { label: "Quantization", href: "/quantization", icon: Shrink, section: "quantization" },
   { label: "Compute", href: "/compute", icon: Box, section: "compute" },
-  { label: "GPU Providers", href: "/providers", icon: Cloud },
-  { label: "API Proxy", href: "/proxy", icon: Network },
+  { label: "GPU Providers", href: "/providers", icon: Cloud, section: "providers" },
+  { label: "API Proxy", href: "/proxy", icon: Network, section: "proxy" },
+];
+// Its own group rather than one Resources entry: these four are PEERS — a run, a
+// prompt search, an evaluator and a sandbox are each reusable on their own, and
+// they used to be an in-page tab bar. The rail is a better home because it stays
+// visible from a detail page, where the tab bar disappeared.
+const EXPERIMENTS: Item[] = [
+  { label: "Runs", href: "/experiments", icon: Microscope, section: "experiments" },
+  { label: "Optimize", href: "/experiments/optimize", icon: Wand2, section: "experiments" },
+  { label: "Evaluators", href: "/experiments/evaluators", icon: ListChecks, section: "experiments" },
+  { label: "Sandboxes", href: "/experiments/sandboxes", icon: ToyBrick, section: "experiments" },
 ];
 const ACCOUNT: Item[] = [
   { label: "API tokens", href: "/api-keys", icon: KeyRound },
@@ -40,7 +55,7 @@ const ACCOUNT: Item[] = [
 const ADMIN: Item[] = [
   { label: "Activity", href: "/activity", icon: Activity },
   { label: "Analytics", href: "/admin/analytics", icon: BarChart3 },
-  { label: "GitOps", href: "/gitops", icon: GitBranch },
+  { label: "GitOps", href: "/gitops", icon: GitBranch, section: "gitops" },
   { label: "Organization", href: "/organization", icon: Users },
   { label: "Roles", href: "/admin/roles", icon: Shield },
   { label: "Secrets", href: "/admin/secrets", icon: Lock },
@@ -64,7 +79,9 @@ export function ConsoleSidebar({
   counts?: Counts;
 } = {}) {
   const disabledSet = new Set(disabled);
-  const resources = RESOURCES.filter((item) => !(item.section && disabledSet.has(item.section)));
+  const hidden = (item: Item) => !!item.section && disabledSet.has(item.section);
+  const resources = RESOURCES.filter((item) => !hidden(item));
+  const admin = ADMIN.filter((item) => !hidden(item));
   // Map of href → numeric badge to show next to the item label. Always
   // present (default 0) so admins know the rail is wired up even when
   // nothing's pending.
@@ -125,8 +142,17 @@ export function ConsoleSidebar({
     if (href === "/quantization") {
       return pathname === "/quantization" || pathname.startsWith("/quantization/");
     }
+    // "Runs" owns the section root, its detail pages and /new — but must yield to
+    // its siblings, or every sub-route would light up two rows at once.
     if (href === "/experiments") {
-      return pathname === "/experiments" || pathname.startsWith("/experiments/");
+      return (
+        pathname === "/experiments" ||
+        (pathname.startsWith("/experiments/") &&
+          !EXPERIMENTS.some((s) => s.href !== href && pathname.startsWith(s.href)))
+      );
+    }
+    if (href.startsWith("/experiments/")) {
+      return pathname === href || pathname.startsWith(`${href}/`);
     }
     if (href === "/gitops") {
       return pathname === "/gitops" || pathname.startsWith("/gitops/");
@@ -153,7 +179,21 @@ export function ConsoleSidebar({
         ))}
       </SidebarGroup>
 
-      {isAdmin && (
+      {!disabledSet.has("experiments") && (
+        <SidebarGroup label="Experiments" collapsed={collapsed}>
+          {EXPERIMENTS.map((item) => (
+            <SidebarItem
+              key={item.href}
+              item={item}
+              active={isActive(item.href)}
+              collapsed={collapsed}
+              onNavigate={closeMobile}
+            />
+          ))}
+        </SidebarGroup>
+      )}
+
+      {isAdmin && !disabledSet.has("manage") && (
         <SidebarGroup label="Manage" collapsed={collapsed}>
           {MANAGE.map((item) => (
             <SidebarItem
@@ -182,7 +222,7 @@ export function ConsoleSidebar({
 
       {isAdmin && (
         <SidebarGroup label="Admin" collapsed={collapsed}>
-          {ADMIN.map((item) => (
+          {admin.map((item) => (
             <SidebarItem
               key={item.label}
               item={item}

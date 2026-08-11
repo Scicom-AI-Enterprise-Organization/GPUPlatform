@@ -7,7 +7,6 @@ import { gateway } from "@/lib/gateway";
 import type { ExperimentRecord, PageResponse } from "@/lib/types";
 import { currentUsername } from "@/lib/current-user";
 import { getMe } from "@/lib/me";
-import { SectionTabs } from "./section-tabs";
 import { ExperimentsList } from "./experiments-list";
 
 async function loadExperiments(
@@ -48,8 +47,6 @@ export default async function ExperimentsPage() {
             </p>
           </div>
         </div>
-
-        <SectionTabs />
 
         {noAccess && <NoAccessAlert />}
 
