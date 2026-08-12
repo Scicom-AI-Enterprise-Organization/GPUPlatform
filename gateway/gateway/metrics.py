@@ -358,9 +358,32 @@ PROXY_TTFT = Histogram(
     buckets=_TTFT_BUCKETS,
     registry=_registry,
 )
+# ⚠️ DECODE-PHASE ONLY, and only for requests whose TTFT we actually measured
+# (i.e. streamed ones — see stats_writer.decode_tps, which owns the sampling
+# rules and the reasons for them). A non-streaming request contributes NOTHING
+# here: its decode phase was never timed, and dividing its token count by the
+# full end-to-end latency put prefill in the denominator and made this metric
+# read several times under the real GPU decode rate. Use it to answer "how fast
+# is the model generating"; use PROXY_E2E_TPS for "how fast does the caller get
+# its tokens". Alerting on a quantile of a series that mixes the two is what
+# fired ServerlessGPUProxyP10TPSLow against a perfectly healthy backend.
 PROXY_TPS = Histogram(
     "proxy_tokens_per_second",
-    "LLM-proxy output throughput (completion tokens / generation time)",
+    "LLM-proxy output throughput (completion tokens / generation time; "
+    "streamed requests only — decode phase, TTFT excluded)",
+    ["proxy", "model"],
+    buckets=_TPS_BUCKETS,
+    registry=_registry,
+)
+# The end-to-end companion: completion tokens / TOTAL request time, recorded for
+# EVERY completed request. This is what a caller experiences, so it legitimately
+# reads low when a long prompt precedes a short answer — that is a workload
+# property, not a backend fault. Kept as its own series precisely so the two
+# meanings can never be averaged together again.
+PROXY_E2E_TPS = Histogram(
+    "proxy_e2e_tokens_per_second",
+    "LLM-proxy end-to-end output efficiency (completion tokens / total request "
+    "time, prefill and queueing included; all completed requests)",
     ["proxy", "model"],
     buckets=_TPS_BUCKETS,
     registry=_registry,
@@ -566,14 +589,18 @@ def set_bg_queue_depth(n: int) -> None:
 
 def observe_proxy(
     proxy: str, model: str, upstream: str, status: str, duration_s: float | None = None,
-    ttft_s: float | None = None, tps: float | None = None, avg_logprob: float | None = None,
+    ttft_s: float | None = None, tps: float | None = None, e2e_tps: float | None = None,
+    avg_logprob: float | None = None,
 ) -> None:
     """Record one proxied request: bump the outcome counter and, when known, observe
     its latency / time-to-first-token / output throughput. `proxy` is the endpoint id;
     `status` is the terminal state (completed / failed / cancelled / timeout / …).
-    ttft_s/tps are only meaningful for completed requests (None otherwise). avg_logprob
-    is the audio-drift signal (whisper verbose_json segments; None for non-audio or
-    when the caller didn't request verbose_json)."""
+    ttft_s/tps are only meaningful for completed requests (None otherwise). `tps` is
+    DECODE-phase throughput and is None for non-streaming requests by design;
+    `e2e_tps` is the end-to-end companion defined for every completed request (see
+    the PROXY_TPS / PROXY_E2E_TPS notes). avg_logprob is the audio-drift signal
+    (whisper verbose_json segments; None for non-audio or when the caller didn't
+    request verbose_json)."""
     PROXY_REQUESTS_TOTAL.labels(
         proxy=proxy, model=model or "", upstream=upstream or "", status=status
     ).inc()
@@ -583,6 +610,8 @@ def observe_proxy(
         PROXY_TTFT.labels(proxy=proxy, model=model or "").observe(ttft_s)
     if tps is not None:
         PROXY_TPS.labels(proxy=proxy, model=model or "").observe(tps)
+    if e2e_tps is not None:
+        PROXY_E2E_TPS.labels(proxy=proxy, model=model or "").observe(e2e_tps)
     if avg_logprob is not None:
         # Store NLL (-logprob, >= 0) so the histogram keeps its _sum sample; see
         # the PROXY_AUDIO_NLL / _NLL_BUCKETS notes for why.
@@ -596,6 +625,7 @@ def render_proxy(proxy: str) -> bytes:
     class _ProxyFilter:
         def collect(self):
             for metric in (PROXY_REQUESTS_TOTAL, PROXY_REQUEST_DURATION, PROXY_TTFT, PROXY_TPS,
+                           PROXY_E2E_TPS,
                            PROXY_AUDIO_NLL, PROXY_AUDIO_RTF, PROXY_AUDIO_SECONDS,
                            PROXY_AUDIO_PROCESS_SECONDS, PROXY_TTS_CER, PROXY_TTS_WER,
                            PROXY_TTS_EVAL_TOTAL, PROXY_CAPTURE_TOTAL,

@@ -1265,6 +1265,14 @@ async def _unary(app, request: Request, request_id: str, forward,
             res = await forward()
             if request_id in live:
                 live[request_id]["upstream"] = res["upstream"]
+            # ⚠️ No `ttft_ms` here, and there CANNOT be one: this is the buffered
+            # path (`_do_unary` awaits `cli.post`), so the upstream's first byte
+            # only lands once generation has finished. Timing it would yield
+            # ttft ≈ latency, i.e. a decode window of ~0 and a tok/s in the
+            # thousands — the exact artefact `stats_writer._TPS_MIN_GEN_MS`
+            # exists to reject. `decode_tps()` therefore reports None for these
+            # requests; `e2e_tps()` still covers them. Don't "fix" this by
+            # stamping a synthetic TTFT.
             await _finish(request_id, "completed", status_code=res["status_code"],
                           latency_ms=res["latency_ms"], pt=res["pt"], ct=res["ct"], upstream=res["upstream"],
                           avg_logprob=res.get("avg_logprob"))
