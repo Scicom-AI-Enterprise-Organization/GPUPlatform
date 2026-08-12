@@ -38,6 +38,56 @@ _task: Optional[asyncio.Task] = None
 _sessionmaker = None  # async_sessionmaker, set by start()
 _dropped = 0
 
+# ---------- output-throughput (tok/s) sampling rules --------------------------
+# A tok/s sample only means "decode speed" when we actually timed the DECODE
+# phase — i.e. we know TTFT and can subtract it. Two guards keep the histogram
+# from filling with values that are arithmetically fine and physically absurd:
+_TPS_MIN_TOKENS = int(os.environ.get("STATS_TPS_MIN_TOKENS", "8") or "8")
+_TPS_MIN_GEN_MS = float(os.environ.get("STATS_TPS_MIN_GEN_MS", "50") or "50")
+
+
+def decode_tps(ct: Optional[int], latency_ms: Optional[float],
+               ttft_ms: Optional[float]) -> Optional[float]:
+    """Output throughput over the DECODE phase only, or None when we can't
+    measure it honestly. `None` is a deliberate answer, not a fallback.
+
+    ⚠️ This used to fall back to ``gen_ms = latency_ms`` whenever TTFT was
+    unknown, which silently made the metric ``completion_tokens / TOTAL time``
+    for every NON-STREAMING request (the buffered JSON path never records a
+    TTFT). Prefill is in that denominator, so the number collapsed in exact
+    proportion to the prompt:output ratio — on a workload of long prompts and
+    short answers it read ~4x under the real decode rate and dragged the P10
+    alert below its threshold while the backend was healthy. A tok/s figure
+    that means "decode speed" for 14% of requests and "end-to-end efficiency"
+    for the other 86% is not a quantity you can put a threshold on; see
+    ``e2e_tps()`` for the end-to-end number, reported separately on purpose.
+
+    The two floors guard the OTHER direction. Streaming TTFT is stamped on the
+    first response BODY CHUNK, so an upstream that flushes its whole body at
+    once yields ``gen_ms ≈ 0`` and a tok/s in the thousands (3.3% of live
+    samples landed above the 500 tok/s top bucket, which also corrupts the
+    histogram's _sum, i.e. every mean derived from it).
+    """
+    if not ct or ct < _TPS_MIN_TOKENS:
+        return None            # too few tokens: one slow chunk sets the rate
+    if ttft_ms is None or latency_ms is None:
+        return None            # decode phase was never timed (non-streaming)
+    gen_ms = latency_ms - ttft_ms
+    if gen_ms < _TPS_MIN_GEN_MS:
+        return None            # ttft ≈ latency: buffered flush, not a decode
+    return ct / (gen_ms / 1000.0)
+
+
+def e2e_tps(ct: Optional[int], latency_ms: Optional[float]) -> Optional[float]:
+    """End-to-end output efficiency: completion tokens / TOTAL wall time
+    (prefill + queue + network + decode). Defined for every completed request,
+    streaming or not, which is exactly why it must NOT share a series with
+    ``decode_tps`` — this one legitimately reads low on a long prompt with a
+    short answer, and that is a property of the request, not of the GPU."""
+    if not ct or not latency_ms or latency_ms <= 0:
+        return None
+    return ct / (latency_ms / 1000.0)
+
 
 # ---------- public enqueue API (sync, non-blocking) --------------------------
 
@@ -144,11 +194,7 @@ def _apply_serverless(row, it: dict, now: datetime) -> None:
         from . import metrics as _metrics
         ttft_ms, latency_ms = it.get("ttft_ms"), it.get("latency_ms")
         ttft_s = (ttft_ms / 1000.0) if ttft_ms is not None else None
-        tps = None
-        if ct and latency_ms:
-            gen_ms = latency_ms - ttft_ms if (ttft_ms is not None and latency_ms > ttft_ms) else latency_ms
-            if gen_ms > 0:
-                tps = ct / (gen_ms / 1000.0)
+        tps = decode_tps(ct, latency_ms, ttft_ms)
         if ttft_s is not None or tps is not None:
             model = (row.payload or {}).get("model") if isinstance(row.payload, dict) else None
             _metrics.observe_serverless_stream(row.app_id, model or "", ttft_s=ttft_s, tps=tps)
@@ -178,15 +224,11 @@ def _apply_proxy(row, it: dict, now: datetime) -> None:
         from . import metrics as _metrics
         ttft_ms, latency_ms, ct = it.get("ttft_ms"), it.get("latency_ms"), it.get("ct")
         ttft_s = (ttft_ms / 1000.0) if ttft_ms is not None else None
-        tps = None
-        if ct and latency_ms:
-            gen_ms = latency_ms - ttft_ms if (ttft_ms is not None and latency_ms > ttft_ms) else latency_ms
-            if gen_ms > 0:
-                tps = ct / (gen_ms / 1000.0)
+        tps = decode_tps(ct, latency_ms, ttft_ms)
         _metrics.observe_proxy(
             row.endpoint_id, row.model, (it.get("upstream") or row.upstream or ""), it["status"],
             (latency_ms / 1000.0) if latency_ms is not None else None, ttft_s=ttft_s, tps=tps,
-            avg_logprob=it.get("avg_logprob"),
+            e2e_tps=e2e_tps(ct, latency_ms), avg_logprob=it.get("avg_logprob"),
         )
     except Exception:  # noqa: BLE001 — metrics are best-effort
         pass
