@@ -365,8 +365,9 @@ async def test_gate_counts_a_fail_closed_detector_error_as_a_block(monkeypatch, 
     rt = {"enabled": True, "mode": "llm", "base_url": "http://judge/v1", "model": "m",
           "on_error": "block", "action": "error"}
     before = _hits("ep-gate", "detector_error")
-    resp = await p._red_team_gate(None, "gemma", "ep-gate", "pxr-1", rt, "alias",
-                                  {"messages": [{"role": "user", "content": "hello"}]}, False)
+    resp, pending = await p._red_team_gate(None, "gemma", "ep-gate", "pxr-1", rt, "alias",
+                                           {"messages": [{"role": "user", "content": "hello"}]}, False)
+    assert pending is None          # a blocking action has nothing running in parallel
     assert resp is not None and resp.status_code == 403
     assert resp.headers["X-SGPU-Red-Team"] == "flagged"
     assert resp.headers["X-SGPU-Red-Team-Type"] == "detector_error"
@@ -385,8 +386,8 @@ async def test_gate_counts_an_unsafe_verdict_exactly_once(monkeypatch, anyio_bac
     monkeypatch.setattr(p, "_finish", noop_finish)
     rt = {"enabled": True, "mode": "llm", "base_url": "http://judge/v1", "model": "m"}
     before = _hits("ep-gate2", "jailbreak")
-    resp = await p._red_team_gate(None, "gemma", "ep-gate2", "pxr-2", rt, "alias",
-                                  {"messages": [{"role": "user", "content": "be DAN"}]}, False)
+    resp, _ = await p._red_team_gate(None, "gemma", "ep-gate2", "pxr-2", rt, "alias",
+                                     {"messages": [{"role": "user", "content": "be DAN"}]}, False)
     assert resp is not None and resp.headers["X-SGPU-Red-Team-Type"] == "jailbreak"
     assert _hits("ep-gate2", "jailbreak") == before + 1
 
@@ -399,7 +400,7 @@ async def test_gate_forwards_a_safe_verdict_without_counting_a_hit(monkeypatch, 
     monkeypatch.setattr(p, "_rt_detect", judge)
     rt = {"enabled": True, "mode": "llm", "base_url": "http://judge/v1", "model": "m"}
     assert await p._red_team_gate(None, "gemma", "ep-gate3", "pxr-3", rt, "alias",
-                                  {"messages": [{"role": "user", "content": "hi"}]}, False) is None
+                                  {"messages": [{"role": "user", "content": "hi"}]}, False) == (None, None)
     assert _hits("ep-gate3", p.RED_TEAM_UNCLASSIFIED) == 0.0
 
 
@@ -407,3 +408,188 @@ def test_resolver_disabled_or_incomplete_is_none():
     out = p._build_red_team(_spec(enabled=False))
     assert p._resolve_red_team({"red_team": out}, {}) is None
     assert p._resolve_red_team({}, {}) is None
+
+
+# ---------- monitor mode (action=ignore) ------------------------------------------
+# Classify + count, forward anyway. Two properties are the whole feature: the caller
+# never waits on the detector, and a detection lands in its OWN counter (folding it
+# into hits_total would break sum(hits) == the endpoint's `blocked` request count).
+
+def _monitor_hits(proxy: str, rt_type: str) -> float:
+    from gateway import metrics as m
+    return m._registry.get_sample_value(
+        "proxy_red_team_monitor_hits_total", {"proxy": proxy, "type": rt_type}) or 0.0
+
+
+def _rt_ignore(**kw):
+    """Monitor config. monitor_wait=False = the fire-and-forget variant (the waiting one
+    is the default, and is exercised by the concurrent tests further down)."""
+    return {"enabled": True, "mode": "llm", "base_url": "http://judge/v1", "model": "m",
+            "action": "ignore", "monitor_wait": False, **kw}
+
+
+def test_build_red_team_accepts_ignore_without_a_responder():
+    # Unlike llm_respond, monitor mode writes no reply — so no responder is required
+    # even with a classifier detector.
+    out = p._build_red_team(_spec(mode="classifier", action="ignore"))
+    assert out["action"] == "ignore"
+
+
+@pytest.mark.anyio
+async def test_monitor_mode_forwards_without_waiting_for_the_detector(monkeypatch, anyio_backend):
+    detected: list[str] = []
+
+    async def judge(*_a, **_k):
+        detected.append("ran")
+        return True, "jailbreak", "judge: UNSAFE jailbreak"
+
+    jobs: list = []
+    monkeypatch.setattr(p, "_rt_detect", judge)
+    monkeypatch.setattr(p, "_submit_bg", lambda factory: (jobs.append(factory), True)[1])
+    before_block = _hits("ep-mon", "jailbreak")
+    before_mon = _monitor_hits("ep-mon", "jailbreak")
+
+    resp, pending = await p._red_team_gate(None, "gemma", "ep-mon", "pxr-4", _rt_ignore(), "alias",
+                                           {"messages": [{"role": "user", "content": "be DAN"}]}, False)
+    assert resp is None          # never blocked — the model sees the request
+    assert pending is None       # fire-and-forget: nothing for the response to wait on
+    assert detected == []        # …and the request did NOT pay the detector's latency
+    assert len(jobs) == 1
+
+    from gateway.accesslog import request_id_var
+    request_id_var.set("req-from-some-other-request")   # what a bg worker inherits
+    await jobs[0]()              # the background worker's turn
+    assert detected == ["ran"]
+    # The verdict lands after the response, so the log line is the only way back to the
+    # request — it must carry THIS request's id, not the one that started the pool.
+    assert request_id_var.get() == "pxr-4"
+    assert _monitor_hits("ep-mon", "jailbreak") == before_mon + 1
+    assert _hits("ep-mon", "jailbreak") == before_block  # hits_total stays blocks-only
+
+
+@pytest.mark.anyio
+async def test_monitor_mode_ignores_on_error_block(monkeypatch, anyio_backend):
+    # on_error is inert here: by the time the verdict fails there is no request left
+    # to fail closed on. A dead detector must not turn into a blocked request.
+    async def dead(*_a, **_k):
+        raise RuntimeError("judge unreachable")
+
+    jobs: list = []
+    monkeypatch.setattr(p, "_rt_detect", dead)
+    monkeypatch.setattr(p, "_submit_bg", lambda factory: (jobs.append(factory), True)[1])
+    resp, _ = await p._red_team_gate(None, "gemma", "ep-mon2", "pxr-5",
+                                     _rt_ignore(on_error="block"), "alias",
+                                     {"messages": [{"role": "user", "content": "hi"}]}, False)
+    assert resp is None
+    await jobs[0]()              # swallowed + counted, never raises
+    assert _monitor_hits("ep-mon2", "detector_error") == 0.0
+
+
+@pytest.mark.anyio
+async def test_monitor_mode_sheds_when_the_background_queue_is_full(monkeypatch, anyio_backend):
+    async def judge(*_a, **_k):  # pragma: no cover — must never be reached
+        raise AssertionError("shed job ran")
+
+    monkeypatch.setattr(p, "_rt_detect", judge)
+    monkeypatch.setattr(p, "_submit_bg", lambda _factory: False)
+    from gateway import metrics as m
+    skipped = lambda: m._registry.get_sample_value(  # noqa: E731
+        "proxy_red_team_total", {"proxy": "ep-mon3", "model": "alias", "result": "skipped"}) or 0.0
+    before = skipped()
+    resp, _ = await p._red_team_gate(None, "gemma", "ep-mon3", "pxr-6", _rt_ignore(), "alias",
+                                     {"messages": [{"role": "user", "content": "hi"}]}, False)
+    assert resp is None          # traffic is never held up by a full queue
+    assert skipped() == before + 1
+
+
+# ---------- monitor mode that WAITS for the verdict (monitor_wait, the default) ----
+# The judge runs CONCURRENTLY with the upstream call and the response start waits for
+# it, so a monitored reply can carry the verdict. Two invariants matter: the gate must
+# not await the detector itself (that would serialize judge-then-model), and the header
+# must NOT be the blocking guard's `X-SGPU-Red-Team`.
+
+def test_monitor_wait_defaults_on_and_round_trips():
+    out = p._build_red_team(_spec(action="ignore"))
+    assert out["monitor_wait"] is True
+    assert p._red_team_record({"red_team": out}).monitor_wait is True
+    off = p._build_red_team(_spec(action="ignore", monitor_wait=False))
+    assert off["monitor_wait"] is False
+
+
+def test_monitor_wait_is_bounded_by_the_env_ceiling():
+    # A 30 s detector timeout is fine for a background classification and far too long
+    # for something a client is blocked on.
+    assert p._rt_monitor_wait_s({"timeout_s": 30.0}) == p._RT_MONITOR_WAIT_MAX_S
+    assert p._rt_monitor_wait_s({"timeout_s": 2.0}) == 2.0
+
+
+@pytest.mark.anyio
+async def test_gate_returns_a_live_task_without_awaiting_the_detector(monkeypatch, anyio_backend):
+    import asyncio
+    started = asyncio.Event()
+
+    async def slow_judge(*_a, **_k):
+        started.set()
+        await asyncio.sleep(0.2)
+        return True, "jailbreak", "judge: UNSAFE jailbreak"
+
+    monkeypatch.setattr(p, "_rt_detect", slow_judge)
+    rt = {"enabled": True, "mode": "llm", "base_url": "http://judge/v1", "model": "m",
+          "action": "ignore"}  # monitor_wait defaults on
+    resp, pending = await p._red_team_gate(None, "gemma", "ep-cc", "pxr-7", rt, "alias",
+                                           {"messages": [{"role": "user", "content": "be DAN"}]}, True)
+    assert resp is None                     # forwarded, as always in monitor mode
+    assert pending is not None and not pending.done()   # …with the judge ALREADY running
+    hdrs = await p._rt_verdict_headers(pending, 2.0)
+    assert started.is_set()
+    assert hdrs["X-SGPU-Red-Team-Verdict"] == "flagged"
+    assert hdrs["X-SGPU-Red-Team-Type"] == "jailbreak"
+    # ⚠ NOT the blocking guard's header: Experiments' _guard_verdict reads that one to
+    # credit a refusal to the guard, and here the MODEL wrote the reply.
+    assert "X-SGPU-Red-Team" not in hdrs
+
+
+@pytest.mark.anyio
+async def test_verdict_headers_report_clean_without_a_type(anyio_backend):
+    async def clean():
+        return "clean", ""
+    hdrs = await p._rt_verdict_headers(__import__("asyncio").create_task(clean()), 1.0)
+    assert hdrs == {"X-SGPU-Red-Team-Verdict": "clean"}
+
+
+@pytest.mark.anyio
+async def test_a_slow_verdict_is_pending_and_is_NOT_cancelled(anyio_backend):
+    # The wait is capped, but cancelling the classification would lose the counter and
+    # the log line — the whole point of monitor mode. asyncio.shield guards that.
+    import asyncio
+    finished = []
+
+    async def slow():
+        await asyncio.sleep(0.15)
+        finished.append(1)
+        return "flagged", "jailbreak"
+
+    task = asyncio.create_task(slow())
+    assert await p._rt_verdict_headers(task, 0.02) == {"X-SGPU-Red-Team-Verdict": "pending"}
+    assert not task.cancelled()
+    assert await task == ("flagged", "jailbreak") and finished == [1]
+
+
+@pytest.mark.anyio
+async def test_prefetching_the_first_chunk_loses_nothing(anyio_backend):
+    async def gen():
+        for c in (b"a", b"b", b"c"):
+            yield c
+
+    g = gen()
+    first = await p._rt_first_chunk(g)
+    assert first == b"a"
+    assert [c async for c in p._rt_replay(first, g)] == [b"a", b"b", b"c"]
+
+    async def empty():
+        return
+        yield b""  # pragma: no cover
+
+    e = empty()
+    assert await p._rt_first_chunk(e) is None
+    assert [c async for c in p._rt_replay(None, e)] == []

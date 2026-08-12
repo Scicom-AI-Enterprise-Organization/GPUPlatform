@@ -416,8 +416,16 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 </span>
               </CardTitle>
               <p className="text-[11px] text-muted-foreground">
-                Chat requests are screened inline before any upstream sees them; a hit is answered by the gateway
-                with its category in <span className="font-mono">X-SGPU-Red-Team-Type</span>.
+                {ep.red_team.action === "ignore" ? (
+                  <>Monitor only — chat requests are classified <span className="font-medium">in parallel</span> with the model and
+                  forwarded regardless; a hit moves <span className="font-mono">proxy_red_team_monitor_hits_total</span>
+                  {ep.red_team.monitor_wait === false
+                    ? <> and nothing else (fire-and-forget, no verdict on the response).</>
+                    : <> and the reply carries <span className="font-mono">X-SGPU-Red-Team-Verdict</span>.</>}</>
+                ) : (
+                  <>Chat requests are screened inline before any upstream sees them; a hit is answered by the gateway
+                  with its category in <span className="font-mono">X-SGPU-Red-Team-Type</span>.</>
+                )}
               </p>
             </CardHeader>
             <CardContent className="space-y-1.5 text-xs">
@@ -428,9 +436,11 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                   {{ last_user: "last user message", user: "all user messages", full: "full conversation" }[ep.red_team.scan ?? "last_user"]}</span>
                 <span><span className="text-muted-foreground">on hit</span>{" "}
                   {ep.red_team.action === "llm_respond" ? "LLM writes the refusal"
-                    : ep.red_team.action === "error" ? `HTTP ${ep.red_team.error_status ?? 403}` : "canned reply"}</span>
+                    : ep.red_team.action === "error" ? `HTTP ${ep.red_team.error_status ?? 403}`
+                    : ep.red_team.action === "ignore" ? "count only (not blocked)" : "canned reply"}</span>
                 <span><span className="text-muted-foreground">on detector failure</span>{" "}
-                  {ep.red_team.on_error === "block" ? "block (fail closed)" : "allow (fail open)"}</span>
+                  {ep.red_team.action === "ignore" ? "n/a — nothing to block"
+                    : ep.red_team.on_error === "block" ? "block (fail closed)" : "allow (fail open)"}</span>
               </div>
               <div className="text-muted-foreground">
                 types:{" "}

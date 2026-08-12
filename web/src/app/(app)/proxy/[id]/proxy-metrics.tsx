@@ -48,9 +48,15 @@ const DUR = "proxy_request_duration_seconds";
 const TTFT = "proxy_ttft_seconds";
 const TPS = "proxy_tokens_per_second";
 const RT_TOTAL = "proxy_red_team_total";       // {result: safe|unsafe|error|skipped}
-const RT_HITS = "proxy_red_team_hits_total";   // {type: attack category}
+const RT_HITS = "proxy_red_team_hits_total";   // {type: attack category} — BLOCKED
+// action=ignore: flagged and forwarded anyway (monitor mode). A separate series
+// because it is the opposite outcome — see observe_red_team_monitor_hit.
+const RT_MON_HITS = "proxy_red_team_monitor_hits_total";
 // Unsafe/blocked shares the amber identity the Queue tab's "blocked" badge uses.
 const COLOR_UNSAFE = "#f59e0b"; // amber-500
+// Monitored (flagged but forwarded) reads as information, not enforcement — and stays
+// distinguishable from amber under every CVD type.
+const COLOR_MONITORED = "#38bdf8"; // sky-400
 
 // A status counts as a success only when it completed; "cancelled" is neutral
 // (client hung up / manual flush), and "blocked" is the red-team guard working
@@ -71,7 +77,9 @@ type RedTeamSummary = {
   unsafe: number;
   errors: number;
   skipped: number;
-  byType: { type: string; count: number }[];
+  // Per attack category, split by what actually happened to the request: `blocked`
+  // (a guarding action) vs `monitored` (action=ignore — flagged, forwarded anyway).
+  byType: { type: string; blocked: number; monitored: number }[];
 };
 
 type Summary = {
@@ -122,10 +130,15 @@ function summarize(samples: Sample[]): Summary {
   let errors = 0;
   for (const [status, count] of statuses) if (isError(status)) errors += count;
 
-  // Red-team screening outcomes + the blocked-by-attack-type breakdown.
+  // Red-team screening outcomes + the flagged-by-attack-type breakdown.
   const rt: RedTeamSummary = { safe: 0, unsafe: 0, errors: 0, skipped: 0, byType: [] };
   let rtSeen = false;
-  const rtTypes = new Map<string, number>();
+  const rtTypes = new Map<string, { blocked: number; monitored: number }>();
+  const bumpType = (t: string, key: "blocked" | "monitored", v: number) => {
+    let e = rtTypes.get(t);
+    if (!e) { e = { blocked: 0, monitored: 0 }; rtTypes.set(t, e); }
+    e[key] += v;
+  };
   for (const s of samples) {
     if (s.name === RT_TOTAL) {
       rtSeen = true;
@@ -133,15 +146,15 @@ function summarize(samples: Sample[]): Summary {
       else if (s.labels.result === "unsafe") rt.unsafe += s.value;
       else if (s.labels.result === "error") rt.errors += s.value;
       else if (s.labels.result === "skipped") rt.skipped += s.value;
-    } else if (s.name === RT_HITS) {
+    } else if (s.name === RT_HITS || s.name === RT_MON_HITS) {
       rtSeen = true;
-      const t = s.labels.type || "(unknown)";
-      rtTypes.set(t, (rtTypes.get(t) ?? 0) + s.value);
+      bumpType(s.labels.type || "(unknown)",
+               s.name === RT_HITS ? "blocked" : "monitored", s.value);
     }
   }
   rt.byType = [...rtTypes.entries()]
-    .map(([type, count]) => ({ type, count }))
-    .sort((a, b) => b.count - a.count);
+    .map(([type, e]) => ({ type, ...e }))
+    .sort((a, b) => (b.blocked + b.monitored) - (a.blocked + a.monitored));
 
   // Latency / ttft / tps are labelled by model only — build a per-model lookup
   // of sum/count for the table, and the proxy-wide aggregate for the cards.
@@ -380,25 +393,43 @@ export function ProxyMetricsTab({ ep }: { ep: ProxyEndpoint }) {
         // fail-closed detector error (on_error=block) blocks with result="error" and
         // type `detector_error`, so byType is the count that matches the Queue tab's
         // `blocked` bucket. With on_error=allow (the default) the two are identical.
-        const blocked = rt.byType.reduce((a, t) => a + t.count, 0);
+        const blocked = rt.byType.reduce((a, t) => a + t.blocked, 0);
+        // Monitor mode (action=ignore): flagged and forwarded anyway. Its own axis —
+        // these requests DID reach the model, so folding them into "Blocked" would
+        // report a guardrail that isn't there.
+        const monitored = rt.byType.reduce((a, t) => a + t.monitored, 0);
         const screened = rt.safe + rt.unsafe + rt.errors;
-        const blockRate = screened > 0 ? (blocked / screened) * 100 : 0;
+        const flagged = blocked + monitored;
+        const flagRate = screened > 0 ? (flagged / screened) * 100 : 0;
         const typeBars = rt.byType.map((t) => ({
           name: t.type.length > 28 ? `${t.type.slice(0, 27)}…` : t.type,
-          count: t.count,
+          blocked: t.blocked,
+          monitored: t.monitored,
         }));
         const typeChartHeight = Math.min(340, Math.max(120, typeBars.length * 36));
         return (
           <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <div className={"grid grid-cols-2 gap-3 sm:grid-cols-3 "
+                            + (monitored > 0 ? "lg:grid-cols-7" : "lg:grid-cols-6")}>
               <SummaryCard label="Screened" value={fmtInt(screened)} />
               <SummaryCard label="Safe" value={fmtInt(rt.safe)} />
               <SummaryCard label="Blocked" value={fmtInt(blocked)} tone={blocked > 0 ? "bad" : "neutral"} />
-              <SummaryCard label="Block rate" value={`${blockRate.toFixed(blockRate < 10 ? 1 : 0)}%`} tone={blockRate > 0 ? "bad" : "neutral"} />
+              {monitored > 0 && (
+                <SummaryCard label="Flagged, allowed" value={fmtInt(monitored)} tone={monitored > 0 ? "bad" : "neutral"} />
+              )}
+              <SummaryCard label={monitored > 0 ? "Flag rate" : "Block rate"}
+                           value={`${flagRate.toFixed(flagRate < 10 ? 1 : 0)}%`} tone={flagRate > 0 ? "bad" : "neutral"} />
               <SummaryCard label="Detector errors" value={fmtInt(rt.errors)} tone={rt.errors > 0 ? "bad" : "neutral"} />
               <SummaryCard label="Skipped" value={fmtInt(rt.skipped)} />
             </div>
-            <ChartCard title="Blocked by attack type" extra="(X-SGPU-Red-Team-Type)">
+            <ChartCard title="Flagged by attack type"
+                       extra={monitored > 0 ? "(action=ignore counts as monitored — the model answered)" : "(X-SGPU-Red-Team-Type)"}
+                       legend={monitored > 0 ? (
+                         <span className="flex items-center gap-3">
+                           <LegendDot color={COLOR_UNSAFE} label="blocked" />
+                           <LegendDot color={COLOR_MONITORED} label="monitored" />
+                         </span>
+                       ) : undefined}>
               <div className="w-full" style={{ height: typeChartHeight }}>
                 {typeBars.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
@@ -406,13 +437,20 @@ export function ProxyMetricsTab({ ep }: { ep: ProxyEndpoint }) {
                       <XAxis type="number" domain={[0, "dataMax"]} allowDecimals={false} tick={{ fontSize: 10, fill: "#6b7280" }} stroke="#d4d4d8" />
                       <YAxis type="category" dataKey="name" width={170} interval={0} tickLine={false} axisLine={false} tick={{ fontSize: 10, fill: "#9ca3af" }} />
                       <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ fill: "#000", opacity: 0.05 }} />
-                      <Bar dataKey="count" name="blocked" fill={COLOR_UNSAFE} radius={[0, 3, 3, 0]}>
-                        <LabelList dataKey="count" position="right" fontSize={10} fill="#9ca3af" />
-                      </Bar>
+                      {blocked > 0 && (
+                        <Bar dataKey="blocked" name="blocked" fill={COLOR_UNSAFE} radius={[0, 3, 3, 0]}>
+                          <LabelList dataKey="blocked" position="right" fontSize={10} fill="#9ca3af" />
+                        </Bar>
+                      )}
+                      {monitored > 0 && (
+                        <Bar dataKey="monitored" name="monitored" fill={COLOR_MONITORED} radius={[0, 3, 3, 0]}>
+                          <LabelList dataKey="monitored" position="right" fontSize={10} fill="#9ca3af" />
+                        </Bar>
+                      )}
                     </BarChart>
                   </ResponsiveContainer>
                 ) : (
-                  <Empty>No blocked requests yet — every screened request came back safe.</Empty>
+                  <Empty>No flagged requests yet — every screened request came back safe.</Empty>
                 )}
               </div>
             </ChartCard>

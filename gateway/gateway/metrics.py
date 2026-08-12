@@ -503,6 +503,15 @@ PROXY_RED_TEAM_HITS = Counter(
     "Red-team BLOCKED requests by attack category",
     ["proxy", "type"], registry=_registry,
 )
+# Monitor mode (`action=ignore`): the detector flagged the request and it was
+# forwarded ANYWAY — the classification exists only as this counter. Deliberately
+# NOT folded into _HITS: that series' invariant is sum(hits) == the endpoint's
+# `blocked` ProxyRequest count, and a monitored detection blocks nothing.
+PROXY_RED_TEAM_MONITOR_HITS = Counter(
+    "proxy_red_team_monitor_hits_total",
+    "Red-team detections that were ALLOWED THROUGH (action=ignore), by attack category",
+    ["proxy", "type"], registry=_registry,
+)
 PROXY_RED_TEAM_SECONDS = Histogram(
     "proxy_red_team_seconds",
     "Red-team detector call latency (seconds), by detector mode",
@@ -529,6 +538,16 @@ def observe_red_team_hit(proxy: str, rt_type: str) -> None:
     sum(hits) short of the endpoint's `blocked` request count."""
     if rt_type:
         PROXY_RED_TEAM_HITS.labels(proxy=proxy, type=rt_type).inc()
+
+
+def observe_red_team_monitor_hit(proxy: str, rt_type: str) -> None:
+    """One FLAGGED-BUT-FORWARDED request, by category (`action=ignore`). The
+    request was already on its way to the upstream when this fired — there is no
+    block, no response header and no `blocked` ProxyRequest row, so this counter
+    is the ONLY record of the detection. Alert on its rate for realtime
+    monitoring; keep it out of hits_total (see that counter's invariant)."""
+    if rt_type:
+        PROXY_RED_TEAM_MONITOR_HITS.labels(proxy=proxy, type=rt_type).inc()
 
 
 # Depth of the shared off-path background-job queue (TTS CER/WER evals + drift-sample
@@ -580,7 +599,8 @@ def render_proxy(proxy: str) -> bytes:
                            PROXY_AUDIO_NLL, PROXY_AUDIO_RTF, PROXY_AUDIO_SECONDS,
                            PROXY_AUDIO_PROCESS_SECONDS, PROXY_TTS_CER, PROXY_TTS_WER,
                            PROXY_TTS_EVAL_TOTAL, PROXY_CAPTURE_TOTAL,
-                           PROXY_RED_TEAM_TOTAL, PROXY_RED_TEAM_HITS, PROXY_RED_TEAM_SECONDS):
+                           PROXY_RED_TEAM_TOTAL, PROXY_RED_TEAM_HITS,
+                           PROXY_RED_TEAM_MONITOR_HITS, PROXY_RED_TEAM_SECONDS):
                 for mf in metric.collect():
                     samples = [s for s in mf.samples if s.labels.get("proxy") == proxy]
                     if not samples:

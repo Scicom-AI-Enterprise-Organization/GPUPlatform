@@ -93,11 +93,16 @@ const SCAN_LABEL: Record<string, string> = {
   full: "full conversation",
 };
 // What a hit produces. `error` is the only one that isn't a 200 — the other two are
-// ordinary completions carrying a refusal (finish_reason: content_filter).
+// ordinary completions carrying a refusal (finish_reason: content_filter). `ignore`
+// produces no response at all: the request goes on to the chain and only a counter moves.
 const hitLabel = (rt: ProxyRedTeam) =>
   rt.action === "error" ? `HTTP ${rt.error_status ?? 403}`
     : rt.action === "llm_respond" ? "LLM-written refusal"
+    : rt.action === "ignore" ? "counted, not blocked"
     : "canned reply";
+// Monitor mode inverts what the stage MEANS — it observes the route instead of
+// gating it — so the graph has to say so rather than draw a guardrail that isn't one.
+const isMonitor = (rt: ProxyRedTeam) => rt.action === "ignore";
 
 const curveLR = (x1: number, y1: number, x2: number, y2: number) => {
   const dx = Math.max(36, (x2 - x1) * 0.55);
@@ -301,12 +306,19 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
             <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open/kind:rotate-90" />
             <span className="text-sm font-medium">{KIND_LABEL[kind]}</span>
             <code className="truncate text-[11px] text-muted-foreground">POST {KIND_PATH[kind]}</code>
-            {guardFor(redTeam, kind) && (
-              <span className="inline-flex shrink-0 items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-600 dark:text-amber-400"
-                    title="Every request on this path is screened by the red-team guard before any backend is called">
-                <ShieldAlert className="h-2.5 w-2.5" /> screened
-              </span>
-            )}
+            {(() => {
+              const g = guardFor(redTeam, kind);
+              if (!g) return null;
+              const mon = isMonitor(g);
+              return (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-600 dark:text-amber-400"
+                      title={mon
+                        ? "Every request on this path is classified by the red-team detector off the request path — flagged requests are counted, not blocked"
+                        : "Every request on this path is screened by the red-team guard before any backend is called"}>
+                  <ShieldAlert className="h-2.5 w-2.5" /> {mon ? "monitored" : "screened"}
+                </span>
+              );
+            })()}
             <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">
               {items.length} model{items.length === 1 ? "" : "s"}
             </span>
@@ -333,14 +345,23 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
           How failover works
         </summary>
         <ul className="space-y-1 border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
-          {chatGuard && (
+          {chatGuard && (isMonitor(chatGuard) ? (
+            <li>
+              <b className="text-foreground">Chat is classified, not gated.</b> The red-team detector runs in parallel
+              with the model — every request reaches an upstream, and a flagged one is only counted
+              (<span className="font-mono">proxy_red_team_monitor_hits_total</span>) and logged
+              {chatGuard.monitor_wait === false ? null : (
+                <>, with the verdict on the reply as <span className="font-mono">X-SGPU-Red-Team-Verdict</span></>
+              )}. Nothing short-circuits, so failover below applies to all traffic.
+            </li>
+          ) : (
             <li>
               <b className="text-foreground">Chat is screened first.</b> The red-team guard runs before any
               backend is chosen — a hit is answered by the gateway ({hitLabel(chatGuard)}), so it never reaches
               an upstream and never fails over. A detector outage{" "}
               {chatGuard.on_error === "block" ? "blocks the request (fail closed)" : "lets it through (fail open)"}.
             </li>
-          )}
+          ))}
           <li><b className="text-foreground">Moves to the next backend</b> on 5xx, a connection refused/timeout, or a dropped socket.</li>
           {failoverStatus.length > 0 ? (
             <li>
@@ -546,12 +567,19 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
               <Node x={guardX} y={guardY} w={nodeW} tone="wait" glow
                     title={`${guard.mode === "llm" ? "LLM judge" : "classifier"} · ${guard.base_url || "no detector URL"}`
                            + ` · scans the ${SCAN_LABEL[guard.scan ?? "last_user"]}`
-                           + ` · a hit is answered with a ${hitLabel(guard)} and carries X-SGPU-Red-Team-Type`}>
-                <NodeHead tone="wait" icon={ShieldAlert} title="Red-team screen"
+                           + (isMonitor(guard)
+                               ? " · monitor only: the detector runs in parallel with the model and a hit is"
+                                 + " counted (proxy_red_team_monitor_hits_total), never blocked"
+                                 + (guard.monitor_wait === false ? "" : "; the reply carries X-SGPU-Red-Team-Verdict")
+                               : ` · a hit is answered with a ${hitLabel(guard)} and carries X-SGPU-Red-Team-Type`)}>
+                <NodeHead tone="wait" icon={ShieldAlert}
+                          title={isMonitor(guard) ? "Red-team monitor" : "Red-team screen"}
                           right={
-                            <Tag tone={guard.on_error === "block" ? "down" : "wait"}>
-                              {guard.on_error === "block" ? "fail closed" : "fail open"}
-                            </Tag>
+                            isMonitor(guard)
+                              ? <Tag tone="wait">async</Tag>
+                              : <Tag tone={guard.on_error === "block" ? "down" : "wait"}>
+                                  {guard.on_error === "block" ? "fail closed" : "fail open"}
+                                </Tag>
                           } />
                 <NodeRule />
                 <div className="truncate font-mono text-[11px] text-muted-foreground">

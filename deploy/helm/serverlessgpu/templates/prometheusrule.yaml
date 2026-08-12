@@ -136,4 +136,13 @@ spec:
           annotations:
             summary: "Proxy background-job queue saturated"
             description: "TTS-eval/drift-capture jobs are backing up ({{`{{ $value }}`}} pending) — raise PROXY_BG_WORKERS before jobs get shed."
+        # Monitor-mode red teaming (red_team.action=ignore): flagged AND forwarded, so
+        # this counter is the only record of the attack — no `for:` window on purpose.
+        - alert: ProxyRedTeamAttackDetected
+          expr: sum by (proxy, type) (increase(proxy_red_team_monitor_hits_total[5m])) > 0
+          for: 0m
+          labels: {severity: warning}
+          annotations:
+            summary: "Red-team hit on LLM proxy {{`{{ $labels.proxy }}`}} ({{`{{ $labels.type }}`}})"
+            description: "{{`{{ $value }}`}} request(s) in the last 5m were classified {{`{{ $labels.type }}`}} and FORWARDED — this endpoint screens in monitor mode (action=ignore), so the model answered them. Switch the action to a blocking one if that isn't intended."
 {{- end }}

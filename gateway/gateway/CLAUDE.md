@@ -878,13 +878,60 @@ every new `RedTeamSpec` field.
   jailbreak, system_prompt_extraction, harmful_content, pii_exfiltration) drives the judge prompt
   AND the category matching; every block carries `X-SGPU-Red-Team: flagged` +
   **`X-SGPU-Red-Team-Type: <type>`** (sanitized, `unclassified` when the detector names none).
-- **Three actions on a hit.** `respond` (default) = an OpenAI-shaped completion with the canned
-  `message`, `finish_reason: "content_filter"`, SSE-shaped when the caller streamed (`_rt_sse`);
+- **Three blocking actions on a hit.** `respond` (default) = an OpenAI-shaped completion with the
+  canned `message`, `finish_reason: "content_filter"`, SSE-shaped when the caller streamed (`_rt_sse`);
   `llm_respond` = a responder LLM writes the refusal (falls back to canned on ANY failure — a broken
   responder must never turn a block into a 502; responder defaults to the judge endpoint/key in llm
   mode, and is **required config in classifier mode** — validated at save); `error` = the configured
   `error_status` (default **403 — deliberately the proxy's "guardrail block, never failover" code**)
   with `{"error": {…, "red_team_type": …}}`.
+- **`action=ignore` = MONITOR mode: the detector runs CONCURRENTLY with the model, never before
+  it** (added 2026-08-12). Classify for observability, forward the request untouched. Two variants,
+  `monitor_wait` (default **True**):
+  - **`monitor_wait=True`** — `_rt_start_monitor` starts the classification as a task at gate time
+    and `_dispatch_buffered` waits for its verdict **just before the response starts**, so the reply
+    carries **`X-SGPU-Red-Team-Verdict: flagged|clean|error|pending`** (+ `-Type` on a hit). Cost is
+    `max(0, judge − upstream first byte)`, NOT the judge's latency — the two overlap. ⚠ For a
+    **stream** that required pulling the generator's first chunk as a task (`_rt_first_chunk`) while
+    awaiting the verdict, because SSE headers flush before the body; the pulled chunk is replayed by
+    `_rt_replay` so nothing is lost. Consequence: a streamed response's headers now arrive at the
+    first upstream byte instead of immediately — that is the price of a verdict on a stream.
+  - **`monitor_wait=False`** — fire-and-forget via `_rt_submit_monitor` → the shared bounded
+    background queue (`_submit_bg`, same pool as the TTS evals / drift captures). **Zero** added
+    latency, no verdict on the response, counter + log line are the whole record.
+  - ⚠ **The verdict header is `X-SGPU-Red-Team-Verdict`, deliberately NOT `X-SGPU-Red-Team`.**
+    The latter means "this gateway refused the request" and `experiments_api._guard_verdict` reads
+    it to attribute a refusal to the guard instead of the model. In monitor mode the MODEL wrote the
+    reply, so reusing it would drop a genuine model response out of scoring and credit a guardrail
+    that let the attack through — exactly the confusion the guard-attribution work removed.
+  - The wait is bounded by `min(timeout_s, RED_TEAM_MONITOR_WAIT_MAX_S)` (default 10 s) — a 30 s
+    detector timeout is fine for a background classification, not for a blocked client. Over the
+    cap the header says `pending` and the task keeps running under `asyncio.shield`, so the counter
+    and the log line still land. **Never cancel the classification to satisfy the wait.**
+  - `_rt_monitor_tasks` holds a strong reference to every in-flight task: asyncio only weakly
+    references tasks, so without it a verdict can be GC'd mid-flight and the detection silently
+    vanishes under load.
+
+  What follows from the detector not gating the request, all deliberate:
+  - **`on_error` is inert** — the request is already forwarded when the verdict fails, so there is
+    nothing left to fail closed on. A failure is one WARNING + `result="error"` (and
+    `X-SGPU-Red-Team-Verdict: error`). The form says so.
+  - **No `blocked` ProxyRequest row** — the request genuinely completed. Experiments' guard
+    attribution sees an unguarded target here, which is *correct*: the model really did answer the
+    attack, so `model_refusal_rate` is the honest number.
+  - **A full background queue SHEDS the classification** (counted `skipped` + a WARNING naming
+    `PROXY_BG_WORKERS`/`PROXY_BG_QUEUE_MAX`) rather than pushing backpressure onto live traffic.
+  - ⚠ **The WARNING line is the only path from a detection back to its request** (the counter
+    carries no id), so `_job` re-attaches `accesslog.request_id_var` and spells `req=pxr-…` into the
+    message. `_bg_worker` now CLEARS that var before every job for the same reason: a worker task
+    inherits the context of whichever request lazily started the pool, so every off-path log line
+    for the rest of the process was stamped with that one stale id (visible on the TTS-eval and
+    capture jobs too — this fixed those as a side effect).
+  - **The body is still buffered and parsed** — only the detector CALL moved off the path; the scan
+    needs the messages, so the streaming-passthrough fast path stays bypassed.
+  - `_build_red_team` does NOT require a responder for `ignore` (nothing writes a reply), and the
+    stored `message`/`error_status`/responder fields survive untouched so flipping the action back
+    to a blocking one restores the previous behaviour.
 - **What's scanned**: `scan` = `last_user` (default) | `user` | `full`; multimodal content lists
   contribute their text parts; **TAIL-truncated** to `max_chars` (8k) — injections ride at the END
   of long context. A `/v1/completions` body has no `messages`, so `_rt_prompt_text` reads `prompt`
@@ -901,9 +948,17 @@ every new `RedTeamSpec` field.
   (`error_text = "red-team[<type>]: <reason>"`), visible in the Queue tab (new bucket/stat).
 - **Metrics**: `proxy_red_team_total{proxy,model,result=safe|unsafe|error|skipped}`,
   `proxy_red_team_hits_total{proxy,type}` (attack-type breakdown),
-  `proxy_red_team_seconds{proxy,mode}` — all three included in the per-proxy
+  **`proxy_red_team_monitor_hits_total{proxy,type}`** (monitor mode's detections — flagged AND
+  forwarded; deliberately a SEPARATE series so `hits_total`'s == `blocked` invariant below survives,
+  and because the two are opposite outcomes: one blocked an attack, the other let it reach the
+  model. It is the only record of the detection, hence the `ProxyRedTeamAttackDetected` alert fires
+  with no `for:` window — in `deploy/monitoring/prometheus/alerts.yml` **and** the Helm
+  PrometheusRule, the two-synced-files rule),
+  `proxy_red_team_seconds{proxy,mode}` — all four included in the per-proxy
   `/proxy/{name}/metrics` exposition and rendered on the web Metrics tab
-  (screened/safe/blocked cards + a blocked-by-type bar chart). ⚠ `blocked` is NOT an
+  (screened/safe/blocked cards + a flagged-by-type bar chart; monitor hits add a
+  "Flagged, allowed" card and a second sky-coloured bar series, and only appear once
+  the counter is non-zero so a blocking endpoint's tab is unchanged). ⚠ `blocked` is NOT an
   error in the tab's error rate — the guard working as designed isn't an upstream
   failure. ⚠ **The two counters measure different axes**: `_total` is the detector's
   VERDICT, `_hits_total` is the BLOCK. They diverge under `on_error: block`, where a

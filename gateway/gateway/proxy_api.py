@@ -17,7 +17,8 @@ translations,speech,speaker}`, `/v1/models`.
 - **LLM red-teaming screen** (per-endpoint `red_team` config): chat/completions
   requests are checked INLINE by a classifier or LLM judge before forwarding;
   positives short-circuit into a canned reply, an LLM-written refusal, or an HTTP
-  error, with the attack category in `X-SGPU-Red-Team-Type`.
+  error, with the attack category in `X-SGPU-Red-Team-Type`. `action=ignore` makes
+  it monitor-only instead — detector off the request path, hit = a counter.
 - Recent requests are persisted to Postgres for history/audit.
 
 Data plane auth = a platform API key (`sgpu_…`, via `current_user`); management
@@ -27,6 +28,7 @@ routes are admin-only. Upstream API keys are referenced by a GlobalEnv secret ke
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import math
@@ -177,7 +179,10 @@ class RedTeamSpec(BaseModel):
     a positive (attack/abuse) verdict short-circuits into a canned assistant reply,
     an LLM-written refusal, or an HTTP error. Detector = a `classifier` endpoint
     (vLLM /classify or an OpenAI-style /moderations) or an `llm` judge (a chat model
-    answering SAFE/UNSAFE). Key handling mirrors UpstreamSpec."""
+    answering SAFE/UNSAFE). Key handling mirrors UpstreamSpec.
+
+    `action="ignore"` turns the guard into a MONITOR: nothing is blocked, so the
+    detector runs off the request path and a hit is only a Prometheus counter."""
     enabled: bool = True
     mode: str = "classifier"              # classifier | llm
     # classifier: the server root or the full /classify | /moderations URL;
@@ -209,9 +214,20 @@ class RedTeamSpec(BaseModel):
     scan: str = "last_user"               # last_user | user (all user turns) | full (whole conversation)
     max_chars: int = 8000                 # tail-truncate the scanned text to this
     timeout_s: float = 15.0               # detector call read timeout
-    on_error: str = "allow"               # detector broken/unparseable: allow (fail-open) | block
+    # detector broken/unparseable: allow (fail-open) | block. INERT for action=ignore
+    # (the request is already forwarded when the verdict lands — nothing left to block).
+    on_error: str = "allow"
     # action on a positive
-    action: str = "respond"               # respond (canned reply) | llm_respond | error
+    # respond (canned reply) | llm_respond | error | ignore (classify + count only,
+    # detector runs off the request path — see _rt_submit_monitor)
+    action: str = "respond"
+    # action=ignore only. True (default): run the detector CONCURRENTLY with the
+    # upstream call and hold the response start until its verdict lands (bounded by
+    # RED_TEAM_MONITOR_WAIT_MAX_S), so the reply can carry X-SGPU-Red-Team-Verdict.
+    # Costs max(0, judge − upstream first byte), not the judge's full latency.
+    # False: pure fire-and-forget on the background queue — zero added latency, and
+    # the counter + log line are the only record.
+    monitor_wait: bool = True
     message: str = ""                     # canned reply / error message ("" = built-in default)
     responder_base_url: str = ""          # llm_respond: OpenAI /v1 base ("" = the detector's, llm mode only)
     responder_model: str = ""
@@ -298,6 +314,7 @@ class RedTeamRecord(BaseModel):
     timeout_s: float = 15.0
     on_error: str = "allow"
     action: str = "respond"
+    monitor_wait: bool = True
     message: str = ""
     responder_base_url: str = ""
     responder_model: str = ""
@@ -789,7 +806,7 @@ def _capture_record(cfg: dict) -> Optional[CaptureRecord]:
 
 _RT_MODES = ("classifier", "llm")
 _RT_SCANS = ("last_user", "user", "full")
-_RT_ACTIONS = ("respond", "llm_respond", "error")
+_RT_ACTIONS = ("respond", "llm_respond", "error", "ignore")
 _RT_ON_ERROR = ("allow", "block")
 # "" (model default) is also accepted; "disable" is the vLLM chat-template toggle,
 # the rest map to the OpenAI-style reasoning_effort body param.
@@ -859,7 +876,7 @@ def _build_red_team(spec: Optional[RedTeamSpec], existing: Optional[dict] = None
         "scan": scan, "max_chars": max(200, int(spec.max_chars or 8000)),
         "timeout_s": max(1.0, float(spec.timeout_s or 15.0)), "on_error": on_error,
         "action": action, "message": (spec.message or "").strip(),
-        "error_status": status,
+        "error_status": status, "monitor_wait": bool(spec.monitor_wait),
     }
     if (spec.prompt or "").strip():
         out["prompt"] = spec.prompt.strip()
@@ -908,6 +925,7 @@ def _red_team_record(cfg: dict) -> Optional[RedTeamRecord]:
         scan=c.get("scan", "last_user"),
         max_chars=int(c.get("max_chars", 8000)), timeout_s=float(c.get("timeout_s", 15.0)),
         on_error=c.get("on_error", "allow"), action=c.get("action", "respond"),
+        monitor_wait=bool(c.get("monitor_wait", True)),
         message=c.get("message", ""),
         responder_base_url=c.get("responder_base_url", ""),
         responder_model=c.get("responder_model", ""),
@@ -1524,20 +1542,30 @@ async def _handle(request: Request, user: User, endpoint_name: str, payload: dic
     is_stream = bool(payload.get("stream"))
     endpoint_id, candidates, timeout_s, max_conc, request_id, red_team = await _prepare(
         app, endpoint_name, alias, user, is_stream, force=_forced_upstream(request))
+    rt_task = None
     if red_team and upstream_path in _RT_GUARDED_PATHS:
-        blocked = await _red_team_gate(app, endpoint_name, endpoint_id, request_id, red_team,
-                                       alias, payload, is_stream,
-                                       chat=upstream_path == "/chat/completions")
+        blocked, rt_task = await _red_team_gate(app, endpoint_name, endpoint_id, request_id, red_team,
+                                                alias, payload, is_stream,
+                                                chat=upstream_path == "/chat/completions")
         if blocked is not None:
             return blocked
     return await _dispatch_buffered(app, request, user, endpoint_id, candidates, alias, is_stream,
-                                    timeout_s, max_conc, request_id, payload, upstream_path)
+                                    timeout_s, max_conc, request_id, payload, upstream_path,
+                                    rt_task=rt_task,
+                                    rt_wait_s=_rt_monitor_wait_s(red_team) if rt_task else 0.0)
 
 
 async def _dispatch_buffered(app, request, user, endpoint_id, candidates, alias, is_stream,
-                             timeout_s, max_conc, request_id, payload, upstream_path) -> Response:
+                             timeout_s, max_conc, request_id, payload, upstream_path,
+                             rt_task: "Optional[asyncio.Task]" = None,
+                             rt_wait_s: float = 0.0) -> Response:
     """Forward a fully-buffered payload dict — the classic engine (_stream / _do_unary),
-    which supports failover across multiple candidate upstreams."""
+    which supports failover across multiple candidate upstreams.
+
+    `rt_task` is a red-team MONITOR classification already in flight (action=ignore with
+    monitor_wait). It is never a gate: the forward proceeds regardless, and we only wait
+    for its verdict — concurrently with the upstream call — so the reply can carry
+    `X-SGPU-Red-Team-Verdict`."""
     gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream)
@@ -1551,14 +1579,50 @@ async def _dispatch_buffered(app, request, user, endpoint_id, candidates, alias,
         if len(candidates) == 1:
             sse_headers["X-Upstream-Url"] = candidates[0]["base_url"]
             sse_headers["X-Upstream-Name"] = candidates[0]["name"]
-        return StreamingResponse(
-            _stream(app, request_id, endpoint_id, candidates, alias, payload, upstream_path, timeout_s, gate, cancel_ev),
-            media_type="text/event-stream",
-            headers=sse_headers,
-        )
-    return await _unary(app, request, request_id,
+        gen = _stream(app, request_id, endpoint_id, candidates, alias, payload, upstream_path,
+                      timeout_s, gate, cancel_ev)
+        if rt_task is not None:
+            # A stream's headers flush BEFORE its body, so stamping the verdict means
+            # having it before the response starts. Pulling the generator's first chunk
+            # is what opens the upstream connection, so do that as a task and wait for
+            # the verdict alongside it: total delay is max(judge, first byte) instead of
+            # judge + first byte. Nothing is serialized, and no chunk is lost — the one
+            # we pulled is replayed first.
+            first_task = asyncio.create_task(_rt_first_chunk(gen))
+            sse_headers.update(await _rt_verdict_headers(rt_task, rt_wait_s))
+            try:
+                first = await first_task
+            except BaseException:
+                await gen.aclose()
+                raise
+            gen = _rt_replay(first, gen)
+        return StreamingResponse(gen, media_type="text/event-stream", headers=sse_headers)
+    resp = await _unary(app, request, request_id,
                         lambda: _do_unary(app, endpoint_id, candidates, alias, payload, upstream_path, timeout_s),
                         gate, cancel_ev)
+    if rt_task is not None:
+        # Unary is the easy half: the body is already buffered, so the judge has been
+        # running against the whole upstream call and the wait is usually already over.
+        for k, v in (await _rt_verdict_headers(rt_task, rt_wait_s)).items():
+            resp.headers[k] = v
+    return resp
+
+
+async def _rt_first_chunk(gen):
+    """Pull the first chunk of a stream (this is what starts the upstream call).
+    None = the stream ended without yielding anything."""
+    try:
+        return await gen.__anext__()
+    except StopAsyncIteration:
+        return None
+
+
+async def _rt_replay(first, gen):
+    """Relay a stream whose first chunk was already pulled."""
+    if first is not None:
+        yield first
+    async for chunk in gen:
+        yield chunk
 
 
 # ---------- streaming request-body passthrough (big-payload latency fix) -----
@@ -1870,7 +1934,9 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
     # stream; it can't inject new top-level keys. An upstream with extra_body (e.g.
     # OpenRouter provider pinning) must go through the buffered path so extra_body is
     # merged into the parsed payload. Red teaming also forces the buffered path — the
-    # detector needs the PARSED messages, so there's nothing to overlap.
+    # detector needs the PARSED messages, so there's nothing to overlap. That holds for
+    # monitor mode (action=ignore) too: only the detector CALL moves off the request
+    # path there, the scan itself still needs the messages.
     if len(candidates) == 1 and not candidates[0].get("extra_body") and rt_active is None:
         cand = candidates[0]
         real = cand["models"][alias]
@@ -1892,14 +1958,17 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
     is_stream = bool(payload.get("stream"))
     request_id = f"pxr-{_secrets.token_hex(8)}"
     await _insert_request_row(request_id, endpoint_id, user, alias, is_stream)
+    rt_task = None
     if rt_active is not None:
-        blocked = await _red_team_gate(app, endpoint_name, endpoint_id, request_id, rt_active,
-                                       alias, payload, is_stream,
-                                       chat=upstream_path == "/chat/completions")
+        blocked, rt_task = await _red_team_gate(app, endpoint_name, endpoint_id, request_id, rt_active,
+                                                alias, payload, is_stream,
+                                                chat=upstream_path == "/chat/completions")
         if blocked is not None:
             return blocked
     return await _dispatch_buffered(app, request, user, endpoint_id, candidates, alias, is_stream,
-                                    timeout_s, max_conc, request_id, payload, upstream_path)
+                                    timeout_s, max_conc, request_id, payload, upstream_path,
+                                    rt_task=rt_task,
+                                    rt_wait_s=_rt_monitor_wait_s(rt_active) if rt_task else 0.0)
 
 
 # ---------- LLM red-teaming guard (inline chat screening) --------------------
@@ -1912,6 +1981,13 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
 # Every blocked response carries X-SGPU-Red-Team: flagged + the attack category in
 # X-SGPU-Red-Team-Type (from the endpoint's `types` taxonomy, default
 # RED_TEAM_DEFAULT_TYPES, fallback RED_TEAM_UNCLASSIFIED).
+#
+# The FOURTH action, `ignore`, is not a block at all: it classifies for
+# observability (a Prometheus counter to alert on) and forwards the request
+# untouched. Blocking nothing means waiting on the detector buys nothing, so that
+# path runs ASYNC on the shared background queue (`_rt_submit_monitor`) and adds no
+# request latency. The body still has to be buffered and parsed for the scan, so
+# the passthrough fast path stays bypassed here too.
 
 RED_TEAM_BLOCK_MESSAGE = ("I can't help with that request — it was flagged by this "
                           "endpoint's safety screening.")
@@ -2236,20 +2312,141 @@ async def _rt_sse(request_id: str, alias: str, content: str, *, chat: bool = Tru
     yield b"data: [DONE]\n\n"
 
 
+async def _rt_monitor_job(app, endpoint_name: str, endpoint_id: str, request_id: str, rt: dict,
+                          alias: str, text: str, mode: str) -> tuple[str, str]:
+    """Classify one request that is ALREADY being forwarded: count it, log it, and
+    return `(verdict, type)` with verdict ∈ flagged | clean | error. Never raises —
+    the request is gone, so there is nothing a raise could usefully do.
+
+    Runs either on the background queue (`monitor_wait=False`) or as a task the
+    response waits on (`monitor_wait=True`); the classification itself is identical,
+    only who awaits it differs."""
+    from . import metrics as _metrics
+    from .accesslog import request_id_var
+    # Re-attach the id of the request being classified: the verdict can land long after
+    # the response, so this log line is the ONLY way back to it (the counter carries
+    # no id). Also spelled into the message so a grep survives a format change.
+    request_id_var.set(request_id)
+    t0 = time.perf_counter()
+    try:
+        flagged, rt_type, reason = await _rt_detect(app, rt, text)
+    except (httpx.HTTPError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as e:
+        _metrics.observe_red_team(endpoint_id, alias, "error", mode=mode,
+                                  seconds=time.perf_counter() - t0)
+        logger.warning("red-team monitor detector failed on %s req=%s "
+                       "(request already forwarded): %s", endpoint_name, request_id, e)
+        return "error", ""
+    _metrics.observe_red_team(endpoint_id, alias, "unsafe" if flagged else "safe",
+                              mode=mode, seconds=time.perf_counter() - t0)
+    if not flagged:
+        return "clean", ""
+    rt_type = rt_type or RED_TEAM_UNCLASSIFIED
+    _metrics.observe_red_team_monitor_hit(endpoint_id, rt_type)
+    logger.warning("red-team FLAG (monitor, allowed through) on %s req=%s model=%s type=%s: %s",
+                   endpoint_name, request_id, alias, rt_type, reason[:200])
+    return "flagged", rt_type
+
+
+# Live monitor tasks the response is waiting on. asyncio only weakly references a
+# task, so without this set a verdict task can be garbage-collected mid-flight — the
+# classification would silently vanish under load, which is the one failure this
+# feature cannot have.
+_rt_monitor_tasks: "set[asyncio.Task]" = set()
+# Ceiling on how long a response may wait for its verdict. The detector's own
+# `timeout_s` can be 30 s+, which is fine for a background classification but not for
+# something a client is blocked on — the wait is min(timeout_s, this).
+_RT_MONITOR_WAIT_MAX_S = float(os.environ.get("RED_TEAM_MONITOR_WAIT_MAX_S", "10") or "10")
+
+
+def _rt_monitor_wait_s(rt: dict) -> float:
+    return max(0.1, min(float(rt.get("timeout_s") or 15.0), _RT_MONITOR_WAIT_MAX_S))
+
+
+def _rt_start_monitor(app, endpoint_name: str, endpoint_id: str, request_id: str, rt: dict,
+                      alias: str, text: str, mode: str) -> "asyncio.Task":
+    """Start the classification NOW as a task, so it runs while the upstream call is in
+    flight, and hand the handle back so the response can wait for its verdict."""
+    task = asyncio.create_task(_rt_monitor_job(app, endpoint_name, endpoint_id, request_id,
+                                               rt, alias, text, mode))
+    _rt_monitor_tasks.add(task)
+    task.add_done_callback(_rt_monitor_tasks.discard)
+    return task
+
+
+async def _rt_verdict_headers(task: "asyncio.Task", wait_s: float) -> dict[str, str]:
+    """Wait (bounded) for a monitor verdict and render it as response headers.
+
+    ⚠ `X-SGPU-Red-Team-Verdict`, deliberately NOT `X-SGPU-Red-Team`. That header means
+    "this gateway refused the request", and Experiments' `_guard_verdict` reads it to
+    attribute a refusal to the guard instead of the model. In monitor mode the MODEL
+    wrote the reply, so reusing it would drop a genuine model response out of scoring
+    and credit a guardrail that let the attack through — the exact confusion the
+    guard-attribution work existed to remove. Values: flagged | clean | error |
+    pending (the verdict outran the wait; the counter + log still get it).
+
+    `shield` matters: a timeout here must not CANCEL the classification, or a slow
+    detector would mean no metric and no log line at all."""
+    try:
+        verdict, rt_type = await asyncio.wait_for(asyncio.shield(task), wait_s)
+    except asyncio.TimeoutError:
+        return {"X-SGPU-Red-Team-Verdict": "pending"}
+    except Exception:  # noqa: BLE001 — _rt_monitor_job swallows its own errors; belt+braces
+        return {"X-SGPU-Red-Team-Verdict": "error"}
+    out = {"X-SGPU-Red-Team-Verdict": verdict}
+    if verdict == "flagged":
+        out["X-SGPU-Red-Team-Type"] = _rt_header_safe(rt_type) or RED_TEAM_UNCLASSIFIED
+    return out
+
+
+def _rt_submit_monitor(app, endpoint_name: str, endpoint_id: str, request_id: str, rt: dict,
+                       alias: str, text: str, mode: str) -> None:
+    """Fire-and-forget monitor (`monitor_wait=False`): classify OFF the request path,
+    nobody waits. Rides the same bounded background queue as the TTS evals / drift
+    captures (`_submit_bg`), so a slow or dead detector costs the endpoint zero added
+    latency — at the price of no verdict on the response.
+
+    Consequences, all intentional:
+      * `on_error` is inert — there is no request left to fail closed on.
+      * no verdict header at all (the response is long gone) and no `blocked`
+        ProxyRequest row — the counter IS the record.
+      * a FULL queue sheds the classification (counted `skipped` + logged) rather than
+        applying backpressure to live traffic."""
+    if not _submit_bg(functools.partial(_rt_monitor_job, app, endpoint_name, endpoint_id,
+                                        request_id, rt, alias, text, mode)):
+        from . import metrics as _metrics
+        _metrics.observe_red_team(endpoint_id, alias, "skipped")
+        logger.warning("red-team monitor shed on %s req=%s — background queue full (raise "
+                       "PROXY_BG_WORKERS / PROXY_BG_QUEUE_MAX); this request was NOT classified",
+                       endpoint_name, request_id)
+
+
 async def _red_team_gate(app, endpoint_name: str, endpoint_id: str, request_id: str, rt: dict,
                          alias: str, payload: dict, is_stream: bool,
-                         chat: bool = True) -> Optional[Response]:
-    """Screen one chat request. Returns the short-circuit Response when BLOCKED,
-    else None (forward normally). A detector failure follows on_error: allow
-    (fail-open, default — an outage must not take the endpoint down) or block.
-    Metrics label `proxy` with the endpoint ID — the convention every proxy_*
-    series uses, and what render_proxy (/proxy/{name}/metrics) filters on."""
+                         chat: bool = True) -> tuple[Optional[Response], Optional["asyncio.Task"]]:
+    """Screen one chat request. Returns `(blocked_response, monitor_task)`:
+      * `(Response, None)` — BLOCKED, return it and never touch an upstream.
+      * `(None, None)`     — forward normally, nothing pending.
+      * `(None, Task)`     — monitor mode with `monitor_wait`: forward normally, and the
+        task classifying this request is already running; the dispatcher awaits it
+        (bounded) so the reply can carry `X-SGPU-Red-Team-Verdict`.
+    A detector failure follows on_error: allow (fail-open, default — an outage must not
+    take the endpoint down) or block. Metrics label `proxy` with the endpoint ID — the
+    convention every proxy_* series uses, and what render_proxy filters on."""
     from . import metrics as _metrics
     mode = rt.get("mode") or "classifier"
     text = _rt_scan_text(payload, rt.get("scan") or "last_user", int(rt.get("max_chars") or 8000))
     if not text:
         _metrics.observe_red_team(endpoint_id, alias, "skipped")
-        return None
+        return None, None
+    if (rt.get("action") or "respond") == "ignore":
+        # Monitor-only: forward NOW either way. With monitor_wait the detector starts
+        # here and runs CONCURRENTLY with the upstream call (the dispatcher waits for
+        # its verdict just before the response starts); without it, fire-and-forget.
+        if rt.get("monitor_wait", True):
+            return None, _rt_start_monitor(app, endpoint_name, endpoint_id, request_id,
+                                           rt, alias, text, mode)
+        _rt_submit_monitor(app, endpoint_name, endpoint_id, request_id, rt, alias, text, mode)
+        return None, None
     t0 = time.perf_counter()
     try:
         flagged, rt_type, reason = await _rt_detect(app, rt, text)
@@ -2260,12 +2457,12 @@ async def _red_team_gate(app, endpoint_name: str, endpoint_id: str, request_id: 
                                   seconds=time.perf_counter() - t0)
         if (rt.get("on_error") or "allow") != "block":
             logger.warning("red-team detector failed on %s (fail-open): %s", endpoint_name, e)
-            return None
+            return None, None
         flagged = True
         rt_type = "detector_error"
         reason = f"detector unavailable (on_error=block): {e}"
     if not flagged:
-        return None
+        return None, None
     rt_type = rt_type or RED_TEAM_UNCLASSIFIED
     # Counted HERE, not off the verdict: a fail-closed detector error blocks with
     # result="error", and the by-type breakdown must still show it (and stay equal
@@ -2284,7 +2481,7 @@ async def _red_team_gate(app, endpoint_name: str, endpoint_id: str, request_id: 
                       error=f"red-team[{rt_type}]: {reason}"[:500])
         return JSONResponse({"error": {"message": message, "type": "red_team_blocked",
                                        "code": "content_filter", "red_team_type": rt_type}},
-                            status_code=status, headers=hdrs)
+                            status_code=status, headers=hdrs), None
     content = message
     if action == "llm_respond":
         content = (await _rt_llm_respond(app, rt, text)) or message
@@ -2294,8 +2491,8 @@ async def _red_team_gate(app, endpoint_name: str, endpoint_id: str, request_id: 
         return StreamingResponse(_rt_sse(request_id, alias, content, chat=chat),
                                  media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no", **hdrs})
-    return JSONResponse(_rt_completion_body(request_id, alias, content, chat=chat), headers=hdrs)
+                                          "X-Accel-Buffering": "no", **hdrs}), None
+    return JSONResponse(_rt_completion_body(request_id, alias, content, chat=chat), headers=hdrs), None
 
 
 # ---------- background job queue (off-path eval + capture) -------------------
@@ -2311,8 +2508,15 @@ _bg_started = False
 
 async def _bg_worker() -> None:
     assert _bg_queue is not None
+    from .accesslog import request_id_var
     while True:
         factory = await _bg_queue.get()
+        # A worker task inherits the ContextVar context of whichever REQUEST happened to
+        # start the pool (_ensure_bg_workers runs on a request's loop), so without this
+        # every off-path log line for the rest of the process is stamped ` [req-<that
+        # one>]` — actively misleading when an alert sends you looking for the request.
+        # Clear it per job; a job that knows its own id sets it (see _rt_submit_monitor).
+        request_id_var.set(None)
         try:
             await factory()
         except Exception as e:  # noqa: BLE001 — a bad job must never kill the worker
@@ -3354,6 +3558,7 @@ def _audit_red_team_view(c: Optional[dict]) -> Optional[dict]:
         "on_error": c.get("on_error", "allow"),
         "no_system": bool(c.get("no_system", False)),
         "action": c.get("action", "respond"),
+        "monitor_wait": bool(c.get("monitor_wait", True)),
         "responder_base_url": c.get("responder_base_url", ""),
         "responder_model": c.get("responder_model", ""),
         "error_status": c.get("error_status", 403),

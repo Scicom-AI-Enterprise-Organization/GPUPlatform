@@ -1787,7 +1787,8 @@ export const RED_TEAM_DEFAULT_TYPES = [
 // checks every request BEFORE it reaches an upstream; a positive verdict
 // short-circuits into a canned reply, an LLM-written refusal, or an HTTP error.
 // Every block carries its attack category in the X-SGPU-Red-Team-Type header
-// (from `types`; server default taxonomy when empty).
+// (from `types`; server default taxonomy when empty). `action: "ignore"` makes it
+// a monitor instead — classify + count, forward anyway, no inline latency.
 export type ProxyRedTeam = {
   enabled: boolean;
   mode: "classifier" | "llm";
@@ -1806,8 +1807,15 @@ export type ProxyRedTeam = {
   scan?: "last_user" | "user" | "full";
   max_chars?: number;
   timeout_s?: number;
-  on_error?: "allow" | "block"; // detector outage: fail-open or refuse
-  action?: "respond" | "llm_respond" | "error";
+  on_error?: "allow" | "block"; // detector outage: fail-open or refuse (inert for action "ignore")
+  // "ignore" = monitor only: nothing is blocked and a hit bumps
+  // proxy_red_team_monitor_hits_total (for realtime alerting).
+  action?: "respond" | "llm_respond" | "error" | "ignore";
+  // action "ignore" only. true (default): the detector runs in PARALLEL with the
+  // upstream call and the response start waits for its verdict, so the reply carries
+  // X-SGPU-Red-Team-Verdict (flagged|clean|error|pending). false: fire-and-forget —
+  // zero added latency, no verdict on the response.
+  monitor_wait?: boolean;
   message?: string; // canned reply / error message ("" = built-in default)
   responder_base_url?: string;
   responder_model?: string;

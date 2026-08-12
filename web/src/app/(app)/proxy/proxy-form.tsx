@@ -246,7 +246,12 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
   const [rtMaxChars, setRtMaxChars] = useState(String(rt0?.max_chars ?? 8000));
   const [rtTimeoutS, setRtTimeoutS] = useState(String(rt0?.timeout_s ?? 15));
   const [rtOnError, setRtOnError] = useState<"allow" | "block">(rt0?.on_error ?? "allow");
-  const [rtAction, setRtAction] = useState<"respond" | "llm_respond" | "error">(rt0?.action ?? "respond");
+  const [rtAction, setRtAction] = useState<"respond" | "llm_respond" | "error" | "ignore">(rt0?.action ?? "respond");
+  // Monitor mode: nothing is blocked, so the reply/status/responder fields are dead
+  // here. rtMonitorWait decides whether the response waits for the verdict (judge runs
+  // in parallel with the model) so it can carry the X-SGPU-Red-Team-Verdict header.
+  const rtMonitor = rtAction === "ignore";
+  const [rtMonitorWait, setRtMonitorWait] = useState(rt0?.monitor_wait ?? true);
   const [rtMessage, setRtMessage] = useState(rt0?.message ?? "");
   const [rtRespBase, setRtRespBase] = useState(rt0?.responder_base_url ?? "");
   const [rtRespModel, setRtRespModel] = useState(rt0?.responder_model ?? "");
@@ -627,6 +632,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
           timeout_s: Number(rtTimeoutS) || 15,
           on_error: rtOnError,
           action: rtAction,
+          monitor_wait: rtMonitorWait,
           message: rtMessage.trim(),
           responder_base_url: rtRespBase.trim(),
           responder_model: rtRespModel.trim(),
@@ -747,7 +753,9 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         <p className="mb-4 text-xs text-muted-foreground">
           Optional — screen every <span className="font-mono">/v1/chat/completions</span> request through a detector <span className="font-medium">before</span> it
           reaches an upstream. A hit is answered by this gateway (the model never sees the request) and carries its category in the
-          <span className="font-mono"> X-SGPU-Red-Team-Type</span> response header. Leave the URL/model blank to disable. Detector latency is paid inline by each request.
+          <span className="font-mono"> X-SGPU-Red-Team-Type</span> response header. Leave the URL/model blank to disable. Detector latency is paid inline by each request
+          — unless you set the action to <span className="font-medium">Ignore</span>, which runs the detector in parallel with the model, blocks nothing, and reports the
+          verdict as <span className="font-mono">X-SGPU-Red-Team-Verdict</span> + a Prometheus counter.
         </p>
         {/* Collapsed while the switch is off — the fields keep their state and
             reappear on re-enable; the stored config is untouched until save. */}
@@ -884,6 +892,14 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
                 <SelectItem value="block" className="text-xs">Block the request (fail closed)</SelectItem>
               </SelectContent>
             </Select>
+            {rtMonitor && (
+              /* Kept editable (the value survives flipping the action back) but say so:
+                 in monitor mode the request is long gone when the verdict fails. */
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                not used while the action is <span className="font-medium">Ignore</span> — there is no request left to fail closed on; a
+                detector failure is logged and counted as <span className="font-mono">error</span>.
+              </p>
+            )}
           </div>
           <div>
             <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Reasoning</Label>
@@ -921,7 +937,9 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             <Input type="number" min={1} step={1} value={rtTimeoutS}
                    onChange={(e) => setRtTimeoutS(e.target.value)} className="font-mono text-xs" />
             <p className="mt-1 text-[11px] text-muted-foreground">
-              read timeout on the detector call, paid inline by every chat request; a timeout follows the failure policy above. Default 15.
+              read timeout on the detector call{rtMonitor
+                ? <> — paid by the background worker, not by the request; a timeout is counted as <span className="font-mono">error</span></>
+                : <>, paid inline by every chat request; a timeout follows the failure policy above</>}. Default 15.
             </p>
           </div>
         </div>
@@ -1072,19 +1090,63 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
         <div className="mt-4 border-t border-border/60 pt-3">
           <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">On a hit</Label>
           <div className="mt-1 inline-flex rounded-md border border-border p-0.5 text-xs">
-            {(["respond", "llm_respond", "error"] as const).map((m) => (
+            {(["respond", "llm_respond", "error", "ignore"] as const).map((m) => (
               <button key={m} type="button" onClick={() => setRtAction(m)}
                       className={"rounded px-2 py-1 " + (rtAction === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
-                {{ respond: "Canned reply", llm_respond: "LLM writes the refusal", error: "HTTP error" }[m]}
+                {{ respond: "Canned reply", llm_respond: "LLM writes the refusal", error: "HTTP error",
+                   ignore: "Ignore (classify only)" }[m]}
               </button>
             ))}
           </div>
           <p className="mt-1 text-[11px] text-muted-foreground">
             {rtAction === "respond" ? <>return a normal chat completion with the message below (<span className="font-mono">finish_reason: content_filter</span>) — SDKs keep working, streamed requests get an SSE-shaped reply</>
               : rtAction === "llm_respond" ? <>a responder LLM writes a contextual refusal (falls back to the canned message if it fails)</>
-              : <>reject outright with the status code below and an <span className="font-mono">{"{error: …}"}</span> body</>}
+              : rtAction === "error" ? <>reject outright with the status code below and an <span className="font-mono">{"{error: …}"}</span> body</>
+              : <>forward the request untouched and only <span className="font-medium">count</span> the hit — the detector never gates the model, it runs <span className="font-medium">alongside</span> it</>}
           </p>
+          {rtMonitor && (
+            /* Monitor mode is the one action with no reply to configure — say what it
+               DOES produce instead, and be explicit that the model sees the request. */
+            <div className="mt-2 space-y-2 rounded-md border border-border bg-muted/20 p-2 text-[11px] text-muted-foreground">
+              <div>
+                Detections land in <span className="font-mono">proxy_red_team_monitor_hits_total{"{proxy,type}"}</span> (per attack
+                category) plus <span className="font-mono">proxy_red_team_total{"{result}"}</span> — scrape <span className="font-mono">/metrics</span> and
+                alert on its rate for realtime visibility. They also log a <span className="font-mono">WARNING</span> line each,
+                carrying the request id.
+              </div>
+              <div>
+                <span className="font-medium text-foreground">Nothing is blocked:</span> the model answers every request, and it is
+                recorded <span className="font-mono">completed</span>, not <span className="font-mono">blocked</span>, in the Queue tab.
+                The detector-failure policy above is inert here.
+              </div>
+              <div className="flex items-start justify-between gap-3 border-t border-border/60 pt-2">
+                <div>
+                  <span className="font-medium text-foreground">Stamp the verdict on the response</span> —{" "}
+                  {rtMonitorWait ? (
+                    <>the judge runs <span className="font-medium">in parallel</span> with the model, the reply waits only for
+                    whatever is left of it, and then carries{" "}
+                    <span className="font-mono">X-SGPU-Red-Team-Verdict: flagged|clean|error|pending</span> (plus{" "}
+                    <span className="font-mono">-Type</span> on a hit). Cost is{" "}
+                    <span className="font-mono">max(0, judge − first token)</span>, not the judge&apos;s full latency; a verdict
+                    slower than the cap returns <span className="font-mono">pending</span> and still lands in the counter.</>
+                  ) : (
+                    <>off: pure fire-and-forget on the background queue. <span className="font-medium">Zero</span> added latency and
+                    no verdict on the response — the counter and the log line are the only record.</>
+                  )}
+                </div>
+                <Switch checked={rtMonitorWait} onCheckedChange={setRtMonitorWait} />
+              </div>
+              {rtMonitorWait && (
+                <div>
+                  ⚠ Not <span className="font-mono">X-SGPU-Red-Team: flagged</span> — that header means{" "}
+                  <span className="font-medium">the gateway refused this request</span>, and Experiments reads it to credit the
+                  refusal to the guard rather than the model. Here the model answered, so the verdict gets its own header.
+                </div>
+              )}
+            </div>
+          )}
         </div>
+        {!rtMonitor && (<>
         <div className="mt-3">
           <Label className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">
             {rtAction === "error" ? "Error message"
@@ -1155,6 +1217,7 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             </div>
           </>
         )}
+        </>)}
         </>)}
       </section>
 
