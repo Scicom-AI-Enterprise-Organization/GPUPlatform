@@ -730,6 +730,10 @@ export function ProxyForm({ initial, prefill }: { initial?: ProxyEndpoint; prefi
             setUps((a) => a.filter((u) => u.uid !== uid));
             setSelectedUid((cur) => (cur === uid ? null : cur));
           }}
+          // Local state only — the form saves as one PATCH, so writing straight through
+          // here would half-apply an edit that is still being made.
+          onEnableUpstream={(uid) =>
+            setUps((a) => a.map((u) => (u.uid === uid ? { ...u, enabled: true } : u)))}
           // Ties break on list position, so moving an upstream to the front is what makes
           // it the primary — the only way to change the winner without editing a priority.
           onPromote={(uid) => setUps((a) => {

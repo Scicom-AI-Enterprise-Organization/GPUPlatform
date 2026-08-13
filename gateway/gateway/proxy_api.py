@@ -969,6 +969,31 @@ def _forced_upstream(request: Request) -> Optional[str]:
     return v or None
 
 
+def _disabled_serving(cfg: dict, alias: str) -> list[dict]:
+    """Switched-off upstreams that DO map `alias`. Not candidates — but the operator
+    needs them named, because "no backend" and "your standby is switched off" are the
+    same 404 otherwise, and the second one is fixed by one toggle."""
+    return [u for u in cfg.get("upstreams", [])
+            if not u.get("enabled", True) and alias in (u.get("models") or {})]
+
+
+def _no_candidate_error(cfg: dict, alias: str, endpoint_name: str,
+                        force: Optional[str] = None) -> dict:
+    """The detail body for "nothing can serve this request". Names the disabled
+    backends that map the alias so the error points at the fix instead of reading
+    like a config typo."""
+    if force:
+        return {"error": f"forced upstream '{force}' not found, disabled, or does not "
+                         f"serve model '{alias}' on endpoint '{endpoint_name}'"}
+    off = _disabled_serving(cfg, alias)
+    if off:
+        names = ", ".join(u.get("name") or u.get("id", "?") for u in off)
+        return {"error": f"model '{alias}' has no enabled backend on endpoint "
+                         f"'{endpoint_name}' — {len(off)} switched off: {names}",
+                "disabled_upstreams": [u.get("name") or u.get("id", "") for u in off]}
+    return {"error": f"model '{alias}' is not served by endpoint '{endpoint_name}'"}
+
+
 def _select_candidates(app, endpoint_id: str, cfg: dict, alias: str,
                        force: Optional[str] = None) -> list[dict]:
     """Upstreams serving `alias`, enabled, ordered: alive-or-unknown first, then
@@ -1496,10 +1521,8 @@ async def _route(app, endpoint_name: str, alias: str, force: Optional[str] = Non
         endpoint_id = ep.id
         candidates = _select_candidates(app, endpoint_id, cfg, alias, force)
         if not candidates:
-            if force:
-                raise HTTPException(status_code=404, detail={"error":
-                    f"forced upstream '{force}' not found, disabled, or does not serve model '{alias}' on endpoint '{endpoint_name}'"})
-            raise HTTPException(status_code=404, detail={"error": f"model '{alias}' is not served by endpoint '{endpoint_name}'"})
+            raise HTTPException(status_code=404,
+                                detail=_no_candidate_error(cfg, alias, endpoint_name, force))
         genv = await load_global_env(s)
         failover = _failover_statuses(cfg)
         for u in candidates:
@@ -1524,10 +1547,8 @@ async def _resolve_speech_route(app, endpoint_name: str, alias: str, force: Opti
         endpoint_id = ep.id
         candidates = _select_candidates(app, endpoint_id, cfg, alias, force)
         if not candidates:
-            if force:
-                raise HTTPException(status_code=404, detail={"error":
-                    f"forced upstream '{force}' not found, disabled, or does not serve model '{alias}' on endpoint '{endpoint_name}'"})
-            raise HTTPException(status_code=404, detail={"error": f"model '{alias}' is not served by endpoint '{endpoint_name}'"})
+            raise HTTPException(status_code=404,
+                                detail=_no_candidate_error(cfg, alias, endpoint_name, force))
         genv = await load_global_env(s)
         failover = _failover_statuses(cfg)
         for u in candidates:
@@ -3478,28 +3499,33 @@ def _proxy_health_report(app, ep: ProxyEndpoint) -> tuple[dict, int]:
       degraded     — ≥1 alive but ≥1 known-dead (still serves via failover)   → 200
       unhealthy    — every enabled upstream is known-dead                     → 503
       disabled     — endpoint disabled                                        → 503
-      misconfigured— enabled but no enabled upstreams                         → 503"""
+      misconfigured— enabled but no enabled upstreams                         → 503
+
+    `upstreams_total` counts only the ENABLED ones (they are what serve traffic), so a
+    switched-off standby is reported separately as `upstreams_disabled` / `disabled`
+    rather than being omitted entirely — otherwise an unhealthy endpoint with a usable
+    backup one toggle away is indistinguishable from one with nothing left."""
     cfg = ep.config or {}
     health = _health(app)
     now = time.time()
-    ups = [u for u in cfg.get("upstreams", []) if u.get("enabled", True)]
-    items: list[dict] = []
-    n_alive = n_dead = 0
-    for u in ups:
+    all_ups = cfg.get("upstreams", [])
+    ups = [u for u in all_ups if u.get("enabled", True)]
+
+    def _state_of(u: dict) -> dict:
         h = health.get((ep.id, u.get("id")))
         fresh = bool(h) and (now - h.get("checked_at", 0)) < HEALTH_TTL_S
-        if fresh and h.get("alive"):
-            state = "alive"; n_alive += 1
-        elif fresh and h.get("alive") is False:
-            state = "dead"; n_dead += 1
-        else:
-            state = "unknown"
-        items.append({
+        state = "alive" if fresh and h.get("alive") else "dead" if fresh and h.get("alive") is False else "unknown"
+        return {
             "name": u.get("name", ""), "state": state,
             "latency_ms": (h or {}).get("latency_ms"),
             "checked_at": (h or {}).get("checked_at"),
             "error": (h or {}).get("error") if state == "dead" else None,
-        })
+        }
+
+    items = [_state_of(u) for u in ups]
+    n_alive = sum(1 for i in items if i["state"] == "alive")
+    n_dead = sum(1 for i in items if i["state"] == "dead")
+    off = [_state_of(u) for u in all_ups if not u.get("enabled", True)]
     if not ep.enabled:
         status, code = "disabled", 503
     elif not ups:
@@ -3510,8 +3536,16 @@ def _proxy_health_report(app, ep: ProxyEndpoint) -> tuple[dict, int]:
         status, code = "degraded", 200
     else:
         status, code = "healthy", 200
-    return {"status": status, "endpoint": ep.name, "enabled": bool(ep.enabled),
-            "upstreams_alive": n_alive, "upstreams_total": len(ups), "upstreams": items}, code
+    out = {"status": status, "endpoint": ep.name, "enabled": bool(ep.enabled),
+           "upstreams_alive": n_alive, "upstreams_total": len(ups),
+           "upstreams_disabled": len(off), "upstreams": items}
+    if off:
+        out["disabled"] = off
+        if code == 503:
+            names = ", ".join(o["name"] or "?" for o in off)
+            out["hint"] = (f"{len(off)} switched-off backend(s) could serve this endpoint: "
+                           f"{names} — enable one to restore service")
+    return out, code
 
 
 @data_router.get("/proxy/{endpoint}/health")
@@ -4676,7 +4710,12 @@ async def proxy_health_loop(app) -> None:
                 genv = await load_global_env(s)
                 for ep in eps:
                     for u in (ep.config or {}).get("upstreams", []):
-                        if u.get("enabled", True) and u.get("base_url"):
+                        # Disabled upstreams are probed too: a switched-off standby is
+                        # exactly the one you need to trust in a hurry, and an unprobed
+                        # one reads "not probed" forever — so re-enabling it during an
+                        # outage is a guess. Costs one /models call per disabled backend
+                        # per tick; they are still never routed to (_select_candidates).
+                        if u.get("base_url"):
                             targets.append((ep.id, u, _resolve_key(u, genv)))
                 if REQUEST_RETENTION_DAYS > 0:  # 0 = keep indefinitely (no prune)
                     cutoff = datetime.now(timezone.utc) - timedelta(days=REQUEST_RETENTION_DAYS)
