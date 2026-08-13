@@ -5,3 +5,6 @@ node_modules
 .env.*.local
 *.tsbuildinfo
 .DS_Store
+
+# pdf.js worker, copied from node_modules by scripts/copy-pdf-worker.mjs
+/public/pdfjs/

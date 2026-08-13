@@ -8,7 +8,7 @@
 // can supply its own transport with the same shape.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Loader2, Play, ShieldAlert, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, Loader2, Play, ShieldAlert, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { NumberField } from "@/components/ui/number-field";
@@ -21,6 +21,10 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { CurlBlock } from "@/components/playground/curl-block";
+import {
+  AttachmentBar, attachmentsBytes, chatContent, fmtBytes, partSummary, readFiles,
+  useImagePaste, type Attachment, type AudioPartKind,
+} from "@/components/playground/attachments";
 import { DEFAULT_TOOLS_JSON } from "@/lib/playground-tools";
 import { cn } from "@/lib/utils";
 
@@ -35,6 +39,10 @@ export type ChatParams = {
   disableThinking: boolean;
   stream: boolean;
   tools?: unknown[]; // OpenAI function schema; when set → sent with tool_choice:"auto"
+  // Images / audio / rasterized PDF pages. Present → the user message becomes a content
+  // PART LIST instead of a plain string (see openAiBody).
+  attachments?: Attachment[];
+  audioAs?: AudioPartKind;   // which audio spelling to send; see attachment-parts.ts
 };
 
 export type SendHandlers = {
@@ -53,6 +61,10 @@ export type ChatTransport = {
   send: (params: ChatParams, h: SendHandlers) => Promise<{ content: string; reasoning: string; tokens?: number; toolCalls?: string; upstream?: Upstream; headers?: Record<string, string> }>;
   // Render an equivalent curl for the current params + bearer token.
   curl: (params: ChatParams, token: string) => string;
+  // The REAL request body, base64 payloads included. Only transports with a JSON body
+  // implement it; the playground uses it to offer a request.json download, because a
+  // curl with a multi-megabyte data URL inlined is not a command anyone can paste.
+  requestJson?: (params: ChatParams) => string;
 };
 
 type Stats = { ttftMs: number; tokens: number; tps: number } | null;
@@ -61,7 +73,20 @@ type Stored = {
   status: "ok" | "error"; output?: string; reasoning?: string; toolCalls?: string; tokens?: number; error?: string;
   upstream?: Upstream;
   headers?: Record<string, string>;
+  // What was attached, NOT the payload — see the note in onSend.
+  attachments?: { kind: string; name: string }[];
 };
+
+/** Save the real request body so `curl -d @request.json` works. Revoked immediately —
+ *  the blob only has to survive the click. */
+function downloadJson(text: string, name = "request.json") {
+  const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 const MAX_HISTORY = 50;
 const now = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
@@ -82,9 +107,13 @@ function toolCallDeltasOf(chunk: { choices?: Array<{ delta?: { tool_calls?: unkn
 // ---- OpenAI-compatible transport (proxy + any /v1/chat/completions endpoint) ----
 
 export function openAiBody(p: ChatParams, withStream: boolean): Record<string, unknown> {
+  // Media parts first, then the text (vLLM's own multi-image example order); no
+  // attachments → a plain string, unchanged for every text-only backend. Lives in
+  // attachment-parts.ts so it can be unit-tested without this file's UI imports.
+  const content = chatContent(p.prompt, p.attachments, p.audioAs);
   const b: Record<string, unknown> = {
     model: p.model,
-    messages: [{ role: "user", content: p.prompt }],
+    messages: [{ role: "user", content }],
     max_tokens: p.maxTokens,
     temperature: p.temperature,
   };
@@ -98,14 +127,23 @@ export function openAiBody(p: ChatParams, withStream: boolean): Record<string, u
 export function openAiTransport(opts: { fetchPath: string; curlUrl: string; extraHeaders?: Record<string, string> }): ChatTransport {
   const extra = opts.extraHeaders ?? {};
   return {
+    requestJson: (p) => JSON.stringify(openAiBody(p, p.stream), null, 2),
     curl: (p, token) => {
-      const body = openAiBody(p, p.stream);
       const flag = p.stream ? "-N " : "";
       const extraLines = Object.entries(extra).map(([k, v]) => `  -H '${k}: ${v}' \\\n`).join("");
-      return `curl ${flag}-X POST '${opts.curlUrl}' \\
+      const head = `curl ${flag}-X POST '${opts.curlUrl}' \\
   -H 'Content-Type: application/json' \\
   -H 'Authorization: Bearer ${token}' \\
-${extraLines}  -d '${JSON.stringify(body, null, 2)}'`;
+${extraLines}`;
+      // ⚠ With attachments the body is inlined NOWHERE. An earlier version printed the
+      // parts with the base64 replaced by "<272 KB … elided>", which copies cleanly and
+      // then fails at the model with a garbage image — a placeholder that looks like a
+      // command is worse than no command. Point at the downloadable file instead.
+      if ((p.attachments?.length ?? 0) > 0) {
+        return `# body: ${partSummary(p.attachments!, p.audioAs)} + text — download request.json`
+          + ` below (base64 is too large to paste) and run this next to it:\n${head}  -d @request.json`;
+      }
+      return `${head}  -d '${JSON.stringify(openAiBody(p, p.stream), null, 2)}'`;
     },
     send: async (p, h) => {
       const res = await fetch(opts.fetchPath, {
@@ -228,6 +266,8 @@ export function ChatPlayground({
   const [effort, setEffort] = useState<Effort>("none");
   const [disableThinking, setDisableThinking] = useState(false);
   const [stream, setStream] = useState(true);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [audioAs, setAudioAs] = useState<AudioPartKind>("input_audio");
   const [useTools, setUseTools] = useState(false);
   const [showToolsEditor, setShowToolsEditor] = useState(false);
   const [toolsText, setToolsText] = useState(DEFAULT_TOOLS_JSON);
@@ -247,6 +287,16 @@ export function ChatPlayground({
   const [err, setErr] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // Screenshot → prompt box → attachment, which is how anyone actually tests a VLM.
+  const addPasted = useCallback((files: File[]) => {
+    void (async () => {
+      const { added, errors } = await readFiles(files);
+      if (added.length) setAttachments((prev) => [...prev, ...added]);
+      if (errors.length) setErr(errors.join(" · "));
+    })();
+  }, []);
+  const onPaste = useImagePaste(addPasted);
+
   const [history, setHistory] = useState<Stored[]>([]);
 
   useEffect(() => {
@@ -260,19 +310,29 @@ export function ChatPlayground({
   const clearAll = useCallback(() => persist([]), [persist]);
 
   const params: ChatParams = useMemo(
-    () => ({ model, prompt, maxTokens, temperature, effort, disableThinking, stream, tools: useTools && parsedTools && parsedTools.length ? parsedTools : undefined }),
-    [model, prompt, maxTokens, temperature, effort, disableThinking, stream, useTools, parsedTools],
+    () => ({ model, prompt, maxTokens, temperature, effort, disableThinking, stream,
+             tools: useTools && parsedTools && parsedTools.length ? parsedTools : undefined,
+             attachments: attachments.length ? attachments : undefined,
+             audioAs }),
+    [model, prompt, maxTokens, temperature, effort, disableThinking, stream, useTools, parsedTools, attachments, audioAs],
   );
 
   const stop = () => abortRef.current?.abort();
 
   const onSend = async () => {
-    if (!prompt.trim()) { setErr("Prompt is required."); return; }
+    // An attachment alone is a valid request — "what is in this image?" is often the
+    // whole point, and a vision model does not need a text turn to answer it.
+    if (!prompt.trim() && attachments.length === 0) { setErr("Prompt is required (or attach a file)."); return; }
     if (!model) { setErr("Pick a model."); return; }
     if (useTools && !parsedTools) { setErr("Tools JSON is invalid — fix it or turn off tools."); return; }
     setErr(null); setAnswer(""); setReasoning(""); setToolCalls(""); setStats(null); setUpstream(null); setRespHeaders(null);
     const id = `pg-${Date.now().toString(36)}`;
     const promptShort = prompt.slice(0, 80);
+    // History is localStorage — record WHAT was attached, never the payload. A couple of
+    // page images would blow the ~5 MB quota and take the whole history with them.
+    const attNote: Stored["attachments"] = attachments.length
+      ? attachments.map((a) => ({ kind: a.kind, name: a.name }))
+      : undefined;
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     const t0 = now();
@@ -294,13 +354,13 @@ export function ChatPlayground({
         const secs = (now() - ref) / 1000;
         setStats({ ttftMs: tFirst != null ? Math.round(tFirst - t0) : 0, tokens: r.tokens, tps: secs > 0 ? r.tokens / secs : 0 });
       }
-      const ok: Stored = { id, ts: Date.now(), prompt: promptShort, model, status: "ok", output: r.content, reasoning: r.reasoning, toolCalls: r.toolCalls, tokens: r.tokens, upstream: r.upstream, headers: r.headers };
+      const ok: Stored = { id, ts: Date.now(), prompt: promptShort, model, status: "ok", output: r.content, reasoning: r.reasoning, toolCalls: r.toolCalls, tokens: r.tokens, upstream: r.upstream, headers: r.headers, attachments: attNote };
       persist([ok, ...history].slice(0, MAX_HISTORY));
     } catch (e) {
       const aborted = e instanceof DOMException && e.name === "AbortError";
       const m = aborted ? "stopped" : e instanceof Error ? e.message : String(e);
       if (!aborted) setErr(m);
-      const failed: Stored = { id, ts: Date.now(), prompt: promptShort, model, status: "error", error: m, output: answer || undefined };
+      const failed: Stored = { id, ts: Date.now(), prompt: promptShort, model, status: "error", error: m, output: answer || undefined, attachments: attNote };
       persist([failed, ...history].slice(0, MAX_HISTORY));
     } finally {
       setSending(false); setStreaming(false); abortRef.current = null;
@@ -323,7 +383,10 @@ export function ChatPlayground({
           {description && <p className="text-xs text-muted-foreground">{description}</p>}
         </CardHeader>
         <CardContent className="space-y-3">
-          <Textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Prompt — sent as a single user message" rows={2} className="font-mono text-sm" />
+          <Textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} onPaste={onPaste}
+                    placeholder="Prompt — sent as a single user message" rows={2} className="font-mono text-sm" />
+          <AttachmentBar attachments={attachments} onChange={setAttachments} disabled={busy}
+                         audioAs={audioAs} onAudioAsChange={setAudioAs} />
           <div className="flex flex-wrap items-end gap-x-4 gap-y-2">
             <div className="flex flex-col gap-1">
               <span className="text-xs text-muted-foreground">model</span>
@@ -426,6 +489,18 @@ export function ChatPlayground({
               BEFORE you run it, and gating it meant a freshly-opened tab showed nothing.
               Built from the current params so it always mirrors the form above. */}
           <CurlBlock build={(tok) => transport.curl(params, tok)} />
+          {attachments.length > 0 && transport.requestJson && (
+            <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+              <Button variant="outline" size="xs" onClick={() => downloadJson(transport.requestJson!(params))}>
+                <Download className="h-3 w-3" /> Download request.json
+              </Button>
+              <span>
+                {attachments.length} attachment part{attachments.length === 1 ? "" : "s"},{" "}
+                {fmtBytes(attachmentsBytes(attachments))} of base64 — the real body, ready for{" "}
+                <span className="font-mono">-d @request.json</span>.
+              </span>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -533,6 +608,14 @@ function HistoryRow({ h }: { h: Stored }) {
         <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", h.status === "ok" ? "bg-emerald-500" : "bg-destructive")} />
         <span className="font-mono text-xs text-muted-foreground">{h.model}</span>
         <span className="min-w-0 flex-1 truncate text-muted-foreground">{h.prompt || "(empty)"}</span>
+        {/* Attachment payloads are never persisted, so a past request shows WHAT it
+            carried — enough to tell "the model saw nothing" from "the model saw this". */}
+        {h.attachments && h.attachments.length > 0 && (
+          <span className="shrink-0 font-mono text-[10px] text-muted-foreground"
+                title={h.attachments.map((a) => `${a.kind}: ${a.name}`).join("\n")}>
+            {h.attachments.length} file{h.attachments.length === 1 ? "" : "s"}
+          </span>
+        )}
         {h.tokens != null && <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{h.tokens} tok</span>}
         <span className="shrink-0 text-[11px] text-muted-foreground">{new Date(h.ts).toLocaleTimeString()}</span>
       </button>

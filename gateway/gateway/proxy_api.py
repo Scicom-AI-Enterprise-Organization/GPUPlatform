@@ -1365,6 +1365,39 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
                     if request_id in live:
                         live[request_id]["upstream"] = u["name"]
                     await _set_started(request_id, upstream=u["name"])
+                    # ⚠ A non-failover ERROR status (4xx, or 5xx on the last candidate) does
+                    # NOT come back as SSE — it's a plain JSON error body. Relaying those
+                    # bytes verbatim used to produce an HTTP 200 `text/event-stream` whose
+                    # body was bare JSON: every SSE client reads only `data:` lines, so the
+                    # caller saw an EMPTY stream and no error at all (hit for real with an
+                    # OpenRouter 404 "No endpoints found for <model>" on an image request).
+                    # The status is already committed to 200 by the time we get here, so the
+                    # error is delivered the only way a stream can carry one — as a data:
+                    # frame the client's own error path already understands.
+                    if r.status_code >= 400:
+                        raw = (await r.aread())[:4000]
+                        text = raw.decode("utf-8", "replace").strip()
+                        # An upstream that DID answer in SSE (some do, with a 4xx) is passed
+                        # through untouched — re-wrapping it would double-frame the error.
+                        if text.startswith("data:") or text.startswith(":"):
+                            yield raw if raw.endswith(b"\n\n") else raw + b"\n\n"
+                        else:
+                            try:
+                                err = json.loads(text)
+                                if not isinstance(err, dict) or "error" not in err:
+                                    raise ValueError
+                            except Exception:
+                                err = {"error": {"message": text or f"upstream HTTP {r.status_code}",
+                                                 "type": "upstream_error", "code": r.status_code}}
+                            yield f"data: {json.dumps(err)}\n\n".encode()
+                        yield b"data: [DONE]\n\n"
+                        finished = True
+                        logger.info("proxy stream: upstream %s returned HTTP %s (surfaced as an SSE error frame): %s",
+                                    u["name"], r.status_code, text[:200])
+                        await _finish(request_id, "failed", status_code=r.status_code,
+                                      latency_ms=int((time.perf_counter() - t0) * 1000),
+                                      upstream=u["name"], error=f"HTTP {r.status_code}: {text}"[:500])
+                        return
                     # With failover candidates the chosen upstream isn't known when the
                     # SSE response HEADERS flush, so X-Upstream-* can't be set there. Emit
                     # it instead as a leading SSE COMMENT (a line starting with ":", which

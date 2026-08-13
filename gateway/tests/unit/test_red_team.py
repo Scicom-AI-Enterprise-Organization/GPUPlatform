@@ -6,6 +6,8 @@ shapes / judge reply), and the block-response bodies. Those are what break silen
 if a shape assumption drifts, so they're pinned here; the detector HTTP call and the
 gate wiring are exercised by the live-stack test.
 """
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -593,3 +595,106 @@ async def test_prefetching_the_first_chunk_loses_nothing(anyio_backend):
     e = empty()
     assert await p._rt_first_chunk(e) is None
     assert [c async for c in p._rt_replay(None, e)] == []
+
+
+# ---------- streaming: a non-failover upstream error must reach the client -----------
+# An upstream 4xx is a plain JSON body, not SSE. Relaying it verbatim produced an HTTP 200
+# text/event-stream whose body was bare JSON — SSE clients read only `data:` lines, so the
+# caller got an EMPTY stream and no error (hit for real: OpenRouter 404 "No endpoints found
+# for <model>" on an image request returned nothing at all).
+
+class _FakeResp:
+    def __init__(self, status: int, body: bytes):
+        self.status_code = status
+        self._body = body
+
+    async def aread(self) -> bytes:
+        return self._body
+
+    async def aiter_bytes(self):        # pragma: no cover — error path returns first
+        yield self._body
+
+
+class _FakeStreamCtx:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+class _FakeClient:
+    def __init__(self, resp):
+        self._resp = resp
+
+    def stream(self, *_a, **_k):
+        return _FakeStreamCtx(self._resp)
+
+
+async def _collect_stream(monkeypatch, status: int, body: bytes) -> list[bytes]:
+    import asyncio as _asyncio
+
+    async def noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(p, "_http", lambda _app: _FakeClient(_FakeResp(status, body)))
+    monkeypatch.setattr(p, "_live", lambda _app: {})
+    monkeypatch.setattr(p, "_set_started", noop)
+    monkeypatch.setattr(p, "_finish", noop)
+    monkeypatch.setattr(p, "_mark_health", lambda *_a, **_k: None)
+    monkeypatch.setattr(p, "_mark_after_failover", lambda *_a, **_k: None)
+    cands = [{"id": "u1", "name": "venice", "base_url": "http://up/v1",
+              "models": {"m": "real-m"}, "_failover": (402, 408, 429)}]
+    gen = p._stream(None, "pxr-1", "ep-1", cands, "m", {"messages": []},
+                    "/chat/completions", 30.0, None, _asyncio.Event())
+    return [chunk async for chunk in gen]
+
+
+@pytest.mark.anyio
+async def test_stream_surfaces_a_json_upstream_error_as_an_sse_frame(monkeypatch, anyio_backend):
+    body = b'{"error":{"message":"No endpoints found for google/gemma-4-31b-it.","code":404}}'
+    frames = await _collect_stream(monkeypatch, 404, body)
+    text = b"".join(frames).decode()
+    assert text.startswith("data: ")                 # SSE-framed, not bare JSON
+    assert "No endpoints found" in text
+    assert text.endswith("data: [DONE]\n\n")         # and the stream is closed properly
+    # The client's own error path keys on a parseable `error` object in a data: frame.
+    payload = json.loads(text.split("\n\n")[0][len("data: "):])
+    assert payload["error"]["code"] == 404
+
+
+@pytest.mark.anyio
+async def test_stream_passes_an_already_sse_error_through_unwrapped(monkeypatch, anyio_backend):
+    # Some upstreams answer a 4xx in SSE already; re-framing would double-wrap it.
+    # 400, not 429: the endpoint's default failover_status covers 402/408/429, so those
+    # take the failover path below instead of this one.
+    body = b'data: {"error":{"message":"rate limited"}}\n\n'
+    frames = await _collect_stream(monkeypatch, 400, body)
+    text = b"".join(frames).decode()
+    assert text.count("data: {") == 1
+    assert "rate limited" in text and text.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.anyio
+async def test_stream_wraps_a_non_json_error_body(monkeypatch, anyio_backend):
+    # An HTML error page (a proxy/LB in front of the model) is still an error the caller
+    # must see, so it is wrapped rather than relayed as unparseable stream content.
+    frames = await _collect_stream(monkeypatch, 400, b"<html>Bad Request</html>")
+    payload = json.loads(b"".join(frames).decode().split("\n\n")[0][len("data: "):])
+    assert payload["error"]["code"] == 400
+    assert "Bad Request" in payload["error"]["message"]
+
+
+@pytest.mark.anyio
+async def test_stream_failover_statuses_still_take_the_failover_path(monkeypatch, anyio_backend):
+    # 429/408/402 and every 5xx were never broken: they exhaust the candidate list and the
+    # loop's own "all upstreams failed" frame is already SSE-shaped. Pinned so the new
+    # error branch above can't quietly swallow them.
+    for status in (429, 502):
+        frames = await _collect_stream(monkeypatch, status, b'{"error":{"message":"nope"}}')
+        text = b"".join(frames).decode()
+        assert "all upstreams failed" in text and f"HTTP {status}" in text
+        assert text.startswith("data: ")

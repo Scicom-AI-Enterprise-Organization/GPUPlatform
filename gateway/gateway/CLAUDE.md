@@ -1036,6 +1036,20 @@ transport failure (`ConnectError` / `ConnectTimeout` / `ReadTimeout` / `ReadErro
 - `>= 500` is not configurable. Note OpenRouter classes a bare `500` as *permanent* while
   502/503/504 are transient; we fail over on all of them, which is right here — a 500 from
   one backend says nothing about the next.
+- **⚠ A non-failover error on the STREAMING path is now re-framed as an SSE `data:` frame**
+  (fixed 2026-08-13). An upstream 4xx answers with a plain JSON body, not SSE, and `_stream`
+  used to relay those bytes verbatim — producing an HTTP **200** `text/event-stream` whose
+  body was bare JSON. Every SSE client (including this platform's own playground) reads only
+  `data:` lines, so the caller saw an **empty stream and no error at all**. Found for real:
+  an image request to an OpenRouter-backed endpoint returned
+  `{"error":{"message":"No endpoints found for google/gemma-4-31b-it."}}` with 404 —
+  non-stream showed it, stream showed nothing. The status is already committed to 200 by the
+  time the generator runs (headers flush first), so the error is delivered the only way a
+  stream can carry one: `data: {"error":…}` + `data: [DONE]`, and the row is marked `failed`
+  with the real upstream status. A body that is ALREADY SSE-shaped is passed through
+  unwrapped. ⚠ This branch only covers **non-failover** statuses — 402/408/429 and every 5xx
+  exhaust the candidate list instead and hit the loop's own (already SSE-shaped)
+  "all upstreams failed" frame. Tests: `test_red_team.py::test_stream_*`.
 - Config lives on the endpoint (`failover_status` in the config JSON), is stamped onto each
   candidate by `_route` / `_resolve_speech_route` as `_failover`, and is surfaced in the API
   record + the "Fail over on status" field. `[]` restores the old never-fail-over-on-4xx
