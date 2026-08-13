@@ -353,10 +353,19 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 const alive = h?.alive;
                 const dot = alive === true ? "bg-emerald-500" : alive === false ? "bg-destructive" : "bg-muted-foreground/50";
                 return (
-                  <div key={u.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-border/60 px-3 py-2 text-sm">
+                  <div key={u.id} className={cn(
+                        "flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border px-3 py-2 text-sm",
+                        // A switched-off backend is easy to skim past when it looks like
+                        // every other row — and it is the row you need during an outage.
+                        u.enabled ? "border-border/60" : "border-dashed border-amber-500/40 bg-amber-500/[0.04]")}>
                     <span className={cn("h-2 w-2 rounded-full", dot, h?.stale && "opacity-50")} />
-                    <span className="font-medium">{u.name}</span>
-                    {!u.enabled && <span className="rounded border border-border bg-muted px-1 text-[10px] uppercase text-muted-foreground">off</span>}
+                    <span className={cn("font-medium", !u.enabled && "text-muted-foreground")}>{u.name}</span>
+                    {!u.enabled && (
+                      <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1 text-[10px] uppercase text-amber-600 dark:text-amber-400"
+                            title="Switched off — takes no traffic, and is skipped by failover">
+                        off · no traffic
+                      </span>
+                    )}
                     <span className="font-mono text-xs text-muted-foreground">{u.base_url}</span>
                     <span className="text-xs text-muted-foreground">pri {u.priority}</span>
                     <span className="text-xs text-muted-foreground">{Object.keys(u.models).join(", ")}</span>
@@ -400,6 +409,10 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                 failoverStatus={ep.failover_status ?? []}
                 healthRows={health}
                 redTeam={ep.red_team}
+                // No editing props: the Overview graph is a read-only preview (same rule
+                // as take-down). A switched-off backend is still DRAWN here — that is the
+                // bug this fixes — but the switch itself lives on the Upstreams card
+                // above and in the edit page's graph.
               />
             </CardContent>
           </Card>

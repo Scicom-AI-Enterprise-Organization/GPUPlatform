@@ -23,7 +23,7 @@
 // routes, because that is the only path `_red_team_gate` runs on — a hit is answered
 // by the gateway itself, so the request never reaches a backend and never fails over.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronRight, Server, SendHorizontal, ShieldAlert, Plus, type LucideIcon } from "lucide-react";
+import { ChevronRight, Server, SendHorizontal, ShieldAlert, Plus, PowerOff, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ProxyRedTeam, ProxyUpstreamHealth } from "@/lib/types";
 import { KIND_LABEL, KIND_ORDER, KIND_PATH, modelKind, type ModelKind } from "./model-kind";
@@ -38,7 +38,14 @@ export type RoutingUpstream = {
   models: { alias: string; real: string }[];
 };
 
-type Route = { kind: ModelKind; real: string; alias: string; chain: RoutingUpstream[]; tie: number };
+// `off` = upstreams that map this alias but are switched off. They are NOT candidates
+// (the gateway filters them in _select_candidates), but they are drawn anyway: erasing
+// them is what makes a disabled backend look deleted, so during an outage nobody
+// realises the standby is one toggle away. See selectDisabled.
+type Route = {
+  kind: ModelKind; real: string; alias: string;
+  chain: RoutingUpstream[]; off: RoutingUpstream[]; tie: number;
+};
 
 // What actually moves a request to the next backend. Identical in all the forwarders
 // (_do_unary, _do_unary_multipart, _stream, _do_speech, _stream_speech): status >= 500, a
@@ -82,6 +89,16 @@ function selectCandidates(ups: RoutingUpstream[], alias: string, down: Set<strin
     .map(({ u }) => u);
 }
 
+// The other half of selectCandidates: upstreams that WOULD serve this alias if they were
+// switched back on, in the order they'd take. Mirrors the gateway's `_disabled_serving`.
+function selectDisabled(ups: RoutingUpstream[], alias: string) {
+  return ups
+    .map((u, idx) => ({ u, idx }))
+    .filter(({ u }) => !u.enabled && u.models.some((m) => m.alias.trim() === alias))
+    .sort((a, b) => (a.u.priority !== b.u.priority ? a.u.priority - b.u.priority : a.idx - b.idx))
+    .map(({ u }) => u);
+}
+
 // The guard is live for a route only under the same conditions `_resolve_red_team`
 // uses (enabled + a detector configured), and only on the chat path.
 const guardFor = (rt: ProxyRedTeam | null | undefined, kind: ModelKind) =>
@@ -109,7 +126,7 @@ const curveDown = (x: number, y1: number, y2: number, bow: number) =>
 export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onPromote,
                                defaultOpen = true, healthRows, failoverStatus = [], redTeam,
                                editable = false, selectedUid = null, onSelect,
-                               onAddUpstream, onDeleteUpstream, renderEditor }: {
+                               onAddUpstream, onDeleteUpstream, renderEditor, onEnableUpstream }: {
   upstreams: RoutingUpstream[];
   maxConcurrency: number;
   timeoutS: number;
@@ -140,6 +157,12 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
   onAddUpstream?: () => void;           // "+ Add backend"
   onDeleteUpstream?: (uid: string) => void;
   renderEditor?: (uid: string) => React.ReactNode;  // host-supplied editor for one upstream
+  // ---- Re-enabling ---------------------------------------------------------
+  // Switch a backend back on from its node. EDIT-MODE ONLY, same rule as take-down:
+  // the Overview graph stays a read-only preview (its Upstreams card is where the
+  // Overview does its enabling). The edit form flips local state and lets Save carry
+  // it, so the graph never writes behind an unsaved form.
+  onEnableUpstream?: (uid: string) => void;
 }) {
   const [simDown, setSimDown] = useState<Set<string>>(new Set());
   const toggleDown = (uid: string) =>
@@ -209,7 +232,7 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
         || alias;
       const top = chain.find((c) => !down.has(c.uid));
       const tie = top ? chain.filter((c) => !down.has(c.uid) && c.priority === top.priority).length : 0;
-      out.push({ kind: modelKind(real, alias), real, alias, chain, tie });
+      out.push({ kind: modelKind(real, alias), real, alias, chain, off: selectDisabled(upstreams, alias), tie });
     }
     return out.sort((a, b) => a.alias.localeCompare(b.alias));
   }, [upstreams, down]);
@@ -222,11 +245,13 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
   // anything at all" for the help text below.
   const chatGuard = guardFor(redTeam, "chat");
 
-  // Upstreams that don't appear in any route node — a disabled backend, or a brand-new
-  // one with no valid alias yet. Only relevant in editable mode, where they still need to
-  // be reachable for editing (you can't click a node that isn't drawn).
+  // Upstreams that don't appear in any route node. A DISABLED backend is no longer in
+  // here — it is drawn in the routes it maps (as an "off" node), which is what makes it
+  // recoverable from the graph. What's left is a backend with no usable alias at all
+  // (typically brand-new), which no route can draw. Shown in read-only mode too: an
+  // upstream that appears nowhere on the page reads as deleted.
   const shownUids = new Set<string>();
-  for (const r of routes) for (const u of r.chain) shownUids.add(u.uid);
+  for (const r of routes) for (const u of [...r.chain, ...r.off]) shownUids.add(u.uid);
   const unrouted = upstreams.filter((u) => !shownUids.has(u.uid));
 
   // The editor slot rendered below the graph for whichever upstream is selected.
@@ -262,16 +287,28 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
     </div>
   ) : null;
 
-  const unroutedBar = editable && unrouted.length > 0 ? (
+  const unroutedBar = unrouted.length > 0 ? (
     <div className="rounded-md border border-dashed border-border px-3 py-2">
-      <span className="text-[11px] text-muted-foreground">Not in any route (disabled or no model alias yet) — click to edit:</span>
+      <span className="text-[11px] text-muted-foreground">
+        Not in any route — no model alias mapped yet{editable ? ", click to edit:" : ":"}
+      </span>
       <div className="mt-1.5 flex flex-wrap gap-1.5">
         {unrouted.map((u) => (
-          <button key={u.uid} type="button" onClick={() => onSelect?.(u.uid)}
-                  className={cn("rounded-md border px-2 py-1 text-[11px]",
-                    selectedUid === u.uid ? "border-primary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>
-            {u.name || "unnamed"}{!u.enabled && " · off"}
-          </button>
+          <span key={u.uid}
+                className={cn("inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px]",
+                  selectedUid === u.uid ? "border-primary text-foreground" : "border-border text-muted-foreground")}>
+            <button type="button" onClick={editable ? () => onSelect?.(u.uid) : undefined}
+                    className={cn(editable && "hover:text-foreground", !editable && "cursor-default")}>
+              {u.name || "unnamed"}{!u.enabled && " · off"}
+            </button>
+            {!u.enabled && editable && onEnableUpstream && (
+              <button type="button" onClick={() => onEnableUpstream(u.uid)}
+                      className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-600 hover:bg-emerald-500/20 dark:text-emerald-400"
+                      title="Switch this backend back on">
+                enable
+              </button>
+            )}
+          </span>
         ))}
       </div>
     </div>
@@ -318,7 +355,8 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
                          listOrder={upstreams} maxConcurrency={maxConcurrency} timeoutS={timeoutS}
                          defaultOpen={defaultOpen} failoverStatus={failoverStatus}
                          guard={guardFor(redTeam, r.kind)}
-                         editable={editable} selectedUid={selectedUid} onSelect={onSelect} />
+                         editable={editable} selectedUid={selectedUid} onSelect={onSelect}
+                         onEnableUpstream={onEnableUpstream} />
             ))}
           </div>
         </details>
@@ -364,7 +402,7 @@ export function RoutingPanel({ upstreams, maxConcurrency, timeoutS, proxyId, onP
 
 function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrder,
                      maxConcurrency, timeoutS, defaultOpen, failoverStatus, guard = null,
-                     editable = false, selectedUid = null, onSelect }: {
+                     editable = false, selectedUid = null, onSelect, onEnableUpstream }: {
   route: Route;
   down: Set<string>;
   health: Record<string, ProxyUpstreamHealth>;
@@ -381,6 +419,7 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
   editable?: boolean;
   selectedUid?: string | null;
   onSelect?: (uid: string | null) => void;
+  onEnableUpstream?: (uid: string) => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [avail, setAvail] = useState(0);
@@ -393,7 +432,11 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
     return () => ro.disconnect();
   }, []);
 
-  const { chain, tie } = route;
+  const { chain, off, tie } = route;
+  // Switched-off backends occupy rows after the live chain, above the end-stop: they are
+  // part of the picture (they map this model) but not part of the path (no edge reaches
+  // them). nodeCount is what the canvas is sized against.
+  const nodeCount = chain.length + off.length;
   const W = avail || 640;
   const twoCol = W >= TWO_COL_MIN;
   const colGap = 84;
@@ -403,7 +446,7 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
   const chainX = twoCol ? PAD + nodeW + colGap : PAD + 24;
   const rowGap = 40;
   const row = NODE_H + rowGap;
-  const rows = chain.length + 1;
+  const rows = nodeCount + 1;
   const chainH = rows * row - rowGap - (NODE_H - TERM_H);
   // The guard is a STAGE of the request column (request → screen → chain), not a
   // candidate: it can end the request, but it never serves it. Both columns centre
@@ -416,7 +459,7 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
     ? PAD + Math.max(0, (colH - chainH) / 2)
     : (guard ? guardY + row : reqY + row);
   const rowY = (i: number) => firstRowY + i * row;
-  const termY = rowY(chain.length);
+  const termY = rowY(nodeCount);
   const termMid = termY + TERM_H / 2;
   const height = Math.max(reqY + reqColH, termY + TERM_H) + PAD;
   const bow = twoCol ? 48 : 26;
@@ -445,11 +488,16 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
         <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open/model:rotate-90" />
         <code className="text-xs font-medium">{route.alias}</code>
         {chain.length === 0 ? (
-          <span className="text-[11px] text-rose-600 dark:text-rose-400">no backend — returns 404</span>
+          <span className="text-[11px] text-rose-600 dark:text-rose-400">
+            {off.length > 0
+              ? `no enabled backend — ${off.length} switched off (${off.map((u) => u.name || "unnamed").join(", ")})`
+              : "no backend — returns 404"}
+          </span>
         ) : (
           <span className="truncate text-[11px] text-muted-foreground">
             served by <span className="font-medium text-emerald-600 dark:text-emerald-400">{chain[0].name || "unnamed"}</span>
             {chain.length > 1 && <> · {chain.length - 1} fallback{chain.length > 2 ? "s" : ""}</>}
+            {off.length > 0 && <> · <span className="text-amber-600 dark:text-amber-400">{off.length} switched off</span></>}
           </span>
         )}
         {tie > 1 && (
@@ -622,10 +670,50 @@ function ModelFlow({ route, down, health, simDown, onToggle, onPromote, listOrde
               );
             })}
 
+            {/* Switched-off backends. Deliberately drawn — a disabled upstream used to
+                vanish from the graph entirely, so when the primary died there was
+                nothing on this page connecting the outage to the standby that could fix
+                it. No edge reaches them: they take no traffic until enabled. */}
+            {off.map((u, j) => {
+              const h = health[u.uid];
+              const probe = h?.alive === false && !h.stale ? `down — ${h.error ?? "probe failed"}`
+                : h?.alive ? `alive · ${h.latency_ms ?? "?"}ms`
+                : "not probed";
+              const selected = editable && selectedUid === u.uid;
+              const ownReal = u.models.find((m) => m.alias.trim() === route.alias)?.real.trim() ?? "";
+              return (
+                <Node key={u.uid} x={chainX} y={rowY(chain.length + j)} w={nodeW} tone="wire"
+                      selected={selected} onClick={editable ? () => onSelect?.(u.uid) : undefined}
+                      title={`${u.name || "unnamed"} · switched off — takes no traffic`
+                             + `${u.base_url ? ` · ${u.base_url}` : ""}${ownReal ? ` · → ${ownReal}` : ""}`}>
+                  <div className="opacity-60">
+                    <NodeHead tone="wire" icon={PowerOff} title={u.name || "unnamed"}
+                              right={<Tag tone="off">off</Tag>} />
+                  </div>
+                  <div className="mt-2 flex items-baseline gap-2 font-mono text-[10px] text-muted-foreground/70">
+                    <span className="shrink-0 opacity-60">prio {u.priority}</span>
+                    {editable && onEnableUpstream && (
+                      <button type="button"
+                              onClick={(e) => { e.stopPropagation(); e.preventDefault(); onEnableUpstream(u.uid); }}
+                              className="shrink-0 rounded bg-emerald-500/10 px-1.5 py-0.5 font-sans text-[10px] font-medium uppercase tracking-wide text-emerald-600 hover:bg-emerald-500/20 dark:text-emerald-400"
+                              title="Switch this backend back on — it starts taking traffic at its priority">
+                        enable
+                      </button>
+                    )}
+                    <span className="ml-auto shrink-0 opacity-60">{probe}</span>
+                  </div>
+                </Node>
+              );
+            })}
+
             {/* end-stop: where the chain would run out, not a failure that happened */}
             <Node x={chainX} y={termY} w={nodeW} h={TERM_H} tone={chain.length ? "wire" : "down"}>
               <div className="truncate font-mono text-[11px] text-muted-foreground">
-                {chain.length === 0 ? `404 · nothing serves "${route.alias}"` : "if every one fails · 502 to client"}
+                {chain.length === 0
+                  // The alias is already the heading of this route — repeating it here
+                  // only pushes the reason out of the node.
+                  ? (off.length > 0 ? "404 · all backends switched off" : `404 · nothing serves "${route.alias}"`)
+                  : "if every one fails · 502 to client"}
               </div>
             </Node>
           </div>
@@ -698,12 +786,15 @@ function NodeRule() {
   return <div className="my-1.5 h-px" style={{ background: "color-mix(in srgb, var(--wire) 70%, transparent)" }} />;
 }
 
-function Tag({ tone, children }: { tone: "live" | "wait" | "down"; children: React.ReactNode }) {
+// `off` is deliberately neutral, not red: a switched-off backend is an admin decision,
+// not a fault. Red is reserved for "this thing is failing".
+function Tag({ tone, children }: { tone: "live" | "wait" | "down" | "off"; children: React.ReactNode }) {
   return (
     <span className={cn(
       "shrink-0 rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide",
       tone === "live" ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
         : tone === "wait" ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+        : tone === "off" ? "bg-muted text-muted-foreground"
         : "bg-rose-500/10 text-rose-600 dark:text-rose-400",
     )}>{children}</span>
   );
