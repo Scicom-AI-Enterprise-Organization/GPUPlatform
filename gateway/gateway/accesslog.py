@@ -12,6 +12,13 @@ shape SlurmUI emits, so the Loki log panel + dashboard variables work identicall
 Without ``LOG_JSON`` the line is human-readable (``POST /tm-fleet/v1/chat/completions
 → 200 (842.301ms)``) for local-dev terminals.
 
+⚠ ``LOG_JSON=1`` means the **whole stdout stream** is JSON, not only these lines:
+``init_root_logging`` swaps the root formatter for ``_JsonLogFormatter`` (so module
+logs and tracebacks parse too) and ``_tame_server_loggers`` folds uvicorn's
+propagate-False loggers into it, dropping its duplicate access line. Anything that
+prints outside the logging module (a library writing to stdout directly) is still
+raw text — there is no way to catch that here.
+
 The access logger is independent of the root logger (``propagate=False``) so the
 JSON lines stay clean — no ``asctime levelname name:`` prefix wrapping them.
 
@@ -48,17 +55,82 @@ class _RequestIdFilter(logging.Filter):
         return True
 
 
+class _JsonLogFormatter(logging.Formatter):
+    """Render an ORDINARY module log record as one JSON object, so `LOG_JSON=1`
+    means the whole stream is JSON — not just the access log.
+
+    Before this, `LOG_JSON=1` only reformatted `gateway.access`/`gateway.endpoint`;
+    every `logger.info(...)` in the gateway (and every httpx/paramiko/boto line)
+    still went out as `2026-08-14 08:46:43,226 INFO httpx: …`. A Loki pipeline that
+    does `| json` drops those lines on the floor as unparseable, so exactly the
+    lines you need when something breaks — the tracebacks — were the ones missing
+    from the query, while the access log they belong to parsed fine.
+
+    Field names match `log_request`'s (`service`/`level`/`time`/`msg` + the same
+    `requestId`) so one LogQL query spans both kinds:
+        {service="gateway"} | json | requestId="pxr-4ce76aeb0409d8b5"
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        rid = request_id_var.get()
+        rec = {
+            "service": "gateway",
+            "kind": "app_log",
+            "level": record.levelname.lower().replace("warning", "warn"),
+            "logger": record.name,
+            "requestId": rid,
+            "time": int(record.created * 1000),
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            rec["exception"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            rec["stack"] = self.formatStack(record.stack_info)
+        return json.dumps(rec, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
 _ROOT_INIT = False
+
+
+def _tame_server_loggers() -> None:
+    """Fold uvicorn's own loggers into the root handler, and silence its access log.
+
+    Two reasons, both visible in a prod log tail:
+    1. uvicorn configures `uvicorn` / `uvicorn.access` with **`propagate: False`** and
+       its own stderr/stdout handlers, so those lines bypass whatever format the root
+       logger has — they stay `INFO:     10.1.28.212:47074 - "GET /ready HTTP/1.1" 200 OK`
+       even under LOG_JSON=1.
+    2. That line is a strictly WORSE DUPLICATE of our own `http_access` record, which
+       `metrics_mw` emits for **every** request (there is no ignore list) with the route
+       template, duration, byte count, app_id and the actionable request id. Keeping both
+       doubles the log bill to say less.
+
+    So: clear uvicorn's handlers and let its records propagate to the root formatter, and
+    turn `uvicorn.access` off entirely. Set `LOG_UVICORN_ACCESS=1` to keep it (useful only
+    if you suspect requests are dying BEFORE the middleware — a malformed request line,
+    or an ASGI-level rejection, never reaches `log_request`)."""
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "gunicorn.error"):
+        lg = logging.getLogger(name)
+        lg.handlers.clear()
+        lg.propagate = True
+    # Set BOTH ways, not just the disable: LOG_UVICORN_ACCESS=1 must actually bring the
+    # line back, even if something (a re-init, another library) already disabled it.
+    logging.getLogger("uvicorn.access").disabled = not truthy(
+        os.environ.get("LOG_UVICORN_ACCESS", ""))
 
 
 def init_root_logging() -> None:
     """Configure the root logger once (idempotent). Called from BOTH run() and
     lifespan so an external ASGI server importing gateway.main:app still gets
     formatted, request-id-correlated logs (basicConfig no-ops if something
-    already configured handlers — we still attach the request-id filter)."""
+    already configured handlers — we still attach the request-id filter).
+
+    `LOG_JSON=1` makes every record a JSON object (see `_JsonLogFormatter`);
+    without it the human-readable dev format is unchanged."""
     global _ROOT_INIT
     if _ROOT_INIT:
         return
+    json_mode = _truthy(os.environ.get("LOG_JSON", ""))
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s%(request_id)s: %(message)s",
@@ -66,6 +138,11 @@ def init_root_logging() -> None:
     f = _RequestIdFilter()
     for h in logging.getLogger().handlers:
         h.addFilter(f)
+        if json_mode:
+            # The request id rides INSIDE the JSON object (`requestId`), so the
+            # `%(request_id)s` text prefix is dropped here rather than duplicated.
+            h.setFormatter(_JsonLogFormatter())
+    _tame_server_loggers()
     _ROOT_INIT = True
 # Separate stream for serverless-endpoint (vLLM) logs re-emitted from
 # /workers/logs, so Loki/Alloy can ingest them as `service="vllm"` alongside
@@ -84,8 +161,11 @@ _EP_ENABLED = False
 _LEVEL_RE = re.compile(r"\b(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG)\b")
 
 
-def _truthy(v: str) -> bool:
+def truthy(v: str) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+_truthy = truthy  # internal alias (pre-existing call sites)
 
 
 def init_access_logging() -> None:

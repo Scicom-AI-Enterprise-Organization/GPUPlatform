@@ -1,0 +1,63 @@
+# Grafana Tempo — the request store for LLM-proxy traces (gateway/tracing.py).
+#
+# Single-binary, local-filesystem blocks: enough to run the whole flow on a laptop
+# and identical in API to a real deployment (the gateway only ever talks OTLP out and
+# /api/search in). For anything beyond dev, point `storage.trace.backend` at S3/GCS.
+#
+# Ports: 4318 OTLP/HTTP (what the gateway exports to by default), 4317 OTLP/gRPC,
+#        3200 the query API (what TEMPO_URL points at — NOT the ingest port).
+target: all
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9096
+  # A proxy trace is small, but a search over a wide window can return a lot of them.
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  # Flush quickly so a trace is searchable seconds after the request finishes — the
+  # Queue tab is a live view, and Tempo's default (a 30m block window) would make a
+  # request that just completed look missing.
+  max_block_duration: 5m
+  complete_block_timeout: 15m
+
+compactor:
+  compaction:
+    # Local dev retention. Raise (or move to object storage) for real traffic; this
+    # is the knob that replaces PROXY_REQUEST_RETENTION_DAYS as the thing bounding
+    # how much request history is kept.
+    block_retention: 168h    # 7 days
+
+query_frontend:
+  search:
+    # The Queue tab pages by over-fetching (Tempo has no OFFSET), so allow a page
+    # bigger than the default 20. gateway/trace_store.py caps its own fetch at
+    # PROXY_TRACE_MAX_FETCH — keep that at or below this.
+    max_result_limit: 1000
+    default_result_limit: 50
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# Tempo is multi-tenant by design; single-tenant mode means no X-Scope-OrgID header
+# is required (leave TEMPO_ORG_ID unset in the gateway). Turn this on and set
+# TEMPO_ORG_ID if you run more than one tenant.
+multitenancy_enabled: false
+
+usage_report:
+  reporting_enabled: false

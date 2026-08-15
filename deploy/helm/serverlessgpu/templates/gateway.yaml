@@ -124,6 +124,50 @@ spec:
                   unreachable, so enabling it never blocks proxy traffic. */}}
             - name: PROXY_CLUSTER
               value: "{{ if or .Values.gateway.proxyCluster .Values.gateway.ha (gt (int .Values.gateway.replicaCount) 1) }}1{{ else }}0{{ end }}"
+            {{- /* Request tracing: one OTLP span per LLM-proxy request, so the
+                  request record can live in a tracing backend (Tempo/Jaeger)
+                  instead of a `proxy_requests` row per request in Postgres.
+                  requestStore controls how much (if any) of it Postgres still
+                  keeps; historySource=auto makes the Queue tab read from
+                  whichever store actually holds the history. */}}
+            {{- if .Values.gateway.tracing.enabled }}
+            - name: PROXY_TRACING
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.gateway.tracing.otlpEndpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: {{ .Values.gateway.tracing.otlpProtocol | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.gateway.tracing.serviceName | quote }}
+            {{- if .Values.gateway.tracing.sampleRatio }}
+            - name: PROXY_TRACE_SAMPLE_RATIO
+              value: {{ .Values.gateway.tracing.sampleRatio | quote }}
+            {{- end }}
+            {{- if .Values.gateway.tracing.slowMs }}
+            - name: PROXY_TRACE_SLOW_MS
+              value: {{ .Values.gateway.tracing.slowMs | quote }}
+            {{- end }}
+            {{- if .Values.gateway.tracing.tempoUrl }}
+            - name: TEMPO_URL
+              value: {{ .Values.gateway.tracing.tempoUrl | quote }}
+            {{- end }}
+            {{- if .Values.gateway.tracing.tempoOrgId }}
+            - name: TEMPO_ORG_ID
+              value: {{ .Values.gateway.tracing.tempoOrgId | quote }}
+            {{- end }}
+            {{- if .Values.gateway.tracing.traceUiUrl }}
+            - name: TRACE_UI_URL
+              value: {{ .Values.gateway.tracing.traceUiUrl | quote }}
+            {{- end }}
+            {{- if .Values.gateway.tracing.windowHours }}
+            - name: PROXY_TRACE_WINDOW_H
+              value: {{ .Values.gateway.tracing.windowHours | quote }}
+            {{- end }}
+            {{- end }}
+            - name: PROXY_REQUEST_STORE
+              value: {{ .Values.gateway.requestStore | quote }}
+            - name: PROXY_HISTORY_SOURCE
+              value: {{ .Values.gateway.historySource | quote }}
             - name: PROVIDER
               value: {{ .Values.gateway.provider | quote }}
             - name: DISABLE_CLOUD_PROVIDERS

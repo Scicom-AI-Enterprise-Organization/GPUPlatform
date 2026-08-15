@@ -171,6 +171,16 @@ STATS_WRITER_DROPPED = Counter(
     registry=_registry,
 )
 
+# Proxy request spans opened but not yet closed (gateway/tracing.py). This is
+# in-flight requests in the steady state; a value that climbs and never falls means
+# spans are leaking — requests whose handler died without reaching `_finish`, which
+# also means those requests are missing from the trace store entirely.
+PROXY_TRACE_PENDING = Gauge(
+    "gateway_proxy_trace_pending_spans",
+    "Proxy request spans opened and not yet ended",
+    registry=_registry,
+)
+
 
 # ---- Serverless-API HTTP metrics (the gateway's own request layer) ----------
 # Buckets are extended past prometheus_client's defaults (which top out at 10s)
@@ -947,6 +957,12 @@ def _sample_runtime_health() -> None:
         STATS_WRITER_QUEUE_DEPTH.set(_sw.queue_depth())
     except Exception:  # noqa: BLE001
         logger.debug("stats-writer depth sample failed", exc_info=True)
+    try:
+        from . import tracing as _tr
+        if _tr.enabled():
+            PROXY_TRACE_PENDING.set(_tr.pending_count())
+    except Exception:  # noqa: BLE001
+        logger.debug("trace pending sample failed", exc_info=True)
 
 
 async def _sample_redis(rdb: "redis_async.Redis") -> None:

@@ -15,6 +15,20 @@ live in the **repo-root `CLAUDE.md`** (always loaded).
   request; `accesslog.init_root_logging()` (idempotent, called from BOTH `run()` and lifespan so
   external ASGI servers get it too) installs a filter rendering ` [req-…]` into every module log
   line via `%(request_id)s` in the root format. Don't `logging.basicConfig` anywhere else.
+- **`LOG_JSON=1` means the WHOLE stdout stream is JSON** (fixed 2026-08-14 — it used to cover
+  only `gateway.access`/`gateway.endpoint`). Two leaks in prod: (1) module logs and tracebacks
+  still went out as `2026-08-14 08:46:43,226 INFO httpx: …`, which a Loki `| json` pipeline drops
+  as unparseable — so the lines you actually need when something breaks were the ones missing
+  from the query; (2) uvicorn configures `uvicorn`/`uvicorn.access` with **`propagate: False`** and
+  its own handlers, so `INFO:     10.1.28.212 - "GET /ready HTTP/1.1" 200 OK` bypassed the format
+  entirely. Now `_JsonLogFormatter` renders every record as `kind="app_log"` with the same
+  `requestId` field the access line uses (one LogQL query spans both), and
+  `_tame_server_loggers()` clears uvicorn's handlers + `propagate=True`. **uvicorn's access log is
+  turned OFF** (`log_config=None` + `access_log=False` in `run()`): `metrics_mw` already logs
+  every request — there is no ignore list — with the route template, duration, bytes and the
+  actionable id, so uvicorn's line was a strictly worse duplicate. `LOG_UVICORN_ACCESS=1` restores
+  it (only useful for requests dying *before* the middleware — a malformed request line).
+  ⚠ Anything printing outside the logging module (a library writing to stdout) is still raw text.
 - **`/ready` = Redis AND Postgres** (each behind a 2s timeout); `/health` stays dependency-free
   liveness. Don't add dependency checks to `/health` — k8s would restart a healthy process over a
   dependency outage.
@@ -283,6 +297,109 @@ endpoint, `""`/`0` clears; UI = pencil on the Parameters tab's GPU row, plus a d
 card for ingress runs). The row value wins over config in `_bench_gpu_meta`; `BenchmarkRecord` and
 `public-compare` now carry resolved top-level `gpu_type`/`gpu_count` so nobody has to parse
 `config_yaml`.
+
+### Proxy request tracing (OTLP → Tempo) + where the request RECORD lives
+
+`tracing.py` (write) + `trace_store.py` (read) + `PROXY_REQUEST_STORE` (how much Postgres
+keeps). Motivation: every proxied request wrote a `proxy_requests` row and **`proxy_requests`
+is not a table shape Postgres should be asked for at prod volume** — append-only, write-once,
+read-rarely, unbounded (`PROXY_REQUEST_RETENTION_DAYS` defaults to 0 = keep forever). The
+record now also goes out as **one OTLP span per request**, and Postgres can be told to hold
+part of it or none.
+
+**The write path had THREE synchronous DB round-trips per request; it now has zero.**
+`_insert_request_row` (INSERT+COMMIT at admission, before the upstream call) and
+`_set_started` (SELECT+UPDATE at queue exit) both checked out a pooled connection on the
+latency path — the same pattern that caused the pool-exhaustion incident `stats_writer` was
+built to fix, still living at the front of the request. Admission is now
+**`_admit_request`** (span + an enqueued `proxy_insert` intent), start is
+`stats_writer.record_proxy_start`, and both share the `proxy` intent kind with the terminal
+one so a fast request collapses to a **single INSERT**.
+
+- **`PROXY_REQUEST_STORE=all|sampled|errors|off`** (default `all` — byte-identical
+  behaviour). `sampled` keeps `PROXY_REQUEST_STORE_RATIO` of rows, chosen by hashing the
+  request id — **deterministic on purpose**: sampled IN at admission and OUT at completion
+  would strand a permanently `queued` row. `errors` writes nothing up front and one COMPLETE
+  row at `_finish` iff the request failed / was blocked / cancelled / returned ≥400.
+- **⚠ The Prometheus metrics must never depend on the row.** `observe_proxy` used to fire as
+  a side effect of the row UPDATE inside `_apply_proxy`, so `store=off` would have silently
+  taken every per-proxy latency/TTFT/tok-s series down with it — a storage decision becoming
+  a monitoring outage. It is now `stats_writer._proxy_metric`, fed `endpoint_id`/`model` on
+  the intent, and `record_proxy_finish(store=False)` enqueues a `proxy_metric` kind that
+  never opens a session. Verified: 15 requests in `errors` mode → 3 rows, 15 in the counter.
+- **⚠ In-flight requests are in NEITHER store.** A span is exported when the request ENDS and
+  (outside `all`) no row exists while it is queued. `_live_records` overlays the live registry
+  onto every non-`all` answer — without it the Queue tab shows an empty queue while requests
+  are actively waiting, which is exactly when someone is looking at it. Page 1 only (offset 0),
+  else an in-flight request repeats on every page.
+- **`_finish` is the single funnel** for span-close AND storage policy, so the trace and the
+  row can never describe the request differently. `_ADMITTED` (request id → admission facts)
+  carries what `_finish` can't otherwise reach: the metric labels, the deferred insert's
+  `created_at`/`owner_id`, and the live overlay. Both it and the span map are swept by the
+  proxy health loop (`_sweep_admitted` / `tracing.sweep`) — a handler that dies without
+  reaching `_finish` would otherwise leak in two places and never emit its trace at all.
+
+**tracing.py**
+- OFF unless `PROXY_TRACING=1`; the opentelemetry import is lazy and a **missing wheel logs
+  and stays off** rather than failing startup (a gateway that won't boot for a telemetry dep
+  is a worse outage than no telemetry). Every entry point is exception-wrapped — it sits on
+  the request path.
+- **⚠ Sampling decides at the END, not the start.** A head sampler (OTel's default) chooses
+  before the outcome is known, so a 5% sample keeps 5% of your failures. `_PolicyProcessor`
+  wraps the BatchSpanProcessor and drops in `on_end`: errors / blocked / cancelled / ≥400 /
+  slower than `PROXY_TRACE_SLOW_MS` are **always** kept, and only plain successes are ratio-
+  sampled (deterministically in the trace id, so replicas agree).
+- The caller's `traceparent` is honoured, so a client that traces its own work gets this span
+  as a **child** rather than an orphan. Deliberately does NOT call `set_tracer_provider` —
+  claiming the global would adopt every library that auto-instruments itself, which is a much
+  larger traffic decision than this one.
+- Attributes are the Queue tab's columns: `sgpu.request.id` / `.proxy.id` / `.proxy.name` /
+  `.model` / `.upstream` / `.status` / `.stream` / `.latency_ms` / `.ttft_ms` / `.owner`,
+  plus `http.response.status_code` and `gen_ai.usage.{input,output}_tokens`. `blocked` and
+  `cancelled` are NOT span-status ERROR — a guardrail doing its job and a caller hanging up
+  are not gateway errors, and marking them would poison every error-rate panel.
+
+**trace_store.py — three things TraceQL can't do that SQL could, all surfaced to the user**
+1. **A time window is mandatory** (`PROXY_TRACE_WINDOW_H`, default 24). "Everything ever" is
+   not a query Tempo answers.
+2. **No `OFFSET`, no `ORDER BY` but time.** ⚠ **A latency sort must fetch the whole window,
+   not one page** — Tempo returns most-recent-first, so ranking a page of `limit` traces
+   answers "slowest of the newest N" while looking like "slowest". Caught in the e2e: a
+   `limit=3` sort returned 5200/410/300 ms and hid the 1820 ms request. Sorting/paging happen
+   in-process over a fetch capped at `PROXY_TRACE_MAX_FETCH` (500); past the cap the `note`
+   says the ranking is partial (a silently truncated ranking reads as an answer).
+3. **`select()` is not optional** — a TraceQL search returns only the attributes it MATCHED
+   on, so without it every unselected column comes back empty and looks like missing data.
+- **⚠ An unreachable Tempo RAISES (502), never an empty list.** "No requests" and "the trace
+  backend is down" must not look identical in a monitoring UI.
+- ⚠ OTLP JSON encodes **ints as strings** (`{"intValue": "1500"}`) — take them at face value
+  and every token count and latency silently becomes text. Both `spanSets` (current) and the
+  older bare `spanSet` are read; handling one returns zero rows against the other version.
+- `GET /{id}/requests?source=db|trace` overrides per call; `PROXY_HISTORY_SOURCE=auto` (default)
+  reads traces exactly when `PROXY_REQUEST_STORE != all`, so flipping storage doesn't also
+  require remembering to flip the read path. The source + caveat ride back as
+  **`X-SGPU-History-Source` / `X-SGPU-History-Note`** (the `x-sgpu-*` prefix is already passed
+  through by the web proxy) and `/request-facets` reports `source`/`window_hours`/`store` —
+  the Queue tab renders both. ⚠ **Header values are latin-1**: an em-dash in the note 500'd the
+  endpoint in the e2e; `_hdr()` sanitizes.
+
+**Local stack**: `deploy/monitoring/docker-compose.monitoring.yml` now runs **Tempo**
+(+ a provisioned Grafana datasource with trace→logs and trace→metrics links).
+⚠ Its OTLP/HTTP host port defaults to **4418, not 4318** — 4318 is squatted on this laptop
+(same class of collision as :8080/:3000); override with `TEMPO_OTLP_HTTP_PORT`. The query
+API (3200, `TEMPO_URL`) and the ingest port are *different services' ports* — mixing them up
+looks like "tracing works but history is empty".
+
+    PROXY_TRACING=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4418 \
+      TEMPO_URL=http://localhost:3200 PROXY_REQUEST_STORE=off .venv/bin/gateway
+
+**Verified e2e locally** (2026-08-14) against a mock upstream, on a second gateway (:8099) so
+the running one was untouched: real proxied requests (unary + SSE + a 500) → OTLP → Tempo →
+the Queue-tab API, with owner/upstream/status/request-id filters, latency sort, facets and
+endpoint isolation all correct; `store=all` regression = 21 concurrent mixed requests → 21
+complete rows (incl. the insert+update-coalesced-in-one-flush case, 0 stuck `queued`);
+`store=errors` = 15 requests → 3 rows, 15 counted in Prometheus. Restart rule: `tracing.py` /
+`trace_store.py` / `proxy_api.py` are imported → **gateway restart** for edits.
 
 ### Activity dashboard (`/activity`) + proxy-mode usage recording
 

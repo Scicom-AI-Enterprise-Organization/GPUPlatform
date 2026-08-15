@@ -1,4 +1,4 @@
-# Gateway API-layer observability (Prometheus + Alertmanager + Loki + Grafana)
+# Gateway API-layer observability (Prometheus + Alertmanager + Loki + Tempo + Grafana)
 
 A self-contained monitoring stack for the gateway API layer — the same shape as
 SlurmUI's: RED metrics, latency percentiles, by-route tables, and a **filterable
@@ -8,7 +8,8 @@ request-log panel**. It does not depend on any cluster's Grafana.
 gateway /metrics             ──scrape──▶ Prometheus ──┬──▶ Alertmanager (:9093, alerts.yml rules)
 gateway JSON access log file ──tail──▶ Promtail ▶ Loki┤──▶ Grafana (GPUPlatform — API Layer)
 gateway endpoint (vLLM) log  ──tail──▶ Promtail ▶ Loki┤   ({service="vllm"})
-Redis queue:{app_id} (sampled into /metrics)─────────┘
+Redis queue:{app_id} (sampled into /metrics)─────────┤
+LLM-proxy requests ──OTLP──▶ Tempo (:4418 in, :3200 out)┘   (one span per proxied request)
 ```
 
 ## Run it locally
@@ -33,6 +34,13 @@ Redis queue:{app_id} (sampled into /metrics)─────────┘
    no-op unless `LOG_JSON=1` **or** `GATEWAY_ENDPOINT_LOG` is set, so plain dev
    pays nothing.)
 
+   `LOG_JSON=1` makes the **whole stdout stream** JSON, not just the access lines:
+   module logs and tracebacks are rendered as `kind="app_log"` records carrying the
+   same `requestId`, and uvicorn's own access line — a lesser duplicate of ours,
+   which used to bypass the format entirely because uvicorn sets `propagate=False`
+   on its loggers — is turned off. Set `LOG_UVICORN_ACCESS=1` to keep it (only
+   useful when you suspect requests are dying *before* the middleware sees them).
+
 2. Bring up the stack:
 
    ```bash
@@ -40,7 +48,50 @@ Redis queue:{app_id} (sampled into /metrics)─────────┘
    ```
 
 3. Open Grafana at <http://localhost:3001> (admin / admin) → **GPUPlatform — API
-   Layer**. Prometheus + Loki datasources and the dashboard are auto-provisioned.
+   Layer**. Prometheus + Loki + Tempo datasources and the dashboard are
+   auto-provisioned.
+
+## Request tracing (Tempo) — the LLM proxy's request record
+
+Every proxied request can be exported as one OTLP span, which is what lets
+`proxy_requests` stop being a row per request in Postgres (that table is
+append-only, unbounded, and read almost never — the wrong shape for a
+transactional store at prod volume). Start the gateway with:
+
+```bash
+PROXY_TRACING=1 \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4418 \
+  TEMPO_URL=http://localhost:3200 \
+  PROXY_REQUEST_STORE=off \
+  .venv/bin/gateway
+```
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT` is where spans are **written** (Tempo's OTLP
+  receiver); `TEMPO_URL` is where the Queue tab **reads them back** (Tempo's query
+  API). Different ports, different directions — swapping them looks like "tracing
+  works but the history is empty".
+- ⚠ The OTLP/HTTP host port defaults to **4418**, not the standard 4318, because
+  4318 is already taken on this laptop. Override with `TEMPO_OTLP_HTTP_PORT`
+  (inside the compose network Tempo still listens on 4318).
+- `PROXY_REQUEST_STORE=all|sampled|errors|off` decides how much Postgres keeps;
+  `all` (the default) changes nothing. `PROXY_HISTORY_SOURCE=auto` makes
+  `/proxy/<id>?tab=queue` read from whichever store actually holds the history.
+- `PROXY_TRACE_SAMPLE_RATIO` samples **successful** requests only — failures,
+  blocks, cancels and anything slower than `PROXY_TRACE_SLOW_MS` are always kept.
+- `TRACE_UI_URL` (e.g.
+  `http://localhost:3001/explore?...&traceId={trace}`) turns on the per-row
+  **trace** link in the Queue tab.
+
+In Grafana → Explore → Tempo, search with TraceQL:
+
+```
+{ span.sgpu.proxy.name="for-agentic" && span.sgpu.status="failed" }
+{ span.sgpu.request.id="pxr-4ce76aeb0409d8b5" }
+{ span.sgpu.latency_ms > 10000 }
+```
+
+The datasource is wired for **trace → logs** (jumps to that request's Loki lines by
+`requestId`) and **trace → metrics**.
 
 ## What you get
 

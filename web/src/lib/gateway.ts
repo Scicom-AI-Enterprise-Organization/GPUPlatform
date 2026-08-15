@@ -121,6 +121,8 @@ import type {
   TestGitopsRepoBody,
   TestGitopsRepoResult,
   ProxyEndpoint,
+  ProxyHistorySource,
+  ProxyRequestFacets,
   ProxyUpstreamHealth,
   ProxyRequest,
   CreateProxyBody,
@@ -209,6 +211,18 @@ export class GatewayError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
+  return (await requestFull<T>(path, init, timeoutMs)).data;
+}
+
+/** Like `request`, but also hands back the response headers. Only needed where the
+ * gateway reports something ABOUT the answer rather than in it — e.g. the proxy
+ * queue's `x-sgpu-history-source` / `-note`, which say which store served the page
+ * and how the trace store's time window bounded it. */
+async function requestFull<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = 30_000,
+): Promise<{ data: T; headers: Headers }> {
   const url = isServer ? `${PUBLIC_BASE}${path}` : `/api/proxy${path}`;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -239,7 +253,7 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = 30_000):
     throw new GatewayError(res.status, body);
   }
   const text = await res.text();
-  return (text ? JSON.parse(text) : null) as T;
+  return { data: (text ? JSON.parse(text) : null) as T, headers: res.headers };
 }
 
 /** Query string for the server-paginated list endpoints (skips empty values). */
@@ -1118,10 +1132,14 @@ export const gateway = {
     const s = q.toString();
     return request<ActivityLogsResponse>(`/v1/history/activity/logs${s ? `?${s}` : ""}`);
   },
-  getProxyRequests: (
+  /** One page of a proxy endpoint's request history. `source`/`note` come back as
+   * headers: which store answered (Postgres rows vs the trace backend) and any caveat
+   * about the answer — the trace store is time-windowed and cannot rank server-side,
+   * so a "slowest first" page can be a ranking over part of the window. */
+  getProxyRequests: async (
     id: string,
     opts: { limit?: number; owner?: string; upstream?: string; status?: string; sort?: string; order?: string; requestId?: string } = {},
-  ) => {
+  ): Promise<{ rows: ProxyRequest[]; source: ProxyHistorySource | null; note: string | null }> => {
     const q = new URLSearchParams({ limit: String(opts.limit ?? 50) });
     if (opts.owner) q.set("owner", opts.owner);
     if (opts.upstream) q.set("upstream", opts.upstream);
@@ -1129,10 +1147,18 @@ export const gateway = {
     if (opts.sort) q.set("sort", opts.sort);
     if (opts.order) q.set("order", opts.order);
     if (opts.requestId) q.set("request_id", opts.requestId);
-    return request<ProxyRequest[]>(`/v1/proxy/${encodeURIComponent(id)}/requests?${q.toString()}`);
+    const { data, headers } = await requestFull<ProxyRequest[]>(
+      `/v1/proxy/${encodeURIComponent(id)}/requests?${q.toString()}`,
+    );
+    const src = headers.get("x-sgpu-history-source");
+    return {
+      rows: data ?? [],
+      source: src === "trace" || src === "db" ? src : null,
+      note: headers.get("x-sgpu-history-note"),
+    };
   },
   getProxyRequestFacets: (id: string) =>
-    request<{ users: string[]; upstreams: string[] }>(
+    request<ProxyRequestFacets>(
       `/v1/proxy/${encodeURIComponent(id)}/request-facets`,
     ),
   cancelProxyRequest: (id: string, reqId: string) =>

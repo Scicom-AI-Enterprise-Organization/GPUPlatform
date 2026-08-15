@@ -18,3 +18,38 @@ datasources:
     url: http://loki:3100
     jsonData:
       maxLines: 1000
+
+  # LLM-proxy request traces (gateway/tracing.py → OTLP → Tempo). One span per
+  # proxied request, carrying the same fields the Queue tab shows: sgpu.request.id,
+  # sgpu.proxy.name, sgpu.model, sgpu.upstream, sgpu.status, sgpu.latency_ms,
+  # sgpu.ttft_ms, gen_ai.usage.*.
+  #
+  #   { span.sgpu.proxy.name="for-agentic" && span.sgpu.status="failed" }
+  #   { span.sgpu.request.id="pxr-4ce76aeb0409d8b5" }
+  #   { span.sgpu.latency_ms > 10000 }
+  - name: Tempo
+    uid: gpuplatform-tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      # Jump from a span to that request's log lines. Both sides key on the SAME id:
+      # the gateway stamps `requestId` (the `pxr-…` id) into every JSON log record,
+      # and the span carries it as sgpu.request.id — see accesslog._JsonLogFormatter.
+      tracesToLogsV2:
+        datasourceUid: gpuplatform-loki
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        filterByTraceID: false
+        customQuery: true
+        query: '{service="gateway"} | json | requestId=`${__span.tags["sgpu.request.id"]}`'
+      # …and to the RED metrics for the same proxy endpoint.
+      tracesToMetrics:
+        datasourceUid: gpuplatform-prometheus
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        queries:
+          - name: 'Proxy request rate'
+            query: 'sum(rate(proxy_requests_total{proxy="$${__span.tags[\"sgpu.proxy.id\"]}"}[5m])) by (status)'
+      nodeGraph:
+        enabled: true

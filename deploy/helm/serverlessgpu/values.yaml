@@ -35,6 +35,36 @@ gateway:
   # Without it, a proxy endpoint's max_concurrency is enforced per-replica, so N
   # replicas allow N× the cap. Fails open on Redis errors.
   proxyCluster: false
+  # Where a proxied request's RECORD lives. `proxy_requests` is one row per
+  # request, inserted and updated on the data plane's hot path — fine at low
+  # volume, wrong for Postgres at high volume (append-only, write-once,
+  # unbounded). Options: all (default, unchanged) | sampled | errors | off.
+  # Anything but `all` needs tracing.enabled, or the history is only in
+  # Prometheus aggregates and nothing can answer "what happened to this request".
+  requestStore: all
+  # Which store the proxy Queue tab reads: auto | db | trace. `auto` follows
+  # requestStore, so flipping storage doesn't also require flipping the read path.
+  historySource: auto
+  # OTLP request tracing → Tempo/Jaeger. otlpEndpoint is the COLLECTOR (4318
+  # http/protobuf, 4317 grpc); tempoUrl is Tempo's QUERY api (3200) and is what
+  # the Queue tab reads back through — they are different ports of different
+  # services and mixing them up looks like "tracing works but history is empty".
+  tracing:
+    enabled: false
+    otlpEndpoint: "http://tempo.monitoring.svc.cluster.local:4318"
+    otlpProtocol: "http/protobuf"
+    serviceName: "gateway"
+    # Ratio for SUCCESSFUL requests only — failures, blocks, cancels and slow
+    # requests are always kept (the sampling decision is made at the END of the
+    # request, so a low ratio never costs you the errors).
+    sampleRatio: ""
+    slowMs: ""
+    tempoUrl: "http://tempo.monitoring.svc.cluster.local:3200"
+    tempoOrgId: ""
+    # Grafana Explore deep link for the Queue tab's per-row "trace" link;
+    # `{trace}` is substituted with the trace id.
+    traceUiUrl: ""
+    windowHours: ""
   # PodDisruptionBudget — rendered automatically once replicaCount >= 2 so a
   # node drain / rollout can never evict every gateway at once. No-op (not
   # rendered) at replicaCount: 1, where it would deadlock drains instead.

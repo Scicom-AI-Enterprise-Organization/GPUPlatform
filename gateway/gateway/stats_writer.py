@@ -149,11 +149,61 @@ def record_proxy_finish(request_id: str, status: str, *, status_code: Optional[i
                         latency_ms: Optional[int] = None, pt: Optional[int] = None,
                         ct: Optional[int] = None, error: Optional[str] = None,
                         upstream: Optional[str] = None, ttft_ms: Optional[int] = None,
-                        avg_logprob: Optional[float] = None) -> None:
-    """A proxied request reached a terminal state — record its outcome + stats."""
-    _enqueue({"kind": "proxy", "id": request_id, "status": status, "status_code": status_code,
+                        avg_logprob: Optional[float] = None,
+                        endpoint_id: Optional[str] = None, model: Optional[str] = None,
+                        store: bool = True) -> None:
+    """A proxied request reached a terminal state — record its outcome + stats.
+
+    `endpoint_id`/`model` are the Prometheus labels. They used to be read off the
+    `proxy_requests` row this intent updates; passing them explicitly is what keeps
+    the per-proxy metrics alive when there IS no row (`PROXY_REQUEST_STORE=off`).
+
+    `store=False` says no row for this request exists or ever will — the intent then
+    carries the metric ONLY and never touches a session, so the mode that exists to
+    keep this traffic out of Postgres doesn't still issue a SELECT per flush."""
+    _enqueue({"kind": "proxy" if store else "proxy_metric",
+              "id": request_id, "status": status, "status_code": status_code,
               "latency_ms": latency_ms, "pt": pt, "ct": ct, "error": error,
-              "upstream": upstream, "ttft_ms": ttft_ms, "avg_logprob": avg_logprob})
+              "upstream": upstream, "ttft_ms": ttft_ms, "avg_logprob": avg_logprob,
+              "endpoint_id": endpoint_id, "model": model})
+
+
+def record_proxy_start(request_id: str, upstream: Optional[str] = None) -> None:
+    """A proxied request left the queue and is being forwarded (status → running).
+
+    Was a direct `UPDATE … SET status='running'` on its own pooled session
+    (`proxy_api._set_started`) — the second of THREE synchronous DB round-trips every
+    proxied request used to pay. Rides the batch writer now; it shares the `proxy`
+    kind with the terminal intent so the two coalesce into one write when a request
+    finishes inside a single flush window (the common case)."""
+    _enqueue({"kind": "proxy", "id": request_id, "running": True,
+              "started_at": datetime.now(timezone.utc), "upstream": upstream})
+
+
+def record_proxy_insert(request_id: str, endpoint_id: str, owner_id: Optional[int],
+                        model: Optional[str], *, is_stream: bool, created_at,
+                        status: str = "queued", started_at=None, completed_at=None,
+                        status_code: Optional[int] = None, latency_ms: Optional[int] = None,
+                        ttft_ms: Optional[int] = None, pt: Optional[int] = None,
+                        ct: Optional[int] = None, error: Optional[str] = None,
+                        upstream: Optional[str] = None) -> None:
+    """INSERT a whole `proxy_requests` row through the batch writer.
+
+    Two callers, both in `proxy_api`:
+    • **admission** (`PROXY_REQUEST_STORE=all|sampled`) — the row that used to be
+      written by an inline `session.add()` + `commit()` BEFORE the upstream call, i.e.
+      a pooled checkout on the latency path of every proxied request.
+    • **terminal** (`PROXY_REQUEST_STORE=errors`) — nothing was written at admission,
+      so a request that failed is inserted complete, in one statement, after the fact.
+
+    A later `record_proxy_finish` for a row that hasn't been flushed yet still lands:
+    the update pass runs in the same session and its SELECT autoflushes this INSERT."""
+    _enqueue({"kind": "proxy_insert", "id": request_id, "endpoint_id": endpoint_id,
+              "owner_id": owner_id, "model": model, "is_stream": is_stream,
+              "created_at": created_at, "status": status, "started_at": started_at,
+              "completed_at": completed_at, "status_code": status_code,
+              "latency_ms": latency_ms, "ttft_ms": ttft_ms, "pt": pt, "ct": ct,
+              "error": error, "upstream": upstream})
 
 
 # ---------- coalescing + flush ----------------------------------------------
@@ -203,6 +253,18 @@ def _apply_serverless(row, it: dict, now: datetime) -> None:
 
 
 def _apply_proxy(row, it: dict, now: datetime) -> None:
+    # A `running` intent (record_proxy_start) carries no terminal `status`, and must
+    # not stamp completed_at or fire the terminal metric. When start + finish coalesce
+    # into one intent, BOTH branches run — started_at is kept and the terminal wins the
+    # status, which is exactly the two-write sequence collapsed into one.
+    if it.get("started_at") is not None and row.started_at is None:
+        row.started_at = it["started_at"]
+    if not it.get("status"):
+        if it.get("upstream"):
+            row.upstream = it["upstream"]
+        if row.status == "queued":
+            row.status = "running"
+        return
     row.status = it["status"]
     if it.get("status_code") is not None:
         row.status_code = it["status_code"]
@@ -219,14 +281,29 @@ def _apply_proxy(row, it: dict, now: datetime) -> None:
     if it.get("error"):
         row.error_text = str(it["error"])[:2048]
     row.completed_at = now
-    # Per-proxy Prometheus metric (in-memory) — parity with the old _finish.
+    _proxy_metric(row.endpoint_id, row.model, it, upstream_fallback=row.upstream)
+
+
+def _proxy_metric(endpoint_id: Optional[str], model: Optional[str], it: dict,
+                  upstream_fallback: Optional[str] = None) -> None:
+    """Per-proxy Prometheus observation for a terminal intent — parity with the old
+    inline `_finish`.
+
+    ⚠ Split out of `_apply_proxy` because it must NOT depend on a `proxy_requests`
+    row existing. With `PROXY_REQUEST_STORE=off` there is no row to update, and a
+    metric emitted only as a side effect of a row update would have silently taken
+    every per-proxy latency/TTFT/tok-s series down with the table — turning a storage
+    decision into a monitoring outage. The intent carries `endpoint_id`/`model` for
+    exactly this path."""
+    if not it.get("status") or not endpoint_id:
+        return
     try:
         from . import metrics as _metrics
         ttft_ms, latency_ms, ct = it.get("ttft_ms"), it.get("latency_ms"), it.get("ct")
         ttft_s = (ttft_ms / 1000.0) if ttft_ms is not None else None
         tps = decode_tps(ct, latency_ms, ttft_ms)
         _metrics.observe_proxy(
-            row.endpoint_id, row.model, (it.get("upstream") or row.upstream or ""), it["status"],
+            endpoint_id, model, (it.get("upstream") or upstream_fallback or ""), it["status"],
             (latency_ms / 1000.0) if latency_ms is not None else None, ttft_s=ttft_s, tps=tps,
             e2e_tps=e2e_tps(ct, latency_ms), avg_logprob=it.get("avg_logprob"),
         )
@@ -266,6 +343,26 @@ def _insert_serverless(s, items: list[dict]) -> None:
         pass
 
 
+def _insert_proxy(s, items: list[dict]) -> None:
+    """Stage brand-new `proxy_requests` rows for INSERT (see record_proxy_insert).
+    Sync — the caller awaits the batched commit."""
+    from .proxy_api import ProxyRequest
+    s.add_all([
+        ProxyRequest(
+            id=it["id"], endpoint_id=it["endpoint_id"], owner_id=it.get("owner_id"),
+            model=it.get("model"), upstream=it.get("upstream"),
+            status=it.get("status") or "queued", is_stream=bool(it.get("is_stream")),
+            status_code=it.get("status_code"), latency_ms=it.get("latency_ms"),
+            ttft_ms=it.get("ttft_ms"), prompt_tokens=it.get("pt"),
+            completion_tokens=it.get("ct"),
+            error_text=(str(it["error"])[:2048] if it.get("error") else None),
+            created_at=it["created_at"], started_at=it.get("started_at"),
+            completed_at=it.get("completed_at"),
+        )
+        for it in items
+    ])
+
+
 async def _flush(items: list[dict]) -> None:
     if not items or _sessionmaker is None:
         return
@@ -285,11 +382,23 @@ async def _flush(items: list[dict]) -> None:
     sv = {rid: it for (kind, rid), it in merged.items() if kind == "serverless"}
     px = {rid: it for (kind, rid), it in merged.items() if kind == "proxy"}
     ins = {rid: it for (kind, rid), it in merged.items() if kind == "serverless_insert"}
+    pins = {rid: it for (kind, rid), it in merged.items() if kind == "proxy_insert"}
     now = datetime.now(timezone.utc)
+
+    # Metric-only intents (store=False): no row exists, so these never open a session.
+    for it in (v for (kind, _), v in merged.items() if kind == "proxy_metric"):
+        _proxy_metric(it.get("endpoint_id"), it.get("model"), it)
+    if not (sv or px or ins or pins):
+        return
 
     async with _sessionmaker() as s:
         if ins:
             _insert_serverless(s, list(ins.values()))
+        if pins:
+            # Staged BEFORE the proxy update pass: a request admitted and finished
+            # inside one window has both intents here, and the update's SELECT
+            # autoflushes these pending INSERTs so it finds the row it just added.
+            _insert_proxy(s, list(pins.values()))
         if sv:
             rows = (await s.execute(select(ReqRow).where(ReqRow.request_id.in_(list(sv))))).scalars().all()
             for row in rows:
@@ -304,6 +413,11 @@ async def _flush(items: list[dict]) -> None:
                     _apply_proxy(row, px[row.id], now)
                 except Exception:  # noqa: BLE001
                     logger.warning("stats apply failed for proxy req %s", row.id, exc_info=True)
+            # Intents whose row doesn't exist — either the endpoint stores no rows
+            # (PROXY_REQUEST_STORE=off/sampled/errors) or the row was pruned. The
+            # Prometheus observation still has to happen; only the row update is lost.
+            for rid in set(px) - {r.id for r in rows}:
+                _proxy_metric(px[rid].get("endpoint_id"), px[rid].get("model"), px[rid])
         try:
             await s.commit()
         except Exception:  # noqa: BLE001 — drop the batch rather than crash the writer

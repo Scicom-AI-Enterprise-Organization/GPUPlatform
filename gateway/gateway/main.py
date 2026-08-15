@@ -717,6 +717,11 @@ async def lifespan(app: FastAPI):
     from . import stats_writer
     stats_writer.start(session_factory())
 
+    # OTLP tracing for LLM-proxy requests (Tempo/Jaeger). No-op unless
+    # PROXY_TRACING=1; never fails startup. See gateway/tracing.py.
+    from . import tracing
+    tracing.start()
+
     # Warm the global-secret cache so sync credential resolvers (S3 key refs)
     # never see a cold cache before the first async load_global_env runs.
     try:
@@ -920,6 +925,13 @@ async def lifespan(app: FastAPI):
         try:
             from . import stats_writer
             await stats_writer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        # Close + export any spans still open (they end as `unknown` rather than
+        # vanishing, so a restart mid-request is visible in the trace store).
+        try:
+            from . import tracing
+            tracing.shutdown()
         except Exception:  # noqa: BLE001
             pass
         await app.state.redis.aclose()
@@ -5666,6 +5678,17 @@ def run():
         log_level="info",
         reload=reload,
         reload_dirs=[os.path.dirname(__file__)] if reload else None,
+        # log_config=None: do NOT let uvicorn install its own logging config. Its
+        # default one attaches private handlers to `uvicorn`/`uvicorn.access` with
+        # propagate=False, which is how `INFO:     1.2.3.4 - "GET /ready HTTP/1.1" 200 OK`
+        # survived LOG_JSON=1 in prod. With no config of its own, uvicorn's records
+        # propagate to the root logger accesslog.init_root_logging() just set up.
+        log_config=None,
+        # Our metrics_mw logs every request already (route template, duration, bytes,
+        # request id) — uvicorn's access line is a lesser duplicate. LOG_UVICORN_ACCESS=1
+        # brings it back; accesslog._tame_server_loggers holds the same rule for a
+        # gateway started by an external ASGI server.
+        access_log=accesslog.truthy(os.environ.get("LOG_UVICORN_ACCESS", "")),
     )
 
 

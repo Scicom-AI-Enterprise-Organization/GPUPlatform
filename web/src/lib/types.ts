@@ -1918,6 +1918,28 @@ export type ProxyRequest = {
   started_at?: string | null;
   completed_at?: string | null;
   live: boolean;
+  ttft_ms?: number | null;
+  /** Set when the record came from the trace store — links out to the full trace. */
+  trace_id?: string | null;
+  trace_url?: string | null;
+};
+
+/** Which store answered the proxy queue's history query. `db` = Postgres
+ * `proxy_requests` rows; `trace` = the OTLP tracing backend (Tempo/Jaeger), which is
+ * what serves it once PROXY_REQUEST_STORE stops keeping a row per request. */
+export type ProxyHistorySource = "db" | "trace";
+
+export type ProxyRequestFacets = {
+  users: string[];
+  upstreams: string[];
+  /** Absent on older gateways — treat as "db". */
+  source?: ProxyHistorySource;
+  /** Trace mode only: how far back the history query can see, in hours. */
+  window_hours?: number | null;
+  /** The gateway's PROXY_REQUEST_STORE setting (all | sampled | errors | off). */
+  store?: string;
+  /** Whether a trace-UI deep link is configured (TRACE_UI_URL). */
+  trace_ui?: boolean;
 };
 
 export type TestProxyUpstreamBody = {

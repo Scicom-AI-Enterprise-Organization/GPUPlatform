@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Pagination } from "@/components/ui/pagination";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
-import { RED_TEAM_DEFAULT_TYPES, type ProxyEndpoint, type ProxyRequest, type ProxyUpstreamHealth } from "@/lib/types";
+import { RED_TEAM_DEFAULT_TYPES, type ProxyEndpoint, type ProxyHistorySource, type ProxyRequest, type ProxyUpstreamHealth } from "@/lib/types";
 import { BaseUrlToggle, type UrlTarget } from "@/components/console/base-url-toggle";
 import { RoutingPanel } from "../routing-panel";
 import { ProxyPlayground } from "./proxy-playground";
@@ -101,6 +101,13 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
   const orderDir: "asc" | "desc" = sortParam.endsWith("asc") ? "asc" : "desc";
   const [reqIdF, setReqIdF] = useState(searchParams.get("req") ?? ""); // in-progress text
   const [facetUsers, setFacetUsers] = useState<string[]>([]);
+  // Where this endpoint's history is coming from, and any caveat about the answer.
+  // The Queue tab used to be a plain window onto a Postgres table; once the record
+  // moves to the trace store the same table is a TIME-WINDOWED, non-server-sortable
+  // view, and pretending otherwise is how "no requests" gets read as "no traffic".
+  const [histSource, setHistSource] = useState<ProxyHistorySource | null>(null);
+  const [histNote, setHistNote] = useState<string | null>(null);
+  const [histStore, setHistStore] = useState<string | null>(null);
   const setQ = useCallback((updates: Record<string, string | null>) => {
     const params = new URLSearchParams(searchParams.toString());
     for (const [k, v] of Object.entries(updates)) { if (v) params.set(k, v); else params.delete(k); }
@@ -140,7 +147,9 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
         }),
       ]);
       setHealth(h);
-      setReqs(r);
+      setReqs(r.rows);
+      setHistSource(r.source);
+      setHistNote(r.note);
     } catch {
       /* transient */
     }
@@ -154,7 +163,9 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
   // Populate the user-filter dropdown from the full history (once).
   useEffect(() => {
     if (readOnly) return;
-    gateway.getProxyRequestFacets(ep.id).then((f) => setFacetUsers(f.users ?? [])).catch(() => {});
+    gateway.getProxyRequestFacets(ep.id)
+      .then((f) => { setFacetUsers(f.users ?? []); setHistStore(f.store ?? null); })
+      .catch(() => {});
   }, [ep.id, readOnly]);
   // Back to page 1 whenever a filter/sort changes (the result set shifts under the page).
   useEffect(() => { setPage(1); }, [filter, ownerF, upstreamF, sortBy, orderDir, reqIdQuery]);
@@ -493,6 +504,21 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
             </div>
           </div>
 
+          {/* Where the history comes from + what bounds it. Only rendered once the
+              first poll has answered, so it never flashes a wrong claim. */}
+          {histSource && (
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <span className={cn("rounded px-1.5 py-0.5 font-medium",
+                histSource === "trace" ? "bg-status-init/15 text-status-init" : "bg-muted")}>
+                {histSource === "trace" ? "history: traces" : "history: database"}
+              </span>
+              {histNote && <span>{histNote}</span>}
+              {histSource === "db" && histStore && histStore !== "all" && (
+                <span>PROXY_REQUEST_STORE={histStore} — this table holds only part of the history</span>
+              )}
+            </div>
+          )}
+
           {/* Server-side filters/sort over the full retained history */}
           <div className="flex flex-wrap items-center gap-2">
             <Select value={ownerF || "__all"} onValueChange={(v) => setQ({ user: v === "__all" ? null : v })}>
@@ -600,6 +626,13 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                     <td className="px-3 py-2">
                       {r.live && (r.status === "queued" || r.status === "running") && (
                         <Button variant="ghost" size="xs" className="text-destructive hover:text-destructive" onClick={() => onCancel(r.id)}>Cancel</Button>
+                      )}
+                      {/* Only rendered when the gateway has a trace-UI base configured
+                          (TRACE_UI_URL) — a link to a Grafana nobody runs is worse than none. */}
+                      {r.trace_url && (
+                        <a href={r.trace_url} target="_blank" rel="noreferrer"
+                           className="text-xs text-muted-foreground hover:text-primary"
+                           title="Open this request's full trace">trace</a>
                       )}
                     </td>
                   </tr>

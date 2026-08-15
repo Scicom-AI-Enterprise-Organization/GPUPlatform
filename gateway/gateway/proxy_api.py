@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -51,6 +52,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from . import audit
 from . import crypto
 from . import proxy_cluster
+from . import trace_store
+from . import tracing
 from .auth import current_user, require_admin
 from .db import Base, Dataset, User, get_session, get_user_by_username, session_factory
 from .global_env_api import load_global_env
@@ -65,6 +68,38 @@ HEALTH_TTL_S = 120                 # a probe older than this is "stale/unknown"
 # 0 (default) = keep proxy request history INDEFINITELY (no prune). Set
 # PROXY_REQUEST_RETENTION_DAYS=N to prune rows older than N days.
 REQUEST_RETENTION_DAYS = int(os.environ.get("PROXY_REQUEST_RETENTION_DAYS", "0") or "0")
+
+# ---------- where a proxied request's RECORD lives --------------------------
+# `proxy_requests` is one row per proxied request, and this is the high-throughput
+# data plane (synthetic-data generation, agent fleets). Postgres is the wrong engine
+# for an append-only event stream at that rate, so the record can move to a tracing
+# backend (see `tracing.py` — Tempo/Jaeger over OTLP) and Postgres can be told to
+# hold less of it, or none:
+#   all     (default) — a row per request, exactly as before. Nothing changes.
+#   sampled           — a deterministic PROXY_REQUEST_STORE_RATIO of requests get a row.
+#   errors            — a row ONLY for requests that failed / were blocked / 4xx-5xx.
+#                       Written once, at the end, instead of insert-then-update.
+#   off               — no rows at all. Traces + Prometheus are the record.
+# ⚠ In every mode but `all`, in-flight requests are served to the Queue tab from the
+# live registry (see `_live_records`), not from the table — a queued request has no
+# row yet in `errors`/`off`, and no span yet either (a span lands when it ENDS).
+REQUEST_STORE = (os.environ.get("PROXY_REQUEST_STORE", "all") or "all").strip().lower()
+if REQUEST_STORE not in ("all", "sampled", "errors", "off"):
+    logger.warning("PROXY_REQUEST_STORE=%r is not one of all|sampled|errors|off — "
+                   "falling back to 'all'", REQUEST_STORE)
+    REQUEST_STORE = "all"
+REQUEST_STORE_RATIO = float(os.environ.get("PROXY_REQUEST_STORE_RATIO", "0.05") or "0.05")
+# Terminal states that `errors` mode persists. `cancelled` is included: a caller
+# hanging up mid-stream is exactly the thing someone comes to the Queue tab to
+# investigate, and it is rare enough not to be a volume concern.
+_STORE_ERROR_STATUSES = frozenset({"failed", "cancelled", "blocked", "unknown"})
+
+# request_id -> admission facts, for the code that runs at TERMINAL time and can no
+# longer reach the request's context: the Prometheus labels (endpoint/model), the
+# deferred insert in `errors` mode, and the Queue tab's live overlay. Popped by
+# `_finish`; leaks are reaped by the health loop (`_sweep_admitted`).
+_ADMITTED: dict[str, dict] = {}
+_ADMITTED_MAX = int(os.environ.get("PROXY_ADMITTED_MAX", "50000") or "50000")
 DEFAULT_TIMEOUT_S = 3600.0
 # Statuses BELOW 500 that also move a request to the next upstream. (>= 500 always does.)
 # These are the three OpenRouter documents as TRANSIENT — the backend is up, it just can't
@@ -369,6 +404,10 @@ class ProxyRequestRecord(BaseModel):
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     live: bool = False
+    ttft_ms: Optional[int] = None
+    # Set only when the record came from (or was matched in) the trace store.
+    trace_id: Optional[str] = None
+    trace_url: Optional[str] = None
 
 
 class TestUpstreamRequest(BaseModel):
@@ -991,15 +1030,21 @@ def _select_candidates(app, endpoint_id: str, cfg: dict, alias: str,
 # ---------- DB record updates (own session, safe from disconnect path) -------
 
 async def _set_started(request_id: str, upstream: Optional[str] = None) -> None:
-    async with session_factory()() as s:
-        row = await s.get(ProxyRequest, request_id)
-        if row is None:
-            return
-        row.status = "running"
-        row.started_at = datetime.now(timezone.utc)
+    """The request left the queue and is being forwarded.
+
+    Was an inline `SELECT … ; UPDATE … SET status='running'` on its own pooled
+    session — the second of three synchronous DB round-trips per proxied request,
+    and one that ran while the caller waited. Now an enqueued intent (batched, and a
+    no-op when no row exists) plus a span event."""
+    from . import stats_writer
+    rec = _ADMITTED.get(request_id)
+    if rec is not None:
+        rec.setdefault("started_at", datetime.now(timezone.utc))
         if upstream:
-            row.upstream = upstream
-        await s.commit()
+            rec["upstream"] = upstream
+    if rec is None or rec.get("stored"):
+        stats_writer.record_proxy_start(request_id, upstream=upstream)
+    tracing.mark_started(request_id, upstream)
 
 
 async def _finish(request_id: str, status: str, *, status_code: Optional[int] = None,
@@ -1012,12 +1057,44 @@ async def _finish(request_id: str, status: str, *, status_code: Optional[int] = 
     writer rather than committed inline: opening a pooled connection per completion
     exhausted the DB pool under load and wedged the gateway. Still `async def` so every
     existing `await _finish(...)` / `create_task(_finish(...))` call site is unchanged;
-    the DB write + metric now happen in the writer's batched flush (parity preserved)."""
+    the DB write + metric now happen in the writer's batched flush (parity preserved).
+
+    This is also the single funnel where the request's OTLP span is closed and where
+    `PROXY_REQUEST_STORE` decides whether Postgres hears about it at all — putting
+    both here is what keeps the trace and the row from ever describing the request
+    differently."""
     from . import stats_writer
+    rec = _ADMITTED.pop(request_id, None)
+    endpoint_id = (rec or {}).get("endpoint_id")
+    model = (rec or {}).get("model")
+    tracing.end_request(request_id, status, status_code=status_code, latency_ms=latency_ms,
+                        ttft_ms=ttft_ms, pt=pt, ct=ct, error=error,
+                        upstream=upstream or (rec or {}).get("upstream"), avg_logprob=avg_logprob)
+    # A row was written at admission → update it (the classic path).
+    if rec is None or rec.get("stored"):
+        stats_writer.record_proxy_finish(
+            request_id, status, status_code=status_code, latency_ms=latency_ms,
+            pt=pt, ct=ct, error=error, upstream=upstream, ttft_ms=ttft_ms,
+            avg_logprob=avg_logprob, endpoint_id=endpoint_id, model=model,
+        )
+        return
+    # No row exists. `errors` mode writes one now, complete, iff this went wrong —
+    # one INSERT for the requests worth keeping instead of insert+update for all of
+    # them. The metric is enqueued separately (store=False) so it fires either way.
+    if REQUEST_STORE == "errors" and (status in _STORE_ERROR_STATUSES
+                                      or (status_code is not None and status_code >= 400)):
+        now = datetime.now(timezone.utc)
+        stats_writer.record_proxy_insert(
+            request_id, rec["endpoint_id"], rec.get("owner_id"), rec.get("model"),
+            is_stream=bool(rec.get("is_stream")), created_at=rec["created_at"],
+            status=status, started_at=rec.get("started_at"), completed_at=now,
+            status_code=status_code, latency_ms=latency_ms, ttft_ms=ttft_ms,
+            pt=pt, ct=ct, error=error, upstream=upstream or rec.get("upstream"),
+        )
     stats_writer.record_proxy_finish(
         request_id, status, status_code=status_code, latency_ms=latency_ms,
         pt=pt, ct=ct, error=error, upstream=upstream, ttft_ms=ttft_ms,
-        avg_logprob=avg_logprob,
+        avg_logprob=avg_logprob, endpoint_id=endpoint_id, model=model, store=False,
     )
 
 
@@ -1543,23 +1620,89 @@ async def _resolve_speech_route(app, endpoint_name: str, alias: str, force: Opti
     return endpoint_id, candidates, timeout_s, max_conc, stt, capture
 
 
-async def _insert_request_row(request_id, endpoint_id, user, alias, is_stream) -> None:
-    async with session_factory()() as s:
-        s.add(ProxyRequest(
-            id=request_id, endpoint_id=endpoint_id, owner_id=getattr(user, "id", None),
-            model=alias, status="queued", is_stream=is_stream,
-            created_at=datetime.now(timezone.utc),
-        ))
-        await s.commit()
+def _store_row(request_id: str) -> bool:
+    """Should THIS request get a `proxy_requests` row at admission? Deterministic in
+    the request id so the sampled subset is stable across replicas and across the
+    admission/terminal pair (a request must not be sampled IN at admission and OUT
+    at completion — that leaves a permanently `queued` row)."""
+    if REQUEST_STORE == "all":
+        return True
+    if REQUEST_STORE != "sampled":
+        return False        # errors → written at _finish; off → never
+    if REQUEST_STORE_RATIO >= 1.0:
+        return True
+    if REQUEST_STORE_RATIO <= 0.0:
+        return False
+    return (int(hashlib.blake2b(request_id.encode(), digest_size=8).hexdigest(), 16)
+            / float(1 << 64)) < REQUEST_STORE_RATIO
+
+
+async def _admit_request(request_id, endpoint_id, user, alias, is_stream,
+                         request: Optional[Request] = None,
+                         endpoint_name: Optional[str] = None) -> None:
+    """Register a newly-admitted proxied request: remember the facts `_finish` will
+    need, open its span, and (depending on `PROXY_REQUEST_STORE`) enqueue the row.
+
+    ⚠ Formerly `_insert_request_row`, which INSERTed + COMMITted inline — a pooled
+    connection checked out and a round-trip paid before the upstream call even
+    started, on every single proxied request. Nothing here touches the database
+    synchronously any more: the row (when there is one) goes through the batch
+    writer, the same treatment `_finish` already had.
+
+    `request` is used for two read-only things: the endpoint's NAME (nicer than its id
+    on a trace) and the caller's headers — a client that traces its own work sends
+    `traceparent`, and honouring it makes this span a child of theirs instead of an
+    orphan."""
+    now = datetime.now(timezone.utc)
+    if request is not None:
+        endpoint_name = endpoint_name or (request.path_params or {}).get("endpoint")
+    rec = {
+        "endpoint_id": endpoint_id, "endpoint_name": endpoint_name,
+        "owner_id": getattr(user, "id", None), "owner": getattr(user, "username", None),
+        "model": alias, "is_stream": bool(is_stream), "created_at": now, "t": time.time(),
+        "stored": _store_row(request_id),
+    }
+    if len(_ADMITTED) < _ADMITTED_MAX:
+        _ADMITTED[request_id] = rec
+    else:  # pathological leak — keep serving, but say so (the sweeper runs on the health loop)
+        logger.warning("proxy: %d admitted requests tracked (max) — not tracking %s",
+                       len(_ADMITTED), request_id)
+    if rec["stored"]:
+        from . import stats_writer
+        stats_writer.record_proxy_insert(
+            request_id, endpoint_id, rec["owner_id"], alias,
+            is_stream=bool(is_stream), created_at=now, status="queued",
+        )
+    tracing.start_request(
+        request_id, endpoint_id=endpoint_id, endpoint_name=endpoint_name, model=alias,
+        owner=rec["owner"], owner_id=rec["owner_id"], is_stream=bool(is_stream),
+        headers=(dict(request.headers) if request is not None and tracing.enabled() else None),
+        created_at=rec["t"],
+    )
+
+
+def _sweep_admitted(max_age_s: float = 7200.0) -> int:
+    """Drop admission records whose request never reached `_finish` (handler killed
+    mid-flight). Without this the dict is a slow leak; `tracing.sweep` does the same
+    for the matching spans. Called from the proxy health loop."""
+    cutoff = time.time() - max_age_s
+    stale = [rid for rid, r in list(_ADMITTED.items()) if r.get("t", 0) < cutoff]
+    for rid in stale:
+        _ADMITTED.pop(rid, None)
+    if stale:
+        logger.warning("proxy: reaped %d admitted request record(s) with no terminal state",
+                       len(stale))
+    return len(stale)
 
 
 async def _prepare(app, endpoint_name: str, alias: str, user: User, is_stream: bool,
-                   force: Optional[str] = None):
-    """Resolve routing (via _route) + record a queued ProxyRequest. Returns
+                   force: Optional[str] = None, request: Optional[Request] = None):
+    """Resolve routing (via _route) + admit the request (span + optional row). Returns
     (endpoint_id, candidates, timeout_s, max_conc, request_id, red_team)."""
     request_id = f"pxr-{_secrets.token_hex(8)}"
     endpoint_id, candidates, timeout_s, max_conc, red_team = await _route(app, endpoint_name, alias, force)
-    await _insert_request_row(request_id, endpoint_id, user, alias, is_stream)
+    await _admit_request(request_id, endpoint_id, user, alias, is_stream,
+                         request=request, endpoint_name=endpoint_name)
     return endpoint_id, candidates, timeout_s, max_conc, request_id, red_team
 
 
@@ -1582,7 +1725,7 @@ async def _handle(request: Request, user: User, endpoint_name: str, payload: dic
     alias = alias.strip()
     is_stream = bool(payload.get("stream"))
     endpoint_id, candidates, timeout_s, max_conc, request_id, red_team = await _prepare(
-        app, endpoint_name, alias, user, is_stream, force=_forced_upstream(request))
+        app, endpoint_name, alias, user, is_stream, force=_forced_upstream(request), request=request)
     rt_task = None
     if red_team and upstream_path in _RT_GUARDED_PATHS:
         blocked, rt_task = await _red_team_gate(app, endpoint_name, endpoint_id, request_id, red_team,
@@ -1815,7 +1958,7 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
     candidate by construction); this also surfaces a non-2xx upstream (e.g. nginx 413) with
     its REAL status instead of masking it inside a 200 SSE envelope."""
     request_id = f"pxr-{_secrets.token_hex(8)}"
-    await _insert_request_row(request_id, endpoint_id, user, alias, is_stream_hint)
+    await _admit_request(request_id, endpoint_id, user, alias, is_stream_hint, request=request)
     gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream_hint)
@@ -1998,7 +2141,8 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
         raise HTTPException(status_code=400, detail={"error": "invalid JSON body"})
     is_stream = bool(payload.get("stream"))
     request_id = f"pxr-{_secrets.token_hex(8)}"
-    await _insert_request_row(request_id, endpoint_id, user, alias, is_stream)
+    await _admit_request(request_id, endpoint_id, user, alias, is_stream,
+                         request=request, endpoint_name=endpoint_name)
     rt_task = None
     if rt_active is not None:
         blocked, rt_task = await _red_team_gate(app, endpoint_name, endpoint_id, request_id, rt_active,
@@ -3118,7 +3262,8 @@ async def _handle_speech(request: Request, user: User, endpoint_name: str) -> Re
     request_id = f"pxr-{_secrets.token_hex(8)}"
     ev = {"stt": stt, "input": input_text, "voice": voice, "capture": capture,
           "request_id": request_id, "sample_id": _trace_sample_id(request, request_id)}
-    await _insert_request_row(request_id, endpoint_id, user, alias, is_stream)
+    await _admit_request(request_id, endpoint_id, user, alias, is_stream,
+                         request=request, endpoint_name=endpoint_name)
     gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream)
@@ -3184,7 +3329,7 @@ async def _stream_audio(app, request, user, endpoint_id, candidates, alias, upst
     JSON — mirroring `_forward_passthrough`. Failover only before the first byte. Gate /
     cancel / TTFT / logprob-sniff / `_finish` match the JSON streaming path."""
     request_id = f"pxr-{_secrets.token_hex(8)}"
-    await _insert_request_row(request_id, endpoint_id, user, alias, True)
+    await _admit_request(request_id, endpoint_id, user, alias, True, request=request)
     gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, True)
@@ -3365,7 +3510,7 @@ async def _handle_audio(request: Request, user: User, endpoint_name: str, upstre
         endpoint_id, candidates, timeout_s, max_conc, _rt = await _route(app, endpoint_name, alias, force)
         return await _stream_audio(app, request, user, endpoint_id, candidates, alias, upstream_path,
                                    file_name, file_bytes, content_type, extra, timeout_s, max_conc)
-    endpoint_id, candidates, timeout_s, max_conc, request_id, _rt = await _prepare(app, endpoint_name, alias, user, False, force=force)
+    endpoint_id, candidates, timeout_s, max_conc, request_id, _rt = await _prepare(app, endpoint_name, alias, user, False, force=force, request=request)
     # Low-logprob sample capture (best-effort) — skipped for a TTS proxy's own round-trip
     # transcription so it doesn't double-capture the same audio as an STT sample.
     capture = None if request.headers.get("x-sgpu-tts-eval") else await _resolve_capture_cfg(endpoint_name)
@@ -3920,14 +4065,111 @@ async def proxy_health(proxy_id: str, request: Request, user: User = Depends(req
     return out
 
 
+def _history_source() -> str:
+    """Which store answers the Queue tab: `db` (Postgres rows) or `trace` (Tempo).
+
+    `auto` (the default) picks `trace` exactly when Postgres is no longer being asked
+    to hold every request — i.e. any `PROXY_REQUEST_STORE` other than `all` — and the
+    trace store is configured. That way flipping the storage mode doesn't ALSO require
+    remembering to flip the read path, which is how a Queue tab ends up mysteriously
+    empty in prod."""
+    pref = (os.environ.get("PROXY_HISTORY_SOURCE", "auto") or "auto").strip().lower()
+    if pref == "trace":
+        return "trace" if trace_store.enabled() else "db"
+    if pref == "db":
+        return "db"
+    return "trace" if (REQUEST_STORE != "all" and trace_store.enabled()) else "db"
+
+
+async def _live_records(app, proxy_id: str) -> list[dict]:
+    """In-flight requests (queued/running) as record dicts, from the live registry.
+
+    ⚠ Load-bearing in every mode except `PROXY_REQUEST_STORE=all`: a queued request has
+    no row (nothing is written until it finishes) AND no span (a span is exported when
+    it ENDS), so without this overlay the Queue tab would show an empty queue while
+    requests were actively waiting — precisely when someone is looking at it."""
+    out: dict[str, dict] = {}
+    for rid, v in list(_live(app).items()):
+        if v.get("endpoint_id") != proxy_id:
+            continue
+        created = v.get("created_at") or time.time()
+        out[rid] = {
+            "id": rid, "endpoint_id": proxy_id, "owner": v.get("owner"),
+            "model": v.get("model"), "upstream": v.get("upstream"),
+            "status": "running" if v.get("state") == "running" else "queued",
+            "is_stream": bool(v.get("is_stream")), "status_code": None,
+            "latency_ms": None, "ttft_ms": None, "prompt_tokens": None,
+            "completion_tokens": None, "error_text": None,
+            "created_at": datetime.fromtimestamp(created, tz=timezone.utc).isoformat(),
+            "started_at": None, "completed_at": None, "live": True,
+            "trace_id": tracing.trace_id(rid), "trace_url": None,
+        }
+    if proxy_cluster.enabled():
+        # Requests in flight on ANOTHER replica: the registry carries the same fields.
+        try:
+            for r in await proxy_cluster.live_list_endpoint(app.state.redis, proxy_id):
+                rid = r.get("id")
+                if not rid or rid in out:
+                    continue
+                created = float(r.get("created_at") or time.time())
+                out[rid] = {
+                    "id": rid, "endpoint_id": proxy_id, "owner": r.get("owner"),
+                    "model": r.get("model"), "upstream": r.get("upstream"),
+                    "status": "running" if r.get("state") == "running" else "queued",
+                    "is_stream": bool(r.get("is_stream")), "status_code": None,
+                    "latency_ms": None, "ttft_ms": None, "prompt_tokens": None,
+                    "completion_tokens": None, "error_text": None,
+                    "created_at": datetime.fromtimestamp(created, tz=timezone.utc).isoformat(),
+                    "started_at": None, "completed_at": None, "live": True,
+                    "trace_id": None, "trace_url": None,
+                }
+        except Exception:  # noqa: BLE001 — a Redis blip degrades the overlay, not the page
+            logger.debug("live overlay: cluster registry unavailable", exc_info=True)
+    return list(out.values())
+
+
+def _hdr(value: str) -> str:
+    """ASCII-safe header value. HTTP headers are latin-1, and Starlette raises on
+    anything outside it — an em-dash in a human-readable note 500'd the whole
+    endpoint (found in the e2e run). Notes are prose, so sanitize rather than trust."""
+    return value.encode("ascii", "replace").decode("ascii")
+
+
+def _matches_filters(rec: dict, owner: Optional[str], upstream: Optional[str],
+                     status: Optional[str], request_id: Optional[str]) -> bool:
+    """Apply the Queue tab's filters to an overlaid live record. The stored/traced
+    rows are filtered by the backend; these are filtered here so both halves of the
+    list obey the same query."""
+    if request_id and rec.get("id") != request_id:
+        return False
+    if owner and rec.get("owner") != owner:
+        return False
+    if upstream and rec.get("upstream") != upstream:
+        return False
+    if status and rec.get("status") != status:
+        return False
+    return True
+
+
 @router.get("/{proxy_id}/request-facets")
 async def proxy_request_facets(proxy_id: str, user: User = Depends(require_admin),  # noqa: ARG001
                                session: AsyncSession = Depends(get_session)):
     """Distinct users + upstreams seen on this endpoint — to populate the queue
-    tab's filter dropdowns (server-side, so it covers the full history)."""
+    tab's filter dropdowns (server-side, so it covers the full history).
+
+    Also reports WHERE the history is being read from (`source`) and the window it
+    covers, because those change what the tab can honestly show: the trace store is
+    time-windowed and cannot sort or page like SQL. The Queue tab renders this."""
     row = await session.get(ProxyEndpoint, proxy_id)
     if row is None:
         raise HTTPException(status_code=404, detail="proxy endpoint not found")
+    upstreams = sorted({u.get("name") for u in (row.config or {}).get("upstreams", []) if u.get("name")})
+    source = _history_source()
+    if source == "trace":
+        users = await trace_store.facet_users(proxy_id)
+        return {"users": users, "upstreams": upstreams, "source": "trace",
+                "window_hours": trace_store.WINDOW_H, "store": REQUEST_STORE,
+                "trace_ui": bool(os.environ.get("TRACE_UI_URL"))}
     oids = [o for o in (await session.execute(
         select(ProxyRequest.owner_id).where(ProxyRequest.endpoint_id == proxy_id).distinct()
     )).scalars().all() if o is not None]
@@ -3935,20 +4177,63 @@ async def proxy_request_facets(proxy_id: str, user: User = Depends(require_admin
     if oids:
         users = sorted(u.username for u in (await session.execute(
             select(User).where(User.id.in_(oids)))).scalars().all())
-    upstreams = sorted({u.get("name") for u in (row.config or {}).get("upstreams", []) if u.get("name")})
-    return {"users": users, "upstreams": upstreams}
+    return {"users": users, "upstreams": upstreams, "source": "db",
+            "window_hours": None, "store": REQUEST_STORE,
+            "trace_ui": bool(os.environ.get("TRACE_UI_URL"))}
 
 
 @router.get("/{proxy_id}/requests", response_model=list[ProxyRequestRecord])
 async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offset: int = 0,
                          owner: Optional[str] = None, upstream: Optional[str] = None,
                          status: Optional[str] = None, sort: str = "created", order: str = "desc",
-                         request_id: Optional[str] = None,
+                         request_id: Optional[str] = None, source: Optional[str] = None,
+                         since_hours: Optional[float] = None,
+                         response: Response = None,  # type: ignore[assignment]
                          user: User = Depends(require_admin),  # noqa: ARG001
                          session: AsyncSession = Depends(get_session)):
+    """One page of this endpoint's request history.
+
+    Served from Postgres or from the trace store (see `_history_source`; `?source=`
+    overrides for one call). Either way, in-flight requests are overlaid from the live
+    registry — they exist in neither store yet. The chosen source and any caveat about
+    the answer ride back as `X-SGPU-History-Source` / `X-SGPU-History-Note` (response headers
+    keep the list shape unchanged for existing clients)."""
     row = await session.get(ProxyEndpoint, proxy_id)
     if row is None:
         raise HTTPException(status_code=404, detail="proxy endpoint not found")
+    src = (source or "").strip().lower() or _history_source()
+    if src == "trace" and not trace_store.enabled():
+        raise HTTPException(status_code=400, detail={
+            "error": "source=trace requested but no trace store is configured (set TEMPO_URL)"})
+    live_overlay = ([r for r in await _live_records(request.app, proxy_id)
+                     if _matches_filters(r, owner, upstream, status, request_id)]
+                    if offset <= 0 else [])
+    if src == "trace":
+        try:
+            traced, note = await trace_store.search_requests(
+                proxy_id, owner=owner, upstream=upstream, status=status,
+                request_id=request_id, limit=min(limit, 200), offset=max(0, offset),
+                sort=sort, order=order, since_hours=since_hours)
+        except trace_store.TraceStoreError as e:
+            # Deliberately a 502, not an empty list: "no requests" and "the trace
+            # backend is down" must never look the same in a monitoring UI.
+            raise HTTPException(status_code=502, detail={"error": str(e)}) from e
+        if response is not None:
+            response.headers["X-SGPU-History-Source"] = "trace"
+            if note:
+                response.headers["X-SGPU-History-Note"] = _hdr(note)
+        live_ids = {r["id"] for r in live_overlay}
+        merged = live_overlay + [r for r in traced if r["id"] not in live_ids]
+        return [
+            ProxyRequestRecord(**{**r, "trace_url": trace_store.trace_ui_url(r.get("trace_id"))})
+            for r in merged[:max(1, limit)]
+        ]
+    if response is not None:
+        response.headers["X-SGPU-History-Source"] = "db"
+        if REQUEST_STORE != "all":
+            response.headers["X-SGPU-History-Note"] = _hdr(
+                f"PROXY_REQUEST_STORE={REQUEST_STORE}: Postgres holds only part of this "
+                f"endpoint's history; the full record is in the trace store")
     live = _live(request.app)
     live_ids = {rid for rid, v in live.items() if v.get("endpoint_id") == proxy_id}
     if proxy_cluster.enabled():
@@ -3983,11 +4268,12 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offse
     if owner_ids:
         for u in (await session.execute(select(User).where(User.id.in_(owner_ids)))).scalars().all():
             owners[u.id] = u.username
-    return [
+    stored = [
         ProxyRequestRecord(
             id=r.id, endpoint_id=r.endpoint_id, owner=owners.get(r.owner_id) if r.owner_id is not None else None,
             model=r.model, upstream=r.upstream, status=r.status,
             is_stream=r.is_stream, status_code=r.status_code, latency_ms=r.latency_ms,
+            ttft_ms=r.ttft_ms,
             prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens, error_text=r.error_text,
             created_at=r.created_at.isoformat() if r.created_at else "",
             started_at=r.started_at.isoformat() if r.started_at else None,
@@ -3996,6 +4282,13 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offse
         )
         for r in rows
     ]
+    if REQUEST_STORE == "all":
+        return stored          # every request has a row; the overlay would only duplicate
+    # Partial storage: an in-flight request may have no row yet. Overlay it, exactly
+    # as the trace branch does, so "what is queued right now" is answerable in every mode.
+    have = {r.id for r in stored}
+    extra = [ProxyRequestRecord(**r) for r in live_overlay if r["id"] not in have]
+    return (extra + stored)[:max(1, limit)]
 
 
 @router.post("/{proxy_id}/requests/{req_id}/cancel")
@@ -4682,6 +4975,10 @@ async def proxy_health_loop(app) -> None:
                     cutoff = datetime.now(timezone.utc) - timedelta(days=REQUEST_RETENTION_DAYS)
                     await s.execute(delete(ProxyRequest).where(ProxyRequest.created_at < cutoff))
                 await s.commit()
+            # Reap per-request state whose owner died before `_finish` (both maps, so
+            # a leak can't grow in one of them unnoticed).
+            _sweep_admitted()
+            tracing.sweep()
             cli = _http(app)
             for endpoint_id, u, key in targets:
                 await _probe(app, cli, endpoint_id, u, key)

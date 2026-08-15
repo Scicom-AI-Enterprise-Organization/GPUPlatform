@@ -44,6 +44,13 @@ dependencies = [
     # NO torch (tokenization only), so it doesn't pull a GPU stack onto the gateway.
     "transformers>=4.45",
     "jinja2>=3.1",
+    # OTLP tracing for LLM-proxy requests (gateway/tracing.py → Tempo/Jaeger). The
+    # http/protobuf exporter is the default because it needs no grpcio wheel; set
+    # OTEL_EXPORTER_OTLP_PROTOCOL=grpc only if you also install
+    # opentelemetry-exporter-otlp-proto-grpc. Imported lazily and behind PROXY_TRACING=1,
+    # so a venv that predates this line still boots (tracing just stays off).
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
     # llm-benchmaq is the CLI we shell out to for benchmark runs. Public repo;
     # pulls in paramiko/scp/etc. Tracks @main so benchmaq fixes (e.g. hf download
     # for huggingface_hub>=1.0 / Gemma 4) ship on the next gateway image build.

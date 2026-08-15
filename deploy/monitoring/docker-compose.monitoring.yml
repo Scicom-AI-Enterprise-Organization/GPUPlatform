@@ -73,6 +73,28 @@ services:
     depends_on: [loki]
     networks: [monitoring]
 
+  # Distributed tracing store for LLM-proxy requests. The gateway exports one span
+  # per proxied request over OTLP (PROXY_TRACING=1) and — when the Queue tab is
+  # reading from traces (PROXY_HISTORY_SOURCE=trace / PROXY_REQUEST_STORE≠all) —
+  # queries it back through :3200. This is what lets `proxy_requests` stop being a
+  # row per request in Postgres.
+  tempo:
+    image: grafana/tempo:2.6.1
+    restart: unless-stopped
+    command: -config.file=/etc/tempo/tempo-config.yml
+    volumes:
+      - ./tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
+      - tempodata:/var/tempo
+    ports:
+      # ⚠ Host ports are overridable, and OTLP/HTTP defaults to 4418 rather than the
+      # standard 4318 ON PURPOSE: 4318 is already squatted on this laptop (same class
+      # of collision as :8080/:3000). Inside the compose network Tempo still listens on
+      # the standard ports — only the host mapping moves.
+      - "${TEMPO_QUERY_PORT:-3200}:3200"        # query API → TEMPO_URL=http://localhost:3200
+      - "${TEMPO_OTLP_HTTP_PORT:-4418}:4318"    # OTLP/HTTP → OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4418
+      - "${TEMPO_OTLP_GRPC_PORT:-4317}:4317"    # OTLP/gRPC
+    networks: [monitoring]
+
   grafana:
     image: grafana/grafana:11.3.0
     restart: unless-stopped
@@ -87,7 +109,7 @@ services:
       # The dashboard JSONs live in deploy/grafana (shared with the helm chart).
       - ../grafana:/var/lib/grafana/dashboards:ro
       - grafanadata:/var/lib/grafana
-    depends_on: [prometheus, loki]
+    depends_on: [prometheus, loki, tempo]
     networks: [monitoring]
 
 networks:
@@ -97,6 +119,7 @@ networks:
 volumes:
   promdata:
   lokidata:
+  tempodata:
   promtailpos:
   grafanadata:
   alertmanagerdata:
