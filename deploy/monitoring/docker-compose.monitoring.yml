@@ -19,6 +19,14 @@
 #
 # Grafana:    http://localhost:3001  (admin / admin on first boot)
 # Prometheus: http://localhost:9091
+# ⚠ Explicit project name. Compose otherwise derives it from the parent DIRECTORY
+# ("monitoring"), which this file shares with SlurmUI's stack
+# (~/Documents/SlurmUI/monitoring/docker-compose.monitoring.yml) — so a plain
+# `docker compose -f deploy/monitoring/... up|down` here silently adopted and could
+# tear down THAT stack's Prometheus/Loki/Grafana. Same class of collision as the
+# :8080/:3000 host-port ones.
+name: gpuplatform-monitoring
+
 services:
   prometheus:
     image: prom/prometheus:v2.55.1

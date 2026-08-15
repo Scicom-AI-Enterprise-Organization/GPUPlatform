@@ -1101,7 +1101,8 @@ async def _finish(request_id: str, status: str, *, status_code: Optional[int] = 
 # ---------- forwarding engine ------------------------------------------------
 
 async def _do_unary(app, endpoint_id: str, candidates: list[dict], alias: str,
-                    payload: dict, upstream_path: str, timeout_s: float) -> dict:
+                    payload: dict, upstream_path: str, timeout_s: float,
+                    request_id: Optional[str] = None) -> dict:
     """Try candidates in order; failover on connect error / 5xx. Returns the
     upstream's JSON + status. Raises HTTPException(502) if all fail."""
     cli = _http(app)
@@ -1112,19 +1113,32 @@ async def _do_unary(app, endpoint_id: str, candidates: list[dict], alias: str,
         if u.get("_key"):
             headers["Authorization"] = f"Bearer {u['_key']}"
         url = u["base_url"].rstrip("/") + upstream_path
+        # One span per ATTEMPT — that is what makes failover legible in the trace
+        # (N sibling spans, the failed ones marked) instead of a single attribute
+        # naming whichever upstream happened to answer.
+        ch = tracing.start_child(request_id, f"upstream {u['name']}", kind="client", attrs={
+            "sgpu.upstream": u["name"], "url.full": url, "http.request.method": "POST",
+            "sgpu.model.upstream": u["models"][alias],
+        })
         t0 = time.perf_counter()
         try:
             r = await cli.post(url, json=body, headers=headers,
                                timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError) as e:
             _mark_health(app, endpoint_id, u["id"], False, error=str(e))
+            tracing.end_child(ch, error=f"{type(e).__name__}: {e}",
+                              attrs={"sgpu.failover": True})
             last_err = f"{u['name']}: {type(e).__name__}"
             continue
         lat = int((time.perf_counter() - t0) * 1000)
         if _should_failover(u, r.status_code):
             _mark_after_failover(app, endpoint_id, u, r.status_code, lat)
+            tracing.end_child(ch, error=f"HTTP {r.status_code}",
+                              attrs={"http.response.status_code": r.status_code,
+                                     "sgpu.failover": True})
             last_err = f"{u['name']}: HTTP {r.status_code}"
             continue
+        tracing.end_child(ch, attrs={"http.response.status_code": r.status_code})
         _mark_health(app, endpoint_id, u["id"], True, latency_ms=lat)
         try:
             data = r.json()
@@ -1333,7 +1347,12 @@ async def _unary(app, request: Request, request_id: str, forward,
         token = None
         try:
             if gate is not None:
-                token = await gate.acquire(cancel_ev, live.get(request_id))
+                qch = tracing.start_child(request_id, "queue",
+                                          attrs={"sgpu.gate.limit": getattr(gate, "max_conc", None)})
+                try:
+                    token = await gate.acquire(cancel_ev, live.get(request_id))
+                finally:
+                    tracing.end_child(qch)
             if cancel_ev.is_set():
                 raise asyncio.CancelledError()
             if request_id in live:
@@ -1413,8 +1432,15 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
     finished = False
     try:
         if gate is not None:
-            token = await gate.acquire(cancel_ev, live.get(request_id))
-            gate_held = True
+            # Only when the endpoint HAS a cap — with no gate there is no queue, and a
+            # zero-duration "queue" span on every request would be pure noise.
+            qch = tracing.start_child(request_id, "queue", attrs={
+                "sgpu.gate.limit": getattr(gate, "max_conc", None)})
+            try:
+                token = await gate.acquire(cancel_ev, live.get(request_id))
+                gate_held = True
+            finally:
+                tracing.end_child(qch)
         if cancel_ev.is_set():
             return
         if request_id in live:
@@ -1430,12 +1456,21 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
             if u.get("_key"):
                 headers["Authorization"] = f"Bearer {u['_key']}"
             url = u["base_url"].rstrip("/") + upstream_path
+            # Covers connect → headers → the whole relay, so the waterfall shows where
+            # the time actually went on a stream (and each failover attempt separately).
+            ch = tracing.start_child(request_id, f"upstream {u['name']}", kind="client", attrs={
+                "sgpu.upstream": u["name"], "url.full": url, "http.request.method": "POST",
+                "sgpu.stream": True, "sgpu.model.upstream": u["models"][alias],
+            })
             t0 = time.perf_counter()
             try:
                 async with cli.stream("POST", url, json=body, headers=headers,
                                       timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0)) as r:
                     if _should_failover(u, r.status_code):
                         _mark_after_failover(app, endpoint_id, u, r.status_code)
+                        tracing.end_child(ch, error=f"HTTP {r.status_code}",
+                                          attrs={"http.response.status_code": r.status_code,
+                                                 "sgpu.failover": True})
                         last_err = f"{u['name']}: HTTP {r.status_code}"
                         continue  # failover (nothing sent yet)
                     _mark_health(app, endpoint_id, u["id"], True, latency_ms=int((time.perf_counter() - t0) * 1000))
@@ -1471,6 +1506,8 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
                         finished = True
                         logger.info("proxy stream: upstream %s returned HTTP %s (surfaced as an SSE error frame): %s",
                                     u["name"], r.status_code, text[:200])
+                        tracing.end_child(ch, error=f"HTTP {r.status_code}: {text[:200]}",
+                                          attrs={"http.response.status_code": r.status_code})
                         await _finish(request_id, "failed", status_code=r.status_code,
                                       latency_ms=int((time.perf_counter() - t0) * 1000),
                                       upstream=u["name"], error=f"HTTP {r.status_code}: {text}"[:500])
@@ -1493,6 +1530,10 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
                             if not sent_any:
                                 sent_any = True
                                 ttft_ms = int((time.perf_counter() - t0) * 1000)  # time-to-first-token
+                                # An EVENT, not just the attribute: this is the moment
+                                # the waterfall needs to separate prefill from decode.
+                                tracing.add_event(request_id, "first_token",
+                                                  {"sgpu.ttft_ms": ttft_ms})
                             yield chunk
                             # Light usage scan — the `"usage"` substring guard keeps the
                             # JSON parser off content chunks; only the final usage frame hits it.
@@ -1531,18 +1572,26 @@ async def _stream(app, request_id: str, endpoint_id: str, candidates: list[dict]
                             continue
                         yield b"data: [DONE]\n\n"
                         finished = True
+                        tracing.end_child(ch, error=f"closed mid-stream: {type(e).__name__}",
+                                          attrs={"http.response.status_code": r.status_code,
+                                                 "sgpu.ttft_ms": ttft_ms})
                         await _finish(request_id, "completed", status_code=r.status_code,
                                       latency_ms=int((time.perf_counter() - t0) * 1000),
                                       ttft_ms=ttft_ms, pt=pt, ct=ct, upstream=u["name"],
                                       error=f"upstream closed mid-stream: {type(e).__name__}")
                         return
                     finished = True
+                    tracing.end_child(ch, attrs={
+                        "http.response.status_code": r.status_code, "sgpu.ttft_ms": ttft_ms,
+                        "gen_ai.usage.input_tokens": pt, "gen_ai.usage.output_tokens": ct})
                     await _finish(request_id, "completed", status_code=r.status_code,
                                   latency_ms=int((time.perf_counter() - t0) * 1000),
                                   ttft_ms=ttft_ms, pt=pt, ct=ct, upstream=u["name"])
                     return
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 _mark_health(app, endpoint_id, u["id"], False, error=str(e))
+                tracing.end_child(ch, error=f"{type(e).__name__}: {e}",
+                                  attrs={"sgpu.failover": True})
                 last_err = f"{u['name']}: {type(e).__name__}"
                 continue
         finished = True
@@ -1639,7 +1688,8 @@ def _store_row(request_id: str) -> bool:
 
 async def _admit_request(request_id, endpoint_id, user, alias, is_stream,
                          request: Optional[Request] = None,
-                         endpoint_name: Optional[str] = None) -> None:
+                         endpoint_name: Optional[str] = None,
+                         t0: Optional[float] = None) -> None:
     """Register a newly-admitted proxied request: remember the facts `_finish` will
     need, open its span, and (depending on `PROXY_REQUEST_STORE`) enqueue the row.
 
@@ -1659,7 +1709,8 @@ async def _admit_request(request_id, endpoint_id, user, alias, is_stream,
     rec = {
         "endpoint_id": endpoint_id, "endpoint_name": endpoint_name,
         "owner_id": getattr(user, "id", None), "owner": getattr(user, "username", None),
-        "model": alias, "is_stream": bool(is_stream), "created_at": now, "t": time.time(),
+        "model": alias, "is_stream": bool(is_stream), "created_at": now,
+        "t": t0 or time.time(),
         "stored": _store_row(request_id),
     }
     if len(_ADMITTED) < _ADMITTED_MAX:
@@ -1700,9 +1751,14 @@ async def _prepare(app, endpoint_name: str, alias: str, user: User, is_stream: b
     """Resolve routing (via _route) + admit the request (span + optional row). Returns
     (endpoint_id, candidates, timeout_s, max_conc, request_id, red_team)."""
     request_id = f"pxr-{_secrets.token_hex(8)}"
+    # ⚠ Stamp the arrival time BEFORE routing. `_route` hits the DB for the endpoint
+    # config on every request, and a span that starts after it hides that work — the
+    # trace would show a fast request while the caller waited on a slow query.
+    t0 = time.time()
     endpoint_id, candidates, timeout_s, max_conc, red_team = await _route(app, endpoint_name, alias, force)
     await _admit_request(request_id, endpoint_id, user, alias, is_stream,
-                         request=request, endpoint_name=endpoint_name)
+                         request=request, endpoint_name=endpoint_name, t0=t0)
+    tracing.add_event(request_id, "routed", {"sgpu.candidates": len(candidates)})
     return endpoint_id, candidates, timeout_s, max_conc, request_id, red_team
 
 
@@ -1782,7 +1838,8 @@ async def _dispatch_buffered(app, request, user, endpoint_id, candidates, alias,
             gen = _rt_replay(first, gen)
         return StreamingResponse(gen, media_type="text/event-stream", headers=sse_headers)
     resp = await _unary(app, request, request_id,
-                        lambda: _do_unary(app, endpoint_id, candidates, alias, payload, upstream_path, timeout_s),
+                        lambda: _do_unary(app, endpoint_id, candidates, alias, payload, upstream_path, timeout_s,
+                                          request_id=request_id),
                         gate, cancel_ev)
     if rt_task is not None:
         # Unary is the easy half: the body is already buffered, so the judge has been
@@ -1950,7 +2007,8 @@ async def _ingest_body(request: Request) -> dict:
 
 
 async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, upstream_path,
-                               head: bytes, body_it, timeout_s, max_conc, is_stream_hint) -> Response:
+                               head: bytes, body_it, timeout_s, max_conc, is_stream_hint,
+                               t_arrive: Optional[float] = None) -> Response:
     """Single-upstream forward that STREAMS the request body (with `model` rewritten) to the
     upstream as it keeps arriving from the client — overlapping the client→gateway upload
     with the gateway→upstream relay. Branches the RESPONSE on the upstream's content-type
@@ -1958,7 +2016,9 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
     candidate by construction); this also surfaces a non-2xx upstream (e.g. nginx 413) with
     its REAL status instead of masking it inside a 200 SSE envelope."""
     request_id = f"pxr-{_secrets.token_hex(8)}"
-    await _admit_request(request_id, endpoint_id, user, alias, is_stream_hint, request=request)
+    await _admit_request(request_id, endpoint_id, user, alias, is_stream_hint, request=request,
+                         t0=t_arrive)
+    tracing.add_event(request_id, "routed", {"sgpu.candidates": 1, "sgpu.passthrough": True})
     gate = _get_gate(app, endpoint_id, max_conc)
     cancel_ev = asyncio.Event()
     _register_live(app, request_id, endpoint_id, alias, user, cancel_ev, is_stream_hint)
@@ -1977,14 +2037,26 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
     token = None
     gate_held = False
     handed_off = False
+    up_ch = None
     try:
         if gate is not None:
-            token = await gate.acquire(cancel_ev, live.get(request_id)); gate_held = True
+            qch = tracing.start_child(request_id, "queue",
+                                      attrs={"sgpu.gate.limit": getattr(gate, "max_conc", None)})
+            try:
+                token = await gate.acquire(cancel_ev, live.get(request_id)); gate_held = True
+            finally:
+                tracing.end_child(qch)
         if cancel_ev.is_set():
             raise asyncio.CancelledError()
         if request_id in live:
             live[request_id]["state"] = "running"; live[request_id]["upstream"] = cand["name"]
         await _set_started(request_id, upstream=cand["name"])
+        # Ended by whichever branch below terminates the request; `end_request` closes
+        # it as unfinished if a cancel path skips them.
+        up_ch = tracing.start_child(request_id, f"upstream {cand['name']}", kind="client", attrs={
+            "sgpu.upstream": cand["name"], "url.full": url, "http.request.method": "POST",
+            "sgpu.passthrough": True, "sgpu.model.upstream": cand["models"][alias],
+        })
         t0 = time.perf_counter()
         req = cli.build_request("POST", url, content=_agen(), headers=headers,
                                 timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=timeout_s, pool=10.0))
@@ -2008,6 +2080,8 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
                           latency_ms=lat, pt=usage.get("prompt_tokens"), ct=usage.get("completion_tokens"),
                           upstream=cand["name"],
                           error=None if ok else (json.dumps(obj)[:500] if isinstance(obj, dict) else str(obj)[:500]))
+            tracing.end_child(up_ch, attrs={"http.response.status_code": r.status_code},
+                              error=None if ok else "upstream error", ok=ok)
             live.pop(request_id, None)
             return JSONResponse(obj, status_code=r.status_code, headers=base_hdrs)
         # SSE relay — hand the concurrency slot + cleanup off to the generator's finally.
@@ -2023,6 +2097,7 @@ async def _forward_passthrough(app, request, user, endpoint_id, cand, alias, ups
                         break
                     if ttft is None:
                         ttft = int((time.perf_counter() - t0) * 1000)
+                        tracing.add_event(request_id, "first_token", {"sgpu.ttft_ms": ttft})
                     yield chunk
                     try:  # light usage sniff — same as _stream
                         usage_buf += chunk.decode("utf-8", "ignore")
@@ -2085,6 +2160,10 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
     single upstream when possible (overlap); otherwise buffers + uses the classic failover
     path. PROXY_STREAM_PASSTHROUGH=0 forces the classic path for all requests."""
     app = request.app
+    # Arrival time, stamped before ANY work — body ingest and the routing DB read both
+    # happen below, and a span starting after them would report a fast request while
+    # the caller was waiting. Threaded into `_admit_request` as the span's start.
+    t_arrive = time.time()
     if os.environ.get("PROXY_STREAM_PASSTHROUGH", "1") == "0":
         try:
             payload = await request.json()
@@ -2129,7 +2208,8 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
         flat = head.replace(b" ", b"").replace(b"\n", b"").replace(b"\t", b"").replace(b"\r", b"")
         is_stream_hint = b'"stream":true' in flat[:4096]
         return await _forward_passthrough(app, request, user, endpoint_id, cand, alias, upstream_path,
-                                          new_head, it, timeout_s, max_conc, is_stream_hint)
+                                          new_head, it, timeout_s, max_conc, is_stream_hint,
+                                          t_arrive=t_arrive)
 
     # multiple candidates (or red teaming) → buffer the rest, parse, classic dispatch
     rest = bytearray(ing["head"])
@@ -2142,7 +2222,8 @@ async def _handle_ingest(request: Request, user: User, endpoint_name: str, upstr
     is_stream = bool(payload.get("stream"))
     request_id = f"pxr-{_secrets.token_hex(8)}"
     await _admit_request(request_id, endpoint_id, user, alias, is_stream,
-                         request=request, endpoint_name=endpoint_name)
+                         request=request, endpoint_name=endpoint_name, t0=t_arrive)
+    tracing.add_event(request_id, "routed", {"sgpu.candidates": len(candidates)})
     rt_task = None
     if rt_active is not None:
         blocked, rt_task = await _red_team_gate(app, endpoint_name, endpoint_id, request_id, rt_active,
@@ -2633,13 +2714,22 @@ async def _red_team_gate(app, endpoint_name: str, endpoint_id: str, request_id: 
         _rt_submit_monitor(app, endpoint_name, endpoint_id, request_id, rt, alias, text, mode)
         return None, None
     t0 = time.perf_counter()
+    # In a BLOCKING action this call is paid inline by every request on the endpoint —
+    # it belongs in the waterfall, not just in a histogram, because "the endpoint got
+    # slower" and "the guard's judge model got slower" look identical without it.
+    rt_ch = tracing.start_child(request_id, f"red_team {mode}", kind="client",
+                                attrs={"sgpu.red_team.mode": mode,
+                                       "sgpu.red_team.scan_chars": len(text)})
     try:
         flagged, rt_type, reason = await _rt_detect(app, rt, text)
         _metrics.observe_red_team(endpoint_id, alias, "unsafe" if flagged else "safe",
                                   mode=mode, seconds=time.perf_counter() - t0)
+        tracing.end_child(rt_ch, attrs={"sgpu.red_team.flagged": bool(flagged),
+                                        "sgpu.red_team.type": rt_type or ""})
     except (httpx.HTTPError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as e:
         _metrics.observe_red_team(endpoint_id, alias, "error", mode=mode,
                                   seconds=time.perf_counter() - t0)
+        tracing.end_child(rt_ch, error=f"{type(e).__name__}: {e}")
         if (rt.get("on_error") or "allow") != "block":
             logger.warning("red-team detector failed on %s (fail-open): %s", endpoint_name, e)
             return None, None
@@ -3194,6 +3284,7 @@ async def _stream_speech(app, request_id: str, endpoint_id: str, candidates: lis
                         break
                     if ttft is None:
                         ttft = int((time.perf_counter() - t0) * 1000)
+                        tracing.add_event(request_id, "first_token", {"sgpu.ttft_ms": ttft})
                     yield chunk
                     nbytes += len(chunk)
                     if not truncated:
@@ -3420,6 +3511,7 @@ async def _stream_audio(app, request, user, endpoint_id, candidates, alias, upst
                         break
                     if ttft is None:
                         ttft = int((time.perf_counter() - t0) * 1000)
+                        tracing.add_event(request_id, "first_token", {"sgpu.ttft_ms": ttft})
                     yield chunk
                     # Best-effort logprob + duration sniff — only frames that could carry
                     # either (the `avg_logprob`/`logprobs`/`segments`/`duration` guard keeps
@@ -4102,7 +4194,7 @@ async def _live_records(app, proxy_id: str) -> list[dict]:
             "completion_tokens": None, "error_text": None,
             "created_at": datetime.fromtimestamp(created, tz=timezone.utc).isoformat(),
             "started_at": None, "completed_at": None, "live": True,
-            "trace_id": tracing.trace_id(rid), "trace_url": None,
+            "trace_id": tracing.trace_id(rid), "trace_url": trace_store.trace_ui_url(None, rid),
         }
     if proxy_cluster.enabled():
         # Requests in flight on ANOTHER replica: the registry carries the same fields.
@@ -4121,7 +4213,7 @@ async def _live_records(app, proxy_id: str) -> list[dict]:
                     "completion_tokens": None, "error_text": None,
                     "created_at": datetime.fromtimestamp(created, tz=timezone.utc).isoformat(),
                     "started_at": None, "completed_at": None, "live": True,
-                    "trace_id": None, "trace_url": None,
+                    "trace_id": None, "trace_url": trace_store.trace_ui_url(None, rid),
                 }
         except Exception:  # noqa: BLE001 — a Redis blip degrades the overlay, not the page
             logger.debug("live overlay: cluster registry unavailable", exc_info=True)
@@ -4225,7 +4317,8 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offse
         live_ids = {r["id"] for r in live_overlay}
         merged = live_overlay + [r for r in traced if r["id"] not in live_ids]
         return [
-            ProxyRequestRecord(**{**r, "trace_url": trace_store.trace_ui_url(r.get("trace_id"))})
+            ProxyRequestRecord(**{**r, "trace_url": trace_store.trace_ui_url(
+                r.get("trace_id"), r.get("id"))})
             for r in merged[:max(1, limit)]
         ]
     if response is not None:
@@ -4268,8 +4361,13 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offse
     if owner_ids:
         for u in (await session.execute(select(User).where(User.id.in_(owner_ids)))).scalars().all():
             owners[u.id] = u.username
+    # ⚠ A Postgres row has no trace id — the tracer mints one and stores it nowhere.
+    # So the deep link here is by REQUEST id (a TraceQL search), which is exactly why
+    # TRACE_UI_URL supports `{request}`: a `{trace}`-only template would render no
+    # link at all in the default store=all mode, i.e. on the page most people open.
     stored = [
         ProxyRequestRecord(
+            trace_url=trace_store.trace_ui_url(None, r.id),
             id=r.id, endpoint_id=r.endpoint_id, owner=owners.get(r.owner_id) if r.owner_id is not None else None,
             model=r.model, upstream=r.upstream, status=r.status,
             is_stream=r.is_stream, status_code=r.status_code, latency_ms=r.latency_ms,

@@ -629,10 +629,14 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                       )}
                       {/* Only rendered when the gateway has a trace-UI base configured
                           (TRACE_UI_URL) — a link to a Grafana nobody runs is worse than none. */}
+                      {/* ⚠ The title is not decoration: a span is exported and indexed a
+                          second or two AFTER the request finishes, so clicking the
+                          instant a row appears opens an empty search — which reads as
+                          "tracing is broken" rather than "too early". */}
                       {r.trace_url && (
                         <a href={r.trace_url} target="_blank" rel="noreferrer"
                            className="text-xs text-muted-foreground hover:text-primary"
-                           title="Open this request's full trace">trace</a>
+                           title="Open this request's full trace (available a couple of seconds after it completes)">trace</a>
                       )}
                     </td>
                   </tr>

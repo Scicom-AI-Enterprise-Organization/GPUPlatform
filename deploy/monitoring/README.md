@@ -47,6 +47,15 @@ LLM-proxy requests ──OTLP──▶ Tempo (:4418 in, :3200 out)┘   (one spa
    docker compose -f deploy/monitoring/docker-compose.monitoring.yml up -d
    ```
 
+   ⚠ **On a machine that also runs SlurmUI's monitoring stack** (`~/Documents/SlurmUI/
+   monitoring/`), that stack already owns :3001 / :9091 / :9093, so bringing all of
+   these up will fail on port conflicts — start only what's missing, e.g.
+   `… up -d tempo`, and add the Tempo datasource to the Grafana you already have
+   (URL `http://host.docker.internal:3200`, since the two stacks are on different
+   Docker networks). This compose sets an explicit `name: gpuplatform-monitoring`;
+   without it Compose derives the project from the parent directory — `monitoring`
+   for BOTH files — and a `down` here would tear down SlurmUI's stack.
+
 3. Open Grafana at <http://localhost:3001> (admin / admin) → **GPUPlatform — API
    Layer**. Prometheus + Loki + Tempo datasources and the dashboard are
    auto-provisioned.

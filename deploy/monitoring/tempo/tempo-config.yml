@@ -30,6 +30,15 @@ ingester:
   # request that just completed look missing.
   max_block_duration: 5m
   complete_block_timeout: 15m
+  # ⚠ `trace_idle_period` is the one that decides how soon a FINISHED trace can be
+  # FOUND: the ingester keeps a trace in its live map until nothing has been appended
+  # to it for this long, and only then cuts it into a searchable block. At the 10s
+  # default, clicking a Queue-tab row right after the request completes reliably
+  # lands on an empty search (measured end-to-end: ~15s to searchable, ~10s of it
+  # here). These traces are single-process and complete the moment the request ends,
+  # so waiting 10s for more spans buys nothing.
+  trace_idle_period: 2s
+  flush_check_period: 2s
 
 compactor:
   compaction:

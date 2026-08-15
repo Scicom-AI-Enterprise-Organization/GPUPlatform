@@ -359,6 +359,49 @@ one so a fast request collapses to a **single INSERT**.
   `cancelled` are NOT span-status ERROR — a guardrail doing its job and a caller hanging up
   are not gateway errors, and marking them would poison every error-rate panel.
 
+**The trace is a WATERFALL, not one bar** (added 2026-08-15 — the first cut emitted a single
+flat span, which is a log line wearing a trace's clothes). `tracing.start_child` /
+`end_child` / `add_event` hang phases off the request span:
+
+    proxy <endpoint>                     ← the request, starts when it ARRIVED
+      • routed        @+5.8ms            ← body ingest + the routing DB read
+      • running       @+5.9ms
+      • first_token   @+62.1ms           ← prefill|decode boundary on a stream
+      ├─ queue                 0.0ms     ← only when the endpoint HAS max_concurrency
+      ├─ red_team <mode>      41.0ms     ← blocking guard, paid inline by every request
+      ├─ upstream <name-A>     1.1ms ✗   ← failover attempt (error, sgpu.failover=true)
+      └─ upstream <name-B>    60.6ms     ← the one that served it
+
+- **⚠ One span per upstream ATTEMPT is the point.** Failover as N sibling spans (the failed
+  ones marked) is a story; a single `upstream=<whoever answered>` attribute is not. Covered:
+  `_do_unary`, `_stream`, `_forward_passthrough`.
+- **⚠ The span must start BEFORE routing.** `_route` does a DB read per request; a span
+  opened after it shows a fast request while the caller waited on a slow query. `_prepare`
+  and `_handle_ingest` stamp `t_arrive` up front and thread it through `_admit_request(t0=…)`,
+  which is also the row's `created_at`. The `routed` event marks where that ended.
+- **⚠ `mark_started` emits the `running` event only ONCE.** `_set_started` is called twice on
+  the streaming path (before and after upstream selection) — the attribute update is
+  idempotent, two "running" marks on a waterfall are not.
+- **A child left open is never exported** — the phase silently vanishes instead of failing
+  loudly — so `end_request` force-closes stragglers (`sgpu.unfinished=true`) for the cancel /
+  disconnect paths that skip the explicit `end_child`.
+- `first_token` is an EVENT as well as `ttft_ms`: an attribute gives the number, only an
+  event gives its position in the waterfall.
+
+**⚠ A finished request is NOT instantly searchable — and the Queue tab links straight to
+it.** Measured end-to-end (request completes → the trace can be FOUND by request id):
+**~15s out of the box**, which reads as "tracing is broken" when you click a row that just
+appeared. Two stacked delays, both now tuned:
+- **5s** in the SDK — `BatchSpanProcessor`'s default `schedule_delay_millis`. Fine for
+  offline analysis, wrong for a UI that deep-links. → `PROXY_TRACE_EXPORT_DELAY_MS` (1000).
+- **~10s** in Tempo — `ingester.trace_idle_period` (default 10s) holds a trace in the live
+  map waiting for more spans before cutting it into a searchable block. These traces are
+  single-process and complete when the request ends, so that wait buys nothing. → **2s** in
+  `deploy/monitoring/tempo/tempo-config.yml`.
+Result: **~2.0s** (3 runs: 2.1 / 2.1 / 1.8). It cannot be zero, so the Queue tab's `trace`
+link says so in its tooltip. ⚠ `docker compose up -d tempo` does NOT restart the container
+for a mounted-config change — `docker restart gpuplatform-monitoring-tempo-1`.
+
 **trace_store.py — three things TraceQL can't do that SQL could, all surfaced to the user**
 1. **A time window is mandatory** (`PROXY_TRACE_WINDOW_H`, default 24). "Everything ever" is
    not a query Tempo answers.

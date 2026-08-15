@@ -250,3 +250,85 @@ def test_trace_ui_url_templating(monkeypatch):
     monkeypatch.setenv("TRACE_UI_URL", "http://jaeger/trace/")
     assert ts.trace_ui_url("abc") == "http://jaeger/trace/abc"
     assert ts.trace_ui_url(None) is None
+
+
+def test_request_id_template_links_rows_that_have_no_trace_id(monkeypatch):
+    """⚠ The default storage mode serves Postgres rows, which carry NO trace id — a
+    `{trace}`-only template renders no link on the page most people open. `{request}`
+    points at a TraceQL search instead, so one template serves both sources."""
+    from gateway import trace_store as ts
+    monkeypatch.setenv(
+        "TRACE_UI_URL",
+        'http://g/explore?q={ span.sgpu.request.id="{request}" }')
+    assert ts.trace_ui_url(None, "pxr-abc").endswith('"pxr-abc" }')
+    assert ts.trace_ui_url("deadbeef", "pxr-abc").endswith('"pxr-abc" }')  # request wins
+    assert ts.trace_ui_url("deadbeef", None) is None       # nothing to substitute
+    # …and a {trace} template still behaves as before.
+    monkeypatch.setenv("TRACE_UI_URL", "http://g/explore?traceId={trace}")
+    assert ts.trace_ui_url("deadbeef", "pxr-abc") == "http://g/explore?traceId=deadbeef"
+    assert ts.trace_ui_url(None, "pxr-abc") is None
+
+
+# ---------- span SHAPE: a trace must be a waterfall, not one flat bar ----------
+
+def test_child_helpers_are_safe_when_tracing_is_off():
+    """They sit inside the forwarding loops and are called unconditionally."""
+    import gateway.tracing as t
+    importlib.reload(t)
+    h = t.start_child("pxr-1", "upstream x", kind="client", attrs={"a": 1})
+    assert h is None
+    t.end_child(h, attrs={"b": 2}, error="nope")     # must not raise on None
+    t.add_event("pxr-1", "first_token", {"sgpu.ttft_ms": 12})
+
+
+def test_running_event_fires_once_even_though_set_started_is_called_twice():
+    """`_set_started` runs twice on the streaming path (before and after upstream
+    selection). The attribute update is idempotent; two `running` marks on a waterfall
+    read as two queue exits."""
+    import gateway.tracing as t
+
+    class FakeSpan:
+        def __init__(self):
+            self.events = []
+            self.attrs = {}
+        def add_event(self, name, attrs=None):
+            self.events.append(name)
+        def set_attribute(self, k, v):
+            self.attrs[k] = v
+
+    span = FakeSpan()
+    t._PENDING["pxr-1"] = {"span": span, "created": 0.0}
+    t._enabled = True
+    try:
+        t.mark_started("pxr-1", "up-a")
+        t.mark_started("pxr-1", "up-b")
+        assert span.events == ["running"]
+        assert span.attrs["sgpu.upstream"] == "up-b"   # still tracks the real upstream
+    finally:
+        t._enabled = False
+        t._PENDING.clear()
+
+
+def test_end_request_force_closes_children_left_open():
+    """A child span that is never ended is simply dropped from the export — the phase
+    vanishes from the waterfall silently. Cancel/disconnect paths skip the explicit
+    end_child, so the parent must close them."""
+    import gateway.tracing as t
+
+    class FakeChild:
+        def __init__(self):
+            self.ended = False
+            self.attrs = {}
+        def is_recording(self):
+            return not self.ended
+        def set_attribute(self, k, v):
+            self.attrs[k] = v
+        def end(self):
+            self.ended = True
+
+    orphan = FakeChild()
+    rec = {"children": [orphan]}
+    t._close_children(rec)
+    assert orphan.ended is True
+    assert orphan.attrs.get("sgpu.unfinished") is True
+    t._close_children(rec)          # idempotent — a second pass must not re-end it

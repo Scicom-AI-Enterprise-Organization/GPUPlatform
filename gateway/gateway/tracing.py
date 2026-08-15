@@ -39,6 +39,8 @@ Config (all optional; tracing is OFF unless ``PROXY_TRACING=1``):
     OTEL_SERVICE_NAME=gateway
     PROXY_TRACE_SAMPLE_RATIO=1.0          # ratio for SUCCESSFUL requests only
     PROXY_TRACE_SLOW_MS=0                 # 0=off; else always keep >= this latency
+    PROXY_TRACE_EXPORT_DELAY_MS=1000      # batch-export delay (OTel default 5000 is
+                                          # too slow for a UI that links to the trace)
 """
 
 from __future__ import annotations
@@ -59,6 +61,12 @@ _SLOW_MS = int(os.environ.get("PROXY_TRACE_SLOW_MS", "0") or "0")
 # A span whose request never reached a terminal state (handler died between admission
 # and _finish) would sit in _PENDING forever. The sweeper ends those as `unknown`.
 _STALE_S = float(os.environ.get("PROXY_TRACE_STALE_S", "7200") or "7200")
+# ⚠ How long a finished span may sit in the SDK's queue before it is shipped.
+# The OTel default is 5000ms, which is fine for offline analysis and WRONG here: the
+# Queue tab links straight to the trace, so a user clicking a row seconds after it
+# completes lands on an empty search and concludes tracing is broken (measured: 15s
+# from request-end to searchable, 5s of it here). Lower = more, smaller exports.
+_EXPORT_DELAY_MS = int(os.environ.get("PROXY_TRACE_EXPORT_DELAY_MS", "1000") or "1000")
 
 # Statuses that are ALWAYS exported regardless of the sample ratio — the whole point
 # of sampling at the end rather than the start.
@@ -176,7 +184,8 @@ def start() -> bool:
                 "service.namespace": os.environ.get("OTEL_SERVICE_NAMESPACE") or "serverless-gpu",
             })
             _provider = TracerProvider(resource=resource)
-            _provider.add_span_processor(_make_policy_processor(BatchSpanProcessor(_build_exporter())))
+            _provider.add_span_processor(_make_policy_processor(BatchSpanProcessor(
+                _build_exporter(), schedule_delay_millis=_EXPORT_DELAY_MS)))
             # Deliberately NOT trace.set_tracer_provider(): this provider serves the
             # proxy's own spans. Claiming the global would silently adopt every
             # library that auto-instruments itself, which is a different (and much
@@ -271,11 +280,91 @@ def mark_started(request_id: str, upstream: Optional[str] = None) -> None:
         if rec is None:
             return
         span = rec["span"]
-        span.add_event("running", {"sgpu.upstream": upstream} if upstream else None)
-        span.set_attribute("sgpu.status", "running")
+        # ⚠ `_set_started` is called more than once on the streaming path (once before
+        # upstream selection, once after). The ATTRIBUTE update is idempotent, the
+        # EVENT is not — two "running" marks on one waterfall reads as two queue exits.
+        if not rec.get("started"):
+            rec["started"] = True
+            span.add_event("running", {"sgpu.upstream": upstream} if upstream else None)
+            span.set_attribute("sgpu.status", "running")
         _set(span, "sgpu.upstream", upstream)
     except Exception:  # noqa: BLE001
         logger.debug("mark_started span failed", exc_info=True)
+
+
+def add_event(request_id: str, name: str, attrs: Optional[dict] = None) -> None:
+    """Mark an instant on the request's span (e.g. the first token). Events are how a
+    waterfall shows a moment that has no duration; an attribute like `ttft_ms` can
+    only tell you the number, never where in the request it happened."""
+    if not _enabled:
+        return
+    try:
+        rec = _PENDING.get(request_id)
+        if rec is not None:
+            rec["span"].add_event(name, {k: v for k, v in (attrs or {}).items() if v is not None})
+    except Exception:  # noqa: BLE001
+        logger.debug("add_event failed", exc_info=True)
+
+
+def start_child(request_id: str, name: str, *, kind: str = "internal",
+                attrs: Optional[dict] = None):
+    """Open a CHILD span under this request's span, and return a handle for
+    `end_child` (None when tracing is off / the parent is gone — `end_child` accepts
+    that, so call sites need no branching).
+
+    This is what turns the trace from one flat bar into a waterfall: the queue wait,
+    the red-team detector call, and **one span per upstream ATTEMPT** — which is the
+    only way failover is legible at all (three sibling `upstream …` spans, two of them
+    failed, is a story; a single `upstream=third-one` attribute is not)."""
+    if not _enabled:
+        return None
+    try:
+        rec = _PENDING.get(request_id)
+        if rec is None:
+            return None
+        from opentelemetry.trace import SpanKind, set_span_in_context
+        kinds = {"internal": SpanKind.INTERNAL, "client": SpanKind.CLIENT,
+                 "server": SpanKind.SERVER, "producer": SpanKind.PRODUCER}
+        span = _tracer.start_span(name, context=set_span_in_context(rec["span"]),
+                                  kind=kinds.get(kind, SpanKind.INTERNAL))
+        for k, v in (attrs or {}).items():
+            _set(span, k, v)
+        # Held so `end_request` can close anything a `return`/cancel path skipped —
+        # a child left open is never exported, so the phase silently vanishes from
+        # the waterfall rather than failing loudly.
+        rec.setdefault("children", []).append(span)
+        return span
+    except Exception:  # noqa: BLE001
+        logger.debug("start_child failed", exc_info=True)
+        return None
+
+
+def end_child(handle, *, attrs: Optional[dict] = None, error: Optional[str] = None,
+              ok: bool = True) -> None:
+    """Close a child span. Idempotent-ish and None-safe."""
+    if handle is None:
+        return
+    try:
+        from opentelemetry.trace import Status, StatusCode
+        for k, v in (attrs or {}).items():
+            _set(handle, k, v)
+        if error:
+            _set(handle, "sgpu.error", str(error)[:1024])
+        handle.set_status(Status(StatusCode.ERROR if (error or not ok) else StatusCode.OK,
+                                 str(error)[:256] if error else None))
+        handle.end()
+    except Exception:  # noqa: BLE001
+        logger.debug("end_child failed", exc_info=True)
+
+
+def _close_children(rec: dict) -> None:
+    for ch in rec.get("children") or []:
+        try:
+            if ch.is_recording():
+                ch.set_attribute("sgpu.unfinished", True)
+                ch.end()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def end_request(request_id: str, status: str, *, status_code: Optional[int] = None,
@@ -292,6 +381,7 @@ def end_request(request_id: str, status: str, *, status_code: Optional[int] = No
         return
     try:
         from opentelemetry.trace import Status, StatusCode
+        _close_children(rec)      # a child left open is dropped from the export
         span = rec["span"]
         span.set_attribute("sgpu.status", status)
         _set(span, "http.response.status_code", status_code)
