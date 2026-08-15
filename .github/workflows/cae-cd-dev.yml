@@ -105,6 +105,27 @@ jobs:
         # matches the tag argocd-cae-dev pins.
         run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
+      # pi-worker (vLLM + CUDA) is tens of GB. It has to fit on the runner's
+      # root volume TWICE: once unpacked in the docker daemon, then again as
+      # the tar `skopeo copy docker-daemon:` writes before it pushes. The
+      # 2026-08-13 run died exactly there — "no space left on device" writing
+      # /var/tmp/container_images_docker-tar*, after a clean 16-minute build.
+      # gateway and web are small enough that they never hit this, so only the
+      # heavy component pays the ~1min cleanup.
+      - name: Free up runner disk space
+        if: matrix.component == 'pi-worker'
+        run: |
+          echo "before:"; df -h / /mnt
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/share/swift
+          echo "after:"; df -h / /mnt
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -150,6 +171,12 @@ jobs:
             echo "::error::SWR_REGISTRY / SWR_USERNAME / SWR_PASSWORD secrets are not set"
             exit 1
           fi
+          # skopeo spools the whole image to $TMPDIR (default /var/tmp, on the
+          # ~20GB root volume) before pushing. /mnt is the runner's ephemeral
+          # disk with ~65GB free — the only volume big enough for pi-worker.
+          export TMPDIR=/mnt/skopeo-tmp
+          sudo mkdir -p "${TMPDIR}"
+          sudo chmod 1777 "${TMPDIR}"
           dests="${TAG}"
           [ "${PUSH_LATEST}" = "true" ] && dests="${dests} latest"
           for DEST in ${dests}; do
