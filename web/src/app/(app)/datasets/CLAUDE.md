@@ -73,6 +73,32 @@ still *packs* (`llm_pack` accepts it per-request) but previews wrong — set it 
   - `hf-mirror-card.tsx` — publish an S3 dataset to the self-hosted HF mirror.
 - `merge/` — merge ≥2 `label` datasets into one audio dataset.
 
+## Lineage canvas (`[datasetId]/lineage-card.tsx`, Details tab)
+
+A node graph of what the dataset was **derived** from, fed by `GET /v1/datasets/{id}/lineage`
+(gateway `lineage.py`). The autotrain run page reuses the same component under a **Lineage**
+tab (`autotrain/[runId]/lineage-tab.tsx`), which additionally shows `train_splits`.
+
+- **Same visual language as the proxy routing panel** — it shares the `--live/--fall/--down/
+  --wire/--surface/--canvas/--dot/--glow/--vignette` palette vars, the dot-grid + vignette
+  canvas, tinted-icon node cards and curved SVG edges. Copy the palette block if you add a
+  third canvas; two graphs in one console that look unrelated read as two products.
+- **⚠ It flows LEFT → RIGHT, the opposite axis to routing's top-down chain, because the
+  topology is opposite too.** Routing is a chain (exactly one edge leaves the request, the
+  rest are failure paths); lineage is a DAG that FANS IN — many corpora converge into one
+  training set. Levels are longest-path from a root, so an edge never points backwards.
+- **⚠ Nodes are de-duplicated by id here, unlike the API's `flat`.** In a list, collapsing a
+  repeated corpus would hide that it was merged in twice; in a graph the opposite holds — one
+  node with two outgoing edges IS "included twice", and two boxes would imply two corpora.
+- **It lives on the Details tab, next to Metadata** (provenance is metadata). It was first
+  mounted under Columns, where it rendered correctly and nobody saw it.
+- A dataset with no ancestry renders "this is an original source" rather than an empty canvas,
+  and rows created before `Dataset.lineage` existed still resolve — the gateway reconstructs
+  those edges from the legacy signals.
+- **⚠ Fetch after an `await`, never synchronously in the effect** (`react-hooks/
+  set-state-in-effect`). Both components use a `reloadKey` + `cancelled` flag, which also stops
+  a slow response overwriting a newer one when the id changes.
+
 ## Download (`GET /v1/datasets/{id}/download` → zip)
 
 The row browser's **Download** button streams a zip of `audio/…` + `metadata.json`, scoped to

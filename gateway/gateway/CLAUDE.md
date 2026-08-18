@@ -1299,6 +1299,33 @@ chain, and a finetune on clean audio has seen none of it.
   missing).
 - **Restart rules**: `whisper_finetune.py` is **SFTP'd per run** → trainer edits need no gateway
   restart. `training_api.py` is imported → its `_AUG_TECHNIQUES` edit **does**.
+
+#### `train_splits` — subset ablation over one merged corpus (added 2026-08-16)
+
+`CreateTrainingRunRequest.train_splits: list[str]` (ASR only) restricts training to some of the
+training dataset's `split` labels. A merged audio dataset labels each source by origin —
+`<config>/<split>` for a HF subset, a bare `train` for a Label project — so "train on the
+call-centre audio plus two of the six synthetic subsets" used to mean a re-merge and a
+re-materialisation of tens of thousands of clips per arm. It is now a config field over one
+prebuilt dataset, which is what makes a per-subset ablation affordable at all.
+
+`whisper_finetune.filter_train_splits` is applied to `train_pairs` **after** every branch of the
+train/eval selection, so it composes with `no_eval`, `test_dataset(s)` and the seeded hold-out
+rather than special-casing any of them.
+
+- **Matching**: full label (`synthetic_podcast/train`) or its config prefix
+  (`synthetic_podcast`). A bare `train` therefore selects only the unprefixed rows — matching on
+  the split *suffix* instead would silently select every subset's train half and every arm of an
+  ablation would train on the identical corpus while reporting different names.
+- **⚠ It narrows the TRAINING half only.** Eval rows never reach the filter: this changes what is
+  learned, not what is scored.
+- **⚠ An empty selection RAISES; an entry that matches nothing WARNS and continues**, naming the
+  labels that were present. Same class as the silently-dropped augment name, but worse in
+  consequence — training on less data than was asked for reads as a result about the data.
+  `[split] train_splits=[…]: kept N/M training rows (<per-label counts>)` is the line to check.
+- Unit tests: `gateway/tests/unit/test_whisper_train_splits.py`.
+- Restart rule: the trainer half ships per run, but the pydantic field is in `training_api.py`
+  → **gateway restart** before the first run that uses it, or the key is silently dropped.
 - **`resolve_augment` aliases** (automation YAML): `all` = the 8 classic techniques, `livekit_all`
   = the 11 transport ones, `stream_all` = the 7 streaming-regime ones, `voice_all` = both voice-agent
   families. Each alias keeps its meaning as techniques are added — **one technique is picked per
@@ -1469,6 +1496,37 @@ Every transcript in the row browser read blank while the CSV was perfectly fine 
 `synthetic-tts-user-v2-audio`, transformed out of `Scicom-intl/Synthetic-User-Turn-TTS`). Both
 branches now spread `**r` FIRST and assign the computed `audio_url`/`transcription`/`row_index`
 after — the rule the chat (`messages_field`) branch already followed for the same reason.
+
+### Dataset lineage (`lineage.py`, added 2026-08-18)
+
+`Dataset.lineage` (JSON, idempotent ALTER) records ONE derivation —
+`{op: merge|transform|pack|generate|normalize, sources: [ids], params: {…}}` — and
+`lineage.resolve()` walks those edges into a tree. Endpoints:
+`GET /v1/datasets/{id}/lineage` (`tree` / `roots` / `flat` / `depth`) and
+`GET /v1/training-runs/{id}/lineage` (per dataset role + `train_splits` + a de-duplicated
+roll-up). UI: a Lineage card on the dataset page, a Lineage tab on the run page.
+
+- **Why it exists:** a training corpus here is routinely FOUR derivations deep (HF repo →
+  transform → merge → merge), and the chain used to live in three incompatible places —
+  a single reverse-lookup hop on `audio_dataset_id`, a prose `description` listing merge
+  inputs, and the transform log. "What is actually in this training set" was only
+  answerable by reading logs, which is precisely what nobody does before trusting a number.
+- **⚠ The dataset id is not the answer on its own.** With `train_splits` set, the run used
+  only PART of the dataset — the id names a container, not the contents. That's why the run
+  endpoint returns the split filter next to the ancestry, and why the tab leads with it.
+- **⚠ Legacy rows are reconstructed, not reported as roots.** `_parents()` falls back to
+  parsing `"Merge of N datasets (…)"` out of the description and to the
+  `audio_dataset_id` reverse lookup, so datasets created before the column resolve too
+  (verified on a real 4-level chain built before it existed). A dataset with genuinely no
+  ancestry renders as "this is an original source" rather than an empty card.
+- **Bounded and cycle-safe** (`MAX_DEPTH` 12, `MAX_NODES` 200): the edges are user-created
+  and this is reachable from an HTTP handler. A node already on the path becomes a `cycle`
+  marker instead of recursing; a deleted parent becomes `missing`.
+- **⚠ `flatten()` does NOT de-duplicate a diamond.** The same corpus merged in twice appears
+  twice — that is the point; collapsing it would hide double-counting. Callers that want
+  unique datasets key by id (the run endpoint does).
+- Unit tests: `gateway/tests/unit/test_lineage.py`. Restart rule: `lineage.py`,
+  `datasets_api.py` and `training_api.py` are imported → **gateway restart** for edits.
 
 ### Merging s3 sources — REFERENCE in place, and where the key comes from
 

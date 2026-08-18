@@ -43,6 +43,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import audit as audit_module
+from . import lineage as lineage_mod
 from . import bench, crypto, dataset_metadata
 from .auth import require_section
 from .db import Dataset, Storage, User, get_session
@@ -4073,6 +4074,33 @@ async def cleanup_orphaned_generating() -> int:
     return n
 
 
+@router.get("/{dataset_id}/lineage")
+async def dataset_lineage(
+    dataset_id: str,
+    user: User = Depends(require_section("datasets")),
+    session: AsyncSession = Depends(get_session),
+):
+    """What this dataset was derived from, walked to its roots.
+
+    `tree` is the nested ancestry, `roots` the original corpora everything came from,
+    and `flat` a depth-first list. Rows created before the `lineage` column exists are
+    reconstructed from the legacy signals (merge description, audio_dataset_id), so an
+    old dataset is not silently reported as a root.
+    """
+    await _require_dataset(session, dataset_id, user)   # 404/403 as usual
+    tree = await lineage_mod.resolve(session, dataset_id)
+    return {"id": dataset_id, "tree": tree,
+            "roots": lineage_mod.roots(tree),
+            "flat": lineage_mod.flatten(tree),
+            "depth": _lineage_depth(tree)}
+
+
+def _lineage_depth(node: Optional[dict]) -> int:
+    if not node or not node.get("sources"):
+        return 0
+    return 1 + max((_lineage_depth(s) for s in node["sources"]), default=0)
+
+
 @router.post("/merge", response_model=DatasetRecord)
 async def merge_datasets(
     req: DatasetMergeRequest,
@@ -4129,6 +4157,8 @@ async def merge_datasets(
         transcription_field=transcription_field,
         num_rows=0,
         transform_status="running",
+        # Derivation record — the inputs used to live only in the prose description.
+        lineage=lineage_mod.record("merge", ids, target=req.target),
     )
     session.add(new)
     await session.commit()

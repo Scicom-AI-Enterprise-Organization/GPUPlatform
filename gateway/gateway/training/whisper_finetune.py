@@ -1769,6 +1769,54 @@ def split_pairs(pairs: list[dict], cfg: dict) -> tuple[list[dict], list[dict]]:
     return train, ev
 
 
+def filter_train_splits(pairs: list[dict], cfg: dict) -> list[dict]:
+    """Keep only the TRAINING rows whose `split` label `train_splits` selects.
+
+    A merged audio dataset labels each source by where it came from — `<config>/<split>`
+    for a HF subset, a bare `train` for a Label project — so "train on the call-centre
+    audio plus two of the six synthetic subsets" was previously a re-merge and a
+    re-materialisation of tens of thousands of clips per ablation. With this it is a
+    config field over one already-built dataset.
+
+    Matching accepts the full label (`synthetic_podcast/train`) or its config prefix
+    (`synthetic_podcast`); an entry naming a bare `train` therefore selects only the
+    unprefixed rows, never every subset's train half. Empty/absent → no filtering.
+    Eval rows never reach here — this narrows what is learned, not what is scored.
+    """
+    want = [str(s).strip() for s in (cfg.get("train_splits") or []) if str(s).strip()]
+    if not want:
+        return pairs
+    wanted = {w.lower() for w in want}
+
+    def label_of(p: dict) -> str:
+        return str(p.get("split") or "train").lower()
+
+    kept = [p for p in pairs if label_of(p) in wanted or label_of(p).split("/", 1)[0] in wanted]
+    seen = sorted({str(p.get("split") or "train") for p in pairs})
+    if not kept:
+        raise RuntimeError(
+            f"train_splits={want} matched none of the {len(pairs)} training rows "
+            f"(labels present: {seen})"
+        )
+    # Name any entry that matched nothing. Training on less data than was asked for is
+    # the failure that makes an ablation unfalsifiable — a typo would otherwise read as
+    # "that subset doesn't help", exactly like the silently-dropped augment names.
+    present: set[str] = set()
+    for p in pairs:
+        lab = label_of(p)
+        present.add(lab)
+        present.add(lab.split("/", 1)[0])
+    if missing := sorted(wanted - present):
+        log(f"[split] WARNING: train_splits entries matched nothing: {missing} "
+            f"(labels present: {seen})")
+    per_label: dict[str, int] = {}
+    for p in kept:
+        per_label[label_of(p)] = per_label.get(label_of(p), 0) + 1
+    log(f"[split] train_splits={want}: kept {len(kept)}/{len(pairs)} training rows "
+        f"({', '.join(f'{k}={v}' for k, v in sorted(per_label.items()))})")
+    return kept
+
+
 # --------------------------------------------------------------------------
 # Training
 # --------------------------------------------------------------------------
@@ -1849,6 +1897,9 @@ def run(cfg: dict) -> None:
         log(f"[split] separate test dataset: {len(train_pairs)} train / {len(eval_pairs)} eval")
     else:
         train_pairs, eval_pairs = split_pairs(pairs, cfg)
+    # Applied to every branch above (and only to the training half), so a subset
+    # ablation composes with a separate/multiple test set rather than fighting it.
+    train_pairs = filter_train_splits(train_pairs, cfg)
     if not train_pairs or (not no_eval and not eval_pairs):
         raise RuntimeError(
             f"need both train and eval examples (got {len(train_pairs)}/{len(eval_pairs)})"

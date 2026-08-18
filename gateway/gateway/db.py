@@ -425,6 +425,13 @@ class Dataset(Base):
     # the resulting audio dataset. Lets the source page resolve + play audio by
     # joining each row's audio basename against the materialised S3 audio.
     audio_dataset_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # How this dataset was DERIVED: {"op": merge|transform|pack|generate|normalize,
+    # "sources": ["ds-…", …], "params": {...}}. `audio_dataset_id` only ever encoded a
+    # single transform hop (and by reverse lookup), and a merge recorded its inputs
+    # nowhere but the prose description — so a dataset four derivations deep could not
+    # be traced back to what it was built from without reading logs. Written at
+    # creation by every derivation path; NULL on a hand-registered/uploaded root.
+    lineage: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     hf_repo: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     hf_revision: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     # kind=hf: which of the repo's declared configs/splits this dataset is scoped
@@ -1166,6 +1173,10 @@ async def init_db() -> None:
         # Link a zip-backed source dataset to its materialised S3 audio dataset.
         await conn.execute(text(
             "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS audio_dataset_id VARCHAR(64)"
+        ))
+        # Derivation record: {op, sources[], params} — see Dataset.lineage.
+        await conn.execute(text(
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS lineage JSON"
         ))
         # Labeling-platform source (kind=label): base URL + project id + encrypted token.
         await conn.execute(text(

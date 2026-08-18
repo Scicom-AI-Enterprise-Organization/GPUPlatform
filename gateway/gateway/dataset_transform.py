@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import lineage as _lineage
 from .db import Dataset, Storage, session_factory
 
 logger = logging.getLogger("gateway.dataset_transform")
@@ -439,6 +440,12 @@ async def _create_output(
             audio_field="audio",
             transcription_field=transcription_field,
             num_rows=num_rows,
+            # Derivation record — see lineage.py. Written here so a transformed dataset
+            # knows its parent WITHOUT the reverse audio_dataset_id lookup, which only
+            # ever worked for one hop and only for audio transforms.
+            lineage=_lineage.record("transform", [source_id],
+                                    hf_subsets=list(getattr(src, "hf_subsets", None) or []) or None,
+                                    kind=kind),
         )
         s.add(new)
         await s.commit()

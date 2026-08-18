@@ -11,6 +11,7 @@ import type { DatasetPreview, DatasetRecord, StorageRecord } from "@/lib/types";
 import { DatasetTitle } from "./dataset-title";
 import { DeleteButton } from "./delete-button";
 import { ColumnsCard } from "./columns-card";
+import { LineageCard } from "./lineage-card";
 import { LabelImportCard } from "./label-import-card";
 import { TransformationCard } from "./transformation-card";
 import { RowBrowser } from "./row-browser";
@@ -293,6 +294,7 @@ export function DatasetDetail({
           )}
 
           <TabsContent value="details" className="!flex-none space-y-6">
+            <LineageCard datasetId={dataset.id} />
             <Card>
               <CardHeader>
                 <CardTitle className="text-base">Metadata</CardTitle>

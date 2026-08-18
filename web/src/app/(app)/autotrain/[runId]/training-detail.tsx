@@ -49,6 +49,7 @@ import { JsonView } from "@/components/json-view";
 import { cn } from "@/lib/utils";
 import type { DatasetRecord, TrainingEpoch, TrainingFile, TrainingGpu, TrainingGpuSample, TrainingRunRecord, TrainingStep, TrainingTrial } from "@/lib/types";
 import { LabelExportTab } from "./label-export-tab";
+import { LineageTab } from "./lineage-tab";
 import { HfExportTab } from "./hf-export-tab";
 import { TryItCompute, defaultCompute, type ComputeChoice } from "./tryit-compute";
 import { gpuTypeToChoice } from "@/lib/gpu-catalog";
@@ -583,6 +584,7 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
             <TabsTrigger value="logs" asChild><Link href={tabHref("logs")} scroll={false}>Logs</Link></TabsTrigger>
             <TabsTrigger value="files" asChild><Link href={tabHref("files")} scroll={false}>Files</Link></TabsTrigger>
             <TabsTrigger value="config" asChild><Link href={tabHref("config")} scroll={false}>Config</Link></TabsTrigger>
+            <TabsTrigger value="lineage" asChild><Link href={tabHref("lineage")} scroll={false}>Lineage</Link></TabsTrigger>
             {canTryIt && <TabsTrigger value="tryit" asChild><Link href={tabHref("tryit")} scroll={false}>Try it</Link></TabsTrigger>}
             {canTryIt && <TabsTrigger value="hf" asChild><Link href={tabHref("hf")} scroll={false}>Export to HF</Link></TabsTrigger>}
             {canLabelExport && <TabsTrigger value="label" asChild><Link href={tabHref("label")} scroll={false}>Export to Label</Link></TabsTrigger>}
@@ -806,6 +808,10 @@ export function TrainingDetail({ initial }: { initial: TrainingRunRecord }) {
 
         <TabsContent value="files" className="!flex-none">
           <FilesTab run={run} />
+        </TabsContent>
+
+        <TabsContent value="lineage" className="!flex-none space-y-4">
+          <LineageTab runId={run.id} />
         </TabsContent>
 
         <TabsContent value="config" className="!flex-none space-y-4">

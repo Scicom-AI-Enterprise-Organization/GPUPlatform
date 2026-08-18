@@ -2999,6 +2999,11 @@ class CreateTrainingRunRequest(BaseModel):
     # form's "No test set" option. test_dataset_id should be null when set.
     no_eval: bool = False
     eval_split_pct: float = 10.0
+    # ASR-only: train on just these `split` labels of the training dataset — the subset
+    # ablation knob for a merged corpus (`train`, `synthetic_podcast/train`, or a bare
+    # config name for all its splits). Empty = every non-eval row, the old behaviour.
+    # Never touches the eval side; an entry matching nothing is warned about in the log.
+    train_splits: list[str] = []
     split_seed: int = 42
     batch_size: int = 8
     grad_accum: int = 1
@@ -3596,6 +3601,7 @@ async def _create_and_launch_run(
         "save_strategy": body.save_strategy, "save_steps": body.save_steps,
         "patience": body.patience, "eval_split_pct": body.eval_split_pct,
         "no_eval": bool(body.no_eval),
+        "train_splits": [str(s).strip() for s in (body.train_splits or []) if str(s).strip()],
         "split_seed": body.split_seed, "batch_size": body.batch_size,
         "grad_accum": body.grad_accum, "cpu_offload": body.cpu_offload,
         "context_parallel": body.context_parallel,
@@ -5445,6 +5451,50 @@ async def cancel_huggingface_import(
     await _set_hf_import_state(run_id, {"status": "cancelled", "error": "stopped by user"})
     await _push_log(redis, run_id, "[gateway] HF import stopped by user.")
     return {"status": "cancelled"}
+
+
+@router.get("/{run_id}/lineage")
+async def run_lineage(
+    run_id: str,
+    user: User = Depends(require_section("training")),
+    session: AsyncSession = Depends(get_session),
+):
+    """What data this run actually trained on, back to the original corpora.
+
+    A merged corpus can be several derivations deep, and `train_splits` may then use
+    only part of it — so "which dataset id" is not an answer to "what is in this
+    model". Returns the ancestry of the training and test datasets, the roots, and the
+    split filter that was applied on top.
+    """
+    from . import lineage as lineage_mod
+
+    r = await session.get(TrainingRun, run_id)
+    if r is None or (r.owner_id != user.id and not user.is_admin):
+        raise HTTPException(status_code=404, detail="training run not found")
+    cfg = r.config_json or {}
+
+    out: dict = {"run_id": run_id, "name": r.name, "status": r.status,
+                 "train_splits": list(cfg.get("train_splits") or []) or None,
+                 "datasets": {}}
+    seen: dict[str, dict] = {}
+    for role, did in (("train", r.dataset_id),
+                      ("test", cfg.get("test_dataset_id")),
+                      *[(f"test[{i}]", t) for i, t in enumerate(cfg.get("test_dataset_ids") or [])]):
+        if not did or did in seen:
+            if did:
+                out["datasets"][role] = {"same_as": did}
+            continue
+        tree = await lineage_mod.resolve(session, did)
+        seen[did] = tree
+        out["datasets"][role] = {"id": did, "tree": tree, "roots": lineage_mod.roots(tree)}
+    # One flat de-duplicated roll-up across every dataset the run touched.
+    allflat: dict[str, dict] = {}
+    for v in out["datasets"].values():
+        for n in lineage_mod.flatten(v.get("tree")):
+            if n.get("id"):
+                allflat[n["id"]] = n
+    out["all_datasets"] = list(allflat.values())
+    return out
 
 
 @router.get("/{run_id}/metrics")
