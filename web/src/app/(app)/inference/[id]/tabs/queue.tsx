@@ -17,8 +17,9 @@ import {
 import { Pagination } from "@/components/ui/pagination";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { gateway } from "@/lib/gateway";
-import type { AppRecord } from "@/lib/types";
+import type { AppRecord, AppRequestCounts } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { APP_SERIES, RangeSelect, RequestHistogram, rangeFromParam } from "@/app/(app)/proxy/[id]/request-histogram";
 
 type Bucket = "in queue" | "in progress" | "completed" | "failed";
 
@@ -69,6 +70,22 @@ const SLUG_BUCKET: Record<string, Bucket | "all"> = {
   failed: "failed",
 };
 
+/**
+ * Which raw DB statuses each display bucket covers.
+ *
+ * The table stores the fine-grained lifecycle (`pending` before a worker picks it up,
+ * `timeout` when the 60s unary poll lapses, `ready`/`cancelled`), while the tab strip
+ * shows four buckets. `/apps/{id}/request-counts` groups by the RAW status, so a bucket's
+ * count is the sum of its members — anything missing here silently undercounts a tab.
+ * Keep in step with the server-side bucketing in `list_app_requests`.
+ */
+const BUCKET_STATUSES: Record<Bucket, string[]> = {
+  "in queue":    ["queued", "pending"],
+  "in progress": ["running"],
+  completed:     ["completed", "ready"],
+  failed:        ["failed", "timeout", "cancelled"],
+};
+
 const BUCKET_TONE: Record<Bucket, string> = {
   "in queue":    "bg-status-init/15 text-status-init",
   "in progress": "bg-status-idle/15 text-status-idle",
@@ -96,10 +113,29 @@ export function QueueTab({ app }: { app: AppRecord }) {
   const [reqIdQuery, setReqIdQuery] = useState("");
   const [facetUsers, setFacetUsers] = useState<string[]>([]);
   const [facetModels, setFacetModels] = useState<string[]>([]);
+  // Exact per-status counts + the histogram series, aggregated server-side over the
+  // whole retained history. `data.items` is ONE page, so nothing here may be derived
+  // from it — the same rule the proxy Queue tab had to learn.
+  const [counts, setCounts] = useState<AppRequestCounts | null>(null);
 
   // The nested filter is URL-driven (?q=queued|running|completed|failed; "all"
   // omits it) so it's shareable + survives back/forward — single source of truth.
   const filter: Bucket | "all" = SLUG_BUCKET[searchParams.get("q") ?? ""] ?? "all";
+  // Histogram range + interval, URL-driven like the bucket filter so a view is shareable.
+  const rangeHours = rangeFromParam(searchParams.get("range"));   // absent → 7d; 0 = all time
+  const interval = searchParams.get("interval") ?? "auto";
+  // Absolute window from drag-to-select; wins over `range` server-side.
+  const brushFrom = searchParams.get("from") ?? "";
+  const brushTo = searchParams.get("to") ?? "";
+  const customRange = Boolean(brushFrom || brushTo);
+  const setHistQ = useCallback(
+    (updates: Record<string, string | null>) => {
+      const params = new URLSearchParams(searchParams.toString());
+      for (const [k, v] of Object.entries(updates)) { if (v) params.set(k, v); else params.delete(k); }
+      router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+    },
+    [router, pathname, searchParams],
+  );
   const selectFilter = useCallback(
     (b: Bucket | "all") => {
       const params = new URLSearchParams(searchParams.toString());
@@ -142,12 +178,24 @@ export function QueueTab({ app }: { app: AppRecord }) {
       }
       setErr(null);
       setData(body);
+      // Counts are a separate call on purpose: the queue route returns one page plus
+      // LIVE Redis gauges (queue_length/in_progress), which answer "right now" but not
+      // "how many ever" — and cannot produce a histogram at all.
+      gateway.getAppRequestCounts(app.app_id, {
+        owner: ownerF || undefined,
+        model: modelF || undefined,
+        sinceHours: rangeHours || undefined,
+        from: brushFrom || undefined,
+        to: brushTo || undefined,
+        bucket: interval,
+      }).then(setCounts).catch(() => { /* chart is additive; never break the table */ });
     } catch (e) {
       setErr({ msg: e instanceof Error ? e.message : String(e) });
     } finally {
       setLoading(false);
     }
-  }, [app.app_id, ownerF, modelF, sortBy, orderDir, reqIdQuery]);
+  }, [app.app_id, ownerF, modelF, sortBy, orderDir, reqIdQuery, rangeHours, interval,
+      brushFrom, brushTo]);
 
   useEffect(() => {
     fetchQueue();
@@ -247,8 +295,21 @@ export function QueueTab({ app }: { app: AppRecord }) {
         </div>
       </div>
 
-      {/* Server-side filters/sort over the full retained history */}
+      {/* Server-side filters/sort over the full retained history. The time range sits
+          here rather than on the chart card — it scopes the tabs, table and pager too. */}
       <div className="flex flex-wrap items-center gap-2">
+        <RangeSelect
+          hours={rangeHours}
+          // Always write the param, `0` included — see DEFAULT_RANGE_H.
+          // Also clear any brushed window — absolute bounds outrank `range`.
+          onHours={(h) => { setHistQ({ range: String(h), from: null, to: null }); setPage(1); }}
+        />
+        {customRange && (
+          <Button variant="outline" size="xs" className="h-8"
+                  onClick={() => { setHistQ({ from: null, to: null }); setPage(1); }}>
+            Clear range
+          </Button>
+        )}
         <Select value={ownerF || "__all"} onValueChange={(v) => { setOwnerF(v === "__all" ? "" : v); setPage(1); }}>
           <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -287,12 +348,26 @@ export function QueueTab({ app }: { app: AppRecord }) {
         </form>
       </div>
 
+      {/* Volume over time — below the filters that scope it, above the rows it
+          describes, matching the proxy Queue tab. The legend is display-only here: the
+          bucket tabs filter on coarse buckets ("failed" spans failed + timeout +
+          cancelled), so clicking a fine-grained status would filter wider than it says. */}
+      <RequestHistogram
+        counts={counts}
+        interval={interval}
+        series={APP_SERIES}
+        loading={loading}
+        onInterval={(i) => setHistQ({ interval: i === "auto" ? null : i })}
+        onBrush={(a, b) => { setHistQ({ from: a, to: b }); setPage(1); }}
+      />
+
       <div className="flex gap-1 border-b border-border">
         {(["all", ...BUCKET_ORDER] as const).map((b) => {
-          const count =
-            b === "all"
-              ? data?.items.length ?? 0
-              : data?.items.filter((i) => i.bucket === b).length ?? 0;
+          // From the server aggregate, not `data.items` (one page). Display buckets are
+          // coarser than the DB statuses, so each sums its members — see BUCKET_STATUSES.
+          const count = b === "all"
+            ? counts?.total ?? data?.items.length ?? 0
+            : BUCKET_STATUSES[b].reduce((n, s) => n + (counts?.by_status?.[s] ?? 0), 0);
           return (
             <button
               key={b}

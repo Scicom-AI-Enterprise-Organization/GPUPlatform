@@ -49,6 +49,8 @@ export async function GET(req: NextRequest) {
       sort: sp.get("sort") || undefined,
       order: sp.get("order") || undefined,
       requestId: sp.get("request_id") || undefined,
+      status: sp.get("status") || undefined,
+      sinceHours: Number(sp.get("since_hours")) || undefined,
     });
 
     const items: Item[] = rows.map((r) => ({
@@ -67,6 +69,9 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({
       app_id: appId,
+      // ⚠ Page-derived (this ONE page of ≤LIMIT rows), kept only for older callers.
+      // The Queue tab's tiles/tab-counts now come from /apps/{id}/request-counts,
+      // which aggregates server-side over the whole retained history.
       queue_length: items.filter((i) => i.bucket === "in queue").length,
       in_progress: items.filter((i) => i.bucket === "in progress").length,
       completed: items.filter((i) => i.bucket === "completed").length,

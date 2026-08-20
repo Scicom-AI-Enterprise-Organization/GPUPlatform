@@ -51,6 +51,11 @@ dependencies = [
     # so a venv that predates this line still boots (tracing just stays off).
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp-proto-http>=1.27",
+    # Correlation ids + outbound context propagation (the org's FastAPI observability
+    # boilerplate). Imported lazily behind GATEWAY_CORRELATION=1, so a venv predating
+    # this line still boots — correlation ids just stay off. The [httpx] extra is what
+    # injects traceparent/X-Correlation-ID on outgoing calls.
+    "wan[httpx] @ git+https://github.com/Scicom-AI-Enterprise-Organization/wan",
     # llm-benchmaq is the CLI we shell out to for benchmark runs. Public repo;
     # pulls in paramiko/scp/etc. Tracks @main so benchmaq fixes (e.g. hf download
     # for huggingface_hub>=1.0 / Gemma 4) ship on the next gateway image build.

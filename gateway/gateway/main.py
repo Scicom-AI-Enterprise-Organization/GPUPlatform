@@ -26,6 +26,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from . import metrics
 from . import accesslog
+from . import observability
 from .auth import (
     SECTIONS,
     create_session,
@@ -722,6 +723,7 @@ async def lifespan(app: FastAPI):
     from . import tracing
     tracing.start()
 
+
     # Warm the global-secret cache so sync credential resolvers (S3 key refs)
     # never see a cold cache before the first async load_global_env runs.
     try:
@@ -948,6 +950,23 @@ app = FastAPI(
     redoc_url=None,
     openapi_url="/openapi.json",
 )
+
+# Correlation ids + outbound propagation via `wan`. No-op unless GATEWAY_CORRELATION=1;
+# never fails startup. See gateway/observability.py.
+#
+# ⚠ MUST run here, at module scope — NOT from `lifespan`. `wan.patch()` calls
+# `app.add_middleware()`, and Starlette raises "Cannot add middleware after an
+# application has started" once the lifespan is running. The failure is soft (a warning,
+# correlation stays off) so it will not crash the gateway — it will just silently do
+# nothing, which is worse.
+#
+# ⚠ Order relative to logging is load-bearing: `wan.patch()` unconditionally
+# reconfigures the root logger and there is no flag to skip it. `lifespan` calls
+# `accesslog.init_root_logging()` later, which re-asserts the gateway's Loki field
+# schema over wan's. Move that call earlier than this and every log line silently
+# changes shape, breaking the SlurmUI-shared dashboards that query `durationMs`/`app_id`.
+observability.start(app)
+
 app.include_router(bench_module.router)
 app.include_router(compute_module.router)
 # JupyterLab reverse proxy for VM Compute sessions. Auth is the per-session
@@ -989,6 +1008,17 @@ async def metrics_mw(request: Request, call_next):
     # Stamp the id into the logging context so every module log line emitted
     # while handling this request carries it (see accesslog._RequestIdFilter).
     _rid_token = accesslog.request_id_var.set(request_id)
+    # The CROSS-SERVICE id. `request_id` is gateway-local and is deliberately
+    # overwritten below by whatever id the route considers actionable (`pxr-…`); the
+    # correlation id is stable for the whole call chain and is what the proxy forwards
+    # upstream, so a worker's logs join the gateway's under one value.
+    correlation_id = (
+        request.headers.get(observability.HEADER.lower())
+        or observability.correlation_id()
+        or observability.new_id()
+    )
+    request.state.correlation_id = correlation_id
+    _cid_token = accesslog.correlation_id_var.set(correlation_id)
     start = time.perf_counter()
     status_code = 500  # default if call_next raises before producing a response
     resp = None
@@ -1018,6 +1048,9 @@ async def metrics_mw(request: Request, call_next):
             request_id = existing
         else:
             resp.headers["x-request-id"] = request_id
+        # Echo the correlation id so a caller can quote it in a bug report and so a
+        # chain of services converges on one value instead of minting per hop.
+        resp.headers.setdefault(observability.HEADER, correlation_id)
         return resp
     finally:
         elapsed = time.perf_counter() - start
@@ -1057,6 +1090,7 @@ async def metrics_mw(request: Request, call_next):
             nbytes=nbytes,
         )
         accesslog.request_id_var.reset(_rid_token)
+        accesslog.correlation_id_var.reset(_cid_token)
 
 
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -4195,6 +4229,7 @@ async def list_app_requests(
     request_id: Optional[str] = None,
     sort: str = "created",   # created | latency | ttft
     order: str = "desc",     # asc | desc
+    since_hours: Optional[float] = None,
 ):
     """Recent requests for an app, newest first. Owner-scoped (admin sees all).
     Reconciles unsettled rows against Redis on the way out so the queue UI shows
@@ -4219,6 +4254,9 @@ async def list_app_requests(
             stmt = stmt.where(ReqRow.owner_id == (ou.id if ou else -1))  # -1 matches nothing
         if model:
             stmt = stmt.where(func.json_extract_path_text(ReqRow.payload, "model") == model)
+        if since_hours and since_hours > 0:
+            stmt = stmt.where(ReqRow.created_at
+                              >= datetime.now(timezone.utc) - timedelta(hours=float(since_hours)))
         if sort == "latency":
             # serverless latency = completed_at - created_at (no stored column); NULLs (still
             # running / never settled) sort last so the slowest completed rows lead.
@@ -4228,7 +4266,10 @@ async def list_app_requests(
             stmt = stmt.order_by(ReqRow.ttft_ms.asc().nulls_last() if order == "asc" else ReqRow.ttft_ms.desc().nulls_last())
         else:
             stmt = stmt.order_by(asc(ReqRow.created_at) if order == "asc" else desc(ReqRow.created_at))
-        stmt = stmt.offset(max(0, offset)).limit(min(limit, 200))
+        # 1000, not 200: the Queue tab pages within what it fetched, so the old cap made
+        # everything past row 200 unreachable by any amount of paging (the proxy-side
+        # list had the same bug). Counts NEVER come from a page — see /request-counts.
+        stmt = stmt.offset(max(0, offset)).limit(min(limit, 1000))
     result = await session.execute(stmt)
     rows = list(result.scalars().all())
 
@@ -4278,6 +4319,109 @@ async def list_app_requests(
         umap = {u.id: u.username for u in urows.scalars().all()}
 
     return [_to_request_record(r, umap.get(r.owner_id)) for r in rows]
+
+
+@app.get("/apps/{app_id}/request-counts")
+async def app_request_counts(
+    app_id: str,
+    user: User = Depends(require_section("inference")),
+    session: AsyncSession = Depends(get_session),
+    status_filter: Optional[str] = None,
+    owner: Optional[str] = None,
+    model: Optional[str] = None,
+    since_hours: Optional[float] = None,
+    bucket: Optional[str] = None,
+):
+    """Exact per-status counts over the WHOLE retained history, plus an optional
+    time series for the Queue tab's bar chart.
+
+    The inference-side mirror of `/proxy/{id}/request-counts` (see its docstring for
+    the full why): the Queue tab used to derive its stat tiles and bucket-tab counts
+    by counting statuses inside the one ≤200-row page it had fetched, which silently
+    reported "in the most recent page" as though it were a total. A count belongs in
+    a `GROUP BY`, not in the client.
+
+    Simpler than the proxy twin on purpose: app requests have no trace-store source,
+    and every admitted request inserts its row up front (`_admit_and_enqueue`), so
+    there is no in-flight overlay to add — the table already contains queued/running
+    rows. Caveat inherited from the list route: rows are settled lazily (orphans are
+    reconciled as pages are read), so a `queued` count can briefly include jobs that
+    already finished; the next list poll settles them.
+    """
+    await _load_owned_app(session, app_id, user)
+    from sqlalchemy import select, func
+    from datetime import datetime, timezone, timedelta
+
+    # Resolve the owner filter once (it needs an await, so it can't live in _apply).
+    # -1 matches nothing — same convention as the list route.
+    owner_id: Optional[int] = None
+    if owner:
+        ou = await get_user_by_username(session, owner)
+        owner_id = ou.id if ou else -1
+
+    def _apply(q):
+        q = q.where(ReqRow.app_id == app_id)
+        if status_filter:
+            q = q.where(ReqRow.status == status_filter)
+        if owner:
+            q = q.where(ReqRow.owner_id == owner_id)
+        if model:
+            q = q.where(func.json_extract_path_text(ReqRow.payload, "model") == model)
+        if since_hours and since_hours > 0:
+            q = q.where(ReqRow.created_at
+                        >= datetime.now(timezone.utc) - timedelta(hours=float(since_hours)))
+        return q
+
+    counts = {s: n for s, n in (await session.execute(
+        _apply(select(ReqRow.status, func.count())).group_by(ReqRow.status))).all()}
+
+    # Histogram interval — shares the proxy's ladder so the two Queue tabs behave
+    # identically (`auto` targets ~50 bars; see proxy_api._auto_bucket).
+    want = (bucket or "").strip().lower()
+    resolved: Optional[str] = None
+    secs: Optional[int] = None
+    buckets: list[dict] = []
+    dense_note: Optional[str] = None
+    axis_from: Optional[float] = None
+    axis_to: Optional[float] = None
+    if want:
+        now = datetime.now(timezone.utc)
+        span_s = float(since_hours or 0) * 3600.0
+        if span_s:
+            # An explicit window IS the axis — the chart spans the whole requested range
+            # even when traffic covers a fraction of it.
+            axis_from, axis_to = (now.timestamp() - span_s), now.timestamp()
+        else:
+            lo, hi = (await session.execute(
+                select(func.min(ReqRow.created_at), func.max(ReqRow.created_at))
+                .where(ReqRow.app_id == app_id))).one()
+            if lo and hi:
+                axis_from, axis_to = lo.timestamp(), hi.timestamp()
+                span_s = axis_to - axis_from
+        resolved = proxy_module._auto_bucket(span_s) if want == "auto" else want
+        secs = proxy_module._BUCKETS.get(resolved)
+        if secs is None:
+            raise HTTPException(status_code=400, detail={
+                "error": f"bucket={want!r} is not one of auto|{'|'.join(proxy_module._BUCKETS)}"})
+        span = func.to_timestamp(
+            func.floor(func.extract("epoch", ReqRow.created_at) / secs) * secs
+        ).label("ts")
+        # Keyed by epoch, not by a formatted string — see densify_buckets' note on why
+        # matching two independently-rendered ISO strings is fragile.
+        agg: dict[float, dict[str, int]] = {}
+        for ts, st, n in (await session.execute(
+                _apply(select(span, ReqRow.status, func.count()))
+                .group_by("ts", ReqRow.status).order_by("ts"))).all():
+            agg.setdefault(ts.timestamp(), {})[st] = n
+        buckets = [{"_epoch": e, "ts": datetime.fromtimestamp(e, timezone.utc).isoformat(),
+                    "total": sum(v.values()), "by_status": v}
+                   for e, v in sorted(agg.items())]
+        # Zero-fill empty periods so the x-axis is continuous (shared with the proxy twin).
+        buckets, dense_note = proxy_module.densify_buckets(buckets, secs, axis_from, axis_to)
+
+    return {"by_status": counts, "total": sum(counts.values()), "buckets": buckets,
+            "bucket": resolved, "bucket_seconds": secs, "bucket_requested": want or None,
+            "source": "db", "exact": True, "note": dense_note}
 
 
 @app.get("/apps/{app_id}/request-facets")

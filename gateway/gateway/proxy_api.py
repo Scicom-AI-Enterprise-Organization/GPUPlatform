@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, delete, func, select
@@ -514,12 +514,41 @@ class EvalRedTeamResponse(BaseModel):
 
 # ---------- app.state accessors ---------------------------------------------
 
+async def _stamp_correlation(request: httpx.Request) -> None:
+    """Carry the caller's ids onto every upstream hop.
+
+    Registered as an httpx request event hook on the SHARED proxy client, which is the
+    single choke point for upstream calls — the ~15 sites in this module that build a
+    `headers = {...}` dict for an upstream request all go through here, so propagation
+    cannot be forgotten by a new call site.
+
+    Three headers, each for a different consumer:
+      * `traceparent`/`baggage` — W3C context, so the upstream's spans become children
+        of the gateway's and Tempo shows one trace end to end;
+      * `X-Correlation-ID` — the cross-service id upstream logs key on;
+      * `X-Request-Id` — the gateway-local id, already what the Queue tab filters by.
+
+    `headers.setdefault`-style guards keep an explicitly-set header authoritative.
+    Never raises: telemetry must not fail a proxied request.
+    """
+    try:
+        from . import observability
+        from .accesslog import request_id_var
+        observability.inject(request.headers)
+        rid = request_id_var.get()
+        if rid and "x-request-id" not in request.headers:
+            request.headers["x-request-id"] = rid
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _http(app) -> httpx.AsyncClient:
     cli = getattr(app.state, "proxy_http", None)
     if cli is None:
         cli = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=10.0),
             follow_redirects=True,
+            event_hooks={"request": [_stamp_correlation]},
         )
         app.state.proxy_http = cli
     return cli
@@ -4308,12 +4337,299 @@ async def proxy_request_facets(proxy_id: str, user: User = Depends(require_admin
             "trace_ui": bool(os.environ.get("TRACE_UI_URL"))}
 
 
+# Histogram intervals, coarsest-last. The ladder is what `bucket=auto` walks to keep the
+# bar count near _AUTO_TARGET — the same trick Kibana's "Auto interval" plays, and the
+# reason its chart stays readable from "last 15 minutes" to "last 5 years".
+_BUCKETS: dict[str, int] = {
+    "1s": 1, "5s": 5, "10s": 10, "30s": 30,
+    "1m": 60, "5m": 300, "10m": 600, "30m": 1800,
+    "1h": 3600, "3h": 10800, "6h": 21600, "12h": 43200,
+    "1d": 86400, "1w": 604800, "30d": 2592000,
+}
+_AUTO_TARGET = 50          # bars to aim for; Kibana targets a similar count
+
+
+# A dense series is one bar per interval whether or not anything happened, so a pinned
+# interval over a long range can ask for an unbounded number of bars (30 days at `1m` is
+# 43,200). `auto` never does this, but an explicit choice can, and the browser renders one
+# element per bar — so cap it and say so rather than shipping a 40k-element response.
+_MAX_BUCKETS = 1000
+
+
+def parse_ts(v: Optional[str]) -> Optional[datetime]:
+    """One window bound: ISO 8601, or epoch seconds. None/blank → None.
+
+    Both spellings are accepted because both arrive: the UI writes ISO into the address
+    bar (readable, shareable), while scripts and the chart's own arithmetic hold epochs.
+    A bad value is a 400 rather than a silent full-range scan — the whole point of the
+    bound is to limit the query.
+    """
+    if v is None or not str(v).strip():
+        return None
+    s = str(v).strip()
+    try:
+        return datetime.fromtimestamp(float(s), timezone.utc)
+    except ValueError:
+        pass
+    s = s.replace("Z", "+00:00")
+    # An unencoded `+` in a query string arrives as a space, so `…T00:00:00+00:00` becomes
+    # `…T00:00:00 00:00`. The values we hand out in `axis_from`/`axis_to` carry that offset,
+    # so anything pasting one back without encoding hits it. Cheap to accept.
+    s = re.sub(r" (\d{2}:\d{2})$", r"+\1", s)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={
+            "error": f"not a timestamp: {v!r} — use ISO 8601 or epoch seconds"}) from e
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def resolve_window(since_hours: Optional[float], frm: Optional[str], to: Optional[str],
+                   ) -> tuple[Optional[datetime], Optional[datetime]]:
+    """The (start, end) the query and the chart axis must agree on.
+
+    Absolute `from`/`to` WIN over `since_hours`: they are what drag-to-select on the
+    histogram produces, and a relative window left over in the URL would otherwise keep
+    overriding the range the user just drew.
+    """
+    a, b = parse_ts(frm), parse_ts(to)
+    if a or b:
+        return a, b
+    if since_hours and since_hours > 0:
+        now = datetime.now(timezone.utc)
+        return now - timedelta(hours=float(since_hours)), now
+    return None, None
+
+
+def densify_buckets(buckets: list[dict], secs: int,
+                    start_epoch: Optional[float], end_epoch: Optional[float]
+                    ) -> tuple[list[dict], Optional[str]]:
+    """Fill gaps with zero-count buckets so the x-axis is continuous.
+
+    `GROUP BY` only emits periods that HAVE rows, so a month with traffic on two days
+    returns two bars — adjacent on screen, implying two consecutive periods. The gaps have
+    to be materialised or the axis misrepresents when the traffic happened.
+
+    `start_epoch`/`end_epoch` bound the axis: with `since_hours` they are the requested
+    window (so the chart shows the whole "last 30 days" even if data covers two of them);
+    without it, the first and last row. Returns `(buckets, note)`.
+    """
+    # `_epoch` is an internal join key. Every early return has to strip it too, or it
+    # leaks into the API response on exactly the paths that skip the rebuild below.
+    def _clean(bs):
+        return [{"ts": b["ts"], "total": b["total"], "by_status": b["by_status"]} for b in bs]
+
+    if not secs or start_epoch is None or end_epoch is None:
+        return _clean(buckets), None
+    first = math.floor(start_epoch / secs) * secs
+    last = math.floor(end_epoch / secs) * secs
+    if last < first:
+        return _clean(buckets), None
+    n = int((last - first) / secs) + 1
+    if n > _MAX_BUCKETS:
+        return _clean(buckets), (
+            f"{n} intervals in range exceeds the {_MAX_BUCKETS}-bar cap — empty periods "
+            f"are omitted; choose a coarser interval or Auto")
+    # Key by epoch, not by the formatted string: the SQL side formats via the session's
+    # timezone, and matching two independently-rendered ISO strings is how an off-by-one
+    # offset turns into a chart of all zeros.
+    have = {int(b["_epoch"]): b for b in buckets}
+    out = []
+    for i in range(n):
+        t = int(first + i * secs)
+        b = have.get(t)
+        out.append({"ts": b["ts"], "total": b["total"], "by_status": b["by_status"]} if b
+                   else {"ts": datetime.fromtimestamp(t, timezone.utc).isoformat(),
+                         "total": 0, "by_status": {}})
+    return out, None
+
+
+def _auto_bucket(span_seconds: float) -> str:
+    """Coarsest interval that keeps the bar count at or under `_AUTO_TARGET`.
+
+    Picking a FIXED interval instead is what makes a histogram useless at one end of the
+    range or the other: 1h buckets over a year is 8,760 bars, and over 10 minutes it is
+    one. Falls back to the coarsest rung rather than raising, so an absurd span still
+    renders something.
+    """
+    if span_seconds <= 0:
+        return "1m"
+    for key, secs in _BUCKETS.items():          # dict preserves insertion order
+        if span_seconds / secs <= _AUTO_TARGET:
+            return key
+    return next(reversed(_BUCKETS))
+
+
+@router.get("/{proxy_id}/request-counts")
+async def proxy_request_counts(proxy_id: str, request: Request,
+                               owner: Optional[str] = None, upstream: Optional[str] = None,
+                               status: Optional[str] = None,
+                               since_hours: Optional[float] = None,
+                               frm: Optional[str] = Query(None, alias="from"),
+                               to: Optional[str] = None,
+                               bucket: Optional[str] = None,
+                               source: Optional[str] = None,
+                               user: User = Depends(require_admin),  # noqa: ARG001
+                               session: AsyncSession = Depends(get_session)):
+    """Exact per-status counts over the WHOLE retained history, plus an optional
+    time series for the Queue tab's bar chart.
+
+    **Why this endpoint exists.** The Queue tab used to derive its stat tiles by
+    counting statuses inside the one page of rows it had fetched
+    (`reqs.filter(r => r.status === s).length` over a 200-row page). On an endpoint with
+    302 rows and 174 of them blocked, that rendered "Blocked 112" — the tile silently
+    reported "blocked within the most recent 200 requests", which is not a number anyone
+    would ask for, and the 102 older rows were unreachable by any amount of paging.
+    A count belongs in a `GROUP BY`, not in the client.
+
+    `total` is what the pager needs to page the full set rather than one slice.
+
+    ⚠ **`exact` is part of the contract.** Postgres answers precisely. The trace store
+    cannot: `trace_store`'s TraceQL mapping is deliberately narrow (no aggregation), so
+    a trace-sourced answer is a floor derived from the spans it can fetch, flagged
+    `exact: false` with a note. Rendering an approximate count as though it were exact
+    is the same class of mistake this endpoint exists to fix.
+    """
+    row = await session.get(ProxyEndpoint, proxy_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="proxy endpoint not found")
+    src = (source or "").strip().lower() or _history_source()
+    want = (bucket or "").strip().lower()
+
+    # Live (in-flight) requests exist in NEITHER store — same overlay rule the list uses,
+    # or "In queue" reads 0 while requests are visibly running.
+    live_overlay = [r for r in await _live_records(request.app, proxy_id)
+                    if _matches_filters(r, owner, upstream, status, None)]
+    live_counts: dict[str, int] = {}
+    for r in live_overlay:
+        live_counts[r["status"]] = live_counts.get(r["status"], 0) + 1
+
+    if src == "trace":
+        counts, note = await trace_store.count_requests(
+            proxy_id, owner=owner, upstream=upstream, status=status,
+            since_hours=since_hours)
+        for k, v in live_counts.items():
+            counts[k] = counts.get(k, 0) + v
+        return {"by_status": counts, "total": sum(counts.values()), "buckets": [],
+                "source": "trace", "exact": False, "store": REQUEST_STORE,
+                "window_hours": trace_store.WINDOW_H,
+                "note": note or ("the trace store cannot aggregate; these are a floor "
+                                 "from the spans that could be fetched")}
+
+    q = select(ProxyRequest.status, func.count()).where(ProxyRequest.endpoint_id == proxy_id)
+    if owner:
+        ou = await get_user_by_username(session, owner)
+        q = q.where(ProxyRequest.owner_id == (ou.id if ou else -1))
+    if upstream:
+        q = q.where(ProxyRequest.upstream == upstream)
+    if status:
+        q = q.where(ProxyRequest.status == status)
+    # One window for the counts, the histogram AND the axis — resolved once so a brushed
+    # range can never disagree with the bars drawn over it.
+    win_from, win_to = resolve_window(since_hours, frm, to)
+    if win_from:
+        q = q.where(ProxyRequest.created_at >= win_from)
+    if win_to:
+        q = q.where(ProxyRequest.created_at <= win_to)
+    counts = {s: n for s, n in (await session.execute(q.group_by(ProxyRequest.status))).all()}
+    if REQUEST_STORE != "all":
+        # Partial storage: in-flight rows may not exist yet, so overlay them (in `all`
+        # mode every request already has a row and adding the overlay would double-count).
+        for k, v in live_counts.items():
+            counts[k] = counts.get(k, 0) + v
+
+    # Resolve the histogram interval. `auto` needs the actual span, so when the caller
+    # gave no `since_hours` we ask the table how far back its rows go — otherwise "all
+    # time" would silently get the finest interval and thousands of bars.
+    resolved: Optional[str] = None
+    secs: Optional[int] = None
+    axis_from: Optional[float] = None
+    axis_to: Optional[float] = None
+    if want:
+        # An explicit window IS the axis, so the chart spans the whole requested range
+        # even when traffic covers a fraction of it. Only a fully open window falls back
+        # to the extent of the data.
+        if win_from or win_to:
+            axis_from = (win_from or datetime.now(timezone.utc)).timestamp()
+            axis_to = (win_to or datetime.now(timezone.utc)).timestamp()
+            if not win_from:
+                lo = (await session.execute(
+                    select(func.min(ProxyRequest.created_at))
+                    .where(ProxyRequest.endpoint_id == proxy_id))).scalar()
+                axis_from = lo.timestamp() if lo else axis_to
+        else:
+            lo, hi = (await session.execute(
+                select(func.min(ProxyRequest.created_at), func.max(ProxyRequest.created_at))
+                .where(ProxyRequest.endpoint_id == proxy_id))).one()
+            if lo and hi:
+                axis_from, axis_to = lo.timestamp(), hi.timestamp()
+        span_s = (axis_to - axis_from) if (axis_from is not None and axis_to is not None) else 0.0
+        resolved = _auto_bucket(span_s) if want == "auto" else want
+        secs = _BUCKETS.get(resolved)
+        if secs is None:
+            raise HTTPException(status_code=400, detail={
+                "error": f"bucket={want!r} is not one of auto|{'|'.join(_BUCKETS)}"})
+
+    buckets: list[dict] = []
+    dense_note: Optional[str] = None
+    if secs:
+        # date_bin would be cleaner but needs PG14+; to_timestamp(floor(epoch/n)*n) works
+        # everywhere and is index-friendly enough at this table's size.
+        span = func.to_timestamp(
+            func.floor(func.extract("epoch", ProxyRequest.created_at) / secs) * secs
+        ).label("ts")
+        bq = select(span, ProxyRequest.status, func.count()).where(
+            ProxyRequest.endpoint_id == proxy_id)
+        if owner:
+            ou = await get_user_by_username(session, owner)
+            bq = bq.where(ProxyRequest.owner_id == (ou.id if ou else -1))
+        if upstream:
+            bq = bq.where(ProxyRequest.upstream == upstream)
+        if status:
+            bq = bq.where(ProxyRequest.status == status)
+        if win_from:
+            bq = bq.where(ProxyRequest.created_at >= win_from)
+        if win_to:
+            bq = bq.where(ProxyRequest.created_at <= win_to)
+        agg: dict[float, dict[str, int]] = {}
+        for ts, st, n in (await session.execute(
+                bq.group_by("ts", ProxyRequest.status).order_by("ts"))).all():
+            agg.setdefault(ts.timestamp(), {})[st] = n
+        buckets = [{"_epoch": e, "ts": datetime.fromtimestamp(e, timezone.utc).isoformat(),
+                    "total": sum(v.values()), "by_status": v}
+                   for e, v in sorted(agg.items())]
+        buckets, dense_note = densify_buckets(buckets, secs, axis_from, axis_to)
+
+    note = dense_note
+    if REQUEST_STORE != "all":
+        store_note = (f"PROXY_REQUEST_STORE={REQUEST_STORE}: Postgres holds only part of "
+                      f"this endpoint's history")
+        note = f"{note}; {store_note}" if note else store_note
+
+    return {"by_status": counts, "total": sum(counts.values()), "buckets": buckets,
+            # `bucket` is what was RESOLVED, not what was asked for — the UI renders it
+            # ("interval: Auto — 3h"), so echoing the literal "auto" back would leave the
+            # chart's x-axis unexplained.
+            "bucket": resolved, "bucket_seconds": secs, "bucket_requested": want or None,
+            "source": "db", "exact": True, "store": REQUEST_STORE,
+            "window_hours": since_hours, "note": note,
+            # The window actually drawn. The brush converts a pixel offset back into a
+            # timestamp against THESE, so they must be the server's resolved bounds and
+            # not the client's guess — an open-ended request resolves against the data.
+            "axis_from": (datetime.fromtimestamp(axis_from, timezone.utc).isoformat()
+                          if axis_from is not None else None),
+            "axis_to": (datetime.fromtimestamp(axis_to, timezone.utc).isoformat()
+                        if axis_to is not None else None)}
+
+
 @router.get("/{proxy_id}/requests", response_model=list[ProxyRequestRecord])
 async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offset: int = 0,
                          owner: Optional[str] = None, upstream: Optional[str] = None,
                          status: Optional[str] = None, sort: str = "created", order: str = "desc",
                          request_id: Optional[str] = None, source: Optional[str] = None,
                          since_hours: Optional[float] = None,
+                         frm: Optional[str] = Query(None, alias="from"),
+                         to: Optional[str] = None,
                          response: Response = None,  # type: ignore[assignment]
                          user: User = Depends(require_admin),  # noqa: ARG001
                          session: AsyncSession = Depends(get_session)):
@@ -4338,7 +4654,7 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offse
         try:
             traced, note = await trace_store.search_requests(
                 proxy_id, owner=owner, upstream=upstream, status=status,
-                request_id=request_id, limit=min(limit, 200), offset=max(0, offset),
+                request_id=request_id, limit=min(max(1, limit), 1000), offset=max(0, offset),
                 sort=sort, order=order, since_hours=since_hours)
         except trace_store.TraceStoreError as e:
             # Deliberately a 502, not an empty list: "no requests" and "the trace
@@ -4383,12 +4699,25 @@ async def proxy_requests(proxy_id: str, request: Request, limit: int = 50, offse
             q = q.where(ProxyRequest.upstream == upstream)
         if status:
             q = q.where(ProxyRequest.status == status)
+        # Same window the chart is drawn from, so brushing a range on the histogram
+        # narrows the TABLE too — a chart that filters only itself is a decoration.
+        win_from, win_to = resolve_window(since_hours, frm, to)
+        if win_from:
+            q = q.where(ProxyRequest.created_at >= win_from)
+        if win_to:
+            q = q.where(ProxyRequest.created_at <= win_to)
         col = ProxyRequest.latency_ms if sort == "latency" else ProxyRequest.created_at
         direction = col.asc() if order == "asc" else col.desc()
         # latency is NULL while queued/running — keep those out of a latency sort's way
         q = q.order_by(direction.nulls_last() if sort == "latency" else direction)
+        # `offset` is honoured against the FULL result set, so a client can page through
+        # every matching row. The cap is per PAGE, not a ceiling on what is reachable —
+        # it used to be min(limit, 200) while the UI also paginated client-side inside
+        # that one page, which made 102 of this endpoint's 302 rows unreachable by any
+        # means and made the status tiles count "within the last 200" (see
+        # /request-counts). Raised to 1000 so a page can be large when asked for.
         rows = (await session.execute(
-            q.offset(max(0, offset)).limit(min(limit, 200))
+            q.offset(max(0, offset)).limit(min(max(1, limit), 1000))
         )).scalars().all()
     owner_ids = {r.owner_id for r in rows if r.owner_id is not None}
     owners: dict[int, str] = {}

@@ -1929,6 +1929,46 @@ export type ProxyRequest = {
  * what serves it once PROXY_REQUEST_STORE stops keeping a row per request. */
 export type ProxyHistorySource = "db" | "trace";
 
+/** One histogram bar: a time bucket, its total, and the per-status breakdown. */
+export type ProxyRequestBucket = {
+  ts: string;
+  total: number;
+  by_status: Record<string, number>;
+};
+
+export type ProxyRequestCounts = {
+  /** Exact per-status counts over the whole retained history (subject to filters). */
+  by_status: Record<string, number>;
+  total: number;
+  buckets: ProxyRequestBucket[];
+  /** The interval actually USED — `bucket=auto` resolves to a real rung ("3h"). */
+  bucket?: string | null;
+  bucket_seconds?: number | null;
+  /** What the caller asked for, so the UI can render "Auto (3h)" vs a pinned "3h". */
+  bucket_requested?: string | null;
+  source?: ProxyHistorySource;
+  /**
+   * False when the count is a floor rather than a total (trace store: no aggregation,
+   * bounded by a fetch cap). Render approximate counts as approximate.
+   */
+  exact?: boolean;
+  store?: string;
+  window_hours?: number | null;
+  note?: string | null;
+  /**
+   * The window actually drawn, resolved server-side (an open-ended request resolves
+   * against the extent of the data). Drag-to-select maps a pixel offset back to a
+   * timestamp against these — the client's own idea of the window would be wrong for
+   * every request that didn't specify one.
+   */
+  axis_from?: string | null;
+  axis_to?: string | null;
+};
+
+/** Same wire shape, served by `/apps/{id}/request-counts` — the inference-queue mirror
+ * (always `source: "db"`, always exact; app requests have no trace-store source). */
+export type AppRequestCounts = ProxyRequestCounts;
+
 export type ProxyRequestFacets = {
   users: string[];
   upstreams: string[];

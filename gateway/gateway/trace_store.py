@@ -260,6 +260,35 @@ async def search_requests(endpoint_id: str, *, owner: Optional[str] = None,
     return page, note
 
 
+async def count_requests(endpoint_id: str, *, owner: Optional[str] = None,
+                         upstream: Optional[str] = None, status: Optional[str] = None,
+                         since_hours: Optional[float] = None
+                         ) -> tuple[dict[str, int], Optional[str]]:
+    """Per-status counts from the trace store — a **floor, not a total**.
+
+    Tempo has no GROUP BY reachable through this module's deliberately narrow TraceQL
+    mapping, so the only way to count is to fetch spans and tally them, which is bounded
+    by `MAX_FETCH` (default 500). On a busier window than that the answer is "at least
+    this many", and the caller MUST surface that: the endpoint this feeds exists
+    precisely because a count that silently meant "within the rows I happened to fetch"
+    was being rendered as a total.
+
+    Returns `(counts, note)`; `note` is non-None whenever the cap was hit.
+    """
+    window = since_hours if since_hours is not None else WINDOW_H
+    q = build_query(endpoint_id, owner=owner, upstream=upstream, status=status)
+    rows = await _search(q, limit=MAX_FETCH, since_hours=window)
+    counts: dict[str, int] = {}
+    for r in rows:
+        st = str(r.get("status") or "unknown")
+        counts[st] = counts.get(st, 0) + 1
+    note = f"from traces, last {window:g}h"
+    if len(rows) >= MAX_FETCH:
+        note += (f" — AT LEAST these counts: the {MAX_FETCH}-trace fetch cap was hit, "
+                 f"so older requests in the window are not included")
+    return counts, note
+
+
 async def facet_users(endpoint_id: str, since_hours: Optional[float] = None) -> list[str]:
     """Distinct `sgpu.owner` values for one endpoint — the Queue tab's user filter.
     Tempo answers this natively (tag values scoped by a TraceQL filter), so it is one

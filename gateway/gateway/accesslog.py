@@ -47,12 +47,40 @@ _LOGGER = logging.getLogger("gateway.access")
 # the handler, so background work started per-request stays correlated.
 request_id_var: ContextVar[Optional[str]] = ContextVar("gateway_request_id", default=None)
 
+# The CROSS-SERVICE id, as opposed to request_id_var which is gateway-local. Set by
+# metrics_mw from an inbound `X-Correlation-ID` (or minted), and forwarded to upstream
+# workers by the proxy, so one id spans the gateway AND whatever it called. Kept here
+# rather than read from `observability` so this module keeps working when `wan` is
+# absent — a log field must never depend on an optional wheel.
+correlation_id_var: ContextVar[Optional[str]] = ContextVar("gateway_correlation_id", default=None)
+
 
 class _RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         rid = request_id_var.get()
         record.request_id = f" [{rid}]" if rid else ""
         return True
+
+
+def trace_ids() -> tuple[Optional[str], Optional[str]]:
+    """`(traceID, spanID)` of the active OTel span as lowercase hex, else `(None, None)`.
+
+    Why these are on every log line: Grafana's Tempo→Loki "trace to logs" link matches on
+    a `traceID` field. Without it you can still find a request's logs by `requestId`, but
+    only by reading the id off the span and hand-writing the LogQL query — the one-click
+    path from a trace to its logs needs this field to exist.
+
+    Never raises and never imports at module scope: the OTel wheels are optional (see
+    `tracing.py`), and a missing one must cost a log field, not the log line.
+    """
+    try:
+        from opentelemetry import trace
+        ctx = trace.get_current_span().get_span_context()
+        if not ctx or not ctx.is_valid:
+            return None, None
+        return f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"
+    except Exception:  # noqa: BLE001
+        return None, None
 
 
 class _JsonLogFormatter(logging.Formatter):
@@ -73,12 +101,16 @@ class _JsonLogFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         rid = request_id_var.get()
+        tid, sid = trace_ids()
         rec = {
             "service": "gateway",
             "kind": "app_log",
             "level": record.levelname.lower().replace("warning", "warn"),
             "logger": record.name,
             "requestId": rid,
+            "correlationId": correlation_id_var.get(),
+            "traceID": tid,
+            "spanID": sid,
             "time": int(record.created * 1000),
             "msg": record.getMessage(),
         }
@@ -226,6 +258,7 @@ def log_request(
     URL for drill-down."""
     status_class = f"{status // 100}xx"
     if _JSON:
+        tid, sid = trace_ids()
         rec = {
             "service": "gateway",
             "kind": "http_access",
@@ -238,6 +271,11 @@ def log_request(
             "durationMs": round(duration_ms, 3),
             "app_id": app_id,
             "requestId": request_id,
+            # ⚠ Additive only — every existing field keeps its name and type, because
+            # SlurmUI's Grafana dashboards query this schema (`| json | durationMs > 1000`).
+            "correlationId": correlation_id_var.get(),
+            "traceID": tid,
+            "spanID": sid,
             "ip": ip,
             "bytes": nbytes,
             "time": int(time.time() * 1000),

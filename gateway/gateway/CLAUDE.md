@@ -298,6 +298,89 @@ card for ingress runs). The row value wins over config in `_bench_gpu_meta`; `Be
 `public-compare` now carry resolved top-level `gpu_type`/`gpu_count` so nobody has to parse
 `config_yaml`.
 
+### Queue tab counts + histogram (`/request-counts`) — never count inside a page
+
+`GET /v1/proxy/{id}/request-counts` aggregates server-side: exact `by_status`, `total`, and
+an optional time series for the bar chart. It exists because the Queue tab used to derive
+its stat tiles with `reqs.filter(r => r.status === s).length` over the one page it had
+fetched. On an endpoint with **302 rows of which 174 were blocked, the Blocked tile read
+112** — it silently meant "blocked within the most recent 200 requests", and the older 102
+rows were unreachable by any amount of paging (`limit: 200` hardcoded client-side, server
+capped at `min(limit, 200)`, then the pager sliced *within* that page; the status filter
+was client-side too).
+
+Rules that keep it honest:
+
+- **Counts come from the server; `reqs` is ONE page.** The pager's total must also match
+  the FILTERED set — with a status filter active it reads `by_status[filter]`, not `total`,
+  or it offers pages that don't exist.
+- **Status filter and paging are both server-side now.** `offset` is honoured against the
+  full result set; the per-page cap (1000) bounds a page, not what is reachable.
+- ⚠ **`exact` is part of the response contract.** Postgres answers precisely; the trace
+  store cannot (no aggregation through `trace_store`'s narrow TraceQL mapping), so
+  `count_requests` returns a **floor** bounded by `MAX_FETCH` with `exact: false` and a
+  note. The UI renders "(at least — approximate)". Showing an approximate count as exact
+  is the same bug this endpoint was built to remove.
+- **`bucket=auto` resolves on the SERVER** (`_auto_bucket`, ~50 bars, Kibana-style ladder)
+  because only the server knows the real span when no `since_hours` is given. The response
+  echoes the RESOLVED interval, not `"auto"` — the chart labels its axis from it.
+- **`ix_proxy_req_endpoint_status` is load-bearing, not an optimisation.** Without it the
+  GROUP BY is a Seq Scan (verified on the plan) and the tab POLLS it, so every open tab
+  re-scans the table on an interval. With `PROXY_REQUEST_RETENTION_DAYS=0` (the default,
+  keep forever) the table only grows. ⚠ An indexed count is still O(matching rows) — at
+  high volume the next step is a rollup table written by `stats_writer`, or moving the
+  chart to the `proxy_requests_total{proxy,model,upstream,status}` Prometheus counter that
+  already exists. A bigger index is not the answer.
+
+### Correlation ids (`observability.py`, via `wan`) — one id across Tempo, Loki and upstreams
+
+`wan` is the org's FastAPI observability boilerplate. It is layered **under** the gateway's
+own telemetry, not over it: `observability.start(app)` calls `wan.patch()` with
+`enable_prometheus_metrics` / `enable_health_endpoints` / `enable_scalar_doc` /
+`enable_request_log` all **off**, because `metrics.py`, `main.py` and `accesslog.py` already
+own those. What we take is the correlation id and its outbound propagation. OFF unless
+`GATEWAY_CORRELATION=1`; a missing wheel degrades to a no-op plus one log line, same
+contract as `tracing.py`.
+
+The chain, and the four places the id has to appear for it to be worth anything:
+
+1. **`metrics_mw`** reuses an inbound `X-Correlation-ID` or mints `cid-…`, sets
+   `accesslog.correlation_id_var`, and echoes the header on the response.
+2. **Log lines** (`accesslog`) gained `correlationId` + `traceID` + `spanID`, **additively** —
+   every pre-existing field keeps its name and type because SlurmUI's dashboards query this
+   schema (`| json | durationMs > 1000`).
+3. **The proxy span** gained `sgpu.correlation.id`, so a Tempo search can start from a value
+   that also appears in Loki and upstream, not just the gateway-local `sgpu.request.id`.
+4. **Upstream calls** get `traceparent` + `X-Correlation-ID` + `X-Request-Id` stamped by
+   `proxy_api._stamp_correlation`, an httpx event hook on the **shared** client — the single
+   choke point, so the ~15 sites that build a `headers = {...}` dict cannot forget it.
+
+**Three things here are load-bearing and easy to undo by accident:**
+
+- ⚠ **`wan.patch()` unconditionally reconfigures the root logger** — there is no flag to skip
+  it. `main.py` therefore re-asserts `accesslog.init_root_logging()` *after*
+  `observability.start(app)`. Swap the order and every log line silently changes shape.
+- ⚠ **`observability.correlation_id()` must read `accesslog.correlation_id_var`, not only
+  wan's contextvar.** `GATEWAY_CORRELATION` defaults to OFF, and in that mode `metrics_mw`
+  still mints an id — a wan-only lookup returns None and upstream propagation silently stops
+  happening in the configuration that actually runs. Same reason `inject()` sets the header
+  itself rather than relying on `propagate.inject`.
+- ⚠ **`tracing.start_request` must only adopt an extracted context when it carries a valid
+  span.** `extract()` on headers with no `traceparent` returns an EMPTY context, and
+  `start_span(context=<empty>)` starts a **new root trace** instead of inheriting the ambient
+  HTTP server span. That put the proxy span in a different trace from the log lines, so going
+  from a Tempo trace to its Loki logs returned nothing — the exact workflow this exists for.
+  Pinned by `tests/unit/test_correlation.py`.
+
+**No provider conflict exists, by design.** `tracing.py` deliberately does *not* call
+`set_tracer_provider()` — it keeps a private provider so its `_PolicyProcessor` tail sampler
+(keep every failure, ratio-sample successes) is not replaced by wan's head sampler. wan owns
+the global provider. Do not "simplify" these into one provider.
+
+`OTLP_ENDPOINT` (wan's) is separate from `OTEL_EXPORTER_OTLP_ENDPOINT` (ours). Leave wan's
+unset unless you want its HTTP spans in Tempo too — trace ids are generated either way, which
+is all the log↔trace link needs.
+
 ### Proxy request tracing (OTLP → Tempo) + where the request RECORD lives
 
 `tracing.py` (write) + `trace_store.py` (read) + `PROXY_REQUEST_STORE` (how much Postgres

@@ -1253,7 +1253,46 @@ async def init_db() -> None:
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_endpoint_latency ON proxy_requests (endpoint_id, latency_ms)",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_owner ON proxy_requests (owner_id)",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_upstream ON proxy_requests (endpoint_id, upstream)",
+        # Serves the Queue tab's per-status COUNTs (`/request-counts`) as an index-only
+        # scan. Without it that GROUP BY is a Seq Scan of the whole table — verified on
+        # the plan — and the tab POLLS it, so every open tab would re-scan on an
+        # interval. Load-bearing while PROXY_REQUEST_RETENTION_DAYS=0 (keep forever):
+        # the table only grows, so an unindexed aggregate degrades without limit.
+        # ⚠ At very high volume even this stops being enough — counting index entries is
+        # O(matching rows). The next step is a rollup table written by `stats_writer`,
+        # not a bigger index.
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_endpoint_status ON proxy_requests (endpoint_id, status)",
+        # The TIME-WINDOWED counts + histogram (`/request-counts?since_hours=…`; the Queue
+        # tab now defaults to 7 days rather than all time). Column order matters: equality
+        # on endpoint_id, RANGE on created_at, `status` last so the GROUP BY key comes off
+        # the index.
+        #
+        # Measured on 2M rows / 20 endpoints / 90 days — "one endpoint, last 7 days":
+        #     no index                             51 ms   (parallel seq scan)
+        #     (created_at)  ← pre-existing        223 ms   ** worse than no index **
+        #     (endpoint_id, status)               114 ms
+        #     (endpoint_id, created_at, status)    15 ms   ← this one
+        #
+        # ⚠ The 223 ms line is why this index is not optional. `ix_proxy_requests_created_at`
+        # is the plan Postgres actually picks for a windowed count when nothing better
+        # exists (verified with EXPLAIN), and it is SLOWER than a seq scan: it bitmaps every
+        # row in the window across ALL endpoints, then throws away the ones that don't match.
+        # (endpoint_id, status) can't bound the range at all, so its cost grows with total
+        # history rather than with the window.
+        #
+        # Not an index-only scan — count(*) still needs visibility checks, so the plan is a
+        # bitmap heap scan. The win is in how few heap blocks it has to touch.
+        # Also covers the histogram, whose bucket expression cannot be indexed but whose
+        # WHERE clause is exactly this.
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_proxy_req_endpoint_created_status ON proxy_requests (endpoint_id, created_at, status)",
+        # Same shape for the inference queue's own table (`/apps/{id}/request-counts`).
+        # `ix_requests_app_created` covers the list's ORDER BY; this adds `status` so the
+        # windowed aggregate stays index-only too.
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requests_app_created_status ON requests (app_id, created_at, status)",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requests_app_created ON requests (app_id, created_at DESC)",
+        # Inference-side twin of ix_proxy_req_endpoint_status, for the same reason:
+        # `/apps/{id}/request-counts` GROUP BYs status per app and the Queue tab polls it.
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_requests_app_status ON requests (app_id, status)",
     )
     import logging as _logging
     # AUTOCOMMIT engine variant (AsyncEngine.execution_options is sync, returns an

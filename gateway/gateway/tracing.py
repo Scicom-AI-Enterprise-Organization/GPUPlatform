@@ -246,7 +246,19 @@ def start_request(request_id: str, *, endpoint_id: str, endpoint_name: Optional[
         if headers:
             try:
                 from opentelemetry.propagate import extract
-                ctx = extract(dict(headers))
+                from opentelemetry.trace import get_current_span
+                extracted = extract(dict(headers))
+                # ⚠ Only adopt the extracted context if it actually carried a span.
+                # `extract()` on headers WITHOUT a traceparent returns an EMPTY context,
+                # and `start_span(context=<empty>)` starts a NEW ROOT TRACE — it does not
+                # fall back to the ambient span. That silently broke the Tempo↔Loki link:
+                # the log lines carry the ambient trace id (from the HTTP server span)
+                # while this span landed in a different trace, so "find this request's
+                # logs" from a trace returned nothing. Passing None inherits the ambient
+                # span instead, which is what we want whenever the caller sent no
+                # traceparent of their own.
+                if get_current_span(extracted).get_span_context().is_valid:
+                    ctx = extracted
             except Exception:  # noqa: BLE001 — a malformed traceparent is the client's bug
                 ctx = None
         from opentelemetry.trace import SpanKind
@@ -256,6 +268,15 @@ def start_request(request_id: str, *, endpoint_id: str, endpoint_name: Optional[
         )
         _set(span, "sgpu.request.id", request_id)
         _set(span, "sgpu.request.kind", "proxy")
+        # The cross-service id, so a Tempo search can start from a value that also
+        # appears in the gateway's Loki lines AND in the upstream worker's, rather than
+        # only from `sgpu.request.id` which is gateway-local. Read via accesslog's
+        # contextvar (not `observability`) so this stays correct when `wan` is absent.
+        try:
+            from .accesslog import correlation_id_var
+            _set(span, "sgpu.correlation.id", correlation_id_var.get())
+        except Exception:  # noqa: BLE001
+            pass
         _set(span, "sgpu.proxy.id", endpoint_id)
         _set(span, "sgpu.proxy.name", endpoint_name)
         _set(span, "sgpu.model", model)

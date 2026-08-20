@@ -6,6 +6,7 @@
 
 import type {
   AppProxyLink,
+  AppRequestCounts,
   BenchStat,
   PageQuery,
   PageResponse,
@@ -123,6 +124,7 @@ import type {
   ProxyEndpoint,
   ProxyHistorySource,
   ProxyRequestFacets,
+  ProxyRequestCounts,
   ProxyUpstreamHealth,
   ProxyRequest,
   CreateProxyBody,
@@ -327,7 +329,7 @@ export const gateway = {
     ),
   listAppRequests: (
     id: string,
-    opts: { limit?: number; owner?: string; model?: string; status?: string; sort?: string; order?: string; requestId?: string } = {},
+    opts: { limit?: number; owner?: string; model?: string; status?: string; sort?: string; order?: string; requestId?: string; sinceHours?: number } = {},
   ) => {
     const q = new URLSearchParams({ limit: String(opts.limit ?? 100) });
     if (opts.owner) q.set("owner", opts.owner);
@@ -336,10 +338,31 @@ export const gateway = {
     if (opts.sort) q.set("sort", opts.sort);
     if (opts.order) q.set("order", opts.order);
     if (opts.requestId) q.set("request_id", opts.requestId);
+    if (opts.sinceHours) q.set("since_hours", String(opts.sinceHours));
     return request<GatewayRequestRecord[]>(`/apps/${encodeURIComponent(id)}/requests?${q.toString()}`);
   },
   getAppRequestFacets: (id: string) =>
     request<{ users: string[]; models: string[] }>(`/apps/${encodeURIComponent(id)}/request-facets`),
+  /**
+   * Exact per-status counts + histogram for an inference app — the Queue tab's
+   * mirror of `getProxyRequestCounts`. Same rule: never count statuses inside a
+   * fetched page; the list is one page of a possibly enormous history.
+   */
+  getAppRequestCounts: (
+    id: string,
+    opts: { owner?: string; model?: string; status?: string; sinceHours?: number; bucket?: string; from?: string; to?: string } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (opts.owner) q.set("owner", opts.owner);
+    if (opts.model) q.set("model", opts.model);
+    if (opts.status) q.set("status_filter", opts.status);
+    if (opts.sinceHours) q.set("since_hours", String(opts.sinceHours));
+    // Absolute bounds from drag-to-select; the gateway lets these win over since_hours.
+    if (opts.from) q.set("from", opts.from);
+    if (opts.to) q.set("to", opts.to);
+    if (opts.bucket) q.set("bucket", opts.bucket);
+    return request<AppRequestCounts>(`/apps/${encodeURIComponent(id)}/request-counts?${q.toString()}`);
+  },
   checkAvailability: (gpu: string, count = 1, cloudType?: "COMMUNITY" | "SECURE") => {
     const params = new URLSearchParams({ gpu, count: String(count) });
     if (cloudType) params.set("cloud_type", cloudType);
@@ -1138,15 +1161,19 @@ export const gateway = {
    * so a "slowest first" page can be a ranking over part of the window. */
   getProxyRequests: async (
     id: string,
-    opts: { limit?: number; owner?: string; upstream?: string; status?: string; sort?: string; order?: string; requestId?: string } = {},
+    opts: { limit?: number; offset?: number; owner?: string; upstream?: string; status?: string; sort?: string; order?: string; requestId?: string; sinceHours?: number; from?: string; to?: string } = {},
   ): Promise<{ rows: ProxyRequest[]; source: ProxyHistorySource | null; note: string | null }> => {
     const q = new URLSearchParams({ limit: String(opts.limit ?? 50) });
+    if (opts.offset) q.set("offset", String(opts.offset));
     if (opts.owner) q.set("owner", opts.owner);
     if (opts.upstream) q.set("upstream", opts.upstream);
     if (opts.status) q.set("status", opts.status);
     if (opts.sort) q.set("sort", opts.sort);
     if (opts.order) q.set("order", opts.order);
     if (opts.requestId) q.set("request_id", opts.requestId);
+    if (opts.sinceHours) q.set("since_hours", String(opts.sinceHours));
+    if (opts.from) q.set("from", opts.from);
+    if (opts.to) q.set("to", opts.to);
     const { data, headers } = await requestFull<ProxyRequest[]>(
       `/v1/proxy/${encodeURIComponent(id)}/requests?${q.toString()}`,
     );
@@ -1161,6 +1188,30 @@ export const gateway = {
     request<ProxyRequestFacets>(
       `/v1/proxy/${encodeURIComponent(id)}/request-facets`,
     ),
+  /**
+   * Exact per-status counts over the whole retained history, plus the histogram series.
+   *
+   * ⚠ Do NOT go back to counting statuses inside a fetched page — that is what made the
+   * Blocked tile read 112 when 174 requests had been blocked. `total` here is also what
+   * the pager needs; the row list only ever holds one page.
+   */
+  getProxyRequestCounts: (
+    id: string,
+    opts: { owner?: string; upstream?: string; status?: string; sinceHours?: number; bucket?: string; from?: string; to?: string } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (opts.owner) q.set("owner", opts.owner);
+    if (opts.upstream) q.set("upstream", opts.upstream);
+    if (opts.status) q.set("status", opts.status);
+    if (opts.sinceHours) q.set("since_hours", String(opts.sinceHours));
+    // Absolute bounds from drag-to-select; the gateway lets these win over since_hours.
+    if (opts.from) q.set("from", opts.from);
+    if (opts.to) q.set("to", opts.to);
+    if (opts.bucket) q.set("bucket", opts.bucket);
+    return request<ProxyRequestCounts>(
+      `/v1/proxy/${encodeURIComponent(id)}/request-counts?${q.toString()}`,
+    );
+  },
   cancelProxyRequest: (id: string, reqId: string) =>
     request<{ ok: boolean; id: string }>(
       `/v1/proxy/${encodeURIComponent(id)}/requests/${encodeURIComponent(reqId)}/cancel`,

@@ -12,7 +12,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Pagination } from "@/components/ui/pagination";
 import { gateway } from "@/lib/gateway";
 import { cn } from "@/lib/utils";
-import { RED_TEAM_DEFAULT_TYPES, type ProxyEndpoint, type ProxyHistorySource, type ProxyRequest, type ProxyUpstreamHealth } from "@/lib/types";
+import { RED_TEAM_DEFAULT_TYPES, type ProxyEndpoint, type ProxyHistorySource, type ProxyRequest, type ProxyRequestCounts, type ProxyUpstreamHealth } from "@/lib/types";
+import { RangeSelect, RequestHistogram, rangeFromParam } from "./request-histogram";
 import { BaseUrlToggle, type UrlTarget } from "@/components/console/base-url-toggle";
 import { RoutingPanel } from "../routing-panel";
 import { ProxyPlayground } from "./proxy-playground";
@@ -108,6 +109,17 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
   const [histSource, setHistSource] = useState<ProxyHistorySource | null>(null);
   const [histNote, setHistNote] = useState<string | null>(null);
   const [histStore, setHistStore] = useState<string | null>(null);
+  // Exact server-side aggregates: the stat tiles, the histogram, and the pager's total.
+  const [counts, setCounts] = useState<ProxyRequestCounts | null>(null);
+  // Time range + histogram interval, URL-driven like the other filters so a view of
+  // "blocked, last 7 days" is a shareable link.
+  const rangeHours = rangeFromParam(searchParams.get("range"));   // absent → 7d; 0 = all time
+  const interval = searchParams.get("interval") ?? "auto";
+  // Absolute window from drag-to-select. Present ⇒ it wins over `range` (server-side too),
+  // so the relative picker shows "Custom" rather than a stale label.
+  const brushFrom = searchParams.get("from") ?? "";
+  const brushTo = searchParams.get("to") ?? "";
+  const customRange = Boolean(brushFrom || brushTo);
   const setQ = useCallback((updates: Record<string, string | null>) => {
     const params = new URLSearchParams(searchParams.toString());
     for (const [k, v] of Object.entries(updates)) { if (v) params.set(k, v); else params.delete(k); }
@@ -135,25 +147,44 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
 
   const poll = useCallback(async () => {
     try {
-      const [h, r] = await Promise.all([
+      // Three calls, deliberately: the ROW LIST is one page, so its length is not a
+      // count of anything. Tiles + histogram come from /request-counts, which aggregates
+      // server-side over the whole retained history. Counting statuses inside the fetched
+      // page is what made "Blocked" read 112 on an endpoint with 174 blocked requests.
+      const [h, r, c] = await Promise.all([
         gateway.getProxyHealth(ep.id),
         gateway.getProxyRequests(ep.id, {
-          limit: 200,
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
           owner: ownerF || undefined,
           upstream: upstreamF || undefined,
+          status: filter === "all" ? undefined : filter,
+          sinceHours: rangeHours || undefined,
+          from: brushFrom || undefined,
+          to: brushTo || undefined,
           sort: sortBy,
           order: orderDir,
           requestId: reqIdQuery || undefined,
+        }),
+        gateway.getProxyRequestCounts(ep.id, {
+          owner: ownerF || undefined,
+          upstream: upstreamF || undefined,
+          sinceHours: rangeHours || undefined,
+          from: brushFrom || undefined,
+          to: brushTo || undefined,
+          bucket: interval,
         }),
       ]);
       setHealth(h);
       setReqs(r.rows);
       setHistSource(r.source);
       setHistNote(r.note);
+      setCounts(c);
     } catch {
       /* transient */
     }
-  }, [ep.id, ownerF, upstreamF, sortBy, orderDir, reqIdQuery]);
+  }, [ep.id, ownerF, upstreamF, sortBy, orderDir, reqIdQuery, filter, rangeHours,
+      interval, page, pageSize, brushFrom, brushTo]);
   useEffect(() => {
     if (readOnly) return; // health + request history are admin-only; don't 403-spam
     poll();
@@ -174,7 +205,9 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
     try { await gateway.cancelProxyRequest(ep.id, rid); poll(); }
     catch (e) { alert(e instanceof Error ? e.message : String(e)); }
   };
-  const queuedCount = reqs.filter((r) => r.status === "queued").length;
+  // Flush acts on what is queued NOW, which is a live fact — take it from the exact
+  // counts, not from whichever page happens to be on screen.
+  const queuedCount = counts?.by_status?.queued ?? 0;
   const onFlush = async () => {
     if (!confirm(`Flush ${queuedCount} queued request${queuedCount === 1 ? "" : "s"}? Running requests are not affected.`)) return;
     setFlushing(true);
@@ -189,13 +222,19 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
     }
   };
   const onRefresh = async () => { setRefreshing(true); await poll(); setRefreshing(false); };
-  const count = (s: string) => reqs.filter((r) => r.status === s).length;
-  const filtered = filter === "all" ? reqs : reqs.filter((r) => r.status === filter);
-  // Client-side pagination over the fetched (server-filtered/sorted) page, like the
-  // serverless queue. Clamp in render so a shrinking result set can't strand a page.
-  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  // ⚠ Counts come from the server, never from `reqs` — `reqs` is ONE page.
+  const count = (s: string) => counts?.by_status?.[s] ?? 0;
+  // Status filtering and paging are both server-side now, so the fetched page IS the
+  // page to render. Slicing again here would paginate within a page.
+  const paged = reqs;
+  // The pager's total must match the FILTERED set. `counts.total` is every status (the
+  // tiles need that), so a status filter has to read its own bucket or the pager offers
+  // pages that don't exist.
+  const total = filter === "all"
+    ? (counts?.total ?? reqs.length)
+    : (counts?.by_status?.[filter] ?? reqs.length);
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const currentPage = Math.min(page, pageCount);
-  const paged = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
   const onDelete = async () => {
     if (!confirm(`Delete proxy endpoint "${ep.name}"?`)) return;
     try { await gateway.deleteProxy(ep.id); router.push("/proxy"); router.refresh(); }
@@ -532,8 +571,25 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
             </div>
           )}
 
-          {/* Server-side filters/sort over the full retained history */}
+
+          {/* Server-side filters/sort over the full retained history. The time range
+              lives here, not on the chart card: it scopes the tabs, table and pager too. */}
           <div className="flex flex-wrap items-center gap-2">
+            <RangeSelect
+              hours={rangeHours}
+              // Always write the param, `0` included — see DEFAULT_RANGE_H.
+              // Clear the brushed window: absolute bounds outrank `range` server-side,
+              // so leaving them would make the relative picker look broken.
+              onHours={(h) => { setQ({ range: String(h), from: null, to: null }); setPage(1); }}
+            />
+            {/* Without this a brushed window is a one-way door: absolute bounds outrank
+                `range` server-side, so there would be no way back to a wider view. */}
+            {customRange && (
+              <Button variant="outline" size="xs" className="h-8"
+                      onClick={() => { setQ({ from: null, to: null }); setPage(1); }}>
+                Clear range
+              </Button>
+            )}
             <Select value={ownerF || "__all"} onValueChange={(v) => setQ({ user: v === "__all" ? null : v })}>
               <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -575,9 +631,29 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
             </form>
           </div>
 
+          {/* Volume over time — placed directly ABOVE the rows it describes and below
+              the filters that scope it, so the chart, the status tabs and the table all
+              answer for the same filtered set. */}
+          <RequestHistogram
+            counts={counts}
+            interval={interval}
+            onInterval={(i) => setQ({ interval: i === "auto" ? null : i })}
+            onBrush={(a, b) => { setQ({ from: a, to: b }); setPage(1); }}
+            statusFilter={filter === "all" ? "" : filter}
+            // The legend only ever emits a BUCKETS status or "" (clear), but it is typed
+            // as a plain string, so narrow before assigning to the union.
+            onStatusFilter={(s) => {
+              setFilter(BUCKETS.includes(s as (typeof BUCKETS)[number])
+                ? (s as (typeof BUCKETS)[number]) : "all");
+              setPage(1);
+            }}
+          />
+
           <div className="flex gap-1 border-b border-border">
             {(["all", ...BUCKETS] as const).map((b) => {
-              const n = b === "all" ? reqs.length : count(b);
+              // `reqs.length` would be the PAGE size — the same class of bug as the old
+              // tiles. "all" is the server's total for the current filters.
+              const n = b === "all" ? (counts?.total ?? reqs.length) : count(b);
               return (
                 <button key={b} onClick={() => setFilter(b)}
                         className={cn("relative px-3 py-1.5 text-xs transition-colors", filter === b ? "text-foreground" : "text-muted-foreground hover:text-foreground")}>
@@ -654,7 +730,7 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
                     </td>
                   </tr>
                 ))}
-                {filtered.length === 0 && (
+                {paged.length === 0 && (
                   <tr><td colSpan={10} className="px-4 py-10 text-center text-sm text-muted-foreground">
                     {filter === "all" ? "No requests yet — fire one from the Playground." : `No ${filter} requests.`}
                   </td></tr>
@@ -663,11 +739,11 @@ export function ProxyDetail({ initial, baseUrl, readOnly = false }: { initial: P
             </table>
           </Card>
 
-          {filtered.length > 0 && (
+          {total > 0 && (
             <Pagination
               page={currentPage}
               pageCount={pageCount}
-              total={filtered.length}
+              total={total}
               pageSize={pageSize}
               onPageChange={setPage}
               onPageSizeChange={(n) => { setPageSize(n); setPage(1); }}
